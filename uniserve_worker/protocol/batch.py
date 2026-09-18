@@ -23,9 +23,8 @@ from .validation import (
 )
 
 
-def native_run(
+def native_batch(
     batch_id: int,
-    run_id: int,
     collective_seq: int,
     operations: tuple[operation.ScheduledRequest, ...],
     block_tables: tuple[BlockTable, ...],
@@ -43,70 +42,71 @@ def native_run(
     commands: tuple[BatchCommand, ...],
     input_products: Sequence[object],
     kv_inputs: Sequence[object],
-) -> ScheduleBatch:
-    """Assemble a validated run from transport-constructed members.
+) -> Batch:
+    """Assemble a validated batch from transport-constructed members.
 
     Called by the Rust IPC transport, which has already decoded and validated
-    every field. Construction therefore bypasses ``ScheduleBatch.__init__`` so
+    every field. Construction therefore bypasses ``Batch.__init__`` so
     typed leaves are not reparsed and ``__post_init__`` validation is not
     repeated.
     """
-    run = object.__new__(ScheduleBatch)
+    batch = object.__new__(Batch)
     set_field = object.__setattr__
-    set_field(run, "batch_id", batch_id)
-    set_field(run, "run_id", run_id)
-    set_field(run, "collective_seq", collective_seq)
-    set_field(run, "operations", operations)
-    set_field(run, "block_tables", block_tables)
-    set_field(run, "new_cache_pages", new_cache_pages)
-    set_field(run, "forward_operation_indices", forward_inputs[0])
-    set_field(run, "request_pool_indices", forward_inputs[1])
-    set_field(run, "seq_lens", forward_inputs[2])
-    set_field(run, "query_lens", forward_inputs[3])
-    set_field(run, "write_kv", forward_inputs[4])
+    set_field(batch, "batch_id", batch_id)
+    set_field(batch, "collective_seq", collective_seq)
+    set_field(batch, "operations", operations)
+    set_field(batch, "block_tables", block_tables)
+    set_field(batch, "new_cache_pages", new_cache_pages)
+    set_field(batch, "forward_operation_indices", forward_inputs[0])
+    set_field(batch, "request_pool_indices", forward_inputs[1])
+    set_field(batch, "seq_lens", forward_inputs[2])
+    set_field(batch, "query_lens", forward_inputs[3])
+    set_field(batch, "write_kv", forward_inputs[4])
 
     set_field(
-        run,
+        batch,
         "latent_params",
         tuple(
-            LatentParams.from_mapping(item, f"run.latent_params[{index}]")
+            LatentParams.from_mapping(item, f"batch.latent_params[{index}]")
             for index, item in enumerate(latent_params)
         ),
     )
     set_field(
-        run,
+        batch,
         "decode_ranges",
         tuple(
-            DecodeRange.from_mapping(item, f"run.decode_ranges[{index}]")
+            DecodeRange.from_mapping(item, f"batch.decode_ranges[{index}]")
             for index, item in enumerate(decode_ranges)
         ),
     )
     set_field(
-        run,
+        batch,
         "buffer_allocations",
         tuple(
             BufferAllocation.from_mapping(
-                item, f"run.buffer_allocations[{index}]"
+                item, f"batch.buffer_allocations[{index}]"
             )
             for index, item in enumerate(buffer_allocations)
         ),
     )
-    set_field(run, "commands", commands)
+    set_field(batch, "commands", commands)
 
     set_field(
-        run,
+        batch,
         "input_products",
         tuple(
-            TensorPublication.from_mapping(item, f"run.input_products[{index}]")
+            TensorPublication.from_mapping(
+                item, f"batch.input_products[{index}]"
+            )
             for index, item in enumerate(input_products)
         ),
     )
     set_field(
-        run,
+        batch,
         "kv_inputs",
         tuple(transfer.KvTransfer.from_mapping(value) for value in kv_inputs),
     )
-    return run
+    return batch
 
 
 @dataclass(frozen=True, slots=True)
@@ -852,11 +852,11 @@ def _validate_buffer_allocations(
 
 
 @dataclass(frozen=True, slots=True)
-class ScheduleBatch:
-    """Describes one scheduler-submitted collection of operations."""
+class Batch:
+    """One numerical call on one component, with every request in it."""
 
+    # Strictly increasing in each worker's submission order.
     batch_id: int
-    run_id: int
     # Monotonic sequence number ordering collective communication across
     # workers.
     collective_seq: int = 1
@@ -880,7 +880,7 @@ class ScheduleBatch:
     kv_inputs: tuple[transfer.KvTransfer, ...] = ()
 
     def __post_init__(self) -> None:
-        """Validate run identity and lifecycle-operation consistency."""
+        """Validate batch identity and lifecycle-operation consistency."""
         self.validate()
 
     @property
@@ -896,7 +896,7 @@ class ScheduleBatch:
         )
 
     def validate(self) -> None:
-        """Enforce run identity, command ordering, and operation counts.
+        """Enforce batch identity, command ordering, and operation counts.
 
         Also enforces token bounds.
         """
@@ -906,7 +906,9 @@ class ScheduleBatch:
                 "command"
             )
         if self.collective_seq < 1:
-            raise invalid_descriptor("run collective sequence must be positive")
+            raise invalid_descriptor(
+                "batch collective sequence must be positive"
+            )
         _validate_forward_inputs(
             len(self.operations),
             self.forward_operation_indices,
@@ -932,6 +934,16 @@ class ScheduleBatch:
         if len(set(request_keys)) != len(request_keys):
             raise invalid_descriptor(
                 "a submission batch carries multiple operations for one request"
+            )
+        # A batch is one numerical call on one component: every call in it
+        # performs the same computation through the same entry, so the rank
+        # executes it as a single homogeneous group and returns one result.
+        calls = {
+            (operation.kind, operation.entry) for operation in self.operations
+        }
+        if len(calls) > 1:
+            raise invalid_descriptor(
+                "a submission batch mixes computations or entries"
             )
         admitted = [admission.request_key for admission in self.admissions]
         if len(set(admitted)) != len(admitted):
@@ -986,7 +998,7 @@ class ScheduleBatch:
         for publication in self.kv_inputs:
             publication.encoded_size_bound()
             if publication.source in sources:
-                raise invalid_descriptor("run repeats a KV input")
+                raise invalid_descriptor("batch repeats a KV input")
             sources.add(publication.source)
             consumers = tuple(
                 operation
@@ -1008,72 +1020,72 @@ class ScheduleBatch:
                     "KV input exceeds its installation transfer-byte bound"
                 )
         _validate_buffer_allocations(
-            self.operations, self.buffer_allocations, "run"
+            self.operations, self.buffer_allocations, "batch"
         )
 
     @classmethod
-    def from_mapping(cls, value: object) -> ScheduleBatch:
-        """Parse a scheduler run and validate it.
+    def from_mapping(cls, value: object) -> Batch:
+        """Parse a scheduler batch and validate it.
 
         Validation covers all lifecycle commands and physical inputs.
         """
-        data = _map(value, "execute run")
-        batch_id = _uint(data.get("batch_id"), "execute run.batch_id")
-        run_id = _uint(data.get("run_id"), "execute run.run_id")
+        data = _map(value, "execute batch")
+        batch_id = _uint(data.get("batch_id"), "execute batch.batch_id")
 
         operations = tuple(
             operation.ScheduledRequest.from_mapping(
-                item, f"execute run.operations[{index}]"
+                item, f"execute batch.operations[{index}]"
             )
             for index, item in enumerate(
-                _seq(data.get("operations", ()), "execute run.operations")
+                _seq(data.get("operations", ()), "execute batch.operations")
             )
         )
         commands = tuple(
             command_from_mapping(
                 item,
-                f"execute run.commands[{index}]",
+                f"execute batch.commands[{index}]",
             )
             for index, item in enumerate(
-                _seq(data.get("commands", ()), "execute run.commands")
+                _seq(data.get("commands", ()), "execute batch.commands")
             )
         )
         input_products = tuple(
             TensorPublication.from_mapping(
-                item, f"execute run.input_products[{index}]"
+                item, f"execute batch.input_products[{index}]"
             )
             for index, item in enumerate(
                 _seq(
-                    data.get("input_products", ()), "execute run.input_products"
+                    data.get("input_products", ()),
+                    "execute batch.input_products",
                 )
             )
         )
 
         return cls(
             batch_id=batch_id,
-            run_id=run_id,
             collective_seq=_uint(
-                data.get("collective_seq"), "execute run.collective_seq"
+                data.get("collective_seq"), "execute batch.collective_seq"
             ),
             operations=operations,
             block_tables=tuple(
                 BlockTable.from_mapping(
-                    item, f"execute run.block_tables[{index}]"
+                    item, f"execute batch.block_tables[{index}]"
                 )
                 for index, item in enumerate(
                     _seq(
-                        data.get("block_tables", ()), "execute run.block_tables"
+                        data.get("block_tables", ()),
+                        "execute batch.block_tables",
                     )
                 )
             ),
             new_cache_pages=tuple(
                 CachePageAllocation.from_mapping(
-                    item, f"execute run.new_cache_pages[{index}]"
+                    item, f"execute batch.new_cache_pages[{index}]"
                 )
                 for index, item in enumerate(
                     _seq(
                         data.get("new_cache_pages", ()),
-                        "execute run.new_cache_pages",
+                        "execute batch.new_cache_pages",
                     )
                 )
             ),
@@ -1099,34 +1111,34 @@ class ScheduleBatch:
             ),
             latent_params=tuple(
                 LatentParams.from_mapping(
-                    item, f"execute run.latent_params[{index}]"
+                    item, f"execute batch.latent_params[{index}]"
                 )
                 for index, item in enumerate(
                     _seq(
                         data.get("latent_params", ()),
-                        "execute run.latent_params",
+                        "execute batch.latent_params",
                     )
                 )
             ),
             decode_ranges=tuple(
                 DecodeRange.from_mapping(
-                    item, f"execute run.decode_ranges[{index}]"
+                    item, f"execute batch.decode_ranges[{index}]"
                 )
                 for index, item in enumerate(
                     _seq(
                         data.get("decode_ranges", ()),
-                        "execute run.decode_ranges",
+                        "execute batch.decode_ranges",
                     )
                 )
             ),
             buffer_allocations=tuple(
                 BufferAllocation.from_mapping(
-                    item, f"execute run.buffer_allocations[{index}]"
+                    item, f"execute batch.buffer_allocations[{index}]"
                 )
                 for index, item in enumerate(
                     _seq(
                         data.get("buffer_allocations", ()),
-                        "execute run.buffer_allocations",
+                        "execute batch.buffer_allocations",
                     )
                 )
             ),
@@ -1134,18 +1146,17 @@ class ScheduleBatch:
             input_products=input_products,
             kv_inputs=tuple(
                 transfer.KvTransfer.from_mapping(value)
-                for value in _seq(data.get("kv_inputs", ()), "run.kv_inputs")
+                for value in _seq(data.get("kv_inputs", ()), "batch.kv_inputs")
             ),
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode run identity and lifecycle commands.
+        """Encode batch identity and lifecycle commands.
 
         Also encodes physical lane descriptors.
         """
         return {
             "batch_id": self.batch_id,
-            "run_id": self.run_id,
             "collective_seq": self.collective_seq,
             "operations": [value.to_mapping() for value in self.operations],
             "block_tables": [value.to_mapping() for value in self.block_tables],

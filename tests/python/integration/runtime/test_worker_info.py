@@ -151,8 +151,8 @@ def test_worker_identity_and_capabilities_reflect_enabled_operations() -> None:
             assert set(info["supported_ops"]) == {
                 code.value for code in allowed
             }
-            assert worker.supports_run_kind(ForwardMode.PREFILL)
-            assert worker.supports_run_kind(ForwardMode.DECODE) == (
+            assert worker.supports_computation(ForwardMode.PREFILL)
+            assert worker.supports_computation(ForwardMode.DECODE) == (
                 ForwardMode.DECODE in allowed
             )
             identities.append(info["configuration_id"])

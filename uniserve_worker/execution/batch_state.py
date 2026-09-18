@@ -19,10 +19,8 @@ from uniserve_worker.execution.rows import (
 )
 from uniserve_worker.foundation.errors import WorkerError, invalid_descriptor
 from uniserve_worker.protocol.batch import (
-    Finish,
-    Free,
+    Batch,
     RegistrationAck,
-    ScheduleBatch,
     TensorPublication,
 )
 from uniserve_worker.protocol.identity import BufferId, RequestKey
@@ -50,7 +48,7 @@ class BatchState:
     object has no callback that can execute its batch or advance the worker.
     """
 
-    batch: ScheduleBatch
+    batch: Batch
     propagate_errors: bool = False
 
     # Physical input reservations held until execution observes readiness.
@@ -120,10 +118,8 @@ class BatchState:
     retirement_events: tuple[torch.cuda.Event, ...] = ()
     retirement_cleaned: bool = False
 
-    # Delivery position over completed groups.
-    sent_groups: set[int] = field(default_factory=set)
-    terminal_sent: bool = False
-    awaiting_poll: bool = False
+    # Whether the batch's single result has been delivered.
+    result_sent: bool = False
 
     def __post_init__(self) -> None:
         self.outputs = [None] * len(self.batch.operations)
@@ -226,10 +222,6 @@ class BatchState:
     @property
     def batch_id(self) -> int:
         return int(self.batch.batch_id)
-
-    @property
-    def run_id(self) -> int:
-        return int(self.batch.run_id)
 
     @property
     def request_ids(self) -> frozenset[int]:
@@ -492,111 +484,76 @@ class BatchState:
         )
 
     def ready(self) -> bool:
-        """Query whether the delivery position has a completed group or.
-
-        terminal error.
-        """
-        if self.error is not None:
-            return not self.terminal_sent
-        return bool(self.completed_groups - self.sent_groups) or (
-            self.complete and not self.terminal_sent
-        )
+        """Query whether the batch's single result can be delivered."""
+        if self.result_sent:
+            return False
+        return self.error is not None or self.complete
 
     def take_output(self) -> BatchOutput:
-        """Consume final values for one entry.
+        """Consume the batch's one result.
 
-        preserving the final command fragment.
+        A batch is one numerical call on one component, so every call it
+        carries completes together and its retirement is already applied.
         """
         if self.error is not None:
             raise RuntimeError(
                 "terminal error must be consumed through take_error"
             )
-        groups = tuple(
-            group
-            for group in self.output_groups
-            if group in self.completed_groups and group not in self.sent_groups
-        )
-        if groups:
-            entries = {
-                group: self.batch.operations[indexes[0]].entry
-                for group, indexes in self.output_groups.items()
-            }
+        if not self.ready():
+            raise RuntimeError("batch has no ready output")
+        self.result_sent = True
 
-            # Deliver one wire entry per fragment; groups sharing the first
-            # ready entry travel together.
-            entry = entries[groups[0]]
-            groups = tuple(group for group in groups if entries[group] == entry)
-            self.sent_groups.update(groups)
-
-            done = (
-                self.complete
-                and len(self.sent_groups) == len(self.output_groups)
-                and not any(
-                    isinstance(command, (Free, Finish))
-                    for command in self.batch.commands
-                )
-            )
-            self.terminal_sent = done
-
-            values: list[RequestOutput] = []
-            for group in groups:
-                for index in self.output_groups[group]:
-                    value = self.outputs[index]
-                    if not isinstance(value, RequestOutput):
-                        raise RuntimeError(
-                            "batch delivery encountered an unmaterialized "
-                            "output"
-                        )
-                    values.append(value)
-
-            successful = {
-                (value.request_key, value.op_id)
-                for value in values
-                if value.status is OpStatus.OK
-            }
-
-            return BatchOutput(
-                batch_id=self.batch_id,
-                run_id=self.run_id,
-                completions=tuple(values),
-                products=tuple(
-                    value
-                    for group in groups
-                    for value in self.group_products[group]
-                    if (value.product.request_key, value.product.producer_op_id)
-                    in successful
-                ),
-                registration=RegistrationAck(
-                    visible=all(
-                        group in self.visible_groups for group in groups
+        groups = tuple(self.output_groups)
+        values: list[RequestOutput] = []
+        for group in groups:
+            for index in self.output_groups[group]:
+                value = self.outputs[index]
+                if not isinstance(value, RequestOutput):
+                    raise RuntimeError(
+                        "batch delivery encountered an unmaterialized output"
                     )
-                ),
-                worker_exec_us=max(
-                    self.group_execution_us[group] for group in groups
-                ),
-                forward_stats=ForwardStats.combine(
+                values.append(value)
+
+        successful = {
+            (value.request_key, value.op_id)
+            for value in values
+            if value.status is OpStatus.OK
+        }
+
+        return BatchOutput(
+            batch_id=self.batch_id,
+            completions=tuple(values),
+            products=tuple(
+                value
+                for group in groups
+                for value in self.group_products[group]
+                if (value.product.request_key, value.product.producer_op_id)
+                in successful
+            ),
+            registration=RegistrationAck(
+                visible=all(group in self.visible_groups for group in groups)
+            ),
+            worker_exec_us=(
+                max(self.group_execution_us[group] for group in groups)
+                if groups
+                else None
+            ),
+            forward_stats=(
+                ForwardStats.combine(
                     tuple(self.group_stats[group] for group in groups)
-                ),
-                done=done,
-            )
-        if self.complete and not self.terminal_sent:
-            self.terminal_sent = True
-            return BatchOutput(
-                batch_id=self.batch_id, run_id=self.run_id, done=True
-            )
-        raise RuntimeError("batch has no ready output")
+                )
+                if groups
+                else None
+            ),
+        )
 
     def take_error(self) -> WorkerError:
         """Consume the terminal error exactly once."""
         error = self.error
-        if error is None or self.terminal_sent:
+        if error is None or self.result_sent:
             raise RuntimeError("batch has no unread terminal error")
-        self.terminal_sent = True
+        self.result_sent = True
         return error
-
-    def pending(self) -> bool:
-        """Report whether the batch still owes a delivery fragment."""
-        return not self.terminal_sent
 
     def close(
         self,

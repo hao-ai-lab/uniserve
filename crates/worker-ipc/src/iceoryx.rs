@@ -106,7 +106,7 @@ macro_rules! ipc_error {
 }
 
 /// IPC version this build emits on every [`Header`].
-pub const IPC_VERSION: u16 = 60;
+pub const IPC_VERSION: u16 = 61;
 
 /// Returns whether this build can decode a peer-advertised IPC `version`.
 pub fn is_supported_ipc_version(version: u16) -> bool {
@@ -125,8 +125,8 @@ pub fn is_supported_ipc_version(version: u16) -> bool {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
-    /// Physical run identity, or zero for non-run requests.
-    pub run_id: u64,
+    /// Batch identity, or zero for frames that carry no batch.
+    pub batch_id: u64,
     /// Request-response correlation identity.
     pub call_id: u64,
     /// Encoded payload length in bytes.
@@ -147,7 +147,7 @@ impl Default for Header {
     /// Returns an empty header stamped with the emitted IPC version.
     fn default() -> Self {
         Self {
-            run_id: 0,
+            batch_id: 0,
             call_id: 0,
             len: 0,
             reserved0: 0,
@@ -530,16 +530,16 @@ impl ServerEndpoint {
 /// Builds the IPC header that accompanies `req`.
 ///
 /// `call_id` is the authoritative request/response correlation key. The
-/// `run_id` field is a diagnostic hint populated from the run. The decoded payload is authoritative for runs that
-/// carry multiple operation identities.
+/// `batch_id` field is a diagnostic hint populated from the batch; the decoded
+/// payload is authoritative for the operation identities it carries.
 pub fn header_for_request(req: &WorkerRequest) -> Header {
     let mut h = Header {
         kind: request_kind_code(req.kind()),
         call_id: req.call_id().unwrap_or_default(),
         ..Default::default()
     };
-    if let Some(run) = req.run() {
-        h.run_id = run.run_id;
+    if let Some(batch) = req.batch() {
+        h.batch_id = batch.batch_id;
     }
     h
 }
@@ -547,8 +547,8 @@ pub fn header_for_request(req: &WorkerRequest) -> Header {
 /// Builds the IPC header that accompanies `resp`.
 ///
 /// `call_id` is the authoritative request/response correlation key. The
-/// `run_id` field is a diagnostic hint populated from the result. The decoded payload is authoritative when a result
-/// aggregates multiple operation identities.
+/// `batch_id` field is a diagnostic hint populated from the result; the decoded
+/// payload is authoritative for the operation identities it carries.
 pub fn header_for_response(resp: &WorkerResponse) -> Header {
     let mut h = Header {
         kind: response_kind_code(resp.kind()),
@@ -556,7 +556,7 @@ pub fn header_for_response(resp: &WorkerResponse) -> Header {
         ..Default::default()
     };
     if let Some(report) = resp.report() {
-        h.run_id = report.run_id;
+        h.batch_id = report.batch_id;
     }
     h
 }
@@ -586,8 +586,7 @@ fn request_kind_code(kind: RequestKind) -> u8 {
     match kind {
         RequestKind::Info => 1,
         RequestKind::Submit => 2,
-        RequestKind::Poll => 3,
-        RequestKind::Close => 4,
+        RequestKind::Close => 3,
     }
 }
 

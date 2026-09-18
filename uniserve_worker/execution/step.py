@@ -302,7 +302,7 @@ def execute_batch(
         group_outcomes = outcomes[completion_group]
         try:
             _commit_group(
-                batch.run_id,
+                batch.batch_id,
                 completion_group,
                 group_outcomes,
                 started,

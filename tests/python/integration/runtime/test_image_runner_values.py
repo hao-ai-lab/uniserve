@@ -555,7 +555,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 ar_params,
                 configure_physical_pool,
                 encode_operation,
-                execution_run,
+                execution_batch,
                 finalized_report,
                 root_parent,
             )
@@ -609,8 +609,10 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
             result = finalized_report(
                 worker,
                 worker.submit(
-                    execution_run(
-                        run_id=1, admissions=(admission,), operations=(encode,)
+                    execution_batch(
+                        batch_id=1,
+                        admissions=(admission,),
+                        operations=(encode,),
                     )
                 ),
             )

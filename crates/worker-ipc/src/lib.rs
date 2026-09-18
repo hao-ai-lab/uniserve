@@ -1,6 +1,6 @@
 //! Versioned scheduler-to-worker protocol and shared-memory transport.
 //!
-//! [`NewRequest`] admits static state, [`ScheduleBatch`] submits planned operations, and
+//! [`NewRequest`] admits static state, [`Batch`] submits planned operations, and
 //! [`BatchOutput`] returns completions and products. [`WorkerInfo`] describes a
 //! loaded worker before execution begins. Numeric request, operation, point,
 //! and generation identities remain stable across serialization.

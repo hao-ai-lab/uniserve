@@ -95,15 +95,14 @@ pub fn record_scheduler_stats(
             .get_or_create(&domain_labels)
             .inc_by(domain.reclaimed_credits);
         metrics
-            .scheduler_domain_completed_runs
+            .scheduler_domain_completed_batches
             .get_or_create(&domain_labels)
-            .inc_by(domain.completed_runs);
+            .inc_by(domain.completed_batches);
         for (kind, value) in [
             ("queue", domain.queue_us),
             ("launch", domain.launch_us),
             ("device", domain.device_us),
             ("completion", domain.completion_us),
-            ("co_resident", domain.co_resident_us),
         ] {
             metrics
                 .scheduler_domain_time_us
@@ -115,10 +114,6 @@ pub fn record_scheduler_stats(
                 })
                 .inc_by(value);
         }
-        metrics
-            .scheduler_domain_co_resident_runs
-            .get_or_create(&domain_labels)
-            .inc_by(domain.co_resident_runs);
     }
 
     // Prefix-cache counters, including the connector-backed external cache path.
@@ -372,13 +367,11 @@ mod tests {
                 error_operations: 1,
                 backpressure_events: 3,
                 reclaimed_credits: 6,
-                completed_runs: 4,
-                co_resident_runs: 2,
+                completed_batches: 4,
                 queue_us: 11,
                 launch_us: 13,
                 device_us: 17,
                 completion_us: 19,
-                co_resident_us: 31,
                 ..Default::default()
             }],
             ..Default::default()
@@ -399,8 +392,13 @@ mod tests {
         assert!(rendered.lines().any(|line| {
             line.starts_with("uniserve:scheduler_domain_time_us_total")
                 && line.contains("domain=\"decode\"")
-                && line.contains("kind=\"co_resident\"")
-                && line.ends_with(" 31")
+                && line.contains("kind=\"device\"")
+                && line.ends_with(" 17")
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("uniserve:scheduler_domain_completed_batches")
+                && line.contains("domain=\"decode\"")
+                && line.ends_with(" 4")
         }));
     }
 }

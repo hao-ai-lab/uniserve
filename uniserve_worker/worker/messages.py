@@ -9,7 +9,7 @@ from typing import Any
 from ..bootstrap.worker_info import RequestKind, ResponseKind
 from ..execution.batch_state import BatchState
 from ..foundation.errors import WorkerError, invalid_descriptor
-from ..protocol.batch import ScheduleBatch
+from ..protocol.batch import Batch
 from ..protocol.output import BatchOutput
 
 
@@ -81,15 +81,15 @@ def request_kind(request: Mapping[str, Any]) -> RequestKind:
         ) from None
 
 
-def run_requests(run: ScheduleBatch) -> frozenset[int]:
-    """Collect request identifiers referenced by a run.
+def batch_requests(batch: Batch) -> frozenset[int]:
+    """Collect request identifiers referenced by a batch.
 
     Admissions, operations, and commands each reference request keys.
     """
     keys = (
-        *(admission.request_key for admission in run.admissions),
-        *(operation.request_key for operation in run.operations),
-        *(command.request_key for command in run.commands),
+        *(admission.request_key for admission in batch.admissions),
+        *(operation.request_key for operation in batch.operations),
+        *(command.request_key for command in batch.commands),
     )
     return frozenset(int(key.request_id) for key in keys)
 
@@ -100,16 +100,19 @@ def raw_request_ids(request: Mapping[str, Any]) -> frozenset[int]:
     Covers submit and lifecycle commands.
     """
     requests: set[int] = set()
-    run = request.get("run")
-    if isinstance(run, ScheduleBatch):
-        return run_requests(run) | requests
-    if not isinstance(run, Mapping):
+    batch = request.get("batch")
+    if isinstance(batch, Batch):
+        return batch_requests(batch) | requests
+    if not isinstance(batch, Mapping):
         return frozenset(requests)
 
     # Walk the raw wire form: operation and command items may wrap their
     # payload in a "value" key, and a request key may nest under a "request"
     # payload (as in admission commands).
-    groups: list[object] = [run.get("operations", ()), run.get("commands", ())]
+    groups: list[object] = [
+        batch.get("operations", ()),
+        batch.get("commands", ()),
+    ]
     for group in groups:
         if not isinstance(group, Sequence):
             continue
@@ -137,7 +140,7 @@ def raw_request_ids(request: Mapping[str, Any]) -> frozenset[int]:
 
 
 def finalize_response(response: Mapping[str, Any]) -> dict[str, Any]:
-    """Convert an in-memory run result into its transport mapping."""
+    """Convert an in-memory batch result into its transport mapping."""
     finalized = dict(response)
     report = finalized.get("result")
     if isinstance(report, BatchOutput):
@@ -149,14 +152,14 @@ def finalize_response(response: Mapping[str, Any]) -> dict[str, Any]:
 class ServiceRequest:
     """Track one decoded IPC request.
 
-    Covers its dependencies, successors, run, and release state.
+    Covers its dependencies, successors, batch, and release state.
     """
 
     sequence: int
     request: dict[str, Any]
     requests: frozenset[int]
     kind: RequestKind
-    run: ScheduleBatch | None = None
+    batch: Batch | None = None
     dependencies: int = 0
     successors: list[ServiceRequest] = field(default_factory=list)
     released: bool = False
@@ -164,12 +167,12 @@ class ServiceRequest:
 
 @dataclass(slots=True)
 class PendingResponse:
-    """Pairs an ordered IPC response with the run that determines readiness."""
+    """Pairs an ordered IPC response with the batch that gates it."""
 
     sequence: int
     requests: frozenset[int]
     response: dict[str, Any]
-    run: BatchState | None = None
+    batch: BatchState | None = None
 
 
 def with_call_id(
