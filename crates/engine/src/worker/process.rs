@@ -357,8 +357,8 @@ pub(super) struct RankProcess {
     info: WorkerInfo,
     startup_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     child: Child,
-    /// Keep the shared store directory until every process in the group exits.
-    _rendezvous: Option<std::sync::Arc<tempfile::TempDir>>,
+    /// The collective rendezvous address this group's ranks share.
+    _rendezvous: Option<String>,
     /// Retains the launch descriptor until the worker has read it.
     _launch_descriptor: tempfile::TempDir,
     depth: usize,
@@ -389,7 +389,7 @@ pub(super) struct PendingRank {
     max_payload: usize,
     /// Taken by adoption alongside the process it cancels.
     startup_abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    rendezvous: Option<std::sync::Arc<tempfile::TempDir>>,
+    rendezvous: Option<String>,
     /// Retains the launch descriptor until the rank has read it; adoption
     /// transfers it to the channel that outlives this launch phase.
     launch_descriptor: Option<tempfile::TempDir>,
@@ -422,7 +422,7 @@ impl PendingRank {
         device: &str,
         rank: u32,
         world_size: u32,
-        rendezvous: Option<std::sync::Arc<tempfile::TempDir>>,
+        rendezvous: Option<String>,
         components: &std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
         startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
         registration: &str,
@@ -439,9 +439,7 @@ impl PendingRank {
                 .collect::<Vec<_>>()
                 .join(",")
         };
-        let distributed_init_method = rendezvous
-            .as_ref()
-            .map(|directory| format!("file://{}", directory.path().join("store").display()));
+        let distributed_init_method = rendezvous.clone();
 
         // One typed descriptor carries every launch value. argv keeps the
         // process identity and the descriptor's location so a running worker
