@@ -887,6 +887,7 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
         model_name: required_str(info.model_name(), "info.model_name")?,
         endpoint: endpoint_from_table(info.endpoint().context("info has no endpoint")?)?,
         device: required_str(info.device(), "info.device")?,
+        fabric_handles: info.fabric_handles(),
         transfer_backends: info
             .transfer_backends()
             .context("info has no transfer backends")?
@@ -1915,6 +1916,7 @@ fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
         endpoint: Some(Box::new(endpoint_to_fb(&info.endpoint))),
         device: Some(info.device.clone()),
         transfer_backends: Some(info.transfer_backends.clone()),
+        fabric_handles: info.fabric_handles,
         world_size: info.world_size,
         configuration_id: Some(info.configuration_id.clone()),
         components: Some(
