@@ -4,6 +4,7 @@
 mod death_watch;
 mod executor;
 mod instance;
+mod launcher;
 mod process;
 mod registration;
 
@@ -40,6 +41,13 @@ pub struct WorkerProcessArgs {
     pub host: String,
     /// CallKind entry membership and parallel geometry.
     pub entries: std::collections::BTreeMap<String, crate::ComponentConfig>,
+    /// How long the head waits for every other host's launcher to present.
+    ///
+    /// The cluster starts a launcher on each host alongside the head, so this
+    /// covers one that is starting rather than one waiting to be scheduled.
+    /// Deployments differ in how quickly that happens, so it is a launch value
+    /// rather than a constant.
+    pub launcher_timeout: std::time::Duration,
     /// Launch the worker without model weights, using its deterministic test
     /// model. Only the engine's own IPC and process tests set this; the serving
     /// command line cannot request it.

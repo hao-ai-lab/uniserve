@@ -149,6 +149,7 @@ impl Default for WorkerProcessArgs {
         Self {
             worker_id: "worker".into(),
             python: "python3".into(),
+            launcher_timeout: std::time::Duration::from_secs(120),
             model: String::new(),
             ranks: crate::WorkerConfig::model("localhost", "cuda", 1, 2).ranks,
             host: "localhost".into(),
@@ -432,6 +433,7 @@ impl PendingRank {
         world_size: u32,
         rendezvous: Option<String>,
         channel_transport: &str,
+        remote: Option<&mut super::launcher::RemoteHost<'_>>,
         components: &std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
         startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
         registration: &str,
@@ -507,6 +509,30 @@ impl PendingRank {
             let pp = std::env::var("PYTHONPATH").unwrap_or_default();
             cmd.env("PYTHONPATH", format!("{}:{}", cwd.display(), pp));
         }
+        // A rank placed on another host is started by that host's launcher,
+        // which needs the same descriptor and environment this process would
+        // have used. The head derives both once, here, for either path.
+        if let Some(remote) = remote {
+            remote.deliver(
+                rank,
+                world_size,
+                &args.python,
+                &args.worker_id,
+                &descriptor,
+                &cmd,
+            )?;
+            return Ok(Self {
+                child: None,
+                rank,
+                world_size,
+                depth,
+                max_payload,
+                startup_abort: Some(startup_abort),
+                rendezvous,
+                launch_descriptor: Some(descriptor_directory),
+                components: components.clone(),
+            });
+        }
         let child = cmd.spawn().context("spawning python worker")?;
 
         Ok(Self {
@@ -529,10 +555,12 @@ impl PendingRank {
 
     /// Fails by name when the rank exited before reporting its endpoint.
     pub(crate) fn check_alive(&mut self) -> anyhow::Result<()> {
-        let child = self
-            .child
-            .as_mut()
-            .expect("an unadopted rank retains its process");
+        // A rank started by another host's launcher has no process here. Its
+        // liveness is its connection, as section 5.1 states, and its exit
+        // reaches the head as a report from the launcher that owns it.
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
         match child.try_wait() {
             Ok(None) => Ok(()),
             Ok(Some(status)) => Err(anyhow::anyhow!(
