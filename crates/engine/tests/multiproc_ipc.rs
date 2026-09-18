@@ -1543,21 +1543,27 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         Err(uniserve_engine::BatchSubmitError::Failed(_))
     ));
     executor.submit_batch(fast)?;
+    // This worker's component spans both ranks, so its ranks stay inside the
+    // same collective and hold one batch in flight. The blocked batch is at the
+    // head of the channel, so nothing behind it runs until its dependency is
+    // readable, and neither batch completes meanwhile.
+    assert!(executor.poll_batch(Duration::from_millis(50))?.is_none());
+    assert!(!publication.published.load(Ordering::Acquire));
+
+    // Waiting does not submit the slow batch again. Its original result becomes
+    // available once the external publisher makes the dependency readable, and
+    // the batch behind it follows in the order the channel delivered them.
+    publication.publish()?;
     let first = executor
         .poll_batch(Duration::from_secs(30))?
-        .ok_or_else(|| anyhow::anyhow!("fast submission did not complete"))?;
-    assert_eq!(first.batch_id, 2);
-    assert!(!publication.published.load(Ordering::Acquire));
+        .ok_or_else(|| anyhow::anyhow!("blocked submission did not complete"))?;
+    assert_eq!(first.batch_id, 1);
     assert_eq!(first.results[0].output.status, CallStatus::Ok);
 
-    // Waiting does not submit the slow batch again. Its original result remains
-    // available after the external publisher makes the dependency readable.
-    assert!(executor.poll_batch(Duration::from_millis(50))?.is_none());
-    publication.publish()?;
     let second = executor
         .poll_batch(Duration::from_secs(30))?
-        .ok_or_else(|| anyhow::anyhow!("slow submission did not complete"))?;
-    assert_eq!(second.batch_id, 1);
+        .ok_or_else(|| anyhow::anyhow!("following submission did not complete"))?;
+    assert_eq!(second.batch_id, 2);
     assert_eq!(second.results[0].output.status, CallStatus::Ok);
 
     let admission = text_admission(33, 1, 3)?;
@@ -2657,6 +2663,10 @@ fn placement_binds_ranks_to_the_engine_host_by_name() {
         "the placement shorthand must place ranks on the host it is given"
     );
 
+    // A rank placed on another host is started by that host's launcher, which
+    // connects to the head and presents the host it owns. No launcher presents
+    // here, so the launch fails naming the host whose ranks never started
+    // rather than waiting for them or starting them in the wrong place.
     let spawned = WorkerGroup::spawn(WorkerProcessArgs {
         python: worker_python(),
         model: String::new(),
@@ -2664,14 +2674,15 @@ fn placement_binds_ranks_to_the_engine_host_by_name() {
         ranks: WorkerConfig::model("compute-1", "cpu", WORLD_SIZE, 2).ranks,
         entries: named.entries.clone(),
         stub: true,
+        launcher_timeout: std::time::Duration::from_secs(2),
         ..WorkerProcessArgs::default()
     });
     let Err(error) = spawned else {
-        panic!("a rank placed on another host must not launch here");
+        panic!("a rank whose host never presented a launcher must not launch");
     };
     let message = format!("{error:#}");
     assert!(
-        message.contains("compute-1") && message.contains("compute-0"),
-        "the refusal must name the rank's host and the engine's host: {message}"
+        message.contains("compute-1"),
+        "the refusal must name the host whose launcher never presented: {message}"
     );
 }
