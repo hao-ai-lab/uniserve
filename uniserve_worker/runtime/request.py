@@ -21,7 +21,6 @@ from ..protocol.batch import (
 )
 from ..protocol.identity import ComputationId, RequestKey
 from ..protocol.operation import ImageParams, OpStatus, ScheduledRequest
-from ..protocol.tensor import TensorRef
 
 if TYPE_CHECKING:
     from ..execution.diffusion_state import ImageState, VideoState
@@ -37,7 +36,6 @@ class RequestProgress:
 
     logical_position: int = 0
     rng_counter: int = 0
-    latent_product: TensorRef | None = None
     flow_step: int = 0
     kv_visible_len: int = 0
     kv_computed_len: int = 0
@@ -72,8 +70,14 @@ class RequestState:
     finish_token_ids: tuple[int, ...]
     accepted_progress: RequestProgress
     accepted_op_id: ComputationId = ComputationId(0, 0)
+    # State one call produces and a later call reads, which the engine does not
+    # track: it lives with the request rather than in a call's stated
+    # coordinates. rng_counter is the request's sampling position and is not
+    # the wire's Rng.semantic_index_base, which the engine derives per call
+    # from the logical position, the scheduled span or the image identity.
+    prompt_logits_ready: bool = False
+    rng_counter: int = 0
     diffusion: ImageState | VideoState | None = None
-    tail: PendingOutput | None = None
     pending_operations: dict[ComputationId, PendingOutput] = field(
         default_factory=dict
     )
@@ -86,7 +90,7 @@ class RequestState:
 
 
 class RequestPool:
-    """Own request slots and publish accepted progress in predecessor order."""
+    """Own request slots and publish accepted progress as calls complete."""
 
     def __init__(
         self,
@@ -144,7 +148,6 @@ class RequestPool:
         for row in self._rows:
             if row is not None:
                 row.diffusion = None
-                row.tail = None
                 row.pending_operations.clear()
         self._rows.clear()
         self._slots_by_request.clear()
@@ -216,23 +219,7 @@ class RequestPool:
                 raise invalid_descriptor(
                     "request operation is already executing"
                 )
-            predecessor: PendingOutput | RequestProgress | None = None
-            if operation.predecessor is not None:
-                predecessor = request.tail or request.accepted_progress
-                if isinstance(predecessor, PendingOutput):
-                    if (
-                        not predecessor.successors_ready
-                        and predecessor.accepted_progress is None
-                    ):
-                        raise invalid_descriptor(
-                            "request predecessor acceptance is unresolved"
-                        )
-                # Runtime can receive an operation after its predecessor
-                # was retired; the admitted accepted snapshot is the
-                # stable base in that case.
-            outputs.append(
-                PendingOutput(operation, request, buffer, index, predecessor)
-            )
+            outputs.append(PendingOutput(operation, request, buffer, index))
         return tuple(outputs)
 
     def validate_pending(self, outputs: Sequence[PendingOutput]) -> None:
@@ -258,29 +245,17 @@ class RequestPool:
         and dependent operations.
         """
         self.validate_pending(outputs)
-        # Keep the verification acceptance boundary for the entire
-        # completion group.
-        continuation = all(output.draft_tokens is None for output in outputs)
         for output in outputs:
-            request = output.request
-            request.pending_operations[output.op_id] = output
-            output.successors_ready = continuation
-            if output.operation.predecessor is not None:
-                request.tail = output
+            output.request.pending_operations[output.op_id] = output
 
     def apply_outputs(self, outputs: Sequence[PendingOutput]) -> None:
-        """Apply actual acceptance in causal order; late outputs never replace.
+        """Apply actual acceptance; a late output never replaces newer state.
 
-        newer state.
+        Calls reach a rank in the order the engine dispatched them and execute
+        in that order, so acceptance applies in the order it arrives. A call
+        identity that does not advance the request's is ignored.
         """
-        from ..execution.output import PendingOutput
-
         for output in outputs:
-            # Acceptance applies in causal order: the predecessor first.
-            predecessor = output.predecessor
-            if isinstance(predecessor, PendingOutput):
-                self.apply_outputs((predecessor,))
-
             request = output.request
             if request.pending_operations.get(output.op_id) is not output:
                 continue
@@ -295,12 +270,15 @@ class RequestPool:
                 ):
                     request.accepted_progress = output.accepted_progress
                     request.accepted_op_id = output.op_id
+                    # The device state a call produced becomes visible to the
+                    # request's later calls only here, so a completion group
+                    # that fails never exposes a partial trajectory.
+                    request.prompt_logits_ready = (
+                        output.accepted_progress.prompt_logits_ready
+                    )
+                    request.rng_counter = output.accepted_progress.rng_counter
                 if output.value.status is OpStatus.ERROR:
                     request.closed = True
-                if request.tail is output:
-                    request.tail = None
-            output.predecessor = None
-            output.successors_ready = True
 
     def cancel_outputs(self, outputs: Sequence[PendingOutput]) -> None:
         """Close requests whose submitted numerical acceptance can no longer be.
@@ -311,9 +289,6 @@ class RequestPool:
             request = output.request
             request.pending_operations.pop(output.op_id, None)
             request.closed = True
-            if request.tail is output:
-                request.tail = None
-            output.predecessor = None
 
     def start(self, admission: NewRequest) -> int | None:
         """Bind an immutable admission to the exact scheduler-assigned slot."""
@@ -362,7 +337,6 @@ class RequestPool:
                 "request retirement requires closed, completed execution"
             )
         row.pending_operations.clear()
-        row.tail = None
         row.diffusion = None
         row.retired = True
 

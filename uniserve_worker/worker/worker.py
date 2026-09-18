@@ -1056,13 +1056,9 @@ class Worker:
         try:
             # CPU work is submitted by the Worker, never by a readiness query.
             for output in batch.outputs:
-                parent: object = output
-                while (
-                    isinstance(parent, PendingOutput) and parent.value is None
-                ):
-                    for task in parent.completion_tasks:
+                if isinstance(output, PendingOutput) and output.value is None:
+                    for task in output.completion_tasks:
                         task.submit_if_ready()
-                    parent = parent.predecessor
 
             for group, indexes in batch.output_groups.items():
                 if group in batch.completed_groups:

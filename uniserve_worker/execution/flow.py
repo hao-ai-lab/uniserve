@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -136,10 +135,7 @@ def prepare_latent(
         raise invalid_descriptor(
             "media preparation has no admitted image parameters"
         )
-    if (
-        operations.require_progress(request).latent_product is not None
-        or operations.require_progress(request).flow_step != 0
-    ):
+    if operations.require_progress(request).flow_step != 0:
         raise invalid_descriptor(
             "media preparation repeats an active latent trajectory"
         )
@@ -205,9 +201,6 @@ def prepare_latent(
     request.latent_expected_step = 0
     request.latent_generation = int(output.generation)
     request.latent_step = 0
-    request.projected_progress = replace(
-        operations.require_progress(request), latent_product=output
-    )
 
     products = publish_latent_transfer(
         operation,
@@ -293,10 +286,6 @@ def initialize(
         or latent_input == latent_output
     ):
         raise invalid_descriptor("flow latent generations are invalid")
-    if operations.require_progress(request).latent_product != latent_input:
-        raise invalid_descriptor(
-            "flow operation does not name the current latent generation"
-        )
 
     row = state.pending_output(
         completion_group, operation.request_key.request_id
@@ -536,9 +525,6 @@ def finish(
     request.latent_expected_step = start_step
     request.latent_generation = int(latent_output.generation)
     request.latent_step = final_step
-    request.projected_progress = replace(
-        operations.require_progress(request), latent_product=latent_output
-    )
 
     products = publish_latent_transfer(
         operation,

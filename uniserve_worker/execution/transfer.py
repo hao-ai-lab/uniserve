@@ -205,14 +205,6 @@ def _publish_current_latent(
     publication_transports: Mapping[str, Transport],
 ) -> TensorPublication:
     """Publish the committed trajectory's current latent pages as a product."""
-    request = state.pending_output(
-        completion_group, operation.request_key.request_id
-    )
-    if operations.require_progress(request).latent_product != reference:
-        raise invalid_descriptor(
-            "latent transfer does not name the committed trajectory"
-        )
-
     if product != operation.latent_output:
         raise invalid_descriptor(
             "product transfer changes the physical product kind"

@@ -27,7 +27,6 @@ from uniserve_worker.protocol.operation import Computation
 from ..foundation.errors import (
     WorkerError,
     WorkerErrorCode,
-    invalid_descriptor,
     resource_error,
 )
 from ..media.buffers import MediaLease
@@ -1091,39 +1090,6 @@ def decode_logprobs(
     return details
 
 
-def _assert_stated_coordinates(
-    operation: ScheduledRequest, progress: RequestProgress | None
-) -> None:
-    """Require the chained ledger to agree with the coordinates the call states.
-
-    The engine computes a call's coordinates from the request state it owns;
-    the rank still derives them from its own predecessor chain. They describe
-    the same submission, so a disagreement is a protocol failure and not a
-    condition the rank can execute through.
-
-    A call with no state predecessor carries no ledger to compare against.
-    """
-    if progress is None:
-        return
-    stated = operation.coordinates
-    if (
-        stated.logical_position == progress.logical_position
-        and stated.kv_visible_len == progress.kv_visible_len
-        and stated.kv_computed_len == progress.kv_computed_len
-        and stated.flow_step == progress.flow_step
-    ):
-        return
-    raise invalid_descriptor(
-        f"operation {operation.op_id} states coordinates "
-        f"(position {stated.logical_position}, visible "
-        f"{stated.kv_visible_len}, computed {stated.kv_computed_len}, "
-        f"step {stated.flow_step}) that disagree with the chained ledger "
-        f"(position {progress.logical_position}, visible "
-        f"{progress.kv_visible_len}, computed {progress.kv_computed_len}, "
-        f"step {progress.flow_step})"
-    )
-
-
 class PendingOutput:
     """One operation's stable predecessor, projected progress.
 
@@ -1140,19 +1106,21 @@ class PendingOutput:
         request: RequestState,
         buffer: OutputBuffer,
         row: int,
-        predecessor: PendingOutput | RequestProgress | None,
     ) -> None:
         self.operation = operation
         self.request = request
-        self.predecessor = predecessor
-        self.projected_progress: RequestProgress | None = (
-            predecessor.accepted_progress or predecessor.projected_progress
-            if isinstance(predecessor, PendingOutput)
-            else predecessor
+        # The call states the coordinates it runs at, so the rank reads them
+        # rather than deriving them from a predecessor's record. The device
+        # state a previous call left behind stays with the request.
+        self.projected_progress: RequestProgress = RequestProgress(
+            logical_position=operation.coordinates.logical_position,
+            rng_counter=request.rng_counter,
+            flow_step=operation.coordinates.flow_step,
+            kv_visible_len=operation.coordinates.kv_visible_len,
+            kv_computed_len=operation.coordinates.kv_computed_len,
+            prompt_logits_ready=request.prompt_logits_ready,
         )
-        _assert_stated_coordinates(operation, self.projected_progress)
         self.accepted_progress: RequestProgress | None = None
-        self.successors_ready: bool = False
 
         self.status = OpStatus.OK
         self.committed_tokens: tuple[int, ...] = ()
@@ -1288,9 +1256,6 @@ class PendingOutput:
         """Query host output readiness without changing request acceptance."""
         if self.value is not None:
             return True
-        parent = self.predecessor
-        if isinstance(parent, PendingOutput) and not parent.ready():
-            return False
         if self._buffer is None or not self._buffer.ready():
             return False
         for task in self.completion_tasks:
@@ -1301,18 +1266,14 @@ class PendingOutput:
     def materialize(self) -> RequestOutput:
         """Resolve output fields once.
 
-        using the stable predecessor's actual acceptance.
+        A call that did not run keeps the request's committed coordinates, so
+        its completion reports where the request still stands.
         """
         if self.value is not None:
             return self.value
         if not self.ready():
             raise RuntimeError("completion was resolved before query-ready")
-        parent = self.predecessor
-        if isinstance(parent, PendingOutput):
-            parent.materialize()
-            accepted_parent = parent.accepted_progress
-        else:
-            accepted_parent = parent
+        accepted_parent = self.request.accepted_progress
 
         status = self.status
         error_code = self.error_code

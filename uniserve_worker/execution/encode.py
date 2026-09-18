@@ -256,12 +256,9 @@ def materialization_latent(
         raise invalid_descriptor(
             "latent materialization requires a latent input"
         )
-    if (
-        int(latent_input.generation) < 1
-        or operations.require_progress(request).latent_product != latent_input
-    ):
+    if int(latent_input.generation) < 1:
         raise invalid_descriptor(
-            "materialization does not name the current latent generation"
+            "materialization does not name a live latent generation"
         )
     image_params = request.request.image
     if image_params is None:
@@ -355,9 +352,6 @@ def publish_image(
         completion_group,
         max_bytes=int(operation.bounds.max_completion_bytes),
         state=state,
-    )
-    request.projected_progress = replace(
-        operations.require_progress(request), latent_product=None
     )
     request.projected_progress = replace(
         operations.require_progress(request), flow_step=0
