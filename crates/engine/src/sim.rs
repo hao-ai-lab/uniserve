@@ -23,9 +23,8 @@ use uniserve_core::{
     try_apply_sampling_counts,
 };
 use uniserve_worker_ipc::{
-    BatchOutput, CallKind, DrawLayout, ErrorCode, FinishFlags, NewRequest, CallStatus,
-    RegistrationAck, RequestOutput, SamplingState, Call, TensorRef, TimingCounters,
-    WorkerInfo,
+    BatchOutput, Call, CallKind, CallStatus, DrawLayout, ErrorCode, FinishFlags, NewRequest,
+    RegistrationAck, RequestOutput, SamplingState, TensorRef, TimingCounters, WorkerInfo,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -517,10 +516,7 @@ impl SimEngine {
             request_key: call.request_key,
             call_id: call.call_id,
             status: CallStatus::Ok,
-            product_generations: call
-                .tensor_outputs()
-                .map(|out| out.generation)
-                .collect(),
+            product_generations: call.tensor_outputs().map(|out| out.generation).collect(),
             error_code: None,
             timing_counters: TimingCounters::default(),
             code: call.code,
@@ -613,9 +609,7 @@ impl SimEngine {
                     record.position = 1;
                     if !visual_state {
                         let query_tokens = match work {
-                            CallKind::Forward(ForwardMode::Prefill) => {
-                                call.bounds.max_tokens
-                            }
+                            CallKind::Forward(ForwardMode::Prefill) => call.bounds.max_tokens,
                             CallKind::Forward(ForwardMode::Decode)
                             | CallKind::Forward(ForwardMode::Verify) => 1,
                             _ => unreachable!(),
@@ -726,10 +720,7 @@ impl SimEngine {
     }
 
     /// Builds a completion for an call resolved entirely by its execution predicate.
-    fn predicated_completion(
-        call: &Call,
-        request: &SimRequestState,
-    ) -> RequestOutput {
+    fn predicated_completion(call: &Call, request: &SimRequestState) -> RequestOutput {
         RequestOutput {
             sampled_logprob: None,
             top_logprobs: Vec::new(),
@@ -915,10 +906,7 @@ impl SimEngine {
                 .requests
                 .get_mut(&call.request_key.request_id)
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "request {} has no admission",
-                        call.request_key.request_id.0
-                    )
+                    anyhow::anyhow!("request {} has no admission", call.request_key.request_id.0)
                 })?;
             anyhow::ensure!(
                 call.request_key == request.admission.request_key,
@@ -963,8 +951,7 @@ impl SimEngine {
                 }
             }
 
-            let completion =
-                Self::execute_call(vocab, text_len, fake_eos, &call, request)?;
+            let completion = Self::execute_call(vocab, text_len, fake_eos, &call, request)?;
             completions.push(completion);
         }
         let report = BatchOutput {
@@ -998,8 +985,7 @@ impl SimEngine {
 mod tests {
     use super::*;
     use uniserve_worker_ipc::{
-        ArRequestParams, Bounds, CallId, DType, ForwardBatch, RequestKey, ShapeBound,
-        TensorRef,
+        ArRequestParams, Bounds, CallId, DType, ForwardBatch, RequestKey, ShapeBound, TensorRef,
     };
 
     fn request_key() -> RequestKey {

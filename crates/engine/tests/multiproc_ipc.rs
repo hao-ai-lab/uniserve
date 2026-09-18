@@ -23,10 +23,9 @@ use uniserve_engine::{
     EngineConfig, EngineCore, Executor, WorkerConfig, WorkerFailure, WorkerGroup, WorkerProcessArgs,
 };
 use uniserve_worker_ipc::{
-    ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, CachePageAllocation, CallKind,
-    CallId, DType, DimBound, ErrorCode, ForwardBatch, Locator, NewRequest, CallStatus,
-    RequestKey, Call, ShapeBound, TensorPublication, TensorRef, TransferHandle,
-    TransferTransport,
+    ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, CachePageAllocation, Call, CallId,
+    CallKind, CallStatus, DType, DimBound, ErrorCode, ForwardBatch, Locator, NewRequest,
+    RequestKey, ShapeBound, TensorPublication, TensorRef, TransferHandle, TransferTransport,
 };
 
 const WORLD_SIZE: usize = 2;
@@ -117,9 +116,7 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
     assert!(terminal, "independent entry work did not retire");
     assert_eq!(
         completed,
-        [CallId::new(2, 0), CallId::new(2, 1)]
-            .into_iter()
-            .collect()
+        [CallId::new(2, 0), CallId::new(2, 1)].into_iter().collect()
     );
 
     // Closing a request releases every participating rank's physical storage.
@@ -281,7 +278,10 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                 .context("Close did not drain accepted work")?
                 .decode_response()?;
             anyhow::ensure!(
-                closed == WorkerResponse::Ok { message_id: Some(5) },
+                closed
+                    == WorkerResponse::Ok {
+                        message_id: Some(5)
+                    },
                 "Close failed: {closed:?}"
             );
 
@@ -509,16 +509,9 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
         }
         assert_eq!(
             completions.keys().copied().collect::<Vec<_>>(),
-            vec![
-                CallId::new(1, 0),
-                CallId::new(1, 1),
-                CallId::new(1, 2),
-            ]
+            vec![CallId::new(1, 0), CallId::new(1, 1), CallId::new(1, 2),]
         );
-        assert_eq!(
-            completions[&CallId::new(1, 0)].committed_tokens,
-            vec![1000]
-        );
+        assert_eq!(completions[&CallId::new(1, 0)].committed_tokens, vec![1000]);
 
         executor.close()?;
     }
@@ -634,7 +627,11 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         let result = poll_logical(&mut executor)?.context("device successor did not complete")?;
         for result in result.results {
             assert_eq!(result.output.status, CallStatus::Ok);
-            assert!(outputs.insert(result.output.call_id, result.output).is_none());
+            assert!(
+                outputs
+                    .insert(result.output.call_id, result.output)
+                    .is_none()
+            );
         }
     }
     assert_eq!(
@@ -890,12 +887,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
 fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    for case in [
-        "retained",
-        "unknown-call",
-        "rank-output",
-        "short-storage",
-    ] {
+    for case in ["retained", "unknown-call", "rank-output", "short-storage"] {
         let directory = tempfile::tempdir()?;
         let wrapper = directory.path().join("worker");
         let name_path = directory.path().join("media-name");
@@ -2405,7 +2397,9 @@ fn token_batch(
         request_key,
         producer_call_id: call_id,
         output_index: 0,
-        generation: (call_id.batch_id as u32).saturating_mul(4).saturating_add(1),
+        generation: (call_id.batch_id as u32)
+            .saturating_mul(4)
+            .saturating_add(1),
         dtype: DType::I64,
         shape_bound: ShapeBound::default(),
     };
