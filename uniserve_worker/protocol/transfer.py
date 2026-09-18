@@ -14,6 +14,12 @@ from .validation import _bytes, _int, _ints, _map, _seq, _str, _uint, _uints
 
 MAX_TRANSFER_HANDLE_BYTES = 64 * 1024
 
+#: Bytes of a CUDA process descriptor handle, which names an allocation only
+#: within the host that exported it.
+DESCRIPTOR_HANDLE_BYTES = 4
+#: Bytes of a CUDA fabric handle, which another host can import.
+FABRIC_HANDLE_BYTES = 64
+
 
 @dataclass(frozen=True, slots=True)
 class WorkerEndpoint:
@@ -181,7 +187,8 @@ class CudaVmmTransfer:
             or len(self.ready_event_handle) not in (0, 64)
             # A fabric handle is 64 bytes and a process descriptor is 4; any
             # other length is not a handle this rank can import.
-            or len(self.allocation_handle) not in (4, 64)
+            or len(self.allocation_handle)
+            not in (DESCRIPTOR_HANDLE_BYTES, FABRIC_HANDLE_BYTES)
         ):
             raise invalid_descriptor("CUDA VMM transfer handle is incomplete")
 
