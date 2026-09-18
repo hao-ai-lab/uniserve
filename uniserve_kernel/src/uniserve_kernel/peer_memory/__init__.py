@@ -65,27 +65,32 @@ def empty(
     return storage[:elements].view(shape)
 
 
-def export_fd(tensor: torch.Tensor) -> tuple[int, int, int] | None:
-    """Export shared storage as an owned descriptor, byte capacity and offset.
+def export_handle(tensor: torch.Tensor) -> tuple[bytes, int, int] | None:
+    """Export shared storage as a shareable handle, byte capacity and offset.
+
+    The handle is the device's probed type: a fabric handle where the driver
+    exports one, which another host inside the fabric domain can import, and a
+    process descriptor otherwise. Both travel as bytes so one publication
+    shape carries either.
 
     Return None for storage without exportable physical backing. The caller
-    closes the descriptor and retains the source through every reader grant.
-    Other CUDA failures are raised.
+    retains the source through every reader grant. Other CUDA failures are
+    raised.
     """
-    return _extension().export_fd(tensor)
+    return _extension().export_handle(tensor)
 
 
-def import_fd(
-    prototype: torch.Tensor, descriptor: int, allocation_bytes: int
+def import_handle(
+    prototype: torch.Tensor, exported: bytes, allocation_bytes: int
 ) -> torch.Tensor:
     """Map a granted allocation on the prototype device as a flat typed tensor.
 
-    The descriptor remains caller-owned and may be closed after this call. The
-    returned tensor retains the imported physical handle. Retain its mapping
-    until all device reads complete, then release it before acknowledging the
-    source grant. This primitive does not synchronize consumer streams.
+    The returned tensor retains the imported physical handle. Retain its
+    mapping until all device reads complete, then release it before
+    acknowledging the source grant. This primitive does not synchronize
+    consumer streams.
     """
-    return _extension().import_fd(prototype, descriptor, allocation_bytes)
+    return _extension().import_handle(prototype, exported, allocation_bytes)
 
 
 def copy_host_device(
