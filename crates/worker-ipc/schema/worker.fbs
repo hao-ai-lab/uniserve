@@ -26,7 +26,7 @@ enum ErrorCode : ubyte {
 
 enum DrawLayout : ubyte { TargetSampling, SpeculativeProposal, FlowNoise }
 
-enum ReqKind : ubyte { Info, Submit, Poll, Close }
+enum ReqKind : ubyte { Info, Submit, Close }
 
 enum RespKind : ubyte { Info, Result, Ok, Error }
 enum KvGroupKind : ubyte { Full, SlidingWindow }
@@ -383,10 +383,9 @@ table NewRequest {
   prompt_token_ids:[uint];
 }
 
-table ScheduleBatch {
+table Batch {
+  // Strictly increasing in each worker's Submit order.
   batch_id:ulong;
-  // Strictly increasing in Submit order for this worker, independent of batch_id.
-  run_id:ulong;
   collective_seq:ulong;
   operations:[ScheduledRequest];
   block_tables:[BlockTable];
@@ -479,14 +478,11 @@ table TensorPublication {
 
 table BatchOutput {
   batch_id:ulong;
-  run_id:ulong;
   completions:[RequestOutput];
   products:[TensorPublication];
   registration:RegistrationAck;
   worker_exec_us:ulong = null;
   forward_stats:ForwardStats;
-  // Free/Finish acknowledgement follows operation fragments as an empty terminal result.
-  done:bool;
 }
 
 table ForwardStats {
@@ -525,8 +521,7 @@ table ForwardStats {
 table WorkerRequest {
   kind:ReqKind;
   call_id:ulong = null;
-  run:ScheduleBatch;
-  poll_run_id:ulong = null;
+  batch:Batch;
 }
 
 table ErrorOperationIdentity {

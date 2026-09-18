@@ -207,7 +207,7 @@ struct Collected {
 
 /// Runs the given (constraint, count) requests through a fresh scheduler at `depth`,
 /// returning per-request collected counts.
-fn run_requests(
+fn batch_requests(
     depth: u32,
     policy: SchedulingPolicy,
     cases: &[(GenerationConstraint, usize)],
@@ -275,7 +275,7 @@ fn run_requests(
 
 #[test]
 fn text_and_image_requests_complete() {
-    let out = run_requests(
+    let out = batch_requests(
         2,
         SchedulingPolicy::Fcfs,
         &[
@@ -450,12 +450,12 @@ fn scheduler_clamps_max_batch_to_worker_info() {
 /// the same prompts produce the same per-request token counts at depth 1 and 2.
 #[test]
 fn queue_depth_is_token_identical() {
-    let d1 = run_requests(
+    let d1 = batch_requests(
         1,
         SchedulingPolicy::Fcfs,
         &[(GenerationConstraint::UndOnly, 4)],
     );
-    let d2 = run_requests(
+    let d2 = batch_requests(
         2,
         SchedulingPolicy::Fcfs,
         &[(GenerationConstraint::UndOnly, 4)],
@@ -520,7 +520,7 @@ fn operation_window_metrics_record_the_full_lifecycle() {
             domain.launched_operations.load(Ordering::Relaxed),
             domain.reclaimed_credits.load(Ordering::Relaxed)
         );
-        assert!(domain.completed_runs.load(Ordering::Relaxed) > 0);
+        assert!(domain.completed_batches.load(Ordering::Relaxed) > 0);
     }
     let mut reporter = uniserve_engine::SchedulerStatsReporter::default();
     let snapshot = reporter.snapshot(&scheduler.stats, 16);
@@ -1999,7 +1999,7 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
 
 #[test]
 fn fcfs_policy_completes_text() {
-    let out = run_requests(
+    let out = batch_requests(
         2,
         SchedulingPolicy::Fcfs,
         &[(GenerationConstraint::UndOnly, 3)],

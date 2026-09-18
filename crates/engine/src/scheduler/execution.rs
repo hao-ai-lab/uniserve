@@ -949,15 +949,19 @@ impl Scheduler {
                 .or_default()
                 .push(BatchCommand::Start { request });
         }
-        let last = *stage_order.last().expect("selected calls name a stage");
-        let mut batches = Vec::with_capacity(stage_order.len());
+        let mut batches = Vec::with_capacity(stage_order.len() + 1);
         for stage in stage_order {
             let (batch_id, operations) = stage_batches.remove(&stage).expect("stage batch exists");
-            let mut batch_commands = starts.remove(&stage).unwrap_or_default();
-            if stage == last {
-                batch_commands.extend(commands.iter().cloned());
-            }
+            let batch_commands = starts.remove(&stage).unwrap_or_default();
             let batch = ExecutionBatch::new(batch_id, operations, batch_commands, Vec::new());
+            self.register_pending_batch(&batch, submit_at);
+            batches.push(batch);
+        }
+        // Retirement is its own batch, submitted after the calls of this pass.
+        // Its result is the retirement acknowledgement, so no call's result
+        // waits for storage the round no longer needs.
+        if !commands.is_empty() {
+            let batch = ExecutionBatch::new(self.next_batch_id(), Vec::new(), commands, Vec::new());
             self.register_pending_batch(&batch, submit_at);
             batches.push(batch);
         }
@@ -1635,8 +1639,8 @@ impl Scheduler {
     }
 
     /// Accumulates timing once per public metric group in a returned batch.
-    fn record_domain_run(stats: &super::stats::DomainStats, timing: TimingCounters) {
-        stats.completed_runs.fetch_add(1, Ordering::Relaxed);
+    fn record_domain_batch(stats: &super::stats::DomainStats, timing: TimingCounters) {
+        stats.completed_batches.fetch_add(1, Ordering::Relaxed);
         stats
             .launch_us
             .fetch_add(timing.queued_us, Ordering::Relaxed);
@@ -2083,7 +2087,7 @@ impl Scheduler {
         let forward_stats = report.forward_stats;
         let completion_count = report.results.len();
         let trace_enabled = self.trace_enabled();
-        let mut domain_run_trace = trace_enabled.then(Vec::new);
+        let mut domain_trace = trace_enabled.then(Vec::new);
         for result in &report.results {
             let record = &result.output;
             if let Some(computation) = self
@@ -2104,17 +2108,15 @@ impl Scheduler {
                 continue;
             };
             let (label, stats) = self.stats.domains.groups()[index];
-            Self::record_domain_run(stats, timing);
-            if let Some(trace) = domain_run_trace.as_mut() {
+            Self::record_domain_batch(stats, timing);
+            if let Some(trace) = domain_trace.as_mut() {
                 trace.push(json!({
                     "result_group": index as u32 + 1,
                     "domain": label,
                     "operations": operation_count,
-                    "execution": "domain_homogeneous",
                     "queue_us": timing.queued_us,
                     "device_us": timing.device_us,
                     "completion_us": timing.copy_us.saturating_add(timing.host_us),
-                    "co_resident_us": 0,
                 }));
             }
         }
@@ -2553,7 +2555,7 @@ impl Scheduler {
                 "worker_exec_us": worker_us,
                 "host_roundtrip_us": batch_roundtrip_us,
                 "batch_complete": batch_complete,
-                "domains": domain_run_trace,
+                "domains": domain_trace,
                 "forward_stats": forward_stats_trace,
                 "batch_size": resolved_ops.len(),
                 "ops": resolved_ops,

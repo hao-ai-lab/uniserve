@@ -18,7 +18,7 @@ from tests.python.fixtures.depth_one import (
     diffusion_prepare_operation,
     diffusion_step_operation,
     encode_operation,
-    execution_run,
+    execution_batch,
     finalized_report,
     kv_publication_operation,
     record_completion,
@@ -92,7 +92,11 @@ class _MisalignedOutputModel(Model):
 
 
 def _publish_conditioning(
-    worker: object, admission: NewRequest, *, op_id: ComputationId, run_id: int
+    worker: object,
+    admission: NewRequest,
+    *,
+    op_id: ComputationId,
+    batch_id: int,
 ):
     publication, product = kv_publication_operation(
         admission.request_key,
@@ -102,8 +106,8 @@ def _publish_conditioning(
     finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=run_id,
+            execution_batch(
+                batch_id=batch_id,
                 admissions=(admission,),
                 operations=(publication,),
             )
@@ -119,7 +123,7 @@ def _prepare_media(
     *,
     op_id: ComputationId,
     predecessor: object,
-    run_id: int,
+    batch_id: int,
     seed: int = 29,
     image_index: int = 1,
 ):
@@ -132,7 +136,7 @@ def _prepare_media(
         image_index=image_index,
     )
     report = worker.submit(
-        execution_run(run_id=run_id, operations=(preparation,))
+        execution_batch(batch_id=batch_id, operations=(preparation,))
     )
     report = finalized_report(worker, report)
     assert report.completions[0].status is OpStatus.OK
@@ -144,7 +148,7 @@ def _prepare_decode(
     admission: NewRequest,
     *,
     op_id: ComputationId,
-    run_id: int,
+    batch_id: int,
     tokens: tuple[int, ...],
 ):
     prefill = token_operation(
@@ -155,8 +159,8 @@ def _prepare_decode(
         tokens=tokens,
     )
     report = worker.submit(
-        execution_run(
-            run_id=run_id,
+        execution_batch(
+            batch_id=batch_id,
             admissions=(admission,),
             operations=(prefill,),
         )
@@ -198,7 +202,7 @@ def _finalized_artifact(
     observation: RequestOutput,
     *,
     op_id: ComputationId,
-    run_id: int,
+    batch_id: int,
 ) -> bytes:
     operation = diffusion_finalize_operation(
         admission.request_key,
@@ -207,7 +211,7 @@ def _finalized_artifact(
         latent=latent,
     )
     report = worker.submit(
-        execution_run(run_id=run_id, operations=(operation,), commands=())
+        execution_batch(batch_id=batch_id, operations=(operation,), commands=())
     )
     report = finalized_report(worker, report)
     assert report.completions[0].status is OpStatus.OK
@@ -227,8 +231,8 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
     extended = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(extend,),
             )
@@ -251,8 +255,8 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
     decoded = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=2,
+            execution_batch(
+                batch_id=2,
                 admissions=(),
                 operations=(decode,),
                 commands=(),
@@ -281,8 +285,8 @@ def test_prefix_reuse_continues_from_the_admitted_logical_position():
     report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(extend,),
             )
@@ -307,8 +311,8 @@ def test_text_extension_rejects_missing_input_tokens() -> None:
     report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1, admissions=(admission,), operations=(operation,)
+            execution_batch(
+                batch_id=1, admissions=(admission,), operations=(operation,)
             )
         ),
     )
@@ -329,8 +333,8 @@ def test_invalid_physical_allocation_reports_error_behind_an_unobserved_parent()
         tokens=(3, 4),
     )
     worker.submit(
-        execution_run(
-            run_id=1,
+        execution_batch(
+            batch_id=1,
             admissions=(admission,),
             operations=(predecessor,),
         )
@@ -355,8 +359,8 @@ def test_invalid_physical_allocation_reports_error_behind_an_unobserved_parent()
     report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=2,
+            execution_batch(
+                batch_id=2,
                 operations=(operation,),
                 block_tables=(invalid_table,),
             )
@@ -378,8 +382,8 @@ def test_decode_reuses_the_published_request_page_table() -> None:
         tokens=(3, 4),
     )
     worker.submit(
-        execution_run(
-            run_id=1,
+        execution_batch(
+            batch_id=1,
             admissions=(admission,),
             operations=(predecessor,),
         )
@@ -397,8 +401,8 @@ def test_decode_reuses_the_published_request_page_table() -> None:
     report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=2,
+            execution_batch(
+                batch_id=2,
                 operations=(operation,),
             )
         ),
@@ -426,9 +430,17 @@ def test_decode_reuses_the_published_request_page_table() -> None:
         ),
     ],
 )
-def test_independent_token_and_flow_match_homogeneous_results(
+def test_lane_and_graph_binding_preserve_token_and_flow_results(
     device, binding, graphs, steps, generation_device
 ):
+    """Lanes carry a token call and a flow call without changing either.
+
+    Each numerical domain travels in its own homogeneous batch; lanes give
+    the two calls their coexistence on one rank. Binding those lanes,
+    capturing graphs, or placing generation on a second device must leave
+    both calls' committed results and the artifact bit-identical to a
+    worker that runs them under the default execution policy.
+    """
     lanes = {
         "default": (),
         "shared": (LaneConfig("compute", 152, COMPUTATIONS),),
@@ -455,152 +467,82 @@ def test_independent_token_and_flow_match_homogeneous_results(
         flow_graph_shapes=((16, 16),),
         lanes=lanes,
     )
-    with (
-        execution_worker(device=device, execution=policy) as mixed,
-        execution_worker(device=device) as split,
-    ):
-        # Each numerical domain uses its own call while sharing request storage.
-        sequence_admission = ar_params(1, block_ids=(0,))
-        flow_admission = umm_params(
-            2, ImageParams(steps=steps, height=16, width=16, seed=29)
+    sequence_admission = ar_params(1, block_ids=(0,))
+    flow_admission = umm_params(
+        2, ImageParams(steps=steps, height=16, width=16, seed=29)
+    )
+
+    def run_both_domains(worker):
+        """Run one token call and one flow call as separate batches."""
+        conditioning = _publish_conditioning(
+            worker, flow_admission, op_id=ComputationId(10, 0), batch_id=1
         )
-        mixed_conditioning = _publish_conditioning(
-            mixed, flow_admission, op_id=ComputationId(10, 0), run_id=1
-        )
-        mixed_latent, mixed_preparation_observation = _prepare_media(
-            mixed,
+        latent, preparation_observation = _prepare_media(
+            worker,
             flow_admission,
-            mixed_conditioning,
+            conditioning,
             op_id=ComputationId(11, 0),
             predecessor=root_parent(flow_admission),
-            run_id=2,
+            batch_id=2,
         )
-        flow, mixed_output_latent = diffusion_step_operation(
-            flow_admission.request_key,
-            op_id=ComputationId(12, 1),
-            predecessor=mixed_preparation_observation.op_id,
-            conditioning=mixed_conditioning,
-            latent=mixed_latent,
-            steps=steps,
-        )
-        sequence, sequence_control = _prepare_decode(
-            mixed,
+        sequence, _sequence_control = _prepare_decode(
+            worker,
             sequence_admission,
-            op_id=ComputationId(11, 0),
-            run_id=3,
-            tokens=(3, 4),
-        )
-
-        combined = execution_run(
-            run_id=4,
-            admissions=(),
-            operations=(sequence, flow),
-            commands=(),
-        )
-        mixed_result = finalized_report(mixed, mixed.submit(combined))
-
-        split_conditioning = _publish_conditioning(
-            split, flow_admission, op_id=ComputationId(10, 0), run_id=1
-        )
-        split_latent, split_preparation_observation = _prepare_media(
-            split,
-            flow_admission,
-            split_conditioning,
-            op_id=ComputationId(11, 0),
-            predecessor=root_parent(flow_admission),
-            run_id=2,
-        )
-        split_flow, split_output_latent = diffusion_step_operation(
-            flow_admission.request_key,
-            op_id=ComputationId(12, 1),
-            predecessor=split_preparation_observation.op_id,
-            conditioning=split_conditioning,
-            latent=split_latent,
-            steps=steps,
-        )
-        split_sequence, split_sequence_control = _prepare_decode(
-            split,
-            sequence_admission,
-            op_id=ComputationId(11, 0),
-            run_id=3,
+            op_id=ComputationId(12, 0),
+            batch_id=3,
             tokens=(3, 4),
         )
         sequence_result = finalized_report(
-            split,
-            split.submit(
-                execution_run(
-                    run_id=4,
-                    admissions=(),
-                    operations=(split_sequence,),
-                    commands=(),
-                )
-            ),
+            worker,
+            worker.submit(execution_batch(batch_id=13, operations=(sequence,))),
+        )
+        flow, output_latent = diffusion_step_operation(
+            flow_admission.request_key,
+            op_id=ComputationId(14, 0),
+            predecessor=preparation_observation.op_id,
+            conditioning=conditioning,
+            latent=latent,
+            steps=steps,
         )
         flow_result = finalized_report(
-            split,
-            split.submit(
-                execution_run(
-                    run_id=5,
-                    admissions=(),
-                    operations=(split_flow,),
-                    commands=(),
-                )
-            ),
+            worker,
+            worker.submit(execution_batch(batch_id=14, operations=(flow,))),
         )
+        artifact = _finalized_artifact(
+            worker,
+            flow_admission,
+            output_latent,
+            record_completion(flow, flow_result),
+            op_id=ComputationId(15, 0),
+            batch_id=15,
+        )
+        return sequence_result, flow_result, artifact
 
-        assert (
-            mixed_result.completions[0].committed_tokens
-            == sequence_result.completions[0].committed_tokens
-        )
-        assert (
-            mixed_result.completions[0].position
-            == sequence_result.completions[0].position
-        )
-        assert (
-            mixed_result.completions[0].kv_visible_len
-            == sequence_result.completions[0].kv_visible_len
-        )
-        assert (
-            mixed_result.completions[0].kv_computed_len
-            == sequence_result.completions[0].kv_computed_len
-        )
-        assert (
-            mixed_result.completions[0].num_completed_steps
-            == sequence_result.completions[0].num_completed_steps
-        )
-        assert (
-            mixed_result.completions[1].position
-            == flow_result.completions[0].position
-        )
-        assert (
-            mixed_result.completions[1].kv_visible_len
-            == flow_result.completions[0].kv_visible_len
-        )
-        assert (
-            mixed_result.completions[1].kv_computed_len
-            == flow_result.completions[0].kv_computed_len
-        )
-        assert (
-            mixed_result.completions[1].num_completed_steps
-            == flow_result.completions[0].num_completed_steps
-        )
-        mixed_flow_observation = record_completion(flow, mixed_result)
-        split_flow_observation = record_completion(split_flow, flow_result)
-        assert _finalized_artifact(
-            mixed,
-            flow_admission,
-            mixed_output_latent,
-            mixed_flow_observation,
-            op_id=ComputationId(13, 0),
-            run_id=5,
-        ) == _finalized_artifact(
-            split,
-            flow_admission,
-            split_output_latent,
-            split_flow_observation,
-            op_id=ComputationId(13, 0),
-            run_id=6,
-        )
+    with (
+        execution_worker(device=device, execution=policy) as bound,
+        execution_worker(device=device) as plain,
+    ):
+        bound_sequence, bound_flow, bound_artifact = run_both_domains(bound)
+        plain_sequence, plain_flow, plain_artifact = run_both_domains(plain)
+
+    token = bound_sequence.completions[0]
+    reference_token = plain_sequence.completions[0]
+    assert token.committed_tokens == reference_token.committed_tokens
+    assert token.position == reference_token.position
+    assert token.kv_visible_len == reference_token.kv_visible_len
+    assert token.kv_computed_len == reference_token.kv_computed_len
+    assert token.num_completed_steps == reference_token.num_completed_steps
+
+    flow_completion = bound_flow.completions[0]
+    reference_flow = plain_flow.completions[0]
+    assert flow_completion.position == reference_flow.position
+    assert flow_completion.kv_visible_len == reference_flow.kv_visible_len
+    assert flow_completion.kv_computed_len == reference_flow.kv_computed_len
+    assert (
+        flow_completion.num_completed_steps
+        == reference_flow.num_completed_steps
+    )
+    assert bound_artifact == plain_artifact
 
 
 def test_next_image_can_start_before_the_previous_artifact_is_observed() -> (
@@ -612,7 +554,7 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> (
     )
     try:
         conditioning = _publish_conditioning(
-            worker, admission, op_id=ComputationId(1, 0), run_id=1
+            worker, admission, op_id=ComputationId(1, 0), batch_id=1
         )
         initial, prepared = _prepare_media(
             worker,
@@ -620,7 +562,7 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> (
             conditioning,
             op_id=ComputationId(2, 0),
             predecessor=root_parent(admission),
-            run_id=2,
+            batch_id=2,
         )
         step, latent = diffusion_step_operation(
             admission.request_key,
@@ -631,7 +573,7 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> (
             steps=1,
         )
         stepped = worker.submit(
-            execution_run(run_id=3, operations=(step,), commands=())
+            execution_batch(batch_id=3, operations=(step,), commands=())
         )
         stepped = finalized_report(worker, stepped)
         accepted = record_completion(step, stepped)
@@ -642,7 +584,7 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> (
             latent=latent,
         )
         first_image = worker.submit(
-            execution_run(run_id=4, operations=(finalize,), commands=())
+            execution_batch(batch_id=4, operations=(finalize,), commands=())
         )
         initial, prepared = _prepare_media(
             worker,
@@ -650,7 +592,7 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> (
             conditioning,
             op_id=ComputationId(5, 0),
             predecessor=accepted.op_id,
-            run_id=5,
+            batch_id=5,
             image_index=2,
         )
         # Reading an earlier artifact must not restore its retired trajectory.
@@ -671,7 +613,7 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> (
             steps=1,
         )
         stepped = worker.submit(
-            execution_run(run_id=6, operations=(step,), commands=())
+            execution_batch(batch_id=6, operations=(step,), commands=())
         )
         stepped = finalized_report(worker, stepped)
         second_png = _finalized_artifact(
@@ -680,7 +622,7 @@ def test_next_image_can_start_before_the_previous_artifact_is_observed() -> (
             latent,
             record_completion(step, stepped),
             op_id=ComputationId(7, 0),
-            run_id=7,
+            batch_id=7,
         )
         with Image.open(
             io.BytesIO(base64.b64decode(second_png, validate=True))
@@ -708,8 +650,8 @@ def test_computation_identity_preserves_homogeneous_decode():
 
         last_tokens.append(tokens[-1])
     prefilled = worker.submit(
-        execution_run(
-            run_id=1,
+        execution_batch(
+            batch_id=1,
             admissions=admissions,
             operations=tuple(prefill_ops),
         )
@@ -731,8 +673,8 @@ def test_computation_identity_preserves_homogeneous_decode():
     decoded = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=2,
+            execution_batch(
+                batch_id=2,
                 admissions=(),
                 operations=tuple(decode_ops),
                 commands=(),
@@ -774,8 +716,8 @@ def test_failed_lane_keeps_kv_pages_until_submitted_device_work_finishes() -> (
         initial_report = finalized_report(
             worker,
             worker.submit(
-                execution_run(
-                    run_id=11,
+                execution_batch(
+                    batch_id=11,
                     admissions=(admission,),
                     operations=(initial,),
                 )
@@ -792,8 +734,8 @@ def test_failed_lane_keeps_kv_pages_until_submitted_device_work_finishes() -> (
         model.misaligned = True
         model.failure_delay_cycles = 1_000_000_000
         failed = worker.submit(
-            execution_run(
-                run_id=12,
+            execution_batch(
+                batch_id=12,
                 commands=(),
                 operations=(retry,),
             )
@@ -830,8 +772,8 @@ def test_output_validation_failure_discards_all_candidate_state():
         tokens=(12, 13),
     )
     initial_report = worker.submit(
-        execution_run(
-            run_id=11,
+        execution_batch(
+            batch_id=11,
             admissions=(admission,),
             operations=(initial,),
         )
@@ -846,8 +788,8 @@ def test_output_validation_failure_discards_all_candidate_state():
         mode=ForwardMode.DECODE,
         tokens=(expected_successor(13),),
     )
-    retry_batch = execution_run(
-        run_id=13, admissions=(), operations=(retry,), input_products=()
+    retry_batch = execution_batch(
+        batch_id=13, admissions=(), operations=(retry,), input_products=()
     )
     model.misaligned = True
     failed = worker.submit(retry_batch)
@@ -867,8 +809,8 @@ def test_output_validation_failure_discards_all_candidate_state():
     result = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=14,
+            execution_batch(
+                batch_id=14,
                 operations=(replacement,),
             )
         ),
@@ -885,7 +827,7 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         5, ImageParams(steps=2, height=64, width=64, seed=29)
     )
     conditioning = _publish_conditioning(
-        worker, admission, op_id=ComputationId(40, 0), run_id=12
+        worker, admission, op_id=ComputationId(40, 0), batch_id=12
     )
     latent, preparation_observation = _prepare_media(
         worker,
@@ -893,7 +835,7 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         conditioning,
         op_id=ComputationId(41, 0),
         predecessor=root_parent(admission),
-        run_id=13,
+        batch_id=13,
     )
     flow, _output_latent = diffusion_step_operation(
         admission.request_key,
@@ -904,8 +846,8 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         steps=2,
     )
 
-    valid_batch = execution_run(
-        run_id=15,
+    valid_batch = execution_batch(
+        batch_id=15,
         admissions=(),
         operations=(flow,),
     )
@@ -938,7 +880,7 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
     )
     recovered = finalized_report(
         worker,
-        worker.submit(execution_run(run_id=16, operations=(replacement,))),
+        worker.submit(execution_batch(batch_id=16, operations=(replacement,))),
     )
     assert recovered.completions[0].status is OpStatus.OK
     assert recovered.completions[0].num_completed_steps == 2
@@ -949,12 +891,12 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         _replacement_latent,
         recovered_observation,
         op_id=ComputationId(44, 0),
-        run_id=17,
+        batch_id=17,
     )
 
     reference = execution_worker(block_size=4)
     reference_conditioning = _publish_conditioning(
-        reference, admission, op_id=ComputationId(40, 0), run_id=12
+        reference, admission, op_id=ComputationId(40, 0), batch_id=12
     )
     reference_latent, reference_preparation_observation = _prepare_media(
         reference,
@@ -962,7 +904,7 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         reference_conditioning,
         op_id=ComputationId(41, 0),
         predecessor=root_parent(admission),
-        run_id=13,
+        batch_id=13,
     )
     reference_flow, reference_output = diffusion_step_operation(
         admission.request_key,
@@ -973,8 +915,8 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         steps=2,
     )
     reference_result = reference.submit(
-        execution_run(
-            run_id=14,
+        execution_batch(
+            batch_id=14,
             operations=(reference_flow,),
             commands=(),
         )
@@ -988,65 +930,10 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         reference_output,
         reference_observation,
         op_id=ComputationId(44, 0),
-        run_id=15,
+        batch_id=15,
     )
     assert recovered_artifact == reference_artifact
     reference.close()
-
-
-def test_mixed_lane_descriptor_failure_preserves_the_other_domain_candidate():
-    worker = execution_worker()
-    sequence_admission = ar_params(61, block_ids=(0,))
-    generation_admission = umm_params(
-        62,
-        ImageParams(steps=1, height=16, width=16, seed=29),
-    )
-    conditioning = _publish_conditioning(
-        worker, generation_admission, op_id=ComputationId(1, 0), run_id=1
-    )
-    latent, preparation_observation = _prepare_media(
-        worker,
-        generation_admission,
-        conditioning,
-        op_id=ComputationId(2, 0),
-        predecessor=root_parent(generation_admission),
-        run_id=2,
-    )
-    sequence, sequence_control = _prepare_decode(
-        worker,
-        sequence_admission,
-        op_id=ComputationId(2, 0),
-        run_id=3,
-        tokens=(7, 8),
-    )
-    missing_latent = replace(latent, generation=latent.generation + 1000)
-    flow, _output_latent = diffusion_step_operation(
-        generation_admission.request_key,
-        op_id=ComputationId(3, 1),
-        predecessor=preparation_observation.op_id,
-        conditioning=conditioning,
-        latent=missing_latent,
-        steps=1,
-    )
-    report = finalized_report(
-        worker,
-        worker.submit(
-            execution_run(
-                run_id=4,
-                admissions=(),
-                operations=(sequence, flow),
-                commands=(),
-            )
-        ),
-    )
-
-    by_request = {
-        record.request_key.request_id: record for record in report.completions
-    }
-    assert by_request[61].status is OpStatus.OK
-    assert by_request[62].status is OpStatus.ERROR
-    assert by_request[62].error_code is ErrorCode.INVALID_OPERATION
-    record_completion(sequence, report)
 
 
 def test_initial_flow_noise_is_stable_across_operation_schedules():
@@ -1057,7 +944,7 @@ def test_initial_flow_noise_is_stable_across_operation_schedules():
     for op_id in (41, 109):
         worker = execution_worker()
         conditioning = _publish_conditioning(
-            worker, admission, op_id=ComputationId(1, 0), run_id=1
+            worker, admission, op_id=ComputationId(1, 0), batch_id=1
         )
         latent, preparation_observation = _prepare_media(
             worker,
@@ -1065,7 +952,7 @@ def test_initial_flow_noise_is_stable_across_operation_schedules():
             conditioning,
             op_id=ComputationId(op_id, 0),
             predecessor=root_parent(admission),
-            run_id=2,
+            batch_id=2,
             seed=29,
             image_index=3,
         )
@@ -1078,8 +965,8 @@ def test_initial_flow_noise_is_stable_across_operation_schedules():
             steps=1,
         )
         flow_report = worker.submit(
-            execution_run(
-                run_id=3,
+            execution_batch(
+                batch_id=3,
                 admissions=(),
                 operations=(flow,),
                 commands=(),
@@ -1094,7 +981,7 @@ def test_initial_flow_noise_is_stable_across_operation_schedules():
                 output_latent,
                 flow_observation,
                 op_id=ComputationId(op_id + 2, 0),
-                run_id=4,
+                batch_id=4,
             )
         )
         worker.close()
@@ -1130,7 +1017,7 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
             ),
         )
         conditioning = _publish_conditioning(
-            worker, admission, op_id=ComputationId(1, 0), run_id=1
+            worker, admission, op_id=ComputationId(1, 0), batch_id=1
         )
         latent, observation = _prepare_media(
             worker,
@@ -1138,7 +1025,7 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
             conditioning,
             op_id=ComputationId(2, 0),
             predecessor=root_parent(admission),
-            run_id=2,
+            batch_id=2,
             seed=31,
         )
         step = 0
@@ -1156,8 +1043,8 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
             report = finalized_report(
                 worker,
                 worker.submit(
-                    execution_run(
-                        run_id=op_id,
+                    execution_batch(
+                        batch_id=op_id,
                         operations=(operation,),
                         commands=(),
                     )
@@ -1175,7 +1062,7 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
             latent,
             observation,
             op_id=ComputationId(op_id, 0),
-            run_id=op_id,
+            batch_id=op_id,
         )
         worker.close()
         return artifact
@@ -1219,8 +1106,8 @@ def test_non_power_of_two_context_capacity_accepts_prefill_and_decode(
             report = finalized_report(
                 worker,
                 worker.submit(
-                    execution_run(
-                        run_id=step + 1,
+                    execution_batch(
+                        batch_id=step + 1,
                         admissions=(admission,) if step == 0 else (),
                         commands=commands,
                         operations=(operation,),
@@ -1255,8 +1142,8 @@ def test_decode_grows_logical_capacity_across_a_kv_page_boundary():
     extended = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(extend,),
             )
@@ -1286,8 +1173,8 @@ def test_decode_grows_logical_capacity_across_a_kv_page_boundary():
         report = finalized_report(
             worker,
             worker.submit(
-                execution_run(
-                    run_id=2 + step,
+                execution_batch(
+                    batch_id=2 + step,
                     admissions=(),
                     operations=(decode,),
                     commands=(),
@@ -1316,7 +1203,7 @@ def test_flow_run_results_cumulative_denoise_step_in_latent_len():
         2, ImageParams(steps=2, height=16, width=16, seed=29)
     )
     conditioning = _publish_conditioning(
-        worker, admission, op_id=ComputationId(1, 0), run_id=1
+        worker, admission, op_id=ComputationId(1, 0), batch_id=1
     )
     initial_latent, preparation_observation = _prepare_media(
         worker,
@@ -1324,7 +1211,7 @@ def test_flow_run_results_cumulative_denoise_step_in_latent_len():
         conditioning,
         op_id=ComputationId(2, 0),
         predecessor=root_parent(admission),
-        run_id=2,
+        batch_id=2,
     )
     first, first_latent = diffusion_step_operation(
         admission.request_key,
@@ -1337,8 +1224,8 @@ def test_flow_run_results_cumulative_denoise_step_in_latent_len():
     first_report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=3,
+            execution_batch(
+                batch_id=3,
                 admissions=(),
                 operations=(first,),
                 commands=(),
@@ -1357,8 +1244,8 @@ def test_flow_run_results_cumulative_denoise_step_in_latent_len():
     second_report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=4,
+            execution_batch(
+                batch_id=4,
                 admissions=(),
                 operations=(second,),
                 commands=(),
@@ -1377,7 +1264,7 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
         71, ImageParams(steps=50, height=16, width=16, seed=29)
     )
     conditioning = _publish_conditioning(
-        worker, admission, op_id=ComputationId(1, 0), run_id=1
+        worker, admission, op_id=ComputationId(1, 0), batch_id=1
     )
     current, observation = _prepare_media(
         worker,
@@ -1385,7 +1272,7 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
         conditioning,
         op_id=ComputationId(2, 0),
         predecessor=root_parent(admission),
-        run_id=2,
+        batch_id=2,
     )
     stale = current
     releasable = None
@@ -1402,8 +1289,8 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
         report = finalized_report(
             worker,
             worker.submit(
-                execution_run(
-                    run_id=3 + index,
+                execution_batch(
+                    batch_id=3 + index,
                     operations=(operation,),
                     commands=(),
                 )
@@ -1416,8 +1303,8 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
         observation = record_completion(operation, report)
 
     worker.submit(
-        execution_run(
-            run_id=53,
+        execution_batch(
+            batch_id=53,
             commands=(Free(releasable.buffer_id),),
         )
     )
@@ -1430,7 +1317,7 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
         steps=1,
     )
     stale_report = worker.submit(
-        execution_run(run_id=54, operations=(stale_operation,))
+        execution_batch(batch_id=54, operations=(stale_operation,))
     )
     stale_report = finalized_report(worker, stale_report)
     assert stale_report.completions[0].status is OpStatus.ERROR
@@ -1453,8 +1340,8 @@ def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thre
     )
     try:
         produced = producer.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(operation,),
             )
@@ -1477,8 +1364,8 @@ def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thre
             sample_continuation=False,
             max_tokens=2,
         )
-        batch = execution_run(
-            run_id=2,
+        batch = execution_batch(
+            batch_id=2,
             admissions=(admission,),
             operations=(visual,),
             input_products=(transferred,),
@@ -1496,8 +1383,8 @@ def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thre
         with pytest.raises(WorkerError, match="no longer owned"):
             consumer.poll(prepared)
         producer.submit(
-            execution_run(
-                run_id=3,
+            execution_batch(
+                batch_id=3,
                 commands=(Free(operation.encoder_output.buffer_id),),
             )
         )
@@ -1528,8 +1415,8 @@ def test_free_preserves_another_requests_feature_with_the_same_generation() -> (
         produced = finalized_report(
             worker,
             worker.submit(
-                execution_run(
-                    run_id=1,
+                execution_batch(
+                    batch_id=1,
                     admissions=admissions,
                     operations=operations,
                 )
@@ -1540,21 +1427,22 @@ def test_free_preserves_another_requests_feature_with_the_same_generation() -> (
             for completion in produced.completions
         )
         worker.submit(
-            execution_run(
-                run_id=2,
+            execution_batch(
+                batch_id=2,
                 commands=(Free(operations[0].encoder_output.buffer_id),),
             )
         )
         visual = visual_state_operation(
             admissions[1].request_key,
-            op_id=ComputationId(2, 0),
+            op_id=ComputationId(3, 0),
             predecessor=root_parent(admissions[1]),
             feature=operations[1].encoder_output,
             sample_continuation=False,
             max_tokens=2,
         )
         consumed = finalized_report(
-            worker, worker.submit(execution_run(run_id=3, operations=(visual,)))
+            worker,
+            worker.submit(execution_batch(batch_id=3, operations=(visual,))),
         )
         assert consumed.completions[0].status is OpStatus.OK
     finally:
@@ -1578,8 +1466,8 @@ def test_cross_stage_device_product_transfer_preserves_generation_and_value() ->
         extended = finalized_report(
             producer,
             producer.submit(
-                execution_run(
-                    run_id=1,
+                execution_batch(
+                    batch_id=1,
                     admissions=(admission,),
                     operations=(extend,),
                 )
@@ -1603,8 +1491,8 @@ def test_cross_stage_device_product_transfer_preserves_generation_and_value() ->
         transfer_report = finalized_report(
             producer,
             producer.submit(
-                execution_run(
-                    run_id=2,
+                execution_batch(
+                    batch_id=2,
                     operations=(transfer,),
                     commands=(),
                 )
@@ -1627,8 +1515,8 @@ def test_cross_stage_device_product_transfer_preserves_generation_and_value() ->
         )
 
         prepared = consumer.submit(
-            execution_run(
-                run_id=3,
+            execution_batch(
+                batch_id=3,
                 admissions=(admission,),
                 operations=(consume,),
                 input_products=(payload,),
@@ -1668,8 +1556,8 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
         )
 
     original = encoded_operation(ComputationId(1, 0), (64, 96, 128))
-    initial = execution_run(
-        run_id=1,
+    initial = execution_batch(
+        batch_id=1,
         admissions=(admission,),
         operations=(original,),
     )
@@ -1698,7 +1586,7 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
         finalized_report(worker, worker.submit(initial))
         report = finalized_report(
             worker,
-            worker.submit(execution_run(run_id=2, operations=(transfer,))),
+            worker.submit(execution_batch(batch_id=2, operations=(transfer,))),
         )
         if output_dtype is not source.dtype:
             assert report.completions[0].status is OpStatus.ERROR
@@ -1714,13 +1602,13 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
         finalized_report(
             worker,
             worker.submit(
-                execution_run(run_id=3, commands=(Free(source.buffer_id),))
+                execution_batch(batch_id=3, commands=(Free(source.buffer_id),))
             ),
         )
 
         replacement = encoded_operation(ComputationId(3, 0), (192, 160, 32))
-        reuse = execution_run(
-            run_id=4,
+        reuse = execution_batch(
+            batch_id=4,
             operations=(replacement,),
         )
         source_allocation = next(
@@ -1741,12 +1629,11 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
         torch.testing.assert_close(ticket.result(), expected, rtol=0, atol=0)
 
         released = worker.submit(
-            execution_run(run_id=5, commands=(Free(output.buffer_id),))
+            execution_batch(batch_id=5, commands=(Free(output.buffer_id),))
         )
         assert not released.complete
         ticket.close()
         released = finalized_report(worker, released)
-        assert released.done
     finally:
         if ticket is not None:
             ticket.close()
@@ -1828,8 +1715,8 @@ def test_tensor_entry_input_preserves_values_through_output_release(
     reader = None
     try:
         prepared = worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(operation,),
                 input_products=(payload,),
@@ -1856,12 +1743,11 @@ def test_tensor_entry_input_preserves_values_through_output_release(
         assert ready.wait(5)
         torch.testing.assert_close(reader.result(), expected, rtol=0, atol=0)
         released = worker.submit(
-            execution_run(run_id=2, commands=(Free(output.buffer_id),))
+            execution_batch(batch_id=2, commands=(Free(output.buffer_id),))
         )
         torch.testing.assert_close(reader.result(), expected, rtol=0, atol=0)
         reader.close()
         released = finalized_report(worker, released)
-        assert released.done
     finally:
         if reader is not None:
             reader.close()
@@ -1892,7 +1778,7 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
     )
     try:
         conditioning = _publish_conditioning(
-            producer, admission, op_id=ComputationId(1, 0), run_id=1
+            producer, admission, op_id=ComputationId(1, 0), batch_id=1
         )
         preparation, _latent = diffusion_prepare_operation(
             admission.request_key,
@@ -1903,7 +1789,9 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
         )
         transitioned = finalized_report(
             producer,
-            producer.submit(execution_run(run_id=2, operations=(preparation,))),
+            producer.submit(
+                execution_batch(batch_id=2, operations=(preparation,))
+            ),
         )
         preparation_observation = record_completion(preparation, transitioned)
         source = preparation.completion_output
@@ -1923,8 +1811,8 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
         transfer_report = finalized_report(
             producer,
             producer.submit(
-                execution_run(
-                    run_id=3,
+                execution_batch(
+                    batch_id=3,
                     operations=(transfer,),
                     commands=(),
                 )
@@ -1944,8 +1832,8 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
             predicate=transferred,
         )
         prepared = consumer.submit(
-            execution_run(
-                run_id=4,
+            execution_batch(
+                batch_id=4,
                 admissions=(admission,),
                 operations=(consume,),
                 input_products=(payload,),
@@ -1977,7 +1865,7 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
         75, ImageParams(steps=1, height=height, width=height, seed=29)
     )
     conditioning = _publish_conditioning(
-        producer, admission, op_id=ComputationId(1, 0), run_id=1
+        producer, admission, op_id=ComputationId(1, 0), batch_id=1
     )
     initial_latent, preparation_observation = _prepare_media(
         producer,
@@ -1985,7 +1873,7 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
         conditioning,
         op_id=ComputationId(2, 0),
         predecessor=root_parent(admission),
-        run_id=2,
+        batch_id=2,
     )
     flow, final_latent = diffusion_step_operation(
         admission.request_key,
@@ -1996,8 +1884,8 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
         steps=1,
     )
     produced = producer.submit(
-        execution_run(
-            run_id=3,
+        execution_batch(
+            batch_id=3,
             operations=(flow,),
             commands=(),
         )
@@ -2030,7 +1918,7 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
         exported = finalized_report(
             producer,
             producer.submit(
-                execution_run(run_id=4, operations=(transfer,), commands=())
+                execution_batch(batch_id=4, operations=(transfer,), commands=())
             ),
         )
         assert exported.completions[0].status is OpStatus.OK
@@ -2100,7 +1988,7 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
         final_latent,
         flow_observation,
         op_id=ComputationId(5, 0),
-        run_id=5,
+        batch_id=5,
     )
     diffusion_finalize = diffusion_finalize_operation(
         admission.request_key,
@@ -2108,8 +1996,8 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
         predecessor=root_parent(admission),
         latent=exported_latent,
     )
-    batch = execution_run(
-        run_id=5,
+    batch = execution_batch(
+        batch_id=5,
         admissions=(admission,),
         operations=(diffusion_finalize,),
         input_products=transferred,
@@ -2160,8 +2048,8 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
     extended = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(extend,),
             )
@@ -2184,8 +2072,8 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
     report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=2,
+            execution_batch(
+                batch_id=2,
                 admissions=(),
                 operations=(encode,),
                 commands=(),
@@ -2216,7 +2104,7 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
     )
     try:
         conditioning = _publish_conditioning(
-            worker, admission, op_id=ComputationId(1, 0), run_id=1
+            worker, admission, op_id=ComputationId(1, 0), batch_id=1
         )
         latent, observation = _prepare_media(
             worker,
@@ -2224,7 +2112,7 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             conditioning,
             op_id=ComputationId(2, 0),
             predecessor=root_parent(admission),
-            run_id=2,
+            batch_id=2,
             seed=31,
         )
         step, completed = diffusion_step_operation(
@@ -2236,7 +2124,8 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             steps=1,
         )
         stepped = finalized_report(
-            worker, worker.submit(execution_run(run_id=3, operations=(step,)))
+            worker,
+            worker.submit(execution_batch(batch_id=3, operations=(step,))),
         )
         assert stepped.completions[0].status is OpStatus.OK
         decode = diffusion_finalize_operation(
@@ -2247,7 +2136,8 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             feedback_source=True,
         )
         decoded = finalized_report(
-            worker, worker.submit(execution_run(run_id=4, operations=(decode,)))
+            worker,
+            worker.submit(execution_batch(batch_id=4, operations=(decode,))),
         )
         assert decoded.completions[0].status is OpStatus.OK
         expected = _media_bytes(decoded.completions[0])
@@ -2269,7 +2159,9 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             )
             transferred = finalized_report(
                 worker,
-                worker.submit(execution_run(run_id=5, operations=(transfer,))),
+                worker.submit(
+                    execution_batch(batch_id=5, operations=(transfer,))
+                ),
             )
             assert transferred.completions[0].status is OpStatus.OK
             descriptor = transferred.products[0].value
@@ -2305,7 +2197,9 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             monkeypatch.setattr(Image.Image, "save", fail_encoding)
         result = finalized_report(
             worker,
-            worker.submit(execution_run(run_id=6, operations=(materialize,))),
+            worker.submit(
+                execution_batch(batch_id=6, operations=(materialize,))
+            ),
         )
         completion = result.completions[0]
         if encoding_fails:
@@ -2340,8 +2234,8 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         tokens=(3, 4),
     )
     extended = worker.submit(
-        execution_run(
-            run_id=1,
+        execution_batch(
+            batch_id=1,
             admissions=(admission,),
             operations=(extend,),
         )
@@ -2354,8 +2248,8 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         predecessor=first_observation.op_id,
     )
     worker.submit(
-        execution_run(
-            run_id=2,
+        execution_batch(
+            batch_id=2,
             admissions=(),
             operations=(publication,),
             commands=(),
@@ -2367,7 +2261,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         conditioning,
         op_id=ComputationId(3, 0),
         predecessor=first_observation.op_id,
-        run_id=3,
+        batch_id=3,
     )
     flow, completed_latent = diffusion_step_operation(
         admission.request_key,
@@ -2378,8 +2272,8 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         steps=2,
     )
     flow_report = worker.submit(
-        execution_run(
-            run_id=4,
+        execution_batch(
+            batch_id=4,
             admissions=(),
             operations=(flow,),
             commands=(),
@@ -2395,8 +2289,8 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         feedback_source=True,
     )
     diffusion_finalize_report = worker.submit(
-        execution_run(
-            run_id=5,
+        execution_batch(
+            batch_id=5,
             admissions=(),
             operations=(diffusion_finalize,),
             commands=(),
@@ -2425,8 +2319,11 @@ def test_generated_feedback_commits_absolute_visual_token_state():
     encode_report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=6, admissions=(), operations=(encode,), input_products=()
+            execution_batch(
+                batch_id=6,
+                admissions=(),
+                operations=(encode,),
+                input_products=(),
             )
         ),
     )
@@ -2460,8 +2357,8 @@ def test_generated_feedback_commits_absolute_visual_token_state():
     report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=7,
+            execution_batch(
+                batch_id=7,
                 admissions=(),
                 operations=(state,),
             )
@@ -2480,8 +2377,8 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         predecessor=feedback_observation.op_id,
     )
     worker.submit(
-        execution_run(
-            run_id=8,
+        execution_batch(
+            batch_id=8,
             operations=(publication,),
             commands=(),
         )
@@ -2492,7 +2389,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         next_conditioning,
         op_id=ComputationId(9, 0),
         predecessor=feedback_observation.op_id,
-        run_id=9,
+        batch_id=9,
         image_index=2,
     )
     next_flow, next_completed_latent = diffusion_step_operation(
@@ -2506,8 +2403,8 @@ def test_generated_feedback_commits_absolute_visual_token_state():
     next_report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=10,
+            execution_batch(
+                batch_id=10,
                 operations=(next_flow,),
                 commands=(),
             )
@@ -2523,7 +2420,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
             next_completed_latent,
             next_observation,
             op_id=ComputationId(11, 0),
-            run_id=11,
+            batch_id=11,
         ).decode("ascii"),
         validate=True,
     ).startswith(_PNG_MAGIC)
@@ -2571,7 +2468,7 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
         76, ImageParams(steps=3, height=16, width=16, seed=29)
     )
     conditioning = _publish_conditioning(
-        worker, admission, op_id=ComputationId(1, 0), run_id=1
+        worker, admission, op_id=ComputationId(1, 0), batch_id=1
     )
     initial, observation = _prepare_media(
         worker,
@@ -2579,7 +2476,7 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
         conditioning,
         op_id=ComputationId(2, 0),
         predecessor=root_parent(admission),
-        run_id=2,
+        batch_id=2,
     )
     first, first_latent = diffusion_step_operation(
         admission.request_key,
@@ -2592,8 +2489,8 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
     first_report = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=3,
+            execution_batch(
+                batch_id=3,
                 operations=(first,),
                 commands=(),
             )
@@ -2632,8 +2529,8 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
                 second_report = finalized_report(
                     worker,
                     worker.submit(
-                        execution_run(
-                            run_id=4,
+                        execution_batch(
+                            batch_id=4,
                             operations=(second,),
                             commands=(Free(initial.buffer_id),),
                         )
@@ -2650,8 +2547,8 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
                     steps=1,
                 )
                 prepared = worker.submit(
-                    execution_run(
-                        run_id=5,
+                    execution_batch(
+                        batch_id=5,
                         operations=(third,),
                         commands=(Free(first_latent.buffer_id),),
                     )
@@ -2672,8 +2569,8 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
                 report = finalized_report(
                     worker,
                     worker.submit(
-                        execution_run(
-                            run_id=6,
+                        execution_batch(
+                            batch_id=6,
                             admissions=(independent,),
                             operations=(operation,),
                         )
@@ -2709,7 +2606,7 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
             76, ImageParams(steps=3, height=16, width=16, seed=29)
         )
         conditioning = _publish_conditioning(
-            worker, admission, op_id=ComputationId(1, 0), run_id=1
+            worker, admission, op_id=ComputationId(1, 0), batch_id=1
         )
         latent, observation = _prepare_media(
             worker,
@@ -2717,7 +2614,7 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
             conditioning,
             op_id=ComputationId(2, 0),
             predecessor=root_parent(admission),
-            run_id=2,
+            batch_id=2,
         )
         retained = latent
         for op_id in (3, 4):
@@ -2732,8 +2629,8 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
             report = finalized_report(
                 worker,
                 worker.submit(
-                    execution_run(
-                        run_id=op_id,
+                    execution_batch(
+                        batch_id=op_id,
                         operations=(operation,),
                         commands=()
                         if op_id == 3
@@ -2753,16 +2650,18 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
             latent=latent,
             steps=1,
         )
-        waiting = execution_run(run_id=5, operations=(third,), commands=())
-        release = execution_run(run_id=6, commands=(Free(retained.buffer_id),))
+        waiting = execution_batch(batch_id=5, operations=(third,), commands=())
+        release = execution_batch(
+            batch_id=6, commands=(Free(retained.buffer_id),)
+        )
         # This run reaches the worker through its IPC endpoint rather than
         # the submit path, so it states its own coordinates here.
         endpoint = QueuedWorkerIpc(
             tuple(
                 {
                     "kind": "submit",
-                    "call_id": run.run_id,
-                    "run": stamp_batch(worker, run),
+                    "call_id": run.batch_id,
+                    "batch": stamp_batch(worker, run),
                 }
                 for run in (waiting, release)
             )
@@ -2780,7 +2679,6 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
                 assert result.completions[0].status is OpStatus.OK
                 assert result.completions[0].num_completed_steps == 3
                 assert responses[6]["kind"] == "result", responses[6]
-                assert BatchOutput.from_mapping(responses[6]["result"]).done
             finally:
                 # Failure cleanup sends the same valid release through IPC,
                 # allowing the serving thread to leave its storage wait
@@ -2789,8 +2687,8 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
                     {
                         "kind": "submit",
                         "call_id": 99,
-                        "run": execution_run(
-                            run_id=99, commands=(Free(retained.buffer_id),)
+                        "batch": execution_batch(
+                            batch_id=99, commands=(Free(retained.buffer_id),)
                         ),
                     }
                 )
@@ -2818,14 +2716,14 @@ def test_full_binding_returns_current_decode_tokens(warmup):
             worker,
             admission,
             op_id=ComputationId(1, 0),
-            run_id=1,
+            batch_id=1,
             tokens=(3, 4),
         )
         result = finalized_report(
             worker,
             worker.submit(
-                execution_run(
-                    run_id=2,
+                execution_batch(
+                    batch_id=2,
                     operations=(decode,),
                     commands=(),
                 )
@@ -2874,14 +2772,14 @@ def test_failed_capture_preserves_error_through_worker_scope_and_reconstruction(
             worker,
             admission,
             op_id=ComputationId(1, 0),
-            run_id=1,
+            batch_id=1,
             tokens=(3, 4),
         )
         result = finalized_report(
             worker,
             worker.submit(
-                execution_run(
-                    run_id=2,
+                execution_batch(
+                    batch_id=2,
                     operations=(decode,),
                     commands=(),
                 )

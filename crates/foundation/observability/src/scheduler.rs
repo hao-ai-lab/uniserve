@@ -194,24 +194,18 @@ pub struct SchedulerMetrics {
         help = "Scheduler operation credits reclaimed by execution domain."
     )]
     pub scheduler_domain_reclaimed_credits: Family<EngineDomainLabels, U64Counter>,
-    /// Completed physical runs grouped by domain.
+    /// Completed batches grouped by domain.
     #[metric(
-        name = "uniserve:scheduler_domain_completed_runs",
-        help = "Completed physical runs by execution domain."
+        name = "uniserve:scheduler_domain_completed_batches",
+        help = "Completed batches by execution domain."
     )]
-    pub scheduler_domain_completed_runs: Family<EngineDomainLabels, U64Counter>,
+    pub scheduler_domain_completed_batches: Family<EngineDomainLabels, U64Counter>,
     /// Cumulative domain time in microseconds grouped by lifecycle phase.
     #[metric(
         name = "uniserve:scheduler_domain_time_us",
-        help = "Cumulative execution-domain time in microseconds by phase: queue, launch, device, completion, or co_resident."
+        help = "Cumulative execution-domain time in microseconds by phase: queue, launch, device, or completion."
     )]
     pub scheduler_domain_time_us: Family<EngineDomainKindLabels, U64Counter>,
-    /// Runs executed concurrently with another domain.
-    #[metric(
-        name = "uniserve:scheduler_domain_co_resident_runs",
-        help = "Physical runs served in a qualified tensorized mixed call by execution domain."
-    )]
-    pub scheduler_domain_co_resident_runs: Family<EngineDomainLabels, U64Counter>,
 
     // Prefix-cache counters, including the connector-backed external cache path.
     /// Prefix-cache query tokens.

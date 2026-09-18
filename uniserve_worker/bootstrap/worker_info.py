@@ -24,12 +24,11 @@ from .config import ComponentConfig
 class RequestKind(StrEnum):
     """Defines IPC request verbs.
 
-    Verbs cover discovery, submission, polling, and shutdown.
+    Verbs cover discovery, submission, and shutdown.
     """
 
     INFO = "info"
     SUBMIT = "submit"
-    POLL = "poll"
     CLOSE = "close"
 
 

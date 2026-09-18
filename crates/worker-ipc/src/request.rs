@@ -8,24 +8,21 @@ use super::*;
 pub enum RequestKind {
     /// Queries worker identity and capabilities.
     Info,
-    /// Submits a physical run.
+    /// Submits a batch.
     Submit,
-    /// Polls a run with remaining completions.
-    Poll,
     /// Requests orderly worker shutdown.
     Close,
 }
 
 impl RequestKind {
     /// Request kinds accepted by the worker endpoint.
-    pub const ALL: [Self; 4] = [Self::Info, Self::Submit, Self::Poll, Self::Close];
+    pub const ALL: [Self; 3] = [Self::Info, Self::Submit, Self::Close];
 
     /// Returns the stable wire name for this request kind.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Info => "info",
             Self::Submit => "submit",
-            Self::Poll => "poll",
             Self::Close => "close",
         }
     }
@@ -40,19 +37,12 @@ pub enum WorkerRequest {
         /// Optional request-response correlation identity.
         call_id: Option<u64>,
     },
-    /// Submits a physical run.
+    /// Submits a batch.
     Submit {
         /// Optional request-response correlation identity.
         call_id: Option<u64>,
-        /// Fully lowered worker run.
-        run: ScheduleBatch,
-    },
-    /// Polls a run for additional completions.
-    Poll {
-        /// Optional request-response correlation identity.
-        call_id: Option<u64>,
-        /// Physical run identity to poll.
-        run_id: u64,
+        /// Fully lowered batch.
+        batch: Batch,
     },
     /// Requests orderly worker shutdown.
     Close {
@@ -67,7 +57,6 @@ impl WorkerRequest {
         match self {
             Self::Info { .. } => RequestKind::Info,
             Self::Submit { .. } => RequestKind::Submit,
-            Self::Poll { .. } => RequestKind::Poll,
             Self::Close { .. } => RequestKind::Close,
         }
     }
@@ -75,27 +64,25 @@ impl WorkerRequest {
     /// Returns the optional call correlation identifier.
     pub const fn call_id(&self) -> Option<u64> {
         match self {
-            Self::Info { call_id }
-            | Self::Submit { call_id, .. }
-            | Self::Poll { call_id, .. }
-            | Self::Close { call_id } => *call_id,
+            Self::Info { call_id } | Self::Submit { call_id, .. } | Self::Close { call_id } => {
+                *call_id
+            }
         }
     }
 
     /// Replaces the call correlation identifier.
     pub fn set_call_id(&mut self, value: Option<u64>) {
         match self {
-            Self::Info { call_id }
-            | Self::Submit { call_id, .. }
-            | Self::Poll { call_id, .. }
-            | Self::Close { call_id } => *call_id = value,
+            Self::Info { call_id } | Self::Submit { call_id, .. } | Self::Close { call_id } => {
+                *call_id = value
+            }
         }
     }
 
-    /// Returns the submitted run carried by this request, if any.
-    pub const fn run(&self) -> Option<&ScheduleBatch> {
+    /// Returns the batch carried by this request, if any.
+    pub const fn batch(&self) -> Option<&Batch> {
         match self {
-            Self::Submit { run, .. } => Some(run),
+            Self::Submit { batch, .. } => Some(batch),
             _ => None,
         }
     }
@@ -104,15 +91,11 @@ impl WorkerRequest {
     pub fn info() -> Self {
         Self::Info { call_id: None }
     }
-    /// Constructs a run-submission request.
-    pub fn submit(run: ScheduleBatch) -> Self {
-        Self::Submit { call_id: None, run }
-    }
-    /// Constructs a completion-poll request for `run_id`.
-    pub fn poll(run_id: u64) -> Self {
-        Self::Poll {
+    /// Constructs a batch-submission request.
+    pub fn submit(batch: Batch) -> Self {
+        Self::Submit {
             call_id: None,
-            run_id,
+            batch,
         }
     }
     /// Constructs a worker-shutdown request.

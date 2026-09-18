@@ -193,10 +193,10 @@ fn media_admission(prompt_token_ids: Vec<u32>) -> NewRequest {
     .unwrap()
 }
 
-fn execute_round_trip(batch: ScheduleBatch) -> ScheduleBatch {
+fn execute_round_trip(batch: Batch) -> Batch {
     let request = WorkerRequest::submit(batch);
     let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
-    decoded.run().unwrap().clone()
+    decoded.batch().unwrap().clone()
 }
 
 #[test]
@@ -244,11 +244,11 @@ fn computation_coordinates_survive_physical_dispatch_and_reject_collisions() {
     let run = batch_with_operations(3, vec![], vec![first.clone(), second]);
     assert_eq!(execute_round_trip(run.clone()), run);
 
-    // A physical fragment can contain sparse logical indices. Dispatch neither
-    // renumbers them nor narrows their unsigned coordinate range.
-    let fragment = batch_with_operations(4, vec![], vec![first.clone()]);
+    // A rank's projection of a batch can hold sparse logical indices. The
+    // projection neither renumbers them nor narrows their unsigned range.
+    let projection = batch_with_operations(4, vec![], vec![first.clone()]);
     assert_eq!(
-        execute_round_trip(fragment).operations[0].op_id,
+        execute_round_trip(projection).operations[0].op_id,
         first.op_id
     );
 
@@ -262,17 +262,16 @@ fn computation_coordinates_survive_physical_dispatch_and_reject_collisions() {
 }
 
 fn batch_with_operations(
-    run_id: u64,
+    batch_id: u64,
     admissions: Vec<NewRequest>,
     operations: Vec<ScheduledRequest>,
-) -> ScheduleBatch {
-    // Logical producer coordinates stay fixed when the physical run is numbered.
+) -> Batch {
+    // Operations name the batch they belong to.
     let batch_id = operations
         .first()
-        .map_or(run_id, |operation| operation.op_id.batch_id);
-    let mut run = ScheduleBatch::new(batch_id, admissions, operations);
-    run.run_id = run_id;
-    run.collective_seq = run_id.max(1);
+        .map_or(batch_id, |operation| operation.op_id.batch_id);
+    let mut run = Batch::new(batch_id, admissions, operations);
+    run.collective_seq = batch_id.max(1);
     let mut next_buffer_offset = 0_u64;
     for (operation_index, operation) in run.operations.iter().enumerate() {
         for output in operation.buffer_outputs() {
@@ -348,7 +347,7 @@ fn batch_with_operations(
 }
 
 fn lane_report(
-    run_id: u64,
+    batch_id: u64,
     completions: Vec<RequestOutput>,
     products: Vec<TensorPublication>,
     visible: bool,
@@ -358,14 +357,12 @@ fn lane_report(
     BatchOutput {
         batch_id: completions
             .first()
-            .map_or(run_id, |record| record.op_id.batch_id),
-        run_id,
+            .map_or(batch_id, |record| record.op_id.batch_id),
         completions,
         products,
         registration: RegistrationAck { visible },
         worker_exec_us,
         forward_stats,
-        done: true,
     }
 }
 
@@ -408,7 +405,14 @@ fn decoder_requires_one_concrete_computation() {
     ];
     for code in invalid {
         let mut malformed = frame.clone();
-        malformed.run.as_mut().unwrap().operations.as_mut().unwrap()[0].code = code;
+        malformed
+            .batch
+            .as_mut()
+            .unwrap()
+            .operations
+            .as_mut()
+            .unwrap()[0]
+            .code = code;
         let mut builder = flatbuffers::FlatBufferBuilder::new();
         let root = malformed.pack(&mut builder);
         builder.finish(root, None);
@@ -458,7 +462,7 @@ fn decoder_requires_every_call_to_state_its_coordinates() {
     let frame = fbs::root_as_worker_request(&bytes).unwrap().unpack();
 
     let mut absent = frame.clone();
-    absent.run.as_mut().unwrap().operations.as_mut().unwrap()[0].coordinates = None;
+    absent.batch.as_mut().unwrap().operations.as_mut().unwrap()[0].coordinates = None;
     let mut builder = flatbuffers::FlatBufferBuilder::new();
     let root = absent.pack(&mut builder);
     builder.finish(root, None);
@@ -470,7 +474,7 @@ fn decoder_requires_every_call_to_state_its_coordinates() {
 
     let mut uncontained = frame;
     uncontained
-        .run
+        .batch
         .as_mut()
         .unwrap()
         .operations
@@ -982,7 +986,10 @@ fn maximum_media_prompt_round_trips() {
     ));
 
     let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
-    assert_eq!(decoded.run().unwrap().admissions().next(), Some(&admission));
+    assert_eq!(
+        decoded.batch().unwrap().admissions().next(),
+        Some(&admission)
+    );
 }
 
 #[test]
@@ -1019,9 +1026,8 @@ fn product_validation_enforces_generation_and_shape_bounds() {
 
 #[test]
 fn batch_rejects_two_operations_for_one_request() {
-    let batch = ScheduleBatch {
+    let batch = Batch {
         batch_id: 1,
-        run_id: 1,
         collective_seq: 1,
         operations: vec![ar_decode_operation(), ar_decode_operation()],
         block_tables: Vec::new(),
@@ -1312,7 +1318,7 @@ fn full_image() -> ImageParams {
 /// single call on its own request key; the first two keys also carry
 /// admissions. A batch is one numerical call on one component, so the variants
 /// cannot share one.
-fn comprehensive_batches() -> Vec<ScheduleBatch> {
+fn comprehensive_batches() -> Vec<Batch> {
     let ar_params = NewRequest::new(
         key_for_request(100),
         100,
@@ -1453,12 +1459,7 @@ fn request_fixtures() -> Vec<WorkerRequest> {
             .expect("one batch per computation variant"),
     );
     submit.set_call_id(Some(91));
-    vec![
-        WorkerRequest::info(),
-        submit,
-        WorkerRequest::poll(42),
-        WorkerRequest::close(),
-    ]
+    vec![WorkerRequest::info(), submit, WorkerRequest::close()]
 }
 
 fn full_caps() -> WorkerInfo {

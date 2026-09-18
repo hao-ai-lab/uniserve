@@ -276,12 +276,9 @@ pub struct DomainSchedulerStats {
     /// Scheduling credits returned after completion.
     #[serde(default)]
     pub reclaimed_credits: u64,
-    /// Physical runs completed in the interval.
+    /// Batches completed in the interval.
     #[serde(default)]
-    pub completed_runs: u64,
-    /// Runs overlapping another execution domain.
-    #[serde(default)]
-    pub co_resident_runs: u64,
+    pub completed_batches: u64,
     /// Time spent queued before launch, in microseconds.
     #[serde(default)]
     pub queue_us: u64,
@@ -294,9 +291,6 @@ pub struct DomainSchedulerStats {
     /// Host completion processing time in microseconds.
     #[serde(default)]
     pub completion_us: u64,
-    /// Device time overlapping another execution domain, in microseconds.
-    #[serde(default)]
-    pub co_resident_us: u64,
 }
 
 /// Serializable scheduler snapshot for one reporting interval.

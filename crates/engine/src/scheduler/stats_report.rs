@@ -22,13 +22,11 @@ struct DomainCumulative {
     error_operations: u64,
     backpressure_events: u64,
     reclaimed_credits: u64,
-    completed_runs: u64,
-    co_resident_runs: u64,
+    completed_batches: u64,
     queue_us: u64,
     launch_us: u64,
     device_us: u64,
     completion_us: u64,
-    co_resident_us: u64,
 }
 
 /// Converts the scheduler's cumulative counters into per-update deltas for the
@@ -159,19 +157,13 @@ impl SchedulerStatsReporter {
                     reclaimed_credits: current
                         .reclaimed_credits
                         .saturating_sub(previous.reclaimed_credits),
-                    completed_runs: current
-                        .completed_runs
-                        .saturating_sub(previous.completed_runs),
-                    co_resident_runs: current
-                        .co_resident_runs
-                        .saturating_sub(previous.co_resident_runs),
+                    completed_batches: current
+                        .completed_batches
+                        .saturating_sub(previous.completed_batches),
                     queue_us: current.queue_us.saturating_sub(previous.queue_us),
                     launch_us: current.launch_us.saturating_sub(previous.launch_us),
                     device_us: current.device_us.saturating_sub(previous.device_us),
                     completion_us: current.completion_us.saturating_sub(previous.completion_us),
-                    co_resident_us: current
-                        .co_resident_us
-                        .saturating_sub(previous.co_resident_us),
                 }
             })
             .collect()
@@ -197,13 +189,11 @@ fn domain_cumulative(stats: &crate::scheduler::DomainStats) -> DomainCumulative 
         error_operations: stats.error_operations.load(Ordering::Relaxed),
         backpressure_events: stats.backpressure_events.load(Ordering::Relaxed),
         reclaimed_credits: stats.reclaimed_credits.load(Ordering::Relaxed),
-        completed_runs: stats.completed_runs.load(Ordering::Relaxed),
-        co_resident_runs: stats.co_resident_runs.load(Ordering::Relaxed),
+        completed_batches: stats.completed_batches.load(Ordering::Relaxed),
         queue_us: stats.queue_us.load(Ordering::Relaxed),
         launch_us: stats.launch_us.load(Ordering::Relaxed),
         device_us: stats.device_us.load(Ordering::Relaxed),
         completion_us: stats.completion_us.load(Ordering::Relaxed),
-        co_resident_us: stats.co_resident_us.load(Ordering::Relaxed),
     }
 }
 

@@ -18,7 +18,7 @@ import torch
 
 from tests.python.fixtures.depth_one import (
     ar_params,
-    execution_run,
+    execution_batch,
     finalized_report,
     record_completion,
     root_parent,
@@ -83,8 +83,8 @@ def test_logprob_reporting_does_not_change_sample_selection() -> None:
     result = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(first, second),
                 operations=(first_op, second_op),
             )
@@ -128,8 +128,8 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
             report = finalized_report(
                 worker,
                 worker.submit(
-                    execution_run(
-                        run_id=1 + index,
+                    execution_batch(
+                        batch_id=1 + index,
                         admissions=(admission,),
                         operations=(extend,),
                     )
@@ -167,8 +167,8 @@ def test_batched_decode_produces_the_serial_oracle_tokens(device: str) -> None:
         result = finalized_report(
             worker,
             worker.submit(
-                execution_run(
-                    run_id=9,
+                execution_batch(
+                    batch_id=9,
                     admissions=(),
                     operations=tuple(decode_ops),
                     commands=tuple(commits),
@@ -226,8 +226,8 @@ def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> (
     result = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(first, second),
                 operations=(first_op, second_op),
             )
@@ -264,8 +264,8 @@ def test_verify_commits_every_accepted_position() -> None:
     prime = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(extend,),
                 input_products=(),
@@ -284,8 +284,8 @@ def test_verify_commits_every_accepted_position() -> None:
     result = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=2,
+            execution_batch(
+                batch_id=2,
                 admissions=(),
                 operations=(verify,),
                 commands=(),
@@ -325,8 +325,8 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(
     prime = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(extend,),
             )
@@ -342,7 +342,7 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(
     )
 
     result = finalized_report(
-        worker, worker.submit(execution_run(run_id=2, operations=(verify,)))
+        worker, worker.submit(execution_batch(batch_id=2, operations=(verify,)))
     )
     successor = replace(
         token_operation(
@@ -360,7 +360,7 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span(
     successor_batch = stamp_batch(
         worker,
         replace(
-            execution_run(run_id=3, operations=(successor,)),
+            execution_batch(batch_id=3, operations=(successor,)),
             seq_lens=(
                 len(extend.input_token_ids) + len(verify.input_token_ids) + 1,
             ),
@@ -404,8 +404,8 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> (
     prime = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(extend,),
             )
@@ -423,8 +423,8 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> (
     result = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=2,
+            execution_batch(
+                batch_id=2,
                 admissions=(),
                 operations=(verify,),
                 commands=(),
@@ -456,8 +456,8 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
     first_result = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(first,),
             )
@@ -475,8 +475,8 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
     second_result = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=2,
+            execution_batch(
+                batch_id=2,
                 admissions=(),
                 operations=(second,),
                 commands=(),
@@ -514,8 +514,8 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
     first_result = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(first,),
             )
@@ -536,8 +536,8 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
     failed = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=2,
+            execution_batch(
+                batch_id=2,
                 operations=(invalid,),
                 commands=(),
             )
@@ -557,8 +557,8 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
     recovered = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=3,
+            execution_batch(
+                batch_id=3,
                 operations=(continued,),
             )
         ),
@@ -576,8 +576,8 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
     oracle_result = finalized_report(
         oracle,
         oracle.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(oracle_first,),
             )
@@ -595,8 +595,8 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
     expected = finalized_report(
         oracle,
         oracle.submit(
-            execution_run(
-                run_id=3,
+            execution_batch(
+                batch_id=3,
                 operations=(oracle_continued,),
                 commands=(),
             )
@@ -628,8 +628,8 @@ def test_worker_samples_with_the_operation_branch_state() -> None:
     result = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(operation,),
             )
@@ -661,8 +661,8 @@ def test_forced_token_schedule_overrides_selection() -> None:
     result = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(operation,),
             )
@@ -690,8 +690,8 @@ def test_all_masked_branch_state_produces_an_error_completion() -> None:
     result = finalized_report(
         worker,
         worker.submit(
-            execution_run(
-                run_id=1,
+            execution_batch(
+                batch_id=1,
                 admissions=(admission,),
                 operations=(operation,),
             )

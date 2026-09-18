@@ -7,10 +7,10 @@ use crate::executor::WorkerResult;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use super::{RunSubmitError, WorkerGroup};
+use super::{BatchSubmitError, WorkerGroup};
 use crate::executor::{
     BatchResult, CommandOutcome, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
-    RequestPlacement, TransferConfig, WorkerFailure, WorkerId, logical_result, physical_run,
+    RequestPlacement, TransferConfig, WorkerFailure, WorkerId, logical_result, physical_batch,
 };
 use anyhow::Context;
 use uniserve_core::CommandWaker;
@@ -22,15 +22,16 @@ use uniserve_worker_ipc::{
 /// One operation's expected worker and result family until its batch retires.
 struct PendingOperation {
     worker: usize,
-    /// Physical submission containing this computation, once dispatched.
-    run_id: Option<u64>,
+    /// Whether the batch carrying this computation has been dispatched.
+    submitted: bool,
     kind: uniserve_worker_ipc::Computation,
     completed: bool,
 }
 
-/// Physical dispatch and receipts for one scheduler batch.
+/// Dispatch and receipts for one scheduler batch.
 struct PendingBatch {
-    worker_runs: HashMap<usize, HashSet<u64>>,
+    /// Workers this batch is dispatched to and has not yet returned from.
+    submitted_workers: HashSet<usize>,
     expected_workers: u64,
     operations: HashMap<(RequestKey, uniserve_worker_ipc::ComputationId), PendingOperation>,
     commands: Vec<BatchCommand>,
@@ -58,71 +59,41 @@ struct WorkerSubmission {
 }
 
 impl WorkerSubmission {
-    /// Split request successors into separate forwards without changing producer identities.
-    fn partition(
+    /// Builds the one submission a worker receives for this batch.
+    ///
+    /// A batch carries one computation to one component, so a worker receives
+    /// it once, under one identity, and answers it once. Product inputs the
+    /// worker does not yet hold travel as dependencies and hold the submission
+    /// in its queue until they resolve.
+    fn build(
         batch_id: u64,
         operations: Vec<(ScheduledRequest, RequestPlacement)>,
         commands: Vec<BatchCommand>,
         inputs: Vec<TensorPublication>,
         kv_inputs: Vec<KvTransfer>,
         dependencies: Vec<BufferId>,
-    ) -> Vec<Self> {
-        let mut groups = vec![Vec::new()];
-        let mut requests = HashSet::new();
-        let mut outputs = HashSet::new();
-        for item in operations {
-            let operation = &item.0;
-            // A publication crossing component storage must leave its producing
-            // run before a consumer can receive its transfer descriptor.
-            let needs_publication = operation
-                .input_buffers()
-                .any(|input| dependencies.contains(&input) && outputs.contains(&input));
-            if requests.contains(&operation.request_key) || needs_publication {
-                groups.push(Vec::new());
-                requests.clear();
-                outputs.clear();
-            }
-            requests.insert(operation.request_key);
-            outputs.extend(operation.output_buffers());
-            groups.last_mut().expect("physical group exists").push(item);
-        }
-        let mut submissions = groups
+    ) -> Self {
+        let consumed = operations
+            .iter()
+            .flat_map(|(operation, _)| operation.input_buffers())
+            .collect::<HashSet<_>>();
+        let input_transfers = inputs
             .into_iter()
-            .map(|operations| {
-                let consumed = operations
-                    .iter()
-                    .flat_map(|(operation, _)| operation.input_buffers())
-                    .collect::<HashSet<_>>();
-                let input_transfers = inputs
-                    .iter()
-                    .filter(|payload| consumed.contains(&payload.product.buffer_id()))
-                    .cloned()
-                    .collect();
-                let dependencies = dependencies
-                    .iter()
-                    .filter(|product| consumed.contains(product))
-                    .cloned()
-                    .collect();
-                let mut batch =
-                    ExecutionBatch::new(batch_id, operations, Vec::new(), input_transfers);
-                batch.kv_inputs = kv_inputs
-                    .iter()
-                    .filter(|publication| consumed.contains(&publication.source))
-                    .cloned()
-                    .collect();
-                Self {
-                    batch,
-                    dependencies,
-                }
-            })
-            .collect::<Vec<_>>();
-        // Closing or freeing must not overtake earlier computations in this batch.
-        submissions
-            .last_mut()
-            .expect("physical group exists")
-            .batch
-            .commands = commands;
-        submissions
+            .filter(|payload| consumed.contains(&payload.product.buffer_id()))
+            .collect();
+        let dependencies = dependencies
+            .into_iter()
+            .filter(|product| consumed.contains(product))
+            .collect();
+        let mut batch = ExecutionBatch::new(batch_id, operations, commands, input_transfers);
+        batch.kv_inputs = kv_inputs
+            .into_iter()
+            .filter(|publication| consumed.contains(&publication.source))
+            .collect();
+        Self {
+            batch,
+            dependencies,
+        }
     }
 }
 
@@ -336,15 +307,12 @@ impl WorkerExecutor {
             self.refresh_worker(index);
         }
         let failed_run = (!lost)
-            .then(|| loss.execution.as_ref().and_then(|error| error.run_id))
+            .then(|| loss.execution.as_ref().and_then(|error| error.batch_id))
             .flatten()
-            .and_then(|run_id| {
-                self.pending.iter().find_map(|(&batch_id, step)| {
-                    step.worker_runs
-                        .get(&index)
-                        .is_some_and(|runs| runs.contains(&run_id))
-                        .then_some((batch_id, run_id))
-                })
+            .filter(|batch_id| {
+                self.pending
+                    .get(batch_id)
+                    .is_some_and(|pending_batch| pending_batch.submitted_workers.contains(&index))
             });
         let mut retired = loss.retired.iter().copied().collect::<HashSet<_>>();
         let failed_operations = retired
@@ -393,10 +361,10 @@ impl WorkerExecutor {
                 buffers.insert(*buffer);
             }
         }
-        for step in self.pending.values() {
-            requests.extend(step.operations.iter().filter_map(|((request, _), worker)| {
-                (lost && worker.worker == index).then_some(*request)
-            }));
+        for pending_batch in self.pending.values() {
+            requests.extend(pending_batch.operations.iter().filter_map(
+                |((request, _), worker)| (lost && worker.worker == index).then_some(*request),
+            ));
         }
         // Abandoning an unstarted producer also invalidates its future buffers.
         // Already running work on another instance keeps its real completion path.
@@ -454,40 +422,33 @@ impl WorkerExecutor {
             }
             *queue = active;
         }
-        for (batch_id, step) in &mut self.pending {
-            if lost {
-                step.worker_runs.remove(&index);
-            } else if let Some((failed_batch, run_id)) = failed_run {
-                if failed_batch == *batch_id {
-                    if let Some(runs) = step.worker_runs.get_mut(&index) {
-                        runs.remove(&run_id);
-                    }
-                }
+        for (batch_id, pending_batch) in &mut self.pending {
+            if lost || failed_run == Some(*batch_id) {
+                pending_batch.submitted_workers.remove(&index);
             }
-            retired.extend(step.operations.iter().filter_map(|(identity, worker)| {
-                ((lost
-                    || worker
-                        .run_id
-                        .is_some_and(|run_id| failed_run == Some((*batch_id, run_id))))
-                    && worker.worker == index
-                    && !worker.completed)
-                    .then_some((*batch_id, identity.0, identity.1))
-            }));
+            retired.extend(
+                pending_batch
+                    .operations
+                    .iter()
+                    .filter_map(|(identity, worker)| {
+                        ((lost || (worker.submitted && failed_run == Some(*batch_id)))
+                            && worker.worker == index
+                            && !worker.completed)
+                            .then_some((*batch_id, identity.0, identity.1))
+                    }),
+            );
             for worker_index in 0..self.workers.len() {
-                let running = step
-                    .worker_runs
-                    .get(&worker_index)
-                    .is_some_and(|runs| !runs.is_empty());
+                let running = pending_batch.submitted_workers.contains(&worker_index);
                 let queued = self.worker_submissions[worker_index]
                     .iter()
                     .any(|submission| submission.batch.id == *batch_id);
                 if !running && !queued {
-                    step.expected_workers &= !Self::worker_bit(worker_index);
+                    pending_batch.expected_workers &= !Self::worker_bit(worker_index);
                 }
             }
-            step.set_command_outcome(&requests, CommandOutcome::Retired);
+            pending_batch.set_command_outcome(&requests, CommandOutcome::Retired);
         }
-        if let Some((batch_id, _)) = failed_run {
+        if let Some(batch_id) = failed_run {
             let failed_requests = loss.requests.iter().copied().collect();
             if let Some(pending) = self.pending.get_mut(&batch_id) {
                 pending.set_command_outcome(&failed_requests, CommandOutcome::Failed);
@@ -495,18 +456,22 @@ impl WorkerExecutor {
         }
         loss.retired.clear();
         for (batch_id, request, operation) in retired {
-            let step = self
+            let pending_batch = self
                 .pending
                 .get_mut(&batch_id)
-                .context("retired operation has no pending step")?;
+                .context("retired operation has no pending batch")?;
             anyhow::ensure!(
-                step.operations
+                pending_batch
+                    .operations
                     .get(&(request, operation))
                     .is_some_and(|operation| !operation.completed),
                 "completed operation cannot be abandoned"
             );
             anyhow::ensure!(
-                step.operations.remove(&(request, operation)).is_some(),
+                pending_batch
+                    .operations
+                    .remove(&(request, operation))
+                    .is_some(),
                 "abandoned operation is not pending"
             );
             loss.retired.push((batch_id, request, operation));
@@ -526,13 +491,11 @@ impl WorkerExecutor {
             {
                 self.publish_result(WorkerResult {
                     batch_id,
-                    run_id: batch_id,
                     results: Vec::new(),
                     products: Vec::new(),
                     registration: uniserve_worker_ipc::RegistrationAck { visible: true },
                     worker_exec_us: None,
                     forward_stats: None,
-                    done: true,
                 })?;
             }
         }
@@ -592,7 +555,7 @@ impl WorkerExecutor {
             .chain(
                 self.pending
                     .values()
-                    .flat_map(|step| step.operations.iter())
+                    .flat_map(|pending_batch| pending_batch.operations.iter())
                     .filter_map(|((key, _), operation)| {
                         (*key == request).then_some(operation.worker)
                     }),
@@ -647,7 +610,7 @@ impl WorkerExecutor {
             })
     }
 
-    /// Submits or queues one worker-local run while preserving collective order.
+    /// Submits or queues one worker-local batch while preserving collective order.
     fn submit_worker(
         &mut self,
         worker_index: usize,
@@ -691,10 +654,9 @@ impl WorkerExecutor {
         }
         let collective_seq = self.worker_collective_seqs[worker_index]
             .checked_add(1)
-            .context("physical run ID space exhausted")?;
-        let mut run = physical_run(
+            .context("collective sequence space exhausted")?;
+        let mut wire = physical_batch(
             batch.id,
-            collective_seq,
             collective_seq,
             batch.requests.clone(),
             commands,
@@ -703,7 +665,7 @@ impl WorkerExecutor {
         )?;
         for dependency in &submission.dependencies {
             if !self.transfer_products.contains_key(dependency)
-                || !run
+                || !wire
                     .operations
                     .iter()
                     .flat_map(|operation| operation.buffer_inputs())
@@ -721,22 +683,22 @@ impl WorkerExecutor {
                         dependency
                     )
                 })?;
-            if !run
+            if !wire
                 .buffer_allocations
                 .iter()
                 .any(|existing| existing.buffer == params.buffer)
             {
-                run.buffer_allocations.push(params);
+                wire.buffer_allocations.push(params);
             }
         }
-        run.validate()?;
-        let tensors = run
+        wire.validate()?;
+        let tensors = wire
             .input_products
             .iter_mut()
             .map(|payload| &mut payload.value)
             .flat_map(|handle| handle.tensors_mut())
             .chain(
-                run.kv_inputs
+                wire.kv_inputs
                     .iter_mut()
                     .flat_map(|publication| &mut publication.tensors),
             );
@@ -753,27 +715,23 @@ impl WorkerExecutor {
             });
         }
 
-        match self.workers[worker_index].1.submit_run(run) {
+        match self.workers[worker_index].1.submit_batch(wire) {
             Ok(()) => {}
-            Err(RunSubmitError::WouldBlock(_)) => return Ok(false),
-            Err(RunSubmitError::Failed(error)) => return Err(error),
+            Err(BatchSubmitError::WouldBlock(_)) => return Ok(false),
+            Err(BatchSubmitError::Failed(error)) => return Err(error),
         }
         self.worker_collective_seqs[worker_index] = collective_seq;
         let pending = self
             .pending
             .get_mut(&batch.id)
             .context("submitted batch is not pending")?;
-        pending
-            .worker_runs
-            .entry(worker_index)
-            .or_default()
-            .insert(collective_seq);
+        pending.submitted_workers.insert(worker_index);
         for (operation, _) in &batch.requests {
             pending
                 .operations
                 .get_mut(&(operation.request_key, operation.op_id))
                 .context("submitted computation is not pending")?
-                .run_id = Some(collective_seq);
+                .submitted = true;
         }
         self.admitted_workers
             .extend(request_keys.into_iter().map(|key| (worker_index, key)));
@@ -835,7 +793,7 @@ impl WorkerExecutor {
         self.dispatch_ready()?;
         for worker_index in 0..self.workers.len() {
             loop {
-                let polled = self.workers[worker_index].1.poll_run(Duration::ZERO);
+                let polled = self.workers[worker_index].1.poll_batch(Duration::ZERO);
                 if self.workers[worker_index].1.take_readiness_change() {
                     self.refresh_worker(worker_index);
                 }
@@ -870,47 +828,30 @@ impl WorkerExecutor {
             .filter(|product| failed_operations.contains(&(product.owner, product.producer_op_id)))
             .cloned()
             .collect();
-        let run_id = report.batch_id;
-        let physical_run_id = report.run_id;
-        anyhow::ensure!(
-            self.pending
-                .get(&run_id)
-                .and_then(|step| step.worker_runs.get(&worker_index))
-                .is_some_and(|runs| runs.contains(&physical_run_id)),
-            "worker returned a run that does not belong to its logical batch"
-        );
-        // The engine consumes logical batch results; physical IDs stop here.
-        report.run_id = run_id;
+        let batch_id = report.batch_id;
         let worker_bit = Self::worker_bit(worker_index);
         {
-            let step = self
+            let pending_batch = self
                 .pending
-                .get_mut(&run_id)
-                .ok_or_else(|| anyhow::anyhow!("worker returned unknown step {run_id}"))?;
+                .get_mut(&batch_id)
+                .ok_or_else(|| anyhow::anyhow!("worker returned unknown batch {batch_id}"))?;
             anyhow::ensure!(
-                step.expected_workers & worker_bit != 0,
-                "worker {worker_index} returned a duplicate or unexpected result for step {run_id}"
+                pending_batch.submitted_workers.remove(&worker_index),
+                "worker returned a batch it was not executing"
             );
             anyhow::ensure!(
-                !report.results.is_empty()
-                    || !step
-                        .operations
-                        .values()
-                        .any(|operation| operation.worker == worker_index && !operation.completed)
-                    || report.done,
-                "worker {worker_index} returned an empty partial report for batch {run_id}"
+                pending_batch.expected_workers & worker_bit != 0,
+                "worker {worker_index} returned a duplicate or unexpected result for batch {batch_id}"
             );
             for completion in &report.results {
                 let identity = (completion.output.request_key, completion.output.op_id);
-                let operation = step
+                let operation = pending_batch
                     .operations
                     .get_mut(&identity)
                     .context("worker returned an unknown operation")?;
                 anyhow::ensure!(
-                    operation.worker == worker_index
-                        && operation.run_id == Some(physical_run_id)
-                        && !operation.completed,
-                    "worker {worker_index} returned a duplicate or unexpected operation for batch {run_id}"
+                    operation.worker == worker_index && operation.submitted && !operation.completed,
+                    "worker {worker_index} returned a duplicate or unexpected operation for batch {batch_id}"
                 );
                 anyhow::ensure!(
                     completion.output.code == operation.kind,
@@ -918,26 +859,21 @@ impl WorkerExecutor {
                 );
                 operation.completed = true;
             }
-            if report.done {
-                anyhow::ensure!(
-                    step.operations
-                        .values()
-                        .all(|operation| operation.worker != worker_index
-                            || operation.run_id != Some(physical_run_id)
-                            || operation.completed),
-                    "worker {worker_index} terminated batch {run_id} before every operation completed"
-                );
-                let runs = step
-                    .worker_runs
-                    .get_mut(&worker_index)
-                    .expect("report run is pending");
-                runs.remove(&physical_run_id);
-                let queued = self.worker_submissions[worker_index]
-                    .iter()
-                    .any(|submission| submission.batch.id == run_id);
-                if runs.is_empty() && !queued {
-                    step.expected_workers &= !worker_bit;
-                }
+            // A batch returns one result, so its every call completes with it.
+            anyhow::ensure!(
+                pending_batch
+                    .operations
+                    .values()
+                    .all(|operation| operation.worker != worker_index
+                        || !operation.submitted
+                        || operation.completed),
+                "worker {worker_index} ended batch {batch_id} before every call completed"
+            );
+            let queued = self.worker_submissions[worker_index]
+                .iter()
+                .any(|submission| submission.batch.id == batch_id);
+            if !queued {
+                pending_batch.expected_workers &= !worker_bit;
             }
         }
         for product in report.products.drain(..) {
@@ -1237,7 +1173,7 @@ impl Executor for WorkerExecutor {
                     (operation.request_key, operation.op_id),
                     PendingOperation {
                         worker: operation_worker,
-                        run_id: None,
+                        submitted: false,
                         kind: operation.code,
                         completed: false,
                     },
@@ -1364,7 +1300,7 @@ impl Executor for WorkerExecutor {
                 expected_workers |= Self::worker_bit(worker_index);
                 // Keep operation-owned resources together while dependencies wait.
                 // Rank indices and collective order are derived at physical submission.
-                self.worker_submissions[worker_index].extend(WorkerSubmission::partition(
+                self.worker_submissions[worker_index].push_back(WorkerSubmission::build(
                     batch_id,
                     ops,
                     commands,
@@ -1376,7 +1312,7 @@ impl Executor for WorkerExecutor {
             self.pending.insert(
                 batch_id,
                 PendingBatch {
-                    worker_runs: HashMap::new(),
+                    submitted_workers: HashSet::new(),
                     expected_workers,
                     operations: operation_routes,
                     commands: batch
@@ -1396,13 +1332,11 @@ impl Executor for WorkerExecutor {
             {
                 self.publish_result(WorkerResult {
                     batch_id,
-                    run_id: batch_id,
                     results: Vec::new(),
                     products: Vec::new(),
                     registration: uniserve_worker_ipc::RegistrationAck { visible: true },
                     worker_exec_us: None,
                     forward_stats: None,
-                    done: true,
                 })?;
             }
             for command in &batch.commands {

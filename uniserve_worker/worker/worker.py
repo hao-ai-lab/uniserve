@@ -73,7 +73,7 @@ from ..foundation.errors import (
     invalid_descriptor,
     unsupported_setup,
 )
-from ..protocol.batch import Finish, Free, ScheduleBatch
+from ..protocol.batch import Batch, Finish, Free
 from ..protocol.output import BatchOutput
 from ..protocol.transfer import WorkerEndpoint
 from ..runtime.block_tables import BlockTables
@@ -100,7 +100,7 @@ _IPC_WAIT_TIMEOUT_US = 60_000_000
 
 
 def _input_producers(
-    batch: ScheduleBatch,
+    batch: Batch,
 ) -> set[tuple[RequestKey, ComputationId]]:
     """Identify producers requiring extended visibility.
 
@@ -720,18 +720,18 @@ class Worker:
         ) or (self.sampling_group is not None and self.sampling_group.size > 1)
 
     def _init_run_tracking(self) -> None:
-        """Initialize run tracking state.
+        """Initialize batch tracking state.
 
         Keeps bounded in-flight work and a constant-size admission
         high-water mark.
         """
-        # Physical IDs increase in transport submission order, independently of
-        # logical batch IDs. Completion order does not affect admission.
-        self._last_run_id = -1
+        # Batch IDs increase in transport submission order and are refused
+        # when they do not advance. Completion order does not affect admission.
+        self._last_batch_id = -1
         self.inflight: dict[int, BatchState] = {}
-        self._run_submissions: dict[int, ServiceRequest] = {}
+        self._batch_submissions: dict[int, ServiceRequest] = {}
         self._preparation_ready: SimpleQueue[BatchState] = SimpleQueue()
-        self._executing_runs: deque[BatchState] = deque()
+        self._executing_batches: deque[BatchState] = deque()
 
         self.pending_responses: deque[PendingResponse] = deque()
         self._waiting_responses: dict[int, PendingResponse] = {}
@@ -775,7 +775,7 @@ class Worker:
                 # admission.
                 self.device_events.reap()
 
-                if self._advance_executing_runs():
+                if self._advance_executing_batches():
                     continue
 
                 if self._send_one_ready_response():
@@ -787,8 +787,6 @@ class Worker:
                 # Close is acknowledged after execution and claimed
                 # responses drain.
                 if self._admission_closed:
-                    self._close_completed_polls()
-
                     if self._service_drained():
                         if self._shutdown_response is not None:
                             self._transport_respond(self._shutdown_response)
@@ -879,50 +877,50 @@ class Worker:
                 )
                 return sequence
 
-            run: ScheduleBatch | None = None
+            batch: Batch | None = None
             if kind is RequestKind.SUBMIT:
-                raw_run = messages.required(request, "run", kind)
-                raw_run_id = (
-                    int(raw_run.run_id)
-                    if isinstance(raw_run, ScheduleBatch)
-                    else int(raw_run.get("run_id", -1))
-                    if isinstance(raw_run, Mapping)
+                raw_batch = messages.required(request, "batch", kind)
+                raw_batch_id = (
+                    int(raw_batch.batch_id)
+                    if isinstance(raw_batch, Batch)
+                    else int(raw_batch.get("batch_id", -1))
+                    if isinstance(raw_batch, Mapping)
                     else -1
                 )
                 with profile_range(
                     worker_range_name(
-                        "run_decode",
-                        run_id=raw_run_id,
+                        "batch_decode",
+                        batch_id=raw_batch_id,
                         rank=self.info.endpoint.rank,
                     )
                 ):
-                    run = (
-                        raw_run
-                        if isinstance(raw_run, ScheduleBatch)
-                        else ScheduleBatch.from_mapping(raw_run)
+                    batch = (
+                        raw_batch
+                        if isinstance(raw_batch, Batch)
+                        else Batch.from_mapping(raw_batch)
                     )
 
-                if run.run_id <= self._last_run_id:
+                if batch.batch_id <= self._last_batch_id:
                     raise invalid_descriptor(
-                        f"run id {run.run_id} must exceed previously "
-                        f"submitted id {self._last_run_id}"
+                        f"batch id {batch.batch_id} must exceed previously "
+                        f"submitted id {self._last_batch_id}"
                     )
-                self._last_run_id = run.run_id
+                self._last_batch_id = batch.batch_id
 
                 # Product release is independent of request-state transitions.
-                # An earlier numerical run may need this retired allocation,
-                # so revocation cannot wait behind that run's execution FIFO.
+                # An earlier numerical batch may need this retired allocation,
+                # so revocation cannot wait behind that batch's execution FIFO.
                 # Existing readers retain storage; the command's ordinary
                 # terminal acknowledgement still waits for their completion.
                 freed = tuple(
                     command.buffer
-                    for command in run.commands
+                    for command in batch.commands
                     if isinstance(command, Free)
                 )
                 if freed:
                     self.release_buffers(freed)
 
-                requests = messages.run_requests(run)
+                requests = messages.batch_requests(batch)
 
             # Each request identifier forms a FIFO dependency chain. Multi-key
             # work waits once per distinct predecessor to avoid double counts.
@@ -931,7 +929,7 @@ class Worker:
                 request=request,
                 requests=requests,
                 kind=kind,
-                run=run,
+                batch=batch,
             )
 
             predecessors = {
@@ -1024,9 +1022,6 @@ class Worker:
         try:
             if pending.kind is RequestKind.SUBMIT:
                 self._launch_execute(pending)
-            elif pending.kind is RequestKind.POLL:
-                self._launch_poll(pending)
-                self._release(pending)
             else:
                 self._launch_admin(pending)
                 self._release(pending)
@@ -1053,73 +1048,73 @@ class Worker:
         )
 
     def _launch_execute(self, pending: ServiceRequest) -> None:
-        """Start one accepted run and queue its first result fragment."""
-        if pending.run is None:
-            raise RuntimeError("accepted execute request lost its run")
-        run = BatchState(pending.run)
-        self._run_submissions[run.run_id] = pending
-        self.inflight[run.run_id] = run
+        """Start one accepted batch and queue its result."""
+        if pending.batch is None:
+            raise RuntimeError("accepted execute request lost its batch")
+        batch = BatchState(pending.batch)
+        self._batch_submissions[batch.batch_id] = pending
+        self.inflight[batch.batch_id] = batch
 
-        self._start_execution(run)
-        self._queue_result(pending, run)
+        self._start_execution(batch)
+        self._queue_result(pending, batch)
 
-    def _start_execution(self, run: BatchState) -> None:
-        """Submit physical inputs for the run.
+    def _start_execution(self, batch: BatchState) -> None:
+        """Submit physical inputs for the batch.
 
         Directly launches the batch when the inputs are ready.
         """
         try:
             unsupported = tuple(
                 operation.kind
-                for operation in run.batch.operations
-                if not self.supports_run_kind(operation.kind)
+                for operation in batch.batch.operations
+                if not self.supports_computation(operation.kind)
             )
             if unsupported:
                 names = sorted({value.value for value in unsupported})
                 raise invalid_descriptor(
-                    "execution run contains work variants unsupported by "
+                    "execution batch contains work variants unsupported by "
                     f"this worker: {names!r}"
                 )
 
-            self._prepare_execution(run)
+            self._prepare_execution(batch)
 
-            if self._advance_execution(run):
-                if not run.complete:
-                    self._executing_runs.append(run)
+            if self._advance_execution(batch):
+                if not batch.complete:
+                    self._executing_batches.append(batch)
             else:
-                run.on_dependencies_ready(
-                    partial(self._preparation_completed, run)
+                batch.on_dependencies_ready(
+                    partial(self._preparation_completed, batch)
                 )
         except BaseException as error:
-            self._fail_run(run, error)
+            self._fail_run(batch, error)
 
-    def _advance_execution(self, run: BatchState) -> bool:
+    def _advance_execution(self, batch: BatchState) -> bool:
         """Execute prepared inputs on the worker thread.
 
         Never executes from a notification callback.
         """
-        if run.complete or run.launched:
+        if batch.complete or batch.launched:
             return True
         try:
-            self.advance_inputs(run)
-            if not run.inputs_ready():
+            self.advance_inputs(batch)
+            if not batch.inputs_ready():
                 return False
-            self._execute_prepared(run)
-            self._notify_run(run)
+            self._execute_prepared(batch)
+            self._notify_batch(batch)
         except BaseException as error:
-            self._fail_run(run, error)
+            self._fail_run(batch, error)
         return True
 
-    def _advance_run(self, run: BatchState) -> None:
+    def _advance_batch(self, batch: BatchState) -> None:
         """Materialize complete groups.
 
         Also advances physical command retirement.
         """
-        if run.complete or not run.launched:
+        if batch.complete or not batch.launched:
             return
         try:
             # CPU work is submitted by the Worker, never by a readiness query.
-            for output in run.outputs:
+            for output in batch.outputs:
                 parent: object = output
                 while (
                     isinstance(parent, PendingOutput) and parent.value is None
@@ -1128,10 +1123,10 @@ class Worker:
                         task.submit_if_ready()
                     parent = parent.predecessor
 
-            for group, indexes in run.output_groups.items():
-                if group in run.completed_groups:
+            for group, indexes in batch.output_groups.items():
+                if group in batch.completed_groups:
                     continue
-                outputs = tuple(run.outputs[index] for index in indexes)
+                outputs = tuple(batch.outputs[index] for index in indexes)
                 if any(value is None for value in outputs):
                     raise RuntimeError(
                         "launched batch is missing an operation output"
@@ -1156,133 +1151,127 @@ class Worker:
                 # Acceptance remains visible after pending rows become wire
                 # values.
                 if len(pending) == len(outputs):
-                    run.accepted_groups.add(group)
+                    batch.accepted_groups.add(group)
                 for index, value in zip(indexes, values, strict=True):
-                    run.outputs[index] = value
-                run.completed_groups.add(group)
+                    batch.outputs[index] = value
+                batch.completed_groups.add(group)
 
-            if len(run.completed_groups) == len(run.output_groups):
-                run.complete = self._advance_retirement(run)
-            self._notify_run(run)
+            if len(batch.completed_groups) == len(batch.output_groups):
+                batch.complete = self._advance_retirement(batch)
+            self._notify_batch(batch)
         except BaseException as error:
-            self._fail_run(run, error, context="completion materialization")
+            self._fail_run(batch, error, context="completion materialization")
 
-    def _notify_run(self, run: BatchState) -> None:
+    def _notify_batch(self, batch: BatchState) -> None:
         """Release submission dependencies and wake its waiting IPC response."""
-        if run.successors_ready:
-            submission = self._run_submissions.pop(run.run_id, None)
+        if batch.successors_ready:
+            submission = self._batch_submissions.pop(batch.batch_id, None)
             if submission is not None:
                 self._release(submission)
-        self._run_ready(run)
+        self._batch_ready(batch)
 
     def _fail_run(
-        self, run: BatchState, error: BaseException, *, context: str = "execute"
+        self,
+        batch: BatchState,
+        error: BaseException,
+        *,
+        context: str = "execute",
     ) -> None:
         """Record a classified failure and close the batch.
 
         Also wakes its waiting responses.
         """
-        if run.complete:
+        if batch.complete:
             return
-        run.error = (
+        batch.error = (
             error
             if isinstance(error, WorkerError)
             else classify(error, context=context)
         )
         try:
-            self._close_batch(run)
+            self._close_batch(batch)
         except BaseException as cleanup_error:
-            run.error.add_note(f"batch cleanup failed: {cleanup_error!r}")
-        run.complete = True
-        self._notify_run(run)
+            batch.error.add_note(f"batch cleanup failed: {cleanup_error!r}")
+        batch.complete = True
+        self._notify_batch(batch)
 
-    def _launch_poll(self, pending: ServiceRequest) -> None:
-        """Claim the next undelivered fragment of a previously submitted run."""
-        run_id = messages.integer(pending.request, "run_id", RequestKind.POLL)
-        run = self.inflight.get(run_id)
-        if run is None or not run.awaiting_poll:
-            raise invalid_descriptor(
-                f"poll names run {run_id} with no pending results"
-            )
+    def _queue_result(self, request: ServiceRequest, batch: BatchState) -> None:
+        """Queue the response to one Submit.
 
-        run.awaiting_poll = False
-        self._queue_result(pending, run)
-
-    def _queue_result(self, request: ServiceRequest, run: BatchState) -> None:
-        """Queue a Submit or Poll response.
-
-        The response is queued when its next result fragment is ready.
+        The response is queued once the batch's single result is ready.
         """
         pending = PendingResponse(
             request.sequence,
-            request.requests | run.request_ids,
+            request.requests | batch.request_ids,
             messages.with_call_id(
                 messages.response(ResponseKind.RESULT), request.request
             ),
-            run,
+            batch,
         )
-        self._advance_run(run)
+        self._advance_batch(batch)
         if self._pending_ready(pending):
             self.pending_responses.append(pending)
         else:
-            self._waiting_responses[run.run_id] = pending
+            self._waiting_responses[batch.batch_id] = pending
 
-    def _run_ready(self, run: BatchState) -> None:
-        """Wake the single response waiting for this run's next fragment."""
-        pending = self._waiting_responses.pop(run.run_id, None)
+    def _batch_ready(self, batch: BatchState) -> None:
+        """Wake the response waiting for this batch's result."""
+        pending = self._waiting_responses.pop(batch.batch_id, None)
         if pending is not None:
             if self._pending_ready(pending):
                 self.pending_responses.append(pending)
             else:
-                self._waiting_responses[run.run_id] = pending
+                self._waiting_responses[batch.batch_id] = pending
 
-    def _preparation_completed(self, run: BatchState) -> None:
+    def _preparation_completed(self, batch: BatchState) -> None:
         """Enqueue readiness before waking the IPC loop that consumes it."""
-        self._preparation_ready.put(run)
+        self._preparation_ready.put(batch)
         if self.ipc_endpoint is not None:
             self.ipc_endpoint.wake()
 
-    def _advance_executing_runs(self) -> bool:
+    def _advance_executing_batches(self) -> bool:
         """Launch preparation-ready work.
 
         Also advances executing runs in launch order.
         """
         advanced = False
         if not self._preparation_ready.empty():
-            run = self._preparation_ready.get_nowait()
-            if not run.complete:
-                launched = self._advance_execution(run)
-                if not run.complete:
+            batch = self._preparation_ready.get_nowait()
+            if not batch.complete:
+                launched = self._advance_execution(batch)
+                if not batch.complete:
                     if launched:
-                        self._executing_runs.append(run)
+                        self._executing_batches.append(batch)
                     else:
-                        run.on_dependencies_ready(
-                            partial(self._preparation_completed, run)
+                        batch.on_dependencies_ready(
+                            partial(self._preparation_completed, batch)
                         )
             advanced = True
 
-        # Query every launched run: one pending host read or retirement must not
-        # hide an independent completion behind it.
-        for _ in range(len(self._executing_runs)):
-            run = self._executing_runs.popleft()
-            before = len(run.completed_groups)
-            self._advance_run(run)
-            advanced |= run.complete or len(run.completed_groups) != before
-            if not run.complete:
-                self._executing_runs.append(run)
+        # Query every launched batch: one pending host read or retirement
+        # must not hide an independent completion behind it.
+        for _ in range(len(self._executing_batches)):
+            batch = self._executing_batches.popleft()
+            before = len(batch.completed_groups)
+            self._advance_batch(batch)
+            advanced |= batch.complete or len(batch.completed_groups) != before
+            if not batch.complete:
+                self._executing_batches.append(batch)
         return advanced
 
     def _pending_ready(self, pending: PendingResponse) -> bool:
         """Query completion without blocking the service thread."""
-        run = pending.run
-        if run is None:
+        batch = pending.batch
+        if batch is None:
             return True
         with profile_range(
             worker_range_name(
-                "completion", run_id=run.run_id, rank=self.info.endpoint.rank
+                "completion",
+                batch_id=batch.batch_id,
+                rank=self.info.endpoint.rank,
             )
         ):
-            return run.ready()
+            return batch.ready()
 
     def _send_one_ready_response(self) -> bool:
         """Send the oldest transport-ready response if one exists."""
@@ -1297,27 +1286,25 @@ class Worker:
         Transport sequence order is preserved.
         """
         response = dict(pending.response)
-        run = pending.run
-        run_id = run.run_id if run is not None else None
+        batch = pending.batch
+        batch_id = batch.batch_id if batch is not None else None
 
-        if run is not None:
-            if run.error is not None:
+        if batch is not None:
+            if batch.error is not None:
                 response = messages.error_response(
-                    run.take_error(), pending.response
+                    batch.take_error(), pending.response
                 )
             else:
-                response["result"] = run.take_output()
-
-            if run.pending():
-                run.awaiting_poll = True
-            else:
-                del self.inflight[run.run_id]
-                self._close_batch(run)
+                response["result"] = batch.take_output()
+            del self.inflight[batch.batch_id]
+            self._close_batch(batch)
 
         fatal = bool(response.get("fatal"))
         with profile_range(
             worker_range_name(
-                "finalize_response", run_id=run_id, rank=self.info.endpoint.rank
+                "finalize_response",
+                batch_id=batch_id,
+                rank=self.info.endpoint.rank,
             )
         ):
             finalized = messages.finalize_response(response)
@@ -1337,19 +1324,6 @@ class Worker:
             raise RuntimeError("worker has no bound IPC endpoint")
         with profile_range("uniserve.worker.respond"):
             self.ipc_endpoint.respond(response)
-
-    def _close_completed_polls(self) -> None:
-        """Discard unclaimed fragments on close.
-
-        Discarding happens after their execution safely retires.
-        """
-        for run_id, run in tuple(self.inflight.items()):
-            if not run.awaiting_poll:
-                continue
-            self._advance_run(run)
-            if run.complete:
-                del self.inflight[run_id]
-                self._close_batch(run)
 
     def _service_drained(self) -> bool:
         """Return whether the service has drained.
@@ -1377,52 +1351,52 @@ class Worker:
             raise RuntimeError("worker is closed and cannot be reused")
 
     def submit(
-        self, batch: ScheduleBatch, *, propagate_errors: bool = False
+        self, batch: Batch, *, propagate_errors: bool = False
     ) -> BatchState:
         """Accept one batch and submit available work.
 
         Retains the batch's asynchronous state. Call advance to progress
-        pending inputs, CPU work, and retirement, then poll to consume
-        wire-ready fragments. A run ID remains owned until its final
-        fragment is consumed or the Worker closes.
+        pending inputs, CPU work, and retirement, then poll to consume the
+        batch's result. A batch identity remains owned until its result is
+        consumed or the Worker closes.
         """
         self._require_open()
-        if batch.run_id in self.inflight:
-            raise invalid_descriptor("run ID already has an in-flight batch")
+        if batch.batch_id in self.inflight:
+            raise invalid_descriptor("batch ID already has an in-flight batch")
 
         state = BatchState(batch, propagate_errors=propagate_errors)
-        self.inflight[state.run_id] = state
+        self.inflight[state.batch_id] = state
 
         try:
             self._prepare_execution(state)
             self._advance_execution(state)
-            self._advance_run(state)
+            self._advance_batch(state)
         except BaseException:
-            self.inflight.pop(state.run_id, None)
+            self.inflight.pop(state.batch_id, None)
             self._close_batch(state)
             raise
 
         if state.error is not None and propagate_errors:
             error = state.error
-            self.inflight.pop(state.run_id, None)
+            self.inflight.pop(state.batch_id, None)
             self._close_batch(state)
             raise error
         return state
 
     def advance(self) -> None:
-        """Progress pending run state on the caller thread.
+        """Progress pending batch state on the caller thread.
 
         Covers physical dependencies and completed outputs.
         """
         self._require_open()
         for state in tuple(self.inflight.values()):
             self._advance_execution(state)
-            self._advance_run(state)
+            self._advance_batch(state)
 
     def poll(self, state: BatchState) -> BatchOutput | None:
-        """Consume one ready response fragment without launching computation."""
+        """Consume the batch's result without launching computation."""
         self._require_open()
-        if self.inflight.get(state.run_id) is not state:
+        if self.inflight.get(state.batch_id) is not state:
             raise invalid_descriptor(
                 "poll names a batch no longer owned by this Worker"
             )
@@ -1431,15 +1405,13 @@ class Worker:
 
         if state.error is not None:
             error = state.take_error()
-            del self.inflight[state.run_id]
+            del self.inflight[state.batch_id]
             self._close_batch(state)
             raise error
 
         output = state.take_output()
-        if not state.pending():
-            del self.inflight[state.run_id]
-            self._close_batch(state)
-
+        del self.inflight[state.batch_id]
+        self._close_batch(state)
         return output
 
     def _execute_batch(self, state: BatchState) -> None:
@@ -1449,7 +1421,7 @@ class Worker:
         """
         batch = state.batch
         # Cooperative ranks launch computation in the same order. Preparation
-        # and host completion may overlap; neither retains old run identities.
+        # and host completion may overlap; neither retains old batch identities.
         if self.worker_config.world_size > 1 and batch.operations:
             if batch.collective_seq <= self._last_collective_seq:
                 raise invalid_descriptor("collective sequence does not advance")
@@ -1502,8 +1474,8 @@ class Worker:
         state.launched = True
         self._retire_commands(state)
 
-    def supports_run_kind(self, kind: Computation) -> bool:
-        """Return whether this worker can execute one physical run variant."""
+    def supports_computation(self, kind: Computation) -> bool:
+        """Return whether this worker can execute this computation."""
         return kind in self.info.supported_ops
 
     def _prepare_execution(self, state: BatchState) -> None:
@@ -1833,7 +1805,7 @@ class Worker:
             released = self.kv_cache.release_operations(predecessors)
             self.kv_cache.release_buffers(released)
 
-    def _release_commands(self, batch: ScheduleBatch) -> None:
+    def _release_commands(self, batch: Batch) -> None:
         """Apply Free/Finish visibility.
 
         Visibility applies before work can wait for their reusable storage.
@@ -2028,13 +2000,13 @@ class Worker:
         try:
             close_resources(
                 *(
-                    partial(self._close_batch, run)
-                    for run in self.inflight.values()
+                    partial(self._close_batch, batch)
+                    for batch in self.inflight.values()
                 )
             )
         finally:
             self.inflight.clear()
-            self._run_submissions.clear()
+            self._batch_submissions.clear()
             self.pending_responses.clear()
             self._waiting_responses.clear()
 
@@ -2042,7 +2014,7 @@ class Worker:
             self._request_tails.clear()
             self._ready_requests.clear()
             self._collective_submission_tail = None
-            self._executing_runs.clear()
+            self._executing_batches.clear()
 
             while not self._preparation_ready.empty():
                 self._preparation_ready.get_nowait()

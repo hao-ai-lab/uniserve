@@ -60,7 +60,7 @@ impl SimExecutor {
         Self::with_depth(engine, depth)
     }
 
-    /// Starts an asynchronous simulator with an explicit in-flight run limit.
+    /// Starts an asynchronous simulator with an explicit in-flight batch limit.
     ///
     /// # Panics
     ///
@@ -80,10 +80,6 @@ impl SimExecutor {
                             let commands = batch.commands.clone();
                             let result = engine.execute(batch).and_then(|report| {
                                 report.validate()?;
-                                anyhow::ensure!(
-                                    report.done,
-                                    "simulator execution must return a complete batch"
-                                );
                                 Ok((
                                     logical_result(
                                         crate::executor::WorkerResult::receive(report),
@@ -126,8 +122,8 @@ impl SimExecutor {
 }
 
 impl SimExecutor {
-    /// Returns the result of a submitted physical run.
-    fn poll_run(
+    /// Returns the result of a submitted batch.
+    fn poll_batch(
         &mut self,
         timeout: Duration,
     ) -> anyhow::Result<Option<(BatchResult, Vec<uniserve_worker_ipc::BatchCommand>)>> {
@@ -227,7 +223,7 @@ impl Executor for SimExecutor {
 
     /// Polls for the next completed worker operation.
     fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
-        let Some((result, commands)) = self.poll_run(timeout)? else {
+        let Some((result, commands)) = self.poll_batch(timeout)? else {
             return Ok(None);
         };
         for receipt in &result.command_results {
@@ -756,7 +752,7 @@ impl SimEngine {
         }
     }
 
-    /// Sets the advertised unresolved-run capacity, clamped to at least one.
+    /// Sets the advertised unresolved-batch capacity, clamped to at least one.
     pub fn set_queue_depth(&mut self, depth: u32) {
         self.info.queue_depth = depth.max(1);
     }
@@ -877,7 +873,6 @@ impl SimEngine {
     fn execute(&mut self, batch: ExecutionBatch) -> anyhow::Result<BatchOutput> {
         batch.validate()?;
         let batch_id = batch.id;
-        let run_id = batch.id;
         let closed = batch
             .commands
             .iter()
@@ -974,13 +969,11 @@ impl SimEngine {
         }
         let report = BatchOutput {
             batch_id,
-            run_id,
             completions,
             products: Vec::new(),
             registration: RegistrationAck { visible: true },
             worker_exec_us: None,
             forward_stats: None,
-            done: true,
         };
         for request_key in closed {
             if self
@@ -1039,7 +1032,7 @@ mod tests {
         }
     }
 
-    fn batch(run_id: u64, request_index: u32) -> ExecutionBatch {
+    fn batch(batch_id: u64, request_index: u32) -> ExecutionBatch {
         let request_key = request_key();
         let admission = admission();
         let parent = ComputationId::new(0, 0);
@@ -1047,7 +1040,7 @@ mod tests {
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
 
-            token_output: Some(token_output(ComputationId::new(run_id, request_index))),
+            token_output: Some(token_output(ComputationId::new(batch_id, request_index))),
             vision_input: None,
             latent_feature_input: None,
             encoder_output: None,
@@ -1064,7 +1057,7 @@ mod tests {
             input_token_ids: Vec::new(),
             sampling_state: None,
             request_key,
-            op_id: ComputationId::new(run_id, request_index),
+            op_id: ComputationId::new(batch_id, request_index),
             predecessor: Some(parent),
             entry: "model".into(),
             code: Computation::Forward(ForwardMode::Prefill),
@@ -1078,7 +1071,7 @@ mod tests {
             rng: None,
         };
         ExecutionBatch::new(
-            run_id,
+            batch_id,
             vec![(
                 operation,
                 crate::executor::RequestPlacement {
