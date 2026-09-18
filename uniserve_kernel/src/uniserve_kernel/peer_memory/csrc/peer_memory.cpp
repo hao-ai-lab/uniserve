@@ -186,9 +186,11 @@ class PeerAllocation {
     }
   }
 
-  std::string export_handle() const {
+  pybind11::bytes export_handle() const {
     const c10::cuda::CUDAGuard guard(device_);
-    return export_handle_bytes(handle_, device_);
+    // A shareable handle is opaque bytes, not text, so it crosses to Python as
+    // bytes rather than a string the binding would decode as UTF-8.
+    return pybind11::bytes(export_handle_bytes(handle_, device_));
   }
 
   torch::Tensor map_local() const {
@@ -268,7 +270,7 @@ class PeerAllocation {
   CUmemGenericAllocationHandle handle_ = 0;
 };
 
-std::optional<std::tuple<std::string, size_t, size_t>> export_handle(
+std::optional<std::tuple<pybind11::bytes, size_t, size_t>> export_handle(
     torch::Tensor tensor) {
   TORCH_CHECK(tensor.is_cuda() && tensor.numel() > 0,
               "shared allocation export requires a nonempty CUDA tensor");
@@ -295,7 +297,8 @@ std::optional<std::tuple<std::string, size_t, size_t>> export_handle(
     cuMemRelease(handle);
     const auto offset = static_cast<const char*>(tensor.data_ptr()) -
         static_cast<const char*>(base);
-    return std::make_tuple(std::move(exported), tensor.storage().nbytes(), offset);
+    return std::make_tuple(pybind11::bytes(exported), tensor.storage().nbytes(),
+                           offset);
   } catch (...) {
     cuMemRelease(handle);
     throw;

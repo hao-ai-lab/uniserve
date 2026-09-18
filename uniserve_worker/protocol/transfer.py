@@ -146,6 +146,11 @@ class CudaIpcTransfer:
     span_counts: tuple[int, ...]
     tensor_stride: tuple[int, ...]
     ready_event_handle: bytes
+    # The producing rank's shareable allocation handle, of the type its device
+    # was probed for. A fabric handle is importable from another host, so it
+    # travels with the publication rather than through a descriptor grant that
+    # only reaches this one.
+    allocation_handle: bytes = b""
 
     def __post_init__(self) -> None:
         """Validate native CUDA handles and the declared allocation bounds."""
@@ -164,6 +169,9 @@ class CudaIpcTransfer:
             or any(length < 1 for length in self.span_lengths)
             or any(stride < 0 for stride in self.tensor_stride)
             or len(self.ready_event_handle) != 64
+            # A fabric handle is 64 bytes and a process descriptor is 4; any
+            # other length is not a handle this rank can import.
+            or len(self.allocation_handle) not in (4, 64)
         ):
             raise invalid_descriptor("CUDA IPC transfer handle is incomplete")
 
@@ -281,6 +289,10 @@ class Locator:
                     data.get("ready_event_handle"),
                     f"{where}.ready_event_handle",
                 ),
+                allocation_handle=_bytes(
+                    data.get("allocation_handle"),
+                    f"{where}.allocation_handle",
+                ),
             )
         else:
             raise invalid_descriptor(f"{where}.transport is invalid")
@@ -335,6 +347,7 @@ class Locator:
                 span_counts=list(transport.span_counts),
                 tensor_stride=list(transport.tensor_stride),
                 ready_event_handle=transport.ready_event_handle,
+                allocation_handle=transport.allocation_handle,
             )
         return output
 

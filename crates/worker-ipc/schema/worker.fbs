@@ -423,6 +423,10 @@ table Locator {
   span_counts:[uint];
   tensor_stride:[long];
   ready_event_handle:[ubyte];
+  // The producing rank's shareable allocation handle, of the type its device
+  // was probed for: a fabric handle another host can import, or a process
+  // descriptor that reaches only this one.
+  allocation_handle:[ubyte];
   nbytes:ulong;
   dtype:string;
   shape:[ulong];
