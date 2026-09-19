@@ -569,6 +569,44 @@ class TransferCapacity:
             self.used -= value
 
 
+def _row_span(
+    locator: Locator, region: tuple[slice, ...] | None
+) -> tuple[int, int]:
+    """Return the byte offset and length of whole leading-axis rows.
+
+    A borrowed span must be contiguous in the payload, so every axis but the
+    first is taken whole; the payload's leading axis is indexed relative to
+    the locator's own offset.
+    """
+    import torch
+
+    shape = tuple(int(extent) for extent in locator.shape)
+    itemsize = torch.empty(
+        (), dtype=_dtype_from_str(locator.dtype)
+    ).element_size()
+    row_bytes = itemsize
+    for extent in shape[1:]:
+        row_bytes *= extent
+    if region is None:
+        return 0, row_bytes * (shape[0] if shape else 1)
+    if len(region) != len(shape) or any(
+        (axis.start or 0) != 0
+        or (axis.stop is not None and axis.stop != extent)
+        for axis, extent in zip(region[1:], shape[1:], strict=True)
+    ):
+        raise invalid_descriptor(
+            "a borrowed span covers whole rows of the leading axis"
+        )
+    leading = region[0]
+    first = (leading.start or 0) - (locator.offset[0] if locator.offset else 0)
+    last = (shape[0] if leading.stop is None else leading.stop) - (
+        locator.offset[0] if locator.offset else 0
+    )
+    if not 0 <= first < last <= shape[0]:
+        raise invalid_descriptor("a borrowed span lies outside its location")
+    return first * row_bytes, (last - first) * row_bytes
+
+
 _SHM_LIBC = ctypes.CDLL(None, use_errno=True)
 _SHM_LIBC.shm_open.restype = ctypes.c_int
 
@@ -1142,8 +1180,54 @@ class _ShmSource:
     shm: Any
     nbytes: int
     consumers: tuple[int, ...]
-    host: torch.Tensor | tuple[torch.Tensor, ...] | None = None
     signal: Any = None
+    #: Address of the segment's mapping while it is registered with the
+    #: CUDA driver, so a device-to-host copy lands in it directly.
+    registered: int | None = None
+
+
+def _register_segment(buffer: memoryview) -> int:
+    """Page-lock a segment's mapping so device copies land in it directly.
+
+    Returns the mapping's address, which the unregistration needs. The
+    mapping is page-aligned and page-sized, as every shared-memory mapping
+    is, which the driver requires of a registered range.
+    """
+    import torch
+
+    address = ctypes.addressof(ctypes.c_char.from_buffer(buffer))
+    status = torch.cuda.cudart().cudaHostRegister(address, len(buffer), 0)
+    if int(status) != 0:
+        raise resource_error(
+            f"registering a shared-memory segment with the CUDA driver "
+            f"failed with status {int(status)}"
+        )
+    return address
+
+
+def _unregister_segment(address: int) -> None:
+    import torch
+
+    torch.cuda.cudart().cudaHostUnregister(address)
+
+
+@dataclass(slots=True)
+class HostBorrow:
+    """A consumer's direct view of a published segment's bytes.
+
+    The bytes stay in the producer's segment: a codec process maps them by
+    name and offset. ``release`` writes this rank's acknowledgment word once
+    every read of them is done, which lets the producer retire the segment.
+    """
+
+    segment: str
+    offset: int
+    nbytes: int
+    _release: Callable[[], None]
+
+    def release(self) -> None:
+        release, self._release = self._release, lambda: None
+        release()
 
 
 class ShmTransport(Transport):
@@ -1214,6 +1298,9 @@ class ShmTransport(Transport):
     def _reclaim(
         self, source: _ShmSource, retirement: concurrent.futures.Future[None]
     ) -> None:
+        if source.registered is not None:
+            _unregister_segment(source.registered)
+            source.registered = None
         source.shm.close()
         try:
             source.shm.unlink()
@@ -1246,8 +1333,6 @@ class ShmTransport(Transport):
 
     def _complete_publications(self) -> None:
         """Publish completed host bytes without waiting in the Worker thread."""
-        import torch
-
         selector = selectors.DefaultSelector()
         selector.register(self._publication_control_rx, selectors.EVENT_READ)
         closing = False
@@ -1277,9 +1362,8 @@ class ShmTransport(Transport):
                                 )
                         continue
 
-                    # A stream signal fired: the device-to-host DMA is done,
-                    # so move the staged bytes into the shared segment and
-                    # expose (or fail) the publication.
+                    # A stream signal fired: the device-to-host DMA into the
+                    # segment is done, so expose (or fail) the publication.
                     locator, source = key.data
                     selector.unregister(source.signal)
                     failure = None
@@ -1290,17 +1374,7 @@ class ShmTransport(Transport):
                         failure = error
                     else:
                         device_completed = True
-                        try:
-                            assert source.host is not None
-                            raw = source.host.view(torch.uint8).reshape(-1)
-                            payload = segment.HEADER_BYTES
-                            source.shm.buf[
-                                payload : payload + source.nbytes
-                            ] = bytes(raw.numpy())
-                        except BaseException as error:
-                            failure = error
-                        source.host = None
-                        source.signal = None
+                    source.signal = None
                     # The readiness word is written after the payload, with
                     # release ordering, so a consumer that sees it sees the
                     # bytes it announces.
@@ -1363,33 +1437,29 @@ class ShmTransport(Transport):
             segment.initialize(buffer, locator_digest(locator))
             payload = buffer[segment.HEADER_BYTES :]
 
+            packed = torch.frombuffer(payload, dtype=first.dtype).reshape(shape)
+            address = None
             if first.is_cuda:
-                # Device bytes move through a pinned staging buffer; the
-                # stream signal marks the DMA complete on the worker thread.
+                # Device bytes land in the segment itself: its mapping is
+                # page-locked for the copy, and the stream signal marks the
+                # DMA complete on the publication thread.
                 from .._uniserve_ipc import StreamSignal
 
-                host = torch.empty(
-                    shape, dtype=first.dtype, device="cpu", pin_memory=True
-                )
+                address = _register_segment(buffer)
                 signal = StreamSignal()
             else:
-                host = None
                 signal = None
-                packed = torch.frombuffer(payload, dtype=first.dtype).reshape(
-                    shape
-                )
                 for target, value in _copy_pairs(source, packed):
                     target.copy_(value)
-                del packed, target, value
+                del target, value
                 segment.set_state(buffer, segment.READY)
-            del payload
 
             publication = _ShmSource(
                 shm,
                 nbytes,
                 tuple(int(slot) for slot in consumers),
-                host,
                 signal,
+                address,
             )
             self._publications.publish(
                 locator, publication, pending=first.is_cuda
@@ -1397,24 +1467,24 @@ class ShmTransport(Transport):
             registered = True
 
             if first.is_cuda:
-                assert host is not None
                 assert signal is not None
                 submitted = True
                 from uniserve_kernel.peer_memory import copy_host_device
 
                 stream = torch.cuda.current_stream(first.device)
-                for target, value in _copy_pairs(source, host):
+                for target, value in _copy_pairs(source, packed):
                     copy_host_device(target, value, stream)
                     value.record_stream(stream)
                 signal.schedule(int(stream.cuda_stream))
                 self._queue_publication((locator, publication))
+            del packed, payload
             return locator
         except BaseException:
             if registered:
                 self._publications.release(locator)
                 if submitted:
-                    # Preserve the registered pinned destination if CUDA cannot
-                    # establish completion on this exceptional publication path.
+                    # The segment stays mapped and registered until the copy
+                    # into it has retired.
                     torch.cuda.current_stream(first.device).synchronize()
                 if first.is_cuda:
                     segment.set_state(buffer, segment.FAILED)
@@ -1519,6 +1589,61 @@ class ShmTransport(Transport):
             region,
             nbytes=locator.nbytes,
             destination=target,
+        )
+
+    def borrow(
+        self, locator: Locator, region: tuple[slice, ...] | None = None
+    ) -> HostBorrow:
+        """Expose a published payload in place for a reader on this host.
+
+        The reader is told the segment's name and the byte span of ``region``,
+        a span of whole leading-axis rows, and reads it through its own
+        mapping; the bytes are neither copied nor retained here. Readiness
+        is awaited before returning, and releasing the borrow writes this
+        rank's acknowledgment word.
+        """
+        handle = locator.transport
+        if not isinstance(handle, PosixShmTransfer):
+            raise invalid_descriptor(
+                "shared-memory borrow requires a shared-memory locator"
+            )
+        if locator.source.node != self.source.node:
+            raise invalid_descriptor(
+                "shared-memory transport requires the source node"
+            )
+        start, nbytes = _row_span(locator, region)
+        try:
+            shm = _open_shared_memory(
+                handle.name, segment.HEADER_BYTES + locator.nbytes
+            )
+        except FileNotFoundError:
+            raise invalid_descriptor(
+                "publication is retired, invalid, or belongs to another view"
+            ) from None
+        header = memoryview(shm)
+        try:
+            if segment.digest(header) != locator_digest(locator):
+                raise invalid_descriptor(
+                    "publication is retired, invalid, or belongs to another "
+                    "view"
+                )
+            segment.await_ready(header)
+        except BaseException:
+            header.release()
+            shm.close()
+            raise
+
+        def release() -> None:
+            # The word is written after the reader's use of the payload, with
+            # release ordering, so the producer reclaims nothing still read.
+            try:
+                segment.acknowledge(header, self._acknowledgment_slot)
+            finally:
+                header.release()
+                shm.close()
+
+        return HostBorrow(
+            handle.name, segment.HEADER_BYTES + start, nbytes, release
         )
 
     def release(
