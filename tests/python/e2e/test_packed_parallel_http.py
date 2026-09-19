@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from pathlib import Path
@@ -16,6 +15,7 @@ from tests.python.e2e.http_helpers import (
     require_uniserve_binary,
     server_process,
     tiny_input_png_b64,
+    written_deployment,
 )
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu]
@@ -73,7 +73,7 @@ def test_ordered_bindings_generate_outputs(
         "--worker-python",
         sys.executable,
         "--workers",
-        json.dumps([worker_config]),
+        str(written_deployment(tmp_path, [worker_config])),
         "--dtype",
         "bfloat16",
         "--max-total-tokens",

@@ -120,7 +120,7 @@ curl -s http://127.0.0.1:8000/v1/images/generations \
 | `--uds` | Unset | Unix-domain listener instead of TCP |
 | `--device` | `cuda` | Worker device |
 | `--worker-ranks` | `1` | Ranks in the default Worker instance when `--workers` is omitted |
-| `--workers` | Model defaults | JSON static Worker bindings, node/device ranks, and entry parallel configuration |
+| `--workers` | One `model` entry over every rank | Path to a JSON deployment configuration: Worker instances, node/device ranks, and the components placed on them |
 | `--max-model-len` | Model configuration | Context-length ceiling |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |
 | `--max-running-requests` | `128` | Scheduler active-request bound |

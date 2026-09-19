@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import signal
 import socket
@@ -134,3 +135,15 @@ def tiny_input_png_b64() -> str:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def written_deployment(directory: Path, workers: list[dict[str, Any]]) -> Path:
+    """Write the deployment configuration a serve invocation is given.
+
+    `--workers` names a file because a deployment configuration states every
+    rank's node and device and every component placed on them; a test states
+    one the same way a deployment does.
+    """
+    path = directory / "deployment.json"
+    path.write_text(json.dumps(workers, indent=2))
+    return path

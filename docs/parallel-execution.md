@@ -4,9 +4,9 @@ Qwen3, SenseNova and BAGEL use the same tensor, sequence and pipeline parallel e
 
 ## Configure model parallelism
 
-Use `--workers` to declare participating devices and the parallel configuration of the `model` entry. This four-device example combines TP2 with Ulysses SP2:
+`--workers` names a deployment configuration: the participating devices and the parallel configuration of each entry placed on them. This four-device example combines TP2 with Ulysses SP2.
 
-Save the placement as `workers.json`:
+Save it as `workers.json`:
 
 ```json
 [
@@ -35,7 +35,7 @@ Save the placement as `workers.json`:
 
 ```bash
 uniserve serve /workspace/models/Qwen3-32B \
-  --workers "$(cat workers.json)"
+  --workers workers.json
 ```
 
 The same `model` entry configuration applies to SenseNova and BAGEL with their checkpoint paths and model descriptions. The product of tensor, pipeline and sequence degrees must match the entry's rank count. Attention heads must admit the declared partition. Pipeline stages own nonempty layer ranges; layer counts need not divide evenly between stages.
