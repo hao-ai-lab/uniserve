@@ -357,6 +357,34 @@ impl Scheduler {
     }
 }
 
+/// The stages that read a video stage's products, or `None` for a stage
+/// outside the video call graph.
+///
+/// This is the same graph `ready_calls` walks and the input binding reads:
+/// text encoding feeds latent preparation, which opens the denoising ladder;
+/// each step feeds the next and the last feeds both decoders; a decoder's
+/// window feeds its encoder and its encoded unit row feeds the muxer, which
+/// also assembles the encoded audio. The producing rank is told which ranks
+/// read its products from this, because it cannot know on its own.
+pub(crate) fn consuming_stages(stage: PipelineStage) -> Option<&'static [PipelineStage]> {
+    Some(match stage {
+        PipelineStage::TextEncoding => &[PipelineStage::LatentPreparation],
+        PipelineStage::LatentPreparation => &[PipelineStage::Denoising],
+        PipelineStage::Denoising => &[
+            PipelineStage::Denoising,
+            PipelineStage::VideoDecoding,
+            PipelineStage::AudioDecoding,
+        ],
+        PipelineStage::VideoDecoding => &[PipelineStage::VideoEncoding, PipelineStage::Muxing],
+        PipelineStage::VideoEncoding => &[PipelineStage::Muxing],
+        PipelineStage::AudioDecoding => &[PipelineStage::AudioEncoding],
+        PipelineStage::AudioEncoding | PipelineStage::Muxing => &[],
+        PipelineStage::VisionEncoding
+        | PipelineStage::LatentEncoding
+        | PipelineStage::ImageDecoding => return None,
+    })
+}
+
 /// The lanes one media call occupies while it is in flight.
 ///
 /// A component lane measured in media units carries `units`; every other
@@ -827,6 +855,7 @@ impl Scheduler {
             let completion_output = (outputs.is_empty() && stateful)
                 .then(|| self.media_completion_product(request_key, call_id));
             let mut call = Call {
+                consumer_slots: Vec::new(),
                 token_input: None,
                 coordinates: CallCoordinates {
                     logical_position: 0,

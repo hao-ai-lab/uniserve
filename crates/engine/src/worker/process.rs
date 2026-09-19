@@ -246,7 +246,6 @@ impl WorkerProcessArgs {
         distributed_init_method: Option<String>,
         channel_transport: &str,
         acknowledgment_slot: u32,
-        product_consumers: &[u32],
         products_cross_hosts: bool,
     ) -> anyhow::Result<serde_json::Value> {
         let depth = self.queue_depth.max(1);
@@ -258,10 +257,9 @@ impl WorkerProcessArgs {
         // a rank on the head's host can offer shared memory, a rank elsewhere
         // cannot, and only the head knows where a rank was placed.
         fields.insert("channel_transport".into(), json!(channel_transport));
-        // A consumer writes its own slot's word in every chunk it reads, and a
-        // producer watches the slots of the ranks that read its products.
+        // A consumer writes its own slot's word in every chunk or segment it
+        // reads; the slots a producer watches travel on each producing call.
         fields.insert("acknowledgment_slot".into(), json!(acknowledgment_slot));
-        fields.insert("product_consumers".into(), json!(product_consumers));
         // Readiness is a producer synchronize only where an interprocess event
         // cannot carry it, which is exactly where a consumer is on another
         // host. Only the placement knows that.
@@ -466,9 +464,9 @@ impl PendingRank {
         // A rank cannot name the ranks that read what it publishes: it knows
         // its own component, not which component consumes its products, and a
         // product is consumed in a later batch than the one producing it. The
-        // edges hold that, so the head states the consumers here.
+        // head states a product's readers on the call that produces it and
+        // gives the rank its own slot here.
         let acknowledgment_slot = args.transfer.acknowledgment_slot(&args.worker_id, rank);
-        let product_consumers = args.transfer.product_consumers(&args.worker_id, rank);
         let products_cross_hosts = args.transfer.products_cross_hosts(&args.worker_id, rank);
         let names = |backends: &std::collections::BTreeSet<crate::executor::TransferBackend>| {
             backends
@@ -493,7 +491,6 @@ impl PendingRank {
             distributed_init_method,
             channel_transport,
             acknowledgment_slot,
-            &product_consumers,
             products_cross_hosts,
         )?;
         let descriptor_directory = tempfile::Builder::new()

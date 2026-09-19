@@ -131,12 +131,14 @@ def test_independent_product_work_preserves_request_progress(
 def test_retained_encoder_product_outlives_its_producer_request(
     backends: tuple[str, ...], device: str
 ) -> None:
-    backend = backends[0]
+    # A consumer binds the mechanisms its edge to the producer carries, which
+    # a placement gives both ends alike: a device product travels on the
+    # device mechanism and a host product on the host mechanism.
     producer = execution_worker(transfer_backends=backends, device=device)
     consumer = (
         producer
-        if backend == "local"
-        else execution_worker(transfer_backends=(backend,), device=device)
+        if backends == ("local",)
+        else execution_worker(transfer_backends=backends, device=device)
     )
     admission = ar_params(91, block_ids=(0,))
     image = io.BytesIO()
@@ -196,7 +198,7 @@ def test_retained_encoder_product_outlives_its_producer_request(
             calls=(visual,),
             input_products=produced.products,
         )
-        if backend != "local":
+        if backends != ("local",):
             prepared = consumer.submit(batch)
             assert prepared is not None
             deadline = time.monotonic() + 5

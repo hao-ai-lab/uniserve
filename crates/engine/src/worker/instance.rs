@@ -844,6 +844,51 @@ impl WorkerGroup {
     }
 }
 
+impl WorkerGroup {
+    /// Acknowledgment slots of the ranks that read the products a call
+    /// produces on `rank`, where `members` are the ranks executing the call.
+    ///
+    /// A video stage's readers are the ranks of the components serving the
+    /// stages that consume it, less the ranks that produce their own copy: a
+    /// consumer reads the copy it holds before any other. Work outside the
+    /// video graph is read by the destinations of the rank's transfer edges.
+    fn consumer_slots(
+        &self,
+        call: &uniserve_worker_ipc::Call,
+        members: &[usize],
+        rank: usize,
+    ) -> Vec<u32> {
+        let transfer = &self.process_args.transfer;
+        let worker = &self.process_args.worker_id;
+        let consuming = match call.code {
+            uniserve_worker_ipc::CallKind::Pipeline(stage) => {
+                crate::scheduler::consuming_stages(stage)
+            }
+            _ => None,
+        };
+        let Some(consuming) = consuming else {
+            return transfer.product_consumers(worker, rank as u32);
+        };
+        let mut slots = BTreeSet::new();
+        for stage in consuming {
+            let Some(entry) = self
+                .info
+                .pipeline_components
+                .get(stage)
+                .and_then(|name| self.process_args.entries.get(name))
+            else {
+                continue;
+            };
+            for &reader in &entry.ranks {
+                if reader != rank && !members.contains(&reader) {
+                    slots.insert(transfer.acknowledgment_slot(worker, reader as u32));
+                }
+            }
+        }
+        slots.into_iter().collect()
+    }
+}
+
 /// Restrict a physical invocation to each entry's actual members. Request and
 /// storage commands retain group-wide visibility, including on otherwise idle
 /// ranks; they do not create synthetic computation completions.
@@ -851,6 +896,7 @@ fn rank_projection(
     batch: &Batch,
     entries: &BTreeMap<String, crate::ComponentConfig>,
     rank_count: usize,
+    consumer_slots: impl Fn(&uniserve_worker_ipc::Call, &[usize], usize) -> Vec<u32>,
 ) -> anyhow::Result<Vec<(usize, Batch)>> {
     let members = batch
         .calls
@@ -888,10 +934,16 @@ fn rank_projection(
         }
         // A rank receives the batch's projection onto the calls it owns,
         // under the same identity: commands travel to every participating rank.
+        // Each call states which ranks read its products, which only the head
+        // can derive from the placement.
         let mut projection = batch.clone();
         projection.calls = indices
             .iter()
-            .map(|index| batch.calls[*index].clone())
+            .map(|index| {
+                let mut call = batch.calls[*index].clone();
+                call.consumer_slots = consumer_slots(&call, members[*index], rank);
+                call
+            })
             .collect();
         projection.forward = batch.forward.select(&indices);
         let slots = projection
@@ -1333,21 +1385,26 @@ impl WorkerGroup {
             .validate()
             .map_err(anyhow::Error::from)
             .map_err(BatchSubmitError::Failed)?;
-        let rank_batches = rank_projection(&batch, &self.process_args.entries, self.workers.len())
-            .and_then(|batches| {
-                batches
-                    .into_iter()
-                    .map(|(rank, mut batch)| {
-                        self.process_args.transfer.bind_inputs(
-                            &mut batch.input_products,
-                            &mut batch.kv_inputs,
-                            &self.workers[rank].info().endpoint,
-                        )?;
-                        Ok((rank, batch))
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()
-            })
-            .map_err(BatchSubmitError::Failed)?;
+        let rank_batches = rank_projection(
+            &batch,
+            &self.process_args.entries,
+            self.workers.len(),
+            |call, members, rank| self.consumer_slots(call, members, rank),
+        )
+        .and_then(|batches| {
+            batches
+                .into_iter()
+                .map(|(rank, mut batch)| {
+                    self.process_args.transfer.bind_inputs(
+                        &mut batch.input_products,
+                        &mut batch.kv_inputs,
+                        &self.workers[rank].info().endpoint,
+                    )?;
+                    Ok((rank, batch))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        })
+        .map_err(BatchSubmitError::Failed)?;
         let batch_id = batch.batch_id;
         let requests = batch
             .calls()

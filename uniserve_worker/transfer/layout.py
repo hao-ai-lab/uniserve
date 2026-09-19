@@ -197,14 +197,20 @@ def fetch_tensor(
         device=device,
     )
 
-    # Greedily cover the requested region from bound source locations in
-    # publication order. Each read records its region in both source-local
-    # and region-local coordinates.
+    # Greedily cover the requested region from bound source locations, the
+    # copies this rank holds itself before any other rank's and otherwise in
+    # publication order, so a replicated product is never read across ranks.
+    # The producer of every remote copy is told which ranks read it on that
+    # basis. Each read records its region in both source-local and
+    # region-local coordinates.
     missing = [region]
     reads: list[
         tuple[Transport, Locator, tuple[slice, ...], tuple[slice, ...]]
     ] = []
-    for location in tensor.locations:
+    ordered = sorted(
+        tensor.locations, key=lambda location: location.backend != "local"
+    )
+    for location in ordered:
         transport = bindings.get((location.source, location.backend))
         if transport is None:
             continue

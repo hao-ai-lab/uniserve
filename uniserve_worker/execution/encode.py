@@ -215,6 +215,7 @@ def publish_features(
             publication_transports,
             resident,
             retain=partial(tensor_store.retain_publication, write),
+            consumers=call.consumer_slots,
         )
         request.exported_locators.extend(locations)
         request.tensor_exports[feature_output.buffer_id] = tuple(

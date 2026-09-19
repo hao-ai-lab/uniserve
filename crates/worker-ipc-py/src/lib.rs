@@ -17,9 +17,10 @@
 mod convert;
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule};
@@ -492,12 +493,52 @@ fn service_name(id: &str) -> String {
     uniserve_worker_ipc::service_name(id)
 }
 
+/// Resolves one aligned 32-bit word inside a writable buffer.
+///
+/// A shared-memory segment's header words are read and written by different
+/// processes, and the readiness word is written after the payload it
+/// announces. Python cannot order those stores, so the words are accessed
+/// through release and acquire atomics here.
+fn buffer_word(buffer: &PyBuffer<u8>, offset: usize) -> PyResult<*mut u32> {
+    if buffer.readonly() {
+        return Err(py_runtime("atomic word requires a writable buffer"));
+    }
+    if offset % 4 != 0 || offset.saturating_add(4) > buffer.len_bytes() {
+        return Err(py_runtime("atomic word offset is outside its buffer"));
+    }
+    // SAFETY: the offset is aligned and inside the buffer, whose memory the
+    // caller keeps mapped while the returned pointer is used.
+    Ok(unsafe { buffer.buf_ptr().cast::<u8>().add(offset).cast::<u32>() })
+}
+
+#[pyfunction]
+/// Stores `value` at `offset` with release ordering, after every earlier
+/// write into any memory this process made.
+fn atomic_store_u32(buffer: PyBuffer<u8>, offset: usize, value: u32) -> PyResult<()> {
+    let word = buffer_word(&buffer, offset)?;
+    // SAFETY: `buffer_word` checked alignment and bounds; the buffer stays
+    // mapped for the call.
+    unsafe { AtomicU32::from_ptr(word) }.store(value, Ordering::Release);
+    Ok(())
+}
+
+#[pyfunction]
+/// Loads the word at `offset` with acquire ordering, so that every write the
+/// storing process made before its release store is visible afterwards.
+fn atomic_load_u32(buffer: PyBuffer<u8>, offset: usize) -> PyResult<u32> {
+    let word = buffer_word(&buffer, offset)?;
+    // SAFETY: as in `atomic_store_u32`.
+    Ok(unsafe { AtomicU32::from_ptr(word) }.load(Ordering::Acquire))
+}
+
 #[pymodule]
 /// Registers the worker IPC Python extension module.
 fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyServer>()?;
     m.add_class::<PyStreamSignal>()?;
     m.add_function(wrap_pyfunction!(service_name, m)?)?;
+    m.add_function(wrap_pyfunction!(atomic_store_u32, m)?)?;
+    m.add_function(wrap_pyfunction!(atomic_load_u32, m)?)?;
     Ok(())
 }
 

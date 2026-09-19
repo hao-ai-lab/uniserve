@@ -299,6 +299,7 @@ fn latent_output(output_index: u16, bytes: u64, dtype: DType) -> Result<TensorRe
 /// Builds the actual computation before assigning storage and execution identities.
 fn computation(request: &GenerationRequest, code: CallKind) -> Call {
     Call {
+        consumer_slots: Vec::new(),
         token_input: None,
 
         request_key: RequestKey::new(0, request.request_id, 0),

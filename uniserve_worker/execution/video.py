@@ -842,6 +842,10 @@ def execute(
                 raise invalid_descriptor(
                     "media decoder must return one numerical tensor"
                 )
+            # A PCM media unit is a host product: the muxer's audio encoder
+            # consumes it on its host lane, so it travels as host bytes over
+            # the host mechanism, across hosts as readily as within one. A
+            # decoded video window stays on its device for the encoder there.
             products = transfer.publish_tensors(
                 call,
                 result.values,
@@ -849,6 +853,7 @@ def execute(
                 tensor_store=tensor_store,
                 publication_transports=publication_transports,
                 state=state,
+                host=call.kind is PipelineStage.AUDIO_DECODING,
             )
         elif call.kind is PipelineStage.VIDEO_ENCODING:
             # The rank that decoded this media unit converts it to RGB on its

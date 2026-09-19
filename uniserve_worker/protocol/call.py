@@ -580,6 +580,10 @@ class Call:
     # KV cache transfer endpoints, as persistent buffer identities.
     kv_input: identity.BufferId | None = None
     kv_output: identity.BufferId | None = None
+    # Acknowledgment slots of the ranks that read this call's products, stated
+    # by the engine; a published product retires once each has acknowledged
+    # it. This rank's own slot is never listed.
+    consumer_slots: tuple[int, ...] = ()
 
     def tensor_inputs(self) -> tuple[tensor.TensorRef, ...]:
         """Return tensor inputs from the computation signature.
@@ -956,6 +960,12 @@ class Call:
             else identity.BufferId.from_mapping(
                 get("kv_output"), f"{where}.kv_output"
             ),
+            consumer_slots=tuple(
+                _uint(slot, f"{where}.consumer_slots[{index}]")
+                for index, slot in enumerate(
+                    _seq(get("consumer_slots", ()), f"{where}.consumer_slots")
+                )
+            ),
             input_image=(
                 None
                 if get("input_image") is None
@@ -1026,6 +1036,7 @@ class Call:
             "kv_output": None
             if self.kv_output is None
             else self.kv_output.to_mapping(),
+            "consumer_slots": list(self.consumer_slots),
             "sampling_state": (
                 None
                 if self.sampling_state is None

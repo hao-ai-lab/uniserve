@@ -20,7 +20,6 @@ DEFAULTS: dict[str, Any] = {
     "registration_address": "127.0.0.1:0",
     "channel_transport": "iceoryx2",
     "acknowledgment_slot": 0,
-    "product_consumers": [],
     "products_cross_hosts": False,
     "worker_id": "worker",
     "queue_depth": 2,

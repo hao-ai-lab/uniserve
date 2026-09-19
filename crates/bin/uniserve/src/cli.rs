@@ -147,7 +147,9 @@ pub(crate) struct SharedRuntimeArgs {
     /// each one's node/device ranks, and the components placed on them.
     #[arg(long, value_name = "FILE", value_parser = read_workers)]
     pub workers: Option<Box<[WorkerConfig]>>,
-    /// Directed product bindings: source[:rank]->destination[:rank]=backend.
+    /// Directed product bindings: source[:rank]->destination[:rank]=mechanisms,
+    /// where mechanisms names the edge's device mechanism, its host mechanism,
+    /// or both joined by `+` with the device mechanism first (`cuda_vmm+shm`).
     #[arg(long)]
     pub transfer: Option<TransferConfig>,
     /// KV block size in tokens (the page size).

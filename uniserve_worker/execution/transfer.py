@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING
@@ -92,6 +92,7 @@ def execute(
             expected_base=expected_base,
             buffer=output,
             transports=transports,
+            consumers=call.consumer_slots,
         )
         request.cache_publication = (output, snapshot)
 
@@ -278,6 +279,7 @@ def publish_latent_source(
         transports,
         source.spans,
         retain=partial(pool.retain_publication, source),
+        consumers=row.call.consumer_slots,
     )
     request.exported_locators.extend(locations)
     request.latent_exports[product.buffer_id] = tuple(
@@ -302,10 +304,12 @@ def publish_tensors(
     state: BatchState,
     tensor_store: TensorStore,
     publication_transports: Mapping[str, Transport],
+    host: bool = False,
 ) -> tuple[TensorPublication, ...]:
-    """Publish each numerical result from the rank owning its assigned.
+    """Publish each numerical result from the rank owning its assigned region.
 
-    region.
+    A product published as `host` travels as host bytes over the host
+    mechanism of the rank's edges, whatever device produced it.
     """
     outputs = call.outputs
     if len(outputs) != len(values):
@@ -325,6 +329,8 @@ def publish_tensors(
             tensor_store=tensor_store,
             publication_transports=publication_transports,
             state=state,
+            consumers=call.consumer_slots,
+            host=host,
         )
         for output, value in zip(outputs, values, strict=True)
         if output in owned
@@ -340,10 +346,13 @@ def publish_product(
     state: BatchState,
     tensor_store: TensorStore,
     publication_transports: Mapping[str, Transport],
+    consumers: Sequence[int] = (),
+    host: bool = False,
 ) -> TensorPublication:
-    """Publish a typed device, encoder.
+    """Publish a typed device, encoder or artifact product.
 
-    or artifact product through the selected transport.
+    `consumers` are the acknowledgment slots the producing call names; a
+    `host` product is published as host bytes.
     """
     from .encode import bound_device_write
 
@@ -451,6 +460,8 @@ def publish_product(
         value,
         retain=retain,
         offset=None if region is None else _slices.offset(region),
+        consumers=consumers,
+        host=host,
     )
     request.exported_locators.extend(locations)
     request.tensor_exports[product.buffer_id] = tuple(

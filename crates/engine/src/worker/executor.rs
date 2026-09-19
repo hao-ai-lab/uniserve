@@ -215,64 +215,69 @@ impl WorkerExecutor {
                             .insert((source.endpoint.clone(), destination.endpoint.clone())),
                         "physical transfer edge has conflicting bindings"
                     );
-                    let backend = edge.transport.as_str();
-                    anyhow::ensure!(
-                        source.transfer_backends.iter().any(|name| name == backend)
-                            && destination
-                                .transfer_backends
-                                .iter()
-                                .any(|name| name == backend),
-                        "physical edge requires an uninitialized transfer backend {backend}"
-                    );
-                    // Each mechanism decides for itself how far it reaches.
-                    // An edge it cannot serve would fail on its first
-                    // publication, so it is refused here by name instead.
-                    let (source_host, destination_host) =
-                        (&source.endpoint.node, &destination.endpoint.node);
-                    let crosses_hosts = source_host != destination_host;
-                    match edge.transport {
-                        crate::executor::TransferBackend::Local => anyhow::ensure!(
-                            source.endpoint.address_space == destination.endpoint.address_space,
-                            "local transfer requires a shared address space"
-                        ),
-                        crate::executor::TransferBackend::CudaVmm => {
-                            anyhow::ensure!(
-                                source.device.starts_with("cuda:")
-                                    && destination.device.starts_with("cuda:"),
-                                "CUDA VMM requires CUDA devices on both endpoints"
-                            );
-                            // A device handle crosses hosts only where the
-                            // producing device exports a fabric handle and the
-                            // consuming device can import one.
-                            if crosses_hosts {
-                                let unreachable = if source.fabric_handles {
-                                    destination_host
-                                } else {
-                                    source_host
-                                };
+                    // An edge carries device products on one mechanism and
+                    // host products on another; each decides for itself how
+                    // far it reaches.
+                    for mechanism in edge.mechanisms() {
+                        let backend = mechanism.as_str();
+                        anyhow::ensure!(
+                            source.transfer_backends.iter().any(|name| name == backend)
+                                && destination
+                                    .transfer_backends
+                                    .iter()
+                                    .any(|name| name == backend),
+                            "physical edge requires an uninitialized transfer backend {backend}"
+                        );
+                        // Each mechanism decides for itself how far it reaches.
+                        // An edge it cannot serve would fail on its first
+                        // publication, so it is refused here by name instead.
+                        let (source_host, destination_host) =
+                            (&source.endpoint.node, &destination.endpoint.node);
+                        let crosses_hosts = source_host != destination_host;
+                        match mechanism {
+                            crate::executor::TransferBackend::Local => anyhow::ensure!(
+                                source.endpoint.address_space == destination.endpoint.address_space,
+                                "local transfer requires a shared address space"
+                            ),
+                            crate::executor::TransferBackend::CudaVmm => {
                                 anyhow::ensure!(
-                                    source.fabric_handles && destination.fabric_handles,
-                                    "transfer edge from worker {} on host {source_host} to \
+                                    source.device.starts_with("cuda:")
+                                        && destination.device.starts_with("cuda:"),
+                                    "CUDA VMM requires CUDA devices on both endpoints"
+                                );
+                                // A device handle crosses hosts only where the
+                                // producing device exports a fabric handle and the
+                                // consuming device can import one.
+                                if crosses_hosts {
+                                    let unreachable = if source.fabric_handles {
+                                        destination_host
+                                    } else {
+                                        source_host
+                                    };
+                                    anyhow::ensure!(
+                                        source.fabric_handles && destination.fabric_handles,
+                                        "transfer edge from worker {} on host {source_host} to \
                                      worker {} on host {destination_host} crosses hosts, and \
                                      the device on host {unreachable} exports a process \
                                      descriptor the other host cannot import",
-                                    edge.source_worker.0,
-                                    edge.destination_worker.0,
-                                );
+                                        edge.source_worker.0,
+                                        edge.destination_worker.0,
+                                    );
+                                }
                             }
-                        }
-                        // Shared memory names a segment in one host's namespace.
-                        crate::executor::TransferBackend::Shm => anyhow::ensure!(
-                            !crosses_hosts,
-                            "transfer edge from worker {} on host {source_host} to worker {} \
+                            // Shared memory names a segment in one host's namespace.
+                            crate::executor::TransferBackend::Shm => anyhow::ensure!(
+                                !crosses_hosts,
+                                "transfer edge from worker {} on host {source_host} to worker {} \
                              on host {destination_host} crosses hosts over shared memory, \
                              which names a segment in one host's namespace",
-                            edge.source_worker.0,
-                            edge.destination_worker.0,
-                        ),
-                        // A product on the rank channel reaches wherever the
-                        // channel does, which is every host of the instance.
-                        crate::executor::TransferBackend::Channel => {}
+                                edge.source_worker.0,
+                                edge.destination_worker.0,
+                            ),
+                            // A product on the rank channel reaches wherever the
+                            // channel does, which is every host of the instance.
+                            crate::executor::TransferBackend::Channel => {}
+                        }
                     }
                 }
             }

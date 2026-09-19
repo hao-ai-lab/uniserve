@@ -1039,6 +1039,7 @@ mod tests {
         let request_key = request_key();
         let admission = admission();
         let call = Call {
+            consumer_slots: Vec::new(),
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
 

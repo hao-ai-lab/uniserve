@@ -452,6 +452,7 @@ impl<'py> NativeRequestConversion<'py> {
                     .map(|buffer| self.buffer_id(buffer))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py)),
+                pyo3::types::PyTuple::new(py, &call.consumer_slots)?.into_any(),
             ],
         )?;
         self.types.call.bind(py).call1(arguments)
@@ -1924,6 +1925,7 @@ mod tests {
             shape_bound: ShapeBound::default(),
         };
         let call = Call {
+            consumer_slots: Vec::new(),
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
 
@@ -1996,6 +1998,7 @@ mod tests {
         )
         .unwrap();
         let media_call = Call {
+            consumer_slots: Vec::new(),
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
 
@@ -2045,6 +2048,7 @@ mod tests {
             generation: 3,
         };
         let kv_call = Call {
+            consumer_slots: Vec::new(),
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
             token_output: None,
