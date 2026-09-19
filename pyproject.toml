@@ -65,6 +65,12 @@ uniserve-worker = "uniserve_worker.main:main"
 # console script whose dependencies it never declares.
 include = ["uniserve", "uniserve.*", "uniserve_models*", "uniserve_worker*"]
 
+[tool.setuptools.package-data]
+# A model package declares how its components divide beside its numerical code.
+# The declaration is read at serving time, without importing the package, so it
+# has to ship with it.
+"uniserve_models" = ["*/placement.toml"]
+
 # Native worker IPC extension (PyO3).
 [[tool.setuptools-rust.ext-modules]]
 target = "uniserve_worker._uniserve_ipc"
