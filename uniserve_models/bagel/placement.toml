@@ -1,0 +1,4 @@
+# One division per component, as `uniserve_models.placement` reads them.
+#
+# The model is one component whose tensors divide over every rank.
+model = "tensor"

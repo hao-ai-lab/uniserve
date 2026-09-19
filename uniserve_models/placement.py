@@ -1,151 +1,175 @@
-"""Each architecture's computation entries and how they partition over ranks.
+"""How a model's components divide work over the ranks that hold them.
 
-A model knows which components it owns and how each one divides work: a
-denoiser partitions a sequence, a text encoder partitions tensors, a decoder
-divides a timeline into media units, and a muxer assembles an artifact and
-divides nothing. Serving infrastructure owns the rest of placement -- which
-host and device each rank is, how many ranks there are, and how they are
-numbered -- so this module states only what the model itself determines, for a
-given number of ranks.
+A model owns two statements about placement. Which components exist, and how
+each one divides: a denoiser divides a sequence by attention head, a text
+encoder divides its tensors, a decoder divides its output timeline into media
+units, and a muxer assembles the artifact and divides nothing. Everything else
+is the serving infrastructure's -- which host and device each rank is, how many
+ranks there are, and how they are numbered -- so a model states the division
+and shared code states what that division means for a given rank count.
 
-The module is deliberately free of numerical dependencies. Resolving a
-checkpoint's entries reads one metadata file and imports nothing from the
-model's numerical package, so an engine can ask for a placement without paying
-for a framework import.
+Each model package declares its components beside its numerical code, in a
+``placement.toml`` naming one division per component. The declaration is read
+rather than imported, so resolving a placement costs two file reads and no
+framework import, and an engine can ask for one without loading a model.
 """
 
 from __future__ import annotations
 
 import json
+import tomllib
 from collections.abc import Mapping
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 
-__all__ = ["ARCHITECTURE_PACKAGES", "architecture_of", "entries_for"]
+__all__ = [
+    "Partition",
+    "architecture_of",
+    "divisions_of",
+    "entries_for",
+    "package_of",
+]
 
 
-#: Architecture name to the package implementing it. Loading reads the same
-#: mapping, so an architecture is named in one place.
-ARCHITECTURE_PACKAGES: Mapping[str, str] = MappingProxyType(
+#: Architecture name to the package under this one implementing it, which is
+#: where that architecture's declaration lives. Loading asks for the package
+#: through `package_of`, so an architecture names its implementation once.
+_PACKAGES: Mapping[str, str] = MappingProxyType(
     {
-        "Qwen3ForCausalLM": "uniserve_models.qwen3",
-        "Qwen3MoeForCausalLM": "uniserve_models.qwen3",
-        "BagelForConditionalGeneration": "uniserve_models.bagel",
-        "NEOChatModel": "uniserve_models.sensenova_u1",
-        "MiniMaxH3Transformer3DModel": "uniserve_models.minimax_h3",
+        "Qwen3ForCausalLM": "qwen3",
+        "Qwen3MoeForCausalLM": "qwen3",
+        "BagelForConditionalGeneration": "bagel",
+        "NEOChatModel": "sensenova_u1",
+        "MiniMaxH3Transformer3DModel": "minimax_h3",
     }
 )
 
+#: A modular media checkpoint's root names the pipeline assembled around the
+#: denoising transformer rather than the transformer that implements the
+#: architecture; this reads one as the other.
+_PIPELINE_ARCHITECTURES: Mapping[str, str] = MappingProxyType(
+    {"MiniMaxH3ModularPipeline": "MiniMaxH3Transformer3DModel"}
+)
 
-def _tensor_parallel(ranks: int) -> dict:
-    """Partition one component's tensors across every rank."""
-    return {
-        "ranks": list(range(ranks)),
-        "parallel_config": {"tensor_parallel_size": ranks},
-    }
-
-
-def _token_entries(ranks: int) -> dict:
-    """A decoder-only language model is one component over every rank."""
-    return {"model": _tensor_parallel(ranks)}
+#: The file in which a package declares one division per component.
+_DECLARATION = "placement.toml"
 
 
-def _minimax_h3_entries(ranks: int) -> dict:
-    """MiniMax H3's five components and the partition each one admits.
+class Partition(StrEnum):
+    """How one component divides its work over the ranks that hold it.
 
-    The denoiser divides its sequence by attention head, so its Ulysses degree
-    is the rank count. The text encoder divides its tensors. Both decoders
-    divide their output timeline into media units, one per rank, and reconstruct
-    and encode where they decode. The muxer assembles the encoded units into the
-    artifact; it owns no numerical method and divides nothing, so it is placed
-    alone.
+    The division is the model's mathematical property and does not depend on
+    how wide the instance is; the rank count turns it into a placement.
+    """
+
+    #: Divides the component's tensors, every rank holding a shard of each.
+    TENSOR = "tensor"
+    #: Divides the sequence by attention head, which Ulysses exchanges.
+    SEQUENCE = "sequence"
+    #: Divides the output timeline, each rank reconstructing its own units.
+    MEDIA_UNITS = "media_units"
+    #: Divides nothing, so one rank holds the whole component.
+    NOTHING = "nothing"
+
+
+def _placed(partition: Partition, ranks: int) -> dict:
+    """State one component's placement over an instance of ``ranks`` ranks.
+
+    The result is a `ComponentConfig` as an explicit ``--workers`` placement
+    writes it, so a declared placement and a written one are the same object to
+    the engine.
     """
     members = list(range(ranks))
-    unit_decoder = {
-        "ranks": members,
-        "parallel_config": {},
-        "distribution": "temporal_units",
-        "units_per_rank": 1,
-    }
-    return {
-        "denoiser": {
-            "ranks": members,
-            "parallel_config": {
-                "sequence_parallel": {
-                    "kind": "ulysses",
-                    "ulysses_degree": ranks,
-                }
-            },
-        },
-        "text_encoder": _tensor_parallel(ranks),
-        "video_decoder": dict(unit_decoder),
-        "audio_decoder": dict(unit_decoder),
-        "muxer": {"ranks": [0], "parallel_config": {}},
-    }
-
-
-#: Architecture name to the entries it declares for a rank count.
-_ENTRIES = MappingProxyType(
-    {
-        "Qwen3ForCausalLM": _token_entries,
-        "Qwen3MoeForCausalLM": _token_entries,
-        "BagelForConditionalGeneration": _token_entries,
-        "NEOChatModel": _token_entries,
-        "MiniMaxH3Transformer3DModel": _minimax_h3_entries,
-    }
-)
-
-
-#: Where a checkpoint names the architecture it implements, in the order the
-#: sources are consulted. A decoder-only checkpoint lists it in its own config.
-#: A modular media checkpoint's root names the pipeline rather than the
-#: architecture, so the denoising transformer's config names it instead.
-_DECLARATIONS = (
-    ("config.json", "architectures"),
-    ("transformer/config.json", "_class_name"),
-)
+    match partition:
+        case Partition.TENSOR:
+            return {
+                "ranks": members,
+                "parallel_config": {"tensor_parallel_size": ranks},
+            }
+        case Partition.SEQUENCE:
+            return {
+                "ranks": members,
+                "parallel_config": {
+                    "sequence_parallel": {
+                        "kind": "ulysses",
+                        "ulysses_degree": ranks,
+                    }
+                },
+            }
+        case Partition.MEDIA_UNITS:
+            return {
+                "ranks": members,
+                "parallel_config": {},
+                "distribution": "temporal_units",
+                "units_per_rank": 1,
+            }
+        case Partition.NOTHING:
+            return {"ranks": [0], "parallel_config": {}}
+    # Reached only if a division is declared that no placement expands, which
+    # is a partition added above without the placement it stands for.
+    raise ValueError(f"no placement states the {partition} division")
 
 
 def architecture_of(path: str | Path) -> str:
-    """Return the single architecture a local checkpoint declares.
+    """Return the single supported architecture a checkpoint declares.
 
-    Reads the checkpoint's own metadata and nothing else, so identifying a
-    checkpoint costs two file reads and no framework import.
+    A checkpoint names its architecture in its own root metadata, whichever of
+    the two roots it carries.
     """
     root = Path(path)
-    for name, field in _DECLARATIONS:
-        metadata = root / name
-        if not metadata.is_file():
-            continue
-        declared = json.loads(metadata.read_text()).get(field, ())
-        names = (declared,) if isinstance(declared, str) else tuple(declared)
-        if len(names) != 1 or names[0] not in _ENTRIES:
-            raise ValueError(
-                f"{metadata} must declare one supported architecture; "
-                f"found {names!r}"
-            )
-        return names[0]
-    raise ValueError(f"{root} declares no architecture metadata")
+    metadata = root / "config.json"
+    if not metadata.is_file():
+        metadata = root / "modular_model_index.json"
+    declared = json.loads(metadata.read_text()) if metadata.is_file() else {}
+
+    pipeline = _PIPELINE_ARCHITECTURES.get(declared.get("_class_name"))
+    architectures = (
+        (pipeline,) if pipeline else tuple(declared.get("architectures", ()))
+    )
+    if len(architectures) != 1 or architectures[0] not in _PACKAGES:
+        raise ValueError(
+            f"checkpoint must declare one supported architecture; "
+            f"found {architectures!r}"
+        )
+    return architectures[0]
+
+
+def package_of(path: str | Path) -> str:
+    """Return the module implementing a checkpoint's architecture."""
+    return f"{__package__}.{_PACKAGES[architecture_of(path)]}"
+
+
+def divisions_of(architecture: str) -> Mapping[str, Partition]:
+    """Return the division each of an architecture's components admits."""
+    package = Path(__file__).parent / _PACKAGES[architecture]
+    declared = tomllib.loads((package / _DECLARATION).read_text())
+    return MappingProxyType(
+        {name: Partition(value) for name, value in declared.items()}
+    )
 
 
 def entries_for(path: str | Path, ranks: int) -> dict:
-    """Return the computation entries a checkpoint's architecture declares.
+    """Return the components a checkpoint places over ``ranks`` ranks.
 
-    The result maps each component name to the membership and partition it
-    admits over ``ranks`` ranks, in the schema the engine's explicit placement
-    already accepts. Rank identity -- host and device -- is the caller's.
+    Each component is mapped to the membership and partition it admits, in the
+    schema an explicit placement already uses. Rank identity -- which host and
+    which device -- is the caller's.
     """
     if type(ranks) is not int or ranks < 1:
         raise ValueError("a placement requires a positive rank count")
-    return _ENTRIES[architecture_of(path)](ranks)
+    divisions = divisions_of(architecture_of(path))
+    return {
+        name: _placed(partition, ranks) for name, partition in divisions.items()
+    }
 
 
 def main() -> int:
-    """Print one checkpoint's entries as JSON, for a non-Python caller."""
+    """Print one checkpoint's placement as JSON, for a non-Python caller."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Report the computation entries a checkpoint declares."
+        description="Report the components a checkpoint places."
     )
     parser.add_argument("--model", required=True)
     parser.add_argument("--ranks", type=int, required=True)
