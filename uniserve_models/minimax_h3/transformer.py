@@ -67,8 +67,8 @@ class TransformerLayer(nn.Module):
                     interval.stop - inputs.token_slice.start,
                 )
                 # Retain this layer's residual while its projected values pass
-                # through the next numerical stage's borrowed scratch.
-                hidden[local].copy_(value)
+                # through the next numerical stage's borrowed scratch; the
+                # normalization pass writes the copy as it reads the rows.
                 yield (
                     interval,
                     ops.modulated_rms_norm(
@@ -78,6 +78,7 @@ class TransformerLayer(nn.Module):
                         scale_attn,
                         indices[local],
                         eps=self.norm[0].eps,
+                        retain=hidden[local],
                     ),
                 )
 
