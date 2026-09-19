@@ -1663,3 +1663,18 @@ fn ipc_decode_rejects_malformed_frames() {
     response.truncate(response.len() / 2);
     assert!(decode_response(&response).is_err());
 }
+
+#[test]
+fn a_rank_may_transfer_over_every_mechanism_its_edges_name() {
+    let mut info = WorkerInfo::default();
+    info.transfer_backends = vec![
+        "cuda_vmm".to_owned(),
+        "shm".to_owned(),
+        "channel".to_owned(),
+    ];
+    assert!(info.validate().is_ok());
+
+    info.transfer_backends = vec!["cuda_vmm".to_owned(), "socket".to_owned()];
+    let error = info.validate().unwrap_err().to_string();
+    assert!(error.contains("transfer capabilities"), "{error}");
+}
