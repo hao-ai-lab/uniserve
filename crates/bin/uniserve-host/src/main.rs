@@ -1,11 +1,13 @@
 //! The per-host launcher.
 //!
-//! Each host of an instance runs one of these, started by the cluster; exactly
+//! Each host of a deployment runs one of these, started by the cluster; exactly
 //! one host runs the head. The engine does not start processes on other hosts,
 //! so a launcher connects out to the head, presents its host identity, receives
-//! the launch descriptors of the ranks placed on its host, spawns them, reports
-//! their exits, respawns on instruction, and terminates them when the head's
-//! connection closes.
+//! the launch descriptors of the ranks placed on its host, of every worker
+//! group the deployment places there, spawns them, reports their exits by
+//! worker and rank, stops one group's ranks on instruction ahead of that
+//! group's relaunch, and terminates them all when the head's connection
+//! closes.
 //!
 //! It does nothing else. The head derives every launch value once, so a
 //! launcher's command line is the head's address and its own host identity.
@@ -53,6 +55,8 @@ enum Instruction {
     Spawn(Spawn),
     /// Start one rank again after it exited, under the same identity.
     Respawn(Spawn),
+    /// Stop every rank of one worker group this launcher owns.
+    Stop { worker_id: String },
     /// Stop every rank this launcher owns and exit.
     Terminate,
 }
@@ -77,10 +81,14 @@ struct Spawn {
 /// What this launcher tells the head when a rank exits.
 #[derive(Serialize)]
 struct Exit<'a> {
+    worker_id: &'a str,
     rank: u32,
     /// Exit status text, or the reason the status could not be read.
     status: &'a str,
 }
+
+/// A rank's identity on this host: its worker group and its rank within it.
+type RankKey = (String, u32);
 
 /// One rank this launcher owns.
 struct Rank {
@@ -128,7 +136,7 @@ fn main() -> anyhow::Result<()> {
         .context("flushing this host's presentation")?;
     tracing::info!(host = %args.host_identity, head = %args.head, "presented this host");
 
-    let mut ranks: HashMap<u32, Rank> = HashMap::new();
+    let mut ranks: HashMap<RankKey, Rank> = HashMap::new();
     let outcome = supervise(&mut reader, &mut writer, &args, &mut ranks);
 
     // A closed head connection terminates this host's ranks, whether it closed
@@ -142,7 +150,7 @@ fn supervise(
     reader: &mut BufReader<TcpStream>,
     writer: &mut TcpStream,
     args: &Args,
-    ranks: &mut HashMap<u32, Rank>,
+    ranks: &mut HashMap<RankKey, Rank>,
 ) -> anyhow::Result<()> {
     let mut line = String::new();
     loop {
@@ -158,11 +166,25 @@ fn supervise(
             .with_context(|| format!("decoding an instruction from the head: {}", line.trim()))?;
         match instruction {
             Instruction::Spawn(spawn) | Instruction::Respawn(spawn) => {
-                let rank = spawn.rank;
-                let started = start_rank(args, spawn)
-                    .with_context(|| format!("starting rank {rank} on this host"))?;
-                ranks.insert(rank, started);
-                tracing::info!(rank, "started a rank");
+                let key = (spawn.worker_id.clone(), spawn.rank);
+                let started = start_rank(args, spawn).with_context(|| {
+                    format!("starting rank {} of worker {} on this host", key.1, key.0)
+                })?;
+                ranks.insert(key.clone(), started);
+                tracing::info!(worker = %key.0, rank = key.1, "started a rank");
+            }
+            Instruction::Stop { worker_id } => {
+                let stopped: Vec<RankKey> = ranks
+                    .keys()
+                    .filter(|(worker, _)| *worker == worker_id)
+                    .cloned()
+                    .collect();
+                let mut group: HashMap<RankKey, Rank> = stopped
+                    .into_iter()
+                    .filter_map(|key| ranks.remove(&key).map(|rank| (key, rank)))
+                    .collect();
+                terminate(&mut group);
+                tracing::info!(worker = %worker_id, "head asked this host to stop a worker's ranks");
             }
             Instruction::Terminate => {
                 tracing::info!("head asked this host to stop");
@@ -209,18 +231,19 @@ fn start_rank(args: &Args, spawn: Spawn) -> anyhow::Result<Rank> {
 }
 
 /// Reports every rank that has exited since the last report.
-fn report_exits(writer: &mut TcpStream, ranks: &mut HashMap<u32, Rank>) -> anyhow::Result<()> {
+fn report_exits(writer: &mut TcpStream, ranks: &mut HashMap<RankKey, Rank>) -> anyhow::Result<()> {
     let mut exited = Vec::new();
-    for (rank, owned) in ranks.iter_mut() {
+    for (key, owned) in ranks.iter_mut() {
         match owned.child.try_wait() {
-            Ok(Some(status)) => exited.push((*rank, status.to_string())),
+            Ok(Some(status)) => exited.push((key.clone(), status.to_string())),
             Ok(None) => {}
-            Err(error) => exited.push((*rank, format!("exit status unreadable: {error}"))),
+            Err(error) => exited.push((key.clone(), format!("exit status unreadable: {error}"))),
         }
     }
-    for (rank, status) in exited {
-        ranks.remove(&rank);
+    for ((worker_id, rank), status) in exited {
+        ranks.remove(&(worker_id.clone(), rank));
         let report = serde_json::to_string(&Exit {
+            worker_id: &worker_id,
             rank,
             status: &status,
         })?;
@@ -228,16 +251,16 @@ fn report_exits(writer: &mut TcpStream, ranks: &mut HashMap<u32, Rank>) -> anyho
             .write_all(format!("{report}\n").as_bytes())
             .context("reporting a rank exit to the head")?;
         writer.flush().context("flushing a rank exit report")?;
-        tracing::warn!(rank, status = %status, "a rank exited");
+        tracing::warn!(worker = %worker_id, rank, status = %status, "a rank exited");
     }
     Ok(())
 }
 
-/// Stops every rank this launcher owns.
-fn terminate(ranks: &mut HashMap<u32, Rank>) {
-    for (rank, owned) in ranks.iter_mut() {
+/// Stops every rank in `ranks`.
+fn terminate(ranks: &mut HashMap<RankKey, Rank>) {
+    for ((worker_id, rank), owned) in ranks.iter_mut() {
         if let Err(error) = owned.child.kill() {
-            tracing::warn!(rank, %error, "a rank could not be stopped");
+            tracing::warn!(worker = %worker_id, rank, %error, "a rank could not be stopped");
         }
     }
     for (_, mut owned) in ranks.drain() {

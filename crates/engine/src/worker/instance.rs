@@ -21,51 +21,52 @@ const NEXT_RESULT_DEADLINE: Duration = Duration::from_secs(300);
 
 /// One worker group's spawned ranks and the address they report to.
 /// Every rank of one group, with the launchers that started the remote ones.
-type LaunchedGroup = (Vec<RankProcess>, Option<super::launcher::LauncherRegistry>);
+type LaunchedGroup = (Vec<RankProcess>, Option<super::launcher::Launchers>);
 
 pub(crate) struct LaunchedRanks {
     registry: RankRegistry,
     ranks: Vec<PendingRank>,
     /// Retained so this instance's launchers stay connected; closing a
     /// launcher connection terminates the ranks it started.
-    launchers: Option<super::launcher::LauncherRegistry>,
+    launchers: Option<super::launcher::Launchers>,
 }
 
 impl WorkerProcessArgs {
     /// Launches and connects every rank in one physical worker group.
-    fn launch(&self, cancel: Option<Arc<AtomicBool>>) -> anyhow::Result<LaunchedGroup> {
-        self.adopt_ranks(self.spawn_ranks(cancel)?)
+    ///
+    /// `launchers` is the deployment's registry, which owns the launcher of
+    /// every host this process does not run on; a group placing a rank on
+    /// such a host requires it.
+    fn launch(
+        &self,
+        cancel: Option<Arc<AtomicBool>>,
+        launchers: Option<super::launcher::Launchers>,
+    ) -> anyhow::Result<LaunchedGroup> {
+        self.adopt_ranks(self.spawn_ranks(cancel, launchers)?)
     }
 
     /// Starts every rank of one group without waiting for its endpoint report.
     ///
     /// Spawning is separated from adoption so several groups start their
     /// processes concurrently and then wait for all of their reports together.
-    fn spawn_ranks(&self, cancel: Option<Arc<AtomicBool>>) -> anyhow::Result<LaunchedRanks> {
+    fn spawn_ranks(
+        &self,
+        cancel: Option<Arc<AtomicBool>>,
+        launchers: Option<super::launcher::Launchers>,
+    ) -> anyhow::Result<LaunchedRanks> {
         let cancel = cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         crate::WorkerConfig::validate_members(&self.ranks, &self.components)?;
         // This process spawns exactly the ranks placed on its own host. A rank
-        // placed elsewhere is started by that host's launcher, which connects
-        // here and presents the host it owns before any rank is sent to it.
-        let mut remote_hosts: Vec<String> = self
-            .ranks
-            .iter()
-            .filter(|rank| rank.node != self.host)
-            .map(|rank| rank.node.clone())
-            .collect();
-        remote_hosts.sort();
-        remote_hosts.dedup();
-        let mut launchers = if remote_hosts.is_empty() {
-            None
-        } else {
-            let mut registry = super::launcher::LauncherRegistry::bind()?;
-            tracing::info!(
-                address = registry.address(),
-                hosts = ?remote_hosts,
-                "awaiting a launcher for each host this instance does not run on"
-            );
-            registry.await_hosts(&remote_hosts, self.launcher_timeout)?;
-            Some(registry)
+        // placed elsewhere is started by that host's launcher, which presented
+        // to the deployment's registry before any rank is sent to it.
+        let places_remotely = self.ranks.iter().any(|rank| rank.node != self.host);
+        let launchers = match launchers {
+            Some(registry) if places_remotely => Some(registry),
+            None if places_remotely => anyhow::bail!(
+                "worker {} places a rank on another host but no launcher registry was bound",
+                self.worker_id
+            ),
+            _ => None,
         };
         // A group of cooperating ranks rendezvouses at one TCP address for its
         // entire lifetime, and every rank reports its endpoint to one
@@ -76,13 +77,15 @@ impl WorkerProcessArgs {
         // rendezvous store, so the store is placed on that rank's host: this
         // one, or the host whose launcher reserved a port for it.
         let head = match launchers.as_ref() {
-            Some(registry) => Some(registry.reachable_host()?),
+            Some(registry) => Some(super::launcher::lock(registry)?.reachable_host()?),
             None => None,
         };
         let rendezvous = if self.ranks.len() > 1 {
             let first = &self.ranks[0].node;
             Some(match launchers.as_ref() {
-                Some(registry) if *first != self.host => registry.rendezvous_on(first)?,
+                Some(registry) if *first != self.host => {
+                    super::launcher::lock(registry)?.rendezvous_on(first)?
+                }
                 _ => super::registration::reserve_rendezvous(head)?,
             })
         } else {
@@ -97,9 +100,9 @@ impl WorkerProcessArgs {
             let rank_device = &self.ranks[rank].device;
             // A rank placed elsewhere is delivered to the launcher that owns
             // its host; a rank placed here is spawned by this process.
-            let mut remote = match (&mut launchers, self.ranks[rank].node == self.host) {
+            let mut remote = match (&launchers, self.ranks[rank].node == self.host) {
                 (Some(registry), false) => Some(super::launcher::RemoteHost {
-                    registry,
+                    registry: registry.as_ref(),
                     host: &self.ranks[rank].node,
                 }),
                 _ => None,
@@ -142,7 +145,11 @@ impl WorkerProcessArgs {
             // host started reaches the head as an exit report from the
             // launcher that owns it, which fails the launch by name rather
             // than consuming the registration deadline.
-            if let Some(exits) = launchers.as_mut().map(|hosts| hosts.drain_exits())
+            if let Some(exits) = launchers
+                .as_ref()
+                .map(super::launcher::lock)
+                .transpose()?
+                .map(|mut hosts| hosts.drain_exits(&self.worker_id))
                 && let Some((host, exit)) = exits.into_iter().next()
             {
                 anyhow::bail!(
@@ -190,10 +197,11 @@ pub struct WorkerGroup {
     command_wake_pending: bool,
     readiness_changed: bool,
     closed: bool,
-    /// Launchers of the hosts this instance does not run on. A launcher
-    /// terminates the ranks it started when this connection closes, so the
-    /// group holds them for as long as it holds those ranks.
-    launchers: Option<super::launcher::LauncherRegistry>,
+    /// The deployment's launchers of the hosts this instance does not run
+    /// on, shared with the other groups. A launcher terminates the ranks it
+    /// started when the registry's last owner closes the connection, so the
+    /// group holds it for as long as it holds those ranks.
+    launchers: Option<super::launcher::Launchers>,
 }
 
 type CallIdentity = (u64, u64, u64, uniserve_worker_ipc::CallId);
@@ -332,11 +340,22 @@ impl WorkerGroup {
             args.derive_checkpoint_identity()?;
         }
 
+        // One launcher per host serves every group of the deployment, so the
+        // registry is bound and its hosts awaited once, before any group
+        // sends a rank to them.
+        let launchers = match arguments.first() {
+            Some(first) => super::launcher::LauncherRegistry::for_hosts(
+                &first.host,
+                arguments.iter().map(|args| args.ranks.as_slice()),
+                first.launcher_timeout,
+            )?,
+            None => None,
+        };
         // Every group's processes start before any group waits for reports, so
         // their interpreter and library import overlap.
         let launched = arguments
             .iter()
-            .map(|args| args.spawn_ranks(None))
+            .map(|args| args.spawn_ranks(None, launchers.clone()))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let groups = arguments
             .iter()
@@ -356,7 +375,7 @@ impl WorkerGroup {
     fn from_ranks(
         process_args: WorkerProcessArgs,
         mut workers: Vec<RankProcess>,
-        launchers: Option<super::launcher::LauncherRegistry>,
+        launchers: Option<super::launcher::Launchers>,
     ) -> anyhow::Result<Self> {
         let progress_fds = workers.iter().flat_map(RankProcess::progress_fds).collect();
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
@@ -605,9 +624,14 @@ impl WorkerGroup {
         self.progress_fds.clear();
         self.clear_execution();
         let recovery = (|| -> anyhow::Result<()> {
-            let (mut workers, launchers) = self.process_args.launch(None)?;
-            // Recovery relaunches the group, so the replacement ranks on other
-            // hosts are owned by the launchers this launch presented to.
+            // The group's ranks on other hosts are stopped by their launchers
+            // before the group is relaunched through the same registry, which
+            // stays connected for the deployment's other groups.
+            if let Some(registry) = &self.launchers {
+                super::launcher::lock(registry)?.stop_worker(&self.process_args.worker_id)?;
+            }
+            let (mut workers, launchers) =
+                self.process_args.launch(None, self.launchers.clone())?;
             self.launchers = launchers;
             for worker in &mut workers {
                 worker.finish_startup()?;

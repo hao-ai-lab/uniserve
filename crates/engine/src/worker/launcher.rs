@@ -1,9 +1,12 @@
 //! The head's registry of per-host launchers.
 //!
-//! The engine starts no process on another host. Each host of an instance runs
-//! one `uniserve-host` launcher that connects here and presents its host
+//! The engine starts no process on another host. Each host of a deployment
+//! runs one `uniserve-host` launcher that connects here and presents its host
 //! identity; the head then sends that launcher the launch descriptors of the
-//! ranks the placement put on its host, and the launcher spawns them.
+//! ranks the placement put on its host, of every worker group, and the
+//! launcher spawns them. The registry is bound once per deployment and shared
+//! by its groups, so a host presents one launcher however many workers place
+//! ranks on it; a rank is named to its launcher by worker and rank.
 //!
 //! A launcher's connection is its liveness signal in both directions. Closing
 //! it terminates that host's ranks, which is how an instance stops a host it
@@ -12,6 +15,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -29,7 +33,9 @@ struct Presentation {
 /// What a launcher says when one of its ranks exits.
 #[derive(Deserialize)]
 pub(crate) struct RankExit {
-    /// Global rank identity of the process that exited.
+    /// Worker group of the process that exited.
+    pub worker_id: String,
+    /// Rank of the process that exited within its group.
     pub rank: u32,
     /// Exit status text the launcher read.
     pub status: String,
@@ -41,8 +47,24 @@ pub(crate) struct RankExit {
 enum Instruction<'a> {
     /// Start one rank from the descriptor the head derived for it.
     Spawn(RemoteLaunch<'a>),
+    /// Stop every rank of one worker group the launcher owns, before the
+    /// group is relaunched.
+    Stop { worker_id: &'a str },
     /// Stop every rank the launcher owns.
     Terminate,
+}
+
+/// The registry of one deployment, shared by every group that places a rank
+/// on another host.
+pub(crate) type Launchers = Arc<Mutex<LauncherRegistry>>;
+
+/// Locks the deployment's registry for one operation.
+pub(crate) fn lock(
+    registry: &Launchers,
+) -> anyhow::Result<std::sync::MutexGuard<'_, LauncherRegistry>> {
+    registry
+        .lock()
+        .map_err(|_| anyhow::anyhow!("the launcher registry is poisoned"))
 }
 
 /// Everything a launcher needs to start one rank.
@@ -70,6 +92,10 @@ pub(crate) struct LauncherRegistry {
     address: String,
     /// Connected launchers by the host identity each presented.
     hosts: HashMap<String, Launcher>,
+    /// Exits read from the launchers and not yet taken, by worker group: a
+    /// launcher reports every group's ranks on one connection, and each
+    /// group takes its own.
+    exits: HashMap<String, Vec<(String, RankExit)>>,
 }
 
 impl LauncherRegistry {
@@ -88,7 +114,44 @@ impl LauncherRegistry {
             listener,
             address,
             hosts: HashMap::new(),
+            exits: HashMap::new(),
         })
+    }
+
+    /// Binds a registry and waits for every remote host of a deployment.
+    ///
+    /// `host` is this process's own identity; a launcher is awaited for each
+    /// other host any of the placements names. A deployment placing every
+    /// rank on this host needs no registry.
+    pub(crate) fn for_hosts(
+        host: &str,
+        placements: impl IntoIterator<Item = impl AsRef<[crate::WorkerRank]>>,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<Launchers>> {
+        let mut remote_hosts: Vec<String> = placements
+            .into_iter()
+            .flat_map(|ranks| {
+                ranks
+                    .as_ref()
+                    .iter()
+                    .filter(|rank| rank.node != host)
+                    .map(|rank| rank.node.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        remote_hosts.sort();
+        remote_hosts.dedup();
+        if remote_hosts.is_empty() {
+            return Ok(None);
+        }
+        let mut registry = Self::bind()?;
+        tracing::info!(
+            address = registry.address(),
+            hosts = ?remote_hosts,
+            "awaiting a launcher for each host this instance does not run on"
+        );
+        registry.await_hosts(&remote_hosts, timeout)?;
+        Ok(Some(Arc::new(Mutex::new(registry))))
     }
 
     /// Returns the address a launcher's command line names.
@@ -233,9 +296,9 @@ impl LauncherRegistry {
             .with_context(|| format!("flushing a launch to host {host}"))
     }
 
-    /// Takes every rank exit its launchers have reported.
-    pub(crate) fn drain_exits(&mut self) -> Vec<(String, RankExit)> {
-        let mut exits = Vec::new();
+    /// Takes every exit of one worker group's ranks its launchers have
+    /// reported, keeping the other groups' exits for their own owners.
+    pub(crate) fn drain_exits(&mut self, worker_id: &str) -> Vec<(String, RankExit)> {
         for (host, launcher) in self.hosts.iter_mut() {
             if launcher.stream.set_nonblocking(true).is_err() {
                 continue;
@@ -247,13 +310,35 @@ impl LauncherRegistry {
                 .is_ok_and(|read| read > 0)
             {
                 if let Ok(exit) = serde_json::from_str::<RankExit>(line.trim()) {
-                    exits.push((host.clone(), exit));
+                    self.exits
+                        .entry(exit.worker_id.clone())
+                        .or_default()
+                        .push((host.clone(), exit));
                 }
                 line.clear();
             }
             let _ = launcher.stream.set_nonblocking(false);
         }
-        exits
+        self.exits.remove(worker_id).unwrap_or_default()
+    }
+
+    /// Stops one worker group's ranks on every launcher, ahead of relaunching
+    /// the group; the launchers stay connected for the other groups.
+    pub(crate) fn stop_worker(&mut self, worker_id: &str) -> anyhow::Result<()> {
+        let line = serde_json::to_string(&Instruction::Stop { worker_id })
+            .context("encoding a worker stop")?;
+        for (host, launcher) in self.hosts.iter_mut() {
+            launcher
+                .stream
+                .write_all(format!("{line}\n").as_bytes())
+                .with_context(|| format!("sending a worker stop to host {host}"))?;
+            launcher
+                .stream
+                .flush()
+                .with_context(|| format!("flushing a worker stop to host {host}"))?;
+        }
+        self.exits.remove(worker_id);
+        Ok(())
     }
 }
 
@@ -286,7 +371,7 @@ impl Drop for LauncherRegistry {
 /// owns it, taking the environment from the command rather than deriving it a
 /// second time.
 pub(crate) struct RemoteHost<'a> {
-    pub registry: &'a mut LauncherRegistry,
+    pub registry: &'a Mutex<LauncherRegistry>,
     pub host: &'a str,
 }
 
@@ -316,7 +401,11 @@ impl RemoteHost<'_> {
         let python = python
             .to_str()
             .context("the interpreter path is not valid text")?;
-        self.registry.spawn_remote(
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the launcher registry is poisoned"))?;
+        registry.spawn_remote(
             self.host,
             RemoteLaunch {
                 rank,
