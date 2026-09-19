@@ -16,9 +16,11 @@ from uniserve.runtime.triton import triton_available
 try:
     import triton
     import triton.language as tl
+    from triton.language.extra.cuda import libdevice
 except Exception:
     triton = None
     tl = None
+    libdevice = None
 
 if triton is not None:
 
@@ -214,6 +216,36 @@ if triton is not None:
         else:
             tl.store(index_row, 0)
             tl.store(count_row, 1)
+
+    @triton.jit
+    def _tile_softmax_kernel(
+        scores,
+        valid_sizes,
+        score_stride_head: tl.constexpr,
+        score_stride_row: tl.constexpr,
+        columns: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        """Softmax one query tile's scores over the valid key tiles in place.
+
+        Key tiles without valid rows are excluded as if their score were
+        negative infinity; a row with no valid key tile becomes zeros.
+        """
+        row = tl.program_id(0)
+        head = tl.program_id(1)
+        offsets = tl.arange(0, block)
+        mask = offsets < columns
+        base = scores + head * score_stride_head + row * score_stride_row
+        values = tl.load(base + offsets, mask=mask, other=float("-inf"))
+        valid = tl.load(valid_sizes + offsets, mask=mask, other=0)
+        values = tl.where(valid > 0, values, float("-inf"))
+
+        peak = tl.max(values, axis=0)
+        weights = tl.where(
+            values > float("-inf"), libdevice.exp(values - peak), 0.0
+        )
+        total = tl.sum(weights, axis=0)
+        tl.store(base + offsets, weights / tl.maximum(total, 1e-38), mask=mask)
 
     @triton.jit
     def _pack_qkv_kernel(
@@ -693,6 +725,52 @@ def _write_block_map_fake(
     del local_prefix, local_video, prefix_tiles, valid_tiles, selected
 
 
+def _tile_softmax(scores: torch.Tensor, valid_sizes: torch.Tensor) -> None:
+    """Normalize each score row over the key tiles that hold valid rows."""
+    assert triton is not None
+    heads, rows, columns = (int(size) for size in scores.shape)
+    if (
+        scores.dtype != torch.float32
+        or scores.stride(-1) != 1
+        or valid_sizes.dtype != torch.int32
+        or valid_sizes.shape != (columns,)
+        or not valid_sizes.is_contiguous()
+    ):
+        raise ValueError(
+            "tile softmax requires fp32 score rows and one valid size per "
+            "key tile"
+        )
+
+    # One program of two warps per head and query tile row, the fastest of
+    # the measured warp counts; the row fits one block.
+    _tile_softmax_kernel[(rows, heads)](
+        scores,
+        valid_sizes,
+        int(scores.stride(0)),
+        int(scores.stride(1)),
+        columns,
+        triton.next_power_of_2(columns),
+        num_warps=2,
+        num_stages=1,
+    )
+
+
+@torch.library.custom_op(
+    "uniserve::video_sparse_tile_softmax", mutates_args=("scores",)
+)
+def _tile_softmax_custom(
+    scores: torch.Tensor, valid_sizes: torch.Tensor
+) -> None:
+    """Expose the masked tile softmax as a score-mutating custom operator."""
+    _tile_softmax(scores, valid_sizes)
+
+
+@_tile_softmax_custom.register_fake
+def _tile_softmax_fake(scores: torch.Tensor, valid_sizes: torch.Tensor) -> None:
+    """Declare fake-tensor mutation for the tile softmax custom operator."""
+    del scores, valid_sizes
+
+
 def _unpack_add_compression(
     attended: torch.Tensor,
     gate: torch.Tensor,
@@ -850,6 +928,16 @@ def write_block_map(
     )
 
 
+def tile_softmax(scores: torch.Tensor, valid_sizes: torch.Tensor) -> None:
+    """Softmax ``scores`` ``[heads, query_tiles, key_tiles]`` in place.
+
+    Each row is normalized over the key tiles whose ``valid_sizes`` entry is
+    positive, the others weigh zero; a row without any valid key tile is
+    written as zeros.
+    """
+    _tile_softmax_custom(scores, valid_sizes)
+
+
 def unpack_add_compression(
     attended: torch.Tensor,
     gate: torch.Tensor,
@@ -885,6 +973,7 @@ __all__ = [
     "compose_to_head_shards",
     "pack_qkv",
     "pool_qkv_means",
+    "tile_softmax",
     "unpack_add_compression",
     "write_block_map",
 ]
