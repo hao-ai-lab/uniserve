@@ -23,10 +23,18 @@ from uniserve.nn.attention import AttentionParallelConfig
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.quantization import QuantizationConfig, Quantizer
 
-from .components import package_of
-
 ConfigT = TypeVar("ConfigT")
 ModelT = TypeVar("ModelT", bound=nn.Module)
+
+_catalog: Mapping[str, str] = MappingProxyType(
+    {
+        "Qwen3ForCausalLM": "uniserve_models.qwen3",
+        "Qwen3MoeForCausalLM": "uniserve_models.qwen3",
+        "BagelForConditionalGeneration": "uniserve_models.bagel",
+        "NEOChatModel": "uniserve_models.sensenova_u1",
+        "MiniMaxH3Transformer3DModel": "uniserve_models.minimax_h3",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,7 +374,15 @@ def read_config(
         if (root / "config.json").is_file()
         else _json(root / "modular_model_index.json")
     )
-    package = import_module(package_of(root))
+    architectures = metadata.get("architectures", ())
+    if metadata.get("_class_name") == "MiniMaxH3ModularPipeline":
+        architectures = ("MiniMaxH3Transformer3DModel",)
+    if len(architectures) != 1 or architectures[0] not in _catalog:
+        raise ValueError(
+            f"checkpoint must declare one supported architecture; "
+            f"found {architectures!r}"
+        )
+    package = import_module(_catalog[architectures[0]])
 
     inventory = _inventory(root, repository, revision, io)
     # All architecture/index/tokenizer sidecars are small and required to

@@ -12,25 +12,45 @@ from uniserve_eval.config import ROOT, load_config
 pytestmark = pytest.mark.unit
 
 
-def test_fast_h3_server_topology_accepts_environment_override(
+def test_fast_h3_serves_the_deployment_configuration_it_is_given(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("UNISERVE_H3_WORKER_RANKS", "2")
+    """A width is a deployment, so serving another one names another file."""
+    monkeypatch.setenv(
+        "UNISERVE_H3_DEPLOYMENT", "config/minimax-h3-two-devices.json"
+    )
     monkeypatch.setenv("UNISERVE_H3_CUDA_VISIBLE_DEVICES", "0,1")
     monkeypatch.setenv("UNISERVE_H3_MEM_FRACTION", "0.99")
     monkeypatch.setenv("UNISERVE_H3_QUANT_MODE", "performance")
 
     server = load_config().servers["minimax-h3"]
-    rank_value = server.command.index("--worker-ranks") + 1
+    deployment = server.command.index("--workers") + 1
     fraction_value = server.command.index("--mem-fraction-static") + 1
     precision_value = server.command.index("--quantization-config") + 1
 
-    assert server.command[rank_value] == "2"
+    assert server.command[deployment] == "config/minimax-h3-two-devices.json"
     assert server.command[fraction_value] == "0.99"
     assert json.loads(server.command[precision_value]) == {
         "mode": "performance"
     }
     assert server.environment["CUDA_VISIBLE_DEVICES"] == "0,1"
+
+
+def test_fast_h3_defaults_to_the_four_device_deployment(monkeypatch) -> None:
+    monkeypatch.delenv("UNISERVE_H3_DEPLOYMENT", raising=False)
+
+    server = load_config().servers["minimax-h3"]
+    deployment = server.command.index("--workers") + 1
+
+    named = ROOT / server.command[deployment]
+    assert named.is_file(), f"{named} is the default deployment and must exist"
+    assert sorted(json.loads(named.read_text())[0]["entries"]) == [
+        "audio_decoder",
+        "denoiser",
+        "muxer",
+        "text_encoder",
+        "video_decoder",
+    ]
 
 
 def test_fast_h3_server_defaults_to_balanced_precision(monkeypatch) -> None:

@@ -20,6 +20,7 @@ from tests.python.e2e.http_helpers import (
     find_free_port,
     require_uniserve_binary,
     server_process,
+    written_deployment,
 )
 from uniserve_eval.config import load_config
 from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
@@ -260,7 +261,7 @@ def test_component_bindings_release_cancelled_requests(
         "--worker-python",
         sys.executable,
         "--workers",
-        json.dumps(workers),
+        str(written_deployment(tmp_path, workers)),
         "--transfer",
         ",".join(
             f"{source}->{destination}=cuda_vmm"

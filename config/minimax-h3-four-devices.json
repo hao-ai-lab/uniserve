@@ -1,0 +1,37 @@
+[
+  {
+    "id": "model",
+    "ranks": [
+      { "node": "localhost", "device": "cuda:0" },
+      { "node": "localhost", "device": "cuda:1" },
+      { "node": "localhost", "device": "cuda:2" },
+      { "node": "localhost", "device": "cuda:3" }
+    ],
+    "entries": {
+      "denoiser": {
+        "ranks": [0, 1, 2, 3],
+        "parallel_config": {
+          "sequence_parallel": { "kind": "ulysses", "ulysses_degree": 4 }
+        }
+      },
+      "text_encoder": {
+        "ranks": [0, 1, 2, 3],
+        "parallel_config": { "tensor_parallel_size": 4 }
+      },
+      "video_decoder": {
+        "ranks": [0, 1, 2, 3],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 1
+      },
+      "audio_decoder": {
+        "ranks": [0, 1, 2, 3],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 1
+      },
+      "muxer": { "ranks": [0], "parallel_config": {} }
+    },
+    "queue_depth": 6
+  }
+]

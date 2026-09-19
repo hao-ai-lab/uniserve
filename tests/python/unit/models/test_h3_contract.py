@@ -145,21 +145,3 @@ def test_h3_direct_configuration_preserves_cross_component_dimensions():
 
     with pytest.raises(ValueError, match="conditioning width"):
         Config(text_encoder=replace(TextEncoderConfig(), hidden_size=4096))
-
-
-def test_the_declaration_names_only_components_the_model_implements(
-    checkpoint,
-):
-    """A declaration is unservable if it names a component nothing implements.
-
-    The entries a checkpoint declares are resolved before any rank loads the
-    model, so nothing else checks that the two agree until a rank fails to find
-    its component.
-    """
-    from uniserve_models.components import entries_for
-    from uniserve_models.minimax_h3.model import entry_points
-
-    config = read_config(checkpoint, IOConfig())
-    implemented = set(entry_points(config)) | {"muxer"}
-
-    assert set(entries_for(checkpoint, 4)) == implemented

@@ -1,5 +1,0 @@
-{
-  "_class_name": "MiniMaxH3ModularPipeline",
-  "_diffusers_version": "0.36.0.dev0",
-  "_blocks_class_name": "MiniMaxH3Blocks"
-}
