@@ -28,16 +28,23 @@ POINTS = (
 #: The video bounds are the ones declared for media unit division, measured on
 #: a real H3 output whose frames entering both encoders were identical, so they
 #: bound the distance a changed GOP structure introduces. A configuration that
-#: changes only how a reduction is ordered across ranks re-encodes nothing and
-#: alters no encoder parameter, so its distance is strictly smaller and these
-#: are an upper bound on it. They are deliberately loose for that use: they
-#: fail a defect that alters decoded pixels, not one that merely reorders a
-#: sum, and the measured values travel with the verdict so a regression inside
-#: them stays visible.
+#: leaves the denoised latents bit-identical and changes only media assembly
+#: re-encodes nothing and alters no encoder parameter, so its distance is
+#: strictly smaller and these are an upper bound on it. They are deliberately
+#: loose for that use: they fail a defect that alters decoded pixels, and the
+#: measured values travel with the verdict so a regression inside them stays
+#: visible.
 #:
-#: The audio bounds admit the same reordering. Unit decoding with a halo is
-#: exact, so a halo defect moves the log-mel error by orders of magnitude
-#: rather than by the last bits of a reduction.
+#: They do not qualify a change inside the denoiser. FastH3's threshold tile
+#: selection flips on ties, and its few-step sampler amplifies a flip into a
+#: different trajectory: reordering only the fp32 sum of the pooled tile means
+#: measured PSNR 15 to 25 dB and SSIM 0.5 to 0.7 against the same seed. Such a
+#: change is qualified by its kernel-level and test-level contracts, and the
+#: seeded comparison then only reports that the bits changed.
+#:
+#: The audio bounds admit media-assembly reordering in the same way. Unit
+#: decoding with a halo is exact, so a halo defect moves the log-mel error by
+#: orders of magnitude rather than by the last bits of a reduction.
 THRESHOLDS = {
     "video": (
         ("psnr_db", "min", 35.0),
