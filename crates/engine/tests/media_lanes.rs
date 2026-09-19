@@ -1,0 +1,488 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+//! Lane-occupancy scheduling of video requests over the GPU-free simulator.
+//!
+//! The observation point is the executor boundary: the batches the simulator
+//! accepts and the moment it hands each result back. The simulator delivers a
+//! result only when the scheduler waits for one, so every batch stays in
+//! flight until the scheduler blocks for a completion, and the record of
+//! submissions and resolutions is a function of scheduling decisions alone.
+
+use std::collections::{BTreeMap, HashMap};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use uniserve_core::{
+    DiffusionRequest, DiffusionSamplingParams, EngineCoreOutput, FinishReason, Request, RequestId,
+};
+use uniserve_engine::{
+    BatchEvent, ComponentConfig, ComponentDistribution, EngineHandle, ExecutionBatch, Scheduler,
+    SimEngine, SimExecutor, SpecialTokenIds,
+};
+use uniserve_worker_ipc::{
+    CallKind, DType, DimBound, EntryInfo, OutputInfo, PipelineStage, ShapeBound,
+};
+
+/// Denoising steps the simulated model advertises and every request follows.
+const STEPS: u32 = 3;
+
+/// Every request carries the same short prompt.
+const PROMPT: [u32; 3] = [11, 12, 13];
+
+/// Declares one loaded component with the outputs its entry produces.
+///
+/// A distributed component reconstructs one media unit per rank per round
+/// and keeps the local parallel degree a temporal-unit distribution requires.
+fn component(
+    name: &str,
+    ranks: Vec<usize>,
+    distributed: bool,
+    outputs: Vec<OutputInfo>,
+) -> EntryInfo {
+    let mut config = ComponentConfig::parallel(ranks, Default::default());
+    if distributed {
+        config.distribution = Some(ComponentDistribution::TemporalUnits);
+    }
+
+    EntryInfo {
+        name: name.to_owned(),
+        config,
+        outputs,
+    }
+}
+
+/// A small tensor result, indexed by media unit along a device-actual leading
+/// axis when `units` bounds it.
+fn output(name: &str, units: Option<u32>) -> OutputInfo {
+    let mut dims = vec![DimBound::Static(4)];
+    if let Some(max) = units {
+        dims.insert(0, DimBound::Device { max });
+    }
+
+    OutputInfo {
+        name: name.to_owned(),
+        dtype: DType::BF16,
+        shape_bound: ShapeBound { dims },
+    }
+}
+
+/// A video worker whose text encoder, denoiser, audio decoder and muxer live on
+/// rank 0 and whose video decoder is distributed over `decoder_ranks` ranks,
+/// each reconstructing one media unit per round.
+///
+/// Stages route to entries the way a loaded model reports them: the video
+/// decoder entry also encodes the units it decodes, and the muxer entry
+/// encodes audio and assembles the artifact.
+fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
+    let mut sim = SimEngine::new();
+    sim.set_queue_depth(64);
+    sim.set_results_on_wait(true);
+
+    let info = sim.mut_info_for_test();
+    info.supported_ops = PipelineStage::VIDEO
+        .iter()
+        .map(|stage| CallKind::Pipeline(*stage))
+        .collect();
+    info.num_inference_steps = STEPS;
+    info.world_size = decoder_ranks as u32;
+    info.host_lane_capacity = host_lane_capacity;
+    info.components = vec![
+        component(
+            "text_encoder",
+            vec![0],
+            false,
+            vec![output("conditioning", Some(64))],
+        ),
+        component(
+            "denoiser",
+            vec![0],
+            false,
+            vec![output("video_latent", None), output("audio_latent", None)],
+        ),
+        component(
+            "video_decoder",
+            (0..decoder_ranks).collect(),
+            true,
+            vec![output("windows", Some(16)), output("encoded", Some(16))],
+        ),
+        component("audio_decoder", vec![0], true, vec![output("audio", None)]),
+        component("muxer", vec![0], false, Vec::new()),
+    ];
+    info.pipeline_components = BTreeMap::from([
+        (PipelineStage::TextEncoding, "text_encoder".to_owned()),
+        (PipelineStage::LatentPreparation, "denoiser".to_owned()),
+        (PipelineStage::Denoising, "denoiser".to_owned()),
+        (PipelineStage::VideoDecoding, "video_decoder".to_owned()),
+        (PipelineStage::VideoEncoding, "video_decoder".to_owned()),
+        (PipelineStage::AudioDecoding, "audio_decoder".to_owned()),
+        (PipelineStage::AudioEncoding, "muxer".to_owned()),
+        (PipelineStage::Muxing, "muxer".to_owned()),
+    ]);
+
+    sim
+}
+
+/// A video request decoded in `num_decode_chunks` media units.
+fn video_request(id: u64, num_decode_chunks: u32) -> Request {
+    Request::Diffusion(DiffusionRequest {
+        request_id: RequestId(id),
+        prompt_token_ids: PROMPT.to_vec(),
+        priority: 0,
+        sampling: DiffusionSamplingParams {
+            num_frames: 16,
+            num_decode_chunks,
+            num_inference_steps: STEPS,
+            seed: id,
+        },
+    })
+}
+
+/// One media call as the executor received it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MediaCall {
+    request: RequestId,
+    stage: PipelineStage,
+    /// Media units the call covers: its decode range, or one without one.
+    units: u32,
+}
+
+impl MediaCall {
+    fn is(&self, request: RequestId, stage: PipelineStage) -> bool {
+        self.request == request && self.stage == stage
+    }
+
+    /// Whether the call runs on a rank's bounded host executor.
+    fn is_host_task(&self) -> bool {
+        matches!(
+            self.stage,
+            PipelineStage::VideoEncoding | PipelineStage::AudioEncoding | PipelineStage::Muxing
+        )
+    }
+
+    /// Whether the call decodes or encodes media after denoising.
+    fn is_media_output(&self) -> bool {
+        self.is_host_task()
+            || matches!(
+                self.stage,
+                PipelineStage::VideoDecoding | PipelineStage::AudioDecoding
+            )
+    }
+}
+
+/// One submission as the executor accepted it, with the calls of earlier
+/// submissions that were still in flight at that moment.
+#[derive(Debug, Clone)]
+struct Submission {
+    calls: Vec<MediaCall>,
+    in_flight: Vec<MediaCall>,
+}
+
+impl Submission {
+    /// Calls that ran at the same time as this submission's calls: those it
+    /// carried and those still in flight when it was accepted.
+    fn concurrent(&self) -> impl Iterator<Item = &MediaCall> {
+        self.calls.iter().chain(self.in_flight.iter())
+    }
+}
+
+/// The record of one served workload: what the executor saw and what each
+/// request's stream delivered.
+struct Served {
+    /// Media submissions in the order the executor accepted them.
+    submissions: Vec<Submission>,
+    /// Every event each request's stream delivered.
+    outcomes: HashMap<RequestId, Vec<EngineCoreOutput>>,
+}
+
+impl Served {
+    /// Submissions carrying a call of this request and stage, with their index.
+    fn submissions_of(
+        &self,
+        request: RequestId,
+        stage: PipelineStage,
+    ) -> Vec<(usize, &Submission)> {
+        self.submissions
+            .iter()
+            .enumerate()
+            .filter(|(_, submission)| submission.calls.iter().any(|call| call.is(request, stage)))
+            .collect()
+    }
+
+    /// Asserts that a request delivered a video artifact and then finished.
+    fn assert_completed(&self, request: RequestId) {
+        let events = &self.outcomes[&request];
+        let artifact = events.iter().find_map(|event| match event {
+            EngineCoreOutput::Artifact(artifact) => Some(artifact),
+            _ => None,
+        });
+        let artifact = artifact
+            .unwrap_or_else(|| panic!("request {request:?} delivered no artifact: {events:?}"));
+        assert_eq!(artifact.content_type, "video/mp4");
+        assert!(!artifact.media.as_bytes().is_empty());
+        assert!(
+            matches!(
+                events.last(),
+                Some(EngineCoreOutput::Finished {
+                    reason: FinishReason::Completed,
+                    ..
+                })
+            ),
+            "request {request:?} did not finish after its artifact: {events:?}"
+        );
+    }
+}
+
+/// Media calls of one batch; a batch carrying only lifecycle commands has none.
+fn media_calls(batch: &ExecutionBatch) -> Vec<MediaCall> {
+    batch
+        .requests
+        .iter()
+        .filter_map(|(call, placement)| {
+            let CallKind::Pipeline(stage) = call.code else {
+                return None;
+            };
+            Some(MediaCall {
+                request: call.request_key.request_id,
+                stage,
+                units: placement.decode.as_ref().map_or(1, |range| range.max_units),
+            })
+        })
+        .collect()
+}
+
+/// Serves the requests, queued together in order, until each stream reaches
+/// a terminal event.
+fn serve(sim: SimEngine, requests: Vec<Request>) -> Served {
+    let mut executor = SimExecutor::new(sim);
+    let boundary = executor.observe();
+    let scheduler = Scheduler::new(Box::new(executor), SpecialTokenIds::default(), 32);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+
+    // Every request is queued before the loop starts, so one admission pass
+    // sees them together, resident in submission order.
+    let mut streams = requests
+        .into_iter()
+        .map(|request| {
+            let id = request.request_id();
+            (id, handle.submit(request).expect("submit media request"))
+        })
+        .collect::<Vec<_>>();
+    let engine_loop = thread::spawn(move || scheduler.run(rx));
+
+    let mut outcomes: HashMap<RequestId, Vec<EngineCoreOutput>> = HashMap::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut terminal = 0;
+    while terminal < streams.len() && Instant::now() < deadline {
+        let mut idle = true;
+        for (id, stream) in streams.iter_mut() {
+            while let Ok(event) = stream.try_recv() {
+                idle = false;
+                if matches!(
+                    event,
+                    EngineCoreOutput::Finished { .. }
+                        | EngineCoreOutput::Rejected { .. }
+                        | EngineCoreOutput::Error { .. }
+                ) {
+                    terminal += 1;
+                }
+                outcomes.entry(*id).or_default().push(event);
+            }
+        }
+        if idle {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    handle.shutdown();
+    let died = engine_loop.join().expect("engine loop thread");
+    assert!(!died, "the engine loop died");
+    assert_eq!(
+        terminal,
+        streams.len(),
+        "every request reaches a terminal event: {outcomes:?}"
+    );
+
+    // The executor is gone with the scheduler, so the record is complete.
+    let mut in_flight: Vec<(u64, Vec<MediaCall>)> = Vec::new();
+    let mut submissions = Vec::new();
+    for event in boundary.iter() {
+        match event {
+            BatchEvent::Submitted(batch) => {
+                let calls = media_calls(&batch);
+                if calls.is_empty() {
+                    continue;
+                }
+                submissions.push(Submission {
+                    calls: calls.clone(),
+                    in_flight: in_flight
+                        .iter()
+                        .flat_map(|(_, calls)| calls.iter().copied())
+                        .collect(),
+                });
+                in_flight.push((batch.id, calls));
+            }
+            BatchEvent::Resolved { batch_id } => in_flight.retain(|(id, _)| *id != batch_id),
+        }
+    }
+
+    Served {
+        submissions,
+        outcomes,
+    }
+}
+
+#[test]
+fn a_younger_request_denoises_only_after_the_older_request_completes_its_steps() {
+    let older = RequestId(1);
+    let younger = RequestId(2);
+    let served = serve(
+        video_worker(2, 1),
+        vec![video_request(older.0, 2), video_request(younger.0, 2)],
+    );
+    served.assert_completed(older);
+    served.assert_completed(younger);
+
+    let younger_steps = served.submissions_of(younger, PipelineStage::Denoising);
+    assert_eq!(younger_steps.len(), STEPS as usize);
+    for (index, submission) in &younger_steps {
+        // The denoiser lane is exclusive: no step of the older request is in
+        // flight, or dispatched alongside, while the younger request steps.
+        assert!(
+            !submission
+                .concurrent()
+                .any(|call| call.is(older, PipelineStage::Denoising)),
+            "the younger request denoised while the older request held the denoiser lane: {submission:?}"
+        );
+        // The lane passes to the younger request only once the older one has
+        // dispatched every step, so its first step follows the older's last.
+        let older_steps_dispatched = served.submissions[..*index]
+            .iter()
+            .flat_map(|earlier| earlier.calls.iter())
+            .filter(|call| call.is(older, PipelineStage::Denoising))
+            .count();
+        assert_eq!(
+            older_steps_dispatched, STEPS as usize,
+            "the younger request denoised before the older request dispatched every step"
+        );
+    }
+
+    // Lane sharing: the older request decodes and encodes its media while the
+    // younger request denoises.
+    assert!(
+        younger_steps.iter().any(|(_, submission)| {
+            submission
+                .in_flight
+                .iter()
+                .any(|call| call.request == older && call.is_media_output())
+        }),
+        "the older request's media output never overlapped the younger request's denoising: {:?}",
+        served.submissions
+    );
+}
+
+#[test]
+fn a_distributed_decoder_admits_calls_up_to_its_rank_width_in_media_units() {
+    // Each decoder rank reconstructs one media unit per round, so the lane
+    // holds as many units as the decoder has ranks.
+    const DECODER_RANKS: u32 = 2;
+
+    let older = RequestId(1);
+    let younger = RequestId(2);
+    let served = serve(
+        video_worker(DECODER_RANKS as usize, 1),
+        vec![
+            video_request(older.0, DECODER_RANKS + 1),
+            video_request(younger.0, 1),
+        ],
+    );
+    served.assert_completed(older);
+    served.assert_completed(younger);
+
+    // A request with more units than the lane holds decodes in successive
+    // rounds: a full round, then the remainder.
+    let older_rounds = served
+        .submissions_of(older, PipelineStage::VideoDecoding)
+        .iter()
+        .flat_map(|(_, submission)| submission.calls.iter())
+        .filter(|call| call.is(older, PipelineStage::VideoDecoding))
+        .map(|call| call.units)
+        .collect::<Vec<_>>();
+    assert_eq!(older_rounds, vec![DECODER_RANKS, 1]);
+
+    // The units in flight on the decoder lane never exceed what it holds.
+    for submission in &served.submissions {
+        let units = |calls: &[MediaCall]| {
+            calls
+                .iter()
+                .filter(|call| call.stage == PipelineStage::VideoDecoding)
+                .map(|call| call.units)
+                .sum::<u32>()
+        };
+        let submitted = units(&submission.calls);
+        if submitted == 0 {
+            continue;
+        }
+        assert!(
+            units(&submission.in_flight) + submitted <= DECODER_RANKS,
+            "decode calls exceeded the lane's media units: {submission:?}"
+        );
+    }
+
+    // The younger request's decode is admitted while the older request's is
+    // in flight, once the older request's remainder round left units free.
+    let younger_decodes = served.submissions_of(younger, PipelineStage::VideoDecoding);
+    assert_eq!(younger_decodes.len(), 1);
+    assert!(
+        younger_decodes[0]
+            .1
+            .concurrent()
+            .any(|call| call.is(older, PipelineStage::VideoDecoding)),
+        "the younger request's decode waited for the older request to finish decoding: {:?}",
+        served.submissions
+    );
+}
+
+#[test]
+fn a_host_lane_admits_no_more_tasks_than_its_rank_advertises() {
+    for capacity in [1_usize, 2] {
+        let request = RequestId(1);
+        let served = serve(
+            video_worker(1, capacity as u32),
+            vec![video_request(request.0, 1)],
+        );
+        served.assert_completed(request);
+
+        // Every host task of this worker lands on rank 0's host lane, whose
+        // occupancy never exceeds the advertised capacity.
+        let mut peak = 0;
+        for submission in &served.submissions {
+            let submitted = submission
+                .calls
+                .iter()
+                .filter(|call| call.is_host_task())
+                .count();
+            if submitted == 0 {
+                continue;
+            }
+            let occupied = submission
+                .in_flight
+                .iter()
+                .filter(|call| call.is_host_task())
+                .count();
+            assert!(
+                occupied + submitted <= capacity,
+                "host tasks exceeded the lane capacity {capacity}: {submission:?}"
+            );
+            peak = peak.max(occupied + submitted);
+        }
+
+        // The video and audio encodes of one request are the tasks that can
+        // overlap: a lane of two holds both, a lane of one serializes them.
+        assert_eq!(
+            peak,
+            capacity.min(2),
+            "host lane capacity {capacity} was not used up to its bound: {:?}",
+            served.submissions
+        );
+    }
+}
