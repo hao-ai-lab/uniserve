@@ -159,7 +159,7 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long = "page-size", default_value_t = 64, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
     pub block_size: u32,
     /// This instance's host identity. Ranks are placed on it by name, and the
-    /// engine owns exactly the ranks whose placement node matches.
+    /// engine owns exactly the ranks whose node matches it.
     #[arg(long = "host-identity", default_value = "localhost")]
     pub host_identity: String,
     /// Hosts the shorthand spreads `--worker-ranks` across, in order, starting
@@ -268,7 +268,7 @@ impl SharedRuntimeArgs {
     /// Section 7's eight-device configuration spans two hosts, and its muxer
     /// sits on rank zero of the head's host, so the head's own identity leads
     /// the list whether or not `--worker-hosts` repeats it.
-    fn placement_hosts(&self) -> Vec<String> {
+    fn rank_hosts(&self) -> Vec<String> {
         let mut hosts = vec![self.host_identity.clone()];
         hosts.extend(
             self.worker_hosts
@@ -288,7 +288,7 @@ impl SharedRuntimeArgs {
         use anyhow::Context as _;
 
         let output = std::process::Command::new(&self.worker_python)
-            .args(["-m", "uniserve_models.placement", "--model"])
+            .args(["-m", "uniserve_models.components", "--model"])
             .arg(&self.model)
             .args(["--ranks", &self.worker_ranks.to_string()])
             .output()
@@ -301,7 +301,7 @@ impl SharedRuntimeArgs {
             })?;
         anyhow::ensure!(
             output.status.success(),
-            "{} declares no placement: {}",
+            "{} declares no components: {}",
             self.model,
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -354,7 +354,7 @@ impl SharedRuntimeArgs {
             max_video_seconds: self.max_video_seconds,
             workers: self.workers.clone().map(Vec::from).unwrap_or_else(|| {
                 vec![WorkerConfig::placed(
-                    &self.placement_hosts(),
+                    &self.rank_hosts(),
                     &self.device,
                     self.worker_ranks,
                     queue_depth,
