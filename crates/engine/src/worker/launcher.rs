@@ -418,3 +418,62 @@ impl RemoteHost<'_> {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::LauncherRegistry;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    /// One launcher serves every worker group placed on its host: the exits
+    /// it reports are routed to the group they belong to, and a stop names
+    /// the group whose ranks it ends.
+    #[test]
+    fn exits_are_routed_to_their_worker_and_a_stop_names_its_worker() {
+        let mut registry = LauncherRegistry::bind().expect("a registry binds");
+        let address = registry.address().to_owned();
+        let launcher = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("the launcher connects");
+            stream
+                .write_all(b"{\"host\":\"b\",\"rendezvous_port\":1}\n")
+                .expect("the launcher presents");
+            stream
+                .write_all(
+                    b"{\"worker_id\":\"model\",\"rank\":5,\"status\":\"exit status: 1\"}\n\
+                      {\"worker_id\":\"host\",\"rank\":1,\"status\":\"exit status: 2\"}\n",
+                )
+                .expect("the launcher reports two exits");
+            let mut line = String::new();
+            BufReader::new(stream)
+                .read_line(&mut line)
+                .expect("the launcher reads the stop");
+            line
+        });
+        registry
+            .await_hosts(&["b".to_owned()], Duration::from_secs(5))
+            .expect("host b presents");
+
+        // Both exits arrive on one connection; each group takes its own and
+        // the other's is kept for its owner.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut model_exits = Vec::new();
+        while model_exits.is_empty() && std::time::Instant::now() < deadline {
+            model_exits = registry.drain_exits("model");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(model_exits.len(), 1);
+        assert_eq!((model_exits[0].0.as_str(), model_exits[0].1.rank), ("b", 5));
+        let host_exits = registry.drain_exits("host");
+        assert_eq!(host_exits.len(), 1);
+        assert_eq!(
+            (host_exits[0].1.worker_id.as_str(), host_exits[0].1.rank),
+            ("host", 1)
+        );
+        assert!(registry.drain_exits("model").is_empty());
+
+        registry.stop_worker("host").expect("the stop is sent");
+        let stop = launcher.join().expect("the launcher thread ends");
+        assert_eq!(stop.trim(), "{\"stop\":{\"worker_id\":\"host\"}}");
+    }
+}
