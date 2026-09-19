@@ -839,6 +839,31 @@ impl WorkerExecutor {
             .filter(|completion| completion.output.status == uniserve_worker_ipc::CallStatus::Error)
             .map(|completion| (completion.output.request_key, completion.output.call_id))
             .collect::<HashSet<_>>();
+        if !failed_calls.is_empty() {
+            // The worker names the code; the request's caller sees only that
+            // its dependent work could not complete, so the code is recorded
+            // here, where the failing call and worker are known.
+            let failed = report
+                .results
+                .iter()
+                .filter(|completion| {
+                    completion.output.status == uniserve_worker_ipc::CallStatus::Error
+                })
+                .map(|completion| {
+                    (
+                        completion.output.request_key,
+                        completion.output.call_id,
+                        completion.output.error_code,
+                    )
+                })
+                .collect::<Vec<_>>();
+            tracing::warn!(
+                worker = %self.workers[worker_index].0,
+                batch_id = report.batch_id,
+                ?failed,
+                "worker returned failed calls"
+            );
+        }
         let failed_buffers = self
             .buffer_routes
             .keys()

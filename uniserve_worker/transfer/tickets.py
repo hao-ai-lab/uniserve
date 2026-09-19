@@ -1719,9 +1719,16 @@ class ChannelTransport(Transport):
         target = _read_destination(locator, device, destination, region)
         started = time.perf_counter()
         with profile_range("channel_fetch_payload"):
-            carried = torch.frombuffer(
+            payload = torch.frombuffer(
                 bytearray(handle.payload), dtype=_dtype_from_str(locator.dtype)
             ).reshape(locator.shape)
+            # A device destination is filled by an asynchronous copy, which
+            # reads pinned host storage; the bytes arrived pageable.
+            if device.type == "cuda":
+                carried = torch.empty_like(payload, pin_memory=True)
+                carried.copy_(payload)
+            else:
+                carried = payload
         self._fetch_seconds += time.perf_counter() - started
         self._fetched += 1
         if region is not None:
