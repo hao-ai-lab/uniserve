@@ -1678,3 +1678,43 @@ fn a_rank_may_transfer_over_every_mechanism_its_edges_name() {
     let error = info.validate().unwrap_err().to_string();
     assert!(error.contains("transfer capabilities"), "{error}");
 }
+
+#[test]
+fn a_channel_product_of_media_size_fits_the_transfer_handle_bound() {
+    // A five-second stereo PCM track: the bytes are the product and travel on
+    // the rank channel, so they do not count against the handle bound.
+    let samples = 5 * 32_000u64;
+    let mut reference = output_product(CallId::new(12, 0));
+    reference.dtype = DType::I16;
+    reference.shape_bound.dims = vec![
+        DimBound::Device {
+            max: samples as u32,
+        },
+        DimBound::Static(2),
+    ];
+    let publication = TensorPublication {
+        product: reference,
+        value: TransferHandle::DeviceProduct {
+            height: 0,
+            width: 0,
+            value_range: String::new(),
+            tensor: TensorTransfer {
+                shape: vec![samples, 2],
+                locations: vec![Locator {
+                    source: WorkerInfo::default().endpoint,
+                    transport: TransferTransport::Channel {
+                        endpoint: "tensor-publisher".into(),
+                        payload: vec![0u8; (samples * 4) as usize],
+                    },
+                    nbytes: samples * 4,
+                    dtype: "int16".into(),
+                    offset: vec![0, 0],
+                    shape: vec![samples, 2],
+                    device: "cpu".into(),
+                }],
+            },
+        },
+    };
+    assert!(publication.validate().is_ok());
+    assert!(publication.value.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES);
+}

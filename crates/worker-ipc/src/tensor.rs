@@ -617,10 +617,10 @@ fn transfer_encoded_size(tensors: &[TensorTransfer]) -> usize {
                     .saturating_add(8usize.saturating_mul(storage_offsets_bytes.len()))
                     .saturating_add(12usize.saturating_mul(span_lengths.len()))
                     .saturating_add(64),
-                TransferTransport::Channel { endpoint, payload } => endpoint
-                    .len()
-                    .saturating_add(payload.len())
-                    .saturating_add(16),
+                // The bytes are the product, not the handle: their budget is
+                // the channel's capacity and the rank channel's message caps,
+                // so only the locator's framing counts toward the handle bound.
+                TransferTransport::Channel { endpoint, .. } => endpoint.len().saturating_add(24),
             };
             size = size.saturating_add(native);
         }
