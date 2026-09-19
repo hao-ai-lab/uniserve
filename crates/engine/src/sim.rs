@@ -739,15 +739,18 @@ impl SimEngine {
                 | PipelineStage::AudioEncoding,
             ) => {}
             CallKind::Pipeline(PipelineStage::Muxing) => {
-                // The muxer assembles the request's encoded media units into
-                // one artifact; the simulator publishes a synthetic payload
-                // that names what it assembled.
-                let payload = format!(
-                    "uniserve-sim-video request={} encoded_units={}",
-                    call.request_key.request_id.0,
-                    call.inputs.len()
-                );
-                record.media_output = Some(publish_media("uniserve-video-", payload.as_bytes())?);
+                // The muxer takes each round's encoded media units as they
+                // arrive and assembles the artifact on the final call, the one
+                // that carries none; the simulator publishes a synthetic
+                // payload for that call only.
+                if call.inputs.is_empty() {
+                    let payload = format!(
+                        "uniserve-sim-video request={}",
+                        call.request_key.request_id.0
+                    );
+                    record.media_output =
+                        Some(publish_media("uniserve-video-", payload.as_bytes())?);
+                }
             }
             CallKind::Pipeline(PipelineStage::ImageDecoding) => {
                 request.flow_step = 0;

@@ -374,8 +374,17 @@ struct MediaFlowState {
     conditioning: Option<TensorRef>,
     latents: Vec<TensorRef>,
     video_segments: BTreeMap<u32, (u32, TensorRef)>,
-    /// Encoded media units by the cursor of the round that produced them.
+    /// Encoded media units by the cursor of the round that produced them,
+    /// until the muxer is handed them.
     encoded_segments: BTreeMap<u32, (u32, TensorRef)>,
+    /// Media unit count of each encode round that has completed and not yet
+    /// been handed to the muxer, by the round's cursor.
+    encoded_ready: BTreeMap<u32, u32>,
+    /// Media units handed to the muxer so far; the next round it takes
+    /// starts here.
+    handed_video_chunks: u32,
+    /// Encoded products carried by the muxing call in flight, retired with it.
+    muxing_inputs: Vec<TensorRef>,
     audio: Option<TensorRef>,
     admission: NewRequest,
     admission_state: WorkerRegistration,
@@ -389,7 +398,11 @@ struct MediaFlowState {
     audio_decoding_scheduled: bool,
     audio_encoding_scheduled: bool,
     audio_encoded: bool,
-    muxing_scheduled: bool,
+    /// Whether a muxing call is in flight; the muxer takes one at a time.
+    muxing_in_flight: bool,
+    /// Whether the call that finalizes the artifact has been scheduled: the
+    /// one that carries no media units, once every unit and the audio are in.
+    final_muxing_scheduled: bool,
     muxed: bool,
     predecessor: CallId,
     terminal_intent: TerminalIntent,

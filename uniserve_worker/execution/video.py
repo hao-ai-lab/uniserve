@@ -1021,11 +1021,11 @@ def execute(
         )
         if reservation is None or mux is None:
             raise RuntimeError("media finalization has no reserved CPU task")
-        if not call.inputs:
-            raise invalid_descriptor(
-                "artifact assembly requires its encoded media units"
-            )
-        # One product per encode round, in media unit order.
+        # A muxing call carries the encode rounds completed since the last
+        # one, one product per round in media unit order, and the muxer
+        # appends them to the request's container. The final call carries
+        # none: every unit and the audio track are in, and it assembles the
+        # artifact.
         units: list[bytes] = []
         for product in call.inputs:
             read = tensor_store.consume(
@@ -1040,14 +1040,18 @@ def execute(
                 )
             rows = read.tensor.to("cpu")
             units.extend(read_encoded_unit(row) for row in rows.unbind(0))
-        tasks = (
-            mux.finalize_artifact(
-                call.request_key,
-                tuple(units),
-                reservation,
-                call.call_id,
-            ),
-        )
+        if units:
+            tasks = (
+                mux.append_units(
+                    call.request_key, tuple(units), reservation, call.call_id
+                ),
+            )
+        else:
+            tasks = (
+                mux.finalize_artifact(
+                    call.request_key, reservation, call.call_id
+                ),
+            )
 
     # Configured HostTask now owns the media lease through its final CPU read.
     request.media_lease = None

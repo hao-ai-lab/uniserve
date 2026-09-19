@@ -447,6 +447,18 @@ impl LaneLedger {
 }
 
 impl Scheduler {
+    /// The cursors of the completed encode rounds the muxer can take next:
+    /// the contiguous run that starts where the units it holds end.
+    fn ready_encode_rounds(state: &MediaFlowState) -> Vec<u32> {
+        let mut rounds = Vec::new();
+        let mut cursor = state.handed_video_chunks;
+        while let Some(units) = state.encoded_ready.get(&cursor) {
+            rounds.push(cursor);
+            cursor += units;
+        }
+        rounds
+    }
+
     /// Lists every call of one request whose inputs are produced.
     ///
     /// A request is a set of calls with data dependencies, so a tick offers all
@@ -492,12 +504,19 @@ impl Scheduler {
         if !state.audio_decoding_scheduled {
             ready.push(PipelineStage::AudioDecoding);
         }
-        // Mux waits for completed writes, never just their scheduled counts.
-        if !state.muxing_scheduled
-            && state.audio_encoded
-            && state.num_encoded_video_chunks == sampling.num_decode_chunks
-        {
-            ready.push(PipelineStage::Muxing);
+        // The muxer consumes media units as they arrive: a muxing call takes
+        // the encode rounds that have completed since the last one, in
+        // order, and a final call carrying no units assembles the artifact
+        // once every unit and the audio track are in. It waits for completed
+        // writes, never just their scheduled counts.
+        if !state.muxing_in_flight && !state.muxed {
+            let next_round_ready = state.encoded_ready.contains_key(&state.handed_video_chunks);
+            let everything_in = state.audio_encoded
+                && state.handed_video_chunks == sampling.num_decode_chunks
+                && !state.final_muxing_scheduled;
+            if next_round_ready || everything_in {
+                ready.push(PipelineStage::Muxing);
+            }
         }
         ready
     }
@@ -777,11 +796,12 @@ impl Scheduler {
                 PipelineStage::AudioEncoding => {
                     vec![state.audio.as_ref().expect("audio is ready").clone()]
                 }
-                // The muxer assembles every encoded media unit of the request.
-                PipelineStage::Muxing => state
-                    .encoded_segments
-                    .values()
-                    .map(|(_, product)| product.clone())
+                // The muxer takes the completed encode rounds that follow the
+                // last it was handed, in media unit order; the final call
+                // carries none.
+                PipelineStage::Muxing => Self::ready_encode_rounds(state)
+                    .into_iter()
+                    .map(|cursor| state.encoded_segments[&cursor].1.clone())
                     .collect(),
                 _ => Vec::new(),
             };
@@ -921,7 +941,25 @@ impl Scheduler {
                         .insert(range.cursor, (range.max_units, call.outputs[0].clone()));
                 }
                 PipelineStage::AudioEncoding => state.audio_encoding_scheduled = true,
-                PipelineStage::Muxing => state.muxing_scheduled = true,
+                PipelineStage::Muxing => {
+                    let rounds = Self::ready_encode_rounds(state);
+                    if rounds.is_empty() {
+                        state.final_muxing_scheduled = true;
+                    }
+                    for cursor in rounds {
+                        let units = state
+                            .encoded_ready
+                            .remove(&cursor)
+                            .expect("a ready encode round was counted");
+                        let (_, product) = state
+                            .encoded_segments
+                            .remove(&cursor)
+                            .expect("a ready encode round has its product");
+                        state.handed_video_chunks += units;
+                        state.muxing_inputs.push(product);
+                    }
+                    state.muxing_in_flight = true;
+                }
                 PipelineStage::VisionEncoding
                 | PipelineStage::LatentEncoding
                 | PipelineStage::ImageDecoding => {
@@ -1785,8 +1823,13 @@ impl Scheduler {
         };
         let mut consumed_products = Vec::new();
         let already_failed = matches!(state.terminal_intent, TerminalIntent::Failure(_));
-        let media_output_valid =
-            (call.code == CallKind::Pipeline(PipelineStage::Muxing)) == media.is_some();
+        // Only the final muxing call, the one that carries no media units,
+        // returns the artifact; every other call returns none.
+        let media_output_valid = if call.code == CallKind::Pipeline(PipelineStage::Muxing) {
+            media.is_some() == call.inputs.is_empty()
+        } else {
+            media.is_none()
+        };
         let step_valid = call.code != CallKind::Pipeline(PipelineStage::Denoising)
             || latent.as_ref().is_some_and(|interval| {
                 record.num_completed_steps == interval.start_step + interval.step_count
@@ -1818,6 +1861,7 @@ impl Scheduler {
                             .as_ref()
                             .expect("submitted media write includes its input range");
                         state.num_encoded_video_chunks += range.max_units;
+                        state.encoded_ready.insert(range.cursor, range.max_units);
                         if let Some((_, product)) = state.video_segments.remove(&range.cursor) {
                             consumed_products.push(product);
                         }
@@ -1829,12 +1873,14 @@ impl Scheduler {
                         }
                     }
                     CallKind::Pipeline(PipelineStage::Muxing) => {
-                        state.muxed = true;
-                        // The artifact is assembled, so every encoded media
-                        // unit it consumed retires with it.
-                        consumed_products
-                            .extend(state.encoded_segments.values().map(|(_, p)| p.clone()));
-                        state.encoded_segments.clear();
+                        // The muxer has taken these units into the container,
+                        // so the encoded products it consumed retire with the
+                        // call; the artifact arrives with the final call.
+                        state.muxing_in_flight = false;
+                        consumed_products.extend(state.muxing_inputs.drain(..));
+                        if media.is_some() {
+                            state.muxed = true;
+                        }
                     }
                     _ => {}
                 }
