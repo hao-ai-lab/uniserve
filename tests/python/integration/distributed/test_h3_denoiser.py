@@ -42,6 +42,7 @@ from uniserve_models.minimax_h3.conditioning import (
 )
 from uniserve_models.minimax_h3.config import TRANSFORMER_FIELDS
 from uniserve_models.minimax_h3.weights import transformer_component
+from uniserve_worker.runtime.request import RequestPool
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -388,11 +389,15 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
             groups=(),
             capacity=2,
         )
+        # Slot storage is the request pool's bank, whose rows the captured
+        # ladder reaches through the device slot index.
+        pool = RequestPool(
+            2, state_buffers=factory.capacity_buffers(), device=device
+        )
+        runner.bind_bank(pool.bank)
         try:
             context = runner.prepare_inputs(size, size)
-            with TensorBuffers.allocate(
-                factory.capacity_buffers(), device=device, pin_memory=True
-            ) as storage:
+            with pool.tensors(1) as storage:
                 views = storage.view(factory.buffers(size))
                 state = {name: views[name] for name in model.modalities}
                 views["text_condition"].zero_()
@@ -441,7 +446,7 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                             inputs,
                             schedules,
                             state=state,
-                            slot=0,
+                            slot=1,
                             input_key=size,
                         )
                         for name in model.modalities:
@@ -457,6 +462,6 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                     for schedule in schedules.values():
                         schedule.timesteps.fill_(float("nan"))
                         schedule.sigmas.fill_(float("nan"))
-                runner.release_slot(0)
         finally:
             runner.close()
+            pool.close()

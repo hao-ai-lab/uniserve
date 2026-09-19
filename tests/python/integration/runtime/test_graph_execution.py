@@ -73,11 +73,16 @@ def test_denoising_reprepared_constants_and_slot_sizes_advance_one_step(
         if branch_device != str(device)
         else (),
     )
+    # Slot storage is one bank with a row per request slot; a captured graph
+    # reaches a slot's row through the device slot index.
+    bank = torch.zeros((2, 64), device=device)
+    runner.bind_bank({"image": bank})
     try:
         for index, (slot, width, key) in enumerate(
             ((1, 32, 2), (1, 64, 3), (2, 32, 2), (1, 32, 2))
         ):
-            sample = torch.full((width,), 7.0, device=device)
+            sample = bank[slot - 1, :width]
+            sample.fill_(7.0)
             reference = sample.clone()
             size = Size(width, float(key + index))
             runner.prepare_inputs(key, size)
@@ -114,11 +119,12 @@ def test_denoising_reprepared_constants_and_slot_sizes_advance_one_step(
 
 @torch.inference_mode()
 def test_captured_ladders_replay_on_every_slot_with_eager_values():
-    """Startup capture leaves every slot's ladder resident and exact.
+    """Startup capture leaves one ladder resident that every slot replays.
 
-    Warmup captures one graph per ladder step on each request slot, so the
-    steps a request runs replay rather than capture, and their values match an
-    eager evaluation of the same ladder from the same samples.
+    Warmup captures one graph per ladder step; the graph gathers whichever
+    slot the device slot index names, so the steps a request runs on either
+    slot replay rather than capture, and their values match an eager
+    evaluation of the same ladder from the same samples.
     """
     device = torch.device("cuda:0")
     model = LinearDenoiser().to(device)
@@ -175,11 +181,13 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
         capacity=2,
         shapes=2,
     )
+    bank = torch.zeros((2, 64), device=device)
+    runner.bind_bank({"image": bank})
     try:
         runner.prepare_inputs(size, size)
-        samples = {
-            slot: torch.full((32,), 7.0, device=device) for slot in slots
-        }
+        samples = {slot: bank[slot - 1, :32] for slot in slots}
+        for sample in samples.values():
+            sample.fill_(7.0)
         for slot in slots:
             resting = samples[slot].clone()
             for step in range(steps):
