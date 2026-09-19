@@ -11,7 +11,6 @@ from torch import nn
 from uniserve.distributed import DeviceMesh
 from uniserve.nn import MergedColumnParallelLinear, RMSNorm, RowParallelLinear
 from uniserve.nn.attention import vsa
-from uniserve.nn.functional import qk_norm_rope
 from uniserve.tensors import BufferConfig
 
 from .config import TransformerConfig
@@ -106,17 +105,6 @@ class Attention(nn.Module):
                     )
                     for name in ("q", "k", "v", "gate")
                 )
-                q, k = qk_norm_rope(
-                    q,
-                    k,
-                    self.query_norm.weight,
-                    self.key_norm.weight,
-                    (cos[interval],),
-                    (sin[interval],),
-                    eps=self.query_norm.eps,
-                    axis_dims=(self.head_dim,),
-                    out=(q, k),
-                )
                 yield interval, (q, k, v, gate)
 
         batch = inputs.vsa
@@ -137,8 +125,21 @@ class Attention(nn.Module):
                 )
             },
         )
+        # Q/K normalization and partial RoPE are applied by VSA while it
+        # prepares each projected chunk, in the same pass that pools and
+        # packs the rows.
         attended = self.vsa.forward_chunks(
-            project(), batch, selected_tiles=selected, workspace=buffers
+            project(),
+            batch,
+            selected_tiles=selected,
+            workspace=buffers,
+            norm_rope=vsa.NormRope(
+                self.query_norm.weight,
+                self.key_norm.weight,
+                self.query_norm.eps,
+                cos,
+                sin,
+            ),
         )
         flattened = (
             (interval, value.flatten(1)) for interval, value in attended
