@@ -155,3 +155,27 @@ def test_a_channel_product_of_media_size_fits_its_publication_bound(
         assert publication.encoded_size_bound() < pcm.numel() * 2
     finally:
         transport.close()
+
+
+@pytest.mark.gpu
+def test_a_channel_product_reaches_a_device_destination(
+    events: EventPool,
+) -> None:
+    """The bytes arrive pageable and still land in a device tensor."""
+    transport = make_transport(
+        "channel", byte_capacity=1 << 20, ticket_capacity=2, event_pool=events
+    )
+    try:
+        source = torch.arange(96, dtype=torch.int16).reshape(48, 2)
+        delivered = Locator.from_mapping(transport.publish(source).to_mapping())
+        destination = torch.empty(48, 2, dtype=torch.int16, device="cuda:0")
+        _await_ticket(
+            transport.fetch(
+                delivered,
+                device=torch.device("cuda:0"),
+                destination=destination,
+            )
+        )
+        assert torch.equal(destination.cpu(), source)
+    finally:
+        transport.close()
