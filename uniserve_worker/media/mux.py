@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -243,71 +243,122 @@ class AvMuxSession:
     """Assembles encoded media units and an encoded audio track into one MP4.
 
     Both tracks arrive already encoded, so assembly creates each output stream
-    from its first payload's parameters and copies packets across with a running
-    timestamp offset. No frame is decoded or re-encoded.
+    from a template and copies packets across with a running timestamp
+    offset; no frame is decoded or re-encoded. Media units are appended as
+    their rounds complete, and the audio track is muxed when the artifact is
+    finalized, so the container is open from the first unit to the last.
     """
 
     def __init__(self, config: AvMuxConfig) -> None:
         self.config = config
+        self._buffer: io.BytesIO | None = None
+        self._container: Any = None
+        self._video_out: Any = None
+        self._audio_out: Any = None
+        self._offset = 0
+        self.units_appended = 0
 
-    def assemble(self, units: tuple[bytes, ...], audio: bytes) -> bytes:
-        """Return the artifact for one request's ordered units and its audio."""
+    @property
+    def total_units(self) -> int:
+        """Return the number of media units the request's video divides into."""
+        return len(self.config.video_unit_frames)
+
+    def _open(self, first_unit: bytes) -> None:
+        """Create the container and both output streams before any packet.
+
+        The video stream is templated from the first unit. The audio stream
+        must exist before the header is written, and the audio track is not
+        encoded until every unit has been reconstructed, so its template is a
+        brief silent track encoded under the same settings, whose codec
+        parameters are the ones the real track carries.
+        """
         import av
 
-        if len(units) != len(self.config.video_unit_frames):
+        self._buffer = io.BytesIO()
+        self._container = av.open(self._buffer, mode="w", format="mp4")
+        source = av.open(io.BytesIO(first_unit))
+        try:
+            self._video_out = self._container.add_stream_from_template(
+                source.streams.video[0]
+            )
+        finally:
+            source.close()
+        template = encode_audio_track(
+            replace(self.config, frame_count=1, video_unit_frames=(1,)),
+            np.zeros((1, 2), dtype=np.int16),
+        )
+        track = av.open(io.BytesIO(template))
+        try:
+            self._audio_out = self._container.add_stream_from_template(
+                track.streams.audio[0]
+            )
+        finally:
+            track.close()
+
+    def append(self, units: tuple[bytes, ...]) -> None:
+        """Copy the packets of the next media units, in order."""
+        import av
+
+        if self.units_appended + len(units) > self.total_units:
+            raise invalid_descriptor(
+                "artifact assembly received more media units than the request"
+            )
+        for payload in units:
+            if self._container is None:
+                self._open(payload)
+            source = av.open(io.BytesIO(payload))
+            try:
+                stream = source.streams.video[0]
+                last = self._offset
+                for packet in source.demux(stream):
+                    if packet.dts is None:
+                        continue
+                    packet.stream = self._video_out
+                    packet.pts = (packet.pts or 0) + self._offset
+                    packet.dts = packet.dts + self._offset
+                    self._container.mux(packet)
+                    last = max(last, packet.dts + (packet.duration or 1))
+                self._offset = last
+            finally:
+                source.close()
+            self.units_appended += 1
+
+    def finalize(self, audio: bytes) -> bytes:
+        """Mux the audio track after every unit and return the artifact."""
+        import av
+
+        if self.units_appended != self.total_units or self._container is None:
             raise invalid_descriptor(
                 "artifact assembly requires every media unit of the request"
             )
-        buffer = io.BytesIO()
-        container = av.open(buffer, mode="w", format="mp4")
+        track = av.open(io.BytesIO(audio))
         try:
-            video_out = audio_out = None
-            offset = 0
-            for payload in units:
-                source = av.open(io.BytesIO(payload))
-                try:
-                    stream = source.streams.video[0]
-                    if video_out is None:
-                        # Both output streams exist before any packet is
-                        # muxed, and video leads so the artifact keeps its
-                        # stream order.
-                        video_out = container.add_stream_from_template(stream)
-                        track = av.open(io.BytesIO(audio))
-                        try:
-                            audio_out = container.add_stream_from_template(
-                                track.streams.audio[0]
-                            )
-                        finally:
-                            track.close()
-                    last = offset
-                    for packet in source.demux(stream):
-                        if packet.dts is None:
-                            continue
-                        packet.stream = video_out
-                        packet.pts = (packet.pts or 0) + offset
-                        packet.dts = packet.dts + offset
-                        container.mux(packet)
-                        last = max(last, packet.dts + (packet.duration or 1))
-                    offset = last
-                finally:
-                    source.close()
-
-            track = av.open(io.BytesIO(audio))
-            try:
-                for packet in track.demux(track.streams.audio[0]):
-                    if packet.dts is None:
-                        continue
-                    packet.stream = audio_out
-                    container.mux(packet)
-            finally:
-                track.close()
+            for packet in track.demux(track.streams.audio[0]):
+                if packet.dts is None:
+                    continue
+                packet.stream = self._audio_out
+                self._container.mux(packet)
         finally:
-            container.close()
-
-        value = buffer.getvalue()
+            track.close()
+        self._container.close()
+        assert self._buffer is not None
+        value = self._buffer.getvalue()
+        self.close()
         if not value:
             raise RuntimeError("media mux produced an empty container")
         return value
+
+    def close(self) -> None:
+        """Discard an open container, for a request that ends early."""
+        if self._container is not None:
+            try:
+                self._container.close()
+            except Exception:  # noqa: BLE001 - closing a discarded container
+                pass
+        self._container = None
+        self._buffer = None
+        self._video_out = None
+        self._audio_out = None
 
 
 @dataclass(slots=True)
@@ -317,6 +368,8 @@ class MuxSession:
     container: AvMuxSession
     audio: bytes | None = None
     audio_tail: concurrent.futures.Future[object] | None = None
+    #: The last append task, which the next append and the finalization follow.
+    mux_tail: concurrent.futures.Future[object] | None = None
     finalized: bool = False
 
 
@@ -442,27 +495,77 @@ class MediaMux:
         session.audio_tail = task.promise
         return task
 
-    def finalize_artifact(
+    def append_units(
         self,
         request_key: RequestKey,
         units: tuple[bytes, ...],
         reservation: HostTask,
         call_id: CallId,
     ) -> HostTask:
-        """Schedule assembly of the artifact from every encoded track."""
+        """Schedule the next media units into the request's container.
+
+        Units of consecutive rounds are appended in order, so a round's task
+        follows the previous round's on the host lane through its dependency.
+        """
+        session = self._sessions.get(request_key)
+        if session is None or session.finalized:
+            raise invalid_descriptor(
+                "media assembly requires an open assembly session"
+            )
+        if not units:
+            raise invalid_descriptor("media assembly received no media units")
+        dependencies = () if session.mux_tail is None else (session.mux_tail,)
+
+        def append() -> None:
+            session.container.append(units)
+
+        task = reservation.configure(
+            append,
+            dependencies=dependencies,
+            input_ready=None,
+            input_completion=None,
+            release=None,
+            profile_name=(
+                f"uniserve.host.mux request={_key_label(request_key)} "
+                f"step={call_id.batch_id} "
+                f"op={call_id.request_index} "
+                f"kind=units rank={self.rank}"
+            ),
+        )
+        session.mux_tail = task.promise
+        return task
+
+    def finalize_artifact(
+        self,
+        request_key: RequestKey,
+        reservation: HostTask,
+        call_id: CallId,
+    ) -> HostTask:
+        """Schedule the artifact's assembly after every unit and the audio.
+
+        The engine schedules this call after the last encode round and the
+        audio track have completed, so the task depends on the last append
+        and on the audio encode rather than on any input of its own.
+        """
         session = self._sessions.get(request_key)
         if session is None or session.finalized:
             raise invalid_descriptor(
                 "media finalization requires an open assembly session"
             )
-        dependencies = (
-            () if session.audio_tail is None else (session.audio_tail,)
+        if session.audio is None and session.audio_tail is None:
+            raise invalid_descriptor(
+                "artifact finalization precedes the audio track's encode"
+            )
+        dependencies = tuple(
+            promise
+            for promise in (session.mux_tail, session.audio_tail)
+            if promise is not None
         )
 
         def publish() -> MediaOutput:
             if session.audio is None:
                 raise RuntimeError("artifact assembly has no encoded audio")
-            payload = session.container.assemble(units, session.audio)
+            payload = session.container.finalize(session.audio)
             return MediaOutput(
                 handle=PosixShmArtifact(name=publish_media_bytes(payload)),
                 bytes=len(payload),
@@ -489,10 +592,12 @@ class MediaMux:
         for key in [
             key for key in self._sessions if key.request_id == int(request_id)
         ]:
-            self._sessions.pop(key)
+            self._sessions.pop(key).container.close()
 
     def close(self) -> None:
         """Discard all active assembly sessions and reject new media work."""
+        for session in self._sessions.values():
+            session.container.close()
         self._sessions.clear()
 
 
