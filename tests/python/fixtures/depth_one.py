@@ -754,6 +754,7 @@ def encode_call(
     encoder_handle: int,
     mode: PipelineStage = PipelineStage.VISION_ENCODING,
     source_product: TensorRef | None = None,
+    entry: str = "model",
 ) -> Call:
     """An encoder computation with an encoded image or a resident image source.
 
@@ -777,6 +778,10 @@ def encode_call(
         predecessor=predecessor,
         coordinates=CallCoordinates(),
         kind=mode,
+        # Which entry serves a stage is the model's, not the stage's: a model
+        # that encodes images from its own component names that component,
+        # while one that encodes from its language backbone names "model".
+        entry=entry,
         bounds=Bounds(max_tokens=64, max_latent_bytes=8_192),
         input_image=image_base64,
         image_input=source_product,

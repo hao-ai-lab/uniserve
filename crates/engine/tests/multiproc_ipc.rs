@@ -35,29 +35,34 @@ static CHILD_LAUNCH_ENV_LOCK: Mutex<()> = Mutex::new(());
 #[test]
 fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> {
     let mut args = rank_group_args(1 << 20, 8 << 20);
-    args.capability_groups = vec!["ar_extend".into()];
+    // The language backbone and the patch encoder hold a rank each, which is
+    // the arrangement a model with several components is served in.
     args.entries = [
         (
             "model".into(),
             uniserve_core::ComponentConfig::parallel(vec![1], Default::default()),
         ),
         (
-            "output".into(),
+            "vision_encoder".into(),
             uniserve_core::ComponentConfig::parallel(vec![0], Default::default()),
         ),
     ]
     .into_iter()
     .collect();
     let mut worker = WorkerGroup::spawn(args)?;
+    let supported = worker.info().supported_ops.clone();
+    assert!(supported.contains(&CallKind::Forward(ForwardMode::Prefill)));
+    assert!(supported.contains(&CallKind::Pipeline(PipelineStage::VisionEncoding)));
     assert_eq!(
-        worker.info().supported_ops,
-        vec![CallKind::Forward(ForwardMode::Prefill)]
+        worker.info().pipeline_components[&PipelineStage::VisionEncoding],
+        "vision_encoder"
     );
+
     let first = text_admission(51, 1, 1)?;
     let second = text_admission(52, 1, 2)?;
     let first_key = first.request_key;
     let second_key = second.request_key;
-    let mut batch = token_batch(
+    let mut extend = token_batch(
         1,
         1,
         first_key,
@@ -69,59 +74,106 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
         BlockId(1),
         0,
     );
-    let mut other = token_batch(
+    let second_admission = token_batch(
         1,
         1,
         second_key,
         Some(second),
-        CallId::new(2, 1),
+        CallId::new(3, 0),
         CallId::new(0, 0),
         CallKind::Forward(ForwardMode::Prefill),
         &[9, 10],
         BlockId(2),
         0,
     );
-    other.calls[0].entry = "output".into();
-    for index in &mut other.forward.call_indices {
-        *index += 1;
-    }
-    batch.calls.extend(other.calls);
-    batch.commands.extend(other.commands);
-    batch.input_products.extend(other.input_products);
-    batch.forward.append(other.forward, 0);
-    batch.block_tables.extend(other.block_tables);
-    batch.new_cache_pages.extend(other.new_cache_pages);
-    let starts = std::mem::take(&mut batch.commands);
+    let mut starts = std::mem::take(&mut extend.commands);
+    starts.extend(second_admission.commands);
     let admission = execute(
         &mut worker,
         Batch::new(1, vec![], vec![]).with_commands(starts),
     )?;
     assert!(admission.results.is_empty());
-    batch.batch_id = 2;
-    batch.collective_seq = 2;
-    worker.submit_batch(batch)?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut completed = std::collections::BTreeSet::new();
-    let mut terminal = false;
-    while std::time::Instant::now() < deadline && !terminal {
-        if let Some(report) = worker.poll_batch(Duration::from_millis(100))? {
-            for completion in report.results {
-                assert_eq!(completion.output.status, CallStatus::Ok);
-                assert_eq!(completion.output.committed_tokens.as_slice().len(), 1);
-                assert!(completed.insert(completion.output.call_id));
-            }
-            terminal = true;
-        }
-    }
-    assert!(terminal, "independent entry work did not retire");
+
+    // A batch carries one call kind for one entry, so each entry's work
+    // travels in its own batch and retires on the ranks that entry holds.
+    extend.batch_id = 2;
+    extend.collective_seq = 2;
+    let extend_report = execute(&mut worker, extend)?;
+    assert_eq!(extend_report.results.len(), 1);
+    assert_eq!(extend_report.results[0].output.call_id, CallId::new(2, 0));
+    assert_eq!(extend_report.results[0].output.status, CallStatus::Ok);
     assert_eq!(
-        completed,
-        [CallId::new(2, 0), CallId::new(2, 1)].into_iter().collect()
+        extend_report.results[0]
+            .output
+            .committed_tokens
+            .as_slice()
+            .len(),
+        1
     );
+
+    let image_bytes = b"iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAGUlEQVR4nGN0SGhgIAUwkaR6VMOohiGlAQCjvQFA6eri4wAAAABJRU5ErkJggg==".to_vec();
+    let feature = TensorRef {
+        request_key: second_key,
+        producer_call_id: CallId::new(3, 0),
+        output_index: 0,
+        generation: 1,
+        dtype: DType::BF16,
+        shape_bound: ShapeBound {
+            dims: vec![DimBound::Device { max: 4096 }],
+        },
+    };
+    let encode = Call {
+        coordinates: CallCoordinates::default(),
+        token_input: None,
+
+        token_output: None,
+        vision_input: None,
+        latent_feature_input: None,
+        encoder_output: Some(feature.clone()),
+        latent_input: None,
+        latent_output: None,
+        image_input: None,
+        image_output: None,
+        completion_output: None,
+        transition_output: None,
+
+        kv_input: None,
+        kv_output: None,
+        input_image: Some(String::from_utf8(image_bytes).unwrap().into()),
+        input_token_ids: Vec::new(),
+        sampling_state: None,
+        request_key: second_key,
+        call_id: CallId::new(3, 0),
+        predecessor: Some(CallId::new(0, 0)),
+        entry: "vision_encoder".into(),
+        code: CallKind::Pipeline(PipelineStage::VisionEncoding),
+        bounds: Bounds {
+            max_tokens: 64,
+            max_latent_bytes: 8192,
+            ..Bounds::default()
+        },
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        predicate: None,
+        rng: None,
+    };
+    let mut encode = Batch::new(3, Vec::new(), vec![encode]);
+    encode.collective_seq = 3;
+    encode
+        .buffer_allocations
+        .push(uniserve_worker_ipc::BufferAllocation {
+            buffer: feature.buffer_id(),
+            offset: 0,
+            bytes: feature.max_bytes(),
+        });
+    let encode_report = execute(&mut worker, encode)?;
+    assert_eq!(encode_report.results.len(), 1);
+    assert_eq!(encode_report.results[0].output.call_id, CallId::new(3, 0));
+    assert_eq!(encode_report.results[0].output.status, CallStatus::Ok);
 
     // Closing a request releases every participating rank's physical storage.
     worker.submit_batch(
-        Batch::new(3, vec![], vec![]).with_commands(
+        Batch::new(4, vec![], vec![]).with_commands(
             [first_key, second_key]
                 .into_iter()
                 .map(|request_key| BatchCommand::Finish {
@@ -351,7 +403,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
                 uniserve_core::ComponentConfig::parallel(vec![1], Default::default()),
             ),
             (
-                "output".into(),
+                "vision_encoder".into(),
                 uniserve_core::ComponentConfig::parallel(vec![0], Default::default()),
             ),
         ]
@@ -406,7 +458,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
         let value = source.calls[0].token_output.clone().unwrap();
         let mut logical = bind(source, "model");
         let publication = TensorRef {
-            producer_call_id: CallId::new(1, 1),
+            producer_call_id: CallId::new(2, 0),
             generation: 2,
             ..value.clone()
         };
@@ -431,7 +483,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             input_token_ids: Vec::new(),
             sampling_state: None,
             request_key: admission.request_key,
-            call_id: CallId::new(1, 1),
+            call_id: CallId::new(2, 0),
             predecessor: None,
             entry: "model".into(),
             code: CallKind::Transfer(TransferMode::Tensor),
@@ -444,12 +496,9 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             predicate: None,
             rng: None,
         };
-        logical
-            .requests
-            .extend(bind(Batch::new(1, vec![], vec![publish]), "model").requests);
 
         let copy = TensorRef {
-            producer_call_id: CallId::new(1, 2),
+            producer_call_id: CallId::new(3, 0),
             generation: 3,
             ..publication.clone()
         };
@@ -474,9 +523,9 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             input_token_ids: Vec::new(),
             sampling_state: None,
             request_key: admission.request_key,
-            call_id: CallId::new(1, 2),
+            call_id: CallId::new(3, 0),
             predecessor: None,
-            entry: "output".into(),
+            entry: "vision_encoder".into(),
             code: CallKind::Transfer(TransferMode::Tensor),
             bounds: Bounds {
                 max_transfer_bytes: publication.max_bytes(),
@@ -487,29 +536,41 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             predicate: None,
             rng: None,
         };
-        logical
-            .requests
-            .extend(bind(Batch::new(1, vec![], vec![consume]), "output").requests);
-        executor.submit(logical)?;
         let mut completions = std::collections::BTreeMap::new();
-        loop {
-            let result = poll_logical(&mut executor)?
-                .context("same-request product chain did not complete")?;
-            for result in result.results {
-                assert_eq!(result.output.status, CallStatus::Ok);
-                assert!(
-                    completions
-                        .insert(result.output.call_id, result.output)
-                        .is_none()
-                );
+        let mut drain = |executor: &mut WorkerExecutor,
+                         completions: &mut std::collections::BTreeMap<_, _>|
+         -> anyhow::Result<()> {
+            loop {
+                let result = poll_logical(executor)?.context("a submitted batch did not retire")?;
+                for result in result.results {
+                    assert_eq!(result.output.status, CallStatus::Ok);
+                    assert!(
+                        completions
+                            .insert(result.output.call_id, result.output)
+                            .is_none()
+                    );
+                }
+                if result.done {
+                    return Ok(());
+                }
             }
-            if result.done {
-                break;
-            }
-        }
+        };
+
+        // Each batch carries one call kind for one entry, and a batch that
+        // reads another's product follows it: a rank executes batches in
+        // channel order and refuses an identifier that does not advance, which
+        // is what carries the dependency now that no ledger does.
+        executor.submit(logical)?;
+        drain(&mut executor, &mut completions)?;
+
+        executor.submit(bind(Batch::new(2, vec![], vec![publish]), "model"))?;
+        drain(&mut executor, &mut completions)?;
+
+        executor.submit(bind(Batch::new(3, vec![], vec![consume]), "vision_encoder"))?;
+        drain(&mut executor, &mut completions)?;
         assert_eq!(
             completions.keys().copied().collect::<Vec<_>>(),
-            vec![CallId::new(1, 0), CallId::new(1, 1), CallId::new(1, 2),]
+            vec![CallId::new(1, 0), CallId::new(2, 0), CallId::new(3, 0),]
         );
         assert_eq!(completions[&CallId::new(1, 0)].committed_tokens, vec![1000]);
 
@@ -667,7 +728,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
             uniserve_core::ComponentConfig::parallel(vec![1], Default::default()),
         ),
         (
-            "output".into(),
+            "vision_encoder".into(),
             uniserve_core::ComponentConfig::parallel(vec![0], Default::default()),
         ),
     ]
@@ -720,8 +781,9 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
             dims: vec![DimBound::Static(1)],
         },
     };
-    // The stub has no text conditioning computation. Registration succeeds,
-    // then the call reports its actual execution error without a product.
+    // The entry holding the language backbone does not serve vision encoding,
+    // which the patch encoder's own entry does. Registration succeeds, then
+    // the call reports its actual execution error without a product.
     let produce = Call {
         coordinates: CallCoordinates::default(),
         token_input: None,
@@ -746,7 +808,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         call_id: CallId::new(1, 0),
         predecessor: None,
         entry: "model".into(),
-        code: CallKind::Pipeline(PipelineStage::TextEncoding),
+        code: CallKind::Pipeline(PipelineStage::VisionEncoding),
         bounds: Bounds::default(),
         inputs: vec![],
         outputs: vec![value.clone()],
@@ -761,7 +823,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
     });
     let mut logical = bind(source, "model");
     let copied = TensorRef {
-        producer_call_id: CallId::new(1, 1),
+        producer_call_id: CallId::new(2, 0),
         generation: 2,
         ..value.clone()
     };
@@ -786,9 +848,9 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         input_token_ids: Vec::new(),
         sampling_state: None,
         request_key: key,
-        call_id: CallId::new(1, 1),
+        call_id: CallId::new(2, 0),
         predecessor: None,
-        entry: "output".into(),
+        entry: "vision_encoder".into(),
         code: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: value.max_bytes(),
@@ -799,22 +861,22 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         predicate: None,
         rng: None,
     };
-    let mut consumer = Batch::new(1, vec![], vec![consume]);
+    let mut consumer = Batch::new(2, vec![], vec![consume]);
     consumer.buffer_allocations.push(BufferAllocation {
         buffer: copied.buffer_id(),
         offset: 256,
         bytes: copied.max_bytes(),
     });
-    logical.requests.extend(bind(consumer, "output").requests);
+    let consumer = bind(consumer, "vision_encoder");
     let independent = text_admission(72, 1, 2)?;
     let independent_key = independent.request_key;
     let independent = bind(
         token_batch(
-            1,
-            1,
+            3,
+            3,
             independent_key,
             Some(independent),
-            CallId::new(1, 2),
+            CallId::new(3, 0),
             CallId::new(0, 0),
             CallKind::Forward(ForwardMode::Prefill),
             &[9],
@@ -824,9 +886,9 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         "model",
     );
 
-    logical.requests.extend(independent.requests);
-    logical.commands.extend(independent.commands);
     executor.submit(logical)?;
+    executor.submit(consumer)?;
+    executor.submit(independent)?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut failed = false;
@@ -845,13 +907,12 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
                 );
                 assert!(loss.endpoints.is_empty());
                 assert_eq!(loss.requests, vec![key]);
-                assert_eq!(loss.retired, vec![(1, key, CallId::new(1, 1))]);
+                assert_eq!(loss.retired, vec![(2, key, CallId::new(2, 0))]);
                 assert!(loss.buffers.contains(&value.buffer_id()));
                 failed = true;
             }
             Ok(Some(result)) => {
-                assert_eq!(result.batch_id, 1);
-                batch_done |= result.done;
+                batch_done |= result.done && result.batch_id == 3;
                 for result in result.results {
                     match result.output.call_id {
                         CallId {
@@ -863,8 +924,8 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
                             source_returned = true;
                         }
                         CallId {
-                            batch_id: 1,
-                            request_index: 2,
+                            batch_id: 3,
+                            request_index: 0,
                         } => {
                             assert_eq!(result.output.status, CallStatus::Ok);
                             assert_eq!(result.output.committed_tokens, vec![1000]);
@@ -892,15 +953,16 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
         let wrapper = directory.path().join("worker");
         let name_path = directory.path().join("media-name");
         let python = serde_json::to_string(&worker_python())?;
-        let fixture = serde_json::to_string(
-            &Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tests/python/fixtures/rank_media.py"),
-        )?;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let fixture = serde_json::to_string(&root.join("tests/python/fixtures/rank_media.py"))?;
+        // The fixture is run by path, so its own directory leads the import
+        // path; the package it shares with the rest of the suite is named here.
+        let import_root = serde_json::to_string(&root.canonicalize()?)?;
         let name = serde_json::to_string(&name_path)?;
         std::fs::write(
             &wrapper,
             format!(
-                "#!/usr/bin/env python3\nimport os, sys\nenv = dict(os.environ, UNISERVE_TEST_MEDIA_RESPONSE={case:?}, UNISERVE_TEST_MEDIA_NAME={name})\nos.execve({python}, [{python}, {fixture}, *sys.argv[3:]], env)\n"
+                "#!/usr/bin/env python3\nimport os, sys\nenv = dict(os.environ, PYTHONPATH={import_root}, UNISERVE_TEST_MEDIA_RESPONSE={case:?}, UNISERVE_TEST_MEDIA_NAME={name})\nos.execve({python}, [{python}, {fixture}, *sys.argv[3:]], env)\n"
             ),
         )?;
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
@@ -1510,7 +1572,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     let slow_root = CallId::new(0, 0);
     let mut slow = token_batch(
         1,
-        2,
+        1,
         slow_admission.request_key,
         Some(slow_admission.clone()),
         CallId::new(1, 0),
@@ -1539,7 +1601,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     let fast_root = CallId::new(0, 0);
     let fast = token_batch(
         2,
-        1,
+        2,
         fast_admission.request_key,
         Some(fast_admission),
         CallId::new(2, 0),
@@ -1684,13 +1746,8 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
     let spawn = |worker_id: &str, depth| -> anyhow::Result<WorkerGroup> {
         let mut args = rank_group_args(1 << 20, 8 << 20);
-        let binding = WorkerConfig::placed(
-            &["localhost".to_owned()],
-            "cpu",
-            1,
-            depth,
-            WorkerConfig::single_entry("model", 1),
-        );
+        let binding =
+            WorkerConfig::placed(&["localhost".to_owned()], "cpu", 1, depth, stub_entries(1));
         args.ranks = binding.ranks.clone();
         args.entries = binding.entries;
         args.queue_depth = depth;
@@ -1921,7 +1978,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         request_key: admission.request_key,
         call_id: CallId::new(8, 0),
         predecessor: Some(CallId::new(0, 0)),
-        entry: "model".into(),
+        entry: "vision_encoder".into(),
         code: CallKind::Pipeline(PipelineStage::VisionEncoding),
         bounds: Bounds {
             max_tokens: 64,
@@ -2253,6 +2310,32 @@ fn spawn_rank_group_with_capacities(
         request_slot_capacity,
         response_slot_capacity,
     ))
+}
+
+/// The components the stub model declares, over `rank_count` ranks.
+///
+/// A placement names what a worker holds, and a worker that serves a model's
+/// whole computation holds every component it declares.
+fn stub_entries(
+    rank_count: usize,
+) -> std::collections::BTreeMap<String, uniserve_core::ComponentConfig> {
+    let members: Vec<_> = (0..rank_count).collect();
+    std::collections::BTreeMap::from([
+        (
+            "model".into(),
+            uniserve_core::ComponentConfig::parallel(
+                members.clone(),
+                uniserve_core::ParallelConfig {
+                    tensor_parallel_size: rank_count,
+                    ..Default::default()
+                },
+            ),
+        ),
+        (
+            "vision_encoder".into(),
+            uniserve_core::ComponentConfig::parallel(members, Default::default()),
+        ),
+    ])
 }
 
 fn rank_group_args(
