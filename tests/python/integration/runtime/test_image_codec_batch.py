@@ -125,7 +125,6 @@ def _run(runner, manager, rows):
         Call(
             RequestKey(1, index, 0),
             CallId(1, 0),
-            None,
             CallCoordinates(),
             row.forward_mode,
             Bounds(),
