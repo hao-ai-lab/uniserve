@@ -71,14 +71,20 @@ impl WorkerProcessArgs {
         // entire lifetime, and every rank reports its endpoint to one
         // registration address. Both are loopback where every rank runs here,
         // which is what a shared directory gave them; where some rank runs
-        // elsewhere both name this host, because a loopback address reaches
-        // only the host that binds it.
+        // elsewhere both name a routable host, because a loopback address
+        // reaches only the host that binds it. The first rank binds the
+        // rendezvous store, so the store is placed on that rank's host: this
+        // one, or the host whose launcher reserved a port for it.
         let head = match launchers.as_ref() {
             Some(registry) => Some(registry.reachable_host()?),
             None => None,
         };
         let rendezvous = if self.ranks.len() > 1 {
-            Some(super::registration::reserve_rendezvous(head)?)
+            let first = &self.ranks[0].node;
+            Some(match launchers.as_ref() {
+                Some(registry) if *first != self.host => registry.rendezvous_on(first)?,
+                _ => super::registration::reserve_rendezvous(head)?,
+            })
         } else {
             None
         };

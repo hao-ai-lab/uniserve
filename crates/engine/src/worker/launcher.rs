@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 struct Presentation {
     /// The host identity this launcher owns, as the placement names it.
     host: String,
+    /// A free port of that host for a rendezvous bound by a rank placed there.
+    rendezvous_port: u16,
 }
 
 /// What a launcher says when one of its ranks exits.
@@ -58,6 +60,8 @@ pub(crate) struct RemoteLaunch<'a> {
 struct Launcher {
     stream: TcpStream,
     reader: BufReader<TcpStream>,
+    /// The port the launcher reserved on its host for a rendezvous.
+    rendezvous_port: u16,
 }
 
 /// The head's launcher registration address and the launchers that presented.
@@ -175,7 +179,36 @@ impl LauncherRegistry {
         stream
             .set_read_timeout(None)
             .context("clearing a launcher's read deadline")?;
-        Ok((presentation.host, Launcher { stream, reader }))
+        Ok((
+            presentation.host,
+            Launcher {
+                stream,
+                reader,
+                rendezvous_port: presentation.rendezvous_port,
+            },
+        ))
+    }
+
+    /// Returns the rendezvous address for a group whose first rank runs on
+    /// `host`, which is another machine.
+    ///
+    /// The first rank binds the collective store, so the store's address has
+    /// to be one of that rank's own host: the address its launcher connected
+    /// from, at the port the launcher reserved there.
+    pub(crate) fn rendezvous_on(&self, host: &str) -> anyhow::Result<String> {
+        let launcher = self
+            .hosts
+            .get(host)
+            .with_context(|| format!("no launcher presented host {host}"))?;
+        let address = launcher
+            .stream
+            .peer_addr()
+            .with_context(|| format!("reading the address host {host} connected from"))?;
+        Ok(format!(
+            "tcp://{}:{}",
+            address.ip(),
+            launcher.rendezvous_port
+        ))
     }
 
     /// Sends one rank's launch to the launcher that owns its host.
