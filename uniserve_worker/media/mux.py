@@ -184,16 +184,17 @@ class MediaMux:
     def audio(
         self,
         request_key: RequestKey,
-        sources: tuple[HostBorrow, ...],
+        source: HostBorrow,
         reservation: HostTask,
         call_id: CallId,
     ) -> HostTask:
-        """Schedule the audio track's encode from its borrowed PCM bytes.
+        """Schedule the audio track's encode from its staged PCM bytes.
 
-        The borrows hold the raw PCM timeline in sample order, one per
-        decoding rank's publication, which the job reads as stereo int16
-        samples. The encoded track is the session's own state rather than a
-        result, because only the assembled artifact is this request's output.
+        The borrow holds the complete raw PCM timeline, which the job reads
+        as stereo int16 samples, and its release returns the segment once
+        the codec has read it. The encoded track is the session's own state
+        rather than a result, because only the assembled artifact is this
+        request's output.
         """
         session = self._sessions.get(request_key)
         if session is None:
@@ -203,23 +204,16 @@ class MediaMux:
 
         key = session_key(request_key)
 
-        def release() -> None:
-            for source in sources:
-                source.release()
-
         task = reservation.configure(
             EncodeAudioTrack(
                 key,
                 session.config,
-                tuple(
-                    SharedSlice(source.segment, source.offset, source.nbytes)
-                    for source in sources
-                ),
+                SharedSlice(source.segment, source.offset, source.nbytes),
             ),
             dependencies=(),
             input_ready=None,
             input_completion=None,
-            release=release,
+            release=source.release,
             profile_name=(
                 f"uniserve.host.encode request={_key_label(request_key)} "
                 f"step={call_id.batch_id} "

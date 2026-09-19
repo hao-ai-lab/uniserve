@@ -235,6 +235,7 @@ class Worker:
                 queue_depth=config.ipc.queue_depth,
                 completion_payload_bytes=config.ipc.max_payload_bytes,
                 acknowledgment_slot=config.ipc.acknowledgment_slot,
+                host_slots=config.ipc.host_slots,
                 products_cross_hosts=config.ipc.products_cross_hosts,
                 components=config.components,
                 process_groups=distributed,
@@ -260,6 +261,7 @@ class Worker:
         queue_depth: int,
         completion_payload_bytes: int,
         acknowledgment_slot: int = 0,
+        host_slots: Sequence[int] = (),
         products_cross_hosts: bool = False,
         attention: str | None = None,
         transfer_backends: tuple[str, ...] = ("local",),
@@ -627,6 +629,7 @@ class Worker:
                 ticket_capacity=arena.transfer_tickets,
                 event_pool=self.device_events,
                 acknowledgment_slot=acknowledgment_slot,
+                host_slots=host_slots,
                 cross_host_consumers=products_cross_hosts,
             )
             for transport in self.transports.values():

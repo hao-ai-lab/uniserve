@@ -230,6 +230,17 @@ class Transport(ABC):
         or hold their own copy has nothing to wait for and ignores them.
         """
 
+    def serves(self, consumers: Sequence[int]) -> bool:
+        """Whether this mechanism reaches the named consumers.
+
+        A publication is made over each mechanism that reaches one of the
+        acknowledgment slots the producing call names; a call that names none
+        is published over every mechanism the rank binds. A mechanism that
+        reaches every consumer wherever it runs serves any call.
+        """
+        del consumers
+        return True
+
     @abstractmethod
     def fetch(
         self,
@@ -1249,8 +1260,12 @@ class ShmTransport(Transport):
         event_pool: EventPool,
         source: WorkerEndpoint | None = None,
         acknowledgment_slot: int = 0,
+        host_slots: Sequence[int] = (),
     ) -> None:
         self._bytes = capacity
+        # Slots of the ranks on this host: the only ones a segment named in
+        # this host's namespace can reach.
+        self._host_slots = frozenset(int(slot) for slot in host_slots)
         self._publications = Publications[_ShmSource](
             capacity=256,
             reclaim=self._reclaim,
@@ -1285,6 +1300,11 @@ class ShmTransport(Transport):
 
     def endpoint(self) -> str:
         return self._publications.name
+
+    def serves(self, consumers: Sequence[int]) -> bool:
+        return not consumers or any(
+            int(slot) in self._host_slots for slot in consumers
+        )
 
     def publication_retirement(
         self, locator: Locator
@@ -1733,10 +1753,14 @@ class ChannelTransport(Transport):
         capacity: TransferCapacity,
         event_pool: EventPool,
         source: WorkerEndpoint | None = None,
+        host_slots: Sequence[int] = (),
     ) -> None:
         self._bytes = capacity
         self._events = event_pool
         self.source = source or WorkerEndpoint.local()
+        # Slots of the ranks on this host, which shared memory reaches; the
+        # channel carries a product only for a consumer elsewhere.
+        self._host_slots = frozenset(int(slot) for slot in host_slots)
         self._endpoint = f"uniserve-channel-{uuid.uuid4().hex}"
         self._reads = _BoundedTransferPool(
             workers=1,
@@ -1759,6 +1783,11 @@ class ChannelTransport(Transport):
 
     def endpoint(self) -> str:
         return self._endpoint
+
+    def serves(self, consumers: Sequence[int]) -> bool:
+        return not consumers or any(
+            int(slot) not in self._host_slots for slot in consumers
+        )
 
     def set_completion_wake(self, wake: Any) -> None:
         self._reads.set_completion_wake(wake)
@@ -2500,15 +2529,19 @@ def make_transports(
     event_pool: EventPool,
     source: WorkerEndpoint | None = None,
     acknowledgment_slot: int = 0,
+    host_slots: Sequence[int] = (),
     cross_host_consumers: bool = False,
 ) -> dict[str, Transport]:
     """Construct configured backends against one rank resource budget.
 
     `acknowledgment_slot` is this rank's own word, which it writes in the
-    header of every chunk or segment it reads. `cross_host_consumers` says
-    whether a rank on another host reads this rank's products, which decides
-    how a device publication states readiness. Which ranks read a given
-    product is stated on the call that produces it.
+    header of every chunk or segment it reads. `host_slots` are the words of
+    the ranks on this host, which decide whether a host product's consumers
+    are reached over shared memory or over the rank channel.
+    `cross_host_consumers` says whether a rank on another host reads this
+    rank's products, which decides how a device publication states
+    readiness. Which ranks read a given product is stated on the call that
+    produces it.
     """
     if not names or len(set(names)) != len(names):
         raise invalid_descriptor(
@@ -2543,6 +2576,9 @@ def make_transports(
                 arguments["cross_host_consumers"] = cross_host_consumers
             if name == "shm":
                 arguments["acknowledgment_slot"] = acknowledgment_slot
+                arguments["host_slots"] = host_slots
+            if name == "channel":
+                arguments["host_slots"] = host_slots
             transports[name] = constructors[name](**arguments)
     except BaseException:
         for transport in transports.values():
@@ -2570,11 +2606,13 @@ def publish_tensor(
 
     A device product is published where it lies, over the device mechanism
     of the rank's edges; a host product, or a device product the caller marks
-    `host`, is published as host bytes over the host mechanism. A device
-    product that neither exports in place nor fits its device's pool falls
-    back to host bytes for that product. A partial failure revokes all
-    preceding locations. Each backend continues to retain the source until
-    its submitted device work and readers retire.
+    `host`, is published as host bytes over each host mechanism that reaches
+    one of its named consumers: shared memory for a consumer on this host,
+    the rank channel for one elsewhere. A device product that neither exports
+    in place nor fits its device's pool falls back to host bytes for that
+    product. A partial failure revokes all preceding locations. Each backend
+    continues to retain the source until its submitted device work and
+    readers retire.
     """
     if not transports:
         raise unsupported_setup(
@@ -2583,13 +2621,15 @@ def publish_tensor(
     first = source[0] if isinstance(source, tuple) else source
     device_product = first.is_cuda and not host
     names = DEVICE_MECHANISMS if device_product else HOST_MECHANISMS
-    selected = [transports[name] for name in names if name in transports]
     # A rank whose edges carry no device mechanism sends its device products
     # as bytes, the crossing any consumer off this device makes anyway.
     if device_product and "cuda_vmm" not in transports:
-        selected = [
-            transports[name] for name in HOST_MECHANISMS if name in transports
-        ]
+        names = HOST_MECHANISMS
+    selected = [
+        transports[name]
+        for name in names
+        if name in transports and transports[name].serves(consumers)
+    ]
     locations: list[Locator] = []
     try:
         for transport in selected:
@@ -2602,7 +2642,11 @@ def publish_tensor(
                 # host bytes instead, over every host mechanism this rank
                 # publishes on.
                 for fallback in HOST_MECHANISMS:
-                    if fallback in transports and fallback != "local":
+                    if (
+                        fallback in transports
+                        and fallback != "local"
+                        and transports[fallback].serves(consumers)
+                    ):
                         location = transports[fallback].publish(
                             source, offset=offset, consumers=consumers
                         )

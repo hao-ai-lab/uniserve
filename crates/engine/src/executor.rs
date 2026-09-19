@@ -856,6 +856,33 @@ impl TransferConfig {
         base + rank
     }
 
+    /// Acknowledgment slots of every rank placed on the same host as one
+    /// rank, across workers, this rank's own included.
+    ///
+    /// A host product is published over the mechanism that reaches the
+    /// consumers its producing call names: shared memory for a consumer on
+    /// the host, the rank channel for one elsewhere. The producing rank is
+    /// told which slots share its host so it can tell the two apart; an
+    /// unplaced rank shares a host with no one.
+    pub fn host_slots(&self, worker: &str, rank: u32) -> Vec<u32> {
+        let Some(host) = self
+            .worker_hosts
+            .get(worker)
+            .and_then(|hosts| hosts.get(rank as usize))
+        else {
+            return Vec::new();
+        };
+        let mut slots = Vec::new();
+        for (name, hosts) in &self.worker_hosts {
+            for (member, placed) in hosts.iter().enumerate() {
+                if placed == host {
+                    slots.push(self.acknowledgment_slot(name, member as u32));
+                }
+            }
+        }
+        slots
+    }
+
     /// Whether any rank that reads this rank's products is on another host.
     ///
     /// A product retires when every consumer has written its word in the
@@ -1407,5 +1434,31 @@ mod tests {
         assert!(
             TransferConfig::parse("encoder->denoiser=shm,encoder:0->denoiser:1=cuda_vmm").is_err()
         );
+    }
+
+    #[test]
+    fn host_slots_name_every_rank_on_the_producing_ranks_host() {
+        let mut transfer = TransferConfig::default();
+        transfer.worker_ranks.insert("host".to_owned(), 2);
+        transfer.worker_ranks.insert("model".to_owned(), 4);
+        transfer.worker_hosts.insert(
+            "host".to_owned(),
+            vec!["a".to_owned(), "b".to_owned()],
+        );
+        transfer.worker_hosts.insert(
+            "model".to_owned(),
+            vec!["a".to_owned(), "a".to_owned(), "b".to_owned(), "b".to_owned()],
+        );
+        // Model rank 3 is on host b with host rank 1 and model rank 2.
+        let slots = transfer.host_slots("model", 3);
+        let expected = [
+            transfer.acknowledgment_slot("host", 1),
+            transfer.acknowledgment_slot("model", 2),
+            transfer.acknowledgment_slot("model", 3),
+        ];
+        assert_eq!(slots, expected);
+        // An unplaced rank shares a host with no one.
+        assert!(transfer.host_slots("model", 7).is_empty());
+        assert!(TransferConfig::default().host_slots("model", 0).is_empty());
     }
 }

@@ -921,6 +921,7 @@ pub(crate) fn media_consumer_slots(
     transfer: &crate::executor::TransferConfig,
     members: &[usize],
     rank: usize,
+    producer: Option<&crate::ComponentConfig>,
 ) -> Vec<u32> {
     let owner_of = |component: &str| {
         if let Some(config) = components.get(component) {
@@ -937,7 +938,30 @@ pub(crate) fn media_consumer_slots(
         let Some((owner, component)) = routing.get(consumer).and_then(|name| owner_of(name)) else {
             continue;
         };
-        for &reader in &component.ranks {
+        // A round deals its media units to each distributed component's
+        // ranks in order, `units_per_rank` each, so a distributed consumer of
+        // a distributed producer reads only the positions this rank produces;
+        // any other consumer reads the whole product.
+        let dealt = producer
+            .filter(|producer| producer.distribution.is_some() && component.distribution.is_some())
+            .and_then(|producer| {
+                producer
+                    .ranks
+                    .iter()
+                    .position(|&member| member == rank)
+                    .map(|index| (producer, index))
+            });
+        let readers: Vec<usize> = match dealt {
+            Some((producer, index)) => {
+                let per_producer = producer.units_per_rank.max(1);
+                let per_reader = component.units_per_rank.max(1);
+                (index * per_producer..(index + 1) * per_producer)
+                    .filter_map(|position| component.ranks.get(position / per_reader).copied())
+                    .collect()
+            }
+            None => component.ranks.clone(),
+        };
+        for reader in readers {
             if owner != worker || (reader != rank && !members.contains(&reader)) {
                 slots.insert(transfer.acknowledgment_slot(owner, reader as u32));
             }
@@ -980,6 +1004,7 @@ impl WorkerGroup {
             transfer,
             members,
             rank,
+            self.process_args.components.get(&call.component),
         )
     }
 

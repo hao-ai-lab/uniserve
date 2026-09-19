@@ -1564,8 +1564,10 @@ mod placement_tests {
     #[test]
     fn a_decoded_unit_names_the_host_worker_ranks_that_read_it() {
         // The decoder's product is read by the video encoder on the host
-        // worker: every encoder rank's slot is named, none of the decoder's
-        // own, and the host worker's slots follow the model worker's run.
+        // worker: the encoder rank dealt this decoder rank's position is
+        // named, none of the decoder's own ranks, and the host worker's
+        // slots follow the model worker's run. A consumer that is not
+        // distributed reads the whole product on every rank.
         use crate::executor::TransferConfig;
         use crate::worker::instance::media_consumer_slots;
 
@@ -1589,12 +1591,42 @@ mod placement_tests {
             &transfer,
             &[0, 1, 2, 3],
             2,
+            model_components.get("video_decoder"),
         );
-        let expected = [
-            transfer.acknowledgment_slot("host", 0),
-            transfer.acknowledgment_slot("host", 1),
-        ];
-        assert_eq!(slots, expected);
+        // Position 2 of the round, two units per host rank: host rank 1.
+        assert_eq!(slots, [transfer.acknowledgment_slot("host", 1)]);
+
+        let routing = BTreeMap::from([
+            (MediaCall::AudioDecoding, "audio_decoder".to_owned()),
+            (MediaCall::AudioEncoding, "muxer".to_owned()),
+        ]);
+        let model_components =
+            BTreeMap::from([("audio_decoder".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
+        let host_components = BTreeMap::from([(
+            "muxer".to_owned(),
+            ComponentConfig {
+                ranks: vec![0],
+                parallel_config: Default::default(),
+                distribution: None,
+                units_per_rank: 1,
+            },
+        )]);
+        let peers = BTreeMap::from([
+            ("host".to_owned(), host_components),
+            ("model".to_owned(), model_components.clone()),
+        ]);
+        let slots = media_consumer_slots(
+            &[MediaCall::AudioEncoding],
+            &routing,
+            "model",
+            &model_components,
+            &peers,
+            &transfer,
+            &[0, 1, 2, 3],
+            3,
+            model_components.get("audio_decoder"),
+        );
+        assert_eq!(slots, [transfer.acknowledgment_slot("host", 0)]);
     }
 
     #[test]

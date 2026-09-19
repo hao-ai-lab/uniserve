@@ -358,15 +358,11 @@ class EncodeVideoUnit:
 
 @dataclass(frozen=True, slots=True)
 class EncodeAudioTrack:
-    """Encode a request's stereo int16 PCM into its mux session's track.
-
-    The timeline arrives as the slices its decoding ranks published, in
-    sample order; the job joins them.
-    """
+    """Encode a request's complete stereo int16 PCM timeline into its track."""
 
     session: SessionKey
     config: AvMuxConfig
-    sources: tuple[SharedSlice, ...]
+    source: SharedSlice
 
 
 @dataclass(frozen=True, slots=True)
@@ -464,8 +460,7 @@ def _execute(job: CodecJob, sessions: dict[SessionKey, _Session]) -> object:
             session = sessions[job.session] = _Session(job.config)
         if session.audio is not None:
             raise ValueError("audio output is already written")
-        samples = np.concatenate([_read(source) for source in job.sources])
-        track = samples.view(np.int16).reshape(-1, 2)
+        track = _read(job.source).view(np.int16).reshape(-1, 2)
         session.audio = encode_audio_track(job.config, track)
         return None
 

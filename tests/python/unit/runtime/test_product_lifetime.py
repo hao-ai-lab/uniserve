@@ -1152,3 +1152,64 @@ def test_fp8_publication_preserves_values_before_a_later_block_scale_growth():
         transport.close()
         pool.close()
         events.close()
+
+
+def test_a_host_product_is_published_where_its_consumers_are() -> None:
+    """Each host mechanism carries a product only to consumers it reaches."""
+    from uniserve_worker.transfer import segment
+    from uniserve_worker.transfer.tickets import (
+        _open_shared_memory,
+        make_transports,
+        publish_tensor,
+    )
+
+    events = EventPool()
+    # Slots 0 and 1 share this host; slot 2 is on another host.
+    transports = make_transports(
+        ("local", "shm", "channel"),
+        byte_capacity=1 << 20,
+        ticket_capacity=8,
+        event_pool=events,
+        acknowledgment_slot=0,
+        host_slots=(0, 1),
+    )
+    value = torch.arange(16, dtype=torch.int16).reshape(8, 2)
+    try:
+        cases = {
+            (1,): {"local", "shm"},
+            (2,): {"local", "channel"},
+            (1, 2): {"local", "shm", "channel"},
+            (): {"local", "shm", "channel"},
+        }
+        for consumers, expected in cases.items():
+            locations = publish_tensor(
+                transports,
+                value,
+                retain=lambda future: None,
+                consumers=consumers,
+                host=True,
+            )
+            try:
+                assert {
+                    location.backend for location in locations
+                } == expected, consumers
+            finally:
+                # A segment retires once its named consumers have written
+                # their words; the channel and local copies retire with the
+                # release alone.
+                for location in locations:
+                    if location.backend == "shm":
+                        mapping = _open_shared_memory(
+                            location.transport.name,
+                            segment.HEADER_BYTES + location.nbytes,
+                        )
+                        try:
+                            for slot in consumers:
+                                segment.acknowledge(memoryview(mapping), slot)
+                        finally:
+                            mapping.close()
+                    transports[location.backend].release(location)
+                transports["shm"].reap()
+    finally:
+        for transport in transports.values():
+            transport.close()
