@@ -522,18 +522,14 @@ impl PendingRank {
             .env("WORLD_SIZE", world_size.to_string())
             .env("LOCAL_RANK", local_rank.to_string())
             .env("LOCAL_WORLD_SIZE", local_world_size.to_string());
-        // CUDA VMM exports cudaMalloc allocations. Expandable VMM segments
-        // cannot supply its memory handles; other ranks retain expandable
-        // allocation to accommodate varying serving shapes.
+        // Every rank serves varying shapes from expandable allocator segments.
+        // Publication never depends on the caching allocator: a device product
+        // is exported from the rank's own VMM arena or copied into its bounded
+        // VMM pool, both reserved outside the allocator.
         if std::env::var_os("PYTORCH_ALLOC_CONF").is_none()
             && std::env::var_os("PYTORCH_CUDA_ALLOC_CONF").is_none()
         {
-            let allocation = if publications.contains(&crate::executor::TransferBackend::CudaVmm) {
-                "expandable_segments:False"
-            } else {
-                "expandable_segments:True"
-            };
-            cmd.env("PYTORCH_CUDA_ALLOC_CONF", allocation);
+            cmd.env("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True");
         }
         if let Ok(cwd) = std::env::current_dir() {
             let pp = std::env::var("PYTHONPATH").unwrap_or_default();

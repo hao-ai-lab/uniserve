@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from math import prod
@@ -403,25 +402,6 @@ class WorkerProcessArgs:
             raise ValueError("publication backends must be bound transports")
         if "cuda_vmm" in backends and not device.startswith("cuda:"):
             raise ValueError("CUDA VMM requires a CUDA worker device")
-
-        # CUDA VMM shares pointers into the caching allocator's segments, which
-        # only works for natively reserved, non-expandable allocations.
-        allocator = (
-            (
-                os.environ.get("PYTORCH_ALLOC_CONF")
-                or os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-            )
-            .replace(" ", "")
-            .lower()
-        )
-        if "cuda_vmm" in publication_backends and (
-            "expandable_segments:true" in allocator
-            or "backend:cudamallocasync" in allocator
-        ):
-            raise ValueError(
-                "CUDA VMM publication requires native nonexpandable "
-                "CUDA allocations"
-            )
 
         return cls(
             worker_id=str(namespace.worker_id),
