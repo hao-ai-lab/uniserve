@@ -445,6 +445,65 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(
         events.close()
 
 
+def test_a_deferred_write_commits_when_its_host_work_publishes_it() -> None:
+    """A write host work fills later packs without it and commits with it."""
+    buffers = BufferPool(byte_capacity=16, devices=("cpu",))
+    store = TensorStore(
+        capacity=2,
+        request_capacity=0,
+        relay_depth=0,
+        buffer_pool=buffers,
+    )
+    rows = TensorRef(
+        request_key=RequestKey(1, 1, 1),
+        producer_call_id=CallId(1, 0),
+        output_index=0,
+        generation=1,
+        dtype=DType.F32,
+        shape_bound=ShapeBound((StaticDim(1),)),
+    )
+    other = replace(rows, output_index=1)
+    consumer = CallId(2, 0)
+    try:
+        writes = store.bind_outputs(
+            ((rows, "cpu"), (other, "cpu")),
+            buffer_allocations={
+                reference.buffer_id: BufferAllocation(
+                    reference.buffer_id, index * 4, 4
+                )
+                for index, reference in enumerate((rows, other))
+            },
+        )
+        deferred, immediate = writes
+        store.defer_write(deferred)
+        store.publish_write(immediate, torch.tensor([7.0]))
+        # The call's completion packs and commits with the immediate write
+        # only; the deferred one is neither published nor exposed yet.
+        store.validate_writes(writes)
+        store.commit_writes(writes)
+        read = store.consume(other, consumer_call_id=consumer)
+        torch.testing.assert_close(
+            read.tensor, torch.tensor([7.0]), rtol=0, atol=0
+        )
+        store.complete_reads((read,))
+        with pytest.raises(WorkerError):
+            store.consume(rows, consumer_call_id=consumer)
+        # Host work publishes and commits it later; then it reads like any
+        # other product.
+        store.publish_write(deferred, torch.tensor([3.0]))
+        store.commit_writes((deferred,))
+        read = store.consume(rows, consumer_call_id=consumer)
+        torch.testing.assert_close(
+            read.tensor, torch.tensor([3.0]), rtol=0, atol=0
+        )
+        store.complete_reads((read,))
+        with pytest.raises(WorkerError):
+            store.defer_write(deferred)
+    finally:
+        store.close()
+        buffers.close()
+
+
 @pytest.mark.parametrize("relay", (False, True))
 def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
     relay: bool,
