@@ -1441,13 +1441,17 @@ mod tests {
         let mut transfer = TransferConfig::default();
         transfer.worker_ranks.insert("host".to_owned(), 2);
         transfer.worker_ranks.insert("model".to_owned(), 4);
-        transfer.worker_hosts.insert(
-            "host".to_owned(),
-            vec!["a".to_owned(), "b".to_owned()],
-        );
+        transfer
+            .worker_hosts
+            .insert("host".to_owned(), vec!["a".to_owned(), "b".to_owned()]);
         transfer.worker_hosts.insert(
             "model".to_owned(),
-            vec!["a".to_owned(), "a".to_owned(), "b".to_owned(), "b".to_owned()],
+            vec![
+                "a".to_owned(),
+                "a".to_owned(),
+                "b".to_owned(),
+                "b".to_owned(),
+            ],
         );
         // Model rank 3 is on host b with host rank 1 and model rank 2.
         let slots = transfer.host_slots("model", 3);

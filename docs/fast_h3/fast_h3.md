@@ -83,7 +83,7 @@ The head logs `awaiting a launcher for each host this instance does not run on a
 uniserve-host --head <address the head logs> --host-identity rank-1
 ```
 
-The launcher starts each rank with the Python interpreter and launch descriptor the head resolved, so the other host needs the same Python environment and the checkpoint at the same path.
+One launcher serves every worker of the deployment that places a rank on its host, here ranks 4 to 7 of the model worker and the second rank of the host worker. The launcher starts each rank with the Python interpreter and launch descriptor the head resolved, so the other host needs the same Python environment and the checkpoint at the same path.
 
 A FastH3 deployment defaults to `--max-video-seconds 15` and `--max-model-len 16384`; set them only to change those limits. `--max-running-requests` caps concurrently resident requests, and the engine clamps that cap to the worker's advertised request-slot capacity; lowering it trades throughput for per-request latency and memory headroom.
 
