@@ -239,7 +239,11 @@ class Locator:
             return "local"
         if isinstance(self.transport, PosixShmTransfer):
             return "shm"
-        return "cuda_vmm"
+        if isinstance(self.transport, ChannelTransfer):
+            return "channel"
+        if isinstance(self.transport, CudaVmmTransfer):
+            return "cuda_vmm"
+        raise invalid_descriptor("tensor locator names an unknown transport")
 
     def __post_init__(self) -> None:
         """Validate tensor shape and handle kind.
