@@ -13,9 +13,12 @@ from torch import nn
 from uniserve.distributed import DeviceMesh
 from uniserve.nn import _binding
 from uniserve.ops import video_sparse as ops
-from uniserve.ops.video_sparse_rows import pack_sparse_input_rows
+from uniserve.ops.video_sparse_rows import (
+    pack_sparse_input_rows,
+    prepare_sparse_input_rows,
+)
 
-from .inputs import BlockInput, Input, Workspace
+from .inputs import BlockInput, Input, NormRope, Workspace
 
 
 class BlockAttention(nn.Module):
@@ -80,8 +83,24 @@ class _PreparedInput:
     pooled_key: torch.Tensor
     pooled_value: torch.Tensor
     packed: torch.Tensor
+    gate: torch.Tensor
 
-    def append(self, interval: slice, q, k, v):
+    def append(
+        self,
+        interval: slice,
+        q,
+        k,
+        v,
+        g,
+        norm_rope: NormRope | None = None,
+        tokens: slice | None = None,
+    ):
+        """Publish one projected interval; ``tokens`` is its global span.
+
+        With ``norm_rope``, Q and K are normalized and rotated as they are
+        pooled and packed, in one pass over the projections that also copies
+        the gate rows.
+        """
         start, stop = interval.start, interval.stop
         if (
             start < 0
@@ -91,13 +110,39 @@ class _PreparedInput:
             or stop - start != q.shape[0]
             or q.shape != k.shape
             or q.shape != v.shape
+            or q.shape != g.shape
         ):
             raise ValueError(
                 "VSA projection chunks must cover complete in-range tiles"
             )
 
+        if norm_rope is not None:
+            assert tokens is not None
+            prepare_sparse_input_rows(
+                q,
+                k,
+                v,
+                g,
+                norm_rope.query_weight,
+                norm_rope.key_weight,
+                norm_rope.cos[tokens],
+                norm_rope.sin[tokens],
+                self.valid_sizes,
+                eps=norm_rope.eps,
+                packed=self.packed,
+                packed_gate=self.gate,
+                pooled_query=self.pooled_query,
+                pooled_key=self.pooled_key,
+                pooled_value=self.pooled_value,
+                owners=self.owners,
+                chunk_rows=self.chunk_tokens,
+                row_start=start,
+            )
+            return
+
         # Pool one mean per 64-token tile, then pack the full-resolution rows
         # into the shared exchange layout at the same logical positions.
+        self.gate[start:stop].copy_(g)
         tiles = slice(start // 64, stop // 64)
         ops.pool_qkv_means(
             q,
@@ -299,7 +344,13 @@ class Attention(nn.Module):
         *,
         selected_tiles: int,
         workspace: Workspace,
+        norm_rope: NormRope | None = None,
     ) -> Iterator[tuple[slice, torch.Tensor]]:
+        """Attend tile-aligned projection chunks of ``(q, k, v, gate)``.
+
+        ``norm_rope`` applies the model's Q/K normalization and rotation to
+        each chunk while it is prepared, so callers pass raw projections.
+        """
         from uniserve.nn.attention._parallel import AttentionRowExchange
 
         parallel = getattr(self, "_parallel", None)
@@ -371,12 +422,12 @@ class Attention(nn.Module):
                     workspace.pooled_key[query_tiles],
                     workspace.pooled_value[query_tiles],
                     buffers["qkv"],
+                    gate,
                 )
             local = slice(
                 interval.start - query_start, interval.stop - query_start
             )
-            prepared.append(local, q, k, v)
-            gate[local].copy_(g)
+            prepared.append(local, q, k, v, g, norm_rope, interval)
             intervals.append((interval.start, interval.stop))
 
         # A gather may publish its local interval before remote intervals.

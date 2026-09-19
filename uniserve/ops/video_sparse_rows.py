@@ -139,6 +139,225 @@ if triton is not None:
         )
 
     @triton.jit
+    def _prepare_masked_qkv_kernel(
+        query,
+        key,
+        value,
+        gate,
+        query_weight,
+        key_weight,
+        cosine,
+        sine,
+        valid_sizes,
+        packed,
+        packed_gate,
+        pooled_query,
+        pooled_key,
+        pooled_value,
+        query_stride_row: tl.constexpr,
+        query_stride_head: tl.constexpr,
+        key_stride_row: tl.constexpr,
+        key_stride_head: tl.constexpr,
+        value_stride_row: tl.constexpr,
+        value_stride_head: tl.constexpr,
+        gate_stride_row: tl.constexpr,
+        gate_stride_head: tl.constexpr,
+        rotary_stride_row: tl.constexpr,
+        pooled_stride_tile: tl.constexpr,
+        pooled_stride_head: tl.constexpr,
+        rows: tl.constexpr,
+        row_start: tl.constexpr,
+        tile_offset: tl.constexpr,
+        heads: tl.constexpr,
+        width: tl.constexpr,
+        half_rotary: tl.constexpr,
+        eps: tl.constexpr,
+        tile_rows: tl.constexpr,
+        slab_rows: tl.constexpr,
+        owners: tl.constexpr,
+        chunk_rows: tl.constexpr,
+    ):
+        """Normalize, rotate, pool and pack one 64-row tile of one head.
+
+        Q and K are RMS-normalized in fp32 over the full head and their even
+        rotary prefix is rotated split-half with compact factors, the same
+        arithmetic as the in-place norm-and-rope kernel. Each head row is
+        read once as two half-width column sets: ``x`` holds the first rotary
+        half followed by the first half of the unrotated tail, ``y`` the
+        partner column of each ``x`` column, so a lane owns a rotation pair
+        and tail columns ride along with unit factors. The packed rows hold
+        the rotated values rounded to the source dtype; the pooled means
+        average those rounded rows over the tile's valid rows in fp32.
+        Queries are packed in owner-interval order and K/V in global row
+        order with rows past a tile's valid size zeroed, the layout of the
+        packing kernel; the gate rows are copied in global row order.
+        """
+        tile = tl.program_id(0)
+        head = tl.program_id(1)
+        half_width: tl.constexpr = width // 2
+        rotary_dim: tl.constexpr = 2 * half_rotary
+        tail_half: tl.constexpr = half_width - half_rotary
+        columns = tl.arange(0, half_width)
+        full_columns = tl.arange(0, width)
+        rotated = columns < half_rotary
+        x_columns = tl.where(
+            rotated, columns, rotary_dim + (columns - half_rotary)
+        )
+        y_columns = x_columns + tl.where(rotated, half_rotary, tail_half)
+        valid_rows = tl.load(valid_sizes + tile_offset + tile)
+
+        # Learned normalization weights, gathered per column set.
+        query_x_weight = tl.load(query_weight + x_columns)[None, :].to(
+            tl.float32
+        )
+        query_y_weight = tl.load(query_weight + y_columns)[None, :].to(
+            tl.float32
+        )
+        key_x_weight = tl.load(key_weight + x_columns)[None, :].to(tl.float32)
+        key_y_weight = tl.load(key_weight + y_columns)[None, :].to(tl.float32)
+
+        component_size = heads * rows * width
+        owner_rows = rows // owners
+        query_x_sum = tl.zeros((half_width,), dtype=tl.float32)
+        query_y_sum = tl.zeros((half_width,), dtype=tl.float32)
+        key_x_sum = tl.zeros((half_width,), dtype=tl.float32)
+        key_y_sum = tl.zeros((half_width,), dtype=tl.float32)
+        value_sum = tl.zeros((width,), dtype=tl.float32)
+
+        for slab in tl.static_range(tile_rows // slab_rows):
+            local_rows = slab * slab_rows + tl.arange(0, slab_rows)
+            input_offsets = (tile * tile_rows + local_rows).to(tl.int64)
+            row_offsets = row_start + input_offsets
+            valid_mask = (local_rows < valid_rows)[:, None]
+
+            query_base = (
+                input_offsets[:, None] * query_stride_row
+                + head * query_stride_head
+            )
+            key_base = (
+                input_offsets[:, None] * key_stride_row + head * key_stride_head
+            )
+            query_x = tl.load(query + query_base + x_columns[None, :]).to(
+                tl.float32
+            )
+            query_y = tl.load(query + query_base + y_columns[None, :]).to(
+                tl.float32
+            )
+            key_x = tl.load(key + key_base + x_columns[None, :]).to(tl.float32)
+            key_y = tl.load(key + key_base + y_columns[None, :]).to(tl.float32)
+
+            # Normalization spans the complete head even though only the
+            # rotary prefix consumes sine and cosine factors.
+            query_rstd = tl.rsqrt(
+                (
+                    tl.sum(query_x * query_x, axis=1)
+                    + tl.sum(query_y * query_y, axis=1)
+                )
+                / width
+                + eps
+            )
+            key_rstd = tl.rsqrt(
+                (tl.sum(key_x * key_x, axis=1) + tl.sum(key_y * key_y, axis=1))
+                / width
+                + eps
+            )
+            query_x = query_x * query_rstd[:, None] * query_x_weight
+            query_y = query_y * query_rstd[:, None] * query_y_weight
+            key_x = key_x * key_rstd[:, None] * key_x_weight
+            key_y = key_y * key_rstd[:, None] * key_y_weight
+
+            # Tail columns load unit factors and pass through the rotation.
+            factor_mask = rotated[None, :] & (local_rows[:, None] >= 0)
+            factor_offsets = (
+                input_offsets[:, None] * rotary_stride_row + columns[None, :]
+            )
+            cosine_values = tl.load(
+                cosine + factor_offsets, mask=factor_mask, other=1.0
+            ).to(tl.float32)
+            sine_values = tl.load(
+                sine + factor_offsets, mask=factor_mask, other=0.0
+            ).to(tl.float32)
+            query_x_out = (query_x * cosine_values - query_y * sine_values).to(
+                query.dtype.element_ty
+            )
+            query_y_out = (query_y * cosine_values + query_x * sine_values).to(
+                query.dtype.element_ty
+            )
+            key_x_out = tl.where(
+                valid_mask, key_x * cosine_values - key_y * sine_values, 0.0
+            ).to(key.dtype.element_ty)
+            key_y_out = tl.where(
+                valid_mask, key_y * cosine_values + key_x * sine_values, 0.0
+            ).to(key.dtype.element_ty)
+            value_values = tl.load(
+                value
+                + input_offsets[:, None] * value_stride_row
+                + head * value_stride_head
+                + full_columns[None, :],
+                mask=valid_mask,
+                other=0.0,
+            )
+
+            # Queries are reordered into per-chunk intervals that group every
+            # owner's rows together; K/V keep global row order.
+            owner = row_offsets // owner_rows
+            local_row = row_offsets % owner_rows
+            segment = local_row // chunk_rows
+            count = tl.minimum(chunk_rows, owner_rows - segment * chunk_rows)
+            interval_row = owner * count + local_row % chunk_rows
+            query_destination = (
+                packed
+                + (
+                    segment * chunk_rows * owners * heads * width
+                    + interval_row * heads * width
+                    + head * width
+                )[:, None]
+            )
+            destination = (row_offsets * heads * width + head * width)[:, None]
+            key_destination = packed + component_size + destination
+            tl.store(query_destination + x_columns[None, :], query_x_out)
+            tl.store(query_destination + y_columns[None, :], query_y_out)
+            tl.store(key_destination + x_columns[None, :], key_x_out)
+            tl.store(key_destination + y_columns[None, :], key_y_out)
+            tl.store(
+                packed
+                + 2 * component_size
+                + destination
+                + full_columns[None, :],
+                value_values,
+            )
+            gate_values = tl.load(
+                gate
+                + input_offsets[:, None] * gate_stride_row
+                + head * gate_stride_head
+                + full_columns[None, :]
+            )
+            tl.store(
+                packed_gate + destination + full_columns[None, :], gate_values
+            )
+
+            query_x_sum += tl.sum(
+                tl.where(valid_mask, query_x_out.to(tl.float32), 0.0), axis=0
+            )
+            query_y_sum += tl.sum(
+                tl.where(valid_mask, query_y_out.to(tl.float32), 0.0), axis=0
+            )
+            key_x_sum += tl.sum(key_x_out.to(tl.float32), axis=0)
+            key_y_sum += tl.sum(key_y_out.to(tl.float32), axis=0)
+            value_sum += tl.sum(value_values.to(tl.float32), axis=0)
+
+        # Pooled means, with the clamped divisor keeping empty tiles finite.
+        divisor = tl.maximum(valid_rows, 1)
+        pooled = (
+            tile_offset + tile
+        ) * pooled_stride_tile + head * pooled_stride_head
+        tl.store(pooled_query + pooled + x_columns, query_x_sum / divisor)
+        tl.store(pooled_query + pooled + y_columns, query_y_sum / divisor)
+        tl.store(pooled_key + pooled + x_columns, key_x_sum / divisor)
+        tl.store(pooled_key + pooled + y_columns, key_y_sum / divisor)
+        tl.store(pooled_value + pooled + full_columns, value_sum / divisor)
+
+    @triton.jit
     def _compose_rows_kernel(
         attended,
         gate,
@@ -359,6 +578,125 @@ def pack_sparse_input_rows(
         num_stages=1,
     )
     return packed
+
+
+def prepare_sparse_input_rows(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    query_weight: torch.Tensor,
+    key_weight: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+    valid_sizes: torch.Tensor,
+    *,
+    eps: float,
+    packed: torch.Tensor,
+    packed_gate: torch.Tensor,
+    pooled_query: torch.Tensor,
+    pooled_key: torch.Tensor,
+    pooled_value: torch.Tensor,
+    owners: int,
+    chunk_rows: int,
+    row_start: int,
+) -> None:
+    """Normalize, rotate, pool and pack a projected Q/K/V/gate row interval.
+
+    One read of the projections yields the packed row-major input layout of
+    ``pack_sparse_input_rows`` with Q and K normalized and rotated as
+    ``qk_norm_rope`` computes them with compact factors, the gate rows copied
+    into ``packed_gate`` at their global rows, and the per-tile means
+    ``pool_qkv_means`` computes from stored projections, written at the
+    interval's tiles. ``cosine`` and ``sine`` hold the interval's compact
+    half-width factors; the interval starts at ``row_start`` and covers whole
+    tiles.
+    """
+    assert triton is not None
+    input_rows, heads, width = (int(size) for size in query.shape)
+    rows = int(packed.shape[1])
+    rotary_dim = int(cosine.shape[-1]) * 2
+    if (
+        query.shape != key.shape
+        or query.shape != value.shape
+        or query.shape != gate.shape
+        or packed.shape != (3, rows, heads, width)
+        or packed_gate.shape != (rows, heads, width)
+        or packed_gate.dtype != gate.dtype
+        or not packed_gate.is_contiguous()
+        or packed.dtype != query.dtype
+        or not packed.is_contiguous()
+        or query_weight.shape != (width,)
+        or key_weight.shape != (width,)
+        or cosine.shape != (input_rows, rotary_dim // 2)
+        or sine.shape != cosine.shape
+        or not 0 < rotary_dim <= width
+        or rotary_dim % 2
+        or width & (width - 1)
+        or row_start < 0
+        or row_start % _TILE
+        or input_rows % _TILE
+        or row_start + input_rows > rows
+        or owners < 1
+        or rows % owners
+        or chunk_rows < 1
+        or pooled_query.shape != pooled_key.shape
+        or pooled_key.shape != pooled_value.shape
+        or pooled_query.shape[1:] != (heads, width)
+        or (row_start + input_rows) // _TILE > pooled_query.shape[0]
+        or any(
+            tensor.dtype != torch.float32 or tensor.stride(-1) != 1
+            for tensor in (pooled_query, pooled_key, pooled_value)
+        )
+    ):
+        raise ValueError(
+            "sparse input preparation requires whole tiles in matching packed "
+            "and pooled storage"
+        )
+
+    # One program prepares one 64-row tile of one head in 32-row slabs with
+    # two warps, the shape that measured fastest for 128-wide heads.
+    half_rotary = rotary_dim // 2
+    _prepare_masked_qkv_kernel[(input_rows // _TILE, heads)](
+        query,
+        key,
+        value,
+        gate,
+        query_weight,
+        key_weight,
+        cosine,
+        sine,
+        valid_sizes,
+        packed,
+        packed_gate,
+        pooled_query,
+        pooled_key,
+        pooled_value,
+        int(query.stride(0)),
+        int(query.stride(1)),
+        int(key.stride(0)),
+        int(key.stride(1)),
+        int(value.stride(0)),
+        int(value.stride(1)),
+        int(gate.stride(0)),
+        int(gate.stride(1)),
+        int(cosine.stride(0)),
+        int(pooled_query.stride(0)),
+        int(pooled_query.stride(1)),
+        rows,
+        row_start,
+        row_start // _TILE,
+        heads,
+        width,
+        half_rotary,
+        float(eps),
+        _TILE,
+        32,
+        owners,
+        chunk_rows,
+        num_warps=2,
+        num_stages=1,
+    )
 
 
 def compose_attention(

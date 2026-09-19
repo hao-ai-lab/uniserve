@@ -197,6 +197,37 @@ class Input:
 
 
 @dataclass(frozen=True, slots=True)
+class NormRope:
+    """Learned Q/K normalization and partial rotation applied while packing.
+
+    Each head is RMS-normalized in fp32 with its learned weight, then an even
+    prefix twice the width of the compact factors is rotated split-half; the
+    remaining columns are only normalized. ``cos`` and ``sin`` hold one row
+    of compact factors per padded token, indexed by global token position.
+    """
+
+    query_weight: torch.Tensor
+    key_weight: torch.Tensor
+    eps: float
+    cos: torch.Tensor
+    sin: torch.Tensor
+
+    def __post_init__(self):
+        if (
+            self.query_weight.shape != self.key_weight.shape
+            or self.query_weight.ndim != 1
+            or self.cos.ndim != 2
+            or self.sin.shape != self.cos.shape
+            or self.cos.shape[1] * 2 > self.query_weight.shape[0]
+            or self.eps < 0
+        ):
+            raise ValueError(
+                "VSA norm-rope needs head-wide weights and compact factors "
+                "within the head"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class Workspace:
     """Borrow scratch for tile pooling, selection, compression and fine
     attention.
