@@ -1,3 +1,7 @@
+# Relative paths below are written against the repository that contains
+# this file, which is its parent directory.
+root = ".."
+
 # Declares serial benchmark servers, workload points, and named benchmark suites.
 # Model and tokenizer placeholders resolve from the launch environment.
 artifact_root = "artifacts/benchmark"

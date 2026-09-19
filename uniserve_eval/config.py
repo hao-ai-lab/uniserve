@@ -23,7 +23,7 @@ from .types import (
     VideoConfig,
 )
 
-ROOT = Path(__file__).resolve().parents[1]
+#: The profiles this driver ships, which `--config` replaces.
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "profiles.toml"
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _ENV_DEFAULT_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-(.*?)\}")
@@ -87,6 +87,8 @@ class SuiteProfile:
 class EvaluationConfig:
     """Contains the complete validated evaluator configuration."""
 
+    #: What the file's relative paths are relative to, which the file states.
+    root: Path
     artifact_root: Path
     servers: dict[str, ServerProfile]
     benchmarks: dict[str, BenchmarkPoint]
@@ -106,9 +108,19 @@ class EvaluationConfig:
 
 
 def load_config(path: Path = DEFAULT_CONFIG) -> EvaluationConfig:
-    """Load and validate an evaluator TOML file."""
-    with Path(path).open("rb") as handle:
+    """Load and validate an evaluator TOML file.
+
+    A profile's relative paths -- its executable, its interpreter, its
+    deployment configuration, its artifact root -- are relative to the tree the
+    file states as its `root`, itself relative to the file. Resolving them
+    against the file rather than against this module's own directory keeps a
+    profile's meaning independent of where the driver is installed.
+    """
+    config_path = Path(path).resolve()
+    with config_path.open("rb") as handle:
         raw = tomllib.load(handle)
+
+    root = (config_path.parent / str(raw.get("root", "."))).resolve()
 
     servers = {
         name: _server_profile(name, value)
@@ -124,8 +136,9 @@ def load_config(path: Path = DEFAULT_CONFIG) -> EvaluationConfig:
     }
     artifact_root = Path(str(raw.get("artifact_root", "artifacts/benchmark")))
     if not artifact_root.is_absolute():
-        artifact_root = ROOT / artifact_root
+        artifact_root = root / artifact_root
     return EvaluationConfig(
+        root=root,
         artifact_root=artifact_root,
         servers=servers,
         benchmarks=benchmarks,
@@ -177,31 +190,26 @@ def require_resolved(value: Any, *, context: str) -> None:
 
 
 def server_launch(
-    server: ServerProfile, executable: Path | None = None
+    server: ServerProfile, executable: Path | None, root: Path
 ) -> ServerLaunch:
-    """Resolve a server profile into an executable launch description."""
+    """Resolve a server profile into an executable launch description.
+
+    `root` is the tree the profile's relative paths are written against, which
+    the configuration states rather than this module deriving it.
+    """
     command = list(server.command)
     selected_executable = (
         executable if executable is not None else Path(command[0])
     )
     if not selected_executable.is_absolute():
-        selected_executable = ROOT / selected_executable
-    selected_executable = selected_executable.absolute()
-    command[0] = str(selected_executable)
+        selected_executable = root / selected_executable
+    command[0] = str(selected_executable.absolute())
 
-    working_directory = next(
-        (
-            parent
-            for parent in selected_executable.parents
-            if (parent / "uniserve_worker").is_dir()
-        ),
-        ROOT,
-    )
-
-    _resolve_command_path(command, "--worker-python", ROOT)
-    return ServerLaunch(
-        tuple(command), working_directory, dict(server.environment)
-    )
+    _resolve_command_path(command, "--worker-python", root)
+    # A server runs in the tree its profile is written against, so a relative
+    # path it was given -- a deployment configuration, a dataset -- resolves
+    # the same way there as it reads in the file.
+    return ServerLaunch(tuple(command), root, dict(server.environment))
 
 
 def _resolve_command_path(command: list[str], option: str, base: Path) -> None:

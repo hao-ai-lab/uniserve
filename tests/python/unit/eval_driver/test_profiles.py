@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from uniserve_eval.config import ROOT, load_config
+from uniserve_eval.config import load_config
 
 pytestmark = pytest.mark.unit
 
@@ -39,10 +39,11 @@ def test_fast_h3_serves_the_deployment_configuration_it_is_given(
 def test_fast_h3_defaults_to_the_four_device_deployment(monkeypatch) -> None:
     monkeypatch.delenv("UNISERVE_H3_DEPLOYMENT", raising=False)
 
-    server = load_config().servers["minimax-h3"]
+    config = load_config()
+    server = config.servers["minimax-h3"]
     deployment = server.command.index("--workers") + 1
 
-    named = ROOT / server.command[deployment]
+    named = config.root / server.command[deployment]
     assert named.is_file(), f"{named} is the default deployment and must exist"
     assert sorted(json.loads(named.read_text())[0]["entries"]) == [
         "audio_decoder",
@@ -91,12 +92,21 @@ output_throughput = "higher"
         load_config(config)
 
 
-def test_runtime_artifact_launch_uses_its_python_package(
+def test_a_profile_resolves_its_paths_against_the_root_it_states(
     tmp_path: Path,
 ) -> None:
-    config_path = tmp_path / "profiles.toml"
+    """A profile means the same thing wherever the driver is installed.
+
+    Its executable, interpreter and working directory follow the tree the file
+    names, so nothing depends on where this package's own source sits.
+    """
+    tree = tmp_path / "tree"
+    (tree / "uniserve_eval").mkdir(parents=True)
+    config_path = tree / "uniserve_eval" / "profiles.toml"
     config_path.write_text(
         """
+root = ".."
+
 [servers.local]
 port = 8000
 command = [
@@ -120,11 +130,6 @@ output_throughput = "higher"
         + "\n",
         encoding="utf-8",
     )
-    runtime_root = tmp_path / "runtime"
-    executable = runtime_root / "bin" / "uniserve"
-    executable.parent.mkdir(parents=True)
-    executable.touch()
-    (runtime_root / "uniserve_worker").mkdir()
 
     result = subprocess.run(
         [
@@ -135,8 +140,6 @@ output_throughput = "higher"
             str(config_path),
             "plan",
             "point",
-            "--executable",
-            str(executable),
         ],
         check=True,
         text=True,
@@ -144,9 +147,9 @@ output_throughput = "higher"
     )
     plan = json.loads(result.stdout)[0]
 
-    assert plan["server_command"][0] == str(executable.absolute())
+    assert plan["server_command"][0] == str(tree / "target/release/uniserve")
     worker_python = plan["server_command"].index("--worker-python") + 1
     assert plan["server_command"][worker_python] == str(
-        (ROOT / ".venv/bin/python").absolute()
+        tree / ".venv/bin/python"
     )
-    assert plan["server_working_directory"] == str(runtime_root)
+    assert plan["server_working_directory"] == str(tree)

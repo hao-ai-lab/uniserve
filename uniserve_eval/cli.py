@@ -43,7 +43,7 @@ def plan(args: argparse.Namespace) -> None:
     rendered = []
     for point in points:
         server = config.servers[point.server]
-        launch = server_launch(server, args.executable)
+        launch = server_launch(server, args.executable, config.root)
         rendered.append(
             {
                 "benchmark": point.name,
