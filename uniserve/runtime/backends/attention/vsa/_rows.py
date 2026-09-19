@@ -50,10 +50,11 @@ class _Rows:
         Produce paired owner intervals against the complete selected key
         domain.
 
-        Counts and indices are read from current device metadata on every
-        call. Each numerical launch finishes using scratch before its
-        epilogue writes transport destinations; downstream consumers may
-        then reuse that scratch.
+        The first interval produced launches the fine attention over the
+        complete packed query domain, reading the live block maps; every
+        interval then composes its own rows from that output into its
+        transport destinations. The attention scratch stays borrowed until
+        the last interval has been composed.
         """
         # The row path reads the live device block maps on every call, so the
         # static pattern carries no information here.
