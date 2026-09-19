@@ -145,8 +145,6 @@ impl Scheduler {
         } else {
             0
         };
-        let denoise_occupies_decode_pipeline =
-            lane == Some(BatchKind::Decode) && self.has_pending_denoising();
         let mut selected = 0usize;
         for id in ids.iter().copied() {
             if selected >= self.config.max_batch {
@@ -188,8 +186,13 @@ impl Scheduler {
                     continue;
                 }
             }
+            // The denoiser is an exclusive lane: the oldest request holds it
+            // for its whole step sequence, and a younger request's denoising
+            // dispatches only once that sequence has completed. Denoising
+            // steps of different requests are therefore never in flight
+            // together, in any lane.
             if next_type == Some(CallKind::Pipeline(PipelineStage::Denoising))
-                && (denoise_occupies_decode_pipeline || !self.flow_prefix_is_schedulable(id))
+                && (self.denoiser_lane_held_by_other(id) || !self.flow_prefix_is_schedulable(id))
             {
                 continue;
             }

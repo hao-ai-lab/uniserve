@@ -76,11 +76,13 @@ impl Scheduler {
         self.pending_calls.get(&id).map_or(0, VecDeque::len)
     }
 
-    /// Returns whether any in-flight call performs denoising.
-    pub(super) fn has_pending_denoising(&self) -> bool {
+    /// Returns whether a request other than `id` holds the denoiser lane,
+    /// that is, has a denoising call in flight.
+    pub(super) fn denoiser_lane_held_by_other(&self, id: RequestId) -> bool {
         self.pending_calls
-            .values()
-            .flatten()
+            .iter()
+            .filter(|(holder, _)| **holder != id)
+            .flat_map(|(_, calls)| calls)
             .any(|op| op.call.code == CallKind::Pipeline(PipelineStage::Denoising))
     }
 
