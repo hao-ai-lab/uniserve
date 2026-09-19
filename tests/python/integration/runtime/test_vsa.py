@@ -45,7 +45,6 @@ def _workspace(q):
         pooled_key=tensor((4, heads, width)),
         pooled_value=tensor((4, heads, width)),
         compressed_tiles=tensor((heads, 4, width)),
-        topk_indices=tensor((heads, 2, 1), torch.int32),
     )
 
 
