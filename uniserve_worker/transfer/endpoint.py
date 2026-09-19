@@ -64,8 +64,10 @@ class Publications(Generic[Source]):
     """Own the registered sources of one address space.
 
     A source is handed back to its owner once the engine has retired the
-    publication, the producer has finished writing it, and every consumer the
-    head named has acknowledged it. A producer that fails with unknown
+    publication, the producer has finished writing it, and no consumer the
+    head named is still reading it. A consumer claims its word in the
+    published storage before its first read and acknowledges after its last,
+    so one that never began holds nothing. A producer that fails with unknown
     physical completion keeps its source registered, so nothing reuses storage
     a device may still be writing.
     """
@@ -76,7 +78,7 @@ class Publications(Generic[Source]):
         capacity: int,
         reclaim: Callable[[Source, Future[None]], None],
         drain: Callable[[Source], None],
-        acknowledged: Callable[[Source], bool],
+        settled: Callable[[Source], bool],
     ) -> None:
         if capacity < 1:
             raise ValueError("publication capacity must be positive")
@@ -88,7 +90,7 @@ class Publications(Generic[Source]):
         self._capacity = capacity
         self._reclaim = reclaim
         self._drain = drain
-        self._acknowledged = acknowledged
+        self._settled = settled
         self._publications: dict[bytes, _Publication[Source]] = {}
         self._lock = threading.Lock()
         self._closing = False
@@ -167,7 +169,7 @@ class Publications(Generic[Source]):
             self._reclaim_locked(publication)
 
     def release(self, locator: Locator) -> Future[None] | None:
-        """Retire a publication; its source returns once acknowledged."""
+        """Retire a publication; its source returns once its readers finish."""
         if locator.transport.endpoint != self.name:
             raise invalid_descriptor(
                 "publication release belongs to another endpoint"
@@ -207,7 +209,7 @@ class Publications(Generic[Source]):
             )
 
     def reap(self) -> None:
-        """Hand back every retired source whose consumers have acknowledged.
+        """Hand back every retired source no consumer is still reading.
 
         An acknowledgment is written into the published storage and reaches
         this process with no notification, so the producer sweeps here.
@@ -219,12 +221,12 @@ class Publications(Generic[Source]):
             self._reap_locked()
 
     def _reclaim_locked(self, publication: _Publication[Source]) -> None:
-        """Hand a source back once retired, complete and acknowledged."""
+        """Hand a source back once retired, complete and no longer read."""
         if (
             publication.retired
             and not publication.pending
             and not publication.reclaiming
-            and self._acknowledged(publication.source)
+            and self._settled(publication.source)
         ):
             publication.reclaiming = True
             try:
