@@ -746,7 +746,12 @@ def _tensor_transfers_size(tensors: tuple[TensorTransfer, ...]) -> int:
                 + len(transport.name.encode())
                 + 16
             )
-        else:
+        elif isinstance(transport, ChannelTransfer):
+            # The bytes are the product, not the handle: their budget is the
+            # channel's byte capacity and the message caps of the rank channel
+            # they travel on, so only the locator's framing counts here.
+            size += len(transport.endpoint.encode()) + 24
+        elif isinstance(transport, CudaVmmTransfer):
             size += (
                 len(transport.endpoint.encode())
                 + len(transport.publication_id.encode())
@@ -755,5 +760,9 @@ def _tensor_transfers_size(tensors: tuple[TensorTransfer, ...]) -> int:
                 + 8 * len(transport.storage_offsets_bytes)
                 + 12 * len(transport.span_lengths)
                 + 64
+            )
+        else:
+            raise invalid_descriptor(
+                "tensor transfer names an unknown transport"
             )
     return size
