@@ -100,6 +100,15 @@ class TensorBuffers:
                 )
         return result
 
+    def backing(self, name: str) -> torch.Tensor:
+        """Borrow one field's complete backing tensor, at its capacity shape."""
+        if self._closed:
+            raise RuntimeError("tensor buffers are closed")
+        value = self._tensors.get(name)
+        if value is None:
+            raise ValueError(f"tensor {name!r} has no backing")
+        return value
+
     def view(
         self, configs: Mapping[str, BufferConfig]
     ) -> Mapping[str, torch.Tensor]:

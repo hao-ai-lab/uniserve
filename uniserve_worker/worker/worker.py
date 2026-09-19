@@ -483,6 +483,8 @@ class Worker:
                 state_buffers=runner.state_buffers or None,
                 device=worker_config.device,
             )
+            if runner.denoising is not None and self.requests.bank:
+                runner.denoising.bind_bank(self.requests.bank)
 
             torch_dtype = getattr(
                 torch,

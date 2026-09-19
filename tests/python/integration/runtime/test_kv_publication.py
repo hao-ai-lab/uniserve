@@ -176,6 +176,7 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
             def acknowledge_held() -> None:
                 for _mapping, header in held:
                     segment.acknowledge(header, 1)
+
             # The worker runs on its own thread; a failed assertion must not
             # wait for a worker that no longer reads its channel.
             executor = ThreadPoolExecutor(max_workers=1)

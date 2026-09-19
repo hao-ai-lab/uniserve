@@ -282,12 +282,14 @@ def capture_denoising(
 ) -> None:
     """Make every declared video shape's denoising ladder resident.
 
-    A denoising graph is captured per request slot and per ladder step, so a
-    request that first meets its shape would otherwise pay one capture per step
-    on its own path. Capture is collective across the component's ranks and
+    A denoising graph is captured per ladder step at each declared size and
+    serves every request slot, since it reaches a slot's storage through the
+    device slot index rather than through the slot's addresses. A request
+    that first meets its shape would otherwise pay one capture per step on
+    its own path. Capture is collective across the component's ranks and
     belongs here, where warmup holds them in lockstep. Samples are unchanged
-    when this returns; a shape the deployment does not declare still serves and
-    captures on first use.
+    when this returns; a shape the deployment does not declare still serves
+    and captures on first use.
     """
     builder, denoising = runner.media_builder, runner.denoising
     sizes = declared_sizes(runner)
@@ -301,24 +303,23 @@ def capture_denoising(
     schedules = builder.schedules(device=runner.worker_config.device)
     for size in sizes:
         context = denoising.prepare_inputs(size, size)
-        for slot, buffers in enumerate(storage, start=1):
-            views = buffers.view(builder.buffers(size))
-            # Capture records kernel launches over these addresses; the values
-            # it reads are irrelevant, and the first real request stages its
-            # own seeded noise and conditioning before replay.
-            with context.activate():
-                views["text_condition"].zero_()
-                for name in builder.denoiser.modalities:
-                    views[name].zero_()
+        # Any slot's rows serve the capture; the first slot's do. The values
+        # it reads are irrelevant, and the first real request stages its own
+        # seeded noise and conditioning before replay.
+        views = storage[0].view(builder.buffers(size))
+        with context.activate():
+            views["text_condition"].zero_()
+            for name in builder.denoiser.modalities:
+                views[name].zero_()
 
-            for index in range(builder.num_steps):
-                denoising.capture(
-                    builder.bind(size, views, schedules, index),
-                    schedules,
-                    state=views,
-                    slot=slot,
-                    input_key=size,
-                )
+        for index in range(builder.num_steps):
+            denoising.capture(
+                builder.bind(size, views, schedules, index),
+                schedules,
+                state=views,
+                slot=1,
+                input_key=size,
+            )
 
 
 @torch.inference_mode()

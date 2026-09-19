@@ -135,12 +135,24 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         self.prepared_inputs: OrderedDict[Hashable, ExecutionContext] = (
             OrderedDict()
         )
-        # One entry per resident ladder: a request slot's sample addresses at
-        # one numerical signature, mapped to the prepared size it borrows.
-        # Least recently used ladders retire first.
-        self._resident: OrderedDict[tuple[Hashable, Hashable], Hashable] = (
-            OrderedDict()
+        # One entry per resident ladder: one numerical signature, mapped to
+        # the prepared size it borrows. A ladder serves every request slot,
+        # because its graph reads and writes slot storage through the slot
+        # index below rather than through a slot's addresses. Least recently
+        # used ladders retire first.
+        self._resident: OrderedDict[Hashable, Hashable] = OrderedDict()
+        # Request slot storage: one bank per field with a leading slot axis,
+        # bound by the owner of the request slots. Graph-owned stage tensors
+        # per prepared size hold the slot a replay gathers, and the slot index
+        # is the one device word a replay reads to find its rows.
+        self._bank: dict[str, torch.Tensor] = {}
+        self._stages: dict[Hashable, dict[Hashable, torch.Tensor]] = {}
+        self._slot_index = (
+            torch.zeros(1, dtype=torch.int64, device=device)
+            if capture_stream is not None
+            else None
         )
+        self._slot_values: dict[int, torch.Tensor] = {}
         self._closed = False
 
     @property
@@ -228,6 +240,162 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                 context.stream or torch.cuda.current_stream(self.device)
             ).synchronize()
 
+    def bind_bank(self, bank: Mapping[str, torch.Tensor]) -> None:
+        """Name the request slot storage captured graphs index into.
+
+        Each value is one field's bank with a leading axis of `capacity` slot
+        rows; a request's tensors are prefixes of its row. A graph gathers the
+        rows the slot index names into its stage, runs the step there, and
+        scatters the samples back, so one captured ladder serves every slot.
+        """
+        for name, value in bank.items():
+            if value.ndim < 1 or value.shape[0] != self.capacity:
+                raise ValueError(
+                    f"slot bank {name!r} must hold {self.capacity} slot rows"
+                )
+            if not value.is_contiguous():
+                raise ValueError(f"slot bank {name!r} must be contiguous")
+        self._bank = dict(bank)
+
+    def _locate(
+        self, tensor: torch.Tensor
+    ) -> tuple[str, int | None, torch.Tensor | None] | None:
+        """Find the bank field and slot row a tensor is a span of.
+
+        A slot tensor is one contiguous span of its row: a size's leading
+        prefix, or a sequence-parallel rank's shard inside it. Returns the
+        field, the slot row and every row's matching span as a 2-D view, or
+        None for a tensor outside every bank.
+        """
+        pointer = tensor.untyped_storage().data_ptr()
+        for name, bank in self._bank.items():
+            if bank.untyped_storage().data_ptr() != pointer:
+                continue
+            if tensor.numel() == 0:
+                # A rank whose shard of this field is empty holds no span of
+                # any row: there is nothing to gather and nothing names a slot.
+                return name, None, None
+            rows = bank.view(bank.shape[0], -1)
+            row_bytes = rows.shape[1] * bank.element_size()
+            offset = tensor.data_ptr() - bank.data_ptr()
+            row, within = divmod(offset, row_bytes)
+            start = within // bank.element_size()
+            if (
+                within % bank.element_size()
+                or not tensor.is_contiguous()
+                or not 0 <= row < rows.shape[0]
+                or start + tensor.numel() > rows.shape[1]
+            ):
+                raise ValueError(
+                    f"slot tensor is not a contiguous span of a {name!r} row: "
+                    f"tensor {tuple(tensor.shape)} {tensor.dtype} on "
+                    f"{tensor.device} at {tensor.data_ptr():#x} with storage "
+                    f"{pointer:#x}, bank {tuple(bank.shape)} at "
+                    f"{bank.data_ptr():#x} with storage "
+                    f"{bank.untyped_storage().data_ptr():#x}"
+                )
+            return name, row, rows[:, start : start + tensor.numel()]
+        return None
+
+    def _stage(
+        self, input_key: Hashable, name: str, template: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the graph-owned stage for one span of a field at one size.
+
+        A field is staged once per span shape: a rank's latent shard and the
+        state's view of the whole row are different spans of the same field,
+        and each keeps its own stage so a ladder's addresses stay fixed.
+        """
+        stages = self._stages.setdefault(input_key, {})
+        key = (name, tuple(template.shape), template.dtype)
+        stage = stages.get(key)
+        if stage is None:
+            stage = torch.empty_like(template)
+            stages[key] = stage
+        return stage
+
+    def _slot_value(self, slot: int) -> torch.Tensor:
+        """Return the pinned host word naming one slot's bank row."""
+        value = self._slot_values.get(slot)
+        if value is None:
+            if not 1 <= slot <= self.capacity:
+                raise ValueError(f"request slot {slot} is outside the bank")
+            value = torch.tensor([slot - 1], dtype=torch.int64).pin_memory()
+            self._slot_values[slot] = value
+        return value
+
+    def _stage_inputs(self, inputs, state, input_key):
+        """Rebind a call's slot tensors to the stage its graph runs on.
+
+        Returns the rebound inputs and state, the slot row the inputs name,
+        the gathers a replay performs before the step and the scatters it
+        performs after: pairs of a bank's rows and the stage that holds one.
+        """
+        slots: dict[int, list[str]] = {}
+        gathers = []
+        scatters = []
+
+        def staged(tensor, *, writeback):
+            located = self._locate(tensor)
+            if located is None:
+                raise ValueError(
+                    "denoising graph capture requires request slot storage "
+                    "bound as a bank"
+                )
+            name, slot, span = located
+            stage = self._stage(input_key, name, tensor)
+            if span is None:
+                return stage
+            slots.setdefault(slot, []).append(name)
+            pair = (span, stage.view(1, -1))
+            gathers.append(pair)
+            if writeback:
+                scatters.append(pair)
+            return stage
+
+        def rebind(value):
+            """Replace every bank-resident tensor in a field by its stage."""
+            if isinstance(value, torch.Tensor):
+                if self._locate(value) is None:
+                    return value
+                return staged(value, writeback=False)
+            if isinstance(value, tuple):
+                return tuple(rebind(item) for item in value)
+            if isinstance(value, Mapping):
+                return {name: rebind(item) for name, item in value.items()}
+            return value
+
+        latents = {
+            name: tuple(
+                replace(value, tensor=staged(value.tensor, writeback=True))
+                for value in values
+            )
+            for name, values in inputs.latents.items()
+        }
+        # Conditioning and any other slot-resident input is gathered but not
+        # written back; the latents are the state a step advances.
+        others = {
+            field.name: rebind(getattr(inputs, field.name))
+            for field in fields(inputs)
+            if field.name not in {"latents", "step_index", "sizes"}
+        }
+        bound = replace(inputs, latents=latents, **others)
+        # State names the same slot storage the latents do; a graph reads the
+        # stage that holds it, never a slot's own addresses.
+        bound_state = {}
+        for name, tensor in state.items():
+            located = self._locate(tensor)
+            if located is None:
+                bound_state[name] = tensor
+            else:
+                bound_state[name] = staged(tensor, writeback=False)
+        if len(slots) != 1:
+            raise ValueError(
+                "a denoising call binds the storage of exactly one slot, not "
+                f"{slots}"
+            )
+        return bound, bound_state, next(iter(slots)) + 1, gathers, scatters
+
     def _resident_ladder(
         self,
         inputs: InputT,
@@ -247,23 +415,31 @@ class DenoisingRunner(Generic[InputT, SizeT]):
             raise RuntimeError("denoising runner is closed")
 
         context = self.prepared_inputs[input_key]
+        bound, bound_state, bound_slot, gathers, scatters = self._stage_inputs(
+            inputs, state, input_key
+        )
+        if slot != bound_slot:
+            raise ValueError(
+                f"denoising call names slot {slot} but binds slot {bound_slot}"
+            )
 
-        # Request slots retain sample and conditioning backing. Schedules are
-        # rebuilt per trajectory, so their values are copied into graph-owned
-        # storage on every invocation instead of making addresses part of reuse.
+        # The signature is taken over the stage the graph runs on, so it holds
+        # for every slot. Schedules are rebuilt per trajectory, so their
+        # values are copied into graph-owned storage on every invocation
+        # instead of making addresses part of reuse.
         signature = (
             _numerical_signature(
                 (
                     tuple(
-                        (field.name, getattr(inputs, field.name))
-                        for field in fields(inputs)
+                        (field.name, getattr(bound, field.name))
+                        for field in fields(bound)
                         if field.name not in {"latents", "step_index"}
                     ),
-                    {
-                        name: tuple(value.tensor for value in values)
-                        for name, values in inputs.latents.items()
-                    },
-                    state,
+                    tuple(
+                        (name, tuple(value.tensor for value in values))
+                        for name, values in bound.latents.items()
+                    ),
+                    bound_state,
                     context.constants,
                     context.workspace,
                 )
@@ -276,13 +452,13 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         }
         temporal = schedules, timesteps
         variant = inputs.step_index, input_signature(timesteps)
-        key = (slot, signature, variant)
+        key = (signature, variant)
 
         missing = capture_required(
             key not in self.graphs, self.groups, self.device
         )
         if missing:
-            self._admit((slot, signature), input_key)
+            self._admit(signature, input_key)
             self._discard_graph(key)
             self.warmup(inputs, schedules, state=state, input_key=input_key)
 
@@ -292,8 +468,8 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                     # Bind graph-owned schedule and timestep copies so replay
                     # only needs their values refreshed, never new addresses.
                     staged = clone_inputs(temporal)
-                    bound = replace(
-                        inputs,
+                    stepped = replace(
+                        bound,
                         latents={
                             name: tuple(
                                 replace(value, timestep=timestep)
@@ -301,17 +477,32 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                                     values, staged[1][name], strict=True
                                 )
                             )
-                            for name, values in inputs.latents.items()
+                            for name, values in bound.latents.items()
                         },
                     )
-                    call = DenoisingStep(
+                    step = DenoisingStep(
                         self.model,
-                        bound,
+                        stepped,
                         staged[0],
-                        state,
+                        bound_state,
                         context.constants,
                         context.workspace,
                     )
+                    slot_index = self._slot_index
+                    assert slot_index is not None
+                    slot_index.copy_(self._slot_value(slot), non_blocking=True)
+
+                    def call():
+                        # The slot index names the rows: gather them into the
+                        # stage, run the step there, and scatter the samples
+                        # back, all inside the graph.
+                        for rows, stage in gathers:
+                            torch.index_select(rows, 0, slot_index, out=stage)
+                        samples = step()
+                        for rows, stage in scatters:
+                            rows.index_copy_(0, slot_index, stage)
+                        return samples
+
                     restore = restore_samples(inputs)
                 graph.capture(call, restore=restore)
             except BaseException:
@@ -319,7 +510,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                 raise
             self.graphs[key] = graph, staged
 
-        self._resident.move_to_end((slot, signature))
+        self._resident.move_to_end(signature)
         graph, staged = self.graphs[key]
         return graph, staged, temporal, context, missing
 
@@ -333,11 +524,12 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         slot: Hashable,
         input_key: Hashable,
     ) -> None:
-        """Make one ladder step's graph resident for a request slot.
+        """Make one ladder step's graph resident.
 
-        Warmup calls this for every step of the production ladder on every slot
-        so no request pays capture on its own path. The caller's samples are
-        unchanged when this returns.
+        Warmup calls this for every step of the production ladder at every
+        declared size so no request pays capture on its own path; the graph
+        serves every request slot. The caller's samples are unchanged when
+        this returns.
         """
         if self.capture_stream is None:
             raise RuntimeError(
@@ -374,31 +566,35 @@ class DenoisingRunner(Generic[InputT, SizeT]):
 
         with context.activate():
             copy_inputs(staged, temporal)
-            result = graph.replay()
+            assert self._slot_index is not None
+            self._slot_index.copy_(self._slot_value(slot), non_blocking=True)
+            graph.replay()
         current.wait_stream(context.stream)
-        return result, "graph_capture" if captured else "graph_replay"
+        # The samples live in the slot's rows, where the graph scattered them.
+        samples = {
+            name: tuple(value.tensor for value in values)
+            for name, values in inputs.latents.items()
+        }
+        return samples, "graph_capture" if captured else "graph_replay"
 
-    def _admit(
-        self, ladder: tuple[Hashable, Hashable], input_key: Hashable
-    ) -> None:
-        """Reserve residency for one slot's ladder at one numerical signature.
+    def _admit(self, signature: Hashable, input_key: Hashable) -> None:
+        """Reserve residency for one ladder at one numerical signature.
 
-        Residency spans every slot at every prepared size, so a ladder captured
-        at startup survives until its slot or its prepared size retires.
+        Residency spans every prepared size, so a ladder captured at startup
+        survives until its prepared size retires.
         """
-        if ladder not in self._resident and len(self._resident) >= (
-            self.capacity * self.shapes
+        if signature not in self._resident and len(self._resident) >= (
+            self.shapes
         ):
             self._release_ladder(next(iter(self._resident)))
-        self._resident[ladder] = input_key
+        self._resident[signature] = input_key
 
-    def _release_ladder(self, ladder: tuple[Hashable, Hashable]) -> None:
-        """Retire every captured step of one slot's ladder."""
-        slot, signature = ladder
+    def _release_ladder(self, signature: Hashable) -> None:
+        """Retire every captured step of one ladder."""
         for key in tuple(self.graphs):
-            if key[0] == slot and key[1] == signature:
+            if key[0] == signature:
                 self._discard_graph(key)
-        self._resident.pop(ladder, None)
+        self._resident.pop(signature, None)
 
     def _discard_graph(self, key):
         resident = self.graphs.pop(key, None)
@@ -411,20 +607,12 @@ class DenoisingRunner(Generic[InputT, SizeT]):
             ).synchronize()
             graph.close()
 
-    def release_slot(self, slot: Hashable) -> None:
-        """Retire a drained slot's graphs before its sample backing is.
-
-        reused.
-        """
-        for ladder in tuple(self._resident):
-            if ladder[0] == slot:
-                self._release_ladder(ladder)
-
     def release_inputs(self, key: Hashable) -> None:
         """Retire dependent calls before releasing their execution context."""
         for ladder, resident_key in tuple(self._resident.items()):
             if resident_key == key:
                 self._release_ladder(ladder)
+        self._stages.pop(key, None)
 
         context = self.prepared_inputs.pop(key, None)
         if context is not None:

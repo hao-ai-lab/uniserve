@@ -111,18 +111,69 @@ class RequestPool:
         self._rows: list[RequestState | None] = [None] * (size + 1)
         self._slots_by_request: dict[int, int] = {}
 
-        self.tensor_slots = (
-            tuple(
+        # Device state fields live in one bank per field with a leading slot
+        # axis, so a captured graph can index a request's sample and
+        # conditioning storage through a device slot tensor instead of baking
+        # a slot's addresses in. Each slot borrows its row of every bank; host
+        # fields stay one pinned allocation per slot.
+        self._bank: TensorBuffers | None = None
+        self._host_slots: tuple[TensorBuffers, ...] = ()
+        self.bank: Mapping[str, torch.Tensor] = {}
+        self.tensor_slots: tuple[TensorBuffers, ...] = ()
+        if state_buffers:
+            pin_memory = torch.device(device).type == "cuda"
+            device_fields = {
+                name: config
+                for name, config in state_buffers.items()
+                if not config.host
+            }
+            host_fields = {
+                name: config
+                for name, config in state_buffers.items()
+                if config.host
+            }
+            self._bank = TensorBuffers.allocate(
+                {
+                    name: BufferConfig(
+                        (size, *config.shape),
+                        config.dtype,
+                        capacity_shape=(
+                            size,
+                            *(
+                                config.shape
+                                if config.capacity_shape is None
+                                else config.capacity_shape
+                            ),
+                        ),
+                    )
+                    for name, config in device_fields.items()
+                },
+                device=device,
+            )
+            self.bank = {
+                name: self._bank.backing(name) for name in device_fields
+            }
+            self._host_slots = tuple(
                 TensorBuffers.allocate(
-                    state_buffers,
-                    device=device,
-                    pin_memory=torch.device(device).type == "cuda",
+                    host_fields, device=device, pin_memory=pin_memory
                 )
                 for _ in range(size)
             )
-            if state_buffers
-            else ()
-        )
+            self.tensor_slots = tuple(
+                TensorBuffers.from_tensors(
+                    {
+                        **{
+                            name: self.bank[name][index]
+                            for name in device_fields
+                        },
+                        **{
+                            name: self._host_slots[index].backing(name)
+                            for name in host_fields
+                        },
+                    }
+                )
+                for index in range(size)
+            )
 
     def tensors(self, request_pool_idx: int) -> TensorBuffers:
         """Borrow storage while holding the execution lease through device.
@@ -153,7 +204,16 @@ class RequestPool:
                 row.pending_calls.clear()
         self._rows.clear()
         self._slots_by_request.clear()
+        for slot in self.tensor_slots:
+            slot.close()
+        for slot in self._host_slots:
+            slot.close()
+        if self._bank is not None:
+            self._bank.close()
         self.tensor_slots = ()
+        self._host_slots = ()
+        self.bank = {}
+        self._bank = None
 
     def get(self, request_id: int) -> RequestState:
         row = self.peek(request_id)
