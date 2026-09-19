@@ -6,6 +6,7 @@ import array
 import math
 import os
 import socket
+import sys
 import tempfile
 from dataclasses import dataclass
 from typing import Any
@@ -72,69 +73,88 @@ class PeerTensor:
         self.coordinator._all_gather_into_tensor(output, input)
 
 
-def allocate_peer_tensor(
+def _peer_identities(
     group: Communicator,
     shape: tuple[int, ...],
-    *,
     dtype: torch.dtype,
-) -> torch.Tensor:
-    """Allocate one physical shard.
+    address: str,
+) -> list[tuple[str, str, tuple[int, ...], str]]:
+    """Exchange and validate what each rank of the group is allocating.
 
-    Allocate one physical shard and map ordered peers into one virtual
-    tensor.
-
-    POSIX descriptors are transferred through Unix-domain sockets using the
-    standard SCM_RIGHTS protocol. The existing process group exchanges socket
-    addresses and validates matching shapes and a shared host before any
-    descriptor transfer. All setup finishes before CUDA graph capture.
+    Peers map one another's physical memory, so every rank must be on one host
+    and allocating the same shape. The result is ordered by the group's ranks.
     """
-    from uniserve_kernel.peer_memory import allocate
+    identity = (socket.gethostname(), address, shape, str(dtype))
+    identities: list[tuple[str, str, tuple[int, ...], str] | None] = [
+        None
+    ] * group.size
+    dist.all_gather_object(identities, identity, group=group._require())
+    if any(
+        peer is None
+        or (peer[0], peer[2], peer[3]) != (identity[0], shape, str(dtype))
+        for peer in identities
+    ):
+        raise ValueError("peer tensors require matching shapes on one host")
 
-    allocation = allocate(shape, dtype=dtype, device=group.device)
-    descriptors = [allocation.export_fd()]
-    try:
-        if group.size == 1:
-            return allocation.map_peers(descriptors)
+    backend_ranks = sorted(group.ranks)
+    ordered = [identities[backend_ranks.index(rank)] for rank in group.ranks]
+    assert all(peer is not None for peer in ordered)
+    return ordered  # type: ignore[return-value]
 
-        with tempfile.TemporaryDirectory(prefix="uniserve-peer-") as directory:
-            address = os.path.join(directory, "memory.sock")
-            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as channel:
-                channel.bind(address)
-                channel.settimeout(
-                    dist.constants.default_pg_timeout.total_seconds()
-                )
 
-                identity = (socket.gethostname(), address, shape, str(dtype))
-                identities: list[
-                    tuple[str, str, tuple[int, ...], str] | None
-                ] = [None] * group.size
-                dist.all_gather_object(
-                    identities, identity, group=group._require()
-                )
-                if any(
-                    peer is None
-                    or (peer[0], peer[2], peer[3])
-                    != (identity[0], shape, str(dtype))
-                    for peer in identities
-                ):
-                    raise ValueError(
-                        "peer tensors require matching shapes on one host"
-                    )
+def _gathered_handles(
+    group: Communicator,
+    handle: bytes,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+) -> list[bytes]:
+    """Collect every owner's fabric handle, in rank order.
 
-                backend_ranks = sorted(group.ranks)
-                ordered = [
-                    identities[backend_ranks.index(rank)]
-                    for rank in group.ranks
-                ]
-                destination = ordered[(group.rank + 1) % group.size]
-                assert destination is not None
+    A fabric handle names memory rather than a file this process holds open, so
+    it is meaningful in any process that receives it and travels as an ordinary
+    payload.
+    """
+    _peer_identities(group, shape, dtype, "")
+    handles: list[bytes | None] = [None] * group.size
+    dist.all_gather_object(handles, handle, group=group._require())
+    backend_ranks = sorted(group.ranks)
+    ordered = [handles[backend_ranks.index(rank)] for rank in group.ranks]
+    if any(peer is None for peer in ordered):
+        raise ValueError("a peer reported no allocation handle")
+    return ordered  # type: ignore[return-value]
 
-                # Descriptors rotate around the logical rank ring: each hop a
-                # rank forwards the descriptor it just received to its successor
-                # and accepts its predecessor's, so after size - 1 hops every
-                # rank holds one descriptor per owner.
-                owner_descriptors = {group.rank: descriptors[0]}
-                current = descriptors[0]
+
+def _rotated_descriptors(
+    group: Communicator,
+    handle: bytes,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+) -> list[bytes]:
+    """Collect every owner's descriptor, in rank order.
+
+    Where a device exports a POSIX descriptor rather than a fabric handle, the
+    handle names a file this process holds open, so it reaches a peer only
+    through `SCM_RIGHTS` on a Unix-domain socket. Descriptors rotate around the
+    logical rank ring: each hop a rank forwards the descriptor it just received
+    to its successor and accepts its predecessor's, so after `size - 1` hops
+    every rank holds one descriptor per owner. All setup finishes before CUDA
+    graph capture.
+    """
+    width = len(handle)
+    received_descriptors: list[int] = []
+    with tempfile.TemporaryDirectory(prefix="uniserve-peer-") as directory:
+        address = os.path.join(directory, "memory.sock")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as channel:
+            channel.bind(address)
+            channel.settimeout(
+                dist.constants.default_pg_timeout.total_seconds()
+            )
+            ordered = _peer_identities(group, shape, dtype, address)
+            destination = ordered[(group.rank + 1) % group.size]
+
+            try:
+                current = int.from_bytes(handle, sys.byteorder)
+                owners = {group.rank: handle}
                 for hop in range(1, group.size):
                     channel.sendmsg(
                         [b"v"],
@@ -151,20 +171,48 @@ def allocate_peer_tensor(
                     _payload, received, _flags, _address = socket.recv_fds(
                         channel, 1, 1
                     )
-                    descriptors.extend(received)
                     if len(received) != 1:
                         raise RuntimeError(
                             "peer allocation exchange requires one descriptor"
                         )
+                    received_descriptors.extend(received)
                     current = received[0]
-                    owner_descriptors[(group.rank - hop) % group.size] = current
+                    owners[(group.rank - hop) % group.size] = current.to_bytes(
+                        width, sys.byteorder
+                    )
+                return [owners[owner] for owner in range(group.size)]
+            finally:
+                for descriptor in received_descriptors:
+                    os.close(descriptor)
 
-                return allocation.map_peers(
-                    [owner_descriptors[owner] for owner in range(group.size)]
-                )
-    finally:
-        for descriptor in descriptors:
-            os.close(descriptor)
+
+def allocate_peer_tensor(
+    group: Communicator,
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Allocate one physical shard and map ordered peers into one tensor.
+
+    Every rank allocates its own shard and exports a handle to it; each rank
+    then maps every owner's shard, in rank order, into one virtual tensor. How
+    a handle reaches a peer depends on what the device exports, which is what
+    the two collection paths below distinguish.
+    """
+    from uniserve_kernel.peer_memory import allocate, exports_fabric_handles
+
+    allocation = allocate(shape, dtype=dtype, device=group.device)
+    handle = allocation.export_handle()
+    if group.size == 1:
+        return allocation.map_peers([handle])
+
+    device = torch.device(group.device)
+    collect = (
+        _gathered_handles
+        if exports_fabric_handles(device.index or 0)
+        else _rotated_descriptors
+    )
+    return allocation.map_peers(collect(group, handle, shape, dtype))
 
 
 def allocate_collective_buffer(
