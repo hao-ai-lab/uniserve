@@ -343,6 +343,10 @@ class ModelLaunchConfig:
 
     path: str
     quantization_config: dict[str, object]
+    # Identity the launching side derived for the checkpoint it names, when
+    # it could read that checkpoint locally. A rank whose loaded checkpoint
+    # has another identity refuses to start.
+    checkpoint_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -422,6 +426,11 @@ class WorkerProcessArgs:
                 ModelLaunchConfig(
                     path=model_path,
                     quantization_config=dict(namespace.quantization_config),
+                    # The descriptor carries the key only when the launching
+                    # side could derive the identity from a local directory.
+                    checkpoint_identity=_optional_text(
+                        getattr(namespace, "checkpoint_identity", None)
+                    ),
                 )
                 if model_path
                 else None

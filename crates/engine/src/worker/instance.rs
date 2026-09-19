@@ -273,6 +273,41 @@ pub(crate) fn refuse_muxer_off_head(
     Ok(())
 }
 
+/// Refuses a rank whose loaded checkpoint is not the one the instance serves.
+///
+/// `reported` holds each rank's checkpoint identity in rank order. When the
+/// head derived an expectation from a local checkpoint directory, every rank
+/// must have loaded that checkpoint; otherwise every rank must have loaded the
+/// checkpoint rank 0 did. The refusal names the rank, the host its placement
+/// put it on, and both identities, so the divergent copy can be found.
+pub(crate) fn refuse_checkpoint_mismatch(
+    expected: Option<&str>,
+    ranks: &[crate::WorkerRank],
+    reported: &[&str],
+) -> anyhow::Result<()> {
+    let host = |rank: usize| {
+        ranks
+            .get(rank)
+            .map_or("<unplaced>", |placed| placed.node.as_str())
+    };
+    let (reference, origin) = match (expected, reported.first()) {
+        (Some(identity), _) => (identity, "the head derived checkpoint".to_owned()),
+        (None, Some(identity)) => (
+            *identity,
+            format!("rank 0 on host {} loaded checkpoint", host(0)),
+        ),
+        (None, None) => return Ok(()),
+    };
+    for (rank, identity) in reported.iter().enumerate() {
+        anyhow::ensure!(
+            *identity == reference,
+            "physical rank {rank} on host {} loaded checkpoint {identity}, but {origin} {reference}",
+            host(rank),
+        );
+    }
+    Ok(())
+}
+
 impl WorkerGroup {
     /// Launch every configured rank and expose the instance after capability agreement.
     pub fn spawn(process_args: WorkerProcessArgs) -> anyhow::Result<Self> {
@@ -282,7 +317,13 @@ impl WorkerGroup {
     }
 
     /// Launch the configured static rank groups and wait for loaded capabilities.
-    pub fn spawn_all(arguments: Vec<WorkerProcessArgs>) -> anyhow::Result<Vec<Self>> {
+    pub fn spawn_all(mut arguments: Vec<WorkerProcessArgs>) -> anyhow::Result<Vec<Self>> {
+        // The head derives each group's checkpoint identity once, before any
+        // rank starts; every launch and relaunch descriptor then carries it.
+        for args in &mut arguments {
+            args.derive_checkpoint_identity()?;
+        }
+
         // Every group's processes start before any group waits for reports, so
         // their interpreter and library import overlap.
         let launched = arguments
@@ -317,6 +358,17 @@ impl WorkerGroup {
         let mut info = workers[0].info().clone();
         let mut canonical = info.clone();
         canonical.configuration_id.clear();
+        // Checkpoint agreement is checked by name before the generic report
+        // comparison, which would otherwise report only that ranks disagree.
+        let checkpoints = workers
+            .iter()
+            .map(|worker| worker.info().checkpoint_identity.as_str())
+            .collect::<Vec<_>>();
+        refuse_checkpoint_mismatch(
+            process_args.checkpoint_identity.as_deref(),
+            &process_args.ranks,
+            &checkpoints,
+        )?;
         for (rank, worker) in workers.iter().enumerate() {
             let rank_info = worker.info();
             rank_info
@@ -1580,7 +1632,7 @@ impl WorkerGroup {
 
 #[cfg(test)]
 mod tests {
-    use super::refuse_muxer_off_head;
+    use super::{refuse_checkpoint_mismatch, refuse_muxer_off_head};
     use crate::WorkerRank;
     use crate::executor::ComponentConfig;
     use std::collections::BTreeMap;
@@ -1640,5 +1692,63 @@ mod tests {
         let error = refuse_muxer_off_head("rank-0", &ranks, &entries(vec![0]), &muxing("output"))
             .expect_err("a muxing component the placement does not bind is refused");
         assert!(format!("{error:#}").contains("output"));
+    }
+
+    const SERVED: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const OTHER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn ranks_that_loaded_the_same_checkpoint_are_admitted() {
+        let ranks = placement(&["rank-0", "rank-1"]);
+        refuse_checkpoint_mismatch(Some(SERVED), &ranks, &[SERVED, SERVED])
+            .expect("every rank loaded the checkpoint the head derived");
+        refuse_checkpoint_mismatch(None, &ranks, &[SERVED, SERVED])
+            .expect("without an expectation, ranks agreeing with rank 0 are admitted");
+        // A stub launch has no checkpoint on either side.
+        refuse_checkpoint_mismatch(None, &ranks, &["", ""])
+            .expect("a launch without a checkpoint has nothing to compare");
+    }
+
+    #[test]
+    fn a_checkpoint_the_head_did_not_derive_is_refused_by_name() {
+        let ranks = placement(&["rank-0", "rank-1"]);
+        let error = refuse_checkpoint_mismatch(Some(SERVED), &ranks, &[SERVED, OTHER])
+            .expect_err("a rank that loaded another checkpoint is refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("rank 1"),
+            "the refusal names the rank: {message}"
+        );
+        assert!(
+            message.contains("rank-1"),
+            "the refusal names the rank's host: {message}"
+        );
+        assert!(
+            message.contains(OTHER),
+            "the refusal names what was loaded: {message}"
+        );
+        assert!(
+            message.contains(SERVED),
+            "the refusal names the expectation: {message}"
+        );
+
+        // Rank 0 itself may be the divergent copy.
+        let error = refuse_checkpoint_mismatch(Some(SERVED), &ranks, &[OTHER, SERVED])
+            .expect_err("rank 0 is held to the head's expectation too");
+        assert!(format!("{error:#}").contains("rank 0 on host rank-0"));
+    }
+
+    #[test]
+    fn ranks_disagreeing_without_an_expectation_are_refused_against_rank_0() {
+        let ranks = placement(&["rank-0", "rank-1"]);
+        let error = refuse_checkpoint_mismatch(None, &ranks, &[SERVED, OTHER])
+            .expect_err("ranks must load one checkpoint even when the head derived none");
+        let message = format!("{error:#}");
+        assert!(message.contains("rank 1 on host rank-1"), "{message}");
+        assert!(message.contains("rank 0 on host rank-0"), "{message}");
+        assert!(
+            message.contains(OTHER) && message.contains(SERVED),
+            "{message}"
+        );
     }
 }

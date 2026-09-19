@@ -896,6 +896,7 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             .collect(),
         world_size: info.world_size(),
         configuration_id: info.configuration_id().unwrap_or_default().to_owned(),
+        checkpoint_identity: info.checkpoint_identity().unwrap_or_default().to_owned(),
         components: info
             .components()
             .map(|items| {
@@ -1919,6 +1920,7 @@ fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
         fabric_handles: info.fabric_handles,
         world_size: info.world_size,
         configuration_id: Some(info.configuration_id.clone()),
+        checkpoint_identity: Some(info.checkpoint_identity.clone()),
         components: Some(
             info.components
                 .iter()
