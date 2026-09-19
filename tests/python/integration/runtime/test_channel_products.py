@@ -46,6 +46,8 @@ def test_a_channel_product_carries_its_own_bytes(events: EventPool) -> None:
         # A round trip through the wire mapping is the journey the product
         # actually makes: rank, head, rank.
         delivered = Locator.from_mapping(locator.to_mapping())
+        # The consumer picks its transport by the mechanism the locator names.
+        assert delivered.backend == "channel"
         destination = torch.empty(3, 4, dtype=torch.bfloat16)
         _await_ticket(
             transport.fetch(
