@@ -250,3 +250,35 @@ def test_text_fp8_swiglu_matches_unfused_boundary() -> None:
     _assert_e4m3_error(
         actual_activated_fp8, actual_activated_scale, expected_activated
     )
+
+
+@pytest.mark.gpu
+def test_modulated_rms_norm_retains_its_source_rows():
+    """The retained rows are the normalized rows' source, byte for byte."""
+    torch.manual_seed(7)
+    hidden = torch.randn(96, 256, device="cuda", dtype=torch.bfloat16)
+    weight = torch.rand(256, device="cuda", dtype=torch.bfloat16) + 0.5
+    shift = torch.randn(3, 256, device="cuda", dtype=torch.bfloat16)
+    scale = torch.randn(3, 256, device="cuda", dtype=torch.bfloat16)
+    row_indices = torch.randint(0, 3, (96,), device="cuda")
+    retained = torch.zeros_like(hidden)
+
+    expected = modulated_rms_norm(
+        hidden, weight, shift, scale, row_indices, eps=1e-6
+    )
+    actual = modulated_rms_norm(
+        hidden, weight, shift, scale, row_indices, eps=1e-6, retain=retained
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(retained, hidden, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="retained rows"):
+        modulated_rms_norm(
+            hidden,
+            weight,
+            shift,
+            scale,
+            row_indices,
+            eps=1e-6,
+            retain=retained[:, :128],
+        )

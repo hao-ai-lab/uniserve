@@ -39,6 +39,7 @@ if triton is not None:
         row_indices_ptr,
         output_ptr,
         output_scale_ptr,
+        retain_ptr,
         gate_row_stride,
         shift_row_stride,
         scale_row_stride,
@@ -47,6 +48,7 @@ if triton is not None:
         EPS: tl.constexpr,  # noqa: N803
         HAS_UPDATE: tl.constexpr,  # noqa: N803
         FP8_OUTPUT: tl.constexpr,  # noqa: N803
+        RETAIN: tl.constexpr,  # noqa: N803
     ):
         row = tl.program_id(0)
         columns = tl.arange(0, BLOCK)
@@ -69,6 +71,10 @@ if triton is not None:
             ).to(tl.float32)
             value = value + gate * update
             tl.store(update_ptr + offsets, value, mask=mask)
+        if RETAIN:
+            # Keep the normalized row's source as the residual for the caller,
+            # written in the same pass that reads it.
+            tl.store(retain_ptr + offsets, value, mask=mask)
 
         mean_square = tl.sum(value * value, axis=0) / WIDTH
         weight = tl.load(weight_ptr + columns, mask=mask, other=0.0).to(
@@ -184,6 +190,7 @@ def _fused_modulation(
     update: torch.Tensor | None = None,
     gate: torch.Tensor | None = None,
     fp8: bool = False,
+    retain: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Own output storage for the fused modulation.
 
@@ -213,6 +220,7 @@ def _fused_modulation(
         row_indices,
         output,
         output if output_scale is None else output_scale,
+        output if retain is None else retain,
         0 if gate is None else gate.stride(0),
         shift.stride(0),
         scale.stride(0),
@@ -221,6 +229,7 @@ def _fused_modulation(
         EPS=eps,
         HAS_UPDATE=update is not None,
         FP8_OUTPUT=fp8,
+        RETAIN=retain is not None,
         num_warps=4 if width < 2048 else 8,
     )
     return output, output_scale
@@ -234,15 +243,29 @@ def modulated_rms_norm(
     row_indices: torch.Tensor,
     *,
     eps: float,
+    retain: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Return RMS-normalized rows with their indexed scale and shift."""
+    """Return RMS-normalized rows with their indexed scale and shift.
+
+    ``retain`` receives a copy of ``value`` in the same pass, so a caller
+    that keeps the residual while ``value`` lives in borrowed scratch does
+    not read it twice.
+    """
+    if retain is not None and (
+        retain.shape != value.shape
+        or retain.dtype != value.dtype
+        or not retain.is_contiguous()
+    ):
+        raise ValueError("retained rows must match the normalized value")
     if value.shape[-1] <= 32768 and _modulation_inputs_eligible(
         value, weight, shift, scale, row_indices
     ):
-        return _fused_modulation(value, weight, shift, scale, row_indices, eps)[
-            0
-        ]
+        return _fused_modulation(
+            value, weight, shift, scale, row_indices, eps, retain=retain
+        )[0]
 
+    if retain is not None:
+        retain.copy_(value)
     return _modulate(value, weight, shift, scale, row_indices, eps).to(
         value.dtype
     )
