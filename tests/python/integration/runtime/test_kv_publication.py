@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import socket
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import replace
-from threading import Event
+from multiprocessing import shared_memory
 
 import torch
 
@@ -46,25 +43,50 @@ from uniserve_worker.protocol.transfer import (
     Locator,
     PosixShmTransfer,
 )
+from uniserve_worker.transfer import segment
+from uniserve_worker.transfer.endpoint import locator_digest
+from uniserve_worker.transfer.tickets import _open_shared_memory
 
 
-def _read_request(locator: Locator) -> bytes:
-    """Encode a host reader's registration request.
+def _gated_copy(locator: Locator) -> tuple[Locator, shared_memory.SharedMemory]:
+    """Copy a ready publication into a segment whose readiness the test holds.
 
-    The request is encoded at the external SHM boundary.
+    The copy carries the digest of the locator that names it, so the reading
+    rank accepts it as the publication it was handed, and stays pending until
+    the test announces it.
     """
     assert isinstance(locator.transport, PosixShmTransfer)
-    descriptor = json.dumps(
-        locator.to_mapping(), sort_keys=True, separators=(",", ":")
+    source = _open_shared_memory(
+        locator.transport.name, segment.HEADER_BYTES + locator.nbytes
     )
-    return (
-        hashlib.sha256(locator.transport.name.encode()).digest()
-        + hashlib.sha256(descriptor.encode()).digest()
+    try:
+        header = memoryview(source)
+        segment.await_ready(header)
+        payload = segment.HEADER_BYTES
+        data = bytes(source[payload : payload + locator.nbytes])
+        header.release()
+    finally:
+        source.close()
+    storage = shared_memory.SharedMemory(
+        create=True, size=segment.HEADER_BYTES + locator.nbytes
     )
+    gated = replace(
+        locator, transport=replace(locator.transport, name=storage.name)
+    )
+    segment.initialize(storage.buf, locator_digest(gated))
+    storage.buf[segment.HEADER_BYTES : segment.HEADER_BYTES + len(data)] = data
+    return gated, storage
 
 
 def test_kv_install_waits_for_storage_and_input_without_blocking_independent_work(  # noqa: E501
 ) -> None:
+    """A KV installation waits for its storage and its input, and no more.
+
+    The storage is held by a retired publication a consumer has not yet
+    acknowledged; the input is a publication whose producer has not yet
+    announced it. Independent work completes meanwhile, the acknowledgment
+    releases the storage, and readiness completes the installation.
+    """
     with (
         execution_worker(transfer_backends=("shm",)) as producer,
         execution_worker(transfer_backends=("shm",), queue_depth=3) as worker,
@@ -72,9 +94,7 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
         incoming = ar_params(45, block_ids=(0,))
         admission = ar_params(44, block_ids=(0,))
         worker.warmup()
-        grant = Event()
-        accepted = Event()
-        endpoint = f"uniserve-test-kv-{uuid.uuid4().hex}"
+        gated_segments: list[shared_memory.SharedMemory] = []
         try:
             publications = []
             commits = []
@@ -105,6 +125,10 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     call_id=CallId(2, 0),
                     predecessor=observation.call_id,
                 )
+                if owner is worker:
+                    # This publication is read by an external consumer whose
+                    # acknowledgment the test controls.
+                    publication = replace(publication, consumer_slots=(1,))
                 published = finalized_report(
                     owner,
                     owner.submit(
@@ -122,62 +146,40 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
             old_locator = resident.tensors[0].locations[0]
             assert isinstance(old_locator.transport, PosixShmTransfer)
 
-            # The external publisher owns real SHM bytes, but gates
-            # permission to read them so storage retirement and input
-            # completion remain distinct.
-            tensors = tuple(
-                replace(
-                    tensor,
-                    locations=tuple(
-                        replace(
-                            locator,
-                            transport=replace(
-                                locator.transport, endpoint=endpoint
-                            ),
-                        )
-                        for locator in tensor.locations
-                    ),
-                )
-                for tensor in source.tensors
-            )
-            incoming_payload = replace(source, tensors=tensors)
-            requests = {
-                _read_request(locator)
-                for tensor in tensors
-                for locator in tensor.locations
-            }
-            with (
-                socket.socket(
-                    socket.AF_UNIX, socket.SOCK_SEQPACKET
-                ) as listener,
-                socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as reader,
-                ThreadPoolExecutor(max_workers=2) as executor,
-            ):
-                listener.bind("\0" + endpoint)
-                listener.listen(len(requests))
-                listener.settimeout(10)
+            # The incoming publication's bytes are real, but the test holds
+            # their readiness, so storage retirement and input completion
+            # remain distinct.
+            tensors = []
+            for tensor in source.tensors:
+                locations = []
+                for locator in tensor.locations:
+                    gated, storage = _gated_copy(locator)
+                    gated_segments.append(storage)
+                    locations.append(gated)
+                tensors.append(replace(tensor, locations=tuple(locations)))
+            incoming_payload = replace(source, tensors=tuple(tensors))
 
-                def serve() -> None:
-                    pending = set(requests)
-                    while pending:
-                        connection, _address = listener.accept()
-                        with connection:
-                            connection.settimeout(10)
-                            pending.remove(connection.recv(128))
-                            accepted.set()
-                            assert grant.wait(10), (
-                                "publisher was never permitted to expose "
-                                "its bytes"
-                            )
-                            connection.sendall(b"G")
-                            assert connection.recv(1) == b"A"
-                            connection.sendall(b"D")
+            # An external consumer holds every segment of the worker's own
+            # publication unacknowledged across the request's Finish.
+            held: list[tuple[object, memoryview]] = []
+            for tensor in resident.tensors:
+                for locator in tensor.locations:
+                    assert isinstance(locator.transport, PosixShmTransfer)
+                    mapping = _open_shared_memory(
+                        locator.transport.name,
+                        segment.HEADER_BYTES + locator.nbytes,
+                    )
+                    header = memoryview(mapping)
+                    segment.await_ready(header)
+                    held.append((mapping, header))
 
-                reader.settimeout(10)
-                reader.connect("\0" + old_locator.transport.endpoint)
-                reader.sendall(_read_request(old_locator))
-                assert reader.recv(1) == b"G"
-                observation = commits[1]
+            def acknowledge_held() -> None:
+                for _mapping, header in held:
+                    segment.acknowledge(header, 1)
+            # The worker runs on its own thread; a failed assertion must not
+            # wait for a worker that no longer reads its channel.
+            executor = ThreadPoolExecutor(max_workers=1)
+            try:
                 finish = Finish(
                     admission.request_key,
                 )
@@ -221,7 +223,6 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     )
                 )
                 worker.bind(ipc)
-                serving = executor.submit(serve)
                 processing = executor.submit(worker.run)
                 reader_held = True
                 try:
@@ -230,15 +231,12 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     completed = BatchOutput.from_mapping(response["result"])
                     assert completed.completions[0].status is CallStatus.OK
 
-                    reader.sendall(b"A")
-                    assert reader.recv(1) == b"D"
+                    acknowledge_held()
                     reader_held = False
                     response = ipc.receive()
                     assert response["message_id"] == 3, response
-                    assert accepted.wait(5), (
-                        "retiring storage did not start the dependent read"
-                    )
-                    grant.set()
+                    for storage in gated_segments:
+                        segment.set_state(storage.buf, segment.READY)
 
                     # No new IPC request drives this transition: the completed
                     # physical import must wake the sleeping process itself.
@@ -247,7 +245,6 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     report = BatchOutput.from_mapping(response["result"])
                     assert report.completions[0].status is CallStatus.OK
                     assert report.completions[0].kv_visible_len == 2
-                    serving.result(timeout=5)
                     for layer in worker.kv_cache.layers:
                         expected = producer.kv_cache.cache.state(layer).read(
                             (1,), start=0, length=2
@@ -260,14 +257,22 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                                 left, right, rtol=0, atol=0
                             )
                 finally:
-                    grant.set()
                     if reader_held:
-                        reader.sendall(b"A")
-                        assert reader.recv(1) == b"D"
+                        acknowledge_held()
+                    for storage in gated_segments:
+                        segment.set_state(storage.buf, segment.READY)
+                    for mapping, header in held:
+                        header.release()
+                        mapping.close()
                     ipc.submit({"kind": "close", "message_id": 6})
                     processing.result(timeout=10)
+            finally:
+                executor.shutdown(wait=False)
         finally:
-            grant.set()
+            for storage in gated_segments:
+                storage.close()
+                with suppress(FileNotFoundError):
+                    storage.unlink()
 
 
 def _installation_call(

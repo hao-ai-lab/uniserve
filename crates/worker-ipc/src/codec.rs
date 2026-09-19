@@ -524,6 +524,10 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
             .input_token_ids()
             .map(|ids| ids.iter().collect())
             .unwrap_or_default(),
+        consumer_slots: call
+            .consumer_slots()
+            .map(|slots| slots.iter().collect())
+            .unwrap_or_default(),
         sampling_state: call.sampling_state().map(|state| SamplingState {
             // A missing whitelist and an empty whitelist have different semantics.
             allowed_token_ids: state.allowed_token_ids().map(|ids| ids.iter().collect()),
@@ -1391,6 +1395,7 @@ fn call_to_fb(call: &Call) -> CodecResult<fbs::CallT> {
         call_id: Some(computation_id_to_fb(call.call_id)),
         coordinates: Some(Box::new(coordinates_to_fb(call.coordinates))),
         input_token_ids: Some(call.input_token_ids.clone()),
+        consumer_slots: Some(call.consumer_slots.clone()),
         input_image: call.input_image.as_deref().map(str::to_owned),
         kv_input: call.kv_input.map(buffer_id_to_fb).map(Box::new),
         kv_output: call.kv_output.map(buffer_id_to_fb).map(Box::new),

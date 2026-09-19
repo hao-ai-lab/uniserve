@@ -7,8 +7,6 @@ helper so the convenience form stays out of the worker's public surface.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-
 from uniserve.runtime import EventPool
 from uniserve_worker.protocol.transfer import WorkerEndpoint
 from uniserve_worker.transfer.tickets import (
@@ -25,7 +23,6 @@ def make_transport(
     ticket_capacity: int,
     event_pool: EventPool,
     source: WorkerEndpoint | None = None,
-    consumers: Sequence[int] = (),
     acknowledgment_slot: int = 0,
     cross_host_consumers: bool = False,
 ) -> Transport:
@@ -36,7 +33,6 @@ def make_transport(
         ticket_capacity=ticket_capacity,
         event_pool=event_pool,
         source=source,
-        consumers=consumers,
         acknowledgment_slot=acknowledgment_slot,
         cross_host_consumers=cross_host_consumers,
     )[str(name)]

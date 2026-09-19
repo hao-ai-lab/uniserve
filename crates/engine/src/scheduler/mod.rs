@@ -22,6 +22,7 @@ pub use config::{
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulerConfig, SchedulingPolicy,
 };
 use config::{MAX_NUM_SEQS, MAX_NUM_WAITING};
+pub(crate) use execution::consuming_stages;
 pub use stats::{
     DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, KvCacheStats, PrefixStats,
     SchedulerStats, TimingStats, WorkerStats,

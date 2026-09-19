@@ -96,6 +96,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _IPC_WAIT_TIMEOUT_US = 60_000_000
+# A consumer's acknowledgment lands in published storage with no
+# notification, so a rank holding a retired publication sweeps on this period.
+_ACKNOWLEDGMENT_SWEEP_US = 1_000
 
 
 def _input_producers(
@@ -228,7 +231,6 @@ class Worker:
                 queue_depth=config.ipc.queue_depth,
                 completion_payload_bytes=config.ipc.max_payload_bytes,
                 acknowledgment_slot=config.ipc.acknowledgment_slot,
-                product_consumers=config.ipc.product_consumers,
                 products_cross_hosts=config.ipc.products_cross_hosts,
                 components=config.components,
                 process_groups=distributed,
@@ -254,7 +256,6 @@ class Worker:
         queue_depth: int,
         completion_payload_bytes: int,
         acknowledgment_slot: int = 0,
-        product_consumers: tuple[int, ...] = (),
         products_cross_hosts: bool = False,
         attention: str | None = None,
         transfer_backends: tuple[str, ...] = ("local",),
@@ -611,7 +612,6 @@ class Worker:
                 byte_capacity=transfer_byte_capacity,
                 ticket_capacity=arena.transfer_tickets,
                 event_pool=self.device_events,
-                consumers=product_consumers,
                 acknowledgment_slot=acknowledgment_slot,
                 cross_host_consumers=products_cross_hosts,
             )
@@ -825,7 +825,8 @@ class Worker:
                     or self._waiting_responses
                     or self.inflight
                 ):
-                    endpoint.wait_incoming(_IPC_WAIT_TIMEOUT_US)
+                    endpoint.wait_incoming(self._service_wait_us())
+                    self._sweep_acknowledgments()
                     continue
 
                 if self._admission_closed:
@@ -835,6 +836,34 @@ class Worker:
         finally:
             if gc_was_enabled:
                 gc.enable()
+
+    def _sweep_acknowledgments(self) -> None:
+        """Reclaim retired publications whose consumers have acknowledged.
+
+        The words arrive with no wake, so this runs after each service wait
+        while any are outstanding; a batch waiting on the storage they hold
+        is advanced by the pass that follows.
+        """
+        if any(
+            transport.awaiting_acknowledgment()
+            for transport in self.transports.values()
+        ):
+            for transport in self.transports.values():
+                transport.reap()
+
+    def _service_wait_us(self) -> int:
+        """How long the service loop may sleep for its next event.
+
+        A retired publication whose consumer has not yet acknowledged it holds
+        storage this rank will reclaim on its next retirement pass, and the
+        word that lets it arrives with no wake, so the wait is short then.
+        """
+        if any(
+            transport.awaiting_acknowledgment()
+            for transport in self.transports.values()
+        ):
+            return _ACKNOWLEDGMENT_SWEEP_US
+        return _IPC_WAIT_TIMEOUT_US
 
     def _dispatch(self, request: Mapping[str, Any]) -> dict[str, Any]:
         """Resolve an administrative request without transport I/O."""
@@ -1359,6 +1388,7 @@ class Worker:
         Covers physical dependencies and completed outputs.
         """
         self._require_open()
+        self._sweep_acknowledgments()
         for state in tuple(self.inflight.values()):
             self._advance_execution(state)
             self._advance_batch(state)

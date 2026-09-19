@@ -68,6 +68,8 @@ from uniserve_worker.protocol.transfer import (
     EncoderTransferValue,
     TensorTransfer,
 )
+from uniserve_worker.transfer import segment
+from uniserve_worker.transfer.tickets import _open_shared_memory
 
 pytestmark = pytest.mark.integration
 
@@ -2428,9 +2430,6 @@ def test_generated_feedback_commits_absolute_visual_token_state():
 def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_independent_work(  # noqa: E501
     device,
 ):
-    import hashlib
-    import json
-    import socket
     from threading import Event
 
     policy = WorkerConfig(
@@ -2476,6 +2475,9 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
         latent=initial,
         steps=1,
     )
+    # An external consumer, named on the call, holds the first latent
+    # unacknowledged across its semantic Free.
+    first = replace(first, consumer_slots=(1,))
     first_report = finalized_report(
         worker,
         worker.submit(
@@ -2492,88 +2494,82 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
         if product.product == first_latent
     )
 
-    locator = payload.tensor.locations[0].to_mapping()
-    digest = hashlib.sha256(
-        json.dumps(locator, sort_keys=True, separators=(",", ":")).encode()
-    ).digest()
-    key = hashlib.sha256(locator["name"].encode()).digest()
+    locator = payload.tensor.locations[0]
     prepared = None
+    held = _open_shared_memory(
+        locator.transport.name, segment.HEADER_BYTES + locator.nbytes
+    )
+    held_header = memoryview(held)
     try:
-        # This host consumer holds a real publication grant across semantic
-        # Free.
-        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as reader:
-            reader.settimeout(5)
-            reader.connect("\0" + locator["endpoint"])
-            reader.sendall(key + digest)
-            assert reader.recv(1) == b"G"
-            try:
-                observation = record_completion(first, first_report)
-                second, second_latent = diffusion_step_call(
-                    admission.request_key,
-                    call_id=CallId(4, 0),
-                    predecessor=observation.call_id,
-                    conditioning=conditioning,
-                    latent=first_latent,
-                    steps=1,
-                )
-                second_report = finalized_report(
-                    worker,
-                    worker.submit(
-                        execution_batch(
-                            batch_id=4,
-                            calls=(second,),
-                            commands=(Free(initial.buffer_id),),
-                        )
-                    ),
-                )
-                assert second_report.completions[0].status is CallStatus.OK
-                observation = record_completion(second, second_report)
-                third, _final_latent = diffusion_step_call(
-                    admission.request_key,
-                    call_id=CallId(5, 0),
-                    predecessor=observation.call_id,
-                    conditioning=conditioning,
-                    latent=second_latent,
-                    steps=1,
-                )
-                prepared = worker.submit(
-                    execution_batch(
-                        batch_id=5,
-                        calls=(third,),
-                        commands=(Free(first_latent.buffer_id),),
-                    )
-                )
-                assert not prepared.inputs_ready()
-                woke = Event()
-                prepared.on_dependencies_ready(woke.set)
-                assert not woke.is_set()
-
-                independent = ar_params(77, block_ids=(7,))
-                call = token_call(
-                    independent.request_key,
-                    call_id=CallId(1, 0),
-                    predecessor=root_parent(independent),
-                    mode=ForwardMode.PREFILL,
-                    tokens=(3, 4),
-                )
-                report = finalized_report(
-                    worker,
-                    worker.submit(
-                        execution_batch(
-                            batch_id=6,
-                            admissions=(independent,),
-                            calls=(call,),
-                        )
-                    ),
-                )
-                assert report.completions[0].status is CallStatus.OK
-                assert not prepared.inputs_ready()
-            finally:
-                reader.sendall(b"A")
-                assert reader.recv(1) == b"D"
-            assert woke.wait(5), (
-                "retired source read did not wake the bank writer"
+        segment.await_ready(held_header)
+        try:
+            observation = record_completion(first, first_report)
+            second, second_latent = diffusion_step_call(
+                admission.request_key,
+                call_id=CallId(4, 0),
+                predecessor=observation.call_id,
+                conditioning=conditioning,
+                latent=first_latent,
+                steps=1,
             )
+            second_report = finalized_report(
+                worker,
+                worker.submit(
+                    execution_batch(
+                        batch_id=4,
+                        calls=(second,),
+                        commands=(Free(initial.buffer_id),),
+                    )
+                ),
+            )
+            assert second_report.completions[0].status is CallStatus.OK
+            observation = record_completion(second, second_report)
+            third, _final_latent = diffusion_step_call(
+                admission.request_key,
+                call_id=CallId(5, 0),
+                predecessor=observation.call_id,
+                conditioning=conditioning,
+                latent=second_latent,
+                steps=1,
+            )
+            prepared = worker.submit(
+                execution_batch(
+                    batch_id=5,
+                    calls=(third,),
+                    commands=(Free(first_latent.buffer_id),),
+                )
+            )
+            assert not prepared.inputs_ready()
+            woke = Event()
+            prepared.on_dependencies_ready(woke.set)
+            assert not woke.is_set()
+
+            independent = ar_params(77, block_ids=(7,))
+            call = token_call(
+                independent.request_key,
+                call_id=CallId(1, 0),
+                predecessor=root_parent(independent),
+                mode=ForwardMode.PREFILL,
+                tokens=(3, 4),
+            )
+            report = finalized_report(
+                worker,
+                worker.submit(
+                    execution_batch(
+                        batch_id=6,
+                        admissions=(independent,),
+                        calls=(call,),
+                    )
+                ),
+            )
+            assert report.completions[0].status is CallStatus.OK
+            assert not prepared.inputs_ready()
+        finally:
+            # The consumer's word lands with no wake; the rank's next pass
+            # reclaims the source and the bank writer proceeds.
+            segment.acknowledge(held_header, 1)
+        worker.advance()
+        assert woke.wait(5), "acknowledged source did not wake the bank writer"
         assert prepared.inputs_ready()
         prepared = finalized_report(worker, prepared)
         report = prepared

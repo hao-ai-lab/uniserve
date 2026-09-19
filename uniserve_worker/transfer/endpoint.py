@@ -1,11 +1,17 @@
-"""Process endpoints for bounded publication grants and physical retirement."""
+"""Registered publications of one address space and their retirement.
+
+A publication is registered when its producer exposes it and retired when
+the engine releases its buffer. Nothing here talks to a consumer: readiness
+and identity travel inside the published storage, and a consumer says it has
+finished by writing its acknowledgment word there. The producing rank sweeps
+those words when it retires the publication, so a consumer on another host
+retires a product the same way one on this host does.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import selectors
-import socket
 import threading
 import uuid
 from collections.abc import Callable
@@ -20,7 +26,7 @@ Source = TypeVar("Source")
 
 
 def locator_digest(locator: Locator) -> bytes:
-    """Bind a grant to the registered view, including its producer fence."""
+    """Bind a read to the registered view, including its producer fence."""
     encoded = json.dumps(
         locator.to_mapping(),
         sort_keys=True,
@@ -31,7 +37,7 @@ def locator_digest(locator: Locator) -> bytes:
 
 
 def publication_key(locator: Locator) -> bytes:
-    """Return the fixed-width source key carried by the reader protocol."""
+    """Return the fixed-width key that identifies a publication."""
     handle = locator.transport
     if isinstance(handle, CudaVmmTransfer):
         return handle.publication_id.encode("ascii")
@@ -40,130 +46,54 @@ def publication_key(locator: Locator) -> bytes:
     raise invalid_descriptor("process publication requires a shared transport")
 
 
-def open_reader(locator: Locator) -> socket.socket:
-    """Acquire source ownership before opening shared state.
-
-    Ownership is acquired before opening any shared allocation or readiness
-    signal. The request is the 32-byte publication key followed by the
-    32-byte locator digest. The endpoint answers with one byte: "G" grants
-    the read, "F" reports a failed producer, and anything else rejects the
-    request. The returned connection stays open until finish_reader()
-    acknowledges.
-
-    The grant conveys ownership and nothing else. A publication carries its
-    own shareable allocation handle, which a consumer on another host can
-    import, where a descriptor passed over this connection could only reach
-    the producer's own host.
-    """
-    handle = locator.transport
-    if not isinstance(handle, (CudaVmmTransfer, PosixShmTransfer)):
-        raise invalid_descriptor("process read requires a shared transport")
-    connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    try:
-        connection.connect("\0" + handle.endpoint)
-        connection.sendall(publication_key(locator) + locator_digest(locator))
-        response = connection.recv(1)
-        if not response:
-            raise resource_error(
-                "publication endpoint was lost before readiness"
-            )
-        if response == b"F":
-            raise resource_error("publication producer failed before readiness")
-        if response != b"G":
-            raise invalid_descriptor(
-                "publication is retired, invalid, or has no reader capacity"
-            )
-    except OSError as error:
-        connection.close()
-        raise resource_error(
-            "publication endpoint was lost before readiness"
-        ) from error
-    except BaseException:
-        connection.close()
-        raise
-    return connection
-
-
-def finish_reader(connection: socket.socket) -> None:
-    """Acknowledge that the reader has stopped accessing the source allocation.
-
-    Sends "A" and waits for "D", which the endpoint only returns after any
-    resulting reclamation, so a completed handshake includes the producer's
-    physical release and capacity accounting.
-    """
-    try:
-        connection.sendall(b"A")
-        response = connection.recv(1)
-    except OSError as error:
-        raise resource_error(
-            "publication endpoint lost reader acknowledgement"
-        ) from error
-    if response != b"D":
-        raise resource_error("publication endpoint lost reader acknowledgement")
-
-
 @dataclass(slots=True)
 class _Publication(Generic[Source]):
-    """Registered source and its grant lifecycle under the endpoint lock."""
+    """One registered source and where it stands towards reclamation."""
 
     locator: Locator
     source: Source
     digest: bytes
-    pending: bool  # producer may still be writing; grants wait for complete()
-    readers: int = 0
+    pending: bool  # the producer may still be writing the published bytes
     retired: bool = False
     error: BaseException | None = None
     retirement: Future[None] = field(default_factory=Future)
     reclaiming: bool = False  # physical hand-back to the owner has started
 
 
-class PublicationEndpoint(Generic[Source]):
-    """Own registered sources and reader grants for one address space.
+class Publications(Generic[Source]):
+    """Own the registered sources of one address space.
 
-    A grant pins the exact source before the reader opens its allocation. A
-    retirement rejects new grants and waits for both producer completion and
-    every granted read. A disconnect after a grant preserves the source and
-    reports failed retirement; it never proves device completion.
+    A source is handed back to its owner once the engine has retired the
+    publication, the producer has finished writing it, and every consumer the
+    head named has acknowledged it. A producer that fails with unknown
+    physical completion keeps its source registered, so nothing reuses storage
+    a device may still be writing.
     """
 
     def __init__(
         self,
         *,
-        reader_capacity: int,
-        publication_capacity: int,
+        capacity: int,
         reclaim: Callable[[Source, Future[None]], None],
         drain: Callable[[Source], None],
+        acknowledged: Callable[[Source], bool],
     ) -> None:
-        if min(reader_capacity, publication_capacity) < 1:
-            raise ValueError(
-                "publication and reader capacities must be positive"
-            )
+        if capacity < 1:
+            raise ValueError("publication capacity must be positive")
 
-        self.name = f"uniserve-read-{uuid.uuid4().hex}"
-        self._reader_capacity = reader_capacity
-        self._publication_capacity = publication_capacity
+        # The incarnation names this address space in every locator it
+        # publishes, so a locator from an earlier life of the process is
+        # refused rather than resolved against the wrong owner.
+        self.name = f"uniserve-publications-{uuid.uuid4().hex}"
+        self._capacity = capacity
         self._reclaim = reclaim
         self._drain = drain
+        self._acknowledged = acknowledged
         self._publications: dict[bytes, _Publication[Source]] = {}
         self._lock = threading.Lock()
         self._closing = False
         self._closed = False
-        self._lost_readers = 0
         self._error: BaseException | None = None
-
-        # Abstract-namespace SEQPACKET listener; the control pair wakes the
-        # serving thread on producer completion and close.
-        self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        self._listener.bind("\0" + self.name)
-        self._listener.listen(reader_capacity)
-        self._listener.setblocking(False)
-        self._control_rx, self._control_tx = socket.socketpair()
-        self._control_rx.setblocking(False)
-        self._control_tx.setblocking(False)
-        self._worker = threading.Thread(
-            target=self._serve, name="uniserve-publication-readers", daemon=True
-        )
-        self._worker.start()
 
     def publish(
         self, locator: Locator, source: Source, *, pending: bool = False
@@ -177,10 +107,7 @@ class PublicationEndpoint(Generic[Source]):
             self._reap_locked()
             if self._error is not None:
                 raise self._error
-            if (
-                self._closing
-                or len(self._publications) >= self._publication_capacity
-            ):
+            if self._closing or len(self._publications) >= self._capacity:
                 raise resource_error(
                     "transport publication capacity is unavailable"
                 )
@@ -192,13 +119,29 @@ class PublicationEndpoint(Generic[Source]):
                 locator, source, locator_digest(locator), pending
             )
 
-    def source(self, locator: Locator) -> Source:
-        """Borrow a registered source.
+    def source(self, locator: Locator, *, reading: bool = False) -> Source:
+        """Borrow a registered source by its exact locator.
 
-        The endpoint must have granted the caller's read.
+        The owner borrows its source through retirement; a reader borrows it
+        only while the publication is live, and a failed producer refuses the
+        reader as it would have refused a grant.
         """
         with self._lock:
-            return self._publications[publication_key(locator)].source
+            publication = self._publications.get(publication_key(locator))
+            if (
+                publication is None
+                or publication.digest != locator_digest(locator)
+                or (reading and publication.retired)
+            ):
+                raise invalid_descriptor(
+                    "publication is retired, invalid, or belongs to another "
+                    "view"
+                )
+            if reading and publication.error is not None:
+                raise resource_error(
+                    "publication producer failed before readiness"
+                )
+            return publication.source
 
     def complete(
         self,
@@ -207,10 +150,10 @@ class PublicationEndpoint(Generic[Source]):
         error: BaseException | None = None,
         producer_completed: bool = True,
     ) -> None:
-        """Expose producer readiness or failure to waiting readers.
+        """Record producer completion or failure.
 
         A failure with unknown physical completion keeps the source allocation
-        registered even after every reader is rejected and publication retires.
+        registered even after the publication retires.
         """
         if not producer_completed and error is None:
             raise ValueError("unknown producer completion requires a failure")
@@ -223,14 +166,8 @@ class PublicationEndpoint(Generic[Source]):
                 publication.retirement.set_exception(error)
             self._reclaim_locked(publication)
 
-        try:
-            self._control_tx.send(b"R")
-        except BlockingIOError:
-            # An already queued notification also scans all pending grants.
-            pass
-
     def release(self, locator: Locator) -> Future[None] | None:
-        """Revoke publication while retaining granted physical readers."""
+        """Retire a publication; its source returns once acknowledged."""
         if locator.transport.endpoint != self.name:
             raise invalid_descriptor(
                 "publication release belongs to another endpoint"
@@ -259,13 +196,35 @@ class PublicationEndpoint(Generic[Source]):
                 )
             return publication.retirement
 
+    def awaiting_acknowledgment(self) -> bool:
+        """Report whether a retired source still waits on a consumer's word."""
+        with self._lock:
+            return any(
+                publication.retired
+                and not publication.pending
+                and not publication.reclaiming
+                for publication in self._publications.values()
+            )
+
+    def reap(self) -> None:
+        """Hand back every retired source whose consumers have acknowledged.
+
+        An acknowledgment is written into the published storage and reaches
+        this process with no notification, so the producer sweeps here.
+        """
+        with self._lock:
+            for publication in tuple(self._publications.values()):
+                if publication.retired and not publication.reclaiming:
+                    self._reclaim_locked(publication)
+            self._reap_locked()
+
     def _reclaim_locked(self, publication: _Publication[Source]) -> None:
-        """Hand source back once retired, producer-complete, and reader-free."""
+        """Hand a source back once retired, complete and acknowledged."""
         if (
             publication.retired
             and not publication.pending
-            and publication.readers == 0
             and not publication.reclaiming
+            and self._acknowledged(publication.source)
         ):
             publication.reclaiming = True
             try:
@@ -276,11 +235,7 @@ class PublicationEndpoint(Generic[Source]):
                 raise
 
     def _reap_locked(self) -> None:
-        """Remove retired metadata.
-
-        Removal happens after its physical owner has returned the
-        allocation.
-        """
+        """Forget retired publications whose owners took their storage back."""
         for key, publication in tuple(self._publications.items()):
             if (
                 publication.reclaiming
@@ -290,193 +245,26 @@ class PublicationEndpoint(Generic[Source]):
                 del self._publications[key]
 
     def close(self) -> None:
-        """Drain granted readers and close the endpoint.
-
-        Unresolved ownership is surfaced.
-        """
+        """Retire every publication and surface unresolved ownership."""
         if not self._closed:
             with self._lock:
                 self._closing = True
                 for publication in tuple(self._publications.values()):
                     publication.retired = True
                     self._reclaim_locked(publication)
-            try:
-                self._control_tx.send(b"C")
-            except BlockingIOError:
-                pass
-            self._worker.join()
-
-            # The serving thread is gone; synchronously drain any reclamation
-            # whose physical completion is still outstanding.
+            # Reclamation whose physical completion is still outstanding is
+            # drained synchronously: the owner is closing.
             for publication in tuple(self._publications.values()):
                 if publication.reclaiming and not publication.retirement.done():
                     self._drain(publication.source)
             with self._lock:
                 self._reap_locked()
-            self._control_rx.close()
-            self._control_tx.close()
             self._closed = True
 
         if self._error is not None:
             raise self._error
-        if self._lost_readers:
-            raise resource_error(
-                "reader disconnected without completion; "
-                "sources remain retained"
-            )
         if self._publications:
             raise resource_error(
-                "publication lost producer completion; sources remain retained"
+                "publication lost producer completion or acknowledgment; "
+                "sources remain retained"
             )
-
-    def _serve(self) -> None:
-        selector = selectors.DefaultSelector()
-        selector.register(self._listener, selectors.EVENT_READ)
-        selector.register(self._control_rx, selectors.EVENT_READ)
-        # Per-connection reader state: (None, False) awaits the key+digest
-        # packet; (publication, False) holds a counted reader slot awaiting its
-        # grant; (publication, True) is granted and awaits the "A" release.
-        clients: dict[
-            socket.socket, tuple[_Publication[Source] | None, bool]
-        ] = {}
-        closing = False
-
-        def remove(connection: socket.socket) -> None:
-            publication, granted = clients.pop(connection)
-            if publication is not None:
-                with self._lock:
-                    if not granted:
-                        publication.readers -= 1
-                        self._reclaim_locked(publication)
-                    else:
-                        # A granted reader that vanishes without "A" never
-                        # proved device completion; the source stays retained.
-                        self._lost_readers += 1
-                        if not publication.retirement.done():
-                            publication.retirement.set_exception(
-                                resource_error(
-                                    "reader disconnected without "
-                                    "physical completion"
-                                )
-                            )
-            selector.unregister(connection)
-            connection.close()
-
-        def grant(connection: socket.socket) -> None:
-            publication, granted = clients[connection]
-            if publication is None or granted:
-                return
-            with self._lock:
-                if publication.error is not None or (
-                    closing and publication.pending
-                ):
-                    response = b"F"
-                elif publication.pending:
-                    # Producer fence not yet observed; retried on each control
-                    # notification until the publication completes or closes.
-                    return
-                else:
-                    response = b"G"
-            try:
-                connection.send(response)
-            except OSError:
-                remove(connection)
-            else:
-                if response == b"G":
-                    clients[connection] = publication, True
-                else:
-                    remove(connection)
-
-        try:
-            while not closing or clients:
-                for key, _events in selector.select():
-                    connection = key.fileobj
-                    if connection is self._control_rx:
-                        # Producer completion ("R") or endpoint close ("C"):
-                        # rescan every waiting reader against current state.
-                        self._control_rx.recv(4096)
-                        if self._closing and not closing:
-                            closing = True
-                            selector.unregister(self._listener)
-                            self._listener.close()
-                        for client in tuple(clients):
-                            if closing and clients[client][0] is None:
-                                remove(client)
-                            else:
-                                grant(client)
-                        continue
-                    if connection is self._listener:
-                        if closing:
-                            continue
-                        client, _address = self._listener.accept()
-                        client.setblocking(False)
-                        if len(clients) >= self._reader_capacity:
-                            try:
-                                client.send(b"E")
-                            except OSError:
-                                pass
-                            finally:
-                                client.close()
-                        else:
-                            clients[client] = None, False
-                            selector.register(client, selectors.EVENT_READ)
-                        continue
-                    assert isinstance(connection, socket.socket)
-                    if connection not in clients:
-                        continue
-                    publication, granted = clients[connection]
-                    try:
-                        # One packet is either the 64-byte key+digest request
-                        # or the 1-byte "A" release acknowledgement.
-                        packet = connection.recv(65)
-                    except BlockingIOError:
-                        continue
-                    except OSError:
-                        packet = b""
-                    if (
-                        publication is None
-                        and len(packet) == 64
-                        and not closing
-                    ):
-                        with self._lock:
-                            # The key selects the publication; the digest binds
-                            # the reader to its exact registered view.
-                            publication = self._publications.get(packet[:32])
-                            if (
-                                publication is not None
-                                and not publication.retired
-                                and publication.digest == packet[32:]
-                            ):
-                                publication.readers += 1
-                                clients[connection] = publication, False
-                            else:
-                                publication = None
-                        if publication is not None:
-                            grant(connection)
-                            continue
-                    elif publication is not None and granted and packet == b"A":
-                        # Reclaim before replying so an observed D includes the
-                        # producer's physical release and capacity accounting.
-                        with self._lock:
-                            publication.readers -= 1
-                            self._reclaim_locked(publication)
-                        clients[connection] = None, False
-                        try:
-                            connection.send(b"D")
-                        except OSError:
-                            pass
-                        remove(connection)
-                        continue
-                    if publication is None and packet:
-                        try:
-                            connection.send(b"E")
-                        except OSError:
-                            pass
-                    remove(connection)
-        except BaseException as error:
-            self._error = error
-        finally:
-            for connection in tuple(clients):
-                remove(connection)
-            self._listener.close()
-            selector.close()
