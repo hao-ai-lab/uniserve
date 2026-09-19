@@ -985,6 +985,7 @@ def test_media_capture_releases_capacity_after_its_completion_fence():
         video=video.Config(1, image.Config(2, 2)),
         frame_rate=1,
         audio_rate=8,
+        pin=True,
     )
     lease = ring.reserve("video")
     try:
