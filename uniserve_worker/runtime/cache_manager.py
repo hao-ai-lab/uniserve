@@ -635,8 +635,12 @@ class CacheManager:
         expected_base: BufferId | None,
         buffer: BufferId,
         transports: Mapping[str, Transport],
+        consumers: Sequence[int] = (),
     ) -> KvTransfer:
-        """Export a visible KV extent under its exact buffer identity."""
+        """Export a visible KV extent under its exact buffer identity.
+
+        `consumers` are the acknowledgment slots of the ranks that install it.
+        """
         installed = self._destination_bases.get((buffer.owner, destination))
         if installed is None:
             if expected_base is not None:
@@ -708,6 +712,7 @@ class CacheManager:
                             views,
                             retain=partial(self.retain_publication, source),
                             offset=(0, layer, self.info.kv_head_offset, 0),
+                            consumers=consumers,
                         )
                         locations.extend(exported)
                         locators.extend(exported)
@@ -749,6 +754,7 @@ class CacheManager:
                                 transports,
                                 views,
                                 retain=partial(self.retain_publication, source),
+                                consumers=consumers,
                                 offset=(
                                     0,
                                     field_index,

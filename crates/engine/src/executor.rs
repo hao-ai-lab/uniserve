@@ -624,6 +624,12 @@ impl FromStr for TransferBackend {
 }
 
 /// One explicit directed transfer edge between configured pool identities.
+///
+/// Products move by one device mechanism and one host mechanism, and a
+/// product's location decides which carries it: a device product travels on
+/// the edge's device mechanism, a host product on its host mechanism. An edge
+/// may name only one of the two, in which case products of the other
+/// location have no way across it and are refused where they are bound.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferEdge {
     /// Pool that produces the transferred product.
@@ -634,8 +640,22 @@ pub struct TransferEdge {
     pub destination_worker: WorkerId,
     /// One consumer member, or all members when omitted.
     pub destination_rank: Option<u32>,
-    /// Data-plane mechanism used for the edge.
-    pub transport: TransferBackend,
+    /// Mechanism carrying device products across this edge.
+    pub device: Option<TransferBackend>,
+    /// Mechanism carrying host products across this edge.
+    pub host: Option<TransferBackend>,
+}
+
+impl TransferEdge {
+    /// The mechanisms this edge carries products on, device first.
+    pub fn mechanisms(&self) -> impl Iterator<Item = TransferBackend> + '_ {
+        self.device.into_iter().chain(self.host)
+    }
+
+    /// Whether this edge carries products on `backend`.
+    pub fn carries(&self, backend: TransferBackend) -> bool {
+        self.device == Some(backend) || self.host == Some(backend)
+    }
 }
 
 /// Per-edge local data-plane transfer selection (`--transfer`).
@@ -661,11 +681,12 @@ pub struct TransferConfig {
 impl TransferConfig {
     /// Binds missing intra-Worker edges from the configured physical endpoints.
     ///
-    /// Each rank is a separate process. Its self-edge uses local storage; CUDA
-    /// peers use CUDA VMM, which reaches another host where both devices export
-    /// a fabric handle; a host-accessible pair on one host uses shared memory,
-    /// and one spanning hosts uses the rank channel, because a shared-memory
-    /// segment is named in one host's namespace. Explicit bindings take
+    /// Each rank is a separate process. Its self-edge uses local storage for
+    /// both locations. Between two ranks, device products move over CUDA VMM
+    /// where both hold a CUDA device, which reaches another host where both
+    /// devices export a fabric handle; host products move over shared memory
+    /// on one host and over the rank channel across hosts, because a
+    /// shared-memory segment is named in one host's namespace. Explicit bindings take
     /// precedence. Initialized endpoint and backend capabilities are validated
     /// before the executor accepts work, and an edge that would have to cross
     /// hosts without fabric handles is refused by name.
@@ -694,29 +715,32 @@ impl TransferConfig {
                     }) {
                         continue;
                     }
-                    let transport = if source_rank == destination_rank {
-                        TransferBackend::Local
-                    } else if source.device.starts_with("cuda:")
-                        && destination.device.starts_with("cuda:")
-                    {
+                    let (device, host) = if source_rank == destination_rank {
+                        (Some(TransferBackend::Local), Some(TransferBackend::Local))
+                    } else {
                         // A fabric handle reaches another host; where the
                         // devices export a process descriptor instead, the
                         // physical edge check refuses this edge by name.
-                        TransferBackend::CudaVmm
-                    } else if source.node == destination.node {
-                        TransferBackend::Shm
-                    } else {
+                        let device = (source.device.starts_with("cuda:")
+                            && destination.device.starts_with("cuda:"))
+                        .then_some(TransferBackend::CudaVmm);
                         // A shared-memory segment is named in one host's
                         // namespace, so a host product that leaves its host
                         // travels on the rank channel's data path.
-                        TransferBackend::Channel
+                        let host = if source.node == destination.node {
+                            TransferBackend::Shm
+                        } else {
+                            TransferBackend::Channel
+                        };
+                        (device, Some(host))
                     };
                     self.edges.push(TransferEdge {
                         source_worker: worker.id.clone(),
                         source_rank: Some(source_rank),
                         destination_worker: worker.id.clone(),
                         destination_rank: Some(destination_rank),
-                        transport,
+                        device,
+                        host,
                     });
                 }
             }
@@ -740,15 +764,15 @@ impl TransferConfig {
             if edge.source_worker.0 == worker
                 && edge.source_rank.is_none_or(|source| source == rank)
             {
-                backends.insert(edge.transport);
-                publications.insert(edge.transport);
+                backends.extend(edge.mechanisms());
+                publications.extend(edge.mechanisms());
             }
             if edge.destination_worker.0 == worker
                 && edge
                     .destination_rank
                     .is_none_or(|destination| destination == rank)
             {
-                backends.insert(edge.transport);
+                backends.extend(edge.mechanisms());
             }
         }
         if publications.is_empty() {
@@ -880,9 +904,17 @@ impl TransferConfig {
                     .flat_map(|publication| &mut publication.tensors),
             );
         for tensor in tensors {
+            // A product's location chose the mechanism it was published on,
+            // so a location is kept where the edge carries that mechanism for
+            // either location.
             tensor.locations.retain(|location| {
-                let selected = self
-                    .edges
+                let published = match &location.transport {
+                    TransferTransport::Local { .. } => TransferBackend::Local,
+                    TransferTransport::PosixShm { .. } => TransferBackend::Shm,
+                    TransferTransport::CudaVmm { .. } => TransferBackend::CudaVmm,
+                    TransferTransport::Channel { .. } => TransferBackend::Channel,
+                };
+                self.edges
                     .iter()
                     .find(|edge| {
                         edge.source_worker.0 == location.source.worker_id
@@ -894,23 +926,10 @@ impl TransferConfig {
                                 .destination_rank
                                 .is_none_or(|rank| rank == destination.rank)
                     })
-                    .map(|edge| edge.transport)
-                    .or_else(|| {
-                        (&location.source == destination).then_some(TransferBackend::Local)
-                    });
-                matches!(
-                    (selected, &location.transport),
-                    (
-                        Some(TransferBackend::Local),
-                        TransferTransport::Local { .. }
-                    ) | (
-                        Some(TransferBackend::Shm),
-                        TransferTransport::PosixShm { .. }
-                    ) | (
-                        Some(TransferBackend::CudaVmm),
-                        TransferTransport::CudaVmm { .. }
+                    .map_or_else(
+                        || &location.source == destination && published == TransferBackend::Local,
+                        |edge| edge.carries(published),
                     )
-                )
             });
             anyhow::ensure!(
                 !tensor.locations.is_empty(),
@@ -922,7 +941,11 @@ impl TransferConfig {
         Ok(())
     }
 
-    /// Parses `source[:rank]->destination[:rank]=backend` directed bindings.
+    /// Parses `source[:rank]->destination[:rank]=mechanisms` directed bindings.
+    ///
+    /// `mechanisms` names the edge's device mechanism, its host mechanism, or
+    /// both joined by `+` with the device mechanism first, as in
+    /// `cuda_vmm+shm`. `local` serves both locations.
     pub fn parse(s: &str) -> Result<Self, TransferConfigError> {
         let mut edges = Vec::new();
 
@@ -955,7 +978,7 @@ impl TransferConfig {
             })?;
             let (src, source_rank) = endpoint(src)?;
             let (dst, destination_rank) = endpoint(dst)?;
-            let backend = TransferBackend::from_str(backend.trim())?;
+            let (device, host) = Self::parse_mechanisms(backend.trim())?;
 
             if edges.iter().any(|existing: &TransferEdge| {
                 existing.source_worker == src
@@ -977,7 +1000,8 @@ impl TransferConfig {
                 source_rank,
                 destination_worker: dst,
                 destination_rank,
-                transport: backend,
+                device,
+                host,
             });
         }
 
@@ -986,6 +1010,40 @@ impl TransferConfig {
             worker_ranks: std::collections::BTreeMap::new(),
             worker_hosts: std::collections::BTreeMap::new(),
         })
+    }
+
+    /// Resolves an edge's mechanism text into its device and host mechanisms.
+    fn parse_mechanisms(
+        text: &str,
+    ) -> Result<(Option<TransferBackend>, Option<TransferBackend>), TransferConfigError> {
+        let backends = text
+            .split('+')
+            .map(|name| TransferBackend::from_str(name.trim()))
+            .collect::<Result<Vec<_>, _>>()?;
+        if backends.contains(&TransferBackend::Local) {
+            // Local storage serves both locations and combines with nothing.
+            if backends.len() > 1 {
+                return Err(TransferConfigError::message(format!(
+                    "transfer mechanisms {text:?} combine local with another mechanism"
+                )));
+            }
+            return Ok((Some(TransferBackend::Local), Some(TransferBackend::Local)));
+        }
+        let mut device = None;
+        let mut host = None;
+        for backend in backends {
+            let slot = match backend {
+                TransferBackend::CudaVmm => &mut device,
+                TransferBackend::Shm | TransferBackend::Channel => &mut host,
+                TransferBackend::Local => unreachable!("local mechanisms return above"),
+            };
+            if slot.replace(backend).is_some() {
+                return Err(TransferConfigError::message(format!(
+                    "transfer mechanisms {text:?} name two mechanisms for one location"
+                )));
+            }
+        }
+        Ok((device, host))
     }
 }
 
@@ -1132,14 +1190,16 @@ mod tests {
                     source_rank: Some(0),
                     destination_worker: WorkerId("decode".to_owned()),
                     destination_rank: None,
-                    transport: TransferBackend::CudaVmm,
+                    device: Some(TransferBackend::CudaVmm),
+                    host: Some(TransferBackend::Shm),
                 },
                 TransferEdge {
                     source_worker: WorkerId("encoder".to_owned()),
                     source_rank: Some(0),
                     destination_worker: WorkerId("encoder".to_owned()),
                     destination_rank: Some(0),
-                    transport: TransferBackend::Local,
+                    device: Some(TransferBackend::Local),
+                    host: Some(TransferBackend::Local),
                 },
             ],
             worker_ranks: std::collections::BTreeMap::new(),
@@ -1167,8 +1227,28 @@ mod tests {
         // Host products cross hosts on the rank channel, so the mechanism has
         // to be nameable in a placement's transfer bindings.
         let transfer = TransferConfig::parse("video_decoder->muxer=channel").unwrap();
-        assert_eq!(transfer.edges[0].transport, TransferBackend::Channel);
+        assert_eq!(transfer.edges[0].host, Some(TransferBackend::Channel));
+        assert_eq!(transfer.edges[0].device, None);
         assert_eq!(TransferBackend::Channel.as_str(), "channel");
+    }
+
+    #[test]
+    fn an_edge_names_a_device_mechanism_and_a_host_mechanism() {
+        // A product's location decides which mechanism carries it, so one
+        // edge binds both, and each location has at most one.
+        let both = TransferConfig::parse("decoder->muxer=cuda_vmm+shm").unwrap();
+        assert_eq!(both.edges[0].device, Some(TransferBackend::CudaVmm));
+        assert_eq!(both.edges[0].host, Some(TransferBackend::Shm));
+        assert!(both.edges[0].carries(TransferBackend::Shm));
+        assert!(!both.edges[0].carries(TransferBackend::Channel));
+
+        let local = TransferConfig::parse("decoder->decoder=local").unwrap();
+        assert_eq!(local.edges[0].device, Some(TransferBackend::Local));
+        assert_eq!(local.edges[0].host, Some(TransferBackend::Local));
+
+        assert!(TransferConfig::parse("a->b=shm+channel").is_err());
+        assert!(TransferConfig::parse("a->b=local+shm").is_err());
+        assert!(TransferConfig::parse("a->b=cuda_vmm+cuda_vmm").is_err());
     }
 
     #[test]
@@ -1181,10 +1261,11 @@ mod tests {
                 source_rank: None,
                 destination_worker: WorkerId("prefill".to_owned()),
                 destination_rank: None,
-                transport: TransferBackend::CudaVmm,
+                device: Some(TransferBackend::CudaVmm),
+                host: None,
             }
         );
-        assert_eq!(t.edges[1].transport, TransferBackend::Shm);
+        assert_eq!(t.edges[1].host, Some(TransferBackend::Shm));
         assert!(TransferConfig::parse("bad-entry").is_err());
         assert!(TransferConfig::parse("prefill->decode=tcp").is_err());
         assert!(TransferConfig::parse("prefill->decode=shm,prefill->decode=cuda_vmm").is_err());

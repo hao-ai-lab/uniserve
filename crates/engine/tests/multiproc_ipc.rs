@@ -3,10 +3,7 @@
 #![cfg(target_os = "linux")]
 
 use std::fs::{OpenOptions, remove_file};
-use std::io::Write as _;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -121,6 +118,7 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
         },
     };
     let encode = Call {
+        consumer_slots: Vec::new(),
         coordinates: CallCoordinates::default(),
         token_input: None,
 
@@ -456,6 +454,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             ..value.clone()
         };
         let publish = Call {
+            consumer_slots: Vec::new(),
             coordinates: CallCoordinates::default(),
             token_input: Some(value.clone()),
 
@@ -495,6 +494,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             ..publication.clone()
         };
         let consume = Call {
+            consumer_slots: Vec::new(),
             coordinates: CallCoordinates::default(),
             token_input: Some(publication.clone()),
 
@@ -772,6 +772,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
     // which the patch encoder's own entry does. Registration succeeds, then
     // the call reports its actual execution error without a product.
     let produce = Call {
+        consumer_slots: Vec::new(),
         coordinates: CallCoordinates::default(),
         token_input: None,
 
@@ -814,6 +815,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         ..value.clone()
     };
     let consume = Call {
+        consumer_slots: Vec::new(),
         coordinates: CallCoordinates::default(),
         token_input: None,
 
@@ -1287,6 +1289,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         generation: 2,
     };
     let call = Call {
+        consumer_slots: Vec::new(),
         coordinates: coordinates_after(&first.results[0].output),
         token_input: None,
 
@@ -1552,7 +1555,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         dtype: DType::U8,
         shape_bound: ShapeBound::default(),
     };
-    let mut publication = SlowShmPublication::start()?;
+    let publication = SlowShmPublication::start()?;
     slow.calls[0].predicate = Some(predicate.clone());
     slow.input_products.push(TensorPublication {
         product: predicate,
@@ -1618,6 +1621,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         ..input.clone()
     };
     let call = Call {
+        consumer_slots: Vec::new(),
         coordinates: CallCoordinates::default(),
         token_input: None,
 
@@ -1674,7 +1678,6 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     };
     assert_eq!(tensor.shape, vec![1]);
     assert_eq!(tensor.locations.len(), WORLD_SIZE);
-    publication.finish()?;
     executor.close()?;
     assert!(publication.path.is_file());
     Ok(())
@@ -1816,6 +1819,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         ..source.clone()
     };
     let publish = Call {
+        consumer_slots: Vec::new(),
         coordinates: coordinates_after(&produced.results[0].output),
         token_input: Some(source.clone()),
 
@@ -1860,6 +1864,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         ..publication.clone()
     };
     let transfer = Call {
+        consumer_slots: Vec::new(),
         coordinates: CallCoordinates::default(),
         token_input: Some(publication.clone()),
 
@@ -1911,6 +1916,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         },
     };
     let encode = Call {
+        consumer_slots: Vec::new(),
         coordinates: CallCoordinates::default(),
         token_input: None,
 
@@ -2028,6 +2034,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     // The retained product's separate lifetime survives request slot reuse.
     let next = text_admission(59, 1, 5)?;
     let retained = Call {
+        consumer_slots: Vec::new(),
         coordinates: CallCoordinates::default(),
         token_input: None,
         token_output: None,
@@ -2148,56 +2155,86 @@ impl Drop for PausedProcess {
     }
 }
 
+/// An external shared-memory publisher the test controls.
+///
+/// The segment carries what a consumer needs in its header: the digest of the
+/// locator that names it, and a readiness word the test writes after the
+/// payload. Until then a rank that reads it waits on that word.
 struct SlowShmPublication {
     name: String,
     endpoint: String,
     path: PathBuf,
     published: Arc<AtomicBool>,
-    stop_readers: Arc<AtomicBool>,
-    notify: UnixStream,
-    readers: Option<thread::JoinHandle<anyhow::Result<()>>>,
 }
+
+/// Byte layout of a shared-memory publication's header, as the worker's
+/// `transfer.segment` module lays it out.
+const SEGMENT_HEADER_BYTES: u64 = 512;
+const SEGMENT_STATE_OFFSET: u64 = 32;
+const SEGMENT_READY: u32 = 1;
 
 impl SlowShmPublication {
     fn start() -> anyhow::Result<Self> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let name = format!("uniserve-transfer-{}-{nonce}", std::process::id());
         let path = Path::new("/dev/shm").join(&name);
+        let endpoint = format!("{name}-readers");
+        let publication = Self {
+            name,
+            endpoint,
+            path,
+            published: Arc::new(AtomicBool::new(false)),
+        };
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
-            .open(&path)?;
-        file.set_len(1)?;
-        file.write_all_at(&[0], 0)?;
-        let endpoint = format!("{name}-readers");
-        let published = Arc::new(AtomicBool::new(false));
-        let stop_readers = Arc::new(AtomicBool::new(false));
-        let (notify, notifications) = UnixStream::pair()?;
-        let readers = start_shm_readers(
-            &endpoint,
-            Arc::clone(&published),
-            Arc::clone(&stop_readers),
-            notifications,
-        )?;
-        Ok(Self {
-            name,
-            endpoint,
-            path,
-            published,
-            stop_readers,
-            notify,
-            readers: Some(readers),
-        })
+            .open(&publication.path)?;
+        file.set_len(SEGMENT_HEADER_BYTES + 1)?;
+        // The header names the exact locator the rank will be handed, the way
+        // the worker's own publications do, so the rank accepts the segment.
+        file.write_all_at(&publication.digest()?, 0)?;
+        file.write_all_at(&[0], SEGMENT_HEADER_BYTES)?;
+        Ok(publication)
+    }
+
+    /// The digest the worker computes over a locator: SHA-256 of its
+    /// canonical JSON, keys sorted, no whitespace.
+    fn digest(&self) -> anyhow::Result<[u8; 32]> {
+        use sha2::Digest as _;
+
+        let canonical = format!(
+            concat!(
+                "{{\"device\":\"cpu\",\"dtype\":\"uint8\",\"endpoint\":\"{endpoint}\",",
+                "\"name\":\"{name}\",\"nbytes\":1,\"offset\":[0],\"shape\":[1],",
+                "\"source\":{{\"address_space\":\"{address_space}\",",
+                "\"incarnation\":\"{incarnation}\",\"node\":\"{node}\",\"rank\":0,",
+                "\"worker_id\":\"publisher\"}},\"transport\":\"posix_shm\"}}"
+            ),
+            endpoint = self.endpoint,
+            name = self.name,
+            address_space = self.address_space(),
+            incarnation = self.endpoint,
+            node = self.node()?,
+        );
+        Ok(sha2::Sha256::digest(canonical.as_bytes()).into())
+    }
+
+    fn address_space(&self) -> String {
+        format!("rust:{}", std::process::id())
+    }
+
+    fn node(&self) -> anyhow::Result<String> {
+        Ok(std::fs::read_to_string("/etc/hostname")?.trim().to_owned())
     }
 
     fn publish(&self) -> anyhow::Result<()> {
-        OpenOptions::new()
-            .write(true)
-            .open(&self.path)?
-            .write_all_at(&[1], 0)?;
+        let file = OpenOptions::new().write(true).open(&self.path)?;
+        // The payload lands before the readiness word; each write is a system
+        // call, which orders them for a reader on another core.
+        file.write_all_at(&[1], SEGMENT_HEADER_BYTES)?;
+        file.write_all_at(&SEGMENT_READY.to_ne_bytes(), SEGMENT_STATE_OFFSET)?;
         self.published.store(true, Ordering::Release);
-        (&self.notify).write_all(b"R")?;
         Ok(())
     }
 
@@ -2212,8 +2249,8 @@ impl SlowShmPublication {
                     source: uniserve_worker_ipc::WorkerEndpoint {
                         worker_id: "publisher".into(),
                         rank: 0,
-                        node: std::fs::read_to_string("/etc/hostname")?.trim().into(),
-                        address_space: format!("rust:{}", std::process::id()),
+                        node: self.node()?,
+                        address_space: self.address_space(),
                         incarnation: self.endpoint.clone(),
                     },
                     transport: TransferTransport::PosixShm {
@@ -2229,24 +2266,10 @@ impl SlowShmPublication {
             },
         })
     }
-
-    fn finish(&mut self) -> anyhow::Result<()> {
-        self.stop_readers.store(true, Ordering::Release);
-        (&self.notify).write_all(b"C")?;
-        if let Some(readers) = self.readers.take() {
-            readers
-                .join()
-                .map_err(|_| anyhow::anyhow!("shared-memory reader endpoint panicked"))??;
-        }
-        Ok(())
-    }
 }
 
 impl Drop for SlowShmPublication {
     fn drop(&mut self) {
-        if self.readers.is_some() {
-            let _ = self.finish();
-        }
         let _ = remove_file(&self.path);
     }
 }
@@ -2475,6 +2498,7 @@ fn token_batch(
         shape_bound: ShapeBound::default(),
     };
     let call = Call {
+        consumer_slots: Vec::new(),
         // These requests hold no cached prefix and no image positions, so the
         // logical sequence and the initialized cache advance together.
         coordinates: CallCoordinates {
@@ -2547,173 +2571,6 @@ fn command_batch(batch_id: u64, command: BatchCommand) -> Batch {
     Batch::new(batch_id, Vec::new(), Vec::new()).with_commands(vec![command])
 }
 
-fn start_shm_readers(
-    endpoint: &str,
-    published: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
-    notifications: UnixStream,
-) -> anyhow::Result<thread::JoinHandle<anyhow::Result<()>>> {
-    let descriptor = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            0,
-        )
-    };
-    anyhow::ensure!(
-        descriptor >= 0,
-        "failed to create shared-memory reader socket"
-    );
-    let listener = unsafe { OwnedFd::from_raw_fd(descriptor) };
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    anyhow::ensure!(
-        endpoint.len() + 1 < address.sun_path.len(),
-        "reader endpoint is too long"
-    );
-    for (target, byte) in address.sun_path[1..].iter_mut().zip(endpoint.bytes()) {
-        *target = byte as libc::c_char;
-    }
-    let address_length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + endpoint.len();
-    let bound = unsafe {
-        libc::bind(
-            listener.as_raw_fd(),
-            (&raw const address).cast(),
-            address_length as libc::socklen_t,
-        )
-    };
-    anyhow::ensure!(
-        bound == 0,
-        "failed to bind reader endpoint: {}",
-        std::io::Error::last_os_error()
-    );
-    anyhow::ensure!(
-        unsafe { libc::listen(listener.as_raw_fd(), 8) } == 0,
-        "failed to listen for readers"
-    );
-    Ok(thread::spawn(move || {
-        let mut readers: Vec<(OwnedFd, bool, bool)> = Vec::new();
-        let send = |reader: &OwnedFd, response: u8| -> anyhow::Result<()> {
-            anyhow::ensure!(
-                unsafe {
-                    libc::send(
-                        reader.as_raw_fd(),
-                        (&raw const response).cast(),
-                        1,
-                        libc::MSG_NOSIGNAL,
-                    )
-                } == 1,
-                "reader endpoint response failed"
-            );
-            Ok(())
-        };
-        while !stop.load(Ordering::Acquire) {
-            let mut descriptors = vec![
-                libc::pollfd {
-                    fd: listener.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: notifications.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-            ];
-            descriptors.extend(readers.iter().map(|(reader, _, _)| libc::pollfd {
-                fd: reader.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            }));
-            let polled = unsafe {
-                libc::poll(
-                    descriptors.as_mut_ptr(),
-                    descriptors.len() as libc::nfds_t,
-                    -1,
-                )
-            };
-            anyhow::ensure!(polled >= 0, "reader endpoint poll failed");
-            if descriptors[1].revents != 0 {
-                let mut messages = [0_u8; 64];
-                let count = unsafe {
-                    libc::recv(
-                        notifications.as_raw_fd(),
-                        messages.as_mut_ptr().cast(),
-                        messages.len(),
-                        0,
-                    )
-                };
-                anyhow::ensure!(count > 0, "publication notification endpoint closed");
-                if stop.load(Ordering::Acquire) {
-                    break;
-                }
-                if published.load(Ordering::Acquire) {
-                    for (reader, requested, granted) in &mut readers {
-                        if *requested && !*granted {
-                            send(reader, b'G')?;
-                            *granted = true;
-                        }
-                    }
-                }
-            }
-            for index in (2..descriptors.len()).rev() {
-                if descriptors[index].revents == 0 {
-                    continue;
-                }
-                let (reader, requested, granted) = &mut readers[index - 2];
-                let mut packet = [0_u8; 65];
-                let received = unsafe {
-                    libc::recv(
-                        reader.as_raw_fd(),
-                        packet.as_mut_ptr().cast(),
-                        packet.len(),
-                        0,
-                    )
-                };
-                if received == 0 {
-                    readers.remove(index - 2);
-                    continue;
-                }
-                anyhow::ensure!(received > 0, "reader endpoint receive failed");
-                if *granted {
-                    anyhow::ensure!(
-                        received == 1 && packet[0] == b'A',
-                        "reader did not acknowledge completion"
-                    );
-                    send(reader, b'D')?;
-                    readers.remove(index - 2);
-                } else {
-                    anyhow::ensure!(
-                        !*requested && received == 64,
-                        "reader grant has invalid identity length"
-                    );
-                    *requested = true;
-                    if published.load(Ordering::Acquire) {
-                        send(reader, b'G')?;
-                        *granted = true;
-                    }
-                }
-            }
-            if descriptors[0].revents != 0 {
-                let client = unsafe {
-                    libc::accept4(
-                        listener.as_raw_fd(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-                    )
-                };
-                anyhow::ensure!(client >= 0, "reader endpoint accept failed");
-                readers.push((unsafe { OwnedFd::from_raw_fd(client) }, false, false));
-            }
-        }
-        Ok(())
-    }))
-}
-
-/// The engine owns exactly the ranks placed on its own host. A placement may
-/// name that host explicitly instead of relying on a reserved local name, and a
-/// rank placed anywhere else is refused by name rather than launched here.
 #[test]
 fn placement_binds_ranks_to_the_engine_host_by_name() {
     let named = WorkerConfig::placed(

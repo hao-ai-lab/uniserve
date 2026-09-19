@@ -863,14 +863,20 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
         events.close()
 
 
-def test_failed_latent_publication_retains_its_pages_without_poisoning_other_requests(  # noqa: E501
+def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_other_requests(  # noqa: E501
     latent_output,
 ) -> None:
-    import hashlib
-    import json
-    import socket
+    """A retired publication holds its pages until its consumer acknowledges.
+
+    The consumer named on the publication has not written its word, so the
+    pages stay owned and the request is not retirement-ready, while an
+    independent request proceeds. Once the word lands, the next sweep returns
+    the pages.
+    """
     from contextlib import suppress
-    from multiprocessing import shared_memory
+
+    from uniserve_worker.transfer import segment
+    from uniserve_worker.transfer.tickets import _open_shared_memory
 
     events = EventPool()
     transport = make_transport(
@@ -898,35 +904,20 @@ def test_failed_latent_publication_retains_its_pages_without_poisoning_other_req
     source = pool.reserve_publication(
         product, request_pool_idx=1, page_table=(1,), latent_units=4
     )
-    locator = transport.publish(source.spans[0])
+    locator = transport.publish(source.spans[0], consumers=(1,))
     retirement = transport.publication_retirement(locator)
     pool.retain_publication(source, retirement)
     commit = latent_output(1, (1,), 4, 16, 64)
     pool.validate_updates((commit,))
     pool.apply_updates((commit,))
     try:
-        descriptor = locator.to_mapping()
-        digest = hashlib.sha256(
-            json.dumps(
-                descriptor, sort_keys=True, separators=(",", ":")
-            ).encode()
-        ).digest()
-        key = hashlib.sha256(descriptor["name"].encode()).digest()
-        failed = Event()
-        retirement.add_done_callback(lambda _future: failed.set())
-        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as reader:
-            reader.settimeout(5)
-            reader.connect("\0" + descriptor["endpoint"])
-            reader.sendall(key + digest)
-            assert reader.recv(1) == b"G"
-            # Lost acknowledgement cannot prove physical completion.
-        assert failed.wait(5)
-        with pytest.raises(WorkerError, match="without physical completion"):
-            retirement.result()
         transport.release(locator)
         pool.release_buffers((product.buffer_id,))
-        with pytest.raises(WorkerError, match="without physical completion"):
-            pool.retirement_ready((product.request_key,))
+        transport.reap()
+        assert not retirement.done(), (
+            "publication retired before its consumer acknowledged"
+        )
+        assert not pool.retirement_ready((product.request_key,))
         pool.release_slots((1,))
         with pytest.raises(WorkerError, match="owned"):
             pool.reserve_import(
@@ -957,18 +948,27 @@ def test_failed_latent_publication_retains_its_pages_without_poisoning_other_req
             atol=0,
         )
         assert pool.retirement_ready((RequestKey(1, 2, 1),))
+
+        # The consumer writes its word; the producer's next sweep returns the
+        # segment and with it the pages.
+        storage = _open_shared_memory(
+            locator.transport.name, segment.HEADER_BYTES + locator.nbytes
+        )
+        try:
+            header = memoryview(storage)
+            segment.acknowledge(header, 1)
+            header.release()
+        finally:
+            storage.close()
+        transport.reap()
+        retirement.result(timeout=5)
+        assert pool.retirement_ready((product.request_key,))
     finally:
         with suppress(WorkerError):
             transport.close()
         with suppress(WorkerError):
             pool.close()
         events.close()
-        # Both sides of this host-only test have stopped. Remove the retained
-        # external segment without treating it as an acknowledged publication.
-        with suppress(FileNotFoundError):
-            segment = shared_memory.SharedMemory(name=locator.transport.name)
-            segment.close()
-            segment.unlink()
 
 
 @pytest.mark.gpu

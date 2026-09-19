@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import socket
-import uuid
 from multiprocessing import shared_memory
 
 from uniserve_worker.protocol.transfer import (
@@ -11,33 +9,38 @@ from uniserve_worker.protocol.transfer import (
     PosixShmTransfer,
     WorkerEndpoint,
 )
+from uniserve_worker.transfer import segment
+from uniserve_worker.transfer.endpoint import locator_digest
 
 
 def serve_pending_publication(channel, shape=(1024,)) -> None:
-    """Exit on command before permitting a registered reader to access bytes."""
-    storage = shared_memory.SharedMemory(create=True, size=4096)
-    endpoint = f"uniserve-test-pending-{uuid.uuid4().hex}"
+    """Publish a segment that never becomes ready, then fail it on command.
+
+    The segment carries the header a consumer reads: the locator's digest and
+    a readiness word left pending. On "exit" the producer marks the
+    publication failed and unlinks the segment, which is what a consumer of a
+    failing producer observes.
+    """
+    nbytes = 4096
+    storage = shared_memory.SharedMemory(
+        create=True, size=segment.HEADER_BYTES + nbytes
+    )
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
-            listener.bind("\0" + endpoint)
-            listener.listen(1)
-            locator = Locator(
-                source=WorkerEndpoint.local("publisher"),
-                transport=PosixShmTransfer(
-                    endpoint=endpoint, name=storage.name
-                ),
-                nbytes=4096,
-                dtype="float32",
-                shape=shape,
-                offset=(0,) * len(shape),
-                device="cpu",
-            )
-            channel.send(locator.to_mapping())
-            connection, _address = listener.accept()
-            with connection:
-                assert len(connection.recv(128)) == 64
-                channel.send("pending")
-                assert channel.recv() == "exit"
+        locator = Locator(
+            source=WorkerEndpoint.local("publisher"),
+            transport=PosixShmTransfer(
+                endpoint="uniserve-test-pending", name=storage.name
+            ),
+            nbytes=nbytes,
+            dtype="float32",
+            shape=shape,
+            offset=(0,) * len(shape),
+            device="cpu",
+        )
+        segment.initialize(storage.buf, locator_digest(locator))
+        channel.send(locator.to_mapping())
+        assert channel.recv() == "exit"
+        segment.set_state(storage.buf, segment.FAILED)
     finally:
         storage.close()
         storage.unlink()

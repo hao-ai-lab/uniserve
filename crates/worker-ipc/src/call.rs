@@ -418,6 +418,14 @@ pub struct Call {
     pub inputs: Vec<TensorRef>,
     /// Outputs allocated to this producer.
     pub outputs: Vec<TensorRef>,
+    /// Acknowledgment slots of the ranks that read this call's products.
+    ///
+    /// A producing rank cannot name its readers: it knows its own component,
+    /// not which component consumes what it publishes, and a product is read
+    /// in a later batch than the one producing it. The head states them, and
+    /// a published product retires once each has acknowledged it. The
+    /// executing rank's own slot is never listed.
+    pub consumer_slots: Vec<u32>,
     /// Source token scalar transported between computation entries.
     pub token_input: Option<TensorRef>,
     /// Sampled token and continuation bit in one I64 scalar.

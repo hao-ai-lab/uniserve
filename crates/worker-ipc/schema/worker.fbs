@@ -250,6 +250,7 @@ table Call {
   input_image:string;
   kv_input:BufferId;
   kv_output:BufferId;
+  consumer_slots:[uint];
 }
 
 table BlockTable {

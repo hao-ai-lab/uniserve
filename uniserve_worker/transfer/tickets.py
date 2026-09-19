@@ -45,7 +45,8 @@ from ..protocol.transfer import (
     PosixShmTransfer,
     WorkerEndpoint,
 )
-from .endpoint import PublicationEndpoint, finish_reader, open_reader
+from . import segment
+from .endpoint import Publications, locator_digest
 from .layout import region_view, validate_destination
 from .vmm_pool import ACK_WORD_BYTES, PoolChunk, PoolExhaustedError, VmmPool
 
@@ -214,12 +215,19 @@ class Transport(ABC):
         tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
         offset: tuple[int, ...] | None = None,
+        consumers: Sequence[int] = (),
     ) -> Locator:
         """Expose a descriptor and producer fence for an immutable version.
 
         The allocation owner must retain the published range, without writes,
         until publication_retirement() completes after release(). Keeping a
         tensor reference does not authorize reuse of an arena or page range.
+
+        `consumers` are the acknowledgment slots of the ranks that read this
+        publication, as the head stated them on the producing call. A
+        mechanism that holds storage another process reads returns it once
+        each has acknowledged; a mechanism whose consumers are in this process
+        or hold their own copy has nothing to wait for and ignores them.
         """
 
     @abstractmethod
@@ -261,6 +269,14 @@ class Transport(ABC):
         which reaches the producer with no local notification. A transport
         whose publications retire with their own producer has nothing to sweep.
         """
+
+    def awaiting_acknowledgment(self) -> bool:
+        """Report whether a retired publication still waits on a consumer.
+
+        An acknowledgment arrives with no notification, so a producer with one
+        outstanding sweeps on a short period rather than on its next event.
+        """
+        return False
 
     @abstractmethod
     def close(self) -> None:
@@ -558,9 +574,13 @@ _SHM_LIBC.shm_open.restype = ctypes.c_int
 
 
 def _open_shared_memory(name: str, size: int) -> mmap.mmap:
-    """Open an existing shared-memory segment and validate its declared size."""
+    """Open an existing shared-memory segment.
+
+    The mapping is writable, because a consumer writes its own acknowledgment
+    word in the segment's header once it has copied the payload out.
+    """
     canonical_name = name if name.startswith("/") else f"/{name}"
-    descriptor = _SHM_LIBC.shm_open(canonical_name.encode(), os.O_RDONLY)
+    descriptor = _SHM_LIBC.shm_open(canonical_name.encode(), os.O_RDWR)
     if descriptor < 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error), canonical_name)
@@ -569,7 +589,7 @@ def _open_shared_memory(name: str, size: int) -> mmap.mmap:
             descriptor,
             int(size),
             flags=mmap.MAP_SHARED,
-            prot=mmap.PROT_READ,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
         )
     finally:
         os.close(descriptor)
@@ -875,8 +895,9 @@ class LocalTransport(Transport):
         tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
         offset: tuple[int, ...] | None = None,
-        # Storage that never leaves this host retires with its readers'
-        # connections, so the acknowledgment count does not apply.
+        # Storage read in its own process retires with its readers here;
+        # the consumers the head names never read it through this mechanism.
+        consumers: Sequence[int] = (),
     ) -> Locator:
         """Register a detached tensor in the in-process endpoint table.
 
@@ -1111,16 +1132,29 @@ class LocalTransport(Transport):
 
 @dataclass(slots=True)
 class _ShmSource:
-    """Own a shared allocation and any unfinished device-to-host publication."""
+    """Own a shared segment and any unfinished device-to-host publication.
+
+    The segment begins with the header of ``segment``: the publication's
+    digest, its readiness word and one acknowledgment word per instance rank.
+    ``consumers`` are the slots whose words return the segment.
+    """
 
     shm: Any
     nbytes: int
+    consumers: tuple[int, ...]
     host: torch.Tensor | tuple[torch.Tensor, ...] | None = None
     signal: Any = None
 
 
 class ShmTransport(Transport):
-    """Shared-memory publication with producer readiness and reader grants."""
+    """Shared-memory publication whose segment carries its own readiness.
+
+    A consumer opens the segment by name, checks the digest in its header
+    against the locator, waits on the readiness word and writes its own
+    acknowledgment word once it has copied the payload out. The producer
+    unlinks the segment once every named consumer has acknowledged, so a
+    read needs no connection to the producing rank.
+    """
 
     name = "shm"
 
@@ -1130,14 +1164,17 @@ class ShmTransport(Transport):
         capacity: TransferCapacity,
         event_pool: EventPool,
         source: WorkerEndpoint | None = None,
+        acknowledgment_slot: int = 0,
     ) -> None:
         self._bytes = capacity
-        self._publications = PublicationEndpoint[_ShmSource](
-            reader_capacity=capacity.ticket_capacity,
-            publication_capacity=256,
+        self._publications = Publications[_ShmSource](
+            capacity=256,
             reclaim=self._reclaim,
             drain=lambda source: None,
+            acknowledged=self._acknowledged,
         )
+        # This rank's own word in the header of every segment it reads.
+        self._acknowledgment_slot = int(acknowledgment_slot)
         self.source = source or WorkerEndpoint.local()
         self._publication_queue: queue.Queue[
             tuple[Locator, _ShmSource] | None
@@ -1184,6 +1221,19 @@ class ShmTransport(Transport):
             pass
         self._bytes.release(source.nbytes)
         retirement.set_result(None)
+
+    @staticmethod
+    def _acknowledged(source: _ShmSource) -> bool:
+        """Report whether every named consumer has written its word."""
+        if not source.consumers:
+            return True
+        return segment.acknowledged(source.shm.buf, source.consumers)
+
+    def reap(self) -> None:
+        self._publications.reap()
+
+    def awaiting_acknowledgment(self) -> bool:
+        return self._publications.awaiting_acknowledgment()
 
     def _queue_publication(
         self, item: tuple[Locator, _ShmSource] | None
@@ -1243,11 +1293,21 @@ class ShmTransport(Transport):
                         try:
                             assert source.host is not None
                             raw = source.host.view(torch.uint8).reshape(-1)
-                            source.shm.buf[: source.nbytes] = bytes(raw.numpy())
+                            payload = segment.HEADER_BYTES
+                            source.shm.buf[
+                                payload : payload + source.nbytes
+                            ] = bytes(raw.numpy())
                         except BaseException as error:
                             failure = error
                         source.host = None
                         source.signal = None
+                    # The readiness word is written after the payload, with
+                    # release ordering, so a consumer that sees it sees the
+                    # bytes it announces.
+                    segment.set_state(
+                        source.shm.buf,
+                        segment.READY if failure is None else segment.FAILED,
+                    )
                     self._publications.complete(
                         locator,
                         error=failure,
@@ -1263,27 +1323,45 @@ class ShmTransport(Transport):
         tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
         offset: tuple[int, ...] | None = None,
-        # Storage that never leaves this host retires with its readers'
-        # connections, so the acknowledgment count does not apply.
+        consumers: Sequence[int] = (),
     ) -> Locator:
-        """Register source storage before exposing its readiness descriptor."""
+        """Publish into a segment whose header carries its readiness."""
         import torch
 
         source, shape, offset = _publication_views(tensor, offset)
         first = source[0] if isinstance(source, tuple) else source
         nbytes = _nbytes(source)
+        # Capacity acknowledged since the last sweep is reclaimed first.
+        self._publications.reap()
         self._bytes.acquire(nbytes)
 
         shm = None
         registered = False
         submitted = False
         try:
-            shm = allocate_shared_memory(max(1, nbytes))
+            shm = allocate_shared_memory(segment.HEADER_BYTES + max(1, nbytes))
             buffer = shm.buf
             if buffer is None:
                 raise RuntimeError(
                     "shared-memory publication has no writable buffer"
                 )
+            locator = Locator(
+                source=self.source,
+                transport=PosixShmTransfer(
+                    endpoint=self.endpoint(),
+                    name=shm.name,
+                ),
+                nbytes=nbytes,
+                dtype=_dtype_to_str(first.dtype),
+                shape=shape,
+                offset=offset,
+                device=str(first.device),
+            )
+            # The header names the exact view this segment holds, so a
+            # consumer holding a locator for another view refuses it without
+            # asking this rank.
+            segment.initialize(buffer, locator_digest(locator))
+            payload = buffer[segment.HEADER_BYTES :]
 
             if first.is_cuda:
                 # Device bytes move through a pinned staging buffer; the
@@ -1297,25 +1375,21 @@ class ShmTransport(Transport):
             else:
                 host = None
                 signal = None
-                packed = torch.frombuffer(buffer, dtype=first.dtype).reshape(
+                packed = torch.frombuffer(payload, dtype=first.dtype).reshape(
                     shape
                 )
                 for target, value in _copy_pairs(source, packed):
                     target.copy_(value)
                 del packed, target, value
+                segment.set_state(buffer, segment.READY)
+            del payload
 
-            publication = _ShmSource(shm, nbytes, host, signal)
-            locator = Locator(
-                source=self.source,
-                transport=PosixShmTransfer(
-                    endpoint=self.endpoint(),
-                    name=shm.name,
-                ),
-                nbytes=nbytes,
-                dtype=_dtype_to_str(first.dtype),
-                shape=shape,
-                offset=offset,
-                device=str(first.device),
+            publication = _ShmSource(
+                shm,
+                nbytes,
+                tuple(int(slot) for slot in consumers),
+                host,
+                signal,
             )
             self._publications.publish(
                 locator, publication, pending=first.is_cuda
@@ -1343,6 +1417,7 @@ class ShmTransport(Transport):
                     # establish completion on this exceptional publication path.
                     torch.cuda.current_stream(first.device).synchronize()
                 if first.is_cuda:
+                    segment.set_state(buffer, segment.FAILED)
                     self._publications.complete(locator)
             else:
                 if shm is not None:
@@ -1359,9 +1434,10 @@ class ShmTransport(Transport):
         destination: torch.Tensor | tuple[torch.Tensor, ...] | None,
         region: tuple[slice, ...] | None,
     ) -> None:
-        """Hold host bytes through source retirement.
+        """Copy the payload out of the segment, then acknowledge it.
 
-        The bytes are held through asynchronous destination copying as well.
+        The copy holds the segment only while it runs; the bytes are held
+        through the (possibly asynchronous) destination copy in this process.
         """
         import torch
 
@@ -1370,32 +1446,37 @@ class ShmTransport(Transport):
             raise invalid_descriptor(
                 "shared-memory read requires a shared-memory locator"
             )
-        connection = open_reader(locator)
-        failure: BaseException | None = None
         try:
             ticket._require_active()
-            # Copy the bytes out of the segment up front so the reader grant
-            # can be returned before the (possibly asynchronous) destination
-            # copy; the grant only needs to cover access to the segment.
-            shm = _open_shared_memory(handle.name, locator.nbytes)
             try:
-                buf = bytearray(shm[: locator.nbytes])
+                shm = _open_shared_memory(
+                    handle.name, segment.HEADER_BYTES + locator.nbytes
+                )
+            except FileNotFoundError:
+                raise invalid_descriptor(
+                    "publication is retired, invalid, or belongs to another "
+                    "view"
+                ) from None
+            try:
+                header = memoryview(shm)
+                if segment.digest(header) != locator_digest(locator):
+                    raise invalid_descriptor(
+                        "publication is retired, invalid, or belongs to "
+                        "another view"
+                    )
+                segment.await_ready(header, check=ticket._require_active)
+                payload = segment.HEADER_BYTES
+                buf = bytearray(shm[payload : payload + locator.nbytes])
+                # The word is written after the copy above, with release
+                # ordering, so the producer reclaims nothing this rank still
+                # reads.
+                segment.acknowledge(header, self._acknowledgment_slot)
             finally:
+                header.release()
                 shm.close()
         except BaseException as error:
-            failure = error
             ticket._fail(error)
             raise
-        finally:
-            try:
-                try:
-                    finish_reader(connection)
-                except BaseException as cleanup_error:
-                    if failure is not None:
-                        raise failure from cleanup_error
-                    raise
-            finally:
-                connection.close()
         source = torch.frombuffer(
             buf, dtype=_dtype_from_str(locator.dtype)
         ).reshape(locator.shape)
@@ -1562,6 +1643,9 @@ class ChannelTransport(Transport):
         tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
         offset: tuple[int, ...] | None = None,
+        # The head holds the bytes for its consumers and releases them with
+        # the buffer, so nothing here waits for an acknowledgment.
+        consumers: Sequence[int] = (),
     ) -> Locator:
         """Copy the product into a locator that carries it."""
         import torch
@@ -1713,7 +1797,13 @@ class ChannelTransport(Transport):
 
 
 class CudaVmmTransport(Transport):
-    """CUDA mapping and asynchronous copies protected by reader grants."""
+    """Device publications a consumer imports by their shareable handle.
+
+    A consumer maps the producer's allocation from the handle the locator
+    carries and, for a pool chunk, writes its acknowledgment word in the
+    chunk's header once its copies retire. Nothing connects back to the
+    producing rank, which is what lets a device product cross hosts.
+    """
 
     name = "cuda_vmm"
 
@@ -1723,7 +1813,6 @@ class CudaVmmTransport(Transport):
         capacity: TransferCapacity,
         event_pool: EventPool,
         source: WorkerEndpoint | None = None,
-        consumers: Sequence[int] = (),
         acknowledgment_slot: int = 0,
         cross_host_consumers: bool = False,
     ) -> None:
@@ -1747,10 +1836,6 @@ class CudaVmmTransport(Transport):
         # publishes from. The pool is bounded by this rank's transfer byte
         # budget, which is what that budget already governs.
         self._pools: dict[str, VmmPool] = {}
-        # Every product of this rank reaches the same destinations, which the
-        # head derived from the transfer edges, so the consumers are this
-        # rank's rather than each product's.
-        self._consumers = tuple(int(slot) for slot in consumers)
         # This rank's own word in every chunk header it reads.
         self._acknowledgment_slot = int(acknowledgment_slot)
         # Whether a publication has to state readiness without an interprocess
@@ -1769,11 +1854,14 @@ class CudaVmmTransport(Transport):
         # Publications whose fence has drained but whose consumers have not all
         # acknowledged. Their chunks are held until reap() finds them settled.
         self._unacknowledged: list[_CudaSource] = []
-        self._publications = PublicationEndpoint[_CudaSource](
-            reader_capacity=capacity.ticket_capacity,
-            publication_capacity=256,
+        # A source is released when its own fence drains: a pool publication
+        # was copied into its chunk, and the chunk is what waits for the
+        # consumers, swept separately in reap().
+        self._publications = Publications[_CudaSource](
+            capacity=256,
             reclaim=self._reclaim,
             drain=self._drain,
+            acknowledged=lambda source: True,
         )
         self._reads = _BoundedTransferPool(
             workers=2,
@@ -1854,6 +1942,9 @@ class CudaVmmTransport(Transport):
                 waiting.append(source)
         self._unacknowledged = waiting
 
+    def awaiting_acknowledgment(self) -> bool:
+        return bool(self._unacknowledged)
+
     def _drain(self, source: _CudaSource) -> None:
         source.event.synchronize()
         self._events.reap()
@@ -1872,13 +1963,17 @@ class CudaVmmTransport(Transport):
         tensor: torch.Tensor | tuple[torch.Tensor, ...],
         *,
         offset: tuple[int, ...] | None = None,
+        consumers: Sequence[int] = (),
     ) -> Locator:
         """Export an immutable source and retain capacity.
 
-        Capacity is retained until its producer fence retires.
+        Capacity is retained until its producer fence retires. A product that
+        can neither be exported where it lies nor fit its device's pool raises
+        `PoolExhaustedError`, and the caller publishes it as bytes over the
+        host mechanism instead.
         """
         import torch
-        from uniserve_kernel.peer_memory import empty, export_handle
+        from uniserve_kernel.peer_memory import export_handle
 
         source, shape, offset = _publication_views(tensor, offset)
         spans = source if isinstance(source, tuple) else (source,)
@@ -1925,17 +2020,19 @@ class CudaVmmTransport(Transport):
                 # whose one handle a consumer imports once however many
                 # products it reads from that device. Only the publication's
                 # logical spans are materialized, never an enclosing allocator
-                # segment.
+                # segment. A product the pool cannot hold is the caller's to
+                # publish over the host mechanism; the pool reports the
+                # exhaustion once.
                 pool = self._pool(first.device)
                 try:
                     chunk = pool.reserve(_nbytes(tensor))
                 except PoolExhaustedError:
-                    # A product the pool cannot hold keeps its own allocation
-                    # rather than failing the publication.
-                    pass
+                    self._bytes.release(nbytes)
+                    raise
             if exported is not None:
                 descriptor, storage_size, storage_offset = exported
-            elif chunk is not None:
+            else:
+                assert chunk is not None
                 shared = chunk.storage.view(first.dtype).view(shape)
                 for target, value in _copy_pairs(source, shared):
                     target.copy_(value, non_blocking=True)
@@ -1948,20 +2045,6 @@ class CudaVmmTransport(Transport):
                 # A consumer reads the payload, which follows the chunk's
                 # acknowledgment words, so the offset names the payload.
                 storage_offset = chunk.payload_offset
-            else:
-                # A product too large for the pool takes its own exportable
-                # allocation, as every product did before the pool existed.
-                shared = empty(shape, dtype=first.dtype, device=first.device)
-                for target, value in _copy_pairs(source, shared):
-                    target.copy_(value, non_blocking=True)
-                copied_source = source
-                source = shared
-                spans = (shared,)
-                first = shared
-                exported = export_handle(first)
-                if exported is None:
-                    raise RuntimeError("shared allocation cannot be exported")
-                descriptor, storage_size, storage_offset = exported
             # A publication hands its consumers an event wherever one can
             # reach them, which is every consumer on this host. A consumer
             # elsewhere can wait on nothing this rank records: an event handle
@@ -1986,10 +2069,10 @@ class CudaVmmTransport(Transport):
             )
             self._events.retain(event, first.device)
             self._events.record(event, first.device)
-            # The chunk returns to its pool once every rank the head named has
-            # written its acknowledgment, which a consumer on another host can
-            # do and a reader grant could not carry.
-            readers = self._consumers
+            # The chunk returns to its pool once every rank the head named as
+            # a reader of this call's products has written its acknowledgment,
+            # which a consumer on another host can do as well as one here.
+            readers = tuple(int(slot) for slot in consumers)
             publication = _CudaSource(
                 source,
                 event,
@@ -2120,28 +2203,15 @@ class CudaVmmTransport(Transport):
 
         handle = locator.transport
         assert isinstance(handle, CudaVmmTransfer)
-        # A grant is a connection to an abstract-namespace Unix socket, so it
-        # exists only on the producing rank's host and a consumer elsewhere
-        # cannot acquire one. This is not a choice between mechanisms: the
-        # producer is either reachable that way or it is not.
-        #
-        # Where it is, the grant is taken, because it is what checks that this
-        # locator names a publication the producer still holds — a check no
-        # consumer can make locally. Where it is not, the locator is the
-        # engine's word: the engine binds only locators the producing rank
-        # reported to it, and frees a product's buffer only once the batch
-        # consuming it has completed.
-        connection = (
-            open_reader(locator)
-            if locator.source.node == self.source.node
-            else None
-        )
+        # No consumer can check that a locator still names a publication the
+        # producer holds; the locator is the engine's word. The engine binds
+        # only locators the producing rank reported to it, and frees a
+        # product's buffer only once the batch consuming it has completed.
         mapped = None
         event = None
         # A read in the producer's own address space needs no acknowledgment:
         # the publication's own owner reclaims it.
         acknowledgment = None
-        failure: BaseException | None = None
         try:
             ticket._require_active()
             destination = _read_destination(
@@ -2160,7 +2230,9 @@ class CudaVmmTransport(Transport):
                         raise invalid_descriptor(
                             "CUDA publication has no live local owner"
                         )
-                    publication = owner._publications.source(locator)
+                    publication = owner._publications.source(
+                        locator, reading=True
+                    )
                     mapped = publication.tensor
                     event = publication.event
                 else:
@@ -2226,28 +2298,16 @@ class CudaVmmTransport(Transport):
                     ticket, mapped, destination, event, acknowledgment
                 )
         except BaseException as error:
-            failure = error
             # Failure visibility must not wait for the source's retirement
             # acknowledgement. Physical ownership remains with the backend.
             ticket._fail(error)
             raise
         finally:
-            try:
-                # An undrained read keeps its mapping and fence through the
-                # ticket; only a physically settled read returns its grant.
-                if not ticket._unretired:
-                    mapped = None
-                    event = None
-                    if connection is not None:
-                        try:
-                            finish_reader(connection)
-                        except BaseException as cleanup_error:
-                            if failure is not None:
-                                raise failure from cleanup_error
-                            raise
-            finally:
-                if connection is not None:
-                    connection.close()
+            # An undrained read keeps its mapping and fence through the
+            # ticket; a physically settled read drops them here.
+            if not ticket._unretired:
+                mapped = None
+                event = None
 
     def release(
         self, locator: Locator
@@ -2307,18 +2367,16 @@ def make_transports(
     ticket_capacity: int,
     event_pool: EventPool,
     source: WorkerEndpoint | None = None,
-    consumers: Sequence[int] = (),
     acknowledgment_slot: int = 0,
     cross_host_consumers: bool = False,
 ) -> dict[str, Transport]:
     """Construct configured backends against one rank resource budget.
 
-    `consumers` holds the acknowledgment slots of the ranks that read this
-    rank's device products, which the head derives from the transfer edges. A
-    device transport holds a published chunk until every one of them has
-    acknowledged it. `acknowledgment_slot` is this rank's own word, which it
-    writes in every chunk it reads. `cross_host_consumers` says whether any of
-    them is on another host, which decides how a publication states readiness.
+    `acknowledgment_slot` is this rank's own word, which it writes in the
+    header of every chunk or segment it reads. `cross_host_consumers` says
+    whether a rank on another host reads this rank's products, which decides
+    how a device publication states readiness. Which ranks read a given
+    product is stated on the call that produces it.
     """
     if not names or len(set(names)) != len(names):
         raise invalid_descriptor(
@@ -2349,9 +2407,10 @@ def make_transports(
                 "source": endpoint,
             }
             if name == "cuda_vmm":
-                arguments["consumers"] = consumers
                 arguments["acknowledgment_slot"] = acknowledgment_slot
                 arguments["cross_host_consumers"] = cross_host_consumers
+            if name == "shm":
+                arguments["acknowledgment_slot"] = acknowledgment_slot
             transports[name] = constructors[name](**arguments)
     except BaseException:
         for transport in transports.values():
@@ -2360,26 +2419,68 @@ def make_transports(
     return transports
 
 
+#: Mechanisms that carry a product where it lies on a device.
+DEVICE_MECHANISMS = ("local", "cuda_vmm")
+#: Mechanisms that carry a product as host bytes.
+HOST_MECHANISMS = ("local", "shm", "channel")
+
+
 def publish_tensor(
     transports: Mapping[str, Transport],
     source: torch.Tensor | tuple[torch.Tensor, ...],
     *,
     retain: Callable[[concurrent.futures.Future[None]], None],
     offset: tuple[int, ...] | None = None,
+    consumers: Sequence[int] = (),
+    host: bool = False,
 ) -> tuple[Locator, ...]:
-    """Publish one representation through each explicitly required backend.
+    """Publish one representation through the mechanisms its location needs.
 
-    A partial failure revokes all preceding locations. Each backend continues
-    to retain the source until its submitted device work and readers retire.
+    A device product is published where it lies, over the device mechanism
+    of the rank's edges; a host product, or a device product the caller marks
+    `host`, is published as host bytes over the host mechanism. A device
+    product that neither exports in place nor fits its device's pool falls
+    back to host bytes for that product. A partial failure revokes all
+    preceding locations. Each backend continues to retain the source until
+    its submitted device work and readers retire.
     """
     if not transports:
         raise unsupported_setup(
             "tensor publication requires a configured transport"
         )
+    first = source[0] if isinstance(source, tuple) else source
+    device_product = first.is_cuda and not host
+    names = DEVICE_MECHANISMS if device_product else HOST_MECHANISMS
+    selected = [transports[name] for name in names if name in transports]
+    # A rank whose edges carry no device mechanism sends its device products
+    # as bytes, the crossing any consumer off this device makes anyway.
+    if device_product and "cuda_vmm" not in transports:
+        selected = [
+            transports[name] for name in HOST_MECHANISMS if name in transports
+        ]
     locations: list[Locator] = []
     try:
-        for transport in transports.values():
-            location = transport.publish(source, offset=offset)
+        for transport in selected:
+            try:
+                location = transport.publish(
+                    source, offset=offset, consumers=consumers
+                )
+            except PoolExhaustedError:
+                # The product does not fit its device's pool: it travels as
+                # host bytes instead, over every host mechanism this rank
+                # publishes on.
+                for fallback in HOST_MECHANISMS:
+                    if fallback in transports and fallback != "local":
+                        location = transports[fallback].publish(
+                            source, offset=offset, consumers=consumers
+                        )
+                        locations.append(location)
+                        retain(
+                            transports[fallback].publication_retirement(
+                                location
+                            )
+                        )
+                continue
             locations.append(location)
             retain(transport.publication_retirement(location))
     except BaseException:

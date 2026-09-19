@@ -25,6 +25,7 @@ fn output_product(call: CallId) -> TensorRef {
 fn ar_decode_call() -> Call {
     let kind = CallKind::Forward(ForwardMode::Decode);
     Call {
+        consumer_slots: Vec::new(),
         token_input: None,
         coordinates: CallCoordinates {
             logical_position: 7,
@@ -71,6 +72,7 @@ fn ar_decode_call() -> Call {
 
 fn call_for(kind: CallKind, call_id: CallId) -> Call {
     Call {
+        consumer_slots: Vec::new(),
         coordinates: CallCoordinates::default(),
         token_input: None,
 
@@ -485,6 +487,7 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
     .enumerate()
     {
         let call = Call {
+            consumer_slots: Vec::new(),
             coordinates: CallCoordinates::default(),
             token_input: None,
 
@@ -1301,6 +1304,7 @@ fn comprehensive_batches() -> Vec<Batch> {
         let key = key_for_request(100 + index as u64);
         let call_id = CallId::new(42 + index as u64, 0);
         calls.push(Call {
+            consumer_slots: Vec::new(),
             coordinates: CallCoordinates::default(),
             token_input: None,
 
