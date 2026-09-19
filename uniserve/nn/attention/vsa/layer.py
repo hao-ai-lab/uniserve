@@ -171,45 +171,22 @@ class Attention(nn.Module):
         local_prefix = max(0, min(tiles, prefix - query_tile_offset))
         local_video = max(0, min(tiles, valid - query_tile_offset))
 
-        # Prefix query tiles attend densely to every valid key tile.
+        # One pass writes every query tile's key-tile list: prefix tiles
+        # attend densely, video tiles to the prefix plus their top-scoring
+        # video tiles, padding tiles to one tile.
         indices, counts = workspace.block_indices, workspace.block_counts
-        indices.zero_()
-        counts.fill_(1)
-        indices[:, :local_prefix, :valid] = inputs.dense_key_indices
-        counts[:, :local_prefix] = inputs.prefix_count + inputs.video_tiles
-
-        # Video query tiles attend to the dense prefix plus their top-scoring
-        # video tiles, written after the prefix entries in the block map.
-        if local_video > local_prefix:
-            selected = workspace.topk_indices
-            if selected.shape != (
-                heads,
-                local_video - local_prefix,
-                selected_tiles,
-            ):
-                raise ValueError(
-                    "VSA top-k workspace must match the selected video tile "
-                    "domain"
-                )
-            ops.threshold_topk_indices(
-                scores[:, local_prefix:local_video, prefix:valid], selected
-            )
-            selected.add_(prefix)
-            indices[:, local_prefix:local_video, :prefix] = (
-                inputs.prefix_key_indices
-            )
-            positions = torch.arange(
-                selected_tiles, device=scores.device, dtype=torch.int64
-            ).view(1, 1, -1)
-            positions.add_(inputs.prefix_count)
-            indices[:, local_prefix:local_video].scatter_(
-                2,
-                positions.expand(heads, local_video - local_prefix, -1),
-                selected,
-            )
-            counts[:, local_prefix:local_video] = (
-                inputs.prefix_count + selected_tiles
-            )
+        ops.write_block_map(
+            scores[:, local_prefix:local_video, prefix:valid],
+            inputs.prefix_key_indices,
+            inputs.dense_key_indices,
+            indices,
+            counts,
+            local_prefix=local_prefix,
+            local_video=local_video,
+            prefix_tiles=prefix,
+            valid_tiles=valid,
+            selected=selected_tiles,
+        )
 
         return BlockInput(
             pattern, indices, counts, inputs.valid_sizes, query_tile_offset

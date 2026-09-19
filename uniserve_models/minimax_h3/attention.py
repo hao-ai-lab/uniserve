@@ -55,13 +55,11 @@ class Attention(nn.Module):
                 "H3 attention requires complete query and key tiles"
             )
 
-        # VSA addresses keys and queries in 64-token tiles; each query tile
-        # attends to `selected` of the key tiles after sparsification.
+        # VSA addresses keys and queries in 64-token tiles.
         heads = (
             self.projection.projections["q"].weight.shape[0] // self.head_dim
         )
         queries, keys = num_query_tokens // 64, num_tokens // 64
-        selected = max(1, math.ceil((1 - self.sparsity) * keys))
         return {
             "attention_output": BufferConfig(
                 (num_query_tokens, heads, self.head_dim), dtype
@@ -80,9 +78,6 @@ class Attention(nn.Module):
             ),
             "compressed_tiles": BufferConfig(
                 (heads, queries, self.head_dim), torch.float32
-            ),
-            "topk_indices": BufferConfig(
-                (heads, queries, selected), torch.int32
             ),
         }
 
@@ -125,28 +120,8 @@ class Attention(nn.Module):
                 yield interval, (q, k, v, gate)
 
         batch = inputs.vsa
-        distribution = self.projection.projections["q"].output_distribution
-        context = distribution.mesh.get_group(distribution.shard_axes(0))
-
-        # Video-domain query tiles owned by this rank: this rank's
-        # contiguous tile range intersected with the video tiles behind the
-        # text/audio prefix.
-        query_tiles = batch.padded_tokens // (64 * context.size)
-        start = context.rank * query_tiles
-        video_queries = max(
-            0,
-            min(start + query_tiles, batch.valid_tiles)
-            - max(start, batch.prefix_tiles),
-        )
         selected = max(1, math.ceil((1 - self.sparsity) * batch.video_tiles))
 
-        # Carve this layer's [heads, video_queries, selected] region out of the
-        # shared flat top-k workspace.
-        heads = workspace["attention_output"].shape[1]
-        shape = (heads, video_queries, selected)
-        topk = (
-            workspace["topk_indices"].view(-1)[: math.prod(shape)].view(shape)
-        )
         buffers = vsa.Workspace(
             **{
                 name: workspace[name]
@@ -161,7 +136,6 @@ class Attention(nn.Module):
                     "compressed_tiles",
                 )
             },
-            topk_indices=topk,
         )
         attended = self.vsa.forward_chunks(
             project(), batch, selected_tiles=selected, workspace=buffers
