@@ -46,7 +46,12 @@ def test_encoded_units_and_audio_assemble_into_a_decodable_mp4():
         encode_video_unit(config, blue),
     )
     audio = encode_audio_track(config, np.zeros((8000, 2), dtype=np.int16))
-    encoded = AvMuxSession(config).assemble(units, audio)
+    # Rounds arrive one at a time; the artifact is assembled once the audio
+    # track follows the last of them.
+    session = AvMuxSession(config)
+    session.append(units[:1])
+    session.append(units[1:])
+    encoded = session.finalize(audio)
 
     with av.open(io.BytesIO(encoded)) as container:
         video, track = container.streams.video[0], container.streams.audio[0]
@@ -72,8 +77,14 @@ def test_assembly_requires_every_media_unit_of_the_request():
     config = _config()
     red = np.zeros((4, 16, 32, 3), dtype=np.uint8)
     audio = encode_audio_track(config, np.zeros((8000, 2), dtype=np.int16))
+    session = AvMuxSession(config)
+    session.append((encode_video_unit(config, red),))
     with pytest.raises(Exception, match="every media unit"):
-        AvMuxSession(config).assemble((encode_video_unit(config, red),), audio)
+        session.finalize(audio)
+    blue = np.zeros((2, 16, 32, 3), dtype=np.uint8)
+    session.append((encode_video_unit(config, blue),))
+    with pytest.raises(Exception, match="more media units"):
+        session.append((encode_video_unit(config, blue),))
 
 
 def test_a_product_row_carries_one_encoded_unit_and_its_length():
