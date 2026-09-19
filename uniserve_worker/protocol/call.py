@@ -132,8 +132,9 @@ class DrawLayout(StrEnum):
     FLOW_NOISE = "flow_noise"
 
 
-# Computations that advance a request's accepted progress; they require a
-# predecessor and mark visible completion when they finish.
+# Computations that advance a request's accepted progress; they mark visible
+# completion when they finish, and a rank chains each from the request's
+# latest state-advancing call.
 _STATE_ADVANCING_WORK = frozenset(
     {
         ForwardMode.PREFILL,
@@ -544,9 +545,6 @@ class Call:
 
     request_key: identity.RequestKey
     call_id: identity.CallId
-    # Immediate dependency within the request; must precede call_id and is
-    # required for state-advancing work and KV installation.
-    predecessor: identity.CallId | None
     # Coordinates this call executes at, stated by the engine.
     coordinates: CallCoordinates
     kind: CallKind
@@ -656,7 +654,7 @@ class Call:
         return self.kind in _STATE_ADVANCING_WORK
 
     def validate(self) -> None:
-        """Enforce call-family, predecessor, and bound invariants.
+        """Enforce call-family and bound invariants.
 
         Also enforces dataflow, predicate, and RNG invariants.
         """
@@ -668,18 +666,6 @@ class Call:
             raise invalid_descriptor("call entry must not be empty")
         if self.kind not in CALL_KINDS:
             raise invalid_descriptor("call requires a valid computation tag")
-        if self.predecessor is None:
-            if (
-                self.advances_state
-                or self.kind is TransferMode.KV_INSTALL
-                or self.latent_input is not None
-            ):
-                raise invalid_descriptor(
-                    "state-changing call requires a predecessor"
-                )
-        if self.predecessor is not None and not self.predecessor < self.call_id:
-            raise invalid_descriptor("predecessor must precede call")
-
         # Token and sampling inputs.
         if len(self.input_token_ids) > self.bounds.max_tokens:
             raise invalid_descriptor(
@@ -848,14 +834,6 @@ class Call:
         call_id = identity.CallId.from_mapping(
             get("call_id"), f"{where}.call_id"
         )
-        predecessor_value = get("predecessor")
-        predecessor = (
-            None
-            if predecessor_value is None
-            else identity.CallId.from_mapping(
-                predecessor_value, f"{where}.predecessor"
-            )
-        )
         coordinates = CallCoordinates.from_mapping(
             get("coordinates"), f"{where}.coordinates"
         )
@@ -902,7 +880,6 @@ class Call:
         call = cls(
             request_key=request_key,
             call_id=call_id,
-            predecessor=predecessor,
             coordinates=coordinates,
             entry=entry,
             kind=work,
@@ -994,16 +971,10 @@ class Call:
         return call
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode computation fields.
-
-        Includes the request and predecessor identities.
-        """
+        """Encode computation fields, including the request identity."""
         return {
             "request_key": self.request_key.to_mapping(),
             "call_id": self.call_id.to_mapping(),
-            "predecessor": None
-            if self.predecessor is None
-            else self.predecessor.to_mapping(),
             "coordinates": self.coordinates.to_mapping(),
             "entry": self.entry,
             "code": self.kind.value,

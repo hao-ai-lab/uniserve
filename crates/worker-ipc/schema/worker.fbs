@@ -222,7 +222,6 @@ table CallCoordinates {
 table Call {
   request_key:RequestKey;
   call_id:CallId;
-  predecessor:CallId;
   coordinates:CallCoordinates;
   entry:string (required);
   code:CallKind (required);

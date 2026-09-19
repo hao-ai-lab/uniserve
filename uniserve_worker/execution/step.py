@@ -488,7 +488,7 @@ def _error_outputs(
         if (
             request is None
             or request.request_key != call.request_key
-            or call.predecessor is None
+            or state.predecessor(call) is None
         ):
             runtime = None
         else:

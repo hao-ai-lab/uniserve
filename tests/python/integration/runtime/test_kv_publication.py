@@ -287,7 +287,6 @@ def _installation_call(
         Call(
             request_key=admission.request_key,
             call_id=call_id,
-            predecessor=predecessor,
             coordinates=CallCoordinates(),
             kind=TransferMode.KV_INSTALL,
             bounds=Bounds(max_transfer_bytes=1 << 20),
@@ -337,7 +336,6 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     closure = Call(
         request_key=closure_template.request_key,
         call_id=closure_template.call_id,
-        predecessor=closure_template.predecessor,
         coordinates=closure_template.coordinates,
         kind=closure_template.kind,
         bounds=closure_template.bounds,
@@ -396,7 +394,6 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     suffix_closure = Call(
         request_key=suffix_template.request_key,
         call_id=suffix_template.call_id,
-        predecessor=suffix_template.predecessor,
         coordinates=suffix_template.coordinates,
         kind=suffix_template.kind,
         bounds=suffix_template.bounds,

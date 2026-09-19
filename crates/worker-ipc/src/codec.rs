@@ -541,10 +541,6 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
                 .unwrap_or_default(),
             force_finish: state.force_finish(),
         }),
-        predecessor: call
-            .predecessor()
-            .map(|id| computation_id_from_fb(Some(id)))
-            .transpose()?,
         entry: call.entry().to_owned(),
         code: computation_from_fb(call.code())?,
         bounds: Bounds {
@@ -1407,7 +1403,6 @@ fn call_to_fb(call: &Call) -> CodecResult<fbs::CallT> {
                 force_finish: state.force_finish,
             })
         }),
-        predecessor: call.predecessor.map(computation_id_to_fb),
         entry: call.entry.clone(),
         code: computation_to_fb(call.code),
         max_tokens: call.bounds.max_tokens,

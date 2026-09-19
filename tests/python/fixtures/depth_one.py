@@ -217,9 +217,11 @@ class _Ledger:
     def __init__(self) -> None:
         self.current: dict[RequestKey, CallCoordinates] = {}
         self.submitted: dict[tuple[RequestKey, CallId], CallCoordinates] = {}
-        # Calls with no request predecessor carry no coordinates, so their
-        # completions report none and leave the request where it was.
+        # A media branch call around the request's state chain carries no
+        # coordinates, so its completion reports none and leaves the request
+        # where it was.
         self.detached: set[tuple[RequestKey, CallId]] = set()
+        self.media: set[RequestKey] = set()
 
 
 def _projected(
@@ -350,12 +352,15 @@ def stamp_batch(worker: object, batch: Batch) -> Batch:
             kv_visible_len=prefix,
             kv_computed_len=prefix,
         )
+        if admission.diffusion is not None:
+            _ledger(worker).media.add(admission.request_key)
     stamped = []
     for call in batch.calls:
         identity = (call.request_key, call.call_id)
         entry = ledger.get(call.request_key, CallCoordinates())
         submitted[identity] = entry
-        if call.predecessor is None:
+        media = call.request_key in _ledger(worker).media
+        if media and not call.advances_state:
             detached.add(identity)
         rule = _CALL_PROJECTIONS.get(identity)
         if rule is not None:
@@ -729,7 +734,6 @@ def token_call(
     call = Call(
         request_key=rk,
         call_id=call_id,
-        predecessor=predecessor,
         coordinates=CallCoordinates(),
         kind=mode,
         bounds=Bounds(
@@ -775,7 +779,6 @@ def encode_call(
     call = Call(
         request_key=rk,
         call_id=call_id,
-        predecessor=predecessor,
         coordinates=CallCoordinates(),
         kind=mode,
         # Which entry serves a stage is the model's, not the stage's: a model
@@ -823,7 +826,6 @@ def diffusion_prepare_call(
     call = Call(
         request_key=rk,
         call_id=call_id,
-        predecessor=predecessor,
         coordinates=CallCoordinates(),
         kind=PipelineStage.LATENT_PREPARATION,
         bounds=Bounds(max_tokens=1, max_latent_bytes=latent.max_bytes),
@@ -862,7 +864,6 @@ def diffusion_step_call(
     call = Call(
         request_key=rk,
         call_id=call_id,
-        predecessor=predecessor,
         coordinates=CallCoordinates(),
         kind=PipelineStage.DENOISING,
         bounds=Bounds(max_tokens=int(steps), max_latent_bytes=output.max_bytes),
@@ -890,7 +891,6 @@ def kv_publication_call(
     call = Call(
         request_key=rk,
         call_id=call_id,
-        predecessor=predecessor,
         coordinates=CallCoordinates(),
         kind=TransferMode.KV_PUBLISH,
         bounds=Bounds(max_transfer_bytes=1 << 20),
@@ -921,7 +921,6 @@ def diffusion_finalize_call(
     return Call(
         request_key=rk,
         call_id=call_id,
-        predecessor=predecessor,
         coordinates=CallCoordinates(),
         kind=PipelineStage.IMAGE_DECODING,
         bounds=Bounds(
@@ -964,7 +963,6 @@ def visual_state_call(
     return Call(
         request_key=rk,
         call_id=call_id,
-        predecessor=predecessor,
         coordinates=CallCoordinates(),
         kind=ForwardMode.PREFILL,
         bounds=Bounds(max_tokens=max_tokens),

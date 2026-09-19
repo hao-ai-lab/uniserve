@@ -5,6 +5,7 @@ actions.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -563,17 +564,25 @@ def decode_range(call: Call, *, state: BatchState) -> DecodeRange:
 
 
 def validate_batch(
-    batch: Batch, *, postprocessor: VideoPostprocessor | None
+    batch: Batch,
+    *,
+    postprocessor: VideoPostprocessor | None,
+    predecessors: Mapping[CallId, CallId | None],
 ) -> None:
-    """Validate video admission requirements before staging state."""
+    """Validate video admission requirements before staging state.
+
+    Latent preparation opens a request's trajectory, so it must be the first
+    state-advancing call of its request: the call it follows is the admission
+    root, not an earlier step.
+    """
     if postprocessor is None:
         return
     for call in batch.calls:
         if call.kind is not PipelineStage.LATENT_PREPARATION:
             continue
-        if call.predecessor != CallId(0, 0):
+        if predecessors.get(call.call_id) != CallId(0, 0):
             raise invalid_descriptor(
-                "video preparation does not name its request root"
+                "video preparation does not follow its request root"
             )
 
 

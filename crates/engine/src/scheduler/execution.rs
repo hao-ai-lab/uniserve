@@ -824,7 +824,6 @@ impl Scheduler {
             } else {
                 None
             };
-            let predecessor = stateful.then(|| state.predecessor);
             let completion_output = (outputs.is_empty() && stateful)
                 .then(|| self.media_completion_product(request_key, call_id));
             let mut call = Call {
@@ -853,7 +852,6 @@ impl Scheduler {
                 sampling_state: None,
                 request_key,
                 call_id,
-                predecessor,
                 entry: entry.to_owned(),
                 code: work,
                 bounds: Bounds::default(),

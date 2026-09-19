@@ -11,10 +11,6 @@ fn request_key() -> RequestKey {
     RequestKey::new(4, RequestId(7), 2)
 }
 
-fn admission_predecessor() -> CallId {
-    CallId::new(0, 0)
-}
-
 fn output_product(call: CallId) -> TensorRef {
     TensorRef {
         request_key: request_key(),
@@ -55,7 +51,6 @@ fn ar_decode_call() -> Call {
         sampling_state: None,
         request_key: request_key(),
         call_id: CallId::new(11, 0),
-        predecessor: Some(admission_predecessor()),
         entry: "model".into(),
         code: kind,
         bounds: Bounds {
@@ -111,7 +106,6 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         sampling_state: None,
         request_key: request_key(),
         call_id,
-        predecessor: Some(admission_predecessor()),
         entry: "model".into(),
         code: kind,
         bounds: Bounds::default(),
@@ -255,10 +249,6 @@ fn computation_coordinates_survive_physical_dispatch_and_reject_collisions() {
     let mut collision = run;
     collision.calls[1].call_id = first.call_id;
     assert!(encode_request(&WorkerRequest::submit(collision)).is_err());
-
-    let mut invalid_parent = first;
-    invalid_parent.predecessor = Some(CallId::new(0, 1));
-    assert!(invalid_parent.validate().is_err());
 }
 
 fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>) -> Batch {
@@ -516,7 +506,6 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             sampling_state: None,
             request_key: request_key(),
             call_id: CallId::new(56 + index as u64, 0),
-            predecessor: None,
             entry: (*entry).into(),
             code: CallKind::Pipeline(*stage),
             bounds: Bounds::default(),
@@ -1311,11 +1300,6 @@ fn comprehensive_batches() -> Vec<Batch> {
         let mut calls = Vec::new();
         let key = key_for_request(100 + index as u64);
         let call_id = CallId::new(42 + index as u64, 0);
-        let predecessor = if index % 2 == 0 {
-            CallId::new(0, 0)
-        } else {
-            CallId::new(9, 0)
-        };
         calls.push(Call {
             coordinates: CallCoordinates::default(),
             token_input: None,
@@ -1352,7 +1336,6 @@ fn comprehensive_batches() -> Vec<Batch> {
             sampling_state: None,
             request_key: key,
             call_id,
-            predecessor: Some(predecessor),
             entry: "model".into(),
             code: kind,
             bounds: Bounds {

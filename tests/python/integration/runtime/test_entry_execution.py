@@ -268,7 +268,6 @@ def test_text_encoder_call_publishes_consumable_conditioning(
     call = Call(
         request_key=key,
         call_id=CallId(1, 0),
-        predecessor=None,
         coordinates=CallCoordinates(),
         kind=PipelineStage.TEXT_ENCODING,
         entry="text_encoder",
@@ -337,7 +336,6 @@ def test_text_encoder_call_publishes_consumable_conditioning(
         consumer = Call(
             request_key=key,
             call_id=CallId(2, 0),
-            predecessor=None,
             coordinates=CallCoordinates(),
             kind=TransferMode.TENSOR,
             entry="text_encoder",
@@ -471,7 +469,6 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
         call = Call(
             request_key=key,
             call_id=op,
-            predecessor=None,
             coordinates=CallCoordinates(),
             kind=PipelineStage.TEXT_ENCODING,
             entry="text_encoder",

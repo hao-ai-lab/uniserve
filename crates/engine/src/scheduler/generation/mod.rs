@@ -303,7 +303,6 @@ fn computation(request: &GenerationRequest, code: CallKind) -> Call {
 
         request_key: RequestKey::new(0, request.request_id, 0),
         call_id: CallId::new(0, 0),
-        predecessor: None,
         coordinates: CallCoordinates::default(),
         entry: "model".into(),
         code,
@@ -672,7 +671,6 @@ pub(crate) enum PlanningError {
 pub(super) fn register_call(
     call: &mut Call,
     request_key: RequestKey,
-    predecessor: CallId,
     next_product_generation: &mut u64,
 ) -> Result<(), PlanningError> {
     let call_id = call.call_id;
@@ -697,7 +695,6 @@ pub(super) fn register_call(
         generation
     };
     call.request_key = request_key;
-    call.predecessor = Some(predecessor);
     if let Some(output) = &mut call.kv_output {
         output.owner = request_key;
         output.producer_call_id = call_id;

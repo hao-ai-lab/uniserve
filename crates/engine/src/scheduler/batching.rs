@@ -534,15 +534,15 @@ impl Scheduler {
             } else {
                 None
             };
-        let (parent, predicate) = if projected_successor {
-            let Some(parent) = self.execution_predecessor(request_id) else {
+        let predicate = if projected_successor {
+            if self.execution_predecessor(request_id).is_none() {
                 tracing::error!(
                     request_id = request_id.0,
                     "projected successor has no execution predecessor"
                 );
                 self.fatal = true;
                 return None;
-            };
+            }
             let Some(predecessor) = self
                 .pending_calls
                 .get(&request_id)
@@ -556,20 +556,19 @@ impl Scheduler {
                 self.fatal = true;
                 return None;
             };
-            let predicate = if call.code == CallKind::Forward(ForwardMode::Decode) {
+            if call.code == CallKind::Forward(ForwardMode::Decode) {
                 predecessor.token_output.clone()
             } else {
                 predecessor.completion_output.clone()
-            };
-            (parent, predicate)
+            }
         } else if let Some(parent) = reusable_device_token {
-            (parent.producer_call_id, Some(parent))
+            Some(parent)
         } else {
-            let Some(parent) = self.state_predecessor(request_id) else {
+            if self.state_predecessor(request_id).is_none() {
                 self.fatal = true;
                 return None;
-            };
-            (parent, None)
+            }
+            None
         };
 
         call.predicate = predicate;
@@ -700,12 +699,9 @@ impl Scheduler {
             }
         }
 
-        if let Err(error) = generation::register_call(
-            &mut call,
-            request_key,
-            parent,
-            &mut self.next_product_generation,
-        ) {
+        if let Err(error) =
+            generation::register_call(&mut call, request_key, &mut self.next_product_generation)
+        {
             for allocation in reserved_buffers {
                 self.free_allocation(allocation);
             }

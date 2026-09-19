@@ -1041,6 +1041,7 @@ def validate_batch(
     worker_info: WorkerInfo,
     model_runner: ModelRunner,
     config: WorkerConfig,
+    predecessors: Mapping[CallId, CallId | None],
 ) -> None:
     """Validate batch identity, completion group resources, routing.
 
@@ -1090,7 +1091,11 @@ def validate_batch(
             "execution batch exceeds request-slot capacity"
         )
 
-    validate_video_batch(batch, postprocessor=model_runner.video_postprocessor)
+    validate_video_batch(
+        batch,
+        postprocessor=model_runner.video_postprocessor,
+        predecessors=predecessors,
+    )
 
 
 def _reserve_outputs(
