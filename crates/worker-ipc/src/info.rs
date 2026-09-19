@@ -310,15 +310,25 @@ impl WorkerInfo {
                 == self.supported_ops.len(),
             "worker info repeat a work variant"
         );
-        if !self.pipeline_components.is_empty() {
+        // A worker names the entry serving each stage it implements. Every
+        // named stage must be one it advertises and an entry it holds; a
+        // deployment that assembles an artifact must name the whole video
+        // pipeline, which a worker reporting only the stages it has need not.
+        ensure_valid!(
+            self.pipeline_components.iter().all(|(stage, entry)| {
+                !entry.is_empty() && self.supported_ops.contains(&CallKind::Pipeline(*stage))
+            }),
+            "a pipeline stage names no entry this worker serves"
+        );
+        if self
+            .pipeline_components
+            .contains_key(&PipelineStage::Muxing)
+        {
             ensure_valid!(
                 self.num_inference_steps > 0
-                    && PipelineStage::VIDEO.iter().all(|stage| {
-                        self.pipeline_components
-                            .get(stage)
-                            .is_some_and(|entry| !entry.is_empty())
-                            && self.supported_ops.contains(&CallKind::Pipeline(*stage))
-                    }),
+                    && PipelineStage::VIDEO
+                        .iter()
+                        .all(|stage| self.pipeline_components.contains_key(stage)),
                 "video components or diffusion step count are incomplete"
             );
         }

@@ -224,7 +224,14 @@ impl Scheduler {
             });
             return;
         }
-        if self.info.pipeline_components.is_empty() {
+        // A worker reports the entry serving each stage it implements, so a
+        // deployment that assembles an artifact is the one that can serve a
+        // video request; reporting some stage is not enough.
+        if !self
+            .info
+            .pipeline_components
+            .contains_key(&uniserve_worker_ipc::PipelineStage::Muxing)
+        {
             let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
                 message: "worker does not provide video pipeline components".to_string(),
             });

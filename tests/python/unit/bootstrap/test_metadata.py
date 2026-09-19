@@ -88,7 +88,7 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(
 def test_h3_worker_advertises_bounded_media_products():
     from uniserve_models.minimax_h3 import Config, Model
     from uniserve_worker.bootstrap.components import (
-        media_components,
+        pipeline_components,
         supported_calls,
     )
     from uniserve_worker.config import WorkerConfig
@@ -113,7 +113,7 @@ def test_h3_worker_advertises_bounded_media_products():
         *VIDEO_STAGES,
         TransferMode.TENSOR,
     }
-    assert media_components(model) == {
+    assert pipeline_components(model) == {
         PipelineStage.TEXT_ENCODING: "text_encoder",
         PipelineStage.LATENT_PREPARATION: "denoiser",
         PipelineStage.DENOISING: "denoiser",

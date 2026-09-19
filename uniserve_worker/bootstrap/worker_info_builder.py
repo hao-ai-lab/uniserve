@@ -45,7 +45,7 @@ from .capacity import (
     request_tensor_window,
     vision_tokens,
 )
-from .components import media_components, supported_calls
+from .components import pipeline_components, supported_calls
 from .config import ComponentConfig
 from .inputs import capability, image_builder, media_builder
 from .worker_info import EntryInfo, WorkerInfo
@@ -192,7 +192,7 @@ def build_worker_layout(
     if completion_payload_bytes <= 0:
         raise ValueError("completion payload capacity must be positive")
 
-    supported_ops = supported_calls(model)
+    supported_ops = supported_calls(model, (name for name, _ in components))
     if allowed_work_variants is not None:
         supported_ops = supported_ops & allowed_work_variants
 
@@ -249,11 +249,20 @@ def build_worker_layout(
         max_tokens = min(max_tokens, lane.max_batch_tokens or max_tokens)
 
     outputs = resolve_outputs(model, worker_config)
+    held = tuple(name for name, _ in components)
     info = replace(
         layout.info,
         supported_ops=tuple(
             code for code in CALL_KINDS if code in supported_ops
         ),
+        # Advertised routing and advertised work describe the same placement,
+        # including a deployment narrowed to a subset of its work variants: a
+        # stage this worker will not accept is a stage it does not route.
+        pipeline_components={
+            stage: entry
+            for stage, entry in pipeline_components(model, held).items()
+            if stage in supported_ops
+        },
         transfer_backends=transfer_backends,
         fabric_handles=_exports_fabric_handles(worker_config.device),
         max_batch_ops=max_calls,
@@ -497,7 +506,7 @@ def _token_worker_layout(
         latent_pages=num_latent_pages,
         buffer_pool_bytes=buffer_pool_bytes,
         max_unresolved_ops=unresolved_window,
-        pipeline_components=dict(media_components(model)),
+        pipeline_components=dict(pipeline_components(model)),
         num_inference_steps=0,
         host_lane_capacity=1,
     )
@@ -570,7 +579,7 @@ def _request_tensor_worker_layout(
         buffer_pool_bytes=slots
         * product_storage_bytes(resolve_outputs(model, worker_config)),
         max_unresolved_ops=unresolved_window,
-        pipeline_components=dict(media_components(model)),
+        pipeline_components=dict(pipeline_components(model)),
         num_inference_steps=media_builder(model, worker_config).num_steps,
         host_lane_capacity=1,
     )
@@ -602,7 +611,7 @@ def _request_tensor_worker_layout(
         * local_product_storage_bytes(
             resolve_outputs(model, worker_config),
             bindings=bindings or {},
-            pipeline_components=media_components(model),
+            pipeline_components=pipeline_components(model),
             max_unresolved_ops=unresolved_window,
         ),
         latent_width=1,
