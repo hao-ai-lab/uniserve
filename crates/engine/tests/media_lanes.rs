@@ -67,12 +67,13 @@ fn output(name: &str, units: Option<u32>) -> OutputInfo {
 }
 
 /// A video worker whose text encoder, denoiser, audio decoder and muxer live on
-/// rank 0 and whose video decoder is distributed over `decoder_ranks` ranks,
-/// each reconstructing one media unit per round.
+/// rank 0 and whose video decoder and video encoder are distributed over
+/// `decoder_ranks` ranks, each reconstructing and encoding one media unit per
+/// round.
 ///
 /// Calls route to components the way a loaded model reports them: the video
-/// decoder component also encodes the units it decodes, and the muxer
-/// encodes audio and assembles the artifact.
+/// encoder component encodes the media units the decoder produced, and the
+/// muxer encodes audio and assembles the artifact.
 fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
     let mut sim = SimEngine::new();
     sim.set_queue_depth(64);
@@ -103,7 +104,13 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
             "video_decoder",
             (0..decoder_ranks).collect(),
             true,
-            vec![output("windows", Some(16)), output("encoded", Some(16))],
+            vec![output("units", Some(16))],
+        ),
+        component(
+            "video_encoder",
+            (0..decoder_ranks).collect(),
+            true,
+            vec![output("encoded", Some(16))],
         ),
         component("audio_decoder", vec![0], true, vec![output("audio", None)]),
         component("muxer", vec![0], false, Vec::new()),
@@ -113,7 +120,7 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
         (MediaCall::LatentPreparation, "denoiser".to_owned()),
         (MediaCall::Denoising, "denoiser".to_owned()),
         (MediaCall::VideoDecoding, "video_decoder".to_owned()),
-        (MediaCall::VideoEncoding, "video_decoder".to_owned()),
+        (MediaCall::VideoEncoding, "video_encoder".to_owned()),
         (MediaCall::AudioDecoding, "audio_decoder".to_owned()),
         (MediaCall::AudioEncoding, "muxer".to_owned()),
         (MediaCall::Muxing, "muxer".to_owned()),

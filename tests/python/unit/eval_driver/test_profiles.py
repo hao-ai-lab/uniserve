@@ -45,13 +45,22 @@ def test_fast_h3_defaults_to_the_four_device_deployment(monkeypatch) -> None:
 
     named = config.root / server.command[deployment]
     assert named.is_file(), f"{named} is the default deployment and must exist"
-    assert sorted(json.loads(named.read_text())[0]["components"]) == [
-        "audio_decoder",
-        "denoiser",
-        "muxer",
-        "text_encoder",
-        "video_decoder",
-    ]
+    # The numerical components run on the model worker's devices; the host
+    # components encode and mux on a host rank.
+    workers = {
+        worker["id"]: sorted(worker["components"])
+        for worker in json.loads(named.read_text())
+    }
+    assert workers == {
+        "model": ["audio_decoder", "denoiser", "text_encoder", "video_decoder"],
+        "host": ["muxer", "video_encoder"],
+    }
+    host = next(
+        worker
+        for worker in json.loads(named.read_text())
+        if worker["id"] == "host"
+    )
+    assert all(rank["device"] == "cpu" for rank in host["ranks"])
 
 
 def test_fast_h3_server_defaults_to_balanced_precision(monkeypatch) -> None:

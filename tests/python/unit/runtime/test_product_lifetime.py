@@ -1030,48 +1030,6 @@ def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_o
         events.close()
 
 
-@pytest.mark.gpu
-def test_media_capture_releases_capacity_after_its_completion_fence():
-    from uniserve.media import image, video
-    from uniserve_worker.media.buffers import MediaBuffers
-
-    events = EventPool()
-    outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
-    ring = MediaBuffers(
-        state_slots=1,
-        unresolved_window=1,
-        max_video_frames_per_round=1,
-        video=video.Config(1, image.Config(2, 2)),
-        frame_rate=1,
-        audio_rate=8,
-        pin=True,
-    )
-    lease = ring.reserve("video")
-    try:
-        output = outputs.acquire(1, token_capacity=8, devices=("cuda:0",))
-        value = torch.arange(12, dtype=torch.uint8, device="cuda:0")
-        output.capture_bytes_into(value, lease.storage)
-        lease.defer_until_ready(output.completion_future())
-        with pytest.raises(WorkerError, match="output ring is exhausted"):
-            ring.reserve("video")
-        # Closing the output owner completes its copy and retires the borrowed
-        # ring capacity even while the lease remains referenced.
-        outputs.close()
-        replacement = ring.reserve("video")
-        try:
-            torch.testing.assert_close(
-                replacement.storage,
-                torch.arange(12, dtype=torch.uint8),
-                rtol=0,
-                atol=0,
-            )
-        finally:
-            replacement.release()
-    finally:
-        outputs.close()
-        events.close()
-
-
 def test_latent_staging_preserves_live_trajectories(latent_output) -> None:
     pool = LatentPool(
         request_pool_size=2,

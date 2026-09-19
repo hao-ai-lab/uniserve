@@ -45,7 +45,7 @@ from .capacity import (
     request_tensor_window,
     vision_tokens,
 )
-from .components import media_components, supported_calls
+from .components import codec_workers, media_components, supported_calls
 from .config import ComponentConfig
 from .inputs import capability, image_builder, media_builder
 from .worker_info import ComponentInfo, WorkerInfo
@@ -609,10 +609,22 @@ def _request_tensor_worker_layout(
         bytes_per_token=0,
     )
 
+    # A rank holding host components advertises one lane slot per codec
+    # process it runs; any other rank's host lane is the arena's executor.
+    codecs = codec_workers(
+        {}
+        if bindings is None
+        else {
+            name: binding.config
+            for name, binding in bindings.items()
+            if binding.owns
+        }
+    )
     return WorkerLayout(
-        # The rank's host executor owns the host lane, so its advertised
-        # capacity is the one the arena reserved.
-        info=replace(info, host_lane_capacity=int(arena.host_lane_inflight)),
+        info=replace(
+            info,
+            host_lane_capacity=codecs or int(arena.host_lane_inflight),
+        ),
         arena=arena,
         input_config=None,
         fixed_device_bytes=(),

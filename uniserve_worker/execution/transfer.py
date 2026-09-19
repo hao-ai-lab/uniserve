@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from uniserve_worker.runtime.block_tables import BlockTables
     from uniserve_worker.runtime.cache_manager import CacheManager
     from uniserve_worker.runtime.latent_pool import LatentPool
-    from uniserve_worker.runtime.tensor_store import TensorStore
+    from uniserve_worker.runtime.tensor_store import TensorRecord, TensorStore
     from uniserve_worker.transfer.tickets import Transport
 
 
@@ -486,6 +486,70 @@ def publish_product(
     return TensorPublication(product=product, value=descriptor)
 
 
+def publish_deferred_product(
+    product: TensorRef,
+    write: TensorRecord,
+    value: torch.Tensor,
+    *,
+    tensor_store: TensorStore,
+    publication_transports: Mapping[str, Transport],
+    consumers: Sequence[int],
+) -> TensorPublication:
+    """Publish a product whose write host work filled after its call committed.
+
+    The committed call released its execution references, so the caller
+    hands over the write it retained. The product is published as host
+    bytes, registered for retirement, and committed here; the caller reports
+    the publication with the completion the work belongs to.
+    """
+    if not publication_transports:
+        raise unsupported_setup(
+            "product publication requires a configured transport"
+        )
+    region = write.region
+    if region is not None and tuple(value.shape) != _slices.shape(region):
+        raise invalid_descriptor(
+            "product tensor disagrees with its assigned region"
+        )
+    shape = write.logical_shape if region is not None else tuple(value.shape)
+    if shape is None:
+        raise invalid_descriptor(
+            "tensor region publication has no logical shape"
+        )
+    if not _representation_matches_product(
+        shape,
+        str(value.dtype).removeprefix("torch."),
+        math.prod(shape) * value.element_size(),
+        product,
+    ):
+        raise invalid_descriptor(
+            "product transfer changes its declared representation"
+        )
+    value = tensor_store.publish_write(write, value, metadata=None)
+    locations = publish_tensor(
+        publication_transports,
+        value,
+        retain=partial(tensor_store.retain_publication, write),
+        offset=None if region is None else _slices.offset(region),
+        consumers=consumers,
+        host=True,
+    )
+    tensor_store.exports[product.buffer_id] = tuple(
+        (publication_transports[location.backend], location)
+        for location in locations
+    )
+    tensor_store.commit_writes((write,))
+    return TensorPublication(
+        product=product,
+        value=DeviceProductTransferValue(
+            height=0,
+            width=0,
+            value_range="",
+            tensor=TensorTransfer(shape=shape, locations=locations),
+        ),
+    )
+
+
 def fetch_product(
     call: Call,
     completion_group: int,
@@ -576,29 +640,30 @@ def _release_locators(
         transfer_backends[locator.backend].release(locator)
 
 
-def reserved_unit_row(
+def reserved_unit_rows(
     call: Call,
     completion_group: int,
     *,
     state: BatchState,
+    count: int,
 ):
-    """Return the product row reserved for one encoded media unit.
+    """Return the product rows reserved for this rank's encoded media units.
 
-    The row is published with its batch and filled when the host task that
-    encodes the unit completes. Nothing reads it before then: the muxer's call
-    is scheduled only once every encode round has completed.
+    The rows are filled and published when the host tasks that encode the
+    units complete. Nothing reads them before then: the muxer's call is
+    scheduled only once every encode round has completed.
     """
     from .encode import bound_device_write
 
     outputs = call.outputs
     if len(outputs) != 1:
         raise invalid_descriptor(
-            "encoded media unit requires exactly one declared product"
+            "encoded media units require exactly one declared product"
         )
     write = bound_device_write(completion_group, outputs[0], state=state)
-    row = write.tensor
-    if row.ndim != 2 or row.shape[0] != 1:
+    rows = write.tensor
+    if rows.ndim != 2 or rows.shape[0] != count:
         raise invalid_descriptor(
-            "encoded media unit product must reserve one row"
+            "encoded media unit product must reserve one row per unit"
         )
-    return row
+    return write, rows

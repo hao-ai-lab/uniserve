@@ -18,14 +18,16 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from uniserve.media import image as media_image
-from uniserve.model import VideoPostprocessor
 from uniserve_worker.execution import calls as calls
 from uniserve_worker.execution.batch_state import BatchState
 from uniserve_worker.execution.commit import _discard_group
+from uniserve_worker.execution.host_media import (
+    BORROWED_INPUT_CALLS,
+    encoded_unit_positions,
+)
 from uniserve_worker.execution.output import OutputBuffer, PendingOutput
 from uniserve_worker.execution.rows import CallIdentity
 from uniserve_worker.execution.sampling import SAMPLING_COMPLETION_FIELDS
-from uniserve_worker.execution.video import require_media_output_ring
 from uniserve_worker.execution.video import (
     validate_batch as validate_video_batch,
 )
@@ -65,11 +67,10 @@ if TYPE_CHECKING:
     from uniserve_worker.config import WorkerConfig
     from uniserve_worker.execution.model_runner import ModelRunner
     from uniserve_worker.execution.output import OutputPool
-    from uniserve_worker.media.buffers import MediaBuffers
     from uniserve_worker.media.mux import MediaMux
     from uniserve_worker.runtime.block_tables import BlockTables
     from uniserve_worker.runtime.cache_manager import CacheManager
-    from uniserve_worker.runtime.host_lane import HostLane
+    from uniserve_worker.runtime.host_lane import HostLane, HostTask
     from uniserve_worker.runtime.latent_pool import LatentPool
     from uniserve_worker.runtime.request import RequestPool
     from uniserve_worker.runtime.tensor_store import TensorStore
@@ -262,9 +263,20 @@ def prepare_inputs(
             "cross-call input requires a configured transport"
         )
 
+    # A host call reads its media inputs in place from the segments their
+    # producers published, so they are borrowed at execution, not imported.
+    borrowed = {
+        product.buffer_id
+        for call in batch.calls
+        if call.kind in BORROWED_INPUT_CALLS
+        for product in call.inputs
+    }
+    state.borrowed_inputs.update(borrowed)
     try:
         for entry in entries:
             assert transports
+            if entry.product.buffer_id in borrowed:
+                continue
 
             # One transferred product must land on exactly one consumer device.
             devices = {
@@ -746,7 +758,6 @@ def _open_group(
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
-    media_buffers: MediaBuffers | None,
     output_pool: OutputPool,
     request_tables: BlockTables | None,
     request_pool: RequestPool,
@@ -855,8 +866,6 @@ def _open_group(
                 completion_group,
                 host_tasks=host_tasks,
                 worker_info=worker_info,
-                media_buffers=media_buffers,
-                postprocessor=model_runner.video_postprocessor,
                 config=config,
                 state=state,
             )
@@ -975,13 +984,13 @@ def _reserve_host_tasks(
     state: BatchState,
     host_tasks: HostLane,
     worker_info: WorkerInfo,
-    media_buffers: MediaBuffers | None,
-    postprocessor: VideoPostprocessor | None,
     config: WorkerConfig,
 ) -> None:
-    """Reserve bounded CPU slots for active calls that schedule host-side.
+    """Reserve bounded host-lane slots for the calls that run host work.
 
-    work.
+    A media unit encode reserves one slot per unit this rank takes from the
+    round; audio encoding, muxing and image decoding reserve one each. A
+    non-distributed component's host work belongs to its publication owner.
     """
     for call in scheduled:
         if call.kind not in {
@@ -992,16 +1001,19 @@ def _reserve_host_tasks(
         }:
             continue
 
-        # A distributed component's host work belongs to whichever of its ranks
-        # received the call, because each holds its own media units. Any
-        # other component materializes on its single publication owner.
-        distributed = any(
-            component.name == call.component
-            and component.config.distribution is not None
-            for component in worker_info.components
+        component = next(
+            (
+                binding
+                for binding in worker_info.components
+                if binding.name == call.component
+            ),
+            None,
+        )
+        distributed = (
+            component is not None and component.config.distribution is not None
         )
         if (
-            postprocessor is not None
+            call.kind is not MediaCall.IMAGE_DECODING
             and not distributed
             and config.rank != worker_info.output_rank(call.component)
         ):
@@ -1015,24 +1027,25 @@ def _reserve_host_tasks(
                 "materialization repeats its CPU task identity"
             )
 
-        reservation = host_tasks.reserve()
-        try:
-            if call.kind in {
-                MediaCall.VIDEO_ENCODING,
-                MediaCall.AUDIO_ENCODING,
-            }:
-                pending.media_lease = require_media_output_ring(
-                    media_buffers
-                ).reserve(
-                    "video"
-                    if call.kind is MediaCall.VIDEO_ENCODING
-                    else "audio"
+        count = 1
+        if call.kind is MediaCall.VIDEO_ENCODING and component is not None:
+            count = len(
+                encoded_unit_positions(
+                    call,
+                    state=state,
+                    component=component.config,
+                    rank=config.rank,
                 )
+            )
+        reservations: list[HostTask] = []
+        try:
+            for _ in range(count):
+                reservations.append(host_tasks.reserve())
         except BaseException:
-            reservation.abandon()
+            for reservation in reservations:
+                reservation.abandon()
             raise
-
-        pending.completion_tasks = (reservation,)
+        pending.completion_tasks = tuple(reservations)
 
 
 def validate_batch(
@@ -1685,6 +1698,8 @@ def _stage_input_products(
 
     for entry in input_products:
         product = entry.product
+        if product.buffer_id in state.borrowed_inputs:
+            continue
         # Transfer metadata determines which runtime owns the imported value;
         # each branch validates identity and shape before publication.
         if not state.input_ready(product.buffer_id):

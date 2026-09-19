@@ -11,22 +11,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve.media import video
 from uniserve.model import AudioDecoder, VideoDecoder, VideoPostprocessor
-from uniserve.profiling import profile_range
 from uniserve.tensors import TensorOutput, concatenate_views
 from uniserve_worker.foundation.errors import (
     invalid_descriptor,
     unsupported_setup,
 )
-from uniserve_worker.media.buffers import MediaBuffers
-from uniserve_worker.media.mux import (
-    AvMuxConfig,
-    MediaEncoder,
-    MediaMux,
-    read_encoded_unit,
-    require_media_codecs,
-)
+from uniserve_worker.media.mux import AvMuxConfig
 from uniserve_worker.protocol.batch import (
     Batch,
     DecodeRange,
@@ -41,7 +32,6 @@ from uniserve_worker.protocol.call import (
 )
 from uniserve_worker.protocol.identity import CallId
 from uniserve_worker.protocol.output import FinishFlags
-from uniserve_worker.runtime.host_lane import HostLane, HostTask
 
 from . import calls
 from .batch_state import BatchState
@@ -57,11 +47,6 @@ if TYPE_CHECKING:
     from ..runtime.tensor_store import TensorStore
     from ..transfer.tickets import Transport
     from .model_runner import ModelRunner
-
-
-def require_video_codecs() -> None:
-    """Verify the output owner's configured video and audio encoders."""
-    require_media_codecs("libx264", "aac")
 
 
 def video_shape(runner: ModelRunner, media: DiffusionParams, tokens: int):
@@ -147,7 +132,19 @@ def prepare_call(runner: ModelRunner, trajectory: VideoState, call, storage):
         return trajectory.tensors["denoising"], context
 
     if kind is MediaCall.VIDEO_DECODING:
-        return {}, runner.prepare_module(
+        # A decode round also converts its media unit to RGB, cross-faded with
+        # the neighbouring unit's tail held in the request's overlap state.
+        postprocessor = runner.video_postprocessor
+        if "video_overlap" not in trajectory.tensors:
+            if storage is None:
+                raise RuntimeError(
+                    "video reconstruction requires reserved overlap storage"
+                )
+            trajectory.tensors["video_overlap"] = storage.view(
+                postprocessor.state_buffers(size.num_frames)
+            )
+        runner.prepare_module(call.component, size.num_frames, method="forward")
+        return trajectory.tensors["video_overlap"], runner.prepare_module(
             call.component, size.num_frames, method="decode"
         )
 
@@ -156,20 +153,6 @@ def prepare_call(runner: ModelRunner, trajectory: VideoState, call, storage):
         frames = decoder.latent_frames(audio_samples(runner, size.num_frames))
         return {}, runner.prepare_module(
             call.component, frames, method="decode"
-        )
-
-    if kind is MediaCall.VIDEO_ENCODING:
-        component = runner.component(kind)
-        if "video_overlap" not in trajectory.tensors:
-            if storage is None:
-                raise RuntimeError(
-                    "video assembly requires reserved overlap storage"
-                )
-            trajectory.tensors["video_overlap"] = storage.view(
-                component.state_buffers(size.num_frames)
-            )
-        return trajectory.tensors["video_overlap"], runner.prepare_module(
-            call.component, size.num_frames, method="forward"
         )
 
     return {}, None
@@ -487,60 +470,6 @@ def mux_config(runner: ModelRunner, media) -> AvMuxConfig:
     )
 
 
-def create_media_resources(
-    runner: ModelRunner,
-    *,
-    rank: int,
-    worker_info,
-    state_slots: int,
-    unresolved_window: int,
-    host_tasks: HostLane,
-    pin: bool,
-):
-    """Reserve this rank's media capture, encoder and assembly resources.
-
-    Every rank that reconstructs media units encodes them on its own host lane
-    and needs a capture ring; only the muxer rank assembles the artifact.
-    """
-    from ..bootstrap.components import MUXER_COMPONENT
-
-    muxer = runner.bindings.get(MUXER_COMPONENT)
-    assembles = (
-        muxer is not None
-        and muxer.owns
-        and rank == worker_info.output_rank(MUXER_COMPONENT)
-    )
-    reconstructs = any(
-        isinstance(call.module, VideoPostprocessor)
-        for _, call in runner._module_calls.values()
-    )
-    if not assembles and not reconstructs:
-        return None, None
-    require_video_codecs()
-
-    decoder = runner.video_decoder
-    output = runner.video_postprocessor
-    audio = runner.audio_decoder
-    frames = runner.media_builder.maximum.num_frames
-    # A capture slot holds one media unit, which is what one encode call
-    # converts, rather than the whole timeline.
-    unit = max(
-        window.stop - window.start for window in decoder.frame_slices(frames)
-    )
-    return (
-        MediaMux(rank=rank, lane=host_tasks) if assembles else None,
-        MediaBuffers(
-            state_slots=state_slots,
-            unresolved_window=unresolved_window,
-            max_video_frames_per_round=unit,
-            video=video.Config(frames, decoder.frame_size),
-            frame_rate=output.frame_rate,
-            audio_rate=audio.sample_rate,
-            pin=pin,
-        ),
-    )
-
-
 def trajectory_params(call: Call, *, state: BatchState):
     """Return the unique latent trajectory params assigned to an call."""
     selected = tuple(
@@ -598,12 +527,16 @@ def execute(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    media_mux: MediaMux | None,
     publication_transports: Mapping[str, Transport],
     request_pool: RequestPool,
     model_runner: ModelRunner,
 ) -> PendingOutput:
-    """Land one ready video action without constructing a model input row."""
+    """Land one ready video call without constructing a model input row.
+
+    Latent preparation, denoising steps and decode rounds run here on the
+    device; a video decode round also converts its media unit to RGB and
+    publishes it as a host product for the host ranks that encode it.
+    """
     if model_runner.video_postprocessor is None:
         raise invalid_descriptor("video execution requires a video model")
     request = state.pending_output(
@@ -644,17 +577,8 @@ def execute(
         else None,
     )
 
-    mux = media_mux
-    # Media units are encoded on the ranks that reconstruct them; only the
-    # muxer rank encodes the audio track and assembles the artifact.
-    if (
-        call.kind in {MediaCall.AUDIO_ENCODING, MediaCall.MUXING}
-        and mux is None
-    ):
-        raise unsupported_setup("artifact assembly has no muxer resources")
     from . import transfer
 
-    tasks: tuple[HostTask, ...] = ()
     products: tuple[TensorPublication, ...] = ()
     if call.kind is MediaCall.LATENT_PREPARATION:
         params = trajectory_params(call, state=state)
@@ -756,12 +680,7 @@ def execute(
                 state=state,
             )
 
-    elif call.kind in {
-        MediaCall.VIDEO_DECODING,
-        MediaCall.AUDIO_DECODING,
-        MediaCall.VIDEO_ENCODING,
-        MediaCall.AUDIO_ENCODING,
-    }:
+    elif call.kind in {MediaCall.VIDEO_DECODING, MediaCall.AUDIO_DECODING}:
         params = decode_range(call, state=state)
         inputs = call.inputs
         if len(inputs) != 1:
@@ -774,13 +693,7 @@ def execute(
             device=model_runner.call_devices(call)[0],
         )
         request.device_reads.append(read)
-        if (
-            read.region is not None
-            and call.kind is not MediaCall.VIDEO_ENCODING
-        ):
-            # Video encoding consumes the media unit this rank decoded, which is
-            # a region of the round's product; every other media call consumes a
-            # complete input.
+        if read.region is not None or read.tensor is None:
             raise invalid_descriptor(
                 "media reconstruction requires complete input coverage"
             )
@@ -788,113 +701,55 @@ def execute(
         cursor, count = params.cursor, params.max_units
         track = (
             MediaTrack.AUDIO
-            if call.kind in {MediaCall.AUDIO_DECODING, MediaCall.AUDIO_ENCODING}
+            if call.kind is MediaCall.AUDIO_DECODING
             else MediaTrack.VIDEO
         )
-        if call.kind in {
-            MediaCall.VIDEO_DECODING,
-            MediaCall.AUDIO_DECODING,
-        }:
-            # Each rank of a distributed decoder binding owns one media unit
-            # of the declared range, on either track.
-            samples = (
-                None
-                if track is MediaTrack.VIDEO
-                else audio_samples(model_runner, media.num_frames)
+        # Each rank of a distributed decoder binding owns one media unit of
+        # the declared range, on either track.
+        samples = (
+            None
+            if track is MediaTrack.VIDEO
+            else audio_samples(model_runner, media.num_frames)
+        )
+        windows = (
+            model_runner.video_decoder.frame_slices(media.num_frames)
+            if samples is None
+            else audio_unit_windows(model_runner, call.component, samples)
+        )
+        binding = model_runner.bindings[call.component]
+        position = binding.config.ranks.index(binding.process_group.global_rank)
+        if position >= count or cursor < 0 or cursor + count > len(windows):
+            raise invalid_descriptor(
+                "media decoder assignment exceeds its media unit range"
             )
-            windows = (
-                model_runner.video_decoder.frame_slices(media.num_frames)
-                if samples is None
-                else audio_unit_windows(model_runner, call.component, samples)
-            )
-            binding = model_runner.bindings[call.component]
-            position = binding.config.ranks.index(
-                binding.process_group.global_rank
-            )
-            if position >= count or cursor < 0 or cursor + count > len(windows):
-                raise invalid_descriptor(
-                    "media decoder assignment exceeds its media unit range"
-                )
-            window = windows[cursor + position]
-            if read.tensor is None:
-                raise invalid_descriptor(
-                    "media decoder has no complete numerical input"
-                )
+        unit = cursor + position
+        window = windows[unit]
 
-            if track is MediaTrack.VIDEO:
-                result = model_runner.run_module(
-                    call.component,
-                    (read.tensor,),
-                    method="decode",
-                    size=media.num_frames,
-                    frames=(window,),
-                    num_frames=(media.num_frames,),
-                )
-            else:
-                decoder = model_runner.component(call.kind)
-                result = model_runner.run_module(
-                    call.component,
-                    (read.tensor,),
-                    method="decode",
-                    size=decoder.latent_frames(samples),
-                    frames=(window,),
-                    num_samples=(samples,),
-                )
-            if result.stats is None:
+        if track is MediaTrack.VIDEO:
+            decoded = model_runner.run_module(
+                call.component,
+                (read.tensor,),
+                method="decode",
+                size=media.num_frames,
+                frames=(window,),
+                num_frames=(media.num_frames,),
+            )
+            if decoded.stats is None:
                 raise RuntimeError("module output has no execution statistics")
-            state.group_forward_stats[completion_group].append(result.stats)
-            if len(result.values) != 1:
+            state.group_forward_stats[completion_group].append(decoded.stats)
+            if len(decoded.values) != 1 or decoded.values[0].shape[0] != 1:
                 raise invalid_descriptor(
-                    "media decoder must return one numerical tensor"
+                    "video decoding reconstructs exactly one media unit"
                 )
-            # A PCM media unit is a host product: the muxer's audio encoder
-            # consumes it on its host lane, so it travels as host bytes over
-            # the host mechanism, across hosts as readily as within one. A
-            # decoded video window stays on its device for the encoder there.
-            products = transfer.publish_tensors(
-                call,
-                result.values,
-                completion_group,
-                tensor_store=tensor_store,
-                publication_transports=publication_transports,
-                state=state,
-                host=call.kind is MediaCall.AUDIO_DECODING,
-            )
-        elif call.kind is MediaCall.VIDEO_ENCODING:
-            # The rank that decoded this media unit converts it to RGB on its
-            # device lane and encodes it on its host lane, so its input is the
-            # shard it published rather than the whole round.
-            binding = model_runner.bindings[call.component]
-            position = binding.config.ranks.index(
-                binding.process_group.global_rank
-            )
+
+            # The decoded window becomes an RGB media unit on this rank,
+            # cross-faded with the neighbouring unit's tail, and that unit
+            # is the product a host rank encodes.
             decoder = model_runner.video_decoder
-            windows = decoder.frame_slices(media.num_frames)
-            unit = cursor + position
-            if position >= count or unit >= len(windows):
-                raise invalid_descriptor(
-                    "media unit assignment exceeds its media unit range"
-                )
-            if read.tensor is None or read.tensor.shape[0] != 1:
-                raise invalid_descriptor(
-                    "video encoding reconstructs exactly one media unit"
-                )
-
-            reservation = (
-                request.completion_tasks[0]
-                if request.completion_tasks
-                else None
-            )
-            ring_lease = request.media_lease
-            if reservation is None or ring_lease is None:
-                raise RuntimeError(
-                    "media output has no reserved capture storage"
-                )
-
             layout = decoder.output_layout(media.num_frames)["video"]
             unit_outputs = (
                 TensorOutput(
-                    read.tensor[0].unsqueeze(0),
+                    decoded.values[0],
                     replace(
                         layout,
                         local_slice=(
@@ -909,165 +764,72 @@ def execute(
                 unit_outputs,
                 method="forward",
                 size=media.num_frames,
-                frames=(windows[unit],),
+                frames=(window,),
                 num_frames=(media.num_frames,),
                 state=slot,
                 unit_count=count,
             )
             state.group_forward_stats[completion_group].append(processed.stats)
-            # Concatenation borrows one flat byte span. Restore the RGB raster
-            # axes before handing its pinned capture to the encoder.
+            # Concatenation borrows one flat byte span; the product row is
+            # the unit's frames at the output raster, and a unit shorter than
+            # the longest fills its row's leading frames.
+            frames = window.stop - window.start
             value = concatenate_views(processed.values).view(
-                -1, decoder.frame_size.height, decoder.frame_size.width, 3
+                1,
+                frames,
+                decoder.frame_size.height,
+                decoder.frame_size.width,
+                3,
             )
-
-            with profile_range(
-                f"uniserve.video.decode_copy "
-                f"request={_request_label(call)} "
-                f"step={call.call_id.batch_id} "
-                f"op={call.call_id.request_index} "
-                f"kind={track.value}"
-            ):
-                capture = state.group_buffers[
-                    completion_group
-                ].capture_bytes_into(value, ring_lease.storage)
-            try:
-                tasks = (
-                    MediaEncoder(rank=model_runner.worker_config.rank).unit(
-                        call.request_key,
-                        config=mux_config(model_runner, media),
-                        unit_index=unit,
-                        frames=capture,
-                        output=state.group_buffers[completion_group],
-                        reservation=reservation,
-                        ring_lease=ring_lease,
-                        call_id=call.call_id,
-                    ),
-                )
-            except BaseException:
-                ring_lease.defer_until_ready(
-                    state.group_buffers[completion_group].completion_future()
-                )
-                raise
-            # The encoded unit is the product the muxer assembles. Its row is
-            # published with this batch and filled when the encode completes;
-            # the muxer's call is scheduled only after every encode round has
-            # completed, so no rank can read the row before its bytes land.
-            row = transfer.reserved_unit_row(
-                call, completion_group, state=state
+            longest = max(
+                span.stop - span.start
+                for span in decoder.frame_slices(media.num_frames)
             )
-            request.encoded_unit_row = row[0]
-            products = transfer.publish_tensors(
-                call,
-                (row,),
-                completion_group,
-                tensor_store=tensor_store,
-                publication_transports=publication_transports,
-                state=state,
-            )
-
+            if frames < longest:
+                row = value.new_zeros((1, longest, *value.shape[2:]))
+                row[:, :frames].copy_(value)
+                value = row
+            values = (value,)
         else:
-            assert mux is not None
-            decoder = model_runner.video_decoder
-            windows = decoder.frame_slices(media.num_frames)
-            mux.open(
-                call.request_key,
-                video=video.Config(media.num_frames, decoder.frame_size),
-                frame_rate=model_runner.video_postprocessor.frame_rate,
-                audio_rate=model_runner.audio_decoder.sample_rate,
-                video_unit_frames=tuple(
-                    window.stop - window.start for window in windows
-                ),
+            audio_decoder = model_runner.component(call.kind)
+            result = model_runner.run_module(
+                call.component,
+                (read.tensor,),
+                method="decode",
+                size=audio_decoder.latent_frames(samples),
+                frames=(window,),
+                num_samples=(samples,),
             )
-            reservation = (
-                request.completion_tasks[0]
-                if request.completion_tasks
-                else None
-            )
-            ring_lease = request.media_lease
-            if reservation is None or ring_lease is None:
-                raise RuntimeError(
-                    "media output has no reserved capture storage"
-                )
-            if read.region is not None:
+            if result.stats is None:
+                raise RuntimeError("module output has no execution statistics")
+            state.group_forward_stats[completion_group].append(result.stats)
+            if len(result.values) != 1:
                 raise invalid_descriptor(
-                    "audio encoding requires the complete sample timeline"
+                    "media decoder must return one numerical tensor"
                 )
-            value = read.tensor.view(torch.uint8)
-            with profile_range(
-                f"uniserve.video.decode_copy "
-                f"request={_request_label(call)} "
-                f"step={call.call_id.batch_id} "
-                f"op={call.call_id.request_index} "
-                f"kind={track.value}"
-            ):
-                capture = state.group_buffers[
-                    completion_group
-                ].capture_bytes_into(value, ring_lease.storage)
-            try:
-                tasks = (
-                    mux.audio(
-                        call.request_key,
-                        capture,
-                        state.group_buffers[completion_group],
-                        reservation,
-                        ring_lease,
-                        call.call_id,
-                    ),
-                )
-            except BaseException:
-                ring_lease.defer_until_ready(
-                    state.group_buffers[completion_group].completion_future()
-                )
-                raise
-    else:
-        reservation = (
-            request.completion_tasks[0] if request.completion_tasks else None
+            values = result.values
+        # Decoded media units are host products: a host rank's encoder reads
+        # them in place from the segment this rank publishes, over the host
+        # mechanism of its edges.
+        products = transfer.publish_tensors(
+            call,
+            values,
+            completion_group,
+            tensor_store=tensor_store,
+            publication_transports=publication_transports,
+            state=state,
+            host=True,
         )
-        if reservation is None or mux is None:
-            raise RuntimeError("media finalization has no reserved CPU task")
-        # A muxing call carries the encode rounds completed since the last
-        # one, one product per round in media unit order, and the muxer
-        # appends them to the request's container. The final call carries
-        # none: every unit and the audio track are in, and it assembles the
-        # artifact.
-        units: list[bytes] = []
-        for product in call.inputs:
-            read = tensor_store.consume(
-                product,
-                consumer_call_id=call.call_id,
-                device=model_runner.call_devices(call)[0],
-            )
-            request.device_reads.append(read)
-            if read.region is not None or read.tensor is None:
-                raise invalid_descriptor(
-                    "artifact assembly requires every encoded media unit"
-                )
-            rows = read.tensor.to("cpu")
-            units.extend(read_encoded_unit(row) for row in rows.unbind(0))
-        if units:
-            tasks = (
-                mux.append_units(
-                    call.request_key, tuple(units), reservation, call.call_id
-                ),
-            )
-        else:
-            tasks = (
-                mux.finalize_artifact(
-                    call.request_key, reservation, call.call_id
-                ),
-            )
+    else:
+        raise invalid_descriptor(f"unsupported video call {call.kind!r}")
 
-    # Configured HostTask now owns the media lease through its final CPU read.
-    request.media_lease = None
     request.status = CallStatus.OK
-    # Reconstruction and mux calls consume products without advancing the
-    # diffusion trajectory. Keep their progress absent; denoising retains the
-    # step already projected above through the same completion boundary.
+    # Reconstruction calls consume products without advancing the diffusion
+    # trajectory. Keep their progress absent; denoising retains the step
+    # already projected above through the same completion boundary.
     request.progress = calls.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
     request.product_generations = calls.output_generations(call)
-    request.completion_tasks = tasks
     request.products = products
     return request
 
@@ -1081,14 +843,6 @@ def _request_label(call: Call) -> str:
 __all__ = [
     "decode_range",
     "execute",
-    "require_video_codecs",
     "trajectory_params",
     "validate_batch",
 ]
-
-
-def require_media_output_ring(ring: MediaBuffers | None) -> MediaBuffers:
-    """Require bounded media storage on the configured output rank."""
-    if ring is None:
-        raise unsupported_setup("call requires the media output owner's ring")
-    return ring

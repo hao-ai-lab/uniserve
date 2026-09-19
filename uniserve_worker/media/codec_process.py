@@ -23,7 +23,6 @@ import subprocess
 import sys
 from dataclasses import dataclass, replace
 from fractions import Fraction
-from multiprocessing import reduction
 from multiprocessing.connection import Connection
 from threading import Lock
 from typing import Any
@@ -42,8 +41,8 @@ __all__ = [
     "MuxAppend",
     "MuxClose",
     "MuxFinalize",
+    "Probe",
     "SessionKey",
-    "SharedMapping",
     "SharedSlice",
     "encode_audio_track",
     "encode_video_unit",
@@ -326,40 +325,27 @@ class AvMuxSession:
         self._audio_out = None
 
 
-class SharedMapping:
-    """Anonymous shared memory a rank pins and its codec processes read.
+@dataclass(frozen=True, slots=True)
+class SharedSlice:
+    """A media unit's bytes inside a POSIX shared-memory segment.
 
-    The memory is a memfd, so it is bounded by the machine rather than by the
-    shared-memory filesystem, and it reaches a codec process as a descriptor.
-    The owner closes it once the mapping's readers are gone.
+    The segment is a host product's publication, named in this host's
+    shared-memory namespace; a codec process maps it for the job that reads
+    it and unmaps it afterwards, so the producer's retirement of the segment
+    never waits on a codec process.
     """
 
-    def __init__(self, name: str, nbytes: int) -> None:
-        if nbytes < 1:
-            raise ValueError("shared mapping capacity must be positive")
-        self.name = name
-        self.nbytes = int(nbytes)
-        self.fd = os.memfd_create(name, 0)
-        try:
-            os.ftruncate(self.fd, self.nbytes)
-            self.buffer = mmap.mmap(self.fd, self.nbytes)
-        except BaseException:
-            os.close(self.fd)
-            raise
-
-    def close(self) -> None:
-        """Unmap and release the descriptor; readers keep their own."""
-        self.buffer.close()
-        os.close(self.fd)
+    segment: str
+    offset: int
+    nbytes: int
 
 
 @dataclass(frozen=True, slots=True)
-class SharedSlice:
-    """A media unit's bytes inside a mapping a codec process attached."""
+class Probe:
+    """Confirm the process serves and its codecs load; the result is True."""
 
-    mapping: str
-    offset: int
-    nbytes: int
+    video_codec: str = "libx264"
+    audio_codec: str = "aac"
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,11 +358,15 @@ class EncodeVideoUnit:
 
 @dataclass(frozen=True, slots=True)
 class EncodeAudioTrack:
-    """Encode a request's stereo int16 PCM into its mux session's track."""
+    """Encode a request's stereo int16 PCM into its mux session's track.
+
+    The timeline arrives as the slices its decoding ranks published, in
+    sample order; the job joins them.
+    """
 
     session: SessionKey
     config: AvMuxConfig
-    source: SharedSlice
+    sources: tuple[SharedSlice, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,7 +397,12 @@ class MuxClose:
 
 
 CodecJob = (
-    EncodeVideoUnit | EncodeAudioTrack | MuxAppend | MuxFinalize | MuxClose
+    Probe
+    | EncodeVideoUnit
+    | EncodeAudioTrack
+    | MuxAppend
+    | MuxFinalize
+    | MuxClose
 )
 
 
@@ -419,31 +414,46 @@ class _Session:
         self.audio: bytes | None = None
 
 
-def _read(mappings: dict[str, mmap.mmap], source: SharedSlice) -> np.ndarray:
-    """View a media unit's bytes in an attached mapping without copying."""
-    mapping = mappings.get(source.mapping)
-    if mapping is None:
-        raise RuntimeError(
-            f"codec process has no mapping named {source.mapping!r}"
+def _read(source: SharedSlice) -> np.ndarray:
+    """View a media unit's bytes in its shared-memory segment without copying.
+
+    The segment is opened by name in this host's shared-memory namespace,
+    read-only; the mapping lives as long as the returned view and is released
+    with it, so a codec that keeps a frame's storage alive keeps the mapping.
+    """
+    if source.offset < 0 or source.nbytes < 0:
+        raise ValueError("media unit lies outside its shared-memory segment")
+    name = source.segment.removeprefix("/")
+    descriptor = os.open(f"/dev/shm/{name}", os.O_RDONLY)
+    try:
+        size = os.fstat(descriptor).st_size
+        if source.offset + source.nbytes > size:
+            raise ValueError(
+                "media unit lies outside its shared-memory segment"
+            )
+        mapping = mmap.mmap(
+            descriptor,
+            source.offset + source.nbytes,
+            prot=mmap.PROT_READ,
         )
-    if source.offset < 0 or source.offset + source.nbytes > len(mapping):
-        raise ValueError("media unit lies outside its shared mapping")
+    finally:
+        os.close(descriptor)
     return np.frombuffer(
         mapping, dtype=np.uint8, count=source.nbytes, offset=source.offset
     )
 
 
-def _execute(
-    job: CodecJob,
-    mappings: dict[str, mmap.mmap],
-    sessions: dict[SessionKey, _Session],
-) -> object:
-    """Run one job against the process's mappings and sessions."""
+def _execute(job: CodecJob, sessions: dict[SessionKey, _Session]) -> object:
+    """Run one job against the process's sessions."""
+    if isinstance(job, Probe):
+        require_media_codecs(job.video_codec, job.audio_codec)
+        return True
+
     if isinstance(job, EncodeVideoUnit):
         raster = job.config.height * job.config.width * 3
         if job.source.nbytes % raster != 0:
             raise ValueError("video capture has invalid RGB24 dimensions")
-        pixels = _read(mappings, job.source).reshape(
+        pixels = _read(job.source).reshape(
             -1, job.config.height, job.config.width, 3
         )
         return encode_video_unit(job.config, pixels)
@@ -454,7 +464,8 @@ def _execute(
             session = sessions[job.session] = _Session(job.config)
         if session.audio is not None:
             raise ValueError("audio output is already written")
-        track = _read(mappings, job.source).view(np.int16).reshape(-1, 2)
+        samples = np.concatenate([_read(source) for source in job.sources])
+        track = samples.view(np.int16).reshape(-1, 2)
         session.audio = encode_audio_track(job.config, track)
         return None
 
@@ -489,7 +500,6 @@ def codec_main(connection: Connection) -> None:
     Every message is answered with ("ok", value) or ("error", exception), so
     a failure of one job reaches its task without ending the process.
     """
-    mappings: dict[str, mmap.mmap] = {}
     sessions: dict[SessionKey, _Session] = {}
     try:
         while True:
@@ -502,18 +512,8 @@ def codec_main(connection: Connection) -> None:
 
             kind = message[0]
             try:
-                if kind == "attach":
-                    _, name, nbytes = message
-                    fd = reduction.recv_handle(connection)
-                    try:
-                        mappings[name] = mmap.mmap(
-                            fd, nbytes, prot=mmap.PROT_READ
-                        )
-                    finally:
-                        os.close(fd)
-                    value: object = None
-                elif kind == "job":
-                    value = _execute(message[1], mappings, sessions)
+                if kind == "job":
+                    value = _execute(message[1], sessions)
                 else:
                     raise TypeError(f"unsupported codec message {kind!r}")
             except BaseException as error:  # noqa: BLE001 - answered
@@ -523,8 +523,6 @@ def codec_main(connection: Connection) -> None:
     finally:
         for session in sessions.values():
             session.container.close()
-        for mapping in mappings.values():
-            mapping.close()
         connection.close()
 
 
@@ -533,11 +531,12 @@ class CodecProcess:
 
     The process is started as its own interpreter running this module, so it
     inherits nothing of the rank but its environment; the connection is one
-    end of a socket pair, over which mappings travel as descriptors. Calls are
-    serialized by a lock, because a process runs one job at a time; the host
-    lane keeps one process per worker so its capacity is the lane's. Transfer
-    releases the interpreter lock, so a job in flight costs the rank nothing
-    but the bytes it exchanges.
+    end of a socket pair. A job names the shared-memory segment it reads, so
+    nothing but the job travels. Calls are serialized by a lock, because a
+    process runs one job at a time; the host lane keeps one process per
+    worker so its capacity is the lane's. Transfer releases the interpreter
+    lock, so a job in flight costs the rank nothing but the bytes it
+    exchanges.
     """
 
     def __init__(self) -> None:
@@ -557,15 +556,6 @@ class CodecProcess:
             theirs.close()
         self._connection = Connection(ours.detach())
         self._lock = Lock()
-
-    def attach(self, mapping: SharedMapping) -> None:
-        """Hand the process a mapping its jobs may read from."""
-        with self._lock:
-            self._connection.send(("attach", mapping.name, mapping.nbytes))
-            reduction.send_handle(
-                self._connection, mapping.fd, self._process.pid
-            )
-            self._reply()
 
     def execute(self, job: CodecJob) -> object:
         """Run one job to completion and return its result."""

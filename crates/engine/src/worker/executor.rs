@@ -127,9 +127,76 @@ pub struct WorkerExecutor {
     closed: bool,
 }
 
+/// Refuses a placement whose decoded video media units would leave their host.
+///
+/// A decoded media unit is a host product of tens of megabytes that its
+/// encoder reads through shared memory; the unit decoded on one rank is
+/// encoded on the rank holding its index, so both must share a host. A
+/// placement that separates them is refused at startup, naming the ranks,
+/// rather than moving every unit through the head's channel.
+pub(crate) fn refuse_units_crossing_hosts(
+    routing: &std::collections::BTreeMap<uniserve_worker_ipc::MediaCall, String>,
+    placements: &[(
+        &WorkerId,
+        &[crate::WorkerRank],
+        &std::collections::BTreeMap<String, crate::ComponentConfig>,
+    )],
+) -> anyhow::Result<()> {
+    let (Some(decoder), Some(encoder)) = (
+        routing.get(&uniserve_worker_ipc::MediaCall::VideoDecoding),
+        routing.get(&uniserve_worker_ipc::MediaCall::VideoEncoding),
+    ) else {
+        return Ok(());
+    };
+    let owner = |component: &str| {
+        placements.iter().find_map(|(id, ranks, components)| {
+            components
+                .get(component)
+                .map(|config| (*id, *ranks, config))
+        })
+    };
+    let (
+        Some((decoder_worker, decoder_ranks, decoder_config)),
+        Some((encoder_worker, encoder_ranks, encoder_config)),
+    ) = (owner(decoder), owner(encoder))
+    else {
+        return Ok(());
+    };
+    if decoder_worker == encoder_worker {
+        return Ok(());
+    }
+    // A round deals its media units to each component's ranks in order,
+    // `units_per_rank` consecutive positions each, so position `p` is
+    // decoded by the decoder's rank `p / per_decoder` and encoded by the
+    // encoder's rank `p / per_encoder`.
+    let per_decoder = decoder_config.units_per_rank.max(1);
+    let per_encoder = encoder_config.units_per_rank.max(1);
+    let round_units = decoder_config.ranks.len() * per_decoder;
+    for position in 0..round_units {
+        let decoding_rank = decoder_config.ranks[position / per_decoder];
+        let Some(&encoding_rank) = encoder_config.ranks.get(position / per_encoder) else {
+            continue;
+        };
+        let decoding_host = decoder_ranks
+            .get(decoding_rank)
+            .map_or("<unplaced>", |rank| rank.node.as_str());
+        let encoding_host = encoder_ranks
+            .get(encoding_rank)
+            .map_or("<unplaced>", |rank| rank.node.as_str());
+        anyhow::ensure!(
+            decoding_host == encoding_host,
+            "media unit {position} is decoded by rank {decoding_rank} of worker {decoder_worker} \
+             on host {decoding_host} and encoded by rank {encoding_rank} of worker \
+             {encoder_worker} on host {encoding_host}; a decoded media unit reaches its encoder \
+             through shared memory and must stay on its host"
+        );
+    }
+    Ok(())
+}
+
 impl WorkerExecutor {
     pub fn try_new(
-        workers: Vec<(WorkerId, WorkerGroup)>,
+        mut workers: Vec<(WorkerId, WorkerGroup)>,
         transfer: TransferConfig,
     ) -> anyhow::Result<Self> {
         let command_wake = crate::handle::WakeSignal::new()?;
@@ -175,6 +242,20 @@ impl WorkerExecutor {
                 .map(|worker| (worker.0.clone(), worker.1.info().clone()))
                 .collect(),
         )?;
+        // The video graph may span workers, so each group learns the whole
+        // deployment's routing to name the ranks that read its products.
+        let media_routing = executor_info.media_routing()?;
+        let placements = workers
+            .iter()
+            .map(|(id, worker)| {
+                let (ranks, components) = worker.placement();
+                (id, ranks, components)
+            })
+            .collect::<Vec<_>>();
+        refuse_units_crossing_hosts(&media_routing, &placements)?;
+        for (_, worker) in &mut workers {
+            worker.set_media_routing(media_routing.clone());
+        }
         let mut physical_edges = HashSet::new();
         for edge in &transfer.edges {
             anyhow::ensure!(
@@ -1446,5 +1527,165 @@ impl Executor for WorkerExecutor {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::refuse_units_crossing_hosts;
+    use crate::WorkerRank;
+    use crate::executor::{ComponentConfig, WorkerId};
+    use std::collections::BTreeMap;
+    use uniserve_worker_ipc::MediaCall;
+
+    fn rank(node: &str, device: &str) -> WorkerRank {
+        WorkerRank {
+            node: node.to_owned(),
+            device: device.to_owned(),
+        }
+    }
+
+    fn distributed(ranks: Vec<usize>, units_per_rank: usize) -> ComponentConfig {
+        ComponentConfig {
+            ranks,
+            parallel_config: Default::default(),
+            distribution: Some(uniserve_core::ComponentDistribution::TemporalUnits),
+            units_per_rank,
+        }
+    }
+
+    fn routing() -> BTreeMap<MediaCall, String> {
+        BTreeMap::from([
+            (MediaCall::VideoDecoding, "video_decoder".to_owned()),
+            (MediaCall::VideoEncoding, "video_encoder".to_owned()),
+        ])
+    }
+
+    #[test]
+    fn a_decoded_unit_names_the_host_worker_ranks_that_read_it() {
+        // The decoder's product is read by the video encoder on the host
+        // worker: every encoder rank's slot is named, none of the decoder's
+        // own, and the host worker's slots follow the model worker's run.
+        use crate::executor::TransferConfig;
+        use crate::worker::instance::media_consumer_slots;
+
+        let model_components =
+            BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
+        let host_components =
+            BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0, 1], 2))]);
+        let peers = BTreeMap::from([
+            ("host".to_owned(), host_components),
+            ("model".to_owned(), model_components.clone()),
+        ]);
+        let mut transfer = TransferConfig::default();
+        transfer.worker_ranks.insert("host".to_owned(), 2);
+        transfer.worker_ranks.insert("model".to_owned(), 4);
+        let slots = media_consumer_slots(
+            &[MediaCall::VideoEncoding],
+            &routing(),
+            "model",
+            &model_components,
+            &peers,
+            &transfer,
+            &[0, 1, 2, 3],
+            2,
+        );
+        let expected = [
+            transfer.acknowledgment_slot("host", 0),
+            transfer.acknowledgment_slot("host", 1),
+        ];
+        assert_eq!(slots, expected);
+    }
+
+    #[test]
+    fn units_encoded_on_their_own_host_are_admitted() {
+        let model = WorkerId("model".to_owned());
+        let host = WorkerId("host".to_owned());
+        let model_ranks = vec![
+            rank("a", "cuda:0"),
+            rank("a", "cuda:1"),
+            rank("b", "cuda:0"),
+            rank("b", "cuda:1"),
+        ];
+        let host_ranks = vec![rank("a", "cpu"), rank("b", "cpu")];
+        let model_components =
+            BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
+        let host_components =
+            BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0, 1], 2))]);
+        refuse_units_crossing_hosts(
+            &routing(),
+            &[
+                (&model, &model_ranks, &model_components),
+                (&host, &host_ranks, &host_components),
+            ],
+        )
+        .expect("two units per host rank stay on their host");
+    }
+
+    #[test]
+    fn a_decoder_dealing_several_units_per_rank_keeps_them_on_its_host() {
+        // Two units per decoding rank and four per host rank: positions 0
+        // to 3 come from host a's decoders and go to host a's encoder,
+        // positions 4 to 7 likewise on host b.
+        let model = WorkerId("model".to_owned());
+        let host = WorkerId("host".to_owned());
+        let model_ranks = vec![
+            rank("a", "cuda:0"),
+            rank("a", "cuda:1"),
+            rank("b", "cuda:0"),
+            rank("b", "cuda:1"),
+        ];
+        let host_ranks = vec![rank("a", "cpu"), rank("b", "cpu")];
+        let model_components =
+            BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1, 2, 3], 2))]);
+        let host_components =
+            BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0, 1], 4))]);
+        refuse_units_crossing_hosts(
+            &routing(),
+            &[
+                (&model, &model_ranks, &model_components),
+                (&host, &host_ranks, &host_components),
+            ],
+        )
+        .expect("each host's units are encoded on it");
+
+        // Three per host rank splits host a's fourth unit off to host b.
+        let host_components =
+            BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0, 1], 3))]);
+        let error = refuse_units_crossing_hosts(
+            &routing(),
+            &[
+                (&model, &model_ranks, &model_components),
+                (&host, &host_ranks, &host_components),
+            ],
+        )
+        .expect_err("the fourth unit leaves host a");
+        assert!(error.to_string().contains("media unit 3"), "{error}");
+    }
+
+    #[test]
+    fn a_unit_encoded_on_another_host_is_refused_by_name() {
+        let model = WorkerId("model".to_owned());
+        let host = WorkerId("host".to_owned());
+        let model_ranks = vec![rank("a", "cuda:0"), rank("b", "cuda:0")];
+        let host_ranks = vec![rank("a", "cpu")];
+        let model_components =
+            BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1], 1))]);
+        let host_components =
+            BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0], 2))]);
+        let error = refuse_units_crossing_hosts(
+            &routing(),
+            &[
+                (&model, &model_ranks, &model_components),
+                (&host, &host_ranks, &host_components),
+            ],
+        )
+        .expect_err("the second unit leaves host b");
+        let message = error.to_string();
+        assert!(message.contains("media unit 1"), "{message}");
+        assert!(
+            message.contains("host b") && message.contains("host a"),
+            "{message}"
+        );
     }
 }
