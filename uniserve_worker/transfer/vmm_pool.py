@@ -8,9 +8,8 @@ pool addressed by offset and size.
 
 Two things follow. A consumer imports one handle per producing device rather
 than one per product, and it can keep that mapping for as long as the producer
-lives. And a publishing rank no longer needs its PyTorch allocator segments to
-be exportable, which is what the ``expandable_segments:False`` constraint
-existed to guarantee.
+lives. And a publishing rank's PyTorch allocator segments never need to be
+exportable, so every rank serves from expandable segments.
 
 A chunk carries its own acknowledgment header but does not track who owes an
 acknowledgment: that belongs to the publication the chunk backs, which the
