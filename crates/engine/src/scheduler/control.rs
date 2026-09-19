@@ -90,7 +90,20 @@ impl Scheduler {
                             self.enqueue(request, event_tx)
                         }
                         Request::Diffusion(request) => {
-                            self.enqueue_media(PendingMedia { request, event_tx })
+                            let queued_at = super::now();
+                            self.trace_record(json!({
+                                "event": "request_queued",
+                                "at_s": queued_at,
+                                "request_id": request.request_id.0,
+                                "queue": "media",
+                                "prompt_tokens": request.prompt_token_ids.len(),
+                                "seconds": request.sampling.num_decode_chunks,
+                            }));
+                            self.enqueue_media(PendingMedia {
+                                request,
+                                event_tx,
+                                queued_at,
+                            })
                         }
                     }
                 }

@@ -1024,6 +1024,31 @@ impl Scheduler {
             let (batch_id, calls) = stage_batches.remove(&stage).expect("stage batch exists");
             let batch_commands = starts.remove(&stage).unwrap_or_default();
             let batch = ExecutionBatch::new(batch_id, calls, batch_commands, Vec::new());
+            if self.trace_enabled() {
+                self.trace_record(json!({
+                    "event": "batch_submitted",
+                    "at_s": now(),
+                    "batch_id": batch.id,
+                    "stage": stage.as_str(),
+                    "batch_size": batch.requests.len(),
+                    "request_ids": batch
+                        .requests
+                        .iter()
+                        .map(|(call, _)| call.request_key.request_id.0)
+                        .collect::<Vec<_>>(),
+                    "admitted_request_ids": batch
+                        .admissions()
+                        .map(|request| request.request_key.request_id.0)
+                        .collect::<Vec<_>>(),
+                    "units": batch
+                        .requests
+                        .iter()
+                        .map(|(_, placement)| {
+                            placement.decode.as_ref().map_or(0, |range| range.max_units)
+                        })
+                        .collect::<Vec<_>>(),
+                }));
+            }
             self.register_pending_batch(&batch, submit_at);
             batches.push(batch);
         }
@@ -1956,6 +1981,21 @@ impl Scheduler {
             return;
         };
         self.running_order.retain(|candidate| *candidate != id);
+        let finished_at = now();
+        self.trace_record(json!({
+            "event": "request_finished",
+            "at_s": finished_at,
+            "request_id": id.0,
+            "queue": "media",
+            "queued_at": state.queued_at,
+            "admitted_at": state.admitted_at,
+            "total_us": ((finished_at - state.queued_at) * 1e6) as u64,
+            "outcome": match &event {
+                DiffusionTerminal::Completed(_) => "completed",
+                DiffusionTerminal::Failed(_) => "failed",
+                DiffusionTerminal::Finished(_) => "finished",
+            },
+        }));
         match event {
             DiffusionTerminal::Completed(artifact) => {
                 let _ = state.event_tx.send(EngineCoreOutput::Artifact(artifact));
@@ -2286,6 +2326,19 @@ impl Scheduler {
                 // generation calls continue through semantic validation.
                 let (image_kv, start_step) = match input {
                     InflightInput::Media { latent, decode } => {
+                        if let Some(ops) = resolved_ops.as_mut() {
+                            ops.push(json!({
+                                "request_id": id.0,
+                                "call_id": call_id,
+                                "kind": call_variant.as_str(),
+                                "status": record.status,
+                                "roundtrip_us": roundtrip_us,
+                                "worker_queued_us": record.timing_counters.queued_us,
+                                "device_us": record.timing_counters.device_us,
+                                "copy_us": record.timing_counters.copy_us,
+                                "host_us": record.timing_counters.host_us,
+                            }));
+                        }
                         self.process_diffusion_result(call, latent, decode, record, media);
                         continue;
                     }

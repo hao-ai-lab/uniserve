@@ -343,6 +343,18 @@ impl Scheduler {
             )
             .expect("validated media admission");
             let root = CallId::new(0, 0);
+            // The interval from receipt to admission is the queue wait; what
+            // follows until the first device call is the engine's and the
+            // rank's preparation, which the batch trace attributes.
+            let admitted_at = now();
+            self.trace_record(json!({
+                "event": "request_admitted",
+                "at_s": admitted_at,
+                "request_id": id.0,
+                "queue": "media",
+                "queued_at": submission.queued_at,
+                "queue_wait_us": ((admitted_at - submission.queued_at) * 1e6) as u64,
+            }));
             self.running_media.insert(
                 id,
                 MediaFlowState {
@@ -359,6 +371,8 @@ impl Scheduler {
                     audio: None,
                     admission,
                     admission_state: WorkerRegistration::Unsubmitted,
+                    queued_at: submission.queued_at,
+                    admitted_at,
                     text_encoding_scheduled: false,
                     latent_preparation_scheduled: false,
                     num_scheduled_steps: 0,
