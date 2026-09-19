@@ -165,9 +165,22 @@ def describe_components(
     return described
 
 
-def supported_calls(model: nn.Module) -> frozenset[CallKind]:
-    """Collect every call kind and transfer mode the model can serve."""
+def supported_calls(
+    model: nn.Module, held: Iterable[str] = ()
+) -> frozenset[CallKind]:
+    """Collect every call kind and transfer mode this worker can serve.
+
+    A placement names the components this worker holds, and a call the holder
+    of its component cannot serve has nowhere to run. A worker given no
+    placement holds every component the model declares, which is the undivided
+    deployment.
+    """
     components = describe_components(model)
+    names = set(held)
+    if names:
+        components = {
+            name: calls for name, calls in components.items() if name in names
+        }
     calls = tuple(call for items in components.values() for call in items)
     kinds = {TransferMode.TENSOR, *call_kinds(calls)}
     if MUXER_COMPONENT in components:
@@ -177,17 +190,9 @@ def supported_calls(model: nn.Module) -> frozenset[CallKind]:
     return frozenset(kinds)
 
 
-def media_components(model: nn.Module) -> dict[PipelineStage, str]:
-    """Resolve the media pipeline's component routing from its capabilities."""
-    components = describe_components(model)
-    if not any(
-        isinstance(call.module, VideoPostprocessor)
-        for calls in components.values()
-        for call in calls
-    ):
-        return {}
-
-    stages = {
+#: The stages a model that reconstructs video must serve between them.
+MEDIA_STAGES = frozenset(
+    {
         PipelineStage.TEXT_ENCODING,
         PipelineStage.LATENT_PREPARATION,
         PipelineStage.DENOISING,
@@ -197,21 +202,58 @@ def media_components(model: nn.Module) -> dict[PipelineStage, str]:
         PipelineStage.AUDIO_ENCODING,
         PipelineStage.MUXING,
     }
+)
 
-    routes = {}
+
+def pipeline_components(
+    model: nn.Module, held: Iterable[str] = ()
+) -> dict[PipelineStage, str]:
+    """Resolve which component serves each pipeline stage this worker holds.
+
+    The engine routes a stage to the entry named here, so a stage a model
+    serves from a component of its own -- a patch encoder placed apart from a
+    language backbone, as much as a denoiser placed apart from a muxer -- is
+    reported whether or not the model reconstructs video. A stage whose
+    component this placement does not hold is not reported, because this
+    worker cannot serve it.
+    """
+    components = describe_components(model)
+    names = set(held)
+    if names:
+        components = {
+            name: calls for name, calls in components.items() if name in names
+        }
+    owners: dict[PipelineStage, list[str]] = {}
     for name, calls in components.items():
-        owned = call_kinds(calls) & stages
+        owned = {
+            kind
+            for kind in call_kinds(calls)
+            if isinstance(kind, PipelineStage)
+        }
         if name == MUXER_COMPONENT:
             # The muxer's stages are host tasks with no numerical owner.
-            owned = MUXER_CALL_KINDS
+            owned = set(MUXER_CALL_KINDS)
         for stage in owned:
-            if stage in routes:
-                raise unsupported_setup(
-                    f"media pipeline repeats {stage.value} computation"
-                )
-            routes[stage] = name
+            owners.setdefault(stage, []).append(name)
 
-    if stages - routes.keys():
+    # A stage several components implement names no single entry, so nothing
+    # can be routed to it and it is not reported.
+    routes = {
+        stage: holders[0]
+        for stage, holders in owners.items()
+        if len(holders) == 1
+    }
+    if MUXER_COMPONENT not in components:
+        return routes
+
+    # A model that reconstructs video serves the whole media pipeline, and
+    # every stage of it from one entry.
+    for stage, holders in owners.items():
+        if len(holders) > 1:
+            raise unsupported_setup(
+                f"media pipeline repeats {stage.value} computation"
+            )
+    if MEDIA_STAGES - routes.keys():
         raise unsupported_setup(
             "media pipeline lacks required numerical capabilities"
         )

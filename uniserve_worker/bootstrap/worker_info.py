@@ -373,9 +373,14 @@ class WorkerInfo:
             raise invalid_descriptor("worker info repeats a work variant")
 
         if self.pipeline_components:
-            if self.num_inference_steps < 1 or set(
-                self.pipeline_components
-            ) != set(VIDEO_STAGES):
+            # A worker reports the entry serving each stage it implements. A
+            # deployment that assembles an artifact serves the whole video
+            # pipeline; one that reports only the stages it has, such as a
+            # patch encoder placed apart from a language backbone, does not.
+            if PipelineStage.MUXING in self.pipeline_components and (
+                self.num_inference_steps < 1
+                or set(self.pipeline_components) != set(VIDEO_STAGES)
+            ):
                 raise invalid_descriptor(
                     "video components or diffusion step count are incomplete"
                 )

@@ -36,7 +36,7 @@ from ..protocol.tensor import DeviceDim, OutputInfo
 from ..runtime.cache_manager import CacheManager
 from ..runtime.results import resolve_outputs
 from ..runtime.tensor_store import TensorStore, device_product_capacity_bytes
-from .components import media_components
+from .components import pipeline_components
 from .inputs import capability, image_builder, media_builder
 
 _DEVICE_PRODUCTS_PER_CALL = 6
@@ -453,7 +453,7 @@ def artifact_import_regions(
     time, and the muxer reads every round. Each round holds one media unit per
     participating rank and the muxer produced one of them itself.
     """
-    components = media_components(model)
+    components = pipeline_components(model)
     entry = components.get(PipelineStage.VIDEO_ENCODING)
     binding = None if entry is None else bindings.get(entry)
     decoder = capability(model, VideoDecoder)
@@ -505,7 +505,7 @@ def model_arena_capacity(
             product_bytes_per_request=local_product_storage_bytes(
                 resolve_outputs(model, worker_config),
                 bindings=bindings or {},
-                pipeline_components=media_components(model),
+                pipeline_components=pipeline_components(model),
                 max_unresolved_ops=request_tensor_window(
                     depth, request_pool_size
                 ),
@@ -753,7 +753,7 @@ def resolve_request_capacity(
                 product_bytes = local_product_storage_bytes(
                     resolve_outputs(model, worker_config),
                     bindings=bindings or {},
-                    pipeline_components=media_components(model),
+                    pipeline_components=pipeline_components(model),
                     max_unresolved_ops=request_tensor_window(
                         queue_depth, count
                     ),

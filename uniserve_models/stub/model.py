@@ -207,10 +207,16 @@ def entry_points(config: Config):
                     EntryPoint("embed_input_ids"),
                     EntryPoint("compute_logits"),
                     EntryPoint("denoiser.forward"),
-                    EntryPoint("vision_encoder.encode"),
                     EntryPoint("latent_encoder.encode"),
                     EntryPoint("image_decoder.decode"),
                 ),
+            ),
+            # The patch encoder is its own component, as it is in a model that
+            # encodes images separately from its language backbone, so a
+            # placement can hold the two on different ranks.
+            "vision_encoder": ComponentEntry(
+                "vision_encoder",
+                (EntryPoint("encode"),),
             ),
         }
     )

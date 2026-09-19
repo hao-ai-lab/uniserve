@@ -148,6 +148,7 @@ def test_retained_encoder_product_outlives_its_producer_request(
         predecessor=root_parent(admission),
         image_base64=base64.b64encode(image.getvalue()).decode("ascii"),
         encoder_handle=11,
+        entry="vision_encoder",
     )
     product = encode.encoder_output
     try:
