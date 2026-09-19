@@ -6,7 +6,7 @@ import gc
 import logging
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from functools import partial
 from queue import SimpleQueue
 from types import TracebackType
@@ -1428,27 +1428,38 @@ class Worker:
                 )
             self._last_collective_seq = batch.collective_seq
 
-        execute_batch(
-            state,
-            propagate_errors=state.propagate_errors,
-            kv_cache=self.kv_cache,
-            host_tasks=self.host_tasks,
-            tensor_store=self.tensor_store,
-            worker_info=self.info,
-            latent_pool=self.latent_pool,
-            media_mux=self.media_mux,
-            media_buffers=self.media_buffers,
-            output_pool=self.output_pool,
-            publication_transports=self.publication_transports,
-            request_tables=self.block_tables,
-            request_pool=self.requests,
-            model_runner=self.runner,
-            decode_state=self.decode_state,
-            sampling_group=self.sampling_group,
-            tokenizer=self.tokenizer,
-            transfer_backends=self.transports,
-            config=self.worker_config,
-        )
+        # A batch with calls is one numerical step of the worker: the profiler's
+        # capture window counts these steps, and the step name becomes the NVTX
+        # range that Nsight shows for the batch. Lifecycle-only batches carry no
+        # computation and are not counted.
+        if self.profiler is not None and batch.calls:
+            first = batch.calls[0]
+            step = self.profiler.step(f"batch:{first.kind}:{first.component}")
+        else:
+            step = nullcontext()
+
+        with step:
+            execute_batch(
+                state,
+                propagate_errors=state.propagate_errors,
+                kv_cache=self.kv_cache,
+                host_tasks=self.host_tasks,
+                tensor_store=self.tensor_store,
+                worker_info=self.info,
+                latent_pool=self.latent_pool,
+                media_mux=self.media_mux,
+                media_buffers=self.media_buffers,
+                output_pool=self.output_pool,
+                publication_transports=self.publication_transports,
+                request_tables=self.block_tables,
+                request_pool=self.requests,
+                model_runner=self.runner,
+                decode_state=self.decode_state,
+                sampling_group=self.sampling_group,
+                tokenizer=self.tokenizer,
+                transfer_backends=self.transports,
+                config=self.worker_config,
+            )
 
         consumed = _input_producers(batch)
         self._release_predecessors(
