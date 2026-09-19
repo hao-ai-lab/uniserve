@@ -291,9 +291,20 @@ struct SimRequestState {
     /// observe it before the predecessor is host-visible. Device executors encode
     /// the same state as a resident count tensor plus per-call deltas.
     penalty_counts: BTreeMap<u32, u32>,
+    /// The latest state-advancing call that completed with status OK, or the
+    /// admission root: the call a later chained call follows, as a rank
+    /// derives it from its own request state.
+    state_call_id: uniserve_worker_ipc::CallId,
 }
 
 impl SimRequestState {
+    /// Whether a call follows the request's state chain. Every call of a
+    /// generation request does; on the media path only a state-advancing
+    /// call does, and the branches around it complete independently.
+    fn chained(&self, call: &Call) -> bool {
+        self.admission.diffusion.is_none() || call.advances_state()
+    }
+
     /// Creates request state from an admitted request.
     fn new(admission: NewRequest) -> Self {
         let prefix_len = admission
@@ -309,6 +320,7 @@ impl SimRequestState {
             flow_step: 0,
             predicate_values: HashMap::new(),
             penalty_counts: BTreeMap::new(),
+            state_call_id: uniserve_worker_ipc::CallId::new(0, 0),
         }
     }
 
@@ -490,9 +502,9 @@ impl SimEngine {
     ) -> anyhow::Result<RequestOutput> {
         // A call states the coordinates it executes at. The simulator holds the
         // same request state a rank does, so a disagreement is a scheduling
-        // failure and not a condition it can execute through. A call with no
-        // request predecessor carries no coordinates.
-        if call.predecessor.is_some() {
+        // failure and not a condition it can execute through. A media branch
+        // call around the chain carries no coordinates.
+        if request.chained(call) {
             let stated = call.coordinates;
             if request.positions_from_model {
                 request.logical_position = stated.logical_position;
@@ -931,8 +943,10 @@ impl SimEngine {
                 })
                 .transpose()?;
             // Binding the input captures its value. The producer relay then has
-            // no future acquisition owner, just as in the physical Worker.
-            if let Some(predecessor) = call.predecessor {
+            // no future acquisition owner, just as in the physical Worker,
+            // which releases the products of the call this one follows.
+            if request.chained(&call) {
+                let predecessor = request.state_call_id;
                 request
                     .predicate_values
                     .retain(|product, _| product.producer_call_id != predecessor);
@@ -952,6 +966,9 @@ impl SimEngine {
             }
 
             let completion = Self::execute_call(vocab, text_len, fake_eos, &call, request)?;
+            if completion.status == CallStatus::Ok && call.advances_state() {
+                request.state_call_id = call.call_id;
+            }
             completions.push(completion);
         }
         let report = BatchOutput {
@@ -1021,7 +1038,6 @@ mod tests {
     fn batch(batch_id: u64, request_index: u32) -> ExecutionBatch {
         let request_key = request_key();
         let admission = admission();
-        let parent = CallId::new(0, 0);
         let call = Call {
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
@@ -1044,7 +1060,6 @@ mod tests {
             sampling_state: None,
             request_key,
             call_id: CallId::new(batch_id, request_index),
-            predecessor: Some(parent),
             entry: "model".into(),
             code: CallKind::Forward(ForwardMode::Prefill),
             bounds: Bounds {
@@ -1080,7 +1095,6 @@ mod tests {
         let mut executor = SimExecutor::new(SimEngine::new());
         let mut selected = batch(1, 3);
         let mut successor = batch(1, 4).requests.remove(0);
-        successor.0.predecessor = Some(CallId::new(1, 3));
         // The selected prompt covers two positions, so its successor in the
         // same batch enters where it left off.
         successor.0.coordinates = uniserve_worker_ipc::CallCoordinates {

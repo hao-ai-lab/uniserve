@@ -671,7 +671,6 @@ def latent_output():
         call = Call(
             request_key=key,
             call_id=CallId(1, 0),
-            predecessor=CallId(0, 0),
             coordinates=CallCoordinates(),
             kind=PipelineStage.LATENT_PREPARATION,
             bounds=Bounds(),

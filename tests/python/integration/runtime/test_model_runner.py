@@ -1473,7 +1473,7 @@ def test_cross_stage_device_product_transfer_preserves_generation_and_value() ->
                 )
             ),
         )
-        observation = record_completion(extend, extended)
+        record_completion(extend, extended)
         source = extend.token_output
         transferred = replace(
             source, producer_call_id=CallId(2, 0), generation=901
@@ -1481,7 +1481,6 @@ def test_cross_stage_device_product_transfer_preserves_generation_and_value() ->
         transfer = Call(
             request_key=admission.request_key,
             call_id=CallId(2, 0),
-            predecessor=observation.call_id,
             coordinates=CallCoordinates(),
             kind=TransferMode.TENSOR,
             bounds=Bounds(max_transfer_bytes=source.max_bytes),
@@ -1572,7 +1571,6 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
     transfer = Call(
         request_key=admission.request_key,
         call_id=CallId(2, 0),
-        predecessor=root_parent(admission),
         coordinates=CallCoordinates(),
         kind=TransferMode.TENSOR,
         bounds=Bounds(
@@ -1677,7 +1675,6 @@ def test_tensor_entry_input_preserves_values_through_output_release(
     call = Call(
         request_key=admission.request_key,
         call_id=CallId(2, 0),
-        predecessor=root_parent(admission),
         coordinates=CallCoordinates(),
         kind=TransferMode.TENSOR,
         bounds=Bounds(max_transfer_bytes=source.max_bytes),
@@ -1792,7 +1789,7 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
             producer,
             producer.submit(execution_batch(batch_id=2, calls=(preparation,))),
         )
-        preparation_observation = record_completion(preparation, transitioned)
+        record_completion(preparation, transitioned)
         source = preparation.completion_output
         transferred = replace(
             source, producer_call_id=CallId(3, 0), generation=903
@@ -1800,7 +1797,6 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
         transfer = Call(
             request_key=admission.request_key,
             call_id=CallId(3, 0),
-            predecessor=preparation_observation.call_id,
             coordinates=CallCoordinates(),
             kind=TransferMode.TENSOR,
             bounds=Bounds(max_transfer_bytes=source.max_bytes),
@@ -1904,7 +1900,6 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
         transfer = Call(
             request_key=admission.request_key,
             call_id=CallId(4, 0),
-            predecessor=flow_observation.call_id,
             coordinates=CallCoordinates(),
             kind=TransferMode.TENSOR,
             bounds=Bounds(
@@ -2150,7 +2145,6 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             transfer = Call(
                 request_key=admission.request_key,
                 call_id=moved.producer_call_id,
-                predecessor=step.call_id,
                 coordinates=CallCoordinates(),
                 kind=TransferMode.TENSOR,
                 bounds=Bounds(max_transfer_bytes=image.max_bytes),
@@ -2179,7 +2173,6 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
         materialize = Call(
             request_key=admission.request_key,
             call_id=CallId(6, 0),
-            predecessor=step.call_id,
             coordinates=CallCoordinates(),
             kind=PipelineStage.IMAGE_DECODING,
             bounds=Bounds(max_completion_bytes=65_536),

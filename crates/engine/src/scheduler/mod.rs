@@ -731,9 +731,12 @@ fn call_output_bound(code: CallKind, bounds: &uniserve_worker_ipc::Bounds) -> us
 
 /// Records the call in the optional benchmark trace.
 fn call_trace(call: &Call) -> serde_json::Value {
-    let parent_kind = match call.predecessor {
-        Some(_) => "call",
-        None => "none",
+    // A state-advancing call follows the request's chain; other work
+    // completes independently of it.
+    let parent_kind = if call.advances_state() {
+        "call"
+    } else {
+        "none"
     };
     json!({
         "kind": call.code.as_str(),

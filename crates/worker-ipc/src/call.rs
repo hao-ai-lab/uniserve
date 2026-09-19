@@ -406,8 +406,6 @@ pub struct Call {
     pub request_key: RequestKey,
     /// Logical batch and selection ordinal of the completed computation.
     pub call_id: CallId,
-    /// Execution-order dependency; zero identifies admission, absent for independent work.
-    pub predecessor: Option<CallId>,
     /// Coordinates this call executes at, so a rank does not derive them.
     pub coordinates: CallCoordinates,
     /// CallKind entry bound within the selected Worker.
@@ -539,20 +537,6 @@ impl Call {
         ensure_valid!(!self.entry.is_empty(), "call entry must not be empty");
         self.coordinates.validate()?;
 
-        ensure_valid!(
-            !(self.advances_state()
-                || self.code == CallKind::Transfer(TransferMode::KvInstall)
-                || self.latent_input.is_some())
-                || self.predecessor.is_some(),
-            "state-changing call requires a predecessor"
-        );
-        if let Some(predecessor) = self.predecessor {
-            ensure_valid!(
-                predecessor.batch_id != 0 || predecessor.request_index == 0,
-                "admission predecessor must use index zero"
-            );
-            ensure_valid!(predecessor < self.call_id, "predecessor must precede call");
-        }
         ensure_valid!(
             self.input_token_ids.len() <= self.bounds.max_tokens as usize,
             "input token count exceeds the computation token bound"

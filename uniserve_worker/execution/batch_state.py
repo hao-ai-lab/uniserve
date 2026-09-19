@@ -24,7 +24,7 @@ from uniserve_worker.protocol.batch import (
     TensorPublication,
 )
 from uniserve_worker.protocol.call import Call, CallStatus
-from uniserve_worker.protocol.identity import BufferId, RequestKey
+from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.output import (
     BatchOutput,
     ForwardStats,
@@ -50,6 +50,9 @@ class BatchState:
 
     batch: Batch
     propagate_errors: bool = False
+    # The call each of this batch's calls follows in its request, derived by
+    # the rank from its own request state; None for independent work.
+    predecessors: dict[CallId, CallId | None] = field(default_factory=dict)
 
     # Physical input reservations held until execution observes readiness.
     tensor_reads: dict[BufferId, TensorRead] = field(default_factory=dict)
@@ -136,6 +139,10 @@ class BatchState:
             for group, indexes in self.output_groups.items()
             for index in indexes
         }
+
+    def predecessor(self, call: Call) -> CallId | None:
+        """Return the call this call follows, or None for independent work."""
+        return self.predecessors.get(call.call_id)
 
     def group_calls(self, group: int) -> tuple[Call, ...]:
         """Borrow original call values belonging to one completion.

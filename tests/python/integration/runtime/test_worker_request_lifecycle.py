@@ -80,7 +80,6 @@ def test_independent_product_work_preserves_request_progress(
         independent = Call(
             request_key=admission.request_key,
             call_id=CallId(2, 0),
-            predecessor=None,
             coordinates=CallCoordinates(),
             kind=TransferMode.TENSOR,
             bounds=Bounds(max_transfer_bytes=source.max_bytes),

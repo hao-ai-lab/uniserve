@@ -70,6 +70,10 @@ class RequestState:
     finish_token_ids: tuple[int, ...]
     accepted_progress: RequestProgress
     accepted_call_id: CallId = CallId(0, 0)
+    # The latest state-advancing call whose result the request accepted with
+    # status OK; the admission root before any. A later call of the request
+    # follows this one when none of its state-advancing calls is in flight.
+    state_call_id: CallId = CallId(0, 0)
     # State one call produces and a later call reads, which the engine does not
     # track: it lives with the request rather than in a call's stated
     # coordinates. rng_counter is the request's sampling position and is not
@@ -240,6 +244,39 @@ class RequestPool:
         for output in outputs:
             output.request.pending_calls[output.call_id] = output
 
+    def predecessors(
+        self, calls: Sequence[Call]
+    ) -> dict[CallId, CallId | None]:
+        """Name the call each of these calls follows in its request.
+
+        A call follows the request's latest state-advancing call: the last one
+        in flight on this rank, otherwise the last one the request accepted,
+        otherwise the admission root. On the media path only a state-advancing
+        call follows the chain; the media branches around it complete
+        independently, so their products are released by the engine's commands
+        rather than by a successor's arrival. A call for a request this rank
+        does not hold follows nothing, and validation names it later.
+        """
+        predecessors: dict[CallId, CallId | None] = {}
+        for call in calls:
+            request = self.peek(call.request_key.request_id)
+            if request is None or request.request_key != call.request_key:
+                predecessors[call.call_id] = None
+                continue
+            media = request.admission.diffusion is not None
+            if media and not call.advances_state:
+                predecessors[call.call_id] = None
+                continue
+            in_flight = [
+                pending.call_id
+                for pending in request.pending_calls.values()
+                if pending.call.advances_state
+            ]
+            predecessors[call.call_id] = (
+                in_flight[-1] if in_flight else request.state_call_id
+            )
+        return predecessors
+
     def apply_outputs(self, outputs: Sequence[PendingOutput]) -> None:
         """Apply actual acceptance; a late output never replaces newer state.
 
@@ -269,6 +306,12 @@ class RequestPool:
                         output.accepted_progress.prompt_logits_ready
                     )
                     request.rng_counter = output.accepted_progress.rng_counter
+                if (
+                    output.value.status is CallStatus.OK
+                    and output.call.advances_state
+                    and output.call_id > request.state_call_id
+                ):
+                    request.state_call_id = output.call_id
                 if output.value.status is CallStatus.ERROR:
                     request.closed = True
 

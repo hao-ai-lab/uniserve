@@ -68,7 +68,6 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
         first_key,
         Some(first),
         CallId::new(2, 0),
-        CallId::new(0, 0),
         CallKind::Forward(ForwardMode::Prefill),
         &[7, 8],
         BlockId(1),
@@ -80,7 +79,6 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
         second_key,
         Some(second),
         CallId::new(3, 0),
-        CallId::new(0, 0),
         CallKind::Forward(ForwardMode::Prefill),
         &[9, 10],
         BlockId(2),
@@ -144,7 +142,6 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
         sampling_state: None,
         request_key: second_key,
         call_id: CallId::new(3, 0),
-        predecessor: Some(CallId::new(0, 0)),
         entry: "vision_encoder".into(),
         code: CallKind::Pipeline(PipelineStage::VisionEncoding),
         bounds: Bounds {
@@ -275,7 +272,6 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                 admission.request_key,
                 Some(admission),
                 CallId::new(1, 0),
-                CallId::new(0, 0),
                 CallKind::Forward(ForwardMode::Prefill),
                 &[7, 8],
                 BlockId(1),
@@ -314,7 +310,6 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                 other.request_key,
                 Some(other),
                 CallId::new(2, 0),
-                CallId::new(0, 0),
                 CallKind::Forward(ForwardMode::Prefill),
                 &[9, 10],
                 BlockId(2),
@@ -442,21 +437,19 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             )
         };
         let admission = text_admission(61, 1, 1)?;
-        let root = CallId::new(0, 0);
         let source = token_batch(
             1,
             1,
             admission.request_key,
             Some(admission.clone()),
             CallId::new(1, 0),
-            root.clone(),
             CallKind::Forward(ForwardMode::Prefill),
             &[7],
             BlockId(1),
             0,
         );
         let value = source.calls[0].token_output.clone().unwrap();
-        let mut logical = bind(source, "model");
+        let logical = bind(source, "model");
         let publication = TensorRef {
             producer_call_id: CallId::new(2, 0),
             generation: 2,
@@ -484,7 +477,6 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             sampling_state: None,
             request_key: admission.request_key,
             call_id: CallId::new(2, 0),
-            predecessor: None,
             entry: "model".into(),
             code: CallKind::Transfer(TransferMode::Tensor),
             bounds: Bounds {
@@ -524,7 +516,6 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             sampling_state: None,
             request_key: admission.request_key,
             call_id: CallId::new(3, 0),
-            predecessor: None,
             entry: "vision_encoder".into(),
             code: CallKind::Transfer(TransferMode::Tensor),
             bounds: Bounds {
@@ -537,8 +528,8 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             rng: None,
         };
         let mut completions = std::collections::BTreeMap::new();
-        let mut drain = |executor: &mut WorkerExecutor,
-                         completions: &mut std::collections::BTreeMap<_, _>|
+        let drain = |executor: &mut WorkerExecutor,
+                     completions: &mut std::collections::BTreeMap<_, _>|
          -> anyhow::Result<()> {
             loop {
                 let result = poll_logical(executor)?.context("a submitted batch did not retire")?;
@@ -605,7 +596,6 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         key,
         Some(admission),
         first_id,
-        CallId::new(0, 0),
         CallKind::Forward(ForwardMode::Prefill),
         &[7],
         BlockId(1),
@@ -617,7 +607,6 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         key,
         None,
         second_id,
-        first_id,
         CallKind::Forward(ForwardMode::Decode),
         &[0],
         BlockId(1),
@@ -633,7 +622,6 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         key,
         None,
         verify_id,
-        second_id,
         CallKind::Forward(ForwardMode::Verify),
         &[0, 900, 901],
         BlockId(1),
@@ -647,7 +635,6 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         key,
         None,
         resumed_id,
-        verify_id,
         CallKind::Forward(ForwardMode::Decode),
         &[0],
         BlockId(1),
@@ -806,7 +793,6 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         sampling_state: None,
         request_key: key,
         call_id: CallId::new(1, 0),
-        predecessor: None,
         entry: "model".into(),
         code: CallKind::Pipeline(PipelineStage::VisionEncoding),
         bounds: Bounds::default(),
@@ -821,7 +807,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         offset: 0,
         bytes: value.max_bytes(),
     });
-    let mut logical = bind(source, "model");
+    let logical = bind(source, "model");
     let copied = TensorRef {
         producer_call_id: CallId::new(2, 0),
         generation: 2,
@@ -849,7 +835,6 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         sampling_state: None,
         request_key: key,
         call_id: CallId::new(2, 0),
-        predecessor: None,
         entry: "vision_encoder".into(),
         code: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
@@ -877,7 +862,6 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
             independent_key,
             Some(independent),
             CallId::new(3, 0),
-            CallId::new(0, 0),
             CallKind::Forward(ForwardMode::Prefill),
             &[9],
             BlockId(2),
@@ -976,7 +960,6 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
             admission.request_key,
             Some(admission),
             CallId::new(1, 0),
-            CallId::new(0, 0),
             CallKind::Forward(ForwardMode::Prefill),
             &[7, 8],
             BlockId(1),
@@ -1135,14 +1118,12 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     sampling.n_logprobs = 1;
     sampling.return_prompt_logprobs = true;
     sampling.n_prompt_logprobs = 1;
-    let root = CallId::new(0, 0);
     let mut initial = token_batch(
         1,
         1,
         admission.request_key,
         Some(admission.clone()),
         CallId::new(1, 0),
-        root.clone(),
         CallKind::Forward(ForwardMode::Prefill),
         &[7, 8],
         BlockId(1),
@@ -1175,7 +1156,6 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         admission.request_key,
         Some(admission.clone()),
         CallId::new(1, 0),
-        root.clone(),
         CallKind::Forward(ForwardMode::Prefill),
         &[7, 8, 9],
         BlockId(1),
@@ -1183,7 +1163,6 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     );
     assert!(executor.submit_batch(conflicting).is_err());
 
-    let selected = completed_call(first_record);
     let stale_key = RequestKey::new(
         admission.request_key.engine_id,
         admission.request_key.request_id,
@@ -1204,7 +1183,6 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         admission.request_key,
         None,
         CallId::new(3, 0),
-        selected,
         CallKind::Forward(ForwardMode::Decode),
         &[first_record.committed_tokens.as_slice()[0]],
         BlockId(1),
@@ -1220,7 +1198,6 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         continued.results[0].output.committed_tokens[0]
     );
     assert!(continued.results[0].output.prompt_logprobs.is_empty());
-    let selected = completed_call(&continued.results[0].output);
     let close = BatchCommand::Finish {
         request_key: admission.request_key,
         retained_buffers: Vec::new(),
@@ -1232,7 +1209,6 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         independent.request_key,
         Some(independent),
         CallId::new(6, 0),
-        root.clone(),
         CallKind::Forward(ForwardMode::Prefill),
         &[9, 10],
         BlockId(2),
@@ -1258,7 +1234,6 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         admission.request_key,
         None,
         CallId::new(8, 0),
-        selected,
         CallKind::Forward(ForwardMode::Decode),
         &[first_record.committed_tokens.as_slice()[0]],
         BlockId(1),
@@ -1290,14 +1265,12 @@ fn check_rank_ipc() -> anyhow::Result<()> {
 fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
     let admission = text_admission(13, 1, 3)?;
     let request_key = admission.request_key;
-    let root = CallId::new(0, 0);
     let mut initial = token_batch(
         9,
         5,
         request_key,
         Some(admission),
         CallId::new(9, 0),
-        root.clone(),
         CallKind::Forward(ForwardMode::Prefill),
         &[7, 8],
         BlockId(3),
@@ -1307,7 +1280,6 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
     let tables = initial.block_tables.clone();
     let first = execute(executor, initial)?;
     assert_eq!(first.results[0].output.status, CallStatus::Ok);
-    let parent = completed_call(&first.results[0].output);
     let buffer = uniserve_worker_ipc::BufferId {
         owner: request_key,
         producer_call_id: CallId::new(10, 0),
@@ -1336,7 +1308,6 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         sampling_state: None,
         request_key,
         call_id: CallId::new(10, 0),
-        predecessor: Some(parent.clone()),
         entry: "model".into(),
         code: CallKind::Transfer(TransferMode::KvPublish),
         bounds: Bounds {
@@ -1402,14 +1373,12 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
 
     let initial_endpoint = executor.info().endpoint.clone();
     let first_admission = text_admission(21, 1, 1)?;
-    let first_root = CallId::new(0, 0);
     let mut first = token_batch(
         1,
         1,
         first_admission.request_key,
         Some(first_admission),
         CallId::new(1, 0),
-        first_root.clone(),
         CallKind::Forward(ForwardMode::Prefill),
         &[3],
         BlockId(1),
@@ -1423,7 +1392,6 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
         finished_key,
         Some(finished_admission),
         CallId::new(1, 1),
-        first_root.clone(),
         CallKind::Forward(ForwardMode::Prefill),
         &[2],
         BlockId(2),
@@ -1446,7 +1414,6 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     execute(&mut executor, close)?;
 
     let lost_admission = text_admission(22, 1, 2)?;
-    let lost_root = CallId::new(0, 0);
     // Keep this rank from completing the batch before the test terminates it.
     let paused = PausedProcess::new(victim.try_into()?)?;
     executor.submit_batch(token_batch(
@@ -1455,7 +1422,6 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
         lost_admission.request_key,
         Some(lost_admission),
         CallId::new(3, 0),
-        lost_root,
         CallKind::Forward(ForwardMode::Prefill),
         &[4],
         BlockId(2),
@@ -1488,7 +1454,6 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     }
 
     let recovered_admission = text_admission(23, 1, 1)?;
-    let recovered_root = CallId::new(0, 0);
     let recovered = execute(
         &mut executor,
         token_batch(
@@ -1497,7 +1462,6 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
             recovered_admission.request_key,
             Some(recovered_admission),
             CallId::new(4, 0),
-            recovered_root,
             CallKind::Forward(ForwardMode::Prefill),
             &[5],
             BlockId(1),
@@ -1569,14 +1533,12 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     })?;
 
     let slow_admission = text_admission(31, 1, 1)?;
-    let slow_root = CallId::new(0, 0);
     let mut slow = token_batch(
         1,
         1,
         slow_admission.request_key,
         Some(slow_admission.clone()),
         CallId::new(1, 0),
-        slow_root,
         CallKind::Forward(ForwardMode::Prefill),
         &[6],
         BlockId(1),
@@ -1598,14 +1560,12 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     });
 
     let fast_admission = text_admission(32, 1, 2)?;
-    let fast_root = CallId::new(0, 0);
     let fast = token_batch(
         2,
         2,
         fast_admission.request_key,
         Some(fast_admission),
         CallId::new(2, 0),
-        fast_root,
         CallKind::Forward(ForwardMode::Prefill),
         &[9],
         BlockId(2),
@@ -1679,7 +1639,6 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         sampling_state: None,
         request_key: admission.request_key,
         call_id: CallId::new(3, 0),
-        predecessor: Some(CallId::new(0, 0)),
         entry: "model".into(),
         code: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
@@ -1801,7 +1760,6 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
             admission.request_key,
             Some(admission),
             CallId::new(batch_id, request_index),
-            CallId::new(0, 0),
             CallKind::Forward(ForwardMode::Prefill),
             &[7],
             BlockId(page),
@@ -1852,7 +1810,6 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     executor.submit(bind(shared, "encoder-0"))?;
     let produced = poll_logical(&mut executor)?.context("source did not complete")?;
     assert!(produced.done);
-    let predecessor = completed_call(&produced.results[0].output);
     let publication = TensorRef {
         producer_call_id: CallId::new(6, 0),
         generation: 2,
@@ -1880,7 +1837,6 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         sampling_state: None,
         request_key: admission.request_key,
         call_id: CallId::new(6, 0),
-        predecessor: Some(predecessor),
         entry: "model".into(),
         code: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
@@ -1925,7 +1881,6 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         sampling_state: None,
         request_key: admission.request_key,
         call_id: CallId::new(7, 0),
-        predecessor: Some(CallId::new(0, 0)),
         entry: "model".into(),
         code: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
@@ -1977,7 +1932,6 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         sampling_state: None,
         request_key: admission.request_key,
         call_id: CallId::new(8, 0),
-        predecessor: Some(CallId::new(0, 0)),
         entry: "vision_encoder".into(),
         code: CallKind::Pipeline(PipelineStage::VisionEncoding),
         bounds: Bounds {
@@ -2098,7 +2052,6 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         sampling_state: None,
         request_key: next.request_key,
         call_id: CallId::new(15, 0),
-        predecessor: Some(CallId::new(0, 0)),
         entry: "model".into(),
         code: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
@@ -2505,7 +2458,6 @@ fn token_batch(
     request_key: RequestKey,
     admission: Option<NewRequest>,
     call_id: CallId,
-    predecessor: CallId,
     mode: CallKind,
     tokens: &[u32],
     page: BlockId,
@@ -2551,7 +2503,6 @@ fn token_batch(
         sampling_state: None,
         request_key,
         call_id,
-        predecessor: Some(predecessor),
         entry: "model".into(),
         code: mode,
         bounds: Bounds {
@@ -2594,10 +2545,6 @@ fn token_batch(
 
 fn command_batch(batch_id: u64, command: BatchCommand) -> Batch {
     Batch::new(batch_id, Vec::new(), Vec::new()).with_commands(vec![command])
-}
-
-fn completed_call(record: &uniserve_worker_ipc::RequestOutput) -> CallId {
-    record.call_id
 }
 
 fn start_shm_readers(
