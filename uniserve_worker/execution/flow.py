@@ -212,9 +212,7 @@ def prepare_latent(
     )
 
     request.status = CallStatus.OK
-    request.projected_progress = calls.execution_runtime(
-        request, cache, flow_step=0
-    )
+    request.progress = calls.execution_runtime(request, cache, flow_step=0)
     request.finish_flags = FinishFlags()
     request.product_generations = calls.output_generations(call)
     request.products = products
@@ -522,7 +520,7 @@ def finish(
     )
 
     request.status = CallStatus.OK
-    request.projected_progress = calls.execution_runtime(
+    request.progress = calls.execution_runtime(
         request,
         trajectory.cache,
         flow_step=final_step,
@@ -569,7 +567,7 @@ def publish_latent_transfer(
 
     transports = publication_transports
     if not any(name != "local" for name in transports) or (
-        config.rank != worker_info.output_rank(call.entry)
+        config.rank != worker_info.output_rank(call.component)
     ):
         return ()
 
@@ -651,7 +649,7 @@ def flow_rows(
     device,
 ):
     """Borrow one learned sample copy for every active guidance branch."""
-    from ..protocol.call import PipelineStage
+    from ..protocol.call import MediaCall
 
     current = _to_device(current, device)
     timestep = _to_device(timestep, device)
@@ -668,7 +666,7 @@ def flow_rows(
             )
         rows.append(
             ForwardRow(
-                forward_mode=PipelineStage.DENOISING,
+                forward_mode=MediaCall.DENOISING,
                 positions=trajectory.positions[temporal],
                 timestep=timestep.reshape(1),
                 latent=current,
@@ -723,7 +721,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
 
     from uniserve.math import ceil_div
 
-    from ..protocol.call import PipelineStage
+    from ..protocol.call import MediaCall
     from .attention import from_blocks
     from .graph_inputs import DiffusionShape
     from .model_runner import capture_image_parameters
@@ -757,7 +755,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
     )
 
     forward = partial(runner.batch_forward, entry)
-    prefix_entry = runner._forward_entries[(entry.name, ForwardMode.PREFILL)]
+    prefix_entry = runner._forward_calls[(entry.name, ForwardMode.PREFILL)]
     stream = entry.context.stream
     if stream is not None:
         stream.wait_stream(torch.cuda.current_stream(entry.device))
@@ -860,7 +858,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                 )
                 rows = tuple(
                     ForwardRow(
-                        forward_mode=PipelineStage.DENOISING,
+                        forward_mode=MediaCall.DENOISING,
                         positions=builder.positions(
                             size, len(prefix), device=entry.device
                         ),
@@ -882,7 +880,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
 
                 batch = entry.input_buffers.stage(
                     rows,
-                    forward_mode=PipelineStage.DENOISING,
+                    forward_mode=MediaCall.DENOISING,
                     attention=attention,
                 )
                 if capture:

@@ -24,7 +24,7 @@ from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.call import (
     Call,
     ForwardMode,
-    PipelineStage,
+    MediaCall,
 )
 
 from .diffusion_state import ImageState
@@ -260,7 +260,7 @@ def initialize_trajectories(
     for index in numerical:
         call, completion_group = scheduled[index]
         if (
-            call.kind is not PipelineStage.DENOISING
+            call.kind is not MediaCall.DENOISING
             or index in outcomes
             or completion_group in errors
         ):
@@ -490,8 +490,8 @@ def prepare_forward_rows(
                 )
                 forward.append((index, task))
             elif call.kind in {
-                PipelineStage.VISION_ENCODING,
-                PipelineStage.LATENT_ENCODING,
+                MediaCall.VISION_ENCODING,
+                MediaCall.LATENT_ENCODING,
             }:
                 prepared = encode.prepare_features(
                     call,
@@ -504,9 +504,7 @@ def prepare_forward_rows(
                 forward.append(
                     (
                         index,
-                        encode.encode_row(
-                            cast(PipelineStage, call.kind), prepared
-                        ),
+                        encode.encode_row(cast(MediaCall, call.kind), prepared),
                     )
                 )
             elif call.latent_input is None:
@@ -541,7 +539,7 @@ def prepare_forward_rows(
                     (
                         index,
                         ForwardRow(
-                            forward_mode=PipelineStage.IMAGE_DECODING,
+                            forward_mode=MediaCall.IMAGE_DECODING,
                             latent=latent,
                             image_height=int(params.height),
                             image_width=int(params.width),

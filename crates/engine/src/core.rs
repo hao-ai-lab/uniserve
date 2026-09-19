@@ -38,13 +38,13 @@ pub struct WorkerRank {
     pub device: String,
 }
 
-/// Static computation entries and their ordered physical rank membership.
+/// Static computation components and their ordered physical rank membership.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
     pub id: WorkerId,
     pub ranks: Vec<WorkerRank>,
-    pub entries: BTreeMap<String, ComponentConfig>,
+    pub components: BTreeMap<String, ComponentConfig>,
     pub queue_depth: usize,
 }
 
@@ -56,13 +56,13 @@ impl WorkerConfig {
             "worker {} queue depth must be positive",
             self.id
         );
-        Self::validate_members(&self.ranks, &self.entries)?;
+        Self::validate_members(&self.ranks, &self.components)?;
         Ok(())
     }
 
     pub fn validate_members(
         ranks: &[WorkerRank],
-        entries: &BTreeMap<String, ComponentConfig>,
+        components: &BTreeMap<String, ComponentConfig>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(!ranks.is_empty(), "worker requires rank members");
         let mut devices = BTreeSet::new();
@@ -76,50 +76,53 @@ impl WorkerConfig {
                 "worker repeats a physical device"
             );
         }
-        anyhow::ensure!(!entries.is_empty(), "worker requires computation entries");
-        for (name, entry) in entries {
-            anyhow::ensure!(!name.is_empty(), "entry name must not be empty");
+        anyhow::ensure!(
+            !components.is_empty(),
+            "worker requires computation components"
+        );
+        for (name, entry) in components {
+            anyhow::ensure!(!name.is_empty(), "component name must not be empty");
             anyhow::ensure!(
                 !entry.ranks.is_empty() && entry.ranks.iter().all(|&rank| rank < ranks.len()),
-                "entry {name} contains invalid members"
+                "component {name} contains invalid members"
             );
             anyhow::ensure!(
                 entry.ranks.iter().collect::<BTreeSet<_>>().len() == entry.ranks.len(),
-                "entry {name} repeats members"
+                "component {name} repeats members"
             );
             let degree = entry.parallel_config.world_size()?;
             if entry.distribution.is_some() {
                 anyhow::ensure!(
                     degree == 1,
-                    "distributed temporal units require local entry geometry"
+                    "distributed temporal units require local component geometry"
                 );
             } else {
                 anyhow::ensure!(
                     degree == entry.ranks.len(),
-                    "entry {name} parallel degree {degree} disagrees with {} members",
+                    "component {name} parallel degree {degree} disagrees with {} members",
                     entry.ranks.len()
                 );
             }
             anyhow::ensure!(
                 entry.units_per_rank > 0,
-                "entry {name} units_per_rank must be positive"
+                "component {name} units_per_rank must be positive"
             );
         }
         Ok(())
     }
 
-    /// Validates unique WorkerGroup identities and one static owner for each entry.
+    /// Validates unique WorkerGroup identities and one static owner for each component.
     pub fn validate_all(workers: &[Self]) -> anyhow::Result<()> {
         anyhow::ensure!(!workers.is_empty(), "engine requires workers");
         let mut ids = BTreeSet::new();
-        let mut entries = BTreeSet::new();
+        let mut components = BTreeSet::new();
         for worker in workers {
             worker.validate()?;
             anyhow::ensure!(ids.insert(&worker.id), "WorkerGroup identity is repeated");
-            for entry in worker.entries.keys() {
+            for entry in worker.components.keys() {
                 anyhow::ensure!(
-                    entries.insert(entry),
-                    "entry {entry} has multiple WorkerGroup owners"
+                    components.insert(entry),
+                    "component {entry} has multiple WorkerGroup owners"
                 );
             }
         }
@@ -127,21 +130,21 @@ impl WorkerConfig {
     }
 
     /// Expands the single-instance CLI shorthand into explicit device membership
-    /// across the named hosts, carrying the entries the model declared.
+    /// across the named hosts, carrying the components the model declared.
     ///
     /// Ranks are assigned in blocks, so the lowest ranks stay on the first
     /// host, and each host numbers its devices from zero. A placement on one
     /// host is the same arithmetic with one block.
     ///
     /// Which components exist and how each one partitions is the model's to
-    /// state, so `entries` arrives already resolved for this rank count. This
+    /// state, so `components` arrives already resolved for this rank count. This
     /// assigns rank identity and nothing else.
     /// One component parallel over every rank.
     ///
     /// This is the whole placement a single-component model declares, and the
     /// one a default or a simulation needs. A model with several components
     /// states its own.
-    pub fn single_entry(name: &str, rank_count: usize) -> BTreeMap<String, ComponentConfig> {
+    pub fn single_component(name: &str, rank_count: usize) -> BTreeMap<String, ComponentConfig> {
         BTreeMap::from([(
             name.into(),
             ComponentConfig::parallel(
@@ -159,7 +162,7 @@ impl WorkerConfig {
         device: &str,
         rank_count: usize,
         queue_depth: usize,
-        entries: BTreeMap<String, ComponentConfig>,
+        components: BTreeMap<String, ComponentConfig>,
     ) -> Self {
         // A host takes its share of the ranks, and the first hosts take the
         // remainder, so a count that does not divide evenly still places every
@@ -184,7 +187,7 @@ impl WorkerConfig {
         Self {
             id: WorkerId("model".into()),
             ranks: placement,
-            entries,
+            components,
             queue_depth,
         }
     }
@@ -212,7 +215,7 @@ pub struct EngineConfig {
     pub scheduler_policy: SchedulingPolicy,
     /// Maximum model context length reported to the frontend.
     pub max_model_len: u32,
-    /// Static computation entries and physical rank membership.
+    /// Static computation components and physical rank membership.
     pub workers: Vec<WorkerConfig>,
     /// Per-edge data-plane transfer backend selection (`--transfer`), e.g.
     /// `encoder->prefill=shm,prefill->decode=cuda_vmm`. Participating worker
@@ -243,7 +246,7 @@ impl EngineConfig {
                 "cpu",
                 1,
                 2,
-                WorkerConfig::single_entry("model", 1),
+                WorkerConfig::single_component("model", 1),
             )
             .ranks,
             block_size: 64,
@@ -267,7 +270,7 @@ impl EngineConfig {
                 "cpu",
                 1,
                 2,
-                WorkerConfig::single_entry("model", 1),
+                WorkerConfig::single_component("model", 1),
             )],
             transfer: TransferConfig::default(),
             worker_process,
@@ -333,7 +336,7 @@ impl EngineCore {
             arguments.push(WorkerProcessArgs {
                 worker_id: worker.id.to_string(),
                 ranks: worker.ranks.clone(),
-                entries: worker.entries.clone(),
+                components: worker.components.clone(),
                 queue_depth: worker.queue_depth,
                 transfer: config.transfer.clone(),
                 ..config.worker_process.clone()
@@ -527,10 +530,10 @@ mod tests {
     /// Entries covering the shapes a placement must validate: one component
     /// parallel over every rank, one dividing its output into units, and one
     /// placed alone.
-    fn mixed_entries(rank_count: usize) -> BTreeMap<String, ComponentConfig> {
+    fn mixed_components(rank_count: usize) -> BTreeMap<String, ComponentConfig> {
         let members: Vec<_> = (0..rank_count).collect();
-        let mut entries = WorkerConfig::single_entry("parallel", rank_count);
-        entries.insert(
+        let mut components = WorkerConfig::single_component("parallel", rank_count);
+        components.insert(
             "divided".into(),
             ComponentConfig {
                 ranks: members,
@@ -539,11 +542,11 @@ mod tests {
                 units_per_rank: 1,
             },
         );
-        entries.insert(
+        components.insert(
             "alone".into(),
             ComponentConfig::parallel(vec![0], ParallelConfig::default()),
         );
-        entries
+        components
     }
 
     #[test]
@@ -555,7 +558,7 @@ mod tests {
                 "cuda",
                 degree,
                 2,
-                WorkerConfig::single_entry(name, degree),
+                WorkerConfig::single_component(name, degree),
             );
             worker.id = WorkerId(name.into());
             workers.push(worker);
@@ -573,7 +576,7 @@ mod tests {
         // the lowest ranks must stay on the first host and each host must
         // number its own devices from zero.
         let hosts = ["rank-0".to_owned(), "rank-1".to_owned()];
-        let worker = WorkerConfig::placed(&hosts, "cuda", 8, 2, mixed_entries(8));
+        let worker = WorkerConfig::placed(&hosts, "cuda", 8, 2, mixed_components(8));
 
         let placement: Vec<_> = worker
             .ranks
@@ -599,12 +602,12 @@ mod tests {
         // and one it places alone stays on rank zero, which is the head's host.
         for entry in ["parallel", "divided"] {
             assert_eq!(
-                worker.entries[entry].ranks.len(),
+                worker.components[entry].ranks.len(),
                 8,
                 "{entry} spans the instance"
             );
         }
-        assert_eq!(worker.entries["alone"].ranks, vec![0]);
+        assert_eq!(worker.components["alone"].ranks, vec![0]);
     }
 
     #[test]
@@ -612,8 +615,13 @@ mod tests {
         // The first hosts take the remainder, which keeps each host's block
         // contiguous and rank zero on the head's host.
         let hosts = ["a".to_owned(), "b".to_owned(), "c".to_owned()];
-        let worker =
-            WorkerConfig::placed(&hosts, "cuda", 8, 2, WorkerConfig::single_entry("model", 8));
+        let worker = WorkerConfig::placed(
+            &hosts,
+            "cuda",
+            8,
+            2,
+            WorkerConfig::single_component("model", 8),
+        );
 
         let nodes: Vec<_> = worker.ranks.iter().map(|rank| rank.node.as_str()).collect();
         assert_eq!(nodes, vec!["a", "a", "a", "b", "b", "b", "c", "c"]);
@@ -623,11 +631,16 @@ mod tests {
     #[test]
     fn entry_geometry_uses_unique_ordered_rank_members() {
         let mut worker =
-            WorkerConfig::placed(&["localhost".to_owned()], "cuda", 4, 2, mixed_entries(4));
+            WorkerConfig::placed(&["localhost".to_owned()], "cuda", 4, 2, mixed_components(4));
         assert!(worker.validate().is_ok());
-        worker.entries.get_mut("parallel").unwrap().ranks.swap(0, 3);
+        worker
+            .components
+            .get_mut("parallel")
+            .unwrap()
+            .ranks
+            .swap(0, 3);
         assert!(worker.validate().is_ok());
-        worker.entries.get_mut("parallel").unwrap().ranks[1] = 3;
+        worker.components.get_mut("parallel").unwrap().ranks[1] = 3;
         assert!(worker.validate().is_err());
     }
 
@@ -638,14 +651,14 @@ mod tests {
             "cuda",
             1,
             2,
-            WorkerConfig::single_entry("model", 1),
+            WorkerConfig::single_component("model", 1),
         );
         let mut other = worker.clone();
         assert!(WorkerConfig::validate_all(&[worker.clone(), other.clone()]).is_err());
         other.id = WorkerId("other".into());
         assert!(WorkerConfig::validate_all(&[worker.clone(), other.clone()]).is_err());
-        let entry = other.entries.remove("model").unwrap();
-        other.entries.insert("divided".into(), entry);
+        let entry = other.components.remove("model").unwrap();
+        other.components.insert("divided".into(), entry);
         assert!(WorkerConfig::validate_all(&[worker, other]).is_ok());
     }
 }

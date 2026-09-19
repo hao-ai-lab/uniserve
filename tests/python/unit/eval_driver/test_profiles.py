@@ -45,7 +45,7 @@ def test_fast_h3_defaults_to_the_four_device_deployment(monkeypatch) -> None:
 
     named = config.root / server.command[deployment]
     assert named.is_file(), f"{named} is the default deployment and must exist"
-    assert sorted(json.loads(named.read_text())[0]["entries"]) == [
+    assert sorted(json.loads(named.read_text())[0]["components"]) == [
         "audio_decoder",
         "denoiser",
         "muxer",

@@ -19,7 +19,7 @@ from uniserve_worker.protocol.call import (
     CALL_KINDS,
     CallKind,
     ForwardMode,
-    PipelineStage,
+    MediaCall,
     TransferMode,
 )
 
@@ -206,26 +206,26 @@ def graph_memory_budget_bytes(total_device_bytes: int) -> int:
 
 
 # JSON lane selectors resolve at startup. Execution binds concrete
-# call kinds, so independent pipeline stages never acquire a second
+# call kinds, so independent media calls never acquire a second
 # scheduling classification.
 LANE_COMPUTATION_GROUPS: dict[str, tuple[CallKind, ...]] = {
     "prefill": (
         ForwardMode.PREFILL,
-        PipelineStage.VISION_ENCODING,
-        PipelineStage.LATENT_ENCODING,
-        PipelineStage.TEXT_ENCODING,
+        MediaCall.VISION_ENCODING,
+        MediaCall.LATENT_ENCODING,
+        MediaCall.TEXT_ENCODING,
         *TransferMode,
     ),
     "decode": (ForwardMode.DECODE, ForwardMode.VERIFY),
     "flow": (
-        PipelineStage.LATENT_PREPARATION,
-        PipelineStage.DENOISING,
-        PipelineStage.IMAGE_DECODING,
-        PipelineStage.VIDEO_DECODING,
-        PipelineStage.AUDIO_DECODING,
-        PipelineStage.VIDEO_ENCODING,
-        PipelineStage.AUDIO_ENCODING,
-        PipelineStage.MUXING,
+        MediaCall.LATENT_PREPARATION,
+        MediaCall.DENOISING,
+        MediaCall.IMAGE_DECODING,
+        MediaCall.VIDEO_DECODING,
+        MediaCall.AUDIO_DECODING,
+        MediaCall.VIDEO_ENCODING,
+        MediaCall.AUDIO_ENCODING,
+        MediaCall.MUXING,
     ),
 }
 

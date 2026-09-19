@@ -27,16 +27,16 @@ from uniserve.runtime.device import canonical_device, device_memory_budget
 from uniserve.tensors import BufferConfig
 
 from ..config import WorkerConfig
+from ..execution.component_binding import ComponentBinding
 from ..execution.input_buffers import InputBufferConfig
-from ..execution.model_entry import ModelEntry
 from ..execution.resources import media_state_buffers
 from ..foundation.errors import unsupported_setup
-from ..protocol.call import PipelineStage
+from ..protocol.call import MediaCall
 from ..protocol.tensor import DeviceDim, OutputInfo
 from ..runtime.cache_manager import CacheManager
 from ..runtime.results import resolve_outputs
 from ..runtime.tensor_store import TensorStore, device_product_capacity_bytes
-from .components import pipeline_components
+from .components import media_components
 from .inputs import capability, image_builder, media_builder
 
 _DEVICE_PRODUCTS_PER_CALL = 6
@@ -230,15 +230,15 @@ def active_latent_capacity_tokens(
 def local_product_storage_bytes(
     entry_outputs: Mapping[str, tuple[OutputInfo, ...]],
     *,
-    bindings: Mapping[str, ModelEntry],
-    pipeline_components: Mapping[PipelineStage, str],
+    bindings: Mapping[str, ComponentBinding],
+    media_components: Mapping[MediaCall, str],
     max_unresolved_ops: int,
 ) -> int:
     """Size persistent products from placement, consumers and output horizon.
 
     Producers and remote consumers each need a complete logical allocation:
     disjoint regions may subsequently be imported into that allocation. A
-    temporal-unit stage only retains its unresolved groups of leading-axis
+    temporal-unit component only retains its unresolved groups of leading-axis
     units. Non-streaming results retain their declared capacity until their
     consumers finish. Alignment follows BufferPool's allocation rules.
     """
@@ -247,26 +247,26 @@ def local_product_storage_bytes(
 
     consumers: dict[str, set[str]] = {}
     # These are the concrete persistent Tensor consumers of the video path.
-    # Denoising state is resident; write stages consume decoded output buffers.
-    for source_stage, destination_stage in (
-        (PipelineStage.TEXT_ENCODING, PipelineStage.LATENT_PREPARATION),
-        (PipelineStage.DENOISING, PipelineStage.VIDEO_DECODING),
-        (PipelineStage.DENOISING, PipelineStage.AUDIO_DECODING),
-        (PipelineStage.VIDEO_DECODING, PipelineStage.VIDEO_ENCODING),
-        (PipelineStage.AUDIO_DECODING, PipelineStage.AUDIO_ENCODING),
-        (PipelineStage.VIDEO_ENCODING, PipelineStage.MUXING),
+    # Denoising state is resident; encoders consume decoded output buffers.
+    for source_call, destination_call in (
+        (MediaCall.TEXT_ENCODING, MediaCall.LATENT_PREPARATION),
+        (MediaCall.DENOISING, MediaCall.VIDEO_DECODING),
+        (MediaCall.DENOISING, MediaCall.AUDIO_DECODING),
+        (MediaCall.VIDEO_DECODING, MediaCall.VIDEO_ENCODING),
+        (MediaCall.AUDIO_DECODING, MediaCall.AUDIO_ENCODING),
+        (MediaCall.VIDEO_ENCODING, MediaCall.MUXING),
     ):
-        source = pipeline_components.get(source_stage)
-        destination = pipeline_components.get(destination_stage)
+        source = media_components.get(source_call)
+        destination = media_components.get(destination_call)
         if source is not None and destination is not None:
             consumers.setdefault(source, set()).add(destination)
     streamed = {
         component
-        for stage in (
-            PipelineStage.VIDEO_DECODING,
-            PipelineStage.VIDEO_ENCODING,
+        for call in (
+            MediaCall.VIDEO_DECODING,
+            MediaCall.VIDEO_ENCODING,
         )
-        if (component := pipeline_components.get(stage)) is not None
+        if (component := media_components.get(call)) is not None
     }
     total = 0
     for entry, outputs in entry_outputs.items():
@@ -445,7 +445,7 @@ def artifact_import_regions(
     model: nn.Module,
     worker_config: WorkerConfig,
     *,
-    bindings: Mapping[str, ModelEntry],
+    bindings: Mapping[str, ComponentBinding],
 ) -> int:
     """Count the remote product regions assembling one artifact reads.
 
@@ -453,9 +453,9 @@ def artifact_import_regions(
     time, and the muxer reads every round. Each round holds one media unit per
     participating rank and the muxer produced one of them itself.
     """
-    components = pipeline_components(model)
-    entry = components.get(PipelineStage.VIDEO_ENCODING)
-    binding = None if entry is None else bindings.get(entry)
+    components = media_components(model)
+    encoder = components.get(MediaCall.VIDEO_ENCODING)
+    binding = None if encoder is None else bindings.get(encoder)
     decoder = capability(model, VideoDecoder)
     builder = media_builder(model, worker_config)
     if binding is None or decoder is None or builder is None:
@@ -479,7 +479,7 @@ def model_arena_capacity(
     max_latent_feature_bytes: int,
     max_vision_feature_bytes: int,
     bytes_per_token: int,
-    bindings: Mapping[str, ModelEntry] | None = None,
+    bindings: Mapping[str, ComponentBinding] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
 ) -> ArenaCapacity:
     """Derive arena bounds from worker settings.
@@ -505,7 +505,7 @@ def model_arena_capacity(
             product_bytes_per_request=local_product_storage_bytes(
                 resolve_outputs(model, worker_config),
                 bindings=bindings or {},
-                pipeline_components=pipeline_components(model),
+                media_components=media_components(model),
                 max_unresolved_ops=request_tensor_window(
                     depth, request_pool_size
                 ),
@@ -719,7 +719,7 @@ def resolve_request_capacity(
     *,
     queue_depth: int,
     capacity_group: Communicator | None,
-    bindings: Mapping[str, ModelEntry] | None = None,
+    bindings: Mapping[str, ComponentBinding] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
 ) -> WorkerConfig:
     """Fit request tensors within the rank's fixed memory grant.
@@ -753,7 +753,7 @@ def resolve_request_capacity(
                 product_bytes = local_product_storage_bytes(
                     resolve_outputs(model, worker_config),
                     bindings=bindings or {},
-                    pipeline_components=pipeline_components(model),
+                    media_components=media_components(model),
                     max_unresolved_ops=request_tensor_window(
                         queue_depth, count
                     ),

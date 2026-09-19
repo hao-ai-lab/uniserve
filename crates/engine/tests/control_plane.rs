@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
-use uniserve_worker_ipc::{ForwardMode, PipelineStage};
+use uniserve_worker_ipc::{ForwardMode, MediaCall};
 
 use uniserve_core::{EngineCoreOutput, FinishReason};
 use uniserve_core::{
@@ -28,46 +28,46 @@ fn generation_capabilities_require_complete_paths_and_distinct_encoders() {
     use uniserve_worker_ipc::CallKind;
 
     let image_path = vec![
-        CallKind::Pipeline(PipelineStage::LatentPreparation),
-        CallKind::Pipeline(PipelineStage::Denoising),
-        CallKind::Pipeline(PipelineStage::ImageDecoding),
+        CallKind::Media(MediaCall::LatentPreparation),
+        CallKind::Media(MediaCall::Denoising),
+        CallKind::Media(MediaCall::ImageDecoding),
     ];
     let cases = [
         (
-            vec![CallKind::Pipeline(PipelineStage::VisionEncoding)],
+            vec![CallKind::Media(MediaCall::VisionEncoding)],
             GenerationFeatures::VISION_ENCODE,
         ),
         (
-            vec![CallKind::Pipeline(PipelineStage::LatentEncoding)],
+            vec![CallKind::Media(MediaCall::LatentEncoding)],
             GenerationFeatures::LATENT_ENCODE,
         ),
         (
             vec![
-                CallKind::Pipeline(PipelineStage::VisionEncoding),
-                CallKind::Pipeline(PipelineStage::LatentEncoding),
+                CallKind::Media(MediaCall::VisionEncoding),
+                CallKind::Media(MediaCall::LatentEncoding),
             ],
             GenerationFeatures::VISION_ENCODE | GenerationFeatures::LATENT_ENCODE,
         ),
         (image_path, GenerationFeatures::IMAGE_GENERATION),
         (
             vec![
-                CallKind::Pipeline(PipelineStage::Denoising),
-                CallKind::Pipeline(PipelineStage::ImageDecoding),
+                CallKind::Media(MediaCall::Denoising),
+                CallKind::Media(MediaCall::ImageDecoding),
             ],
             GenerationFeatures::empty(),
         ),
         (
             vec![
-                CallKind::Pipeline(PipelineStage::LatentPreparation),
-                CallKind::Pipeline(PipelineStage::ImageDecoding),
+                CallKind::Media(MediaCall::LatentPreparation),
+                CallKind::Media(MediaCall::ImageDecoding),
             ],
             GenerationFeatures::empty(),
         ),
         (
             vec![
-                CallKind::Pipeline(PipelineStage::LatentPreparation),
-                CallKind::Pipeline(PipelineStage::Denoising),
-                CallKind::Pipeline(PipelineStage::VideoDecoding),
+                CallKind::Media(MediaCall::LatentPreparation),
+                CallKind::Media(MediaCall::Denoising),
+                CallKind::Media(MediaCall::VideoDecoding),
             ],
             GenerationFeatures::empty(),
         ),

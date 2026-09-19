@@ -28,7 +28,7 @@ from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
     ForwardMode,
-    PipelineStage,
+    MediaCall,
 )
 from uniserve_worker.protocol.output import FinishFlags
 from uniserve_worker.protocol.tensor import TensorRef
@@ -115,7 +115,7 @@ def text(
     state.group_forward_stats[completion_group].append(result.stats)
 
     request.status = CallStatus.OK
-    request.projected_progress = calls.execution_runtime(request, None)
+    request.progress = calls.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
     request.product_generations = tuple(
         output.generation for output in call.tensor_outputs()
@@ -138,9 +138,9 @@ def prepare_features(
     """
     image_processor = model_runner.image_processor()
     mode = call.kind
-    if not isinstance(mode, PipelineStage) or mode not in {
-        PipelineStage.VISION_ENCODING,
-        PipelineStage.LATENT_ENCODING,
+    if not isinstance(mode, MediaCall) or mode not in {
+        MediaCall.VISION_ENCODING,
+        MediaCall.LATENT_ENCODING,
     }:
         raise invalid_descriptor("encode call is missing an encode mode")
     feature_output = call.encoder_output
@@ -210,7 +210,7 @@ def publish_features(
     products: tuple[TensorPublication, ...] = ()
     if any(
         name != "local" for name in publication_transports
-    ) and config.rank == worker_info.output_rank(call.entry):
+    ) and config.rank == worker_info.output_rank(call.component):
         locations = publish_tensor(
             publication_transports,
             resident,
@@ -227,7 +227,7 @@ def publish_features(
                 shape=tuple(resident.shape), locations=locations
             ),
             payload_kind="vision_feature"
-            if call.kind is PipelineStage.VISION_ENCODING
+            if call.kind is MediaCall.VISION_ENCODING
             else "latent_feature",
             height=prepared.height,
             width=prepared.width,
@@ -346,9 +346,7 @@ def publish_image(
         max_bytes=int(call.bounds.max_completion_bytes),
         state=state,
     )
-    request.projected_progress = replace(
-        calls.require_progress(request), flow_step=0
-    )
+    request.progress = replace(calls.require_progress(request), flow_step=0)
     request.latent_params = params
     request.latent_generation = int(latent_input.generation)
     request.latent_step = int(params.start_step)
@@ -382,7 +380,7 @@ def state_outcome(
     cache = (cache[0], cache[1], selected, cache[3])
 
     request.status = CallStatus.OK
-    request.projected_progress = calls.execution_runtime(request, cache)
+    request.progress = calls.execution_runtime(request, cache)
     request.finish_flags = FinishFlags()
     request.product_generations = calls.output_generations(call)
     request.committed_tokens = ()
@@ -406,7 +404,7 @@ def non_state_outcome(
         completion_group, call.request_key.request_id
     )
     request.status = CallStatus.OK
-    request.projected_progress = calls.execution_runtime(request, None)
+    request.progress = calls.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
     request.product_generations = calls.output_generations(call)
     request.products = products
@@ -456,7 +454,7 @@ def encode_source(
 
 
 def encode_row(
-    mode: PipelineStage,
+    mode: MediaCall,
     prepared: PreparedImage,
 ) -> ForwardRow:
     """Build a vision- or latent-encoder row from prepared image tensors."""
@@ -669,7 +667,7 @@ def latent_state_row(
         tables=request_tables,
     )
     return ForwardRow(
-        forward_mode=PipelineStage.DENOISING,
+        forward_mode=MediaCall.DENOISING,
         positions=positions,
         timestep=latent.new_zeros(1),
         latent=latent,

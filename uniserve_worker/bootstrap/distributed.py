@@ -7,54 +7,58 @@ from collections.abc import Mapping
 from uniserve.distributed.mesh import DeviceMesh
 from uniserve.runtime.process_groups import ProcessGroups
 
-from ..execution.model_entry import ModelEntry
+from ..execution.component_binding import ComponentBinding
 from .config import ComponentConfig
 
 
-def initialize_entries(
-    groups: ProcessGroups, entries: Mapping[str, ComponentConfig]
-) -> dict[str, ModelEntry]:
-    """Bind declared entries to their local meshes and shared process world."""
+def initialize_components(
+    groups: ProcessGroups, components: Mapping[str, ComponentConfig]
+) -> dict[str, ComponentBinding]:
+    """Bind declared components to their local meshes and process world."""
     meshes = {}
     rings = {}
-    for name, entry in sorted(entries.items()):
-        if entry.distribution is not None:
+    for name, component in sorted(components.items()):
+        if component.distribution is not None:
             # Media units are independent local invocations, so the numerical
             # mesh is this rank alone. The ranks holding consecutive units still
             # exchange the overlap between them, over a ring every rank creates
             # in the same order because group creation spans the process world.
             ring = groups.bind(
                 DeviceMesh(
-                    ranks=entry.ranks,
-                    shape=(len(entry.ranks),),
+                    ranks=component.ranks,
+                    shape=(len(component.ranks),),
                     axes=("units",),
                     rank=groups.rank,
                 ),
                 device=groups.device,
             )
-            if groups.rank not in entry.ranks:
+            if groups.rank not in component.ranks:
                 continue
             rings[name] = ring.get_group("units")
             ranks = (groups.rank,)
         else:
-            ranks = entry.ranks
+            ranks = component.ranks
         topology = DeviceMesh(
             ranks=ranks,
-            shape=tuple(size for _, size in entry.parallel_config.dimensions),
-            axes=tuple(axis for axis, _ in entry.parallel_config.dimensions),
+            shape=tuple(
+                size for _, size in component.parallel_config.dimensions
+            ),
+            axes=tuple(
+                axis for axis, _ in component.parallel_config.dimensions
+            ),
             rank=groups.rank,
         )
         bound = groups.bind(topology, device=groups.device)
         if groups.rank in ranks:
             meshes[name] = bound
 
-    if not entries or not any(
-        groups.rank in entry.ranks for entry in entries.values()
+    if not components or not any(
+        groups.rank in component.ranks for component in components.values()
     ):
-        raise ValueError("rank has no configured computation entry")
+        raise ValueError("rank has no configured component")
 
     return {
-        name: ModelEntry(
+        name: ComponentBinding(
             name,
             config,
             groups.process_group,
@@ -62,5 +66,5 @@ def initialize_entries(
             groups.device,
             units=rings.get(name),
         )
-        for name, config in entries.items()
+        for name, config in components.items()
     }

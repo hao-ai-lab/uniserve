@@ -11,7 +11,7 @@ import torch
 from uniserve.model.logits import Logits, VocabShard
 from uniserve.tensors import OutputLayout, adjacent_view
 from uniserve_worker.execution.sampling import TokenSelection
-from uniserve_worker.protocol.call import ForwardMode, PipelineStage
+from uniserve_worker.protocol.call import ForwardMode, MediaCall
 from uniserve_worker.protocol.output import ForwardStats
 
 if TYPE_CHECKING:
@@ -25,7 +25,7 @@ InputT = TypeVar("InputT")
 class InputBatch(Generic[InputT]):
     """One typed numerical input and the worker's aligned output controls."""
 
-    forward_mode: ForwardMode | PipelineStage
+    forward_mode: ForwardMode | MediaCall
     inputs: InputT
     request_pool_indices: torch.Tensor
     token_selections: tuple[TokenSelection, ...] = ()

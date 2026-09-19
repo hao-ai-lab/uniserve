@@ -136,7 +136,7 @@ def test_packed_checkpoint_rejects_runtime_numerical_overrides(
     config = worker_args(
         tmp_path,
         model=str(packed_checkpoint),
-        entries={"muxer": {"ranks": [0], "parallel_config": {}}},
+        components={"muxer": {"ranks": [0], "parallel_config": {}}},
         max_batch_tokens=8192,
         quantization_config=json.loads(options),
     )

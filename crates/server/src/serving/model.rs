@@ -437,7 +437,7 @@ impl InputProcessor {
     }
 
     /// Validates the video API request, tokenizes its prompt, and prepares the
-    /// checkpoint frame/chunk counts for direct engine submission.
+    /// checkpoint frame and media unit counts for direct engine submission.
     pub fn preprocess_video_request(
         &self,
         request_id: &crate::serving::ServeRequestId,
@@ -523,16 +523,16 @@ impl InputProcessor {
                 ),
             }));
         }
-        // Each H3 VAE chunk consumes a temporal latent window and emits its
+        // Each H3 video media unit consumes a temporal latent window and emits its
         // non-overlapping frame interval; the model owns overlap reconstruction.
-        let num_decode_chunks = (frame_count - 5) / 17;
+        let video_units = (frame_count - 5) / 17;
         Ok(uniserve_core::DiffusionRequest {
             request_id: uniserve_core::RequestId(0),
             prompt_token_ids,
             priority: 0,
             sampling: uniserve_core::DiffusionSamplingParams {
                 num_frames: frame_count,
-                num_decode_chunks,
+                video_units,
                 num_inference_steps: *num_inference_steps,
                 seed,
             },

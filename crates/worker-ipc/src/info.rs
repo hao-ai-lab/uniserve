@@ -87,7 +87,7 @@ impl KvCacheInfo {
 }
 /// One component's finalized configuration shared by all worker descriptions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EntryInfo {
+pub struct ComponentInfo {
     pub name: String,
     #[serde(flatten)]
     pub config: uniserve_core::ComponentConfig,
@@ -154,7 +154,7 @@ pub struct WorkerInfo {
     pub model_name: String,
     /// Model-declared finite terminal-media computation, when supported.
     #[serde(default)]
-    pub pipeline_components: std::collections::BTreeMap<PipelineStage, String>,
+    pub media_components: std::collections::BTreeMap<MediaCall, String>,
     /// Effective number of diffusion predictions advertised by the loaded model.
     pub num_inference_steps: u32,
     /// Identity of the loaded rank and its host address space.
@@ -182,7 +182,7 @@ pub struct WorkerInfo {
     pub checkpoint_identity: String,
     /// Finalized component membership and logical degrees.
     #[serde(default)]
-    pub components: Vec<EntryInfo>,
+    pub components: Vec<ComponentInfo>,
     /// Call families accepted by the worker.
     pub supported_ops: Vec<CallKind>,
     /// Maximum unresolved physical runs.
@@ -268,7 +268,7 @@ impl WorkerInfo {
                 output.validate()?;
                 ensure_valid!(
                     outputs.insert(&output.name),
-                    "entry repeats a tensor result name"
+                    "component repeats a tensor result name"
                 );
             }
             let params = &component.config;
@@ -319,25 +319,22 @@ impl WorkerInfo {
                 == self.supported_ops.len(),
             "worker info repeat a work variant"
         );
-        // A worker names the entry serving each stage it implements. Every
-        // named stage must be one it advertises and an entry it holds; a
+        // A worker names the component serving each media call it implements. Every
+        // named call must be one it advertises and a component it holds; a
         // deployment that assembles an artifact must name the whole video
-        // pipeline, which a worker reporting only the stages it has need not.
+        // graph, which a worker reporting only the calls it has need not.
         ensure_valid!(
-            self.pipeline_components.iter().all(|(stage, entry)| {
-                !entry.is_empty() && self.supported_ops.contains(&CallKind::Pipeline(*stage))
+            self.media_components.iter().all(|(call, component)| {
+                !component.is_empty() && self.supported_ops.contains(&CallKind::Media(*call))
             }),
-            "a pipeline stage names no entry this worker serves"
+            "a media call names no component this worker serves"
         );
-        if self
-            .pipeline_components
-            .contains_key(&PipelineStage::Muxing)
-        {
+        if self.media_components.contains_key(&MediaCall::Muxing) {
             ensure_valid!(
                 self.num_inference_steps > 0
-                    && PipelineStage::VIDEO
+                    && MediaCall::VIDEO
                         .iter()
-                        .all(|stage| self.pipeline_components.contains_key(stage)),
+                        .all(|call| self.media_components.contains_key(call)),
                 "video components or diffusion step count are incomplete"
             );
         }
@@ -397,7 +394,7 @@ impl Default for WorkerInfo {
     fn default() -> Self {
         Self {
             model_name: "model".to_owned(),
-            pipeline_components: Default::default(),
+            media_components: Default::default(),
             num_inference_steps: 0,
             fabric_handles: false,
             endpoint: WorkerEndpoint {

@@ -16,7 +16,7 @@ from uniserve_worker.protocol.call import (
     Bounds,
     Call,
     CallCoordinates,
-    PipelineStage,
+    MediaCall,
 )
 from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.runtime.cache_manager import CacheManager
@@ -91,9 +91,7 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
                 expected = model.latent_encoder.encode(pixels)
                 torch.manual_seed(129)
                 rows = tuple(
-                    ForwardRow(
-                        PipelineStage.LATENT_ENCODING, encode_pixels=value
-                    )
+                    ForwardRow(MediaCall.LATENT_ENCODING, encode_pixels=value)
                     for value in pixels
                 )
                 encoded = _run(runner, manager, rows)
@@ -103,7 +101,7 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
             )
             rows = tuple(
                 ForwardRow(
-                    PipelineStage.IMAGE_DECODING,
+                    MediaCall.IMAGE_DECODING,
                     latent=value,
                     image_height=size.height,
                     image_width=size.width,

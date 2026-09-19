@@ -17,8 +17,8 @@ from uniserve.distributed import Communicator
 from uniserve.model import Denoiser, DenoiserInput
 from uniserve.runtime import CUDAGraph, ExecutionContext, PrefixCache
 
+from .component_binding import capture_required
 from .graph_inputs import clone_inputs, copy_inputs, input_signature
-from .model_entry import capture_required
 
 InputT = TypeVar("InputT", bound=DenoiserInput)
 SizeT = TypeVar("SizeT")

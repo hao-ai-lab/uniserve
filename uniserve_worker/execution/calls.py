@@ -33,7 +33,7 @@ def require_progress(output: PendingOutput) -> RequestProgress:
 
     call.
     """
-    progress = output.projected_progress
+    progress = output.progress
     if progress is None:
         raise invalid_descriptor("call does not consume request progress")
     return progress
@@ -51,7 +51,7 @@ def execution_runtime(
     The call states them; the cache tuple overrides the KV extents when the
     block tables resolved a different accepted prefix.
     """
-    progress = request.projected_progress
+    progress = request.progress
     if cache is None:
         visible = progress.kv_visible_len
         computed = progress.kv_computed_len
@@ -79,7 +79,7 @@ def cache_coordinates(
     slot = int(request.request.request_pool_idx)
     # Scheduler columns may reserve the full unobserved verifier prefix. The
     # call states the accepted extent its numerical consumers run at.
-    visible = int(request.projected_progress.kv_visible_len)
+    visible = int(request.progress.kv_visible_len)
 
     pool = tables
     if pool is None:
@@ -116,7 +116,7 @@ def _predicated_outcome(
         completion_group, call.request_key.request_id
     )
     request.status = CallStatus.PREDICATED
-    request.projected_progress = execution_runtime(request, None)
+    request.progress = execution_runtime(request, None)
     request.finish_flags = FinishFlags()
     request.product_generations = ()
     return request

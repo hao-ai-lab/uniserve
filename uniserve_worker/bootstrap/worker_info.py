@@ -8,10 +8,10 @@ from enum import StrEnum
 from typing import Any, TypeVar, cast
 
 from uniserve_worker.protocol.call import (
-    VIDEO_STAGES,
+    VIDEO_CALLS,
     CallKind,
     ForwardMode,
-    PipelineStage,
+    MediaCall,
     computation,
 )
 
@@ -208,10 +208,10 @@ class KVCacheInfo:
 
 
 @dataclass(frozen=True, slots=True)
-class EntryInfo:
-    """Loaded entry membership and publishable tensor results.
+class ComponentInfo:
+    """Loaded component membership and publishable tensor results.
 
-    The entry's computation publishes these tensor results.
+    The component's computation publishes these tensor results.
     """
 
     name: str
@@ -220,13 +220,15 @@ class EntryInfo:
 
     def __post_init__(self) -> None:
         if not self.name:
-            raise invalid_descriptor("entry must have a name")
+            raise invalid_descriptor("component must have a name")
         if len({output.name for output in self.outputs}) != len(self.outputs):
-            raise invalid_descriptor("entry repeats a tensor result name")
+            raise invalid_descriptor("component repeats a tensor result name")
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "entry") -> EntryInfo:
-        """Decode one entry and its tensor results from the wire mapping."""
+    def from_mapping(
+        cls, value: object, where: str = "component"
+    ) -> ComponentInfo:
+        """Decode one component and its tensor results from the wire mapping."""
         data = _map(value, where)
         return cls(
             name=_str(data.get("name"), f"{where}.name"),
@@ -246,7 +248,7 @@ class EntryInfo:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode entry membership and publishable results for IPC discovery."""
+        """Encode component membership and results for IPC discovery."""
         return {
             "name": self.name,
             **self.config.to_dict(),
@@ -279,30 +281,31 @@ class WorkerInfo:
     # execution configuration. The engine requires it from every rank that
     # serves a checkpoint; a model built in-process without one reports none.
     checkpoint_identity: str = ""
-    components: tuple[EntryInfo, ...] = ()
+    components: tuple[ComponentInfo, ...] = ()
     device: str = "cpu"
     transfer_backends: tuple[str, ...] = ("local",)
     # Whether this rank's device exports a handle another host can import.
     # A descriptor handle reaches only this host, so the engine refuses a
     # transfer edge that would have to cross one.
     fabric_handles: bool = False
-    pipeline_components: dict[PipelineStage, str] = field(default_factory=dict)
+    media_components: dict[MediaCall, str] = field(default_factory=dict)
     num_inference_steps: int = 0
 
-    def output_rank(self, entry: str) -> int:
-        """Resolve the host publication owner from the call's entry.
+    def output_rank(self, component: str) -> int:
+        """Resolve the host publication owner from the call's component.
 
-        Cooperative numerical outputs may reside on different stages. Host
-        products belong to the entry's first member, matching the rank-report
-        join requirements. An unconfigured local worker has one possible owner.
+        Cooperative numerical outputs may reside on different ranks. Host
+        products belong to the component's first member, matching the
+        rank-report join requirements. An unconfigured local worker has one
+        possible owner.
         """
-        for component in self.components:
-            if component.name == entry:
-                return component.config.ranks[0]
+        for candidate in self.components:
+            if candidate.name == component:
+                return candidate.config.ranks[0]
         if self.world_size == 1:
             return 0
         raise unsupported_setup(
-            f"computation entry {entry!r} has no publication owner"
+            f"component {component!r} has no publication owner"
         )
 
     @property
@@ -376,24 +379,25 @@ class WorkerInfo:
         if len(set(self.supported_ops)) != len(self.supported_ops):
             raise invalid_descriptor("worker info repeats a work variant")
 
-        if self.pipeline_components:
-            # A worker reports the entry serving each stage it implements. A
+        if self.media_components:
+            # A worker reports the component serving each media call it
+            # implements. A
             # deployment that assembles an artifact serves the whole video
-            # pipeline; one that reports only the stages it has, such as a
+            # call graph; one that reports only the calls it has, such as a
             # patch encoder placed apart from a language backbone, does not.
-            if PipelineStage.MUXING in self.pipeline_components and (
+            if MediaCall.MUXING in self.media_components and (
                 self.num_inference_steps < 1
-                or set(self.pipeline_components) != set(VIDEO_STAGES)
+                or set(self.media_components) != set(VIDEO_CALLS)
             ):
                 raise invalid_descriptor(
                     "video components or diffusion step count are incomplete"
                 )
             if any(
-                not component or stage not in self.supported_ops
-                for stage, component in self.pipeline_components.items()
+                not component or call not in self.supported_ops
+                for call, component in self.media_components.items()
             ):
                 raise invalid_descriptor(
-                    "pipeline component uses an unsupported call"
+                    "media component uses an unsupported call"
                 )
 
         has_latent_geometry = bool(self.latent_page_units or self.latent_pages)
@@ -420,13 +424,13 @@ class WorkerInfo:
         """
         data = _map(value, where)
         return cls(
-            pipeline_components={
-                _enum(
-                    PipelineStage, stage, f"{where}.pipeline_components"
-                ): _str(component, f"{where}.pipeline_components")
-                for stage, component in _map(
-                    data.get("pipeline_components", {}),
-                    f"{where}.pipeline_components",
+            media_components={
+                _enum(MediaCall, call, f"{where}.media_components"): _str(
+                    component, f"{where}.media_components"
+                )
+                for call, component in _map(
+                    data.get("media_components", {}),
+                    f"{where}.media_components",
                 ).items()
             },
             num_inference_steps=_uint(
@@ -439,7 +443,7 @@ class WorkerInfo:
                 f"{where}.checkpoint_identity",
             ),
             components=tuple(
-                EntryInfo.from_mapping(item, f"{where}.components[{index}]")
+                ComponentInfo.from_mapping(item, f"{where}.components[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("components", ()), f"{where}.components")
                 )
@@ -507,9 +511,9 @@ class WorkerInfo:
     def to_mapping(self) -> dict[str, object]:
         """Encode worker capabilities and resource bounds for IPC discovery."""
         return {
-            "pipeline_components": {
-                stage.value: component
-                for stage, component in self.pipeline_components.items()
+            "media_components": {
+                call.value: component
+                for call, component in self.media_components.items()
             },
             "num_inference_steps": self.num_inference_steps,
             "model_name": self.model_name,

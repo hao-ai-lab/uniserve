@@ -23,7 +23,7 @@ from uniserve_models.minimax_h3.packing import (
     video_latent_frames,
 )
 from uniserve_worker.bootstrap.config import ComponentConfig
-from uniserve_worker.bootstrap.distributed import initialize_entries
+from uniserve_worker.bootstrap.distributed import initialize_components
 from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.model_runner import ModelRunner
 
@@ -54,7 +54,7 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
     with initialize_process_groups(
         rank=0, local_rank=0, world_size=1, device="cuda:0"
     ) as groups:
-        bindings = initialize_entries(groups, modules)
+        bindings = initialize_components(groups, modules)
         source = models.read_config(
             checkpoint,
             modules=frozenset(

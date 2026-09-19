@@ -290,7 +290,7 @@ fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
     assert_eq!(request.prompt_token_ids, expected);
     assert_eq!(request.sampling.seed, 17);
     assert_eq!(request.sampling.num_frames, 39);
-    assert_eq!(request.sampling.num_decode_chunks, 2);
+    assert_eq!(request.sampling.video_units, 2);
 
     let invalid = |model_name: &str, prompt: &str, seconds| {
         model

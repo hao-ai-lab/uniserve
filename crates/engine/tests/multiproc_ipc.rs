@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use uniserve_worker_ipc::{CallCoordinates, ForwardMode, PipelineStage, TransferMode};
+use uniserve_worker_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode};
 
 use anyhow::Context as _;
 use uniserve_core::{
@@ -30,11 +30,11 @@ const QUEUE_DEPTH: usize = 2;
 static CHILD_LAUNCH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
-fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> {
+fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<()> {
     let mut args = rank_group_args(1 << 20, 8 << 20);
     // The language backbone and the patch encoder hold a rank each, which is
     // the arrangement a model with several components is served in.
-    args.entries = [
+    args.components = [
         (
             "model".into(),
             uniserve_core::ComponentConfig::parallel(vec![1], Default::default()),
@@ -49,9 +49,9 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
     let mut worker = WorkerGroup::spawn(args)?;
     let supported = worker.info().supported_ops.clone();
     assert!(supported.contains(&CallKind::Forward(ForwardMode::Prefill)));
-    assert!(supported.contains(&CallKind::Pipeline(PipelineStage::VisionEncoding)));
+    assert!(supported.contains(&CallKind::Media(MediaCall::VisionEncoding)));
     assert_eq!(
-        worker.info().pipeline_components[&PipelineStage::VisionEncoding],
+        worker.info().media_components[&MediaCall::VisionEncoding],
         "vision_encoder"
     );
 
@@ -89,8 +89,8 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
     )?;
     assert!(admission.results.is_empty());
 
-    // A batch carries one call kind for one entry, so each entry's work
-    // travels in its own batch and retires on the ranks that entry holds.
+    // A batch carries one call kind for one component, so each component's work
+    // travels in its own batch and retires on the ranks that component holds.
     extend.batch_id = 2;
     extend.collective_seq = 2;
     let extend_report = execute(&mut worker, extend)?;
@@ -140,8 +140,8 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
         sampling_state: None,
         request_key: second_key,
         call_id: CallId::new(3, 0),
-        entry: "vision_encoder".into(),
-        code: CallKind::Pipeline(PipelineStage::VisionEncoding),
+        component: "vision_encoder".into(),
+        code: CallKind::Media(MediaCall::VisionEncoding),
         bounds: Bounds {
             max_tokens: 64,
             max_latent_bytes: 8192,
@@ -382,7 +382,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
 }
 
 #[test]
-fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
+fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
     use uniserve_engine::{ExecutionBatch, RequestPlacement, WorkerExecutor, WorkerId};
 
     for transfer in [
@@ -390,7 +390,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
         uniserve_engine::TransferConfig::default(),
     ] {
         let mut args = rank_group_args(1 << 20, 8 << 20);
-        args.entries = [
+        args.components = [
             (
                 "model".into(),
                 uniserve_core::ComponentConfig::parallel(vec![1], Default::default()),
@@ -405,7 +405,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
         let transfer = transfer.with_worker_defaults(&[WorkerConfig {
             id: WorkerId("worker".into()),
             ranks: args.ranks.clone(),
-            entries: args.entries.clone(),
+            components: args.components.clone(),
             queue_depth: args.queue_depth,
         }])?;
         args.transfer = transfer.clone();
@@ -415,7 +415,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
         )?;
         let bind = |mut batch: Batch, entry: &str| {
             let mut call = batch.calls.remove(0);
-            call.entry = entry.into();
+            call.component = entry.into();
             ExecutionBatch::new(
                 batch.batch_id,
                 vec![(
@@ -476,7 +476,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             sampling_state: None,
             request_key: admission.request_key,
             call_id: CallId::new(2, 0),
-            entry: "model".into(),
+            component: "model".into(),
             code: CallKind::Transfer(TransferMode::Tensor),
             bounds: Bounds {
                 max_transfer_bytes: value.max_bytes(),
@@ -516,7 +516,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             sampling_state: None,
             request_key: admission.request_key,
             call_id: CallId::new(3, 0),
-            entry: "vision_encoder".into(),
+            component: "vision_encoder".into(),
             code: CallKind::Transfer(TransferMode::Tensor),
             bounds: Bounds {
                 max_transfer_bytes: publication.max_bytes(),
@@ -547,7 +547,7 @@ fn entries_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
             }
         };
 
-        // Each batch carries one call kind for one entry, and a batch that
+        // Each batch carries one call kind for one component, and a batch that
         // reads another's product follows it: a rank executes batches in
         // channel order and refuses an identifier that does not advance, which
         // is what carries the dependency now that no ledger does.
@@ -709,7 +709,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
     let mut args = rank_group_args(1 << 20, 8 << 20);
     args.queue_depth = 3;
     args.transfer = transfer.clone();
-    args.entries = [
+    args.components = [
         (
             "model".into(),
             uniserve_core::ComponentConfig::parallel(vec![1], Default::default()),
@@ -727,7 +727,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
     )?;
     let bind = |mut batch: Batch, entry: &str| {
         let mut call = batch.calls.remove(0);
-        call.entry = entry.into();
+        call.component = entry.into();
         ExecutionBatch::new(
             batch.batch_id,
             vec![(
@@ -753,7 +753,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         vec![7],
         DiffusionSamplingParams {
             num_frames: 22,
-            num_decode_chunks: 1,
+            video_units: 1,
             num_inference_steps: 4,
             seed: 1000,
         },
@@ -768,8 +768,8 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
             dims: vec![DimBound::Static(1)],
         },
     };
-    // The entry holding the language backbone does not serve vision encoding,
-    // which the patch encoder's own entry does. Registration succeeds, then
+    // The component holding the language backbone does not serve vision encoding,
+    // which the patch encoder's own component does. Registration succeeds, then
     // the call reports its actual execution error without a product.
     let produce = Call {
         consumer_slots: Vec::new(),
@@ -794,8 +794,8 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         sampling_state: None,
         request_key: key,
         call_id: CallId::new(1, 0),
-        entry: "model".into(),
-        code: CallKind::Pipeline(PipelineStage::VisionEncoding),
+        component: "model".into(),
+        code: CallKind::Media(MediaCall::VisionEncoding),
         bounds: Bounds::default(),
         inputs: vec![],
         outputs: vec![value.clone()],
@@ -837,7 +837,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         sampling_state: None,
         request_key: key,
         call_id: CallId::new(2, 0),
-        entry: "vision_encoder".into(),
+        component: "vision_encoder".into(),
         code: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: value.max_bytes(),
@@ -1051,7 +1051,7 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
         "cpu",
         WORLD_SIZE,
         2,
-        WorkerConfig::single_entry("model", WORLD_SIZE),
+        WorkerConfig::single_component("model", WORLD_SIZE),
     )];
     config.worker_process = rank_group_args(128 << 10, 128 << 10);
     let engine = {
@@ -1075,7 +1075,7 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
                 priority: 0,
                 sampling: DiffusionSamplingParams {
                     num_frames: 22,
-                    num_decode_chunks: 3,
+                    video_units: 3,
                     num_inference_steps: 4,
                     seed: index as u64,
                 },
@@ -1311,7 +1311,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         sampling_state: None,
         request_key,
         call_id: CallId::new(10, 0),
-        entry: "model".into(),
+        component: "model".into(),
         code: CallKind::Transfer(TransferMode::KvPublish),
         bounds: Bounds {
             max_transfer_bytes: 4096,
@@ -1519,10 +1519,10 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
             "cpu",
             WORLD_SIZE,
             2,
-            WorkerConfig::single_entry("model", WORLD_SIZE),
+            WorkerConfig::single_component("model", WORLD_SIZE),
         )
         .ranks,
-        entries: WorkerConfig::single_entry("model", WORLD_SIZE),
+        components: WorkerConfig::single_component("model", WORLD_SIZE),
         queue_depth: QUEUE_DEPTH,
         req_slot_cap: 1 << 20,
         resp_slot_cap: 8 << 20,
@@ -1643,7 +1643,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         sampling_state: None,
         request_key: admission.request_key,
         call_id: CallId::new(3, 0),
-        entry: "model".into(),
+        component: "model".into(),
         code: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: input.max_bytes(),
@@ -1670,7 +1670,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     executor.submit_batch(batch)?;
     let transferred = executor
         .poll_batch(Duration::from_secs(30))?
-        .context("tensor input did not reach its computation entry")?;
+        .context("tensor input did not reach its component")?;
     assert_eq!(transferred.results[0].output.status, CallStatus::Ok);
     assert_eq!(transferred.products[0].product, output);
     let TransferHandle::DeviceProduct { tensor, .. } = &transferred.products[0].value else {
@@ -1708,10 +1708,15 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
     let spawn = |worker_id: &str, depth| -> anyhow::Result<WorkerGroup> {
         let mut args = rank_group_args(1 << 20, 8 << 20);
-        let binding =
-            WorkerConfig::placed(&["localhost".to_owned()], "cpu", 1, depth, stub_entries(1));
+        let binding = WorkerConfig::placed(
+            &["localhost".to_owned()],
+            "cpu",
+            1,
+            depth,
+            stub_components(1),
+        );
         args.ranks = binding.ranks.clone();
-        args.entries = binding.entries;
+        args.components = binding.components;
         args.queue_depth = depth;
         args.worker_id = worker_id.into();
         if worker_id == "encoder-0" {
@@ -1841,7 +1846,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         sampling_state: None,
         request_key: admission.request_key,
         call_id: CallId::new(6, 0),
-        entry: "model".into(),
+        component: "model".into(),
         code: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: source.max_bytes(),
@@ -1886,7 +1891,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         sampling_state: None,
         request_key: admission.request_key,
         call_id: CallId::new(7, 0),
-        entry: "model".into(),
+        component: "model".into(),
         code: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: publication.max_bytes(),
@@ -1938,8 +1943,8 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         sampling_state: None,
         request_key: admission.request_key,
         call_id: CallId::new(8, 0),
-        entry: "vision_encoder".into(),
-        code: CallKind::Pipeline(PipelineStage::VisionEncoding),
+        component: "vision_encoder".into(),
+        code: CallKind::Media(MediaCall::VisionEncoding),
         bounds: Bounds {
             max_tokens: 64,
             max_latent_bytes: 8192,
@@ -2059,7 +2064,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         sampling_state: None,
         request_key: next.request_key,
         call_id: CallId::new(15, 0),
-        entry: "model".into(),
+        component: "model".into(),
         code: CallKind::Transfer(TransferMode::Tensor),
         bounds: Bounds {
             max_transfer_bytes: feature.max_bytes(),
@@ -2292,7 +2297,7 @@ fn spawn_rank_group_with_capacities(
 ///
 /// A placement names what a worker holds, and a worker that serves a model's
 /// whole computation holds every component it declares.
-fn stub_entries(
+fn stub_components(
     rank_count: usize,
 ) -> std::collections::BTreeMap<String, uniserve_core::ComponentConfig> {
     let members: Vec<_> = (0..rank_count).collect();
@@ -2332,10 +2337,10 @@ fn rank_group_args(
             "cpu",
             WORLD_SIZE,
             2,
-            WorkerConfig::single_entry("model", WORLD_SIZE),
+            WorkerConfig::single_component("model", WORLD_SIZE),
         )
         .ranks,
-        entries: WorkerConfig::single_entry("model", WORLD_SIZE),
+        components: WorkerConfig::single_component("model", WORLD_SIZE),
         queue_depth: QUEUE_DEPTH,
         req_slot_cap: request_slot_capacity,
         resp_slot_cap: response_slot_capacity,
@@ -2369,7 +2374,7 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "rank": 0,
     "local_rank": 0,
     "world_size": 1,
-    "entries": {
+    "components": {
         "model": {
             "ranks": [
                 0
@@ -2527,7 +2532,7 @@ fn token_batch(
         sampling_state: None,
         request_key,
         call_id,
-        entry: "model".into(),
+        component: "model".into(),
         code: mode,
         bounds: Bounds {
             max_tokens: tokens.len().max(1) as u32,
@@ -2578,7 +2583,7 @@ fn placement_binds_ranks_to_the_engine_host_by_name() {
         "cpu",
         WORLD_SIZE,
         2,
-        WorkerConfig::single_entry("model", WORLD_SIZE),
+        WorkerConfig::single_component("model", WORLD_SIZE),
     );
     assert!(
         named.ranks.iter().all(|rank| rank.node == "compute-0"),
@@ -2598,10 +2603,10 @@ fn placement_binds_ranks_to_the_engine_host_by_name() {
             "cpu",
             WORLD_SIZE,
             2,
-            WorkerConfig::single_entry("model", WORLD_SIZE),
+            WorkerConfig::single_component("model", WORLD_SIZE),
         )
         .ranks,
-        entries: named.entries.clone(),
+        components: named.components.clone(),
         stub: true,
         launcher_timeout: std::time::Duration::from_secs(2),
         ..WorkerProcessArgs::default()

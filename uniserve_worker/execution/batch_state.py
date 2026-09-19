@@ -8,7 +8,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from threading import Lock
-from typing import cast
+from typing import ClassVar, cast
 
 import torch
 
@@ -46,7 +46,15 @@ class BatchState:
 
     Worker submits inputs, launches computation, and materializes results. This
     object has no callback that can execute its batch or advance the worker.
+
+    A batch is one homogeneous group: every call it carries has the same kind
+    and component, so the batch completes as a whole. Execution stages still
+    address that completion by the identity ``COMPLETION``; it is the only
+    key the per-completion bookkeeping below ever holds.
     """
+
+    #: The identity of the batch's single completion.
+    COMPLETION: ClassVar[int] = 1
 
     batch: Batch
     propagate_errors: bool = False
@@ -80,15 +88,15 @@ class BatchState:
     complete: bool = False
     error: WorkerError | None = None
 
-    # Final values addressed by original call index and completion group.
+    # Final values addressed by original call index.
     outputs: list[PendingOutput | RequestOutput | None] = field(
         default_factory=list
     )
-    output_groups: dict[int, tuple[int, ...]] = field(default_factory=dict)
-    completed_groups: set[int] = field(default_factory=set)
-    accepted_groups: set[int] = field(default_factory=set)
+    # Whether every pending output has become its wire value. Retirement may
+    # still be outstanding after this, so it is distinct from ``complete``.
+    materialized: bool = False
 
-    # Per-group execution and publication bookkeeping.
+    # Execution and publication bookkeeping, keyed by ``COMPLETION``.
     group_buffers: dict[int, OutputBuffer] = field(default_factory=dict)
     group_streams: dict[int, torch.cuda.Stream] = field(default_factory=dict)
     group_started_ns: dict[int, int] = field(default_factory=dict)
@@ -101,7 +109,9 @@ class BatchState:
     )
     group_registered: dict[int, bool] = field(default_factory=dict)
     group_published: dict[int, bool] = field(default_factory=dict)
-    request_locations: dict[int, tuple[int, int]] = field(default_factory=dict)
+    # Output index of each request's call. Looking up one request must not
+    # scan the other calls of the batch.
+    request_indexes: dict[int, int] = field(default_factory=dict)
     group_products: dict[int, tuple[TensorPublication, ...]] = field(
         default_factory=dict
     )
@@ -123,35 +133,14 @@ class BatchState:
 
     def __post_init__(self) -> None:
         self.outputs = [None] * len(self.batch.calls)
-
-        groups: dict[tuple[object, str], list[int]] = {}
-        for index, call in enumerate(self.batch.calls):
-            groups.setdefault((call.kind, call.entry), []).append(index)
-
-        self.output_groups = {
-            group: tuple(indexes)
-            for group, indexes in enumerate(groups.values(), start=1)
-        }
-        # Resolve group ownership alongside the output index. Looking up one
-        # request must not scan the other requests in its completion group.
-        self.request_locations = {
-            self.batch.calls[index].request_key.request_id: (group, index)
-            for group, indexes in self.output_groups.items()
-            for index in indexes
+        self.request_indexes = {
+            call.request_key.request_id: index
+            for index, call in enumerate(self.batch.calls)
         }
 
     def predecessor(self, call: Call) -> CallId | None:
         """Return the call this call follows, or None for independent work."""
         return self.predecessors.get(call.call_id)
-
-    def group_calls(self, group: int) -> tuple[Call, ...]:
-        """Borrow original call values belonging to one completion.
-
-        group.
-        """
-        return tuple(
-            self.batch.calls[index] for index in self.output_groups[group]
-        )
 
     def group_scope(self, group: int):
         """Keep numerical access and its retirement fences on the selected.
@@ -172,10 +161,9 @@ class BatchState:
 
         preparation.
         """
-        for index, output in zip(
-            self.output_groups[group], outputs, strict=True
+        for index, (call, output) in enumerate(
+            zip(self.batch.calls, outputs, strict=True)
         ):
-            call = self.batch.calls[index]
             if self.outputs[index] is not None:
                 raise RuntimeError("call output is already reserved")
             if (output.request_key, output.call_id) != (
@@ -196,10 +184,8 @@ class BatchState:
         self.group_published[group] = False
 
     def pending_outputs(self, group: int) -> tuple[PendingOutput, ...]:
-        """Borrow the currently executing outputs of one completion group."""
-        values = tuple(
-            self.outputs[index] for index in self.output_groups[group]
-        )
+        """Borrow the currently executing outputs of the batch's completion."""
+        values = tuple(self.outputs)
         if any(not isinstance(value, PendingOutput) for value in values):
             raise RuntimeError(
                 "completion group has no reserved pending outputs"
@@ -207,16 +193,13 @@ class BatchState:
         return cast(tuple[PendingOutput, ...], values)
 
     def pending_output(self, group: int, request_id: int) -> PendingOutput:
-        """Borrow the reserved pending output of one request in a completion.
-
-        group.
-        """
-        location = self.request_locations.get(int(request_id))
-        if location is None or location[0] != group:
+        """Borrow the reserved pending output of one request of the batch."""
+        index = self.request_indexes.get(int(request_id))
+        if index is None:
             raise invalid_descriptor(
                 f"completion group has no request {request_id}"
             )
-        value = self.outputs[location[1]]
+        value = self.outputs[index]
         if not isinstance(value, PendingOutput):
             raise RuntimeError("request has no reserved pending output")
         return value
@@ -425,9 +408,9 @@ class BatchState:
         if group in self.group_stats:
             raise RuntimeError("completion group was published more than once")
 
-        indexes = self.output_groups[group]
-        for index, output in zip(indexes, outputs, strict=True):
-            call = self.batch.calls[index]
+        for index, (call, output) in enumerate(
+            zip(self.batch.calls, outputs, strict=True)
+        ):
             previous = self.outputs[index]
             if (
                 isinstance(output, PendingOutput)
@@ -487,16 +470,13 @@ class BatchState:
             raise RuntimeError("batch has no ready output")
         self.result_sent = True
 
-        groups = tuple(self.output_groups)
         values: list[RequestOutput] = []
-        for group in groups:
-            for index in self.output_groups[group]:
-                value = self.outputs[index]
-                if not isinstance(value, RequestOutput):
-                    raise RuntimeError(
-                        "batch delivery encountered an unmaterialized output"
-                    )
-                values.append(value)
+        for value in self.outputs:
+            if not isinstance(value, RequestOutput):
+                raise RuntimeError(
+                    "batch delivery encountered an unmaterialized output"
+                )
+            values.append(value)
 
         successful = {
             (value.request_key, value.call_id)
@@ -504,29 +484,29 @@ class BatchState:
             if value.status is CallStatus.OK
         }
 
+        # A batch without calls carries only lifecycle commands and records
+        # no completion, so it reports no execution statistics.
+        completion = self.COMPLETION
+        recorded = completion in self.group_stats
         return BatchOutput(
             batch_id=self.batch_id,
             completions=tuple(values),
             products=tuple(
                 value
-                for group in groups
-                for value in self.group_products[group]
+                for value in self.group_products.get(completion, ())
                 if (value.product.request_key, value.product.producer_call_id)
                 in successful
             ),
             registration=RegistrationAck(
-                visible=all(group in self.visible_groups for group in groups)
+                visible=not self.batch.calls
+                or completion in self.visible_groups
             ),
             worker_exec_us=(
-                max(self.group_execution_us[group] for group in groups)
-                if groups
-                else None
+                self.group_execution_us[completion] if recorded else None
             ),
             forward_stats=(
-                ForwardStats.combine(
-                    tuple(self.group_stats[group] for group in groups)
-                )
-                if groups
+                ForwardStats.combine((self.group_stats[completion],))
+                if recorded
                 else None
             ),
         )

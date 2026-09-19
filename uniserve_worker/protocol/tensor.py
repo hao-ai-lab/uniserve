@@ -155,7 +155,7 @@ def _dim_to_mapping(dim: DimBound) -> dict[str, object]:
 
 @dataclass(frozen=True, slots=True)
 class OutputInfo:
-    """Name and bounded representation of an entry result.
+    """Name and bounded representation of a component result.
 
     Applies before request binding.
     """

@@ -60,7 +60,7 @@ pub struct EngineSettings {
     pub max_model_len: Option<u32>,
     /// Largest request duration resident media state is sized to serve.
     pub max_video_seconds: f64,
-    /// Static Worker configurations with ordered ranks and named computation entries.
+    /// Static Worker configurations with ordered ranks and named computation components.
     pub workers: Vec<WorkerConfig>,
     /// Per-edge data-plane transfer backend (`--transfer`), e.g.
     /// `encoder->prefill=shm,prefill->decode=cuda_vmm`.
@@ -88,7 +88,7 @@ impl Default for EngineSettings {
                 "cuda",
                 1,
                 2,
-                WorkerConfig::single_entry("model", 1),
+                WorkerConfig::single_component("model", 1),
             )],
             transfer: TransferConfig::default(),
             worker_process: WorkerProcessArgs {

@@ -46,7 +46,7 @@ from ..bootstrap.capacity import (
     device_total_bytes,
     resolve_request_capacity,
 )
-from ..bootstrap.distributed import initialize_entries
+from ..bootstrap.distributed import initialize_components
 from ..bootstrap.inputs import capability, image_builder
 from ..bootstrap.model_loader import load_worker_model, prepare_worker_model
 from ..bootstrap.worker_info import RequestKind, ResponseKind, WorkerInfo
@@ -56,7 +56,7 @@ from ..config import (
     graph_memory_budget_bytes,
 )
 from ..execution.batch_state import BatchState
-from ..execution.model_entry import ModelEntry
+from ..execution.component_binding import ComponentBinding
 from ..execution.model_runner import ModelRunner
 from ..execution.output import OutputPool, PendingOutput
 from ..execution.prepare import (
@@ -197,7 +197,7 @@ class Worker:
 
         try:
             try:
-                bindings = initialize_entries(
+                bindings = initialize_components(
                     distributed, dict(config.components)
                 )
             except ValueError as error:
@@ -266,7 +266,7 @@ class Worker:
         flow_prompt: FlowPrompt | None = None,
         components: tuple[tuple[str, ComponentConfig], ...] = (),
         process_groups: ProcessGroups | None = None,
-        bindings: Mapping[str, ModelEntry] | None = None,
+        bindings: Mapping[str, ComponentBinding] | None = None,
         checkpoint_identity: str = "",
     ) -> None:
         """Allocate execution resources for an already-loaded model.
@@ -734,9 +734,9 @@ class Worker:
         self._launched_submissions = 0
         self._collective_component = any(
             group.size > 1
-            for entry in self.runner.bindings.values()
-            if entry.owns
-            for group in entry.groups
+            for binding in self.runner.bindings.values()
+            if binding.owns
+            for group in binding.groups
         ) or (self.sampling_group is not None and self.sampling_group.size > 1)
 
     def _init_run_tracking(self) -> None:
@@ -1111,7 +1111,7 @@ class Worker:
         return True
 
     def _advance_batch(self, batch: BatchState) -> None:
-        """Materialize complete groups.
+        """Materialize the batch's outputs once every pending one is ready.
 
         Also advances physical command retirement.
         """
@@ -1124,40 +1124,32 @@ class Worker:
                     for task in output.completion_tasks:
                         task.submit_if_ready()
 
-            for group, indexes in batch.output_groups.items():
-                if group in batch.completed_groups:
-                    continue
-                outputs = tuple(batch.outputs[index] for index in indexes)
+            if not batch.materialized:
+                outputs = tuple(batch.outputs)
                 if any(value is None for value in outputs):
                     raise RuntimeError(
                         "launched batch is missing an call output"
                     )
-                if any(
-                    isinstance(value, PendingOutput) and not value.ready()
+                if all(
+                    not isinstance(value, PendingOutput) or value.ready()
                     for value in outputs
                 ):
-                    continue
-                pending = tuple(
-                    value
-                    for value in outputs
-                    if isinstance(value, PendingOutput)
-                )
-                values = tuple(
-                    value.materialize()
-                    if isinstance(value, PendingOutput)
-                    else value
-                    for value in outputs
-                )
-                self.requests.apply_outputs(pending)
-                # Acceptance remains visible after pending rows become wire
-                # values.
-                if len(pending) == len(outputs):
-                    batch.accepted_groups.add(group)
-                for index, value in zip(indexes, values, strict=True):
-                    batch.outputs[index] = value
-                batch.completed_groups.add(group)
+                    pending = tuple(
+                        value
+                        for value in outputs
+                        if isinstance(value, PendingOutput)
+                    )
+                    values = tuple(
+                        value.materialize()
+                        if isinstance(value, PendingOutput)
+                        else value
+                        for value in outputs
+                    )
+                    self.requests.apply_outputs(pending)
+                    batch.outputs[:] = values
+                    batch.materialized = True
 
-            if len(batch.completed_groups) == len(batch.output_groups):
+            if batch.materialized:
                 batch.complete = self._advance_retirement(batch)
             self._notify_batch(batch)
         except BaseException as error:
@@ -1252,9 +1244,9 @@ class Worker:
         # must not hide an independent completion behind it.
         for _ in range(len(self._executing_batches)):
             batch = self._executing_batches.popleft()
-            before = len(batch.completed_groups)
+            before = batch.materialized
             self._advance_batch(batch)
-            advanced |= batch.complete or len(batch.completed_groups) != before
+            advanced |= batch.complete or batch.materialized != before
             if not batch.complete:
                 self._executing_batches.append(batch)
         return advanced
