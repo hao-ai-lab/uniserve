@@ -57,7 +57,7 @@ def prepare_launch(
 ) -> ServerLaunch:
     """Resolve a point's server launch and require all environment references."""  # noqa: E501
     server = config.servers[point.server]
-    launch = server_launch(server, executable)
+    launch = server_launch(server, executable, config.root)
     require_resolved(launch.command, context=f"server {server.name}")
     require_resolved(point.workload_dict(), context=f"benchmark {point.name}")
     return launch
