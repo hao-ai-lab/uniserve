@@ -609,16 +609,16 @@ def _request_tensor_worker_layout(
         bytes_per_token=0,
     )
 
-    # A rank holding host components advertises one lane slot per codec
-    # process it runs; any other rank's host lane is the arena's executor.
+    # A host worker advertises one lane slot per codec process a rank holding
+    # every one of its host components runs, the same on each of its ranks:
+    # the engine keeps one capacity per worker and counts occupancy per rank,
+    # and a rank holding fewer components is never handed more tasks than
+    # its own processes serve. Any other worker's host lane is the arena's
+    # executor.
     codecs = codec_workers(
         {}
         if bindings is None
-        else {
-            name: binding.config
-            for name, binding in bindings.items()
-            if binding.owns
-        }
+        else {name: binding.config for name, binding in bindings.items()}
     )
     return WorkerLayout(
         info=replace(
