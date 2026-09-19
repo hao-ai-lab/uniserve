@@ -1331,10 +1331,15 @@ class ShmTransport(Transport):
 
     @staticmethod
     def _acknowledged(source: _ShmSource) -> bool:
-        """Report whether every named consumer has written its word."""
+        """Report whether no named consumer is still reading the segment.
+
+        A retired segment returns once every consumer that began reading has
+        acknowledged; a consumer that never began, such as the reader of a
+        request cancelled before its call was submitted, holds nothing.
+        """
         if not source.consumers:
             return True
-        return segment.acknowledged(source.shm.buf, source.consumers)
+        return segment.settled(source.shm.buf, source.consumers)
 
     def reap(self) -> None:
         self._publications.reap()
@@ -1554,12 +1559,14 @@ class ShmTransport(Transport):
                         "publication is retired, invalid, or belongs to "
                         "another view"
                     )
+                # The claim precedes the first read and the acknowledgment
+                # follows the copy, both with release ordering, so the
+                # producer reclaims nothing this rank still reads and waits
+                # for no rank that never began.
+                segment.claim(header, self._acknowledgment_slot)
                 segment.await_ready(header, check=ticket._require_active)
                 payload = segment.HEADER_BYTES
                 buf = bytearray(shm[payload : payload + locator.nbytes])
-                # The word is written after the copy above, with release
-                # ordering, so the producer reclaims nothing this rank still
-                # reads.
                 segment.acknowledge(header, self._acknowledgment_slot)
             finally:
                 header.release()
@@ -1647,6 +1654,8 @@ class ShmTransport(Transport):
                     "publication is retired, invalid, or belongs to another "
                     "view"
                 )
+            # The claim precedes the reader's first use of the payload.
+            segment.claim(header, self._acknowledgment_slot)
             segment.await_ready(header)
         except BaseException:
             header.release()

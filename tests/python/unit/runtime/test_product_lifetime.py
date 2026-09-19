@@ -445,6 +445,31 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(
         events.close()
 
 
+def test_a_retired_segment_no_consumer_began_reading_returns_at_once() -> None:
+    """A publication released before its consumer read retires unread.
+
+    The engine releases a buffer only once every consuming call has resolved
+    or will never be submitted, as for a request cancelled before its
+    encoder ran, so a named consumer that never claimed the segment is not
+    waited for.
+    """
+    events = EventPool()
+    transport = make_transport(
+        "shm", byte_capacity=4096, ticket_capacity=2, event_pool=events
+    )
+    try:
+        value = torch.arange(8, dtype=torch.float32)
+        locator = transport.publish(value, consumers=(1, 2))
+        retirement = transport.publication_retirement(locator)
+        transport.release(locator)
+        transport.reap()
+        retirement.result(timeout=5)
+        assert not transport.awaiting_acknowledgment()
+    finally:
+        transport.close()
+        events.close()
+
+
 def test_a_deferred_write_commits_when_its_host_work_publishes_it() -> None:
     """A write host work fills later packs without it and commits with it."""
     buffers = BufferPool(byte_capacity=16, devices=("cpu",))
@@ -925,12 +950,12 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
 def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_other_requests(  # noqa: E501
     latent_output,
 ) -> None:
-    """A retired publication holds its pages until its consumer acknowledges.
+    """A retired publication holds its pages while its consumer reads.
 
-    The consumer named on the publication has not written its word, so the
-    pages stay owned and the request is not retirement-ready, while an
-    independent request proceeds. Once the word lands, the next sweep returns
-    the pages.
+    The consumer named on the publication has claimed its word and not yet
+    acknowledged, so the pages stay owned and the request is not
+    retirement-ready, while an independent request proceeds. Once the word
+    lands, the next sweep returns the pages.
     """
     from contextlib import suppress
 
@@ -969,6 +994,16 @@ def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_o
     commit = latent_output(1, (1,), 4, 16, 64)
     pool.validate_updates((commit,))
     pool.apply_updates((commit,))
+    # The consumer begins reading before the engine retires the publication.
+    storage = _open_shared_memory(
+        locator.transport.name, segment.HEADER_BYTES + locator.nbytes
+    )
+    try:
+        header = memoryview(storage)
+        segment.claim(header, 1)
+        header.release()
+    finally:
+        storage.close()
     try:
         transport.release(locator)
         pool.release_buffers((product.buffer_id,))

@@ -3,7 +3,12 @@
 A host product published over shared memory carries everything a consumer
 needs inside the segment itself, so that no connection to the producer is
 required: the publication's identity, its readiness, and one acknowledgment
-word per instance rank. The words are written and read with release and
+word per instance rank. A consumer claims its word when it begins reading
+and acknowledges it once its reads are done, so a producer whose
+publication the engine has retired can tell a consumer still reading from
+one that never began: the engine retires a publication only after every
+consumer's call has resolved or will never be submitted, so no consumer
+begins reading after that. The words are written and read with release and
 acquire ordering, because the readiness word announces the payload written
 before it and the two live in different processes.
 """
@@ -29,6 +34,11 @@ READY = 1
 FAILED = 2
 #: Byte offset of the first acknowledgment word.
 ACK_OFFSET = 64
+#: Acknowledgment word values: the consumer never began reading, it is
+#: reading, or its reads are done.
+UNCLAIMED = 0
+CLAIMED = 1
+ACKNOWLEDGED = 2
 #: Bytes of the header, after which the payload begins; a multiple of the
 #: alignment every payload dtype needs.
 HEADER_BYTES = 512
@@ -100,11 +110,23 @@ def await_ready(
         pause = min(1e-3, pause + 5e-5)
 
 
+def claim(buffer: memoryview, slot: int) -> None:
+    """Mark this rank as reading the payload, before its first read of it."""
+    atomic_store_u32(buffer, ack_offset(slot), CLAIMED)
+
+
 def acknowledge(buffer: memoryview, slot: int) -> None:
     """Write this rank's acknowledgment word, after its reads of the payload."""
-    atomic_store_u32(buffer, ack_offset(slot), 1)
+    atomic_store_u32(buffer, ack_offset(slot), ACKNOWLEDGED)
 
 
-def acknowledged(buffer: memoryview, slots: Sequence[int]) -> bool:
-    """Report whether every named consumer has acknowledged the segment."""
-    return all(atomic_load_u32(buffer, ack_offset(slot)) for slot in slots)
+def settled(buffer: memoryview, slots: Sequence[int]) -> bool:
+    """Report whether no named consumer is still reading the segment.
+
+    Consulted once the engine has retired the publication, after which a
+    consumer that has not claimed its word never will: every named word is
+    then either acknowledged or untouched.
+    """
+    return all(
+        atomic_load_u32(buffer, ack_offset(slot)) != CLAIMED for slot in slots
+    )
