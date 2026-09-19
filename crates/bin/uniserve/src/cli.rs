@@ -3,7 +3,7 @@
 //! The parser exposes the serving command and lowers its model, scheduler,
 //! worker, and HTTP options into the typed server configuration.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -13,7 +13,7 @@ use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use uniserve_core::{KvCacheDtype, ModelDtype};
 use uniserve_engine::{
-    AttentionBackend, ComponentConfig, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
+    AttentionBackend, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
     FlashInferBackend, LaneConfig, TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
@@ -97,11 +97,7 @@ pub(crate) struct ServeArgs {
 impl ServeArgs {
     /// Builds the UniServe-native server config, binding the HTTP listener
     /// directly.
-    pub(crate) fn to_uniserve_config(
-        &self,
-        is_media: bool,
-        entries: BTreeMap<String, ComponentConfig>,
-    ) -> Config {
+    pub(crate) fn to_uniserve_config(&self, is_media: bool) -> Config {
         let listener_mode = match &self.uds {
             Some(path) => HttpListenerMode::BindUnix { path: path.clone() },
             None => HttpListenerMode::BindTcp {
@@ -109,9 +105,7 @@ impl ServeArgs {
                 port: self.port,
             },
         };
-        self.runtime
-            .clone()
-            .into_config(listener_mode, is_media, entries)
+        self.runtime.clone().into_config(listener_mode, is_media)
     }
 }
 
@@ -149,8 +143,9 @@ pub(crate) struct SharedRuntimeArgs {
     /// Number of physical worker processes when configuration is omitted.
     #[arg(long = "worker-ranks", default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub worker_ranks: usize,
-    /// JSON array of Worker configurations, including each replica's node/device ranks.
-    #[arg(long, value_parser = parse_workers)]
+    /// Path to a JSON deployment configuration: the Worker instances to serve,
+    /// each one's node/device ranks, and the components placed on them.
+    #[arg(long, value_name = "FILE", value_parser = read_workers)]
     pub workers: Option<Box<[WorkerConfig]>>,
     /// Directed product bindings: source[:rank]->destination[:rank]=backend.
     #[arg(long)]
@@ -279,40 +274,7 @@ impl SharedRuntimeArgs {
         hosts
     }
 
-    /// Asks the model being served which computation entries it declares.
-    ///
-    /// A model states which components it owns and how each one partitions;
-    /// this process places ranks and names none of them. The model package
-    /// answers without loading the model, so the query costs a process start.
-    pub(crate) fn declared_entries(&self) -> anyhow::Result<BTreeMap<String, ComponentConfig>> {
-        use anyhow::Context as _;
-
-        let output = std::process::Command::new(&self.worker_python)
-            .args(["-m", "uniserve_models.components", "--model"])
-            .arg(&self.model)
-            .args(["--ranks", &self.worker_ranks.to_string()])
-            .output()
-            .with_context(|| {
-                format!(
-                    "asking {} for the entries {} declares",
-                    self.worker_python.display(),
-                    self.model
-                )
-            })?;
-        anyhow::ensure!(
-            output.status.success(),
-            "{} declares no components: {}",
-            self.model,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        serde_json::from_slice(&output.stdout).context("reading the entries the model declared")
-    }
-
-    pub(crate) fn engine_settings(
-        &self,
-        is_media: bool,
-        entries: &BTreeMap<String, ComponentConfig>,
-    ) -> EngineSettings {
+    pub(crate) fn engine_settings(&self, is_media: bool) -> EngineSettings {
         let mut worker_process = self.worker_process.to_args();
         worker_process.host = self.host_identity.clone();
         worker_process.python = self.worker_python.clone();
@@ -352,13 +314,18 @@ impl SharedRuntimeArgs {
             // an explicit `--max-model-len` overrides it.
             max_model_len: self.max_model_len,
             max_video_seconds: self.max_video_seconds,
+            // Without a written configuration a deployment serves one
+            // component over every rank. A model whose components are placed
+            // differently -- on disjoint ranks, or with distinct partitions --
+            // is served by writing that configuration, which `--workers`
+            // parses into exactly the type this builds.
             workers: self.workers.clone().map(Vec::from).unwrap_or_else(|| {
                 vec![WorkerConfig::placed(
                     &self.rank_hosts(),
                     &self.device,
                     self.worker_ranks,
                     queue_depth,
-                    entries.clone(),
+                    WorkerConfig::single_entry("model", self.worker_ranks),
                 )]
             }),
             transfer: self.transfer.clone().unwrap_or_default(),
@@ -367,13 +334,8 @@ impl SharedRuntimeArgs {
     }
 
     /// Builds the OpenAI-server config for the in-process UniServe engine.
-    fn into_config(
-        self,
-        listener_mode: HttpListenerMode,
-        is_media: bool,
-        entries: BTreeMap<String, ComponentConfig>,
-    ) -> Config {
-        let engine = self.engine_settings(is_media, &entries);
+    fn into_config(self, listener_mode: HttpListenerMode, is_media: bool) -> Config {
+        let engine = self.engine_settings(is_media);
         let model = self.resolved_model();
         let api_key = self.configured_api_key();
         let request_timeout = self.request_timeout.map(Duration::from_secs);
@@ -583,6 +545,9 @@ mod tests {
 
     #[test]
     fn serve_accepts_runtime_configuration() {
+        let configuration = written_configuration(
+            r#"[{"id":"text","ranks":[{"node":"localhost","device":"cpu"},{"node":"localhost","device":"cpu"}],"entries":{"model":{"ranks":[0,1],"parallel_config":{"tensor_parallel_size":2}}},"queue_depth":1}]"#,
+        );
         let parsed = <Cli as clap::Parser>::try_parse_from([
             "uniserve",
             "serve",
@@ -630,10 +595,48 @@ mod tests {
             "--lane",
             r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]}"#,
             "--workers",
-            r#"[{"id":"text","ranks":[{"node":"localhost","device":"cpu"},{"node":"localhost","device":"cpu"}],"entries":{"model":{"ranks":[0,1],"parallel_config":{"tensor_parallel_size":2}}},"queue_depth":1}]"#,
+            configuration.to_str().expect("configuration path"),
         ])
         .expect("configured serve invocation");
-        assert!(matches!(parsed.command, Command::Serve(_)));
+        let Command::Serve(args) = parsed.command;
+        let workers = args.runtime.workers.expect("the configuration was read");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].id.0, "text");
+        assert_eq!(workers[0].entries["model"].ranks, vec![0, 1]);
+        assert_eq!(
+            workers[0].entries["model"]
+                .parallel_config
+                .tensor_parallel_size,
+            2
+        );
+    }
+
+    /// Writes a deployment configuration and returns the path naming it.
+    fn written_configuration(body: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "uniserve-deployment-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, body).expect("write deployment configuration");
+        path
+    }
+
+    #[test]
+    fn serve_refuses_a_deployment_configuration_it_cannot_read() {
+        let missing = std::env::temp_dir().join("uniserve-absent-deployment.json");
+        let _ = std::fs::remove_file(&missing);
+        let parsed = <Cli as clap::Parser>::try_parse_from([
+            "uniserve",
+            "serve",
+            "model",
+            "--workers",
+            missing.to_str().expect("configuration path"),
+        ]);
+        assert!(
+            parsed.is_err(),
+            "a missing configuration is not a deployment"
+        );
     }
 
     #[test]
@@ -679,9 +682,17 @@ mod tests {
 }
 
 /// Parses the canonical worker list without a second configuration wrapper.
-fn parse_workers(value: &str) -> Result<Box<[WorkerConfig]>, String> {
-    let workers: Vec<WorkerConfig> =
-        serde_json::from_str(value).map_err(|error| error.to_string())?;
+/// Reads the deployment configuration a serve invocation was given.
+///
+/// The configuration is a file rather than an inline argument because it
+/// states a whole deployment -- every rank's node and device, and every
+/// component placed on them -- and is written once and reused, not composed on
+/// a command line.
+fn read_workers(path: &str) -> Result<Box<[WorkerConfig]>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("reading deployment configuration {path}: {error}"))?;
+    let workers: Vec<WorkerConfig> = serde_json::from_str(&text)
+        .map_err(|error| format!("parsing deployment configuration {path}: {error}"))?;
     WorkerConfig::validate_all(&workers).map_err(|error| error.to_string())?;
     Ok(workers.into_boxed_slice())
 }

@@ -58,13 +58,13 @@ Pass the model root containing `modular_model_index.json`, `fastvideo_inference.
 
 ```bash
 uniserve serve "$H3_MODEL" \
-  --worker-ranks 4 \
+  --workers config/minimax-h3-four-devices.json \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
   --max-running-requests 2
 ```
 
-`--worker-ranks 4` uses four-way Ulysses denoising, TP4 text encoding, temporal video decoding on all four ranks, and rank 0 for audio decoding and MP4 assembly. It does not shard denoiser weights. Use `--workers` for explicit component placement or denoiser tensor/pipeline parallelism.
+`config/minimax-h3-four-devices.json` places FastH3's five components on four devices: four-way Ulysses denoising, TP4 text encoding, one video and one audio media unit per rank, and rank 0 for MP4 assembly. It does not shard denoiser weights. Serving a different width, or sharding the denoiser by tensor or pipeline, is a different deployment configuration; the schema is in [parallel execution](../parallel-execution.md).
 
 A FastH3 deployment defaults to `--max-video-seconds 15` and `--max-model-len 16384`; set them only to change those limits. `--max-running-requests` caps concurrently resident requests, and the engine clamps that cap to the worker's advertised request-slot capacity; lowering it trades throughput for per-request latency and memory headroom.
 
@@ -94,7 +94,7 @@ docker run --rm \
   -p 8000:8000 \
   -v "$H3_MODEL:/models/fast_h3:ro" \
   uniserve-h3 serve /models/fast_h3 \
-    --worker-ranks 4 \
+    --workers config/minimax-h3-four-devices.json \
     --served-model-name FastH3 \
     --host 0.0.0.0 \
     --max-running-requests 2
@@ -172,7 +172,7 @@ On four GB200 devices, the packed 8-Step V2 checkpoint serves every measured dur
 
 ```bash
 uniserve serve skx618/FastVideo-FastH3-8-Step-V2-NVFP4 \
-  --worker-ranks 4 \
+  --workers config/minimax-h3-four-devices.json \
   --served-model-name FastH3
 ```
 
@@ -185,5 +185,5 @@ uniserve serve skx618/FastVideo-FastH3-8-Step-V2-NVFP4 \
 | Missing audio VAE or codec | Restore the locked environment with `uv sync`; do not mix in older Diffusers or PyAV packages. |
 | `unsupported FastH3 checkpoint` | Use a complete checkpoint from the table above; the message names the model ID and revision it expects. |
 | `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `--quantization-config`: a packed NVFP4 checkpoint carries its own precision contract. |
-| GPU out of memory | Reduce resident capacity or choose a sharded `--workers` layout; sequence parallelism alone replicates denoiser weights. |
+| GPU out of memory | Reduce resident capacity, or write a deployment configuration that shards the denoiser; sequence parallelism alone replicates denoiser weights. |
 | MP4 contains an error body | Use `--fail-with-body`, inspect the HTTP status, and confirm the model name and `/v1/capabilities` limits. |
