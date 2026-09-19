@@ -1285,7 +1285,7 @@ class ShmTransport(Transport):
             capacity=256,
             reclaim=self._reclaim,
             drain=lambda source: None,
-            acknowledged=self._acknowledged,
+            settled=self._settled,
         )
         # This rank's own word in the header of every segment it reads.
         self._acknowledgment_slot = int(acknowledgment_slot)
@@ -1345,7 +1345,7 @@ class ShmTransport(Transport):
         retirement.set_result(None)
 
     @staticmethod
-    def _acknowledged(source: _ShmSource) -> bool:
+    def _settled(source: _ShmSource) -> bool:
         """Report whether no named consumer is still reading the segment.
 
         A retired segment returns once every consumer that began reading has
@@ -2036,7 +2036,11 @@ class CudaVmmTransport(Transport):
             capacity=256,
             reclaim=self._reclaim,
             drain=self._drain,
-            acknowledged=lambda source: True,
+            # A device publication's chunk is held by the pool until its
+            # readers finish, which the transport's own sweep decides; the
+            # publication itself owes nothing once the producer's work is
+            # complete.
+            settled=lambda source: True,
         )
         self._reads = _BoundedTransferPool(
             workers=2,

@@ -96,8 +96,8 @@ def test_component_bindings_release_cancelled_requests(
     model_value = os.environ.get("UNISERVE_H3_MODEL")
     if not model_value or not Path(model_value).is_dir():
         pytest.fail(
-            "UNISERVE_H3_MODEL must name the FastH3 Preview v0.2 checkpoint "
-            "directory"
+            "UNISERVE_H3_MODEL must name a supported FastH3 checkpoint "
+            "directory; docs/fast_h3/fast_h3.md lists them"
         )
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -303,6 +303,12 @@ def test_component_bindings_release_cancelled_requests(
         "16384",
         "--max-video-seconds",
         "15",
+        # One and two device layouts hold the whole denoiser on each of their
+        # ranks and split the 15-second sequence over fewer of them, so their
+        # warmup reaches a larger share of the device than the four-device
+        # deployment the default grant is sized for.
+        "--mem-fraction-static",
+        "0.92",
         "--dtype",
         "bfloat16",
         "--quantization-config",
@@ -385,8 +391,8 @@ def test_video_jobs_retain_content_and_cancel_active_work(
     model = os.environ.get("UNISERVE_H3_MODEL")
     if not model or not Path(model).is_dir():
         pytest.fail(
-            "UNISERVE_H3_MODEL must name the supported full FastH3 VSA "
-            "checkpoint"
+            "UNISERVE_H3_MODEL must name a supported FastH3 checkpoint "
+            "directory; docs/fast_h3/fast_h3.md lists them"
         )
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
