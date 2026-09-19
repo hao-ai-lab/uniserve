@@ -101,3 +101,72 @@ def test_selection_compression_and_projected_chunks(provider):
             torch.testing.assert_close(
                 result[live], expected[live], rtol=2e-2, atol=2e-2
             )
+
+
+@torch.inference_mode()
+def test_norm_rope_prepared_chunks_match_normalized_projections():
+    """Raw chunks with a norm-rope attend like pre-normalized chunks."""
+    torch.manual_seed(1119)
+    projections = torch.randn(
+        256, 7, 4, 128, device="cuda", dtype=torch.bfloat16
+    )
+    q, k, v, gate = projections.unbind(2)
+    valid = torch.tensor([64, 64, 25, 0], device="cuda", dtype=torch.int32)
+    query_weight = torch.rand(128, device="cuda", dtype=torch.bfloat16) + 0.5
+    key_weight = torch.rand(128, device="cuda", dtype=torch.bfloat16) + 0.5
+    angles = torch.rand(256, 48, device="cuda") * 6.0
+    cos, sin = angles.cos(), angles.sin()
+    inputs, workspace = _input(valid), _workspace(q)
+    module = vsa.Attention(vsa.BlockAttention(128**-0.5))
+
+    # The reference normalizes and rotates the projections up front with the
+    # public functional, then attends the prepared chunks.
+    from uniserve.nn.functional import qk_norm_rope
+
+    normalized_q, normalized_k = qk_norm_rope(
+        q,
+        k,
+        query_weight,
+        key_weight,
+        (cos,),
+        (sin,),
+        eps=1e-6,
+        axis_dims=(128,),
+    )
+
+    def chunks(query, key):
+        for start, stop in ((0, 64), (64, 192), (192, 256)):
+            yield (
+                slice(start, stop),
+                tuple(value[start:stop] for value in (query, key, v, gate)),
+            )
+
+    def attend(query, key, norm_rope):
+        result = torch.empty_like(q)
+        for interval, output in module.forward_chunks(
+            chunks(query, key),
+            inputs,
+            selected_tiles=1,
+            workspace=workspace,
+            norm_rope=norm_rope,
+        ):
+            result[interval].copy_(output)
+        return result
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with ExecutionContext(module, stream=stream, vsa="cute") as context:
+        context.prepare(None)
+        expected = attend(normalized_q, normalized_k, None).clone()
+        actual = attend(
+            q,
+            k,
+            vsa.NormRope(query_weight, key_weight, 1e-6, cos, sin),
+        )
+        live = torch.arange(256, device="cuda") < 64 * 2 + 25
+        # Both paths round the prepared rows to bf16 after fp32 normalization
+        # and rotation; the tolerance is one bf16 ulp on inputs and outputs.
+        torch.testing.assert_close(
+            actual[live], expected[live], rtol=2**-7, atol=2**-7
+        )
+        torch.cuda.synchronize()
