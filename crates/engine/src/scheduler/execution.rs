@@ -9,22 +9,23 @@ use uniserve_worker_ipc::{CallCoordinates, ForwardMode, PipelineStage, TransferM
 
 impl Scheduler {
     /// Enumerates loaded entries that can execute the requested call.
+    ///
+    /// Which entry serves a pipeline stage is the model's to state, not the
+    /// engine's: a worker resolves it from the capabilities its components
+    /// implement and reports it as `pipeline_components`. That report is the
+    /// only authority here, so the engine holds no component vocabulary of its
+    /// own and cannot drift from the names a model actually binds. A worker
+    /// that reports no pipeline routing serves one undivided model.
     pub(super) fn worker_candidates(
         &self,
         kind: CallKind,
     ) -> impl Iterator<Item = (&crate::WorkerId, &str, &WorkerInfo)> {
         let entry = match kind {
-            CallKind::Pipeline(PipelineStage::TextEncoding) => "text_encoder",
-            CallKind::Pipeline(PipelineStage::LatentPreparation) => "denoiser",
-            CallKind::Pipeline(PipelineStage::Denoising) => "denoiser",
-            CallKind::Pipeline(
-                PipelineStage::VideoEncoding | PipelineStage::AudioEncoding | PipelineStage::Muxing,
-            ) => "output",
-            CallKind::Pipeline(PipelineStage::ImageDecoding) => "denoiser",
-            CallKind::Pipeline(PipelineStage::VideoDecoding) => "video_decoder",
-            CallKind::Pipeline(PipelineStage::AudioDecoding) => "audio_decoder",
-            CallKind::Pipeline(PipelineStage::VisionEncoding) => "vision_encoder",
-            CallKind::Pipeline(PipelineStage::LatentEncoding) => "latent_encoder",
+            CallKind::Pipeline(stage) => self
+                .info
+                .pipeline_components
+                .get(&stage)
+                .map_or("model", String::as_str),
             _ => "model",
         };
         self.entry_candidates(kind, entry)

@@ -645,7 +645,7 @@ mod tests {
         other.id = WorkerId("other".into());
         assert!(WorkerConfig::validate_all(&[worker.clone(), other.clone()]).is_err());
         let entry = other.entries.remove("model").unwrap();
-        other.entries.insert("text_encoder".into(), entry);
+        other.entries.insert("divided".into(), entry);
         assert!(WorkerConfig::validate_all(&[worker, other]).is_ok());
     }
 }
