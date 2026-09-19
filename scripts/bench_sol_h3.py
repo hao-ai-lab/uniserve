@@ -11,6 +11,10 @@ denoising + VAE decoding, Sol-H3's own timing scope) and ``save_s`` (MP4
 encoding), so the sum approximates UniServe's client-side video_latency_ms
 scope, which additionally carries HTTP transfer.
 
+The paths below are the reference engine's own model and adapter, which it
+loads in its own format; they are not UniServe checkpoints and are not part
+of the supported set in docs/fast_h3/fast_h3.md.
+
 Launch (4 GPUs):
     torchrun --standalone --nproc_per_node=4 scripts/bench_sol_h3.py \
         --compute-quant none \
