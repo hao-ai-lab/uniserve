@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from uniserve_models.placement import (
+from uniserve_models.components import (
     Partition,
     architecture_of,
     divisions_of,
@@ -83,7 +83,7 @@ def test_each_division_places_the_component_it_describes(tmp_path):
     assert entries["muxer"] == {"ranks": [0], "parallel_config": {}}
 
 
-def test_a_division_is_the_models_and_the_placement_is_the_instances(tmp_path):
+def test_a_division_is_the_models_and_the_width_is_the_instances(tmp_path):
     root = _media_checkpoint(tmp_path)
     divisions = divisions_of(architecture_of(root))
 
@@ -104,7 +104,7 @@ def test_a_division_is_the_models_and_the_placement_is_the_instances(tmp_path):
 def test_every_supported_architecture_declares_known_divisions():
     # A package added without a declaration, or naming a division shared code
     # cannot place, is otherwise found only when a rank looks for a component.
-    from uniserve_models.placement import _PACKAGES
+    from uniserve_models.components import _PACKAGES
 
     for architecture in _PACKAGES:
         divisions = divisions_of(architecture)
@@ -134,7 +134,7 @@ def test_an_unsupported_or_ambiguous_architecture_is_refused(tmp_path):
         entries_for(tmp_path / "c", 1)
 
 
-def test_a_placement_requires_a_positive_rank_count(tmp_path):
+def test_dividing_components_requires_a_positive_rank_count(tmp_path):
     root = _checkpoint(tmp_path, {"architectures": ["Qwen3ForCausalLM"]})
 
     for ranks in (0, -1):

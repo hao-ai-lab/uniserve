@@ -23,7 +23,7 @@ from uniserve.nn.attention import AttentionParallelConfig
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.quantization import QuantizationConfig, Quantizer
 
-from .placement import package_of
+from .components import package_of
 
 ConfigT = TypeVar("ConfigT")
 ModelT = TypeVar("ModelT", bound=nn.Module)

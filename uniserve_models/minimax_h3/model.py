@@ -57,7 +57,7 @@ def entry_points(config: Config) -> Mapping[str, ComponentEntry]:
                 ),
             ),
             # The rank that reconstructs a media unit also converts it to RGB,
-            # so the decoder and its post-processor are one placement. The
+            # so the decoder and its post-processor are one component. The
             # entry owns two sibling modules, which the empty component path
             # names.
             "video_decoder": ComponentEntry(

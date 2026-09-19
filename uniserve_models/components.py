@@ -1,17 +1,17 @@
-"""How a model's components divide work over the ranks that hold them.
+"""The components a model owns and how each one divides work over ranks.
 
-A model owns two statements about placement. Which components exist, and how
-each one divides: a denoiser divides a sequence by attention head, a text
-encoder divides its tensors, a decoder divides its output timeline into media
-units, and a muxer assembles the artifact and divides nothing. Everything else
-is the serving infrastructure's -- which host and device each rank is, how many
-ranks there are, and how they are numbered -- so a model states the division
-and shared code states what that division means for a given rank count.
+A model states two things about itself before anything loads it: which
+components it has, and how each one divides. A denoiser divides a sequence by
+attention head, a text encoder divides its tensors, a decoder divides its
+output timeline into media units, and a muxer assembles the artifact and
+divides nothing. How wide the instance is, which host and device each rank is,
+and how ranks are numbered are the serving infrastructure's; a model states the
+division, and shared code states what that division means for a rank count.
 
-Each model package declares its components beside its numerical code, in a
-``placement.toml`` naming one division per component. The declaration is read
-rather than imported, so resolving a placement costs two file reads and no
-framework import, and an engine can ask for one without loading a model.
+Each package declares its components beside its numerical code, in a
+``components.toml`` naming one division per component. The declaration is read
+rather than imported, so answering costs two file reads and no framework
+import, and an engine can ask a checkpoint what it holds without loading it.
 """
 
 from __future__ import annotations
@@ -53,14 +53,15 @@ _PIPELINE_ARCHITECTURES: Mapping[str, str] = MappingProxyType(
 )
 
 #: The file in which a package declares one division per component.
-_DECLARATION = "placement.toml"
+_DECLARATION = "components.toml"
 
 
 class Partition(StrEnum):
     """How one component divides its work over the ranks that hold it.
 
-    The division is the model's mathematical property and does not depend on
-    how wide the instance is; the rank count turns it into a placement.
+    The division is the model's own mathematical property and does not depend
+    on how wide the instance is; a rank count turns it into a rank membership
+    and a parallel configuration.
     """
 
     #: Divides the component's tensors, every rank holding a shard of each.
@@ -73,11 +74,11 @@ class Partition(StrEnum):
     NOTHING = "nothing"
 
 
-def _placed(partition: Partition, ranks: int) -> dict:
-    """State one component's placement over an instance of ``ranks`` ranks.
+def _divided(partition: Partition, ranks: int) -> dict:
+    """State how one component divides over an instance of ``ranks`` ranks.
 
-    The result is a `ComponentConfig` as an explicit ``--workers`` placement
-    writes it, so a declared placement and a written one are the same object to
+    The result is a `ComponentConfig` as an explicit ``--workers`` argument
+    writes it, so a declared component and a written one are the same object to
     the engine.
     """
     members = list(range(ranks))
@@ -106,9 +107,9 @@ def _placed(partition: Partition, ranks: int) -> dict:
             }
         case Partition.NOTHING:
             return {"ranks": [0], "parallel_config": {}}
-    # Reached only if a division is declared that no placement expands, which
-    # is a partition added above without the placement it stands for.
-    raise ValueError(f"no placement states the {partition} division")
+    # Reached only for a division nothing expands, which is a partition added
+    # above without the rank membership it stands for.
+    raise ValueError(f"nothing states what the {partition} division divides")
 
 
 def architecture_of(path: str | Path) -> str:
@@ -150,26 +151,28 @@ def divisions_of(architecture: str) -> Mapping[str, Partition]:
 
 
 def entries_for(path: str | Path, ranks: int) -> dict:
-    """Return the components a checkpoint places over ``ranks`` ranks.
+    """Return a checkpoint's components divided over ``ranks`` ranks.
 
-    Each component is mapped to the membership and partition it admits, in the
-    schema an explicit placement already uses. Rank identity -- which host and
-    which device -- is the caller's.
+    Each component is mapped to the rank membership and parallel configuration
+    its division gives it at that width, in the schema the engine's `--workers`
+    entries already use. Rank identity -- which host and which device -- is the
+    caller's.
     """
     if type(ranks) is not int or ranks < 1:
-        raise ValueError("a placement requires a positive rank count")
+        raise ValueError("components divide over a positive rank count")
     divisions = divisions_of(architecture_of(path))
     return {
-        name: _placed(partition, ranks) for name, partition in divisions.items()
+        name: _divided(partition, ranks)
+        for name, partition in divisions.items()
     }
 
 
 def main() -> int:
-    """Print one checkpoint's placement as JSON, for a non-Python caller."""
+    """Print a checkpoint's divided components as JSON, for another language."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Report the components a checkpoint places."
+        description="Report the components a checkpoint holds."
     )
     parser.add_argument("--model", required=True)
     parser.add_argument("--ranks", type=int, required=True)
