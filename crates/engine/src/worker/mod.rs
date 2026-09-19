@@ -47,6 +47,13 @@ pub struct WorkerProcessArgs {
     pub host: String,
     /// Component membership and parallel geometry.
     pub components: std::collections::BTreeMap<String, crate::ComponentConfig>,
+    /// Every worker's component membership, keyed by worker identity, this
+    /// group included. A rank is told which ranks read its products, and the
+    /// consuming component may belong to another worker.
+    pub peers: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, crate::ComponentConfig>,
+    >,
     /// How long the head waits for every other host's launcher to present.
     ///
     /// The cluster starts a launcher on each host alongside the head, so this

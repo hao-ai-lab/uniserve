@@ -114,7 +114,6 @@ def test_component_bindings_release_cancelled_requests(
             "units_per_rank": 1,
         },
         "audio_decoder": {"ranks": [1]},
-        "muxer": {"ranks": [2]},
     }
     if parallel_kind in ("local", "ulysses2", "ulysses4"):
         degree = {"local": 1, "ulysses2": 2, "ulysses4": 4}[parallel_kind]
@@ -140,7 +139,6 @@ def test_component_bindings_release_cancelled_requests(
                 "units_per_rank": 1,
             },
             "audio_decoder": {"ranks": [0]},
-            "muxer": {"ranks": [0]},
         }
     elif parallel_kind in ("pipeline2", "pipeline4"):
         degree = 2 if parallel_kind == "pipeline2" else 4
@@ -207,7 +205,7 @@ def test_component_bindings_release_cancelled_requests(
         "split": [(name,) for name in worker_config],
         "mixed": [
             ("denoiser", "text_encoder"),
-            ("video_decoder", "audio_decoder", "muxer"),
+            ("video_decoder", "audio_decoder"),
         ],
     }[grouping]
     workers = []
@@ -238,13 +236,33 @@ def test_component_bindings_release_cancelled_requests(
             }
         )
         owners.update(dict.fromkeys(names, worker_id))
+    # Media units are encoded and the artifact assembled on a host worker:
+    # one host rank encodes every unit of a round and muxes.
+    decoder_units = len(worker_config["video_decoder"]["ranks"])
+    workers.append(
+        {
+            "id": "host",
+            "ranks": [{"node": "localhost", "device": "cpu"}],
+            "components": {
+                "video_encoder": {
+                    "ranks": [0],
+                    "distribution": "temporal_units",
+                    "units_per_rank": decoder_units,
+                },
+                "muxer": {"ranks": [0]},
+            },
+            "queue_depth": 6,
+        }
+    )
+    owners.update({"video_encoder": "host", "muxer": "host"})
     edges = {
         (owners[source], owners[destination])
         for source, destination in (
             ("text_encoder", "denoiser"),
             ("denoiser", "video_decoder"),
             ("denoiser", "audio_decoder"),
-            ("video_decoder", "muxer"),
+            ("video_decoder", "video_encoder"),
+            ("video_encoder", "muxer"),
             ("audio_decoder", "muxer"),
         )
     }
@@ -264,7 +282,11 @@ def test_component_bindings_release_cancelled_requests(
         str(written_deployment(tmp_path, workers)),
         "--transfer",
         ",".join(
-            f"{source}->{destination}=cuda_vmm"
+            # Device products cross workers over VMM handles; the host
+            # worker's ranks have no device, so their edges carry host
+            # products over shared memory only.
+            f"{source}->{destination}="
+            + ("shm" if "host" in (source, destination) else "cuda_vmm+shm")
             for source, destination in sorted(edges)
         ),
         "--queue-depth",

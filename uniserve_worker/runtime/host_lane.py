@@ -25,8 +25,8 @@ from ..media.codec_process import (
     CodecJob,
     CodecProcess,
     MuxClose,
+    Probe,
     SessionKey,
-    SharedMapping,
 )
 
 __all__ = ["HostLane", "HostTask"]
@@ -124,13 +124,18 @@ class HostLane:
         with self._lock:
             return len(self._tasks)
 
-    def attach(self, mapping: SharedMapping) -> None:
-        """Let every codec process read media units from a shared mapping."""
-        if not self.codec:
-            raise RuntimeError("host lane runs no codec processes")
+    def probe(self) -> None:
+        """Confirm every codec process serves and loads its codecs.
+
+        Run before the rank reports ready, so a missing codec or a process
+        that failed to start surfaces at startup rather than under a request.
+        """
         for worker in self._workers:
-            assert worker.codec is not None
-            worker.codec.attach(mapping)
+            if (
+                worker.codec is not None
+                and worker.codec.execute(Probe()) is not True
+            ):
+                raise RuntimeError("codec process did not answer its probe")
 
     def reserve(self) -> HostTask:
         """Admit a task under the pool's capacity lease before its inputs.

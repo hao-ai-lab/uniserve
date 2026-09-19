@@ -320,24 +320,16 @@ impl WorkerInfo {
             "worker info repeat a work variant"
         );
         // A worker names the component serving each media call it implements. Every
-        // named call must be one it advertises and a component it holds; a
-        // deployment that assembles an artifact must name the whole video
-        // graph, which a worker reporting only the calls it has need not.
+        // named call must be one it advertises and a component it holds. The
+        // video graph may span workers, a model worker decoding and a host
+        // worker encoding and muxing, so its completeness and its diffusion
+        // step count are the executor's checks over every worker.
         ensure_valid!(
             self.media_components.iter().all(|(call, component)| {
                 !component.is_empty() && self.supported_ops.contains(&CallKind::Media(*call))
             }),
             "a media call names no component this worker serves"
         );
-        if self.media_components.contains_key(&MediaCall::Muxing) {
-            ensure_valid!(
-                self.num_inference_steps > 0
-                    && MediaCall::VIDEO
-                        .iter()
-                        .all(|call| self.media_components.contains_key(call)),
-                "video components or diffusion step count are incomplete"
-            );
-        }
         ensure_valid!(
             self.max_batch_ops > 0
                 && self.max_batch_tokens > 0

@@ -168,9 +168,11 @@ impl Scheduler {
         for (role, output_count) in [
             (MediaCall::TextEncoding, 1),
             (MediaCall::Denoising, 2),
-            // The video decoder component declares the decoded windows and the
-            // media units encoded from them; both are indexed by media unit.
-            (MediaCall::VideoDecoding, 2),
+            // The video decoder declares its decoded media units and the
+            // video encoder the rows encoded from them; both are indexed by
+            // media unit.
+            (MediaCall::VideoDecoding, 1),
+            (MediaCall::VideoEncoding, 1),
             (MediaCall::AudioDecoding, 1),
         ] {
             let name = self.info.media_components.get(&role)?;
@@ -200,7 +202,7 @@ impl Scheduler {
                     if !selected {
                         return None;
                     }
-                } else if role == MediaCall::VideoDecoding {
+                } else if matches!(role, MediaCall::VideoDecoding | MediaCall::VideoEncoding) {
                     let Some(DimBound::Device { max }) = shape.dims.first().copied() else {
                         return None;
                     };

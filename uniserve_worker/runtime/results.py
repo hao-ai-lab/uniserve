@@ -53,39 +53,57 @@ def resolve_outputs(
     assemble them. Wire dtypes and persistent product names belong here; model
     output layouts retain only their numerical representation and placement.
     """
-    from ..bootstrap.components import describe_components
+    from ..bootstrap.components import (
+        VIDEO_ENCODER_COMPONENT,
+        describe_components,
+    )
+    from ..bootstrap.inputs import media_builder
+    from ..execution.resources import encoded_units_layout
 
     result = {}
     for component, calls in describe_components(model).items():
         outputs = []
-        for call in calls:
-            for name, layout in output_layouts(model, config, call).items():
-                dtype = _DTYPES.get(layout.dtype)
-                if dtype is None:
-                    raise ValueError(
-                        f"result {component}.{name} has no protocol dtype"
-                    )
-                if len(layout.variable_axes) > 1:
-                    raise ValueError(
-                        f"result {component}.{name} exceeds the protocol "
-                        "dynamic axes"
-                    )
-                # A variable axis becomes a device-sized bound; every other
-                # extent is a static protocol dimension.
-                outputs.append(
-                    OutputInfo(
-                        product_name(call.module, name),
-                        dtype,
-                        ShapeBound(
-                            tuple(
-                                DeviceDim(extent)
-                                if axis in layout.variable_axes
-                                else StaticDim(extent)
-                                for axis, extent in enumerate(layout.shape)
-                            )
-                        ),
-                    )
+        layouts = [
+            (call.module, name, layout)
+            for call in calls
+            for name, layout in output_layouts(model, config, call).items()
+        ]
+        if component == VIDEO_ENCODER_COMPONENT:
+            builder = media_builder(model, config)
+            layouts.append(
+                (
+                    None,
+                    "encoded_units",
+                    encoded_units_layout(model, builder.maximum.num_frames),
                 )
+            )
+        for module, name, layout in layouts:
+            dtype = _DTYPES.get(layout.dtype)
+            if dtype is None:
+                raise ValueError(
+                    f"result {component}.{name} has no protocol dtype"
+                )
+            if len(layout.variable_axes) > 1:
+                raise ValueError(
+                    f"result {component}.{name} exceeds the protocol "
+                    "dynamic axes"
+                )
+            # A variable axis becomes a device-sized bound; every other
+            # extent is a static protocol dimension.
+            outputs.append(
+                OutputInfo(
+                    name if module is None else product_name(module, name),
+                    dtype,
+                    ShapeBound(
+                        tuple(
+                            DeviceDim(extent)
+                            if axis in layout.variable_axes
+                            else StaticDim(extent)
+                            for axis, extent in enumerate(layout.shape)
+                        )
+                    ),
+                )
+            )
         if outputs:
             result[component] = tuple(outputs)
 

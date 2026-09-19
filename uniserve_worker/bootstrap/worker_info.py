@@ -8,7 +8,6 @@ from enum import StrEnum
 from typing import Any, TypeVar, cast
 
 from uniserve_worker.protocol.call import (
-    VIDEO_CALLS,
     CallKind,
     ForwardMode,
     MediaCall,
@@ -381,17 +380,10 @@ class WorkerInfo:
 
         if self.media_components:
             # A worker reports the component serving each media call it
-            # implements. A
-            # deployment that assembles an artifact serves the whole video
-            # call graph; one that reports only the calls it has, such as a
-            # patch encoder placed apart from a language backbone, does not.
-            if MediaCall.MUXING in self.media_components and (
-                self.num_inference_steps < 1
-                or set(self.media_components) != set(VIDEO_CALLS)
-            ):
-                raise invalid_descriptor(
-                    "video components or diffusion step count are incomplete"
-                )
+            # implements. The video call graph may span workers, a model
+            # worker decoding and a host worker encoding and muxing, so its
+            # completeness and its diffusion step count are the engine's
+            # checks over every worker.
             if any(
                 not component or call not in self.supported_ops
                 for call, component in self.media_components.items()
