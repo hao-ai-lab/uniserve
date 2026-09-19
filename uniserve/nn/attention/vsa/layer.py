@@ -203,8 +203,16 @@ class Attention(nn.Module):
         scores = workspace.tile_scores
         query = workspace.pooled_query.permute(1, 0, 2)
         key = workspace.pooled_key.permute(1, 0, 2)
-        torch.matmul(query, key.transpose(-1, -2), out=scores)
-        scores.mul_(self.attention.scale)
+        # The softmax scale is applied in the GEMM epilogue; beta 0 leaves
+        # the score storage unread.
+        torch.baddbmm(
+            scores,
+            query,
+            key.transpose(-1, -2),
+            beta=0.0,
+            alpha=self.attention.scale,
+            out=scores,
+        )
 
         heads, tiles, _ = scores.shape
         pattern = inputs.pattern(
@@ -271,17 +279,24 @@ class Attention(nn.Module):
         scores = workspace.tile_scores
         query = workspace.pooled_query.permute(1, 0, 2)
         key = workspace.pooled_key.permute(1, 0, 2)
-        torch.matmul(query, key.transpose(-1, -2), out=scores)
-        scores.mul_(self.attention.scale)
+        # The softmax scale is applied in the GEMM epilogue; beta 0 leaves
+        # the score storage unread.
+        torch.baddbmm(
+            scores,
+            query,
+            key.transpose(-1, -2),
+            beta=0.0,
+            alpha=self.attention.scale,
+            out=scores,
+        )
         self._compress_scores(batch, workspace)
 
     @staticmethod
     def _compress_scores(batch, workspace):
         scores = workspace.tile_scores
-        scores.masked_fill_(batch.valid_sizes.view(1, 1, -1) == 0, -torch.inf)
-        # Use the native stable FP32 reduction in the caller's score storage;
-        # separate reductions and elementwise passes reread the full tile map.
-        torch.softmax(scores, dim=-1, out=scores)
+        # One pass over the score storage masks empty key tiles and
+        # normalizes each query tile's row in fp32.
+        ops.tile_softmax(scores, batch.valid_sizes)
         torch.matmul(
             scores,
             workspace.pooled_value.permute(1, 0, 2),
