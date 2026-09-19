@@ -210,4 +210,3 @@ class Workspace:
     pooled_key: torch.Tensor
     pooled_value: torch.Tensor
     compressed_tiles: torch.Tensor
-    topk_indices: torch.Tensor

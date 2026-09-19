@@ -136,12 +136,7 @@ def _run(rank, rendezvous):
             )
             context = mesh.get_group(context_axes)
             query_tokens, local_heads = 512 // context.size, 8 // heads.size
-            begin, end = (
-                context.rank * query_tokens,
-                (context.rank + 1) * query_tokens,
-            )
-            start_tile, end_tile = begin // 64, end // 64
-            video_tiles = max(0, min(end_tile, 7) - max(start_tile, 1))
+            begin = context.rank * query_tokens
 
             def tensor(shape, dtype=torch.float32):
                 return torch.empty(shape, device=device, dtype=dtype)
@@ -155,7 +150,6 @@ def _run(rank, rendezvous):
                 tensor((8, local_heads, 128)),
                 tensor((8, local_heads, 128)),
                 tensor((local_heads, query_tokens // 64, 128)),
-                tensor((local_heads, video_tiles, 6), torch.int32),
             )
             inputs = vsa.Input(
                 512,

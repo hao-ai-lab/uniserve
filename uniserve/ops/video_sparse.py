@@ -102,82 +102,118 @@ if triton is not None:
         tl.store(pooled_value + output_offsets, value_mean)
 
     @triton.jit
-    def _threshold_topk_kernel(
+    def _select_block_map_kernel(
         scores,
-        output,
+        prefix_key_indices,
+        dense_key_indices,
+        block_indices,
+        block_counts,
         score_stride_head: tl.constexpr,
         score_stride_row: tl.constexpr,
-        output_stride_head: tl.constexpr,
-        output_stride_row: tl.constexpr,
-        rows_per_head: tl.constexpr,
+        index_stride_head: tl.constexpr,
+        index_stride_row: tl.constexpr,
+        count_stride_head: tl.constexpr,
+        tiles: tl.constexpr,
+        local_prefix: tl.constexpr,
+        local_video: tl.constexpr,
+        prefix_tiles: tl.constexpr,
+        valid_tiles: tl.constexpr,
         columns: tl.constexpr,
         selected: tl.constexpr,
         block: tl.constexpr,
+        dense_block: tl.constexpr,
         iterations: tl.constexpr,
     ):
-        """Select up to ``selected`` score columns.
+        """Write one query tile's key-tile list and count for one head.
 
-        Select up to ``selected`` score columns by iterative threshold
-        search.
+        A prefix query tile attends densely to every valid key tile. A video
+        query tile attends to the dense prefix, then to the ``selected`` video
+        tiles whose pooled scores clear a threshold found by interpolation
+        search; prefix ranks give threshold ties a deterministic order. A
+        padding tile attends to one tile so its count stays positive. Entries
+        past a row's count are left as they were; no consumer reads them.
         """
         row = tl.program_id(0)
-        head = row // rows_per_head
-        query_row = row % rows_per_head
+        head = row // tiles
+        tile = row % tiles
+        index_row = (
+            block_indices + head * index_stride_head + tile * index_stride_row
+        )
+        count_row = block_counts + head * count_stride_head + tile
 
-        offsets = tl.arange(0, block)
-        valid = offsets < columns
-        values = tl.load(
-            scores
-            + head * score_stride_head
-            + query_row * score_stride_row
-            + offsets,
-            mask=valid,
-            other=-float("inf"),
-        ).to(tl.float32)
-
-        # Maintain score bounds and the number of candidates at each bound.
-        # Interpolation converges toward a threshold with at least ``selected``
-        # values while avoiding a full per-row sort.
-        lower = tl.min(tl.where(valid, values, float("inf")))
-        upper = tl.max(tl.where(valid, values, -float("inf"))) + 1.0
-        lower_count = tl.sum(valid.to(tl.int32), axis=0).to(tl.float32)
-        upper_count = 0.0
-
-        for _ in tl.static_range(iterations):
-            # Interpolate the next threshold between the bounds; clamping the
-            # step keeps each iteration strictly inside the bracket.
-            denominator = lower_count - upper_count
-            fraction = (lower_count - selected) / tl.where(
-                denominator > 0.5,
-                denominator,
-                1.0,
+        if tile < local_prefix:
+            offsets = tl.arange(0, dense_block)
+            dense = tl.load(
+                dense_key_indices + offsets, mask=offsets < valid_tiles, other=0
             )
-            fraction = tl.minimum(tl.maximum(fraction, 0.05), 0.95)
+            tl.store(index_row + offsets, dense, mask=offsets < valid_tiles)
+            tl.store(count_row, valid_tiles)
+        elif tile < local_video:
+            prefix_offsets = tl.arange(0, dense_block)
+            prefix = tl.load(
+                prefix_key_indices + prefix_offsets,
+                mask=prefix_offsets < prefix_tiles,
+                other=0,
+            )
+            tl.store(
+                index_row + prefix_offsets,
+                prefix,
+                mask=prefix_offsets < prefix_tiles,
+            )
 
-            threshold = lower + (upper - lower) * fraction
-            count = tl.sum(
-                ((values >= threshold) & valid).to(tl.int32),
-                axis=0,
+            offsets = tl.arange(0, block)
+            valid = offsets < columns
+            values = tl.load(
+                scores
+                + head * score_stride_head
+                + (tile - local_prefix) * score_stride_row
+                + offsets,
+                mask=valid,
+                other=-float("inf"),
             ).to(tl.float32)
 
-            enough = count >= selected
-            lower = tl.where(enough, threshold, lower)
-            lower_count = tl.where(enough, count, lower_count)
-            upper = tl.where(enough, upper, threshold)
-            upper_count = tl.where(enough, upper_count, count)
+            # Maintain score bounds and the number of candidates at each
+            # bound. Interpolation converges toward a threshold with at least
+            # ``selected`` values while avoiding a full per-row sort.
+            lower = tl.min(tl.where(valid, values, float("inf")))
+            upper = tl.max(tl.where(valid, values, -float("inf"))) + 1.0
+            lower_count = tl.sum(valid.to(tl.int32), axis=0).to(tl.float32)
+            upper_count = 0.0
+            for _ in tl.static_range(iterations):
+                # Clamping the step keeps each iteration inside the bracket.
+                denominator = lower_count - upper_count
+                fraction = (lower_count - selected) / tl.where(
+                    denominator > 0.5,
+                    denominator,
+                    1.0,
+                )
+                fraction = tl.minimum(tl.maximum(fraction, 0.05), 0.95)
 
-        # Prefix ranks give threshold ties a deterministic column order and
-        # cap stores at the requested output width.
-        chosen = (values >= lower) & valid
-        positions = tl.cumsum(chosen.to(tl.int32), axis=0) - 1
-        tl.store(
-            output
-            + head * output_stride_head
-            + query_row * output_stride_row
-            + positions,
-            offsets.to(tl.int32),
-            mask=chosen & (positions < selected),
-        )
+                threshold = lower + (upper - lower) * fraction
+                count = tl.sum(
+                    ((values >= threshold) & valid).to(tl.int32),
+                    axis=0,
+                ).to(tl.float32)
+
+                enough = count >= selected
+                lower = tl.where(enough, threshold, lower)
+                lower_count = tl.where(enough, count, lower_count)
+                upper = tl.where(enough, upper, threshold)
+                upper_count = tl.where(enough, upper_count, count)
+
+            # Selected score columns are video key tiles offset by the prefix,
+            # stored after the prefix entries and capped at the selection.
+            chosen = (values >= lower) & valid
+            positions = tl.cumsum(chosen.to(tl.int32), axis=0) - 1
+            tl.store(
+                index_row + prefix_tiles + positions,
+                (offsets + prefix_tiles).to(tl.int32),
+                mask=chosen & (positions < selected),
+            )
+            tl.store(count_row, prefix_tiles + selected)
+        else:
+            tl.store(index_row, 0)
+            tl.store(count_row, 1)
 
     @triton.jit
     def _pack_qkv_kernel(
@@ -549,27 +585,58 @@ def _pool_qkv_means_fake(
     del query_tile_offset, key_tile_offset
 
 
-def _threshold_topk_indices(scores: torch.Tensor, output: torch.Tensor) -> None:
-    """Fill ``output`` with threshold-selected indices for every score row."""
+def _write_block_map(
+    scores: torch.Tensor,
+    prefix_key_indices: torch.Tensor,
+    dense_key_indices: torch.Tensor,
+    block_indices: torch.Tensor,
+    block_counts: torch.Tensor,
+    local_prefix: int,
+    local_video: int,
+    prefix_tiles: int,
+    valid_tiles: int,
+    selected: int,
+) -> None:
+    """Write every query tile's key-tile list and count in one pass."""
     if triton is None or not triton_available(scores.device):
-        raise RuntimeError("sparse threshold selection requires Triton")
+        raise RuntimeError("sparse block-map selection requires Triton")
 
-    heads, rows, columns = (int(size) for size in scores.shape)
-    selected = int(output.shape[-1])
+    heads, tiles = (int(size) for size in block_counts.shape)
+    columns = int(scores.shape[-1])
+    if (
+        scores.ndim != 3
+        or scores.shape[0] != heads
+        or scores.shape[1] != local_video - local_prefix
+        or block_indices.shape[:2] != (heads, tiles)
+        or block_indices.shape[2] < valid_tiles
+        or block_indices.shape[2] < prefix_tiles + selected
+        or not 0 <= local_prefix <= local_video <= tiles
+        or (local_video > local_prefix and columns < selected)
+    ):
+        raise ValueError("sparse block map does not match its score domain")
 
-    # Each program searches one head/query row over a power-of-two score tile
-    # and writes at most the caller-provided selection width.
-    _threshold_topk_kernel[(heads * rows,)](
+    # Each program writes one head/query row: a dense prefix row, a video row
+    # searched over a power-of-two score tile, or a padding row.
+    _select_block_map_kernel[(heads * tiles,)](
         scores,
-        output,
+        prefix_key_indices,
+        dense_key_indices,
+        block_indices,
+        block_counts,
         int(scores.stride(0)),
         int(scores.stride(1)),
-        int(output.stride(0)),
-        int(output.stride(1)),
-        rows,
+        int(block_indices.stride(0)),
+        int(block_indices.stride(1)),
+        int(block_counts.stride(0)),
+        tiles,
+        local_prefix,
+        local_video,
+        prefix_tiles,
+        valid_tiles,
         columns,
         selected,
-        triton.next_power_of_2(columns),
+        triton.next_power_of_2(max(columns, 1)),
+        triton.next_power_of_2(max(valid_tiles, 1)),
         32,
         num_warps=2,
         num_stages=1,
@@ -577,22 +644,53 @@ def _threshold_topk_indices(scores: torch.Tensor, output: torch.Tensor) -> None:
 
 
 @torch.library.custom_op(
-    "uniserve::video_sparse_threshold_topk",
-    mutates_args=("output",),
+    "uniserve::video_sparse_block_map",
+    mutates_args=("block_indices", "block_counts"),
 )
-def _threshold_topk_indices_custom(
-    scores: torch.Tensor, output: torch.Tensor
+def _write_block_map_custom(
+    scores: torch.Tensor,
+    prefix_key_indices: torch.Tensor,
+    dense_key_indices: torch.Tensor,
+    block_indices: torch.Tensor,
+    block_counts: torch.Tensor,
+    local_prefix: int,
+    local_video: int,
+    prefix_tiles: int,
+    valid_tiles: int,
+    selected: int,
 ) -> None:
-    """Expose threshold selection as an output-mutating custom operator."""
-    _threshold_topk_indices(scores, output)
+    """Expose block-map selection as a map-mutating custom operator."""
+    _write_block_map(
+        scores,
+        prefix_key_indices,
+        dense_key_indices,
+        block_indices,
+        block_counts,
+        local_prefix,
+        local_video,
+        prefix_tiles,
+        valid_tiles,
+        selected,
+    )
 
 
-@_threshold_topk_indices_custom.register_fake
-def _threshold_topk_indices_fake(
-    scores: torch.Tensor, output: torch.Tensor
+@_write_block_map_custom.register_fake
+def _write_block_map_fake(
+    scores: torch.Tensor,
+    prefix_key_indices: torch.Tensor,
+    dense_key_indices: torch.Tensor,
+    block_indices: torch.Tensor,
+    block_counts: torch.Tensor,
+    local_prefix: int,
+    local_video: int,
+    prefix_tiles: int,
+    valid_tiles: int,
+    selected: int,
 ) -> None:
-    """Declare fake-tensor mutation for the threshold custom operator."""
-    del scores, output
+    """Declare fake-tensor mutation for the block-map custom operator."""
+    del scores, prefix_key_indices, dense_key_indices
+    del block_indices, block_counts
+    del local_prefix, local_video, prefix_tiles, valid_tiles, selected
 
 
 def _unpack_add_compression(
@@ -717,13 +815,39 @@ def pool_qkv_means(
     )
 
 
-def threshold_topk_indices(scores: torch.Tensor, output: torch.Tensor) -> None:
-    """Fill selected score-column indices.
+def write_block_map(
+    scores: torch.Tensor,
+    prefix_key_indices: torch.Tensor,
+    dense_key_indices: torch.Tensor,
+    block_indices: torch.Tensor,
+    block_counts: torch.Tensor,
+    *,
+    local_prefix: int,
+    local_video: int,
+    prefix_tiles: int,
+    valid_tiles: int,
+    selected: int,
+) -> None:
+    """Fill the block map of every query tile of one call.
 
-    Fill selected score-column indices, using ``output`` width as selection
-    count.
+    ``scores`` holds the video query rows' scores over the video key tiles,
+    ``[heads, local_video - local_prefix, video_tiles]``. Query tiles before
+    ``local_prefix`` attend to the ``valid_tiles`` dense key tiles, tiles
+    before ``local_video`` to the prefix plus ``selected`` video tiles, and
+    later tiles to one tile.
     """
-    _threshold_topk_indices_custom(scores, output)
+    _write_block_map_custom(
+        scores,
+        prefix_key_indices,
+        dense_key_indices,
+        block_indices,
+        block_counts,
+        int(local_prefix),
+        int(local_video),
+        int(prefix_tiles),
+        int(valid_tiles),
+        int(selected),
+    )
 
 
 def unpack_add_compression(
@@ -761,6 +885,6 @@ __all__ = [
     "compose_to_head_shards",
     "pack_qkv",
     "pool_qkv_means",
-    "threshold_topk_indices",
     "unpack_add_compression",
+    "write_block_map",
 ]
