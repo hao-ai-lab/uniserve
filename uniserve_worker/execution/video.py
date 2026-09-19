@@ -41,7 +41,7 @@ from uniserve_worker.protocol.call import (
 )
 from uniserve_worker.protocol.identity import CallId
 from uniserve_worker.protocol.output import FinishFlags
-from uniserve_worker.runtime.host_lane import HostTask
+from uniserve_worker.runtime.host_lane import HostLane, HostTask
 
 from . import calls
 from .batch_state import BatchState
@@ -494,6 +494,8 @@ def create_media_resources(
     worker_info,
     state_slots: int,
     unresolved_window: int,
+    host_tasks: HostLane,
+    pin: bool,
 ):
     """Reserve this rank's media capture, encoder and assembly resources.
 
@@ -526,7 +528,7 @@ def create_media_resources(
         window.stop - window.start for window in decoder.frame_slices(frames)
     )
     return (
-        MediaMux(rank=rank) if assembles else None,
+        MediaMux(rank=rank, lane=host_tasks) if assembles else None,
         MediaBuffers(
             state_slots=state_slots,
             unresolved_window=unresolved_window,
@@ -534,6 +536,7 @@ def create_media_resources(
             video=video.Config(frames, decoder.frame_size),
             frame_rate=output.frame_rate,
             audio_rate=audio.sample_rate,
+            pin=pin,
         ),
     )
 
