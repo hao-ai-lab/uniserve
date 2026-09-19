@@ -12,7 +12,7 @@ from uniserve.loading import Config as IOConfig
 from uniserve_worker.protocol.call import (
     CallKind,
     ForwardMode,
-    PipelineStage,
+    MediaCall,
     TransferMode,
 )
 
@@ -20,27 +20,27 @@ from ..config import WorkerConfig, worker_config_from_namespace
 
 # These launch selectors assign capabilities to a worker pool. A media
 # selector includes both tracks; submitted call kinds still identify the
-# concrete stage.
+# concrete call.
 SUPPORTED_CALL_GROUPS: dict[str, tuple[CallKind, ...]] = {
     "ar_extend": (ForwardMode.PREFILL,),
     "ar_decode": (ForwardMode.DECODE,),
     "ar_verify": (ForwardMode.VERIFY,),
-    "encoder_vision": (PipelineStage.VISION_ENCODING,),
-    "encoder_latent": (PipelineStage.LATENT_ENCODING,),
-    "encoder_text": (PipelineStage.TEXT_ENCODING,),
+    "encoder_vision": (MediaCall.VISION_ENCODING,),
+    "encoder_latent": (MediaCall.LATENT_ENCODING,),
+    "encoder_text": (MediaCall.TEXT_ENCODING,),
     "transfer_product": (TransferMode.TENSOR,),
     "transfer_kv_publish": (TransferMode.KV_PUBLISH,),
     "transfer_kv_install": (TransferMode.KV_INSTALL,),
-    "diffusion_prepare": (PipelineStage.LATENT_PREPARATION,),
-    "diffusion_step": (PipelineStage.DENOISING,),
-    "diffusion_finalize": (PipelineStage.IMAGE_DECODING, PipelineStage.MUXING),
+    "diffusion_prepare": (MediaCall.LATENT_PREPARATION,),
+    "diffusion_step": (MediaCall.DENOISING,),
+    "diffusion_finalize": (MediaCall.IMAGE_DECODING, MediaCall.MUXING),
     "diffusion_decode": (
-        PipelineStage.VIDEO_DECODING,
-        PipelineStage.AUDIO_DECODING,
+        MediaCall.VIDEO_DECODING,
+        MediaCall.AUDIO_DECODING,
     ),
     "media_append": (
-        PipelineStage.VIDEO_ENCODING,
-        PipelineStage.AUDIO_ENCODING,
+        MediaCall.VIDEO_ENCODING,
+        MediaCall.AUDIO_ENCODING,
     ),
 }
 
@@ -138,7 +138,7 @@ class SequenceConfig:
 
 @dataclass(frozen=True, slots=True)
 class ParallelConfig:
-    """Configure tensor, pipeline, and sequence parallelism for one entry."""
+    """Configure tensor, pipeline and sequence parallelism of one component."""
 
     tensor_parallel_size: int = 1
     pipeline_parallel_size: int = 1
@@ -207,7 +207,7 @@ class ParallelConfig:
 
 @dataclass(frozen=True, slots=True)
 class ComponentConfig:
-    """Configure rank placement and parallelism for one model entry."""
+    """Configure rank placement and parallelism for one model component."""
 
     ranks: tuple[int, ...]
     parallel_config: ParallelConfig = ParallelConfig()
@@ -288,18 +288,18 @@ class ComponentConfig:
         return value
 
 
-def parse_entries(
+def parse_components(
     value: dict[str, object], world_size: int
 ) -> tuple[tuple[str, ComponentConfig], ...]:
-    """Parse model entry placement supplied by the worker launcher."""
+    """Parse model component placement supplied by the worker launcher."""
     if not value:
-        raise ValueError("entry configuration must not be empty")
+        raise ValueError("component configuration must not be empty")
 
     components = []
     for name, component in sorted(value.items()):
         if not name or not isinstance(component, dict):
             raise ValueError(
-                "entry configuration requires named component objects"
+                "component configuration requires named component objects"
             )
 
         resolved = ComponentConfig.from_dict(component)
@@ -444,8 +444,8 @@ class WorkerProcessArgs:
             ),
             load=_load_config(namespace),
             use_stub_model=use_stub_model,
-            components=parse_entries(
-                namespace.entries, int(namespace.world_size)
+            components=parse_components(
+                namespace.components, int(namespace.world_size)
             ),
         )
 

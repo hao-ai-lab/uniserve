@@ -1,13 +1,13 @@
 namespace uniserve.ipc;
 
 enum ForwardMode : ubyte { None, Prefill, Decode, Verify }
-enum PipelineStage : ubyte { None, VisionEncoding, LatentEncoding, TextEncoding, LatentPreparation, Denoising, ImageDecoding, VideoDecoding, AudioDecoding, VideoEncoding, AudioEncoding, Muxing }
+enum MediaCall : ubyte { None, VisionEncoding, LatentEncoding, TextEncoding, LatentPreparation, Denoising, ImageDecoding, VideoDecoding, AudioDecoding, VideoEncoding, AudioEncoding, Muxing }
 enum TransferMode : ubyte { None, Tensor, KvPublish, KvInstall }
 
 // Exactly one field is non-None. This is a compact wire encoding of the Rust sum.
 struct CallKind {
   forward_mode:ForwardMode;
-  stage:PipelineStage;
+  media:MediaCall;
   transfer:TransferMode;
 }
 
@@ -128,7 +128,7 @@ table OutputInfo {
   dynamic_axis:int = -1;
 }
 
-table EntryInfo {
+table ComponentInfo {
   name:string;
   ranks:[ulong];
   parallel_config:ParallelConfig;
@@ -137,7 +137,7 @@ table EntryInfo {
   outputs:[OutputInfo];
 }
 
-table PipelineComponent { stage:PipelineStage; component:string; }
+table MediaComponent { call:MediaCall; component:string; }
 
 table WorkerInfo {
   model_name:string;
@@ -150,7 +150,7 @@ table WorkerInfo {
   fabric_handles:bool = false;
   world_size:uint = 1;
   configuration_id:string;
-  components:[EntryInfo];
+  components:[ComponentInfo];
   supported_ops:[CallKind];
   queue_depth:uint;
   max_batch_ops:uint;
@@ -163,7 +163,7 @@ table WorkerInfo {
   encoder_cache_entries:uint;
   encoder_entry_bytes:ulong;
   max_unresolved_ops:uint = 1;
-  pipeline_components:[PipelineComponent];
+  media_components:[MediaComponent];
   num_inference_steps:uint;
   host_lane_capacity:uint = 1;
   // Identity of the loaded checkpoint files. Empty only for the weightless
@@ -226,7 +226,7 @@ table Call {
   request_key:RequestKey;
   call_id:CallId;
   coordinates:CallCoordinates;
-  entry:string (required);
+  component:string (required);
   code:CallKind (required);
   max_tokens:uint;
   max_kv_pages:uint;
@@ -376,7 +376,7 @@ table UmmRequestParams { image:ImageParams; }
 
 table DiffusionSamplingParams {
   num_frames:uint;
-  num_decode_chunks:uint;
+  video_units:uint;
   num_inference_steps:uint;
   seed:ulong;
 }

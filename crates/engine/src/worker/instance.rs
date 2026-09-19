@@ -43,7 +43,7 @@ impl WorkerProcessArgs {
     /// processes concurrently and then wait for all of their reports together.
     fn spawn_ranks(&self, cancel: Option<Arc<AtomicBool>>) -> anyhow::Result<LaunchedRanks> {
         let cancel = cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        crate::WorkerConfig::validate_members(&self.ranks, &self.entries)?;
+        crate::WorkerConfig::validate_members(&self.ranks, &self.components)?;
         // This process spawns exactly the ranks placed on its own host. A rank
         // placed elsewhere is started by that host's launcher, which connects
         // here and presents the host it owns before any rank is sent to it.
@@ -118,7 +118,7 @@ impl WorkerProcessArgs {
                     uniserve_worker_ipc::SOCKET_CHANNEL
                 },
                 remote.as_mut(),
-                &self.entries,
+                &self.components,
                 cancel.clone(),
                 registry.address(),
             )?);
@@ -252,14 +252,13 @@ fn process_world_configuration_id(workers: &[RankProcess]) -> String {
 pub(crate) fn refuse_muxer_off_head(
     head: &str,
     ranks: &[crate::WorkerRank],
-    entries: &BTreeMap<String, crate::executor::ComponentConfig>,
-    pipeline_components: &BTreeMap<uniserve_worker_ipc::PipelineStage, String>,
+    components: &BTreeMap<String, crate::executor::ComponentConfig>,
+    media_components: &BTreeMap<uniserve_worker_ipc::MediaCall, String>,
 ) -> anyhow::Result<()> {
-    let Some(component) = pipeline_components.get(&uniserve_worker_ipc::PipelineStage::Muxing)
-    else {
+    let Some(component) = media_components.get(&uniserve_worker_ipc::MediaCall::Muxing) else {
         return Ok(());
     };
-    let placement = entries.get(component).with_context(|| {
+    let placement = components.get(component).with_context(|| {
         format!("component {component} serves muxing but the placement binds no such component")
     })?;
     for &rank in &placement.ranks {
@@ -414,8 +413,8 @@ impl WorkerGroup {
         refuse_muxer_off_head(
             &process_args.host,
             &process_args.ranks,
-            &process_args.entries,
-            &info.pipeline_components,
+            &process_args.components,
+            &info.media_components,
         )?;
         if let Some(cache) = &mut info.kv_cache {
             let regions: Vec<_> = workers
@@ -836,7 +835,7 @@ impl WorkerGroup {
         }
     }
 
-    /// Join one entry's completed work independently of rank and transport framing.
+    /// Join one component's completed work independently of rank and transport framing.
     fn joinable_report_key(&self) -> Option<(u64, usize, Vec<CallIdentity>)> {
         for (&batch_id, pending_batch) in &self.pending_batches {
             let pending = &pending_batch.remaining;
@@ -856,7 +855,7 @@ impl WorkerGroup {
                 if !pending.contains(&identity) {
                     continue;
                 }
-                let owner = self.process_args.entries[&call.entry].ranks[0];
+                let owner = self.process_args.components[&call.component].ranks[0];
                 let members = self.call_members(batch_id, identity);
                 for report in self.buffers[owner]
                     .iter()
@@ -869,7 +868,7 @@ impl WorkerGroup {
                                 && self.call_members(batch_id, *id) == members
                                 && batch.calls.iter().any(|candidate| {
                                     call_identity(candidate.request_key, candidate.call_id) == *id
-                                        && candidate.entry == call.entry
+                                        && candidate.component == call.component
                                 })
                                 && members.iter().all(|rank| {
                                     self.buffers[*rank].iter().any(|result| {
@@ -906,8 +905,8 @@ impl WorkerGroup {
     /// Acknowledgment slots of the ranks that read the products a call
     /// produces on `rank`, where `members` are the ranks executing the call.
     ///
-    /// A video stage's readers are the ranks of the components serving the
-    /// stages that consume it, less the ranks that produce their own copy: a
+    /// A video call's readers are the ranks of the components serving the
+    /// calls that consume it, less the ranks that produce their own copy: a
     /// consumer reads the copy it holds before any other. Work outside the
     /// video graph is read by the destinations of the rank's transfer edges.
     fn consumer_slots(
@@ -919,8 +918,8 @@ impl WorkerGroup {
         let transfer = &self.process_args.transfer;
         let worker = &self.process_args.worker_id;
         let consuming = match call.code {
-            uniserve_worker_ipc::CallKind::Pipeline(stage) => {
-                crate::scheduler::consuming_stages(stage)
+            uniserve_worker_ipc::CallKind::Media(media_call) => {
+                crate::scheduler::consuming_calls(media_call)
             }
             _ => None,
         };
@@ -928,16 +927,16 @@ impl WorkerGroup {
             return transfer.product_consumers(worker, rank as u32);
         };
         let mut slots = BTreeSet::new();
-        for stage in consuming {
-            let Some(entry) = self
+        for consumer in consuming {
+            let Some(component) = self
                 .info
-                .pipeline_components
-                .get(stage)
-                .and_then(|name| self.process_args.entries.get(name))
+                .media_components
+                .get(consumer)
+                .and_then(|name| self.process_args.components.get(name))
             else {
                 continue;
             };
-            for &reader in &entry.ranks {
+            for &reader in &component.ranks {
                 if reader != rank && !members.contains(&reader) {
                     slots.insert(transfer.acknowledgment_slot(worker, reader as u32));
                 }
@@ -947,12 +946,12 @@ impl WorkerGroup {
     }
 }
 
-/// Restrict a physical invocation to each entry's actual members. Request and
+/// Restrict a physical invocation to each component's actual members. Request and
 /// storage commands retain group-wide visibility, including on otherwise idle
 /// ranks; they do not create synthetic computation completions.
 fn rank_projection(
     batch: &Batch,
-    entries: &BTreeMap<String, crate::ComponentConfig>,
+    components: &BTreeMap<String, crate::ComponentConfig>,
     rank_count: usize,
     consumer_slots: impl Fn(&uniserve_worker_ipc::Call, &[usize], usize) -> Vec<u32>,
 ) -> anyhow::Result<Vec<(usize, Batch)>> {
@@ -960,9 +959,9 @@ fn rank_projection(
         .calls
         .iter()
         .map(|call| {
-            let entry = entries
-                .get(&call.entry)
-                .with_context(|| format!("unknown computation entry {}", call.entry))?;
+            let entry = components
+                .get(&call.component)
+                .with_context(|| format!("unknown component {}", call.component))?;
             let count = if entry.distribution.is_some() {
                 let range = batch
                     .decode_ranges
@@ -970,7 +969,7 @@ fn rank_projection(
                     .find(|range| {
                         range.request_key == call.request_key && range.call_id == call.call_id
                     })
-                    .context("temporally distributed entry requires a decode range")?;
+                    .context("temporally distributed component requires a decode range")?;
                 (range.max_units as usize)
                     .div_ceil(entry.units_per_rank)
                     .min(entry.ranks.len())
@@ -1421,7 +1420,7 @@ impl WorkerGroup {
         self.workers.get(rank).map(RankProcess::info)
     }
 
-    /// Submit each call to its entry members and lifetime commands to the rank group.
+    /// Submit each call to its component members and lifetime commands to the rank group.
     pub fn submit_batch(&mut self, batch: Batch) -> Result<(), BatchSubmitError> {
         if self.closed {
             return Err(BatchSubmitError::Failed(anyhow::anyhow!(
@@ -1445,7 +1444,7 @@ impl WorkerGroup {
             .map_err(BatchSubmitError::Failed)?;
         let rank_batches = rank_projection(
             &batch,
-            &self.process_args.entries,
+            &self.process_args.components,
             self.workers.len(),
             |call, members, rank| self.consumer_slots(call, members, rank),
         )
@@ -1642,7 +1641,7 @@ mod tests {
     use crate::WorkerRank;
     use crate::executor::ComponentConfig;
     use std::collections::BTreeMap;
-    use uniserve_worker_ipc::PipelineStage;
+    use uniserve_worker_ipc::MediaCall;
 
     fn placement(nodes: &[&str]) -> Vec<WorkerRank> {
         nodes
@@ -1655,31 +1654,31 @@ mod tests {
             .collect()
     }
 
-    fn entries(muxer_ranks: Vec<usize>) -> BTreeMap<String, ComponentConfig> {
+    fn components(muxer_ranks: Vec<usize>) -> BTreeMap<String, ComponentConfig> {
         BTreeMap::from([(
             "muxer".to_owned(),
             ComponentConfig::parallel(muxer_ranks, Default::default()),
         )])
     }
 
-    fn muxing(component: &str) -> BTreeMap<PipelineStage, String> {
-        BTreeMap::from([(PipelineStage::Muxing, component.to_owned())])
+    fn muxing(component: &str) -> BTreeMap<MediaCall, String> {
+        BTreeMap::from([(MediaCall::Muxing, component.to_owned())])
     }
 
     #[test]
     fn a_muxer_on_the_head_host_is_admitted() {
         let ranks = placement(&["rank-0", "rank-0", "rank-1", "rank-1"]);
-        refuse_muxer_off_head("rank-0", &ranks, &entries(vec![0]), &muxing("muxer"))
+        refuse_muxer_off_head("rank-0", &ranks, &components(vec![0]), &muxing("muxer"))
             .expect("a muxer on the head's host serves the artifact the head opens");
         // A deployment without a muxer publishes no artifact and is unaffected.
-        refuse_muxer_off_head("rank-0", &ranks, &entries(vec![3]), &BTreeMap::new())
+        refuse_muxer_off_head("rank-0", &ranks, &components(vec![3]), &BTreeMap::new())
             .expect("a placement without muxing has no artifact to place");
     }
 
     #[test]
     fn a_muxer_off_the_head_host_is_refused_by_name() {
         let ranks = placement(&["rank-0", "rank-0", "rank-1", "rank-1"]);
-        let error = refuse_muxer_off_head("rank-0", &ranks, &entries(vec![3]), &muxing("muxer"))
+        let error = refuse_muxer_off_head("rank-0", &ranks, &components(vec![3]), &muxing("muxer"))
             .expect_err("a muxer on another host cannot publish an artifact the head opens");
         let message = format!("{error:#}");
         assert!(
@@ -1695,8 +1694,9 @@ mod tests {
             "the refusal names the head's host: {message}"
         );
 
-        let error = refuse_muxer_off_head("rank-0", &ranks, &entries(vec![0]), &muxing("output"))
-            .expect_err("a muxing component the placement does not bind is refused");
+        let error =
+            refuse_muxer_off_head("rank-0", &ranks, &components(vec![0]), &muxing("output"))
+                .expect_err("a muxing component the placement does not bind is refused");
         assert!(format!("{error:#}").contains("output"));
     }
 

@@ -18,7 +18,7 @@ from uniserve.runtime.device import fill_cpu_bools, fill_cpu_ints
 from uniserve.runtime.tensor_buffers import TensorBuffers
 from uniserve.tensors import BufferConfig, adjacent_view
 from uniserve_worker.ops.staging import gather_request_decode_inputs
-from uniserve_worker.protocol.call import ForwardMode, PipelineStage
+from uniserve_worker.protocol.call import ForwardMode, MediaCall
 from uniserve_worker.runtime.staging_buffers import StagingBuffers
 
 from .attention import cache_pages, columns
@@ -245,7 +245,7 @@ class InputBuffers:
         selections = ()
         if (
             isinstance(forward_mode, ForwardMode)
-            or forward_mode is PipelineStage.DENOISING
+            or forward_mode is MediaCall.DENOISING
         ):
             attention = (
                 columns(rows, cache=cache, tables=tables)
@@ -260,8 +260,8 @@ class InputBuffers:
             else:
                 inputs = self._images(rows, staged)
         elif forward_mode in {
-            PipelineStage.VISION_ENCODING,
-            PipelineStage.LATENT_ENCODING,
+            MediaCall.VISION_ENCODING,
+            MediaCall.LATENT_ENCODING,
         }:
             inputs = VisionInput(
                 tuple(self._device_view(row.encode_pixels) for row in rows),
@@ -273,7 +273,7 @@ class InputBuffers:
                 ),
                 tuple(row.encode_grid_shape for row in rows),
             )
-        elif forward_mode is PipelineStage.IMAGE_DECODING:
+        elif forward_mode is MediaCall.IMAGE_DECODING:
             inputs = DecodeInput(
                 tuple(self._device_view(row.latent) for row in rows),
                 tuple(

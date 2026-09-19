@@ -38,7 +38,7 @@ def product_name(module: nn.Module, name: str) -> str:
             name, name
         )
     if isinstance(module, VideoDecoder) and name == "video":
-        return "video_segments"
+        return "video_units"
     if isinstance(module, AudioDecoder) and name == "audio":
         return "audio_samples"
     return name
@@ -56,19 +56,19 @@ def resolve_outputs(
     from ..bootstrap.components import describe_components
 
     result = {}
-    for entry, calls in describe_components(model).items():
+    for component, calls in describe_components(model).items():
         outputs = []
         for call in calls:
             for name, layout in output_layouts(model, config, call).items():
                 dtype = _DTYPES.get(layout.dtype)
                 if dtype is None:
                     raise ValueError(
-                        f"result {entry}.{name} has no protocol dtype"
+                        f"result {component}.{name} has no protocol dtype"
                     )
                 if len(layout.variable_axes) > 1:
                     raise ValueError(
-                        f"result {entry}.{name} exceeds the protocol dynamic "
-                        "axes"
+                        f"result {component}.{name} exceeds the protocol "
+                        "dynamic axes"
                     )
                 # A variable axis becomes a device-sized bound; every other
                 # extent is a static protocol dimension.
@@ -87,6 +87,6 @@ def resolve_outputs(
                     )
                 )
         if outputs:
-            result[entry] = tuple(outputs)
+            result[component] = tuple(outputs)
 
     return MappingProxyType(result)

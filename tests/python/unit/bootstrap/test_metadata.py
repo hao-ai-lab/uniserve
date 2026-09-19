@@ -88,13 +88,13 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(
 def test_h3_worker_advertises_bounded_media_products():
     from uniserve_models.minimax_h3 import Config, Model
     from uniserve_worker.bootstrap.components import (
-        pipeline_components,
+        media_components,
         supported_calls,
     )
     from uniserve_worker.config import WorkerConfig
     from uniserve_worker.protocol.call import (
-        VIDEO_STAGES,
-        PipelineStage,
+        VIDEO_CALLS,
+        MediaCall,
         TransferMode,
     )
     from uniserve_worker.runtime.results import resolve_outputs
@@ -110,20 +110,20 @@ def test_h3_worker_advertises_bounded_media_products():
     )
     outputs = resolve_outputs(model, config)
     assert set(supported_calls(model)) == {
-        *VIDEO_STAGES,
+        *VIDEO_CALLS,
         TransferMode.TENSOR,
     }
-    assert pipeline_components(model) == {
-        PipelineStage.TEXT_ENCODING: "text_encoder",
-        PipelineStage.LATENT_PREPARATION: "denoiser",
-        PipelineStage.DENOISING: "denoiser",
-        PipelineStage.VIDEO_DECODING: "video_decoder",
-        PipelineStage.AUDIO_DECODING: "audio_decoder",
+    assert media_components(model) == {
+        MediaCall.TEXT_ENCODING: "text_encoder",
+        MediaCall.LATENT_PREPARATION: "denoiser",
+        MediaCall.DENOISING: "denoiser",
+        MediaCall.VIDEO_DECODING: "video_decoder",
+        MediaCall.AUDIO_DECODING: "audio_decoder",
         # The rank that decodes a media unit also post-processes and encodes
         # it; the muxer owns no numerical method and only assembles.
-        PipelineStage.VIDEO_ENCODING: "video_decoder",
-        PipelineStage.AUDIO_ENCODING: "muxer",
-        PipelineStage.MUXING: "muxer",
+        MediaCall.VIDEO_ENCODING: "video_decoder",
+        MediaCall.AUDIO_ENCODING: "muxer",
+        MediaCall.MUXING: "muxer",
     }
     products = {
         value.name: value for values in outputs.values() for value in values
@@ -134,7 +134,7 @@ def test_h3_worker_advertises_bounded_media_products():
         "conditioning": (65, 5120),
         "video_latents": (12 * 24 * 42, 96),
         "audio_latents": (2 * 65, 32),
-        "video_segments": (2, 1, 3, 25, 768, 1344),
+        "video_units": (2, 1, 3, 25, 768, 1344),
         "audio_samples": (52_000, 2),
         # Each media unit is encoded where it was reconstructed. A row is
         # bounded by a quarter of the planar raster its longest unit encodes,

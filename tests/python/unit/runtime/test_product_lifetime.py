@@ -25,7 +25,7 @@ from uniserve_worker.protocol.call import (
     Call,
     CallCoordinates,
     ImageParams,
-    PipelineStage,
+    MediaCall,
 )
 from uniserve_worker.protocol.identity import (
     BufferId,
@@ -672,7 +672,7 @@ def latent_output():
             request_key=key,
             call_id=CallId(1, 0),
             coordinates=CallCoordinates(),
-            kind=PipelineStage.LATENT_PREPARATION,
+            kind=MediaCall.LATENT_PREPARATION,
             bounds=Bounds(),
         )
         requests.start(

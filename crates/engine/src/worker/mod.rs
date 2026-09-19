@@ -45,8 +45,8 @@ pub struct WorkerProcessArgs {
     /// whose placement node matches it, so a placement may name its host
     /// explicitly instead of relying on a reserved local name.
     pub host: String,
-    /// CallKind entry membership and parallel geometry.
-    pub entries: std::collections::BTreeMap<String, crate::ComponentConfig>,
+    /// Component membership and parallel geometry.
+    pub components: std::collections::BTreeMap<String, crate::ComponentConfig>,
     /// How long the head waits for every other host's launcher to present.
     ///
     /// The cluster starts a launcher on each host alongside the head, so this

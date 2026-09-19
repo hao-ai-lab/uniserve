@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::thread::JoinHandle;
 use std::time::Duration;
-use uniserve_worker_ipc::{ForwardMode, PipelineStage, TransferMode};
+use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 
 use crate::executor::{
     BatchResult, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError, WorkerId,
@@ -711,16 +711,16 @@ impl SimEngine {
                         .collect();
                 }
             }
-            CallKind::Pipeline(PipelineStage::TextEncoding)
-            | CallKind::Pipeline(PipelineStage::VisionEncoding)
-            | CallKind::Pipeline(PipelineStage::LatentEncoding) => {}
+            CallKind::Media(MediaCall::TextEncoding)
+            | CallKind::Media(MediaCall::VisionEncoding)
+            | CallKind::Media(MediaCall::LatentEncoding) => {}
             CallKind::Transfer(TransferMode::Tensor)
             | CallKind::Transfer(TransferMode::KvPublish)
             | CallKind::Transfer(TransferMode::KvInstall) => {
                 set_kv_lengths(&mut record, request.kv_visible_len);
             }
-            CallKind::Pipeline(PipelineStage::LatentPreparation) => {}
-            CallKind::Pipeline(PipelineStage::Denoising) => {
+            CallKind::Media(MediaCall::LatentPreparation) => {}
+            CallKind::Media(MediaCall::Denoising) => {
                 let steps = call.bounds.max_tokens.max(1) as u16;
                 request.flow_step = request.flow_step.saturating_add(steps);
                 let total = request
@@ -732,13 +732,13 @@ impl SimEngine {
                 // advanced through every scheduled step.
                 record.finish_flags.length = request.flow_step >= total;
             }
-            CallKind::Pipeline(
-                PipelineStage::VideoDecoding
-                | PipelineStage::AudioDecoding
-                | PipelineStage::VideoEncoding
-                | PipelineStage::AudioEncoding,
+            CallKind::Media(
+                MediaCall::VideoDecoding
+                | MediaCall::AudioDecoding
+                | MediaCall::VideoEncoding
+                | MediaCall::AudioEncoding,
             ) => {}
-            CallKind::Pipeline(PipelineStage::Muxing) => {
+            CallKind::Media(MediaCall::Muxing) => {
                 // The muxer takes each round's encoded media units as they
                 // arrive and assembles the artifact on the final call, the one
                 // that carries none; the simulator publishes a synthetic
@@ -752,7 +752,7 @@ impl SimEngine {
                         Some(publish_media("uniserve-video-", payload.as_bytes())?);
                 }
             }
-            CallKind::Pipeline(PipelineStage::ImageDecoding) => {
+            CallKind::Media(MediaCall::ImageDecoding) => {
                 request.flow_step = 0;
                 if let Some(image) = request.image().cloned() {
                     let (height, width) = if image.height > 0 && image.width > 0 {
@@ -1146,7 +1146,7 @@ mod tests {
             sampling_state: None,
             request_key,
             call_id: CallId::new(batch_id, request_index),
-            entry: "model".into(),
+            component: "model".into(),
             code: CallKind::Forward(ForwardMode::Prefill),
             bounds: Bounds {
                 max_tokens: 2,

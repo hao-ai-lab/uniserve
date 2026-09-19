@@ -37,7 +37,7 @@ class ForwardMode(StrEnum):
     VERIFY = "verify"
 
 
-class PipelineStage(StrEnum):
+class MediaCall(StrEnum):
     """A concrete encoder, diffusion, decoder, or media-output computation."""
 
     VISION_ENCODING = "vision_encoding"
@@ -61,25 +61,25 @@ class TransferMode(StrEnum):
     KV_INSTALL = "kv_install"
 
 
-CallKind: TypeAlias = ForwardMode | PipelineStage | TransferMode
+CallKind: TypeAlias = ForwardMode | MediaCall | TransferMode
 
-# The stage sequence of a video generation pipeline, in execution order.
-VIDEO_STAGES = (
-    PipelineStage.TEXT_ENCODING,
-    PipelineStage.LATENT_PREPARATION,
-    PipelineStage.DENOISING,
-    PipelineStage.VIDEO_DECODING,
-    PipelineStage.AUDIO_DECODING,
-    PipelineStage.VIDEO_ENCODING,
-    PipelineStage.AUDIO_ENCODING,
-    PipelineStage.MUXING,
+# The media calls that produce a video, in execution order.
+VIDEO_CALLS = (
+    MediaCall.TEXT_ENCODING,
+    MediaCall.LATENT_PREPARATION,
+    MediaCall.DENOISING,
+    MediaCall.VIDEO_DECODING,
+    MediaCall.AUDIO_DECODING,
+    MediaCall.VIDEO_ENCODING,
+    MediaCall.AUDIO_ENCODING,
+    MediaCall.MUXING,
 )
 
 CALL_KINDS: tuple[CallKind, ...] = (
     ForwardMode.PREFILL,
     ForwardMode.DECODE,
     ForwardMode.VERIFY,
-    *PipelineStage,
+    *MediaCall,
     *TransferMode,
 )
 
@@ -87,7 +87,7 @@ CALL_KINDS: tuple[CallKind, ...] = (
 def computation(value: object, where: str) -> CallKind:
     """Decode one concrete computation, excluding mixed model-batch metadata."""
     if (
-        isinstance(value, (ForwardMode, PipelineStage, TransferMode))
+        isinstance(value, (ForwardMode, MediaCall, TransferMode))
         and value in CALL_KINDS
     ):
         return value
@@ -140,8 +140,8 @@ _STATE_ADVANCING_WORK = frozenset(
         ForwardMode.PREFILL,
         ForwardMode.DECODE,
         ForwardMode.VERIFY,
-        PipelineStage.LATENT_PREPARATION,
-        PipelineStage.DENOISING,
+        MediaCall.LATENT_PREPARATION,
+        MediaCall.DENOISING,
     }
 )
 
@@ -550,7 +550,7 @@ class Call:
     kind: CallKind
     bounds: Bounds
     # Name of the worker model component that executes this computation.
-    entry: str = "model"
+    component: str = "model"
 
     # Tensor dataflow: generic inputs/outputs plus role-specific endpoints.
     inputs: tuple[tensor.TensorRef, ...] = ()
@@ -666,8 +666,8 @@ class Call:
         if self.call_id.batch_id < 1:
             raise invalid_descriptor("call id must be positive")
         self.coordinates.validate()
-        if not isinstance(self.entry, str) or not self.entry:
-            raise invalid_descriptor("call entry must not be empty")
+        if not isinstance(self.component, str) or not self.component:
+            raise invalid_descriptor("call component must not be empty")
         if self.kind not in CALL_KINDS:
             raise invalid_descriptor("call requires a valid computation tag")
         # Token and sampling inputs.
@@ -686,8 +686,8 @@ class Call:
             or not self.input_image
             or self.kind
             not in {
-                PipelineStage.VISION_ENCODING,
-                PipelineStage.LATENT_ENCODING,
+                MediaCall.VISION_ENCODING,
+                MediaCall.LATENT_ENCODING,
             }
             or self.image_input is not None
         ):
@@ -721,8 +721,8 @@ class Call:
             or self.kind
             not in {
                 TransferMode.KV_INSTALL,
-                PipelineStage.LATENT_PREPARATION,
-                PipelineStage.DENOISING,
+                MediaCall.LATENT_PREPARATION,
+                MediaCall.DENOISING,
             }
         ):
             raise invalid_descriptor(
@@ -841,7 +841,7 @@ class Call:
         coordinates = CallCoordinates.from_mapping(
             get("coordinates"), f"{where}.coordinates"
         )
-        entry = _str(get("entry"), f"{where}.entry")
+        component = _str(get("component"), f"{where}.component")
         work = computation(get("code"), f"{where}.code")
         bounds = _fast_bounds(get("bounds"))
         if bounds is None:
@@ -885,7 +885,7 @@ class Call:
             request_key=request_key,
             call_id=call_id,
             coordinates=coordinates,
-            entry=entry,
+            component=component,
             kind=work,
             bounds=bounds,
             inputs=inputs,
@@ -986,7 +986,7 @@ class Call:
             "request_key": self.request_key.to_mapping(),
             "call_id": self.call_id.to_mapping(),
             "coordinates": self.coordinates.to_mapping(),
-            "entry": self.entry,
+            "component": self.component,
             "code": self.kind.value,
             "bounds": self.bounds.to_mapping(),
             "inputs": [product.to_mapping() for product in self.inputs],

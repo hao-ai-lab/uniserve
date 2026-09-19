@@ -15,8 +15,8 @@ from uniserve_worker.protocol.call import ForwardMode
 from ..runtime.cache_manager import CacheManager
 from .attention import from_blocks
 from .batch import ExecutionOutput, InputBatch
+from .component_binding import ComponentBinding
 from .input_buffers import InputBuffers
-from .model_entry import ModelEntry
 from .rows import ForwardRow
 
 if TYPE_CHECKING:
@@ -85,7 +85,7 @@ def stage_text(
 
 def prepare_prefill(
     runner: ModelRunner,
-    entry: ModelEntry,
+    entry: ComponentBinding,
     buffers: InputBuffers,
     forward: Callable[[InputBatch], ExecutionOutput],
     shapes: tuple[PrefillShape, ...],
@@ -127,7 +127,7 @@ def prepare_prefill(
 
 def prepare_decode(
     runner: ModelRunner,
-    entry: ModelEntry,
+    entry: ComponentBinding,
     buffers: InputBuffers,
     forward: Callable[[InputBatch], ExecutionOutput],
 ) -> None:

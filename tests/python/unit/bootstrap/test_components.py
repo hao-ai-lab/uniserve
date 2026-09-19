@@ -47,7 +47,7 @@ def test_placement_rejects_an_undeclared_computation_entry():
     model = torch.nn.Module()
     model.first = Encoder(network)
     model.second = Encoder(network)
-    with pytest.raises(WorkerError, match="unknown computation entries"):
+    with pytest.raises(WorkerError, match="unknown components"):
         validate_components(
             model,
             {"first": ComponentConfig((0,)), "second": ComponentConfig((0,))},

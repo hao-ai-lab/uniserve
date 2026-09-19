@@ -43,7 +43,7 @@ from uniserve_worker.protocol.batch import (
 from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
-    PipelineStage,
+    MediaCall,
     TransferMode,
 )
 from uniserve_worker.protocol.identity import BufferId, CallId
@@ -111,8 +111,8 @@ def prepare_batch(
         for latent_params in batch.latent_params:
             call = scheduled[(latent_params.request_key, latent_params.call_id)]
             if call.kind not in {
-                PipelineStage.LATENT_PREPARATION,
-                PipelineStage.DENOISING,
+                MediaCall.LATENT_PREPARATION,
+                MediaCall.DENOISING,
             }:
                 continue
 
@@ -248,7 +248,7 @@ def prepare_inputs(
 
     available.
 
-    Each cross-stage input descriptor is validated against its declared product
+    Each cross-call input descriptor is validated against its declared product
     before a destination is reserved; on failure, every input reserved so far
     is released before the error propagates.
     """
@@ -259,7 +259,7 @@ def prepare_inputs(
     transports = transfer_backends
     if (entries or kv_entries) and not transports:
         raise unsupported_setup(
-            "cross-stage input requires a configured transport"
+            "cross-call input requires a configured transport"
         )
 
     try:
@@ -378,7 +378,7 @@ def prepare_inputs(
 
             else:
                 raise invalid_descriptor(
-                    "cross-stage transfer entry has an unknown kind"
+                    "cross-call transfer entry has an unknown kind"
                 )
 
             parameters = {
@@ -758,7 +758,7 @@ def _open_group(
 
     and completion storage.
     """
-    scheduled = state.group_calls(completion_group)
+    scheduled = state.batch.calls
 
     # Predicated rows remain in aligned output/state tables but do not reserve
     # execution-only inputs, CPU tasks, or model resources.
@@ -782,7 +782,7 @@ def _open_group(
         stream = model_runner.call_stream(active_calls[0])
         if stream is not None:
             # Request slots are initialized on the control stream. Independent
-            # numerical entries publish their own producer/consumer fences.
+            # components publish their own producer/consumer fences.
             stream.wait_stream(torch.cuda.current_stream(stream.device))
             state.group_streams[completion_group] = stream
 
@@ -985,25 +985,25 @@ def _reserve_host_tasks(
     """
     for call in scheduled:
         if call.kind not in {
-            PipelineStage.IMAGE_DECODING,
-            PipelineStage.VIDEO_ENCODING,
-            PipelineStage.AUDIO_ENCODING,
-            PipelineStage.MUXING,
+            MediaCall.IMAGE_DECODING,
+            MediaCall.VIDEO_ENCODING,
+            MediaCall.AUDIO_ENCODING,
+            MediaCall.MUXING,
         }:
             continue
 
-        # A distributed entry's host work belongs to whichever of its ranks
+        # A distributed component's host work belongs to whichever of its ranks
         # received the call, because each holds its own media units. Any
-        # other entry materializes on its single publication owner.
+        # other component materializes on its single publication owner.
         distributed = any(
-            component.name == call.entry
+            component.name == call.component
             and component.config.distribution is not None
             for component in worker_info.components
         )
         if (
             postprocessor is not None
             and not distributed
-            and config.rank != worker_info.output_rank(call.entry)
+            and config.rank != worker_info.output_rank(call.component)
         ):
             continue
 
@@ -1018,14 +1018,14 @@ def _reserve_host_tasks(
         reservation = host_tasks.reserve()
         try:
             if call.kind in {
-                PipelineStage.VIDEO_ENCODING,
-                PipelineStage.AUDIO_ENCODING,
+                MediaCall.VIDEO_ENCODING,
+                MediaCall.AUDIO_ENCODING,
             }:
                 pending.media_lease = require_media_output_ring(
                     media_buffers
                 ).reserve(
                     "video"
-                    if call.kind is PipelineStage.VIDEO_ENCODING
+                    if call.kind is MediaCall.VIDEO_ENCODING
                     else "audio"
                 )
         except BaseException:
@@ -1061,13 +1061,14 @@ def validate_batch(
                 (
                     entry
                     for entry in worker_info.components
-                    if entry.name == call.entry
+                    if entry.name == call.component
                 ),
                 None,
             )
             if entry is None or config.rank not in entry.config.ranks:
                 raise invalid_descriptor(
-                    f"call targets entry {call.entry!r} outside this rank"
+                    f"call targets component {call.component!r} outside "
+                    "this rank"
                 )
 
     if len(batch.calls) > config.max_batch_calls:
@@ -1140,12 +1141,12 @@ def _reserve_outputs(
             for output in call.outputs:
                 if call.kind is TransferMode.TENSOR:
                     # Transfers publish the delivered input's representation;
-                    # their destination entry does not execute model
+                    # their destination component does not execute model
                     # mathematics.
                     persistent_bindings.append((output, device))
                     continue
                 layout = model_runner.output_layout(
-                    call.entry,
+                    call.component,
                     output.output_index,
                     request.request.admission.diffusion,
                     decode,
@@ -1365,11 +1366,11 @@ def _bind_latent_inputs(
 
             # Preparation runs once at step zero; each denoise call advances
             # exactly one step from the committed solver state.
-            if call.kind is PipelineStage.LATENT_PREPARATION:
+            if call.kind is MediaCall.LATENT_PREPARATION:
                 valid = (
                     int(params.start_step) == 0 and int(params.step_count) == 0
                 )
-            elif call.kind is PipelineStage.DENOISING:
+            elif call.kind is MediaCall.DENOISING:
                 valid = (
                     int(params.start_step)
                     == int(calls.require_progress(request).flow_step)
@@ -1443,12 +1444,12 @@ def _bind_latent_inputs(
             else transferred.step
         )
 
-        if call.kind is PipelineStage.LATENT_PREPARATION:
+        if call.kind is MediaCall.LATENT_PREPARATION:
             if int(params.start_step) != 0 or int(params.step_count) != 0:
                 raise invalid_descriptor(
                     "media preparation params carries denoise steps"
                 )
-        elif call.kind is PipelineStage.DENOISING:
+        elif call.kind is MediaCall.DENOISING:
             if (
                 int(params.start_step) != committed_step
                 or int(params.step_count) < 1
@@ -1598,7 +1599,7 @@ def _bind_cache_tables(
             None,
         )
         if main_descriptor is not None:
-            visible = int(request.projected_progress.kv_visible_len)
+            visible = int(request.progress.kv_visible_len)
             declared = (
                 inputs.seq_lens[main_descriptor]
                 - inputs.query_lens[main_descriptor]
@@ -1664,9 +1665,7 @@ def _stage_input_products(
     """
     # KV imports consumed by this group must be complete and conflict-free
     # before any transferred product is published.
-    cache_inputs = {
-        call.kv_input for call in state.group_calls(completion_group)
-    }
+    cache_inputs = {call.kv_input for call in state.batch.calls}
     for buffer, write in state.cache_imports.items():
         if buffer not in cache_inputs:
             continue
@@ -1690,14 +1689,14 @@ def _stage_input_products(
         # each branch validates identity and shape before publication.
         if not state.input_ready(product.buffer_id):
             raise invalid_descriptor(
-                "cross-stage input has no query-ready prepared transfer"
+                "cross-call input has no query-ready prepared transfer"
             )
 
         value = entry.value
         if isinstance(value, LatentTransferValue):
             consumers = tuple(
                 call
-                for call in state.group_calls(completion_group)
+                for call in state.batch.calls
                 if product in call.tensor_inputs()
             )
             if len(consumers) != 1:
@@ -1756,14 +1755,14 @@ def _stage_input_products(
                 width=value.width,
             )
             row.latent_imported = True
-            request.projected_progress = replace(
+            request.progress = replace(
                 calls.require_progress(request), flow_step=value.step
             )
             continue
 
         consumers = tuple(
             call
-            for call in state.group_calls(completion_group)
+            for call in state.batch.calls
             if product in call.tensor_inputs() or call.predicate == product
         )
         if not consumers:

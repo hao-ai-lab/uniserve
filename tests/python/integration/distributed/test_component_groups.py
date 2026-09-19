@@ -10,7 +10,7 @@ from uniserve_worker.bootstrap.config import (
     ParallelConfig,
     SequenceConfig,
 )
-from uniserve_worker.bootstrap.distributed import initialize_entries
+from uniserve_worker.bootstrap.distributed import initialize_components
 
 pytestmark = pytest.mark.integration
 
@@ -26,7 +26,7 @@ def _run_groups(rank: int, rendezvous: str, backend: str):
         backend=backend,
         init_method=rendezvous,
     )
-    bindings = initialize_entries(
+    bindings = initialize_components(
         environment,
         {
             "denoiser": ComponentConfig(

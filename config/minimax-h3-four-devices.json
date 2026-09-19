@@ -7,7 +7,7 @@
       { "node": "localhost", "device": "cuda:2" },
       { "node": "localhost", "device": "cuda:3" }
     ],
-    "entries": {
+    "components": {
       "denoiser": {
         "ranks": [0, 1, 2, 3],
         "parallel_config": {

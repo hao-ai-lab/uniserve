@@ -1,7 +1,7 @@
 //! Scheduler-owned pending batches and request-local completion ordering.
 
 use super::*;
-use uniserve_worker_ipc::PipelineStage;
+use uniserve_worker_ipc::MediaCall;
 
 /// Algorithm inputs retained until their computation completes.
 pub(super) enum InflightInput {
@@ -83,7 +83,7 @@ impl Scheduler {
             .iter()
             .filter(|(holder, _)| **holder != id)
             .flat_map(|(_, calls)| calls)
-            .any(|op| op.call.code == CallKind::Pipeline(PipelineStage::Denoising))
+            .any(|op| op.call.code == CallKind::Media(MediaCall::Denoising))
     }
 
     /// Stateful calls retain request order. Pure media branches complete

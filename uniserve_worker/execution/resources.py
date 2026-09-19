@@ -20,11 +20,13 @@ from uniserve.model import (
 from uniserve.tensors import BufferConfig, OutputLayout
 
 from ..config import WorkerConfig
-from .model_entry import Call, ModelEntry
+from .component_binding import Call, ComponentBinding
 
 
 def media_state_buffers(
-    model: nn.Module, bindings: Mapping[str, ModelEntry], config: WorkerConfig
+    model: nn.Module,
+    bindings: Mapping[str, ComponentBinding],
+    config: WorkerConfig,
 ) -> dict[str, BufferConfig]:
     """Reserve resident samples and transfer staging only on participating.
 
@@ -41,7 +43,7 @@ def media_state_buffers(
         for call in binding.calls:
             if (
                 isinstance(call.module, Denoiser)
-                and call.entry.method == "forward"
+                and call.entry_point.method == "forward"
             ):
                 fields = builder.capacity_buffers()
             elif isinstance(call.module, VideoPostprocessor):
@@ -70,7 +72,10 @@ def output_layouts(
     from ..bootstrap.inputs import capability, media_builder
 
     component = call.module
-    if isinstance(component, TextEncoder) and call.entry.method == "encode":
+    if (
+        isinstance(component, TextEncoder)
+        and call.entry_point.method == "encode"
+    ):
         return component.output_layout(
             config.max_sequence_tokens
             if prompt_tokens is None

@@ -32,7 +32,7 @@ REQUIRED_FIELDS = (
     "rank",
     "local_rank",
     "world_size",
-    "entries",
+    "components",
     "transfer_backends",
     "publish_backends",
     "attention_backend",

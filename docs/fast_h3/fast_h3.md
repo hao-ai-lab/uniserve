@@ -64,7 +64,26 @@ uniserve serve "$H3_MODEL" \
   --max-running-requests 2
 ```
 
-`config/minimax-h3-four-devices.json` places FastH3's five components on four devices: four-way Ulysses denoising, TP4 text encoding, one video and one audio media unit per rank, and rank 0 for MP4 assembly. It does not shard denoiser weights. Serving a different width, or sharding the denoiser by tensor or pipeline, is a different deployment configuration; the schema is in [parallel execution](../parallel-execution.md).
+`config/minimax-h3-four-devices.json` is a deployment file: it lists the participating devices and, under `components`, the placement and parallel configuration of each of FastH3's five components. It places them on four devices of one host: four-way Ulysses denoising, TP4 text encoding, one video and one audio media unit per rank, and rank 0 for MP4 assembly. It does not shard denoiser weights. Serving a different width, or sharding the denoiser by tensor or pipeline, is a different deployment file; the schema is in [parallel execution](../parallel-execution.md).
+
+`config/minimax-h3-eight-devices.json` is the same placement over eight devices on two hosts, named `rank-0` and `rank-1` in the file: eight-way Ulysses denoising, TP8 text encoding, one video and one audio media unit per rank, and the muxer on rank 0. The head runs on the host named `rank-0`, which holds ranks 0 to 3, and a launcher on the other host runs ranks 4 to 7. Start the head first:
+
+```bash
+uniserve serve "$H3_MODEL" \
+  --workers config/minimax-h3-eight-devices.json \
+  --host-identity rank-0 \
+  --served-model-name FastH3 \
+  --host 0.0.0.0 \
+  --max-running-requests 2
+```
+
+The head logs `awaiting a launcher for each host this instance does not run on address=...`; on the other host, start the launcher with that address and the host identity the file names:
+
+```bash
+uniserve-host --head <address the head logs> --host-identity rank-1
+```
+
+The launcher starts each rank with the Python interpreter and launch descriptor the head resolved, so the other host needs the same Python environment and the checkpoint at the same path.
 
 A FastH3 deployment defaults to `--max-video-seconds 15` and `--max-model-len 16384`; set them only to change those limits. `--max-running-requests` caps concurrently resident requests, and the engine clamps that cap to the worker's advertised request-slot capacity; lowering it trades throughput for per-request latency and memory headroom.
 

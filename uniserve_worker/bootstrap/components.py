@@ -1,4 +1,4 @@
-"""Bind public numerical capabilities to the worker's logical IPC entries."""
+"""Bind public numerical capabilities to the worker's components."""
 
 from __future__ import annotations
 
@@ -23,12 +23,12 @@ from uniserve.model import (
 )
 from uniserve.nn.vae import PatchAutoencoder
 
-from ..execution.model_entry import Call, ModelEntry
+from ..execution.component_binding import Call, ComponentBinding
 from ..foundation.errors import unsupported_setup
 from ..protocol.call import (
     CallKind,
     ForwardMode,
-    PipelineStage,
+    MediaCall,
     TransferMode,
 )
 from .config import ComponentConfig
@@ -37,9 +37,7 @@ from .config import ComponentConfig
 # artifact on its host lane. It owns no numerical method, so the worker declares
 # it rather than the model, which declares numerical components only.
 MUXER_COMPONENT = "muxer"
-MUXER_CALL_KINDS = frozenset(
-    {PipelineStage.AUDIO_ENCODING, PipelineStage.MUXING}
-)
+MUXER_CALL_KINDS = frozenset({MediaCall.AUDIO_ENCODING, MediaCall.MUXING})
 
 
 def call_kinds(calls: Iterable[Call]) -> frozenset[CallKind]:
@@ -49,35 +47,33 @@ def call_kinds(calls: Iterable[Call]) -> frozenset[CallKind]:
     """
     kinds: set[CallKind] = set()
     for call in calls:
-        module, method = call.module, call.entry.method
+        module, method = call.module, call.entry_point.method
         if isinstance(module, CausalLM) and method == "forward":
             kinds.update(
                 (ForwardMode.PREFILL, ForwardMode.DECODE, ForwardMode.VERIFY)
             )
         elif isinstance(module, Denoiser) and method == "forward":
-            kinds.update(
-                (PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING)
-            )
+            kinds.update((MediaCall.LATENT_PREPARATION, MediaCall.DENOISING))
         elif isinstance(module, VideoPostprocessor) and method == "forward":
             # The post-processor converts one media unit to RGB on the rank that
             # decoded it; encoding that unit is the host half of the same call.
-            kinds.add(PipelineStage.VIDEO_ENCODING)
+            kinds.add(MediaCall.VIDEO_ENCODING)
         elif method == "encode":
             if isinstance(module, TextEncoder):
-                kinds.add(PipelineStage.TEXT_ENCODING)
+                kinds.add(MediaCall.TEXT_ENCODING)
             elif isinstance(module, PatchEncoder):
-                kinds.add(PipelineStage.VISION_ENCODING)
+                kinds.add(MediaCall.VISION_ENCODING)
             elif isinstance(module, PatchAutoencoder):
-                kinds.add(PipelineStage.LATENT_ENCODING)
+                kinds.add(MediaCall.LATENT_ENCODING)
             elif isinstance(module, Encoder):
-                kinds.add(PipelineStage.LATENT_PREPARATION)
+                kinds.add(MediaCall.LATENT_PREPARATION)
         elif method == "decode":
             if isinstance(module, ImageDecoder):
-                kinds.add(PipelineStage.IMAGE_DECODING)
+                kinds.add(MediaCall.IMAGE_DECODING)
             elif isinstance(module, VideoDecoder):
-                kinds.add(PipelineStage.VIDEO_DECODING)
+                kinds.add(MediaCall.VIDEO_DECODING)
             elif isinstance(module, AudioDecoder):
-                kinds.add(PipelineStage.AUDIO_DECODING)
+                kinds.add(MediaCall.AUDIO_DECODING)
     return frozenset(kinds)
 
 
@@ -190,30 +186,30 @@ def supported_calls(
     return frozenset(kinds)
 
 
-#: The stages a model that reconstructs video must serve between them.
-MEDIA_STAGES = frozenset(
+#: The media calls a model that reconstructs video must serve between them.
+VIDEO_CALL_KINDS = frozenset(
     {
-        PipelineStage.TEXT_ENCODING,
-        PipelineStage.LATENT_PREPARATION,
-        PipelineStage.DENOISING,
-        PipelineStage.VIDEO_DECODING,
-        PipelineStage.AUDIO_DECODING,
-        PipelineStage.VIDEO_ENCODING,
-        PipelineStage.AUDIO_ENCODING,
-        PipelineStage.MUXING,
+        MediaCall.TEXT_ENCODING,
+        MediaCall.LATENT_PREPARATION,
+        MediaCall.DENOISING,
+        MediaCall.VIDEO_DECODING,
+        MediaCall.AUDIO_DECODING,
+        MediaCall.VIDEO_ENCODING,
+        MediaCall.AUDIO_ENCODING,
+        MediaCall.MUXING,
     }
 )
 
 
-def pipeline_components(
+def media_components(
     model: nn.Module, held: Iterable[str] = ()
-) -> dict[PipelineStage, str]:
-    """Resolve which component serves each pipeline stage this worker holds.
+) -> dict[MediaCall, str]:
+    """Resolve which component serves each media call this worker holds.
 
-    The engine routes a stage to the entry named here, so a stage a model
+    The engine routes a call to the component named here, so a call a model
     serves from a component of its own -- a patch encoder placed apart from a
     language backbone, as much as a denoiser placed apart from a muxer -- is
-    reported whether or not the model reconstructs video. A stage whose
+    reported whether or not the model reconstructs video. A call whose
     component this placement does not hold is not reported, because this
     worker cannot serve it.
     """
@@ -223,46 +219,41 @@ def pipeline_components(
         components = {
             name: calls for name, calls in components.items() if name in names
         }
-    owners: dict[PipelineStage, list[str]] = {}
+    owners: dict[MediaCall, list[str]] = {}
     for name, calls in components.items():
         owned = {
-            kind
-            for kind in call_kinds(calls)
-            if isinstance(kind, PipelineStage)
+            kind for kind in call_kinds(calls) if isinstance(kind, MediaCall)
         }
         if name == MUXER_COMPONENT:
-            # The muxer's stages are host tasks with no numerical owner.
+            # The muxer's calls are host tasks with no numerical owner.
             owned = set(MUXER_CALL_KINDS)
-        for stage in owned:
-            owners.setdefault(stage, []).append(name)
+        for call in owned:
+            owners.setdefault(call, []).append(name)
 
-    # A stage several components implement names no single entry, so nothing
+    # A call several components implement names no single component, so nothing
     # can be routed to it and it is not reported.
     routes = {
-        stage: holders[0]
-        for stage, holders in owners.items()
+        call: holders[0]
+        for call, holders in owners.items()
         if len(holders) == 1
     }
     if MUXER_COMPONENT not in components:
         return routes
 
-    # A model that reconstructs video serves the whole media pipeline, and
-    # every stage of it from one entry.
-    for stage, holders in owners.items():
+    # A model that reconstructs video serves every video call, and
+    # each of them from one component.
+    for call, holders in owners.items():
         if len(holders) > 1:
             raise unsupported_setup(
-                f"media pipeline repeats {stage.value} computation"
+                f"video calls repeat {call.value} computation"
             )
-    if MEDIA_STAGES - routes.keys():
+    if VIDEO_CALL_KINDS - routes.keys():
         raise unsupported_setup(
-            "media pipeline lacks required numerical capabilities"
+            "video calls lack required numerical capabilities"
         )
-    if (
-        routes[PipelineStage.LATENT_PREPARATION]
-        != routes[PipelineStage.DENOISING]
-    ):
+    if routes[MediaCall.LATENT_PREPARATION] != routes[MediaCall.DENOISING]:
         raise unsupported_setup(
-            "latent preparation must participate in the denoiser entry"
+            "latent preparation must participate in the denoiser component"
         )
     return routes
 
@@ -277,15 +268,13 @@ def validate_components(
     declared = describe_components(model, entries=entries)
     unknown = components.keys() - declared.keys()
     if unknown:
-        raise unsupported_setup(
-            f"unknown computation entries {sorted(unknown)}"
-        )
+        raise unsupported_setup(f"unknown components {sorted(unknown)}")
     for name, component in components.items():
         calls = declared[name]
         if not calls:
             if name != MUXER_COMPONENT:
                 raise unsupported_setup(
-                    f"entry {name!r} has no numerical methods"
+                    f"component {name!r} has no numerical methods"
                 )
             if component.distribution is not None:
                 raise unsupported_setup(
@@ -322,13 +311,13 @@ def validate_components(
 
 def bind_components(
     model: nn.Module,
-    bindings: Mapping[str, ModelEntry],
+    bindings: Mapping[str, ComponentBinding],
     *,
     entries: Mapping[str, ComponentEntry] | None = None,
 ) -> None:
-    """Borrow methods and communicator views for each local stage.
+    """Borrow methods and communicator views for each local component.
 
-    Views are borrowed for every participating stage.
+    Views are borrowed for every participating component.
     """
     declared = validate_components(
         model,
@@ -344,14 +333,14 @@ def bind_components(
         pipeline = mesh.get_group("pp")
         calls = []
         for call in declared[name]:
-            stage = call.entry.stage
+            stage = call.entry_point.stage
             if stage == "first" and pipeline.rank != 0:
                 continue
             if stage == "last" and pipeline.rank != pipeline.size - 1:
                 continue
 
             groups = {}
-            for role in call.entry.groups:
+            for role in call.entry_point.groups:
                 axes = (
                     tuple(
                         axis

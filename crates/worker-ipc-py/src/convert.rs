@@ -8,7 +8,7 @@
 //! [`try_completion_response_from_py`] strictly decodes worker output.
 
 use std::collections::{BTreeMap, HashMap};
-use uniserve_worker_ipc::{ForwardMode, PipelineStage, TransferMode};
+use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::intern;
@@ -76,7 +76,7 @@ struct NativeRequestTypes {
     dtypes: [Py<PyAny>; 7],
     draw_layouts: [Py<PyAny>; 3],
     forward_modes: [Py<PyAny>; ForwardMode::ALL.len()],
-    pipeline_stages: [Py<PyAny>; PipelineStage::ALL.len()],
+    media_calls: [Py<PyAny>; MediaCall::ALL.len()],
     transfer_modes: [Py<PyAny>; TransferMode::ALL.len()],
 }
 
@@ -151,11 +151,7 @@ impl NativeRequestTypes {
                 "ForwardMode",
                 ForwardMode::ALL.map(ForwardMode::as_str),
             )?,
-            pipeline_stages: enum_members(
-                &call,
-                "PipelineStage",
-                PipelineStage::ALL.map(PipelineStage::as_str),
-            )?,
+            media_calls: enum_members(&call, "MediaCall", MediaCall::ALL.map(MediaCall::as_str))?,
             transfer_modes: enum_members(
                 &call,
                 "TransferMode",
@@ -177,7 +173,7 @@ impl NativeRequestTypes {
     fn kind<'py>(&self, py: Python<'py>, kind: CallKind) -> Bound<'py, PyAny> {
         let member = match kind {
             CallKind::Forward(mode) => &self.forward_modes[mode as usize],
-            CallKind::Pipeline(stage) => &self.pipeline_stages[stage as usize],
+            CallKind::Media(call) => &self.media_calls[call as usize],
             CallKind::Transfer(mode) => &self.transfer_modes[mode as usize],
         };
         member.bind(py).clone()
@@ -376,7 +372,7 @@ impl<'py> NativeRequestConversion<'py> {
                 coordinates.into_any(),
                 self.types.kind(py, call.code),
                 bounds.into_any(),
-                call.entry.clone().into_pyobject(py)?.into_any(),
+                call.component.clone().into_pyobject(py)?.into_any(),
                 pyo3::types::PyTuple::new(py, inputs)?.into_any(),
                 pyo3::types::PyTuple::new(py, outputs)?.into_any(),
                 call.token_input
@@ -795,10 +791,7 @@ fn diffusion_params_to_py<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "num_frames"), diffusion.num_frames)?;
-    dict.set_item(
-        intern!(py, "num_decode_chunks"),
-        diffusion.num_decode_chunks,
-    )?;
+    dict.set_item(intern!(py, "video_units"), diffusion.video_units)?;
     dict.set_item(
         intern!(py, "num_inference_steps"),
         diffusion.num_inference_steps,
@@ -1953,7 +1946,7 @@ mod tests {
             }),
             request_key,
             call_id: CallId::new(11, 0),
-            entry: "model".into(),
+            component: "model".into(),
             code: CallKind::Forward(ForwardMode::Prefill),
             bounds: Bounds {
                 max_tokens: 2,
@@ -1991,7 +1984,7 @@ mod tests {
             media_prompt_token_ids,
             DiffusionSamplingParams {
                 num_frames: 22,
-                num_decode_chunks: 3,
+                video_units: 3,
                 num_inference_steps: 4,
                 seed: 29,
             },
@@ -2020,8 +2013,8 @@ mod tests {
             sampling_state: None,
             request_key: media_key,
             call_id: CallId::new(12, 0),
-            entry: "model".into(),
-            code: CallKind::Pipeline(PipelineStage::LatentPreparation),
+            component: "model".into(),
+            code: CallKind::Media(MediaCall::LatentPreparation),
             bounds: Bounds {
                 ..Bounds::default()
             },
@@ -2064,7 +2057,7 @@ mod tests {
 
             request_key: kv_key,
             call_id: CallId::new(13, 0),
-            entry: "decoder".into(),
+            component: "decoder".into(),
             code: CallKind::Transfer(TransferMode::KvInstall),
             bounds: Bounds {
                 max_transfer_bytes: 32,

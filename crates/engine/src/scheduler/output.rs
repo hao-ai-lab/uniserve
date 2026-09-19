@@ -4,7 +4,7 @@
 //! is full, preserving order without blocking the engine owner thread.
 
 use super::*;
-use uniserve_worker_ipc::{ForwardMode, PipelineStage, TransferMode};
+use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 
 /// Flushes journaled public events into the output channel.
 fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<EngineCoreOutput>) -> bool {
@@ -438,7 +438,7 @@ impl Scheduler {
                 let worker = self
                     .worker_affinity
                     .get(&(key, "model".to_owned()))
-                    .expect("prefill has a bound model entry");
+                    .expect("prefill has a bound model component");
                 let source = Arc::new(
                     self.executor
                         .info()
@@ -514,7 +514,7 @@ impl Scheduler {
                     self.begin_image(id);
                 }
             }
-            CallKind::Pipeline(PipelineStage::Denoising) => {
+            CallKind::Media(MediaCall::Denoising) => {
                 // Publish every newly committed step exactly once, including steps
                 // coalesced into a single worker completion.
                 let (image_id, h, w, steps, prev_sd) = {
@@ -557,13 +557,13 @@ impl Scheduler {
                 // The host planner enters commit after the configured step count;
                 // worker completion flags do not determine diffusion termination.
             }
-            CallKind::Pipeline(
-                PipelineStage::VideoDecoding
-                | PipelineStage::AudioDecoding
-                | PipelineStage::AudioEncoding
-                | PipelineStage::Muxing,
+            CallKind::Media(
+                MediaCall::VideoDecoding
+                | MediaCall::AudioDecoding
+                | MediaCall::AudioEncoding
+                | MediaCall::Muxing,
             ) => {}
-            CallKind::Pipeline(PipelineStage::ImageDecoding) => {
+            CallKind::Media(MediaCall::ImageDecoding) => {
                 // Commit becomes visible before optional feedback state is prepared.
                 let image_id = self.running.get(&id).map_or(0, |st| st.image_id);
                 self.emit(id, EngineCoreOutput::ImageCommit { image_id });
@@ -626,8 +626,8 @@ impl Scheduler {
                     self.finish(id, FinishReason::ImageDone);
                 }
             }
-            CallKind::Pipeline(PipelineStage::VisionEncoding)
-            | CallKind::Pipeline(PipelineStage::LatentEncoding) => {
+            CallKind::Media(MediaCall::VisionEncoding)
+            | CallKind::Media(MediaCall::LatentEncoding) => {
                 match is_feedback_computation(&call) {
                     false => {
                         let encoder_cache_key = self.running.get(&id).and_then(|state| {
@@ -723,11 +723,11 @@ impl Scheduler {
                     }
                 }
             }
-            CallKind::Pipeline(PipelineStage::TextEncoding)
+            CallKind::Media(MediaCall::TextEncoding)
             | CallKind::Forward(ForwardMode::Decode)
             | CallKind::Forward(ForwardMode::Verify)
-            | CallKind::Pipeline(PipelineStage::LatentPreparation)
-            | CallKind::Pipeline(PipelineStage::VideoEncoding)
+            | CallKind::Media(MediaCall::LatentPreparation)
+            | CallKind::Media(MediaCall::VideoEncoding)
             | CallKind::Transfer(TransferMode::Tensor)
             | CallKind::Transfer(TransferMode::KvPublish)
             | CallKind::Transfer(TransferMode::KvInstall) => {}

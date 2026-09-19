@@ -21,7 +21,7 @@ from uniserve_worker.bootstrap.capacity import (
 from uniserve_worker.bootstrap.config import ComponentConfig
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_layout
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.protocol.call import ForwardMode, PipelineStage
+from uniserve_worker.protocol.call import ForwardMode, MediaCall
 
 TEST_MODEL = Model()
 TEST_WORKER_CONFIG = stub_worker_config(64, max_batch_tokens=8192)
@@ -175,7 +175,7 @@ def test_worker_info_projects_model_behavior_and_resource_geometry():
     info = layout.info
 
     assert ForwardMode.PREFILL in info.supported_ops
-    assert PipelineStage.DENOISING in info.supported_ops
+    assert MediaCall.DENOISING in info.supported_ops
     assert layout.max_vision_feature_bytes == ((512 // 16) ** 2 * 4 * 2)
     assert info.kv_cache is not None
     assert info.kv_cache.num_layers == len(TEST_MODEL.cache_config.layers)
@@ -315,8 +315,8 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
     offset = 0
     try:
         for request_id in range(1, info.request_slots + 1):
-            for call_id, entry in enumerate(info.components, start=1):
-                output = entry.outputs[0]
+            for call_id, component in enumerate(info.components, start=1):
+                output = component.outputs[0]
                 shape = tuple(
                     dim.extent if isinstance(dim, StaticDim) else dim.bound
                     for dim in output.shape_bound.dims
@@ -390,8 +390,8 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
     from uniserve.distributed.mesh import DeviceMesh
     from uniserve_worker.bootstrap.capacity import local_product_storage_bytes
     from uniserve_worker.bootstrap.config import ComponentConfig
-    from uniserve_worker.execution.model_entry import ModelEntry
-    from uniserve_worker.protocol.call import PipelineStage
+    from uniserve_worker.execution.component_binding import ComponentBinding
+    from uniserve_worker.protocol.call import MediaCall
     from uniserve_worker.protocol.tensor import (
         DeviceDim,
         DType,
@@ -410,7 +410,7 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
     }
     group = Communicator((0, 1, 2, 3), rank)
     bindings = {
-        name: ModelEntry(
+        name: ComponentBinding(
             name,
             config,
             group,
@@ -447,11 +447,11 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
         ),
     }
     components = {
-        PipelineStage.TEXT_ENCODING: "encode",
-        PipelineStage.LATENT_PREPARATION: "predict",
-        PipelineStage.DENOISING: "predict",
-        PipelineStage.VIDEO_DECODING: "decode",
-        PipelineStage.VIDEO_ENCODING: "assemble",
+        MediaCall.TEXT_ENCODING: "encode",
+        MediaCall.LATENT_PREPARATION: "predict",
+        MediaCall.DENOISING: "predict",
+        MediaCall.VIDEO_DECODING: "decode",
+        MediaCall.VIDEO_ENCODING: "assemble",
     }
     # Two outstanding groups each contain four units. Every allocation is
     # aligned to 256 bytes, including imported units from a remote worker.
@@ -477,7 +477,7 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
     assert local_product_storage_bytes(
         outputs,
         bindings=bindings,
-        pipeline_components=components,
+        media_components=components,
         max_unresolved_ops=2,
     ) == expected.get(rank, 0)
     # A horizon beyond the complete trajectory never reserves extra units.
@@ -501,7 +501,7 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
     assert local_product_storage_bytes(
         outputs,
         bindings=bindings,
-        pipeline_components=components,
+        media_components=components,
         max_unresolved_ops=8,
     ) == expected_full.get(rank, 0)
 

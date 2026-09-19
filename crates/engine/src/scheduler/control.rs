@@ -97,7 +97,7 @@ impl Scheduler {
                                 "request_id": request.request_id.0,
                                 "queue": "media",
                                 "prompt_tokens": request.prompt_token_ids.len(),
-                                "seconds": request.sampling.num_decode_chunks,
+                                "seconds": request.sampling.video_units,
                             }));
                             self.enqueue_media(PendingMedia {
                                 request,

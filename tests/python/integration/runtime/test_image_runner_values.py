@@ -26,13 +26,13 @@ from uniserve_worker.bootstrap.capacity import input_buffer_config
 from uniserve_worker.bootstrap.config import ComponentConfig
 from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.attention import from_blocks
+from uniserve_worker.execution.component_binding import ComponentBinding
 from uniserve_worker.execution.flow import (
     flow_rows,
     image_state,
     integrate,
     prefix_row,
 )
-from uniserve_worker.execution.model_entry import ModelEntry
 from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.protocol.call import (
     Bounds,
@@ -40,7 +40,7 @@ from uniserve_worker.protocol.call import (
     CallCoordinates,
     ForwardMode,
     ImageParams,
-    PipelineStage,
+    MediaCall,
 )
 from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.runtime.cache_manager import CacheManager
@@ -87,7 +87,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
         ).model
     group = Communicator((0,), 0, device=torch.device("cuda:0"))
     bindings = {
-        "model": ModelEntry(
+        "model": ComponentBinding(
             "model",
             ComponentConfig((0,)),
             group,
@@ -278,7 +278,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
             )
             result = runner.run_forward_group(
                 rows,
-                calls=calls(PipelineStage.DENOISING),
+                calls=calls(MediaCall.DENOISING),
                 cache=manager,
                 tables=manager.block_tables,
                 states=None,
@@ -347,7 +347,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         axes=tuple(axis for axis, _ in placement.parallel_config.dimensions),
     )
     bindings = {
-        "model": ModelEntry(
+        "model": ComponentBinding(
             "model", placement, group, mesh, torch.device("cuda:0")
         )
     }
@@ -580,7 +580,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
             payload = base64.b64encode(encoded.getvalue()).decode("ascii")
             pixels = prepare_image(
                 processor,
-                PipelineStage.VISION_ENCODING,
+                MediaCall.VISION_ENCODING,
                 payload,
                 device=torch.device("cuda:0"),
             )

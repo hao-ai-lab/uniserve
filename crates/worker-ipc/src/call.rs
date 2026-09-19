@@ -52,7 +52,7 @@ impl ForwardMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
-pub enum PipelineStage {
+pub enum MediaCall {
     VisionEncoding,
     LatentEncoding,
     TextEncoding,
@@ -66,7 +66,7 @@ pub enum PipelineStage {
     Muxing,
 }
 
-impl PipelineStage {
+impl MediaCall {
     pub const ALL: [Self; 11] = [
         Self::VisionEncoding,
         Self::LatentEncoding,
@@ -98,8 +98,8 @@ impl PipelineStage {
     }
 }
 
-impl PipelineStage {
-    /// Fixed stages needed to produce video and audio.
+impl MediaCall {
+    /// Fixed calls needed to produce video and audio.
     pub const VIDEO: [Self; 8] = [
         Self::TextEncoding,
         Self::LatentPreparation,
@@ -135,12 +135,12 @@ impl TransferMode {
 }
 
 /// Exactly one computation classification. The sum preserves the distinct
-/// forward, pipeline, and storage contracts without parallel opcode metadata.
+/// forward, media, and storage contracts without parallel opcode metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CallKind {
     Forward(ForwardMode),
-    Pipeline(PipelineStage),
+    Media(MediaCall),
     Transfer(TransferMode),
 }
 
@@ -261,17 +261,17 @@ impl CallKind {
         Self::Forward(ForwardMode::Prefill),
         Self::Forward(ForwardMode::Decode),
         Self::Forward(ForwardMode::Verify),
-        Self::Pipeline(PipelineStage::VisionEncoding),
-        Self::Pipeline(PipelineStage::LatentEncoding),
-        Self::Pipeline(PipelineStage::TextEncoding),
-        Self::Pipeline(PipelineStage::LatentPreparation),
-        Self::Pipeline(PipelineStage::Denoising),
-        Self::Pipeline(PipelineStage::ImageDecoding),
-        Self::Pipeline(PipelineStage::VideoDecoding),
-        Self::Pipeline(PipelineStage::AudioDecoding),
-        Self::Pipeline(PipelineStage::VideoEncoding),
-        Self::Pipeline(PipelineStage::AudioEncoding),
-        Self::Pipeline(PipelineStage::Muxing),
+        Self::Media(MediaCall::VisionEncoding),
+        Self::Media(MediaCall::LatentEncoding),
+        Self::Media(MediaCall::TextEncoding),
+        Self::Media(MediaCall::LatentPreparation),
+        Self::Media(MediaCall::Denoising),
+        Self::Media(MediaCall::ImageDecoding),
+        Self::Media(MediaCall::VideoDecoding),
+        Self::Media(MediaCall::AudioDecoding),
+        Self::Media(MediaCall::VideoEncoding),
+        Self::Media(MediaCall::AudioEncoding),
+        Self::Media(MediaCall::Muxing),
         Self::Transfer(TransferMode::Tensor),
         Self::Transfer(TransferMode::KvPublish),
         Self::Transfer(TransferMode::KvInstall),
@@ -280,15 +280,14 @@ impl CallKind {
     pub const fn advances_state(self) -> bool {
         matches!(
             self,
-            Self::Forward(_)
-                | Self::Pipeline(PipelineStage::LatentPreparation | PipelineStage::Denoising)
+            Self::Forward(_) | Self::Media(MediaCall::LatentPreparation | MediaCall::Denoising)
         )
     }
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Forward(mode) => mode.as_str(),
-            Self::Pipeline(stage) => stage.as_str(),
+            Self::Media(call) => call.as_str(),
             Self::Transfer(mode) => mode.as_str(),
         }
     }
@@ -305,7 +304,7 @@ pub struct Bounds {
     pub max_latent_bytes: u64,
     /// Maximum host-visible completion data in bytes.
     pub max_completion_bytes: u64,
-    /// Maximum cross-stage transfer data in bytes.
+    /// Maximum cross-call transfer data in bytes.
     pub max_transfer_bytes: u64,
 }
 
@@ -408,8 +407,8 @@ pub struct Call {
     pub call_id: CallId,
     /// Coordinates this call executes at, so a rank does not derive them.
     pub coordinates: CallCoordinates,
-    /// CallKind entry bound within the selected Worker.
-    pub entry: String,
+    /// Component bound within the selected Worker.
+    pub component: String,
     /// CallKind performed by this call.
     pub code: CallKind,
     /// Scheduler-declared limits for the computation and its outputs.
@@ -426,7 +425,7 @@ pub struct Call {
     /// a published product retires once each has acknowledged it. The
     /// executing rank's own slot is never listed.
     pub consumer_slots: Vec<u32>,
-    /// Source token scalar transported between computation entries.
+    /// Source token scalar transported between components.
     pub token_input: Option<TensorRef>,
     /// Sampled token and continuation bit in one I64 scalar.
     pub token_output: Option<TensorRef>,
@@ -542,7 +541,10 @@ impl Call {
     pub fn validate(&self) -> ValidationResult<()> {
         // Establish call identity, family, lineage, and declared capacity.
         ensure_valid!(self.call_id.batch_id > 0, "call id must be positive");
-        ensure_valid!(!self.entry.is_empty(), "call entry must not be empty");
+        ensure_valid!(
+            !self.component.is_empty(),
+            "call component must not be empty"
+        );
         self.coordinates.validate()?;
 
         ensure_valid!(
@@ -571,9 +573,7 @@ impl Call {
                 !image.is_empty()
                     && matches!(
                         self.code,
-                        CallKind::Pipeline(
-                            PipelineStage::VisionEncoding | PipelineStage::LatentEncoding
-                        )
+                        CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding)
                     )
                     && self.image_input.is_none(),
                 "encoded image requires an image encoder without another image source"
@@ -602,7 +602,7 @@ impl Call {
         let consumes_kv = matches!(
             self.code,
             CallKind::Transfer(TransferMode::KvInstall)
-                | CallKind::Pipeline(PipelineStage::LatentPreparation | PipelineStage::Denoising)
+                | CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising)
         );
         if let Some(input) = self.kv_input {
             input.validate()?;
@@ -1061,7 +1061,7 @@ impl NewRequest {
             );
             ensure_valid!(
                 diffusion.num_frames > 0
-                    && diffusion.num_decode_chunks > 0
+                    && diffusion.video_units > 0
                     && self.prompt_token_ids.len() <= u32::MAX as usize
                     && diffusion.num_inference_steps > 0,
                 "diffusion parameters are invalid"
@@ -1435,13 +1435,13 @@ impl Batch {
             );
         }
         // A batch is one numerical call on one component: every call in it
-        // performs the same computation through the same entry, so a rank
+        // performs the same computation through the same component, so a rank
         // executes it as a single homogeneous group and returns one result.
         ensure_valid!(
-            self.calls
-                .windows(2)
-                .all(|pair| { pair[0].code == pair[1].code && pair[0].entry == pair[1].entry }),
-            "a submission batch mixes call kinds or entries"
+            self.calls.windows(2).all(|pair| {
+                pair[0].code == pair[1].code && pair[0].component == pair[1].component
+            }),
+            "a submission batch mixes call kinds or components"
         );
 
         let calls = self
@@ -1504,8 +1504,8 @@ impl Batch {
                 .ok_or_else(|| invalid_message!("latent params does not name a run call"))?;
             let addresses_trajectory = matches!(
                 call.code,
-                CallKind::Pipeline(PipelineStage::LatentPreparation)
-                    | CallKind::Pipeline(PipelineStage::Denoising)
+                CallKind::Media(MediaCall::LatentPreparation)
+                    | CallKind::Media(MediaCall::Denoising)
             ) || call.latent_input.is_some();
             ensure_valid!(
                 addresses_trajectory,
@@ -1523,8 +1523,8 @@ impl Batch {
         for call in &self.calls {
             let needs_latent = matches!(
                 call.code,
-                CallKind::Pipeline(PipelineStage::LatentPreparation)
-                    | CallKind::Pipeline(PipelineStage::Denoising)
+                CallKind::Media(MediaCall::LatentPreparation)
+                    | CallKind::Media(MediaCall::Denoising)
             ) || call.latent_input.is_some();
             ensure_valid!(
                 !needs_latent || latent_ids.contains(&(call.request_key, call.call_id)),
@@ -1547,11 +1547,11 @@ impl Batch {
             ensure_valid!(
                 matches!(
                     call.code,
-                    CallKind::Pipeline(
-                        PipelineStage::VideoDecoding
-                            | PipelineStage::AudioDecoding
-                            | PipelineStage::VideoEncoding
-                            | PipelineStage::AudioEncoding
+                    CallKind::Media(
+                        MediaCall::VideoDecoding
+                            | MediaCall::AudioDecoding
+                            | MediaCall::VideoEncoding
+                            | MediaCall::AudioEncoding
                     )
                 ),
                 "decode params does not name media decode work"
@@ -1560,13 +1560,13 @@ impl Batch {
             // media units as its component has ranks, and one round covers
             // them all, so an audio decode range starts at the first unit.
             ensure_valid!(
-                !matches!(call.code, CallKind::Pipeline(PipelineStage::AudioDecoding))
+                !matches!(call.code, CallKind::Media(MediaCall::AudioDecoding))
                     || (params.cursor == 0 && params.max_units >= 1),
                 "audio decode range must start at the first media unit"
             );
             // Audio encoding consumes the assembled track as one host call.
             ensure_valid!(
-                !matches!(call.code, CallKind::Pipeline(PipelineStage::AudioEncoding))
+                !matches!(call.code, CallKind::Media(MediaCall::AudioEncoding))
                     || (params.cursor == 0 && params.max_units == 1),
                 "audio encode range must address its single sample stream"
             );
@@ -1575,11 +1575,11 @@ impl Batch {
         for call in &self.calls {
             let needs_range = matches!(
                 call.code,
-                CallKind::Pipeline(
-                    PipelineStage::VideoDecoding
-                        | PipelineStage::AudioDecoding
-                        | PipelineStage::VideoEncoding
-                        | PipelineStage::AudioEncoding
+                CallKind::Media(
+                    MediaCall::VideoDecoding
+                        | MediaCall::AudioDecoding
+                        | MediaCall::VideoEncoding
+                        | MediaCall::AudioEncoding
                 )
             );
             ensure_valid!(
@@ -1634,7 +1634,7 @@ impl Batch {
             );
         }
 
-        // Admissions create request state independently of entry execution.
+        // Admissions create request state independently of call execution.
         let mut admitted = HashSet::new();
         for admission in self.admissions() {
             admission.validate()?;
@@ -1670,7 +1670,7 @@ impl Batch {
         }
 
         // Product payloads must be declared, uniquely supplied, and represented
-        // according to whether their storage crosses a stage boundary.
+        // according to whether their storage crosses a call boundary.
         for payload in &self.input_products {
             payload.validate()?;
         }
