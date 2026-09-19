@@ -265,6 +265,7 @@ impl WorkerProcessArgs {
         distributed_init_method: Option<String>,
         channel_transport: &str,
         acknowledgment_slot: u32,
+        host_slots: &[u32],
         products_cross_hosts: bool,
     ) -> anyhow::Result<serde_json::Value> {
         let depth = self.queue_depth.max(1);
@@ -279,6 +280,10 @@ impl WorkerProcessArgs {
         // A consumer writes its own slot's word in every chunk or segment it
         // reads; the slots a producer watches travel on each producing call.
         fields.insert("acknowledgment_slot".into(), json!(acknowledgment_slot));
+        // Which of those slots are on this rank's host decides the mechanism
+        // a host product is published over: shared memory reaches the host,
+        // the rank channel reaches the rest.
+        fields.insert("host_slots".into(), json!(host_slots));
         // Readiness is a producer synchronize only where an interprocess event
         // cannot carry it, which is exactly where a consumer is on another
         // host. Only the placement knows that.
@@ -492,6 +497,7 @@ impl PendingRank {
         // gives the rank its own slot here.
         let acknowledgment_slot = args.transfer.acknowledgment_slot(&args.worker_id, rank);
         let products_cross_hosts = args.transfer.products_cross_hosts(&args.worker_id, rank);
+        let host_slots = args.transfer.host_slots(&args.worker_id, rank);
         let names = |backends: &std::collections::BTreeSet<crate::executor::TransferBackend>| {
             backends
                 .iter()
@@ -515,6 +521,7 @@ impl PendingRank {
             distributed_init_method,
             channel_transport,
             acknowledgment_slot,
+            &host_slots,
             products_cross_hosts,
         )?;
         let descriptor_directory = tempfile::Builder::new()

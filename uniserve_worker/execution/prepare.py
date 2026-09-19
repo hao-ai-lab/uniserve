@@ -263,8 +263,9 @@ def prepare_inputs(
             "cross-call input requires a configured transport"
         )
 
-    # A host call reads its media inputs in place from the segments their
-    # producers published, so they are borrowed at execution, not imported.
+    # A video encode reads its media units in place from the segments the
+    # decoding ranks on this host published, so they are borrowed at
+    # execution, not imported.
     borrowed = {
         product.buffer_id
         for call in batch.calls

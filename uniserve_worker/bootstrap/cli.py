@@ -23,6 +23,7 @@ REQUIRED_FIELDS = (
     "registration_address",
     "channel_transport",
     "acknowledgment_slot",
+    "host_slots",
     "products_cross_hosts",
     "worker_id",
     "queue_depth",

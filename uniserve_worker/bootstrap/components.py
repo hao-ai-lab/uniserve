@@ -249,14 +249,16 @@ def media_components(
         for call in owned:
             owners.setdefault(call, []).append(name)
 
-    # A call several components implement names no single component, so
-    # nothing can be routed to it.
-    for call, holders in owners.items():
-        if len(holders) > 1:
-            raise unsupported_setup(
-                f"media calls repeat {call.value} computation"
-            )
-    routes = {call: holders[0] for call, holders in owners.items()}
+    # A call several components implement names no single component, so it
+    # is not routed: a model whose modules overlap outside the media graph
+    # serves no media call through them, and a media deployment missing a
+    # call is refused by the engine, which names the call, when it checks the
+    # graph across workers.
+    routes = {
+        call: holders[0]
+        for call, holders in owners.items()
+        if len(holders) == 1
+    }
     if (
         MediaCall.LATENT_PREPARATION in routes
         and MediaCall.DENOISING in routes
