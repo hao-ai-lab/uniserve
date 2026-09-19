@@ -11,11 +11,13 @@ import av
 import numpy as np
 import pytest
 
-from uniserve_worker.media.mux import (
+from uniserve_worker.media.codec_process import (
     AvMuxConfig,
     AvMuxSession,
     encode_audio_track,
     encode_video_unit,
+)
+from uniserve_worker.media.mux import (
     encoded_unit_bytes,
     frame_encoded_unit,
     read_encoded_unit,

@@ -10,12 +10,16 @@ import torch
 from uniserve.media.video import Config
 
 from ..foundation.errors import resource_error
+from .codec_process import SharedMapping, SharedSlice
 
 
 class MediaBuffers:
     """Bounded pinned captures shared by bounded video decode implementations.
 
-    Video and audio slots are leased from independent fixed free queues.
+    Video and audio slots are leased from independent fixed free queues. The
+    slots are one shared mapping, pinned for device-to-host copies when the
+    rank decodes on a device, so a codec process reads a captured media unit
+    where the copy left it.
     """
 
     def __init__(
@@ -27,10 +31,11 @@ class MediaBuffers:
         video: Config,
         frame_rate: int,
         audio_rate: int,
+        pin: bool,
     ) -> None:
-        """Allocate bounded video and audio tensors.
+        """Allocate bounded video and audio slots in one shared mapping.
 
-        Each tensor kind has an independent free-slot queue.
+        Each slot kind has an independent free-slot queue.
         """
         self.video_capacity = int(state_slots) * int(unresolved_window)
         self.audio_capacity = int(state_slots)
@@ -55,13 +60,33 @@ class MediaBuffers:
                 "video output-ring media capacities must be positive"
             )
 
+        # Video slots precede audio slots in the mapping; both are byte views
+        # of it, so a slot's offset is its distance from the mapping's start.
+        audio_start = self.video_capacity * video_bytes
+        total = audio_start + self.audio_capacity * audio_bytes
+        self.mapping = SharedMapping("uniserve-media-ring", total)
+        self._pinned = False
+        try:
+            self._base = torch.frombuffer(
+                self.mapping.buffer, dtype=torch.uint8
+            )
+            if pin:
+                _register_pinned(self._base)
+                self._pinned = True
+        except BaseException:
+            self.mapping.close()
+            raise
+
         self._video_storage = tuple(
-            torch.empty(video_bytes, dtype=torch.uint8, pin_memory=True)
-            for _ in range(self.video_capacity)
+            self._base[index * video_bytes : (index + 1) * video_bytes]
+            for index in range(self.video_capacity)
         )
         self._audio_storage = tuple(
-            torch.empty(audio_bytes, dtype=torch.uint8, pin_memory=True)
-            for _ in range(self.audio_capacity)
+            self._base[
+                audio_start + index * audio_bytes : audio_start
+                + (index + 1) * audio_bytes
+            ]
+            for index in range(self.audio_capacity)
         )
 
         # Free lists are reversed so pop() leases the lowest slot index first.
@@ -79,6 +104,18 @@ class MediaBuffers:
                 raise resource_error(f"video {kind} output ring is exhausted")
             index = free.pop()
         return MediaLease(self, kind, index)
+
+    def slice(self, capture: torch.Tensor) -> SharedSlice:
+        """Name a captured view of a leased slot for a codec process."""
+        if capture.device.type != "cpu" or capture.dtype is not torch.uint8:
+            raise ValueError("a media capture is a CPU uint8 view")
+        if not capture.is_contiguous():
+            raise ValueError("a media capture is a contiguous view")
+        offset = int(capture.data_ptr()) - int(self._base.data_ptr())
+        nbytes = int(capture.numel())
+        if offset < 0 or offset + nbytes > int(self._base.numel()):
+            raise ValueError("a media capture lies outside the media ring")
+        return SharedSlice(self.mapping.name, offset, nbytes)
 
     def _storage(self, kind: str, index: int) -> torch.Tensor:
         """Return backing storage for one typed output-ring slot."""
@@ -104,6 +141,31 @@ class MediaBuffers:
                 self.video_capacity - len(self._video_free),
                 self.audio_capacity - len(self._audio_free),
             )
+
+    def close(self) -> None:
+        """Unpin and unmap the ring once no encoder reads it."""
+        if self._pinned:
+            self._pinned = False
+            _unregister_pinned(self._base)
+        self._video_storage = ()
+        self._audio_storage = ()
+        del self._base
+        self.mapping.close()
+
+
+def _register_pinned(base: torch.Tensor) -> None:
+    """Page-lock the mapping so device-to-host copies can target it."""
+    cudart = torch.cuda.cudart()
+    status = cudart.cudaHostRegister(int(base.data_ptr()), int(base.numel()), 0)
+    if status != cudart.cudaError.success:
+        raise RuntimeError(f"pinning the media ring failed: {status!r}")
+
+
+def _unregister_pinned(base: torch.Tensor) -> None:
+    cudart = torch.cuda.cudart()
+    status = cudart.cudaHostUnregister(int(base.data_ptr()))
+    if status != cudart.cudaError.success:
+        raise RuntimeError(f"unpinning the media ring failed: {status!r}")
 
 
 class MediaLease:
@@ -132,6 +194,14 @@ class MediaLease:
                 "video output-ring storage was accessed after release"
             )
         return self._ring._storage(self.kind, self.index)
+
+    def slice(self, capture: torch.Tensor) -> SharedSlice:
+        """Name a captured view of this slot for a codec process."""
+        if self._released:
+            raise RuntimeError(
+                "video output-ring storage was accessed after release"
+            )
+        return self._ring.slice(capture)
 
     def release(self) -> None:
         """Return this output slot to the ring exactly once."""
