@@ -215,6 +215,9 @@ class TensorRecord:
     producer_event: torch.cuda.Event | None = None
     producer_stream: int | None = None
     producer_recorded: bool = False
+    # A deferred write is produced by host work after its call is committed;
+    # it is published and committed when that work completes.
+    deferred: bool = False
     reader_events: torch.cuda.Event | list[torch.cuda.Event] | None = None
     released: bool = False
     _indexed: bool = False
@@ -2033,6 +2036,18 @@ class TensorStore:
                 write.actual_extent = int(value.tensor.numel())
             value.committed = True
 
+    def defer_write(self, write: TensorRecord) -> None:
+        """Let host work publish a reserved write after its call commits.
+
+        The call's completion packs without it; the write is published and
+        committed when the work that fills it completes.
+        """
+        with self._lock:
+            entry = self._require_write_locked(write)
+            if entry.committed or entry.producer_recorded:
+                raise _invariant("a published write cannot be deferred")
+            entry.deferred = True
+
     def validate_writes(self, writes: tuple[TensorRecord, ...]) -> None:
         """Verify that a write batch still refers to active unpublished.
 
@@ -2043,7 +2058,7 @@ class TensorStore:
                 entry = self._require_write_locked(write)
                 if entry.committed:
                     raise _invariant("device-product candidate is not live")
-                if not entry.producer_recorded:
+                if not entry.producer_recorded and not entry.deferred:
                     raise _invariant(
                         "completion packing found an unpublished device product"
                     )
@@ -2056,9 +2071,19 @@ class TensorStore:
         if not writes:
             return
         with self._lock:
+            # A deferred write commits when the host work filling it has
+            # published it, not with the call that reserved it.
             entries = tuple(
-                self._require_write_locked(write) for write in writes
+                entry
+                for entry in (
+                    self._require_write_locked(write) for write in writes
+                )
+                if not (entry.deferred and not entry.producer_recorded)
             )
+            for entry in entries:
+                entry.deferred = False
+            if not entries:
+                return
             keys = tuple(_reference_key(entry.reference) for entry in entries)
             if len(set(keys)) != len(keys):
                 raise _invariant(
