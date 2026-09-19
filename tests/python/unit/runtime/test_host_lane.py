@@ -192,7 +192,7 @@ def test_session_jobs_share_one_codec_process_and_discard_ends_a_session() -> (
 
         session = (1, 5, 0)
         track = pool.reserve().configure(
-            EncodeAudioTrack(session, config, (audio,)), session=session
+            EncodeAudioTrack(session, config, audio), session=session
         )
         track.submit_if_ready()
         # Each append follows the previous one; finalization follows the last
@@ -228,7 +228,7 @@ def test_session_jobs_share_one_codec_process_and_discard_ends_a_session() -> (
         # A discarded session is gone from the process that held it.
         other = (1, 6, 0)
         started = pool.reserve().configure(
-            EncodeAudioTrack(other, config, (audio,)), session=other
+            EncodeAudioTrack(other, config, audio), session=other
         )
         started.submit_if_ready()
         started.promise.result(timeout=30)

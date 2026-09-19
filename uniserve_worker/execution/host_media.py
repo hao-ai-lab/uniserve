@@ -1,12 +1,13 @@
 """Host media calls: media unit encoding, audio encoding and muxing.
 
 These calls run on host ranks. A video encode consumes the RGB media units
-its rank is handed from a decode round, an audio encode consumes the
-request's PCM timeline, and a mux consumes the encoded unit rows; every
-input is a host product borrowed in place from the shared-memory segment its
-producer published, so a codec process reads the producer's bytes directly.
-The encoded unit rows are this rank's product, published when the encodes
-complete.
+its rank is handed from a decode round, borrowed in place from the
+shared-memory segment the decoding rank on this host published, so a codec
+process reads the producer's bytes directly; the encoded unit rows are this
+rank's product, published when the encodes complete. An audio encode
+consumes the request's PCM timeline, imported like any product because its
+decoding ranks may be on other hosts, and staged in a segment of this rank's
+own for the codec; a mux consumes the encoded unit rows.
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ from .batch_state import BatchState
 from .output import PendingOutput
 
 if TYPE_CHECKING:
+    import torch
+
     from uniserve_worker.bootstrap.config import ComponentConfig
     from uniserve_worker.protocol.batch import TensorPublication
     from uniserve_worker.runtime.tensor_store import TensorStore
@@ -52,9 +55,7 @@ HOST_MEDIA_CALLS = frozenset(
     {MediaCall.VIDEO_ENCODING, MediaCall.AUDIO_ENCODING, MediaCall.MUXING}
 )
 #: The calls whose media inputs are read in place rather than imported.
-BORROWED_INPUT_CALLS = frozenset(
-    {MediaCall.VIDEO_ENCODING, MediaCall.AUDIO_ENCODING}
-)
+BORROWED_INPUT_CALLS = frozenset({MediaCall.VIDEO_ENCODING})
 
 
 def encoded_unit_positions(
@@ -140,50 +141,41 @@ def _borrow(
     )
 
 
-def _borrow_all(
-    publication: TensorPublication, *, transports: Mapping[str, Transport]
-) -> tuple[HostBorrow, ...]:
-    """Borrow every shard of a product in place, in leading-axis order.
+def _stage_track(samples: torch.Tensor) -> HostBorrow:
+    """Copy the PCM timeline into a segment of this rank's own for the codec.
 
-    The shards must tile the product's leading axis from its start without
-    gaps or overlaps, as the ranks of a distributed decoder publish it; the
-    product's declared bound may exceed what the request produced.
+    The codec reads media bytes from a named shared-memory segment; the
+    imported timeline lives in this rank's memory, so it is written to a
+    segment the borrow's release unlinks once the encode has read it.
     """
-    shm = _shm(transports)
-    tensor = publication.value.tensor
-    shards = sorted(
-        (
-            location
-            for location in tensor.locations
-            if isinstance(location.transport, PosixShmTransfer)
-        ),
-        key=lambda location: location.offset[0] if location.offset else 0,
+    import torch
+
+    from uniserve_worker.foundation.shared_memory import (
+        allocate_shared_memory,
     )
-    cursor = 0
-    for location in shards:
-        start = location.offset[0] if location.offset else 0
-        if start != cursor or tuple(location.shape[1:]) != tuple(
-            tensor.shape[1:]
-        ):
-            raise invalid_descriptor(
-                "audio track shards do not tile the timeline in order: "
-                + _locations(publication)
-            )
-        cursor = start + int(location.shape[0])
-    if not shards:
-        raise invalid_descriptor(
-            "audio track is not published over shared memory on this host: "
-            + _locations(publication)
-        )
-    borrows: list[HostBorrow] = []
+    from uniserve_worker.transfer.tickets import HostBorrow
+
+    raw = samples.detach().to("cpu").contiguous().view(torch.uint8).reshape(-1)
+    nbytes = int(raw.numel())
+    if nbytes < 1:
+        raise invalid_descriptor("audio encoding has an empty PCM timeline")
+    segment = allocate_shared_memory(nbytes)
     try:
-        for location in shards:
-            borrows.append(shm.borrow(location))
+        # The mapping is dropped before the borrow is released, so closing
+        # the segment finds no exported buffer.
+        torch.frombuffer(segment.buf, dtype=torch.uint8).copy_(raw)
     except BaseException:
-        for borrow in borrows:
-            borrow.release()
+        segment.close()
+        segment.unlink()
         raise
-    return tuple(borrows)
+
+    def release() -> None:
+        segment.close()
+        segment.unlink()
+
+    return HostBorrow(
+        segment=segment.name, offset=0, nbytes=nbytes, _release=release
+    )
 
 
 def execute(
@@ -307,17 +299,30 @@ def execute(
             raise unsupported_setup("audio encoding has no muxer resources")
         config = mux_config(model_runner, media)
         media_mux.open(call.request_key, config=config)
-        publication = _input_publication(call, state)
-        borrows = _borrow_all(publication, transports=transports)
+        if len(call.inputs) != 1:
+            raise invalid_descriptor("audio encoding requires one PCM input")
+        # The timeline's shards come from every audio decoding rank, on this
+        # host or another, so it is imported like any product and read as
+        # one complete tensor.
+        read = tensor_store.consume(
+            call.inputs[0],
+            consumer_call_id=call.call_id,
+            device=model_runner.call_devices(call)[0],
+        )
+        request.device_reads.append(read)
+        if read.region is not None or read.tensor is None:
+            raise invalid_descriptor(
+                "audio encoding requires the complete PCM timeline"
+            )
+        track = _stage_track(read.tensor)
         try:
             tasks = (
                 media_mux.audio(
-                    call.request_key, borrows, reservations[0], call.call_id
+                    call.request_key, track, reservations[0], call.call_id
                 ),
             )
         except BaseException:
-            for borrow in borrows:
-                borrow.release()
+            track.release()
             raise
 
     elif call.kind is MediaCall.MUXING:

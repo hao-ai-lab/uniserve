@@ -82,7 +82,7 @@ def test_units_and_audio_from_shared_memory_assemble_into_an_artifact(
         codec.execute(EncodeVideoUnit(config, second)),
     )
     session = (1, 7, 0)
-    assert codec.execute(EncodeAudioTrack(session, config, (audio,))) is None
+    assert codec.execute(EncodeAudioTrack(session, config, audio)) is None
     # Rounds are appended as they complete; the artifact follows the last.
     codec.execute(MuxAppend(session, config, units[:1]))
     codec.execute(MuxAppend(session, config, units[1:]))
@@ -143,7 +143,7 @@ def test_a_closed_session_cannot_be_finalized(codec, segment):
         codec.execute(MuxFinalize(session))
     # A finalize without audio leaves no half-built session behind either.
     pcm = np.zeros((8000, 2), dtype=np.int16)
-    codec.execute(EncodeAudioTrack(session, config, (_write(segment, 0, pcm),)))
+    codec.execute(EncodeAudioTrack(session, config, _write(segment, 0, pcm)))
     with pytest.raises(ValueError, match="every media unit"):
         codec.execute(MuxFinalize(session))
     with pytest.raises(ValueError, match="no assembly session"):
