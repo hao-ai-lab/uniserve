@@ -69,7 +69,7 @@ include = ["uniserve", "uniserve.*", "uniserve_models*", "uniserve_worker*"]
 # A model package declares how its components divide beside its numerical code.
 # The declaration is read at serving time, without importing the package, so it
 # has to ship with it.
-"uniserve_models" = ["*/placement.toml"]
+"uniserve_models" = ["*/components.toml"]
 
 # Native worker IPC extension (PyO3).
 [[tool.setuptools-rust.ext-modules]]
