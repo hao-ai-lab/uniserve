@@ -38,6 +38,11 @@ struct Args {
 #[derive(Serialize)]
 struct Presentation<'a> {
     host: &'a str,
+    /// A port of this host that the group's first rank may bind its
+    /// collective rendezvous on, when that rank is placed here. The head
+    /// cannot reserve a port on another machine, and the store must be bound
+    /// where its owning rank runs.
+    rendezvous_port: u16,
 }
 
 /// One instruction the head sends a launcher.
@@ -104,9 +109,16 @@ fn main() -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream);
 
     // The head places ranks by host identity, so the launcher says which host
-    // it is before it can be given anything to run.
+    // it is before it can be given anything to run, and names a free port of
+    // this host for a rendezvous the head may place here.
+    let rendezvous_port = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+        .context("reserving a rendezvous port on this host")?
+        .local_addr()
+        .context("reading the reserved rendezvous port")?
+        .port();
     let presentation = serde_json::to_string(&Presentation {
         host: &args.host_identity,
+        rendezvous_port,
     })?;
     writer
         .write_all(format!("{presentation}\n").as_bytes())
