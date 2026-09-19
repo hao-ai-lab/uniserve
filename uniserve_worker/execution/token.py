@@ -295,7 +295,7 @@ def publish_sample(
     penalty_base = None if sample_work is None else sample_work.penalty_base
 
     if call.vision_input is not None or call.latent_feature_input is not None:
-        request.projected_progress = replace(
+        request.progress = replace(
             calls.require_progress(request),
             rng_counter=calls.require_progress(request).rng_counter + (1),
         )
@@ -551,13 +551,13 @@ def _finish_visual(
     position = int(calls.require_progress(request).logical_position)
     if call.completion_output is not None:
         flow = image_builder
-        request.projected_progress = replace(
+        request.progress = replace(
             calls.require_progress(request),
             logical_position=position
             + max(1, 1 if flow is None else int(flow.rope_advance)),
         )
     elif call.vision_input is not None:
-        request.projected_progress = replace(
+        request.progress = replace(
             calls.require_progress(request), logical_position=position + 1
         )
     return encode.state_outcome(
@@ -724,7 +724,7 @@ def prompt_logprob_details(
         targets = tokens
 
     request.runtime_prompt_logits = logits[-1].detach()
-    request.projected_progress = replace(
+    request.progress = replace(
         calls.require_progress(request), prompt_logits_ready=True
     )
     if int(targets.numel()) == 0:
@@ -798,7 +798,7 @@ def token_outcome(
     # unresolved until host completion, with the initialized KV extent retained.
     # Verification keeps the base logical position so acceptance can advance it
     # by the accepted span resolved at host completion.
-    request.projected_progress = replace(
+    request.progress = replace(
         progress,
         logical_position=(
             request.base_logical_position

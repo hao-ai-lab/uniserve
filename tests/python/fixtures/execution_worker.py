@@ -12,7 +12,7 @@ from uniserve.distributed.mesh import Communicator
 from uniserve_models.stub import Model, image_processor
 from uniserve_worker.bootstrap.config import ComponentConfig
 from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.model_entry import ModelEntry
+from uniserve_worker.execution.component_binding import ComponentBinding
 from uniserve_worker.worker import Worker
 
 
@@ -29,7 +29,7 @@ def execution_worker(
     max_request_pool_size: int = 128,
     max_batch_calls: int | None = None,
     components: tuple[tuple[str, ComponentConfig], ...] = (),
-    bindings: Mapping[str, ModelEntry] | None = None,
+    bindings: Mapping[str, ComponentBinding] | None = None,
 ) -> Worker:
     ready = Model().to(device) if model is None else model
     worker_config = replace(

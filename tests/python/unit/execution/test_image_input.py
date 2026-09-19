@@ -15,7 +15,7 @@ from uniserve.processing import (
     TowerTransform,
 )
 from uniserve_worker.execution.image_input import prepare_image
-from uniserve_worker.protocol.call import PipelineStage
+from uniserve_worker.protocol.call import MediaCall
 
 
 @pytest.mark.parametrize("normalization", ("signed_unit", "imagenet"))
@@ -47,7 +47,7 @@ def test_encoded_pixels_match_channel_normalization(
 
     result = prepare_image(
         processor,
-        PipelineStage.VISION_ENCODING,
+        MediaCall.VISION_ENCODING,
         base64.b64encode(encoded.getvalue()).decode(),
         device=torch.device(device),
     )

@@ -158,8 +158,8 @@ impl Default for WorkerProcessArgs {
             }],
             host: "localhost".into(),
             // One local rank running one component. A launch replaces this
-            // with the entries the model being served declared.
-            entries: crate::WorkerConfig::single_entry("model", 1),
+            // with the components the model being served declared.
+            components: crate::WorkerConfig::single_component("model", 1),
             stub: false,
             queue_depth: 2,
             req_slot_cap: 1 << 20,
@@ -294,7 +294,7 @@ impl WorkerProcessArgs {
         fields.insert("rank".into(), json!(rank));
         fields.insert("local_rank".into(), json!(self.host_slot(rank).0));
         fields.insert("world_size".into(), json!(world_size));
-        fields.insert("entries".into(), serde_json::to_value(components)?);
+        fields.insert("components".into(), serde_json::to_value(components)?);
         fields.insert(
             "supported_ops".into(),
             if self.capability_groups.is_empty() {

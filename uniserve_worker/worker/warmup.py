@@ -13,7 +13,7 @@ from uniserve.math import ceil_div
 from uniserve.media.image import Config as ImageConfig
 from uniserve_worker.protocol.call import (
     ForwardMode,
-    PipelineStage,
+    MediaCall,
     TransferMode,
 )
 from uniserve_worker.protocol.identity import (
@@ -273,9 +273,9 @@ def _warmup_batch(
             for call in calls
             if call.kind
             in {
-                PipelineStage.LATENT_PREPARATION,
-                PipelineStage.DENOISING,
-                PipelineStage.IMAGE_DECODING,
+                MediaCall.LATENT_PREPARATION,
+                MediaCall.DENOISING,
+                MediaCall.IMAGE_DECODING,
             }
         ),
         buffer_allocations=tuple(
@@ -441,8 +441,8 @@ def _build_warmup_batch(
             ForwardMode.VERIFY,
             TransferMode.KV_PUBLISH,
             TransferMode.KV_INSTALL,
-            PipelineStage.LATENT_PREPARATION,
-            PipelineStage.DENOISING,
+            MediaCall.LATENT_PREPARATION,
+            MediaCall.DENOISING,
         }:
             continue
 
@@ -557,8 +557,8 @@ def _build_warmup_batch(
         if (
             call.kind
             not in {
-                PipelineStage.LATENT_PREPARATION,
-                PipelineStage.DENOISING,
+                MediaCall.LATENT_PREPARATION,
+                MediaCall.DENOISING,
             }
             and call.latent_input is None
         ):
@@ -599,11 +599,11 @@ def _build_warmup_batch(
             start_step=start_step,
             step_count=(
                 int(call.bounds.max_tokens)
-                if call.kind is PipelineStage.DENOISING
+                if call.kind is MediaCall.DENOISING
                 else 0
             ),
         )
-        if call.kind is PipelineStage.DENOISING:
+        if call.kind is MediaCall.DENOISING:
             extra_tables, extra_allocations, flow_rows = _warmup_flow_tables(
                 requests,
                 call,
@@ -995,8 +995,8 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
     generation = requests.worker.runner.image_builder
     if (
         not {
-            PipelineStage.LATENT_PREPARATION,
-            PipelineStage.DENOISING,
+            MediaCall.LATENT_PREPARATION,
+            MediaCall.DENOISING,
         }.issubset(requests.worker.info.supported_ops)
         or generation is None
     ):
@@ -1124,7 +1124,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                     request_key=key,
                     call_id=call_id,
                     coordinates=CallCoordinates(),
-                    kind=PipelineStage.LATENT_PREPARATION,
+                    kind=MediaCall.LATENT_PREPARATION,
                     bounds=Bounds(
                         max_tokens=1,
                         max_latent_bytes=max_latent_elements * 2,
@@ -1177,7 +1177,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                         request_key=key,
                         call_id=call_id,
                         coordinates=CallCoordinates(flow_step=quantum),
-                        kind=PipelineStage.DENOISING,
+                        kind=MediaCall.DENOISING,
                         bounds=Bounds(
                             max_tokens=1,
                             max_latent_bytes=max_latent_elements * 2,

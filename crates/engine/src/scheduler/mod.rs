@@ -22,13 +22,13 @@ pub use config::{
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulerConfig, SchedulingPolicy,
 };
 use config::{MAX_NUM_SEQS, MAX_NUM_WAITING};
-pub(crate) use execution::consuming_stages;
+pub(crate) use execution::consuming_calls;
 pub use stats::{
     DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, KvCacheStats, PrefixStats,
     SchedulerStats, TimingStats, WorkerStats,
 };
 pub use stats_report::SchedulerStatsReporter;
-use uniserve_worker_ipc::{ForwardMode, PipelineStage, TransferMode};
+use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 
 mod admission;
 mod allocation;
@@ -373,16 +373,18 @@ struct MediaFlowState {
     allocations: MediaAllocations,
     conditioning: Option<TensorRef>,
     latents: Vec<TensorRef>,
-    video_segments: BTreeMap<u32, (u32, TensorRef)>,
+    /// Decoded media units by the cursor of the round that produced them,
+    /// until their encode round retires them.
+    decoded_units: BTreeMap<u32, (u32, TensorRef)>,
     /// Encoded media units by the cursor of the round that produced them,
     /// until the muxer is handed them.
-    encoded_segments: BTreeMap<u32, (u32, TensorRef)>,
+    encoded_units: BTreeMap<u32, (u32, TensorRef)>,
     /// Media unit count of each encode round that has completed and not yet
     /// been handed to the muxer, by the round's cursor.
     encoded_ready: BTreeMap<u32, u32>,
     /// Media units handed to the muxer so far; the next round it takes
     /// starts here.
-    handed_video_chunks: u32,
+    handed_units: u32,
     /// Encoded products carried by the muxing call in flight, retired with it.
     muxing_inputs: Vec<TensorRef>,
     audio: Option<TensorRef>,
@@ -396,9 +398,9 @@ struct MediaFlowState {
     latent_preparation_scheduled: bool,
     num_scheduled_steps: u32,
     num_completed_steps: u32,
-    num_scheduled_decode_chunks: u32,
-    num_scheduled_video_chunks: u32,
-    num_encoded_video_chunks: u32,
+    scheduled_decode_units: u32,
+    scheduled_encode_units: u32,
+    encoded_video_units: u32,
     audio_decoding_scheduled: bool,
     audio_encoding_scheduled: bool,
     audio_encoded: bool,
@@ -650,22 +652,22 @@ fn finish_token_ids(request: &GenerationRequest, eos: &[u32]) -> Vec<u32> {
 fn batch_kind(call_variant: CallKind) -> BatchKind {
     match call_variant {
         CallKind::Forward(ForwardMode::Prefill)
-        | CallKind::Pipeline(PipelineStage::TextEncoding)
-        | CallKind::Pipeline(PipelineStage::VisionEncoding)
-        | CallKind::Pipeline(PipelineStage::LatentEncoding) => BatchKind::Prefill,
+        | CallKind::Media(MediaCall::TextEncoding)
+        | CallKind::Media(MediaCall::VisionEncoding)
+        | CallKind::Media(MediaCall::LatentEncoding) => BatchKind::Prefill,
         CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
             BatchKind::Decode
         }
-        CallKind::Pipeline(PipelineStage::Denoising)
-        | CallKind::Pipeline(PipelineStage::VideoDecoding)
-        | CallKind::Pipeline(PipelineStage::LatentPreparation)
-        | CallKind::Pipeline(
-            PipelineStage::VideoEncoding
-            | PipelineStage::AudioEncoding
-            | PipelineStage::AudioDecoding
-            | PipelineStage::Muxing,
+        CallKind::Media(MediaCall::Denoising)
+        | CallKind::Media(MediaCall::VideoDecoding)
+        | CallKind::Media(MediaCall::LatentPreparation)
+        | CallKind::Media(
+            MediaCall::VideoEncoding
+            | MediaCall::AudioEncoding
+            | MediaCall::AudioDecoding
+            | MediaCall::Muxing,
         )
-        | CallKind::Pipeline(PipelineStage::ImageDecoding)
+        | CallKind::Media(MediaCall::ImageDecoding)
         | CallKind::Transfer(TransferMode::Tensor)
         | CallKind::Transfer(TransferMode::KvPublish)
         | CallKind::Transfer(TransferMode::KvInstall) => BatchKind::Media,
@@ -675,8 +677,8 @@ fn batch_kind(call_variant: CallKind) -> BatchKind {
 /// Returns the scheduling priority for a completion.
 fn completion_priority(call_variant: CallKind) -> u8 {
     match call_variant {
-        CallKind::Pipeline(PipelineStage::Denoising)
-        | CallKind::Pipeline(PipelineStage::ImageDecoding)
+        CallKind::Media(MediaCall::Denoising)
+        | CallKind::Media(MediaCall::ImageDecoding)
         | CallKind::Transfer(TransferMode::KvInstall) => 0,
         _ => 1,
     }
@@ -740,11 +742,9 @@ fn call_output_bound(code: CallKind, bounds: &uniserve_worker_ipc::Bounds) -> us
             .saturating_mul(2)
             .saturating_add(2),
         CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode) => 4,
-        CallKind::Pipeline(PipelineStage::Denoising) => {
-            (bounds.max_tokens as usize).saturating_add(2)
-        }
-        CallKind::Pipeline(PipelineStage::VideoDecoding) => 2,
-        CallKind::Pipeline(PipelineStage::ImageDecoding) => 3,
+        CallKind::Media(MediaCall::Denoising) => (bounds.max_tokens as usize).saturating_add(2),
+        CallKind::Media(MediaCall::VideoDecoding) => 2,
+        CallKind::Media(MediaCall::ImageDecoding) => 3,
         _ => 2,
     }
 }

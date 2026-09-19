@@ -4,7 +4,7 @@ Qwen3, SenseNova and BAGEL use the same tensor, sequence and pipeline parallel e
 
 ## Configure model parallelism
 
-`--workers` names a deployment configuration: the participating devices and the parallel configuration of each entry placed on them. This four-device example combines TP2 with Ulysses SP2.
+`--workers` names a deployment configuration: the participating devices and the parallel configuration of each component placed on them. This four-device example combines TP2 with Ulysses SP2.
 
 Save it as `workers.json`:
 
@@ -18,7 +18,7 @@ Save it as `workers.json`:
       {"node": "localhost", "device": "cuda:2"},
       {"node": "localhost", "device": "cuda:3"}
     ],
-    "entries": {
+    "components": {
       "model": {
         "ranks": [0, 1, 2, 3],
         "parallel_config": {
@@ -38,13 +38,13 @@ uniserve serve /workspace/models/Qwen3-32B \
   --workers workers.json
 ```
 
-The same `model` entry configuration applies to SenseNova and BAGEL with their checkpoint paths and model descriptions. The product of tensor, pipeline and sequence degrees must match the entry's rank count. Attention heads must admit the declared partition. Pipeline stages own nonempty layer ranges; layer counts need not divide evenly between stages.
+The same `model` component configuration applies to SenseNova and BAGEL with their checkpoint paths and model descriptions. The product of tensor, pipeline and sequence degrees must match the component's rank count. Attention heads must admit the declared partition. Pipeline stages own nonempty layer ranges; layer counts need not divide evenly between stages.
 
 For PP2 on two devices, use `pipeline_parallel_size: 2`, `tensor_parallel_size: 1`, and omit `sequence_parallel`. Each stage loads its assigned global checkpoint layers. Embedding and prediction modules follow their stage ownership, and KV storage records each stage's logical layer and head region. An incompatible layout is rejected before serving.
 
 Sequence parallelism partitions packed input rows and exchanges attention heads. It replicates a stage's decoder weights unless combined with tensor or pipeline parallelism. Short decode requests can incur more communication without enough computation to offset it; select topology using the intended workload.
 
-MiniMax H3 has multiple component entries for conditioning, denoising and media decoding. Its default placement and explicit component configuration are described in the [FastH3 guide](fast_h3/fast_h3.md).
+MiniMax H3 has multiple components for conditioning, denoising and media decoding. Its default placement and explicit component configuration are described in the [FastH3 guide](fast_h3/fast_h3.md).
 
 ## Shared execution capabilities
 
@@ -70,7 +70,7 @@ Startup prepares homogeneous text and diffusion calls on their configured execut
 
 ## Worker computation resources
 
-A worker's logical domains (`decode`, `prefill`, and `flow`) resolve to ModelEntry bindings during construction. Without `--lane`, numerical entries use full-device execution streams; independent entries can progress concurrently. An explicit lane configuration creates a CUDAStream with a Green Context and SM quota. Domains assigned to the same stream share compatible InputBuffers and graph storage; separate streams have independent mutable computation storage and NCCL communicators. The explicit-stream NCCL provider keeps communication kernels inside the assigned Green Context during eager execution and capture. ModelRunner owns numerical grouping and synchronization for each actual forward call while preserving result alignment and completion boundaries.
+A worker's logical domains (`decode`, `prefill`, and `flow`) resolve to ComponentBinding values during construction. Without `--lane`, components use full-device execution streams; independent components can progress concurrently. An explicit lane configuration creates a CUDAStream with a Green Context and SM quota. Domains assigned to the same stream share compatible InputBuffers and graph storage; separate streams have independent mutable computation storage and NCCL communicators. The explicit-stream NCCL provider keeps communication kernels inside the assigned Green Context during eager execution and capture. ModelRunner owns numerical grouping and synchronization for each actual forward call while preserving result alignment and completion boundaries.
 
 The following server options configure a shared 152-SM binding or independent 64/88-SM bindings on a device supporting those quotas:
 

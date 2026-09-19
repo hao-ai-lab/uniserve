@@ -1,7 +1,7 @@
 //! Engine-loop construction, event parking, and owner-thread execution.
 
 use super::*;
-use uniserve_worker_ipc::{ForwardMode, PipelineStage};
+use uniserve_worker_ipc::{ForwardMode, MediaCall};
 
 /// Intersects model requirements with capacities actually loaded by the worker.
 fn resolve_generation_limits(
@@ -15,15 +15,15 @@ fn resolve_generation_limits(
     {
         available.insert(uniserve_core::GenerationFeatures::UNDERSTANDING);
     }
-    if supports(CallKind::Pipeline(PipelineStage::VisionEncoding)) {
+    if supports(CallKind::Media(MediaCall::VisionEncoding)) {
         available.insert(uniserve_core::GenerationFeatures::VISION_ENCODE);
     }
-    if supports(CallKind::Pipeline(PipelineStage::LatentEncoding)) {
+    if supports(CallKind::Media(MediaCall::LatentEncoding)) {
         available.insert(uniserve_core::GenerationFeatures::LATENT_ENCODE);
     }
-    if supports(CallKind::Pipeline(PipelineStage::LatentPreparation))
-        && supports(CallKind::Pipeline(PipelineStage::Denoising))
-        && supports(CallKind::Pipeline(PipelineStage::ImageDecoding))
+    if supports(CallKind::Media(MediaCall::LatentPreparation))
+        && supports(CallKind::Media(MediaCall::Denoising))
+        && supports(CallKind::Media(MediaCall::ImageDecoding))
     {
         available.insert(uniserve_core::GenerationFeatures::IMAGE_GENERATION);
     }
@@ -91,13 +91,13 @@ impl Scheduler {
         // Capability families are mutually ordered from diffusion-only through
         // unified multimodal support to autoregressive-only execution.
         let work = &info.supported_ops;
-        let family = if work.contains(&CallKind::Pipeline(PipelineStage::LatentPreparation))
+        let family = if work.contains(&CallKind::Media(MediaCall::LatentPreparation))
             && !work.contains(&CallKind::Forward(ForwardMode::Decode))
         {
             RuntimeFamily::Diffusion
-        } else if work.contains(&CallKind::Pipeline(PipelineStage::Denoising))
-            || (work.contains(&CallKind::Pipeline(PipelineStage::VisionEncoding))
-                || work.contains(&CallKind::Pipeline(PipelineStage::LatentEncoding)))
+        } else if work.contains(&CallKind::Media(MediaCall::Denoising))
+            || (work.contains(&CallKind::Media(MediaCall::VisionEncoding))
+                || work.contains(&CallKind::Media(MediaCall::LatentEncoding)))
         {
             RuntimeFamily::Umm
         } else {
@@ -173,7 +173,7 @@ impl Scheduler {
             info.uses_kv()
                 && info
                     .supported_ops
-                    .contains(&CallKind::Pipeline(PipelineStage::Denoising)),
+                    .contains(&CallKind::Media(MediaCall::Denoising)),
         );
         let request_pool_capacity = info.request_slots as usize;
         let main_request_capacity = request_pool_capacity
@@ -330,7 +330,7 @@ impl Scheduler {
                 && self
                     .info
                     .supported_ops
-                    .contains(&CallKind::Pipeline(PipelineStage::Denoising)),
+                    .contains(&CallKind::Media(MediaCall::Denoising)),
         );
         let capacity = self
             .request_pool

@@ -96,7 +96,7 @@ def test_model_loading_failure_releases_the_reported_endpoint(tmp_path):
 
 
 def _stub_config(directory, *, rank=0, world_size=1, init_method=None):
-    """Launch one weightless rank of a tensor-parallel stub entry."""
+    """Launch one weightless rank of a tensor-parallel stub component."""
     directory.mkdir(parents=True, exist_ok=True)
     return worker_args(
         directory,
@@ -110,7 +110,7 @@ def _stub_config(directory, *, rank=0, world_size=1, init_method=None):
         local_rank=rank,
         world_size=world_size,
         kv_token_capacity=4096,
-        entries={
+        components={
             "model": {
                 "ranks": list(range(world_size)),
                 "parallel_config": {"tensor_parallel_size": world_size},

@@ -321,14 +321,14 @@ class DiffusionParams:
     """Effective diffusion bounds and seed resolved by model preprocessing."""
 
     num_frames: int
-    num_decode_chunks: int
+    video_units: int
     num_inference_steps: int
     # Deterministic noise seed; nonnegative.
     seed: int
 
     def __post_init__(self) -> None:
         """Require positive work bounds and a nonnegative deterministic seed."""
-        for name in ("num_frames", "num_decode_chunks", "num_inference_steps"):
+        for name in ("num_frames", "video_units", "num_inference_steps"):
             if getattr(self, name) < 1:
                 raise invalid_descriptor(f"diffusion {name} must be positive")
         _nonnegative(self.seed, "diffusion seed")
@@ -341,9 +341,7 @@ class DiffusionParams:
         data = _map(value, where)
         return cls(
             num_frames=_uint(data.get("num_frames"), f"{where}.num_frames"),
-            num_decode_chunks=_uint(
-                data.get("num_decode_chunks"), f"{where}.num_decode_chunks"
-            ),
+            video_units=_uint(data.get("video_units"), f"{where}.video_units"),
             num_inference_steps=_uint(
                 data.get("num_inference_steps"), f"{where}.num_inference_steps"
             ),
@@ -354,7 +352,7 @@ class DiffusionParams:
         """Serialize the shared diffusion parameter definition."""
         return {
             "num_frames": self.num_frames,
-            "num_decode_chunks": self.num_decode_chunks,
+            "video_units": self.video_units,
             "num_inference_steps": self.num_inference_steps,
             "seed": self.seed,
         }
@@ -931,12 +929,12 @@ class Batch:
                 "a submission batch carries multiple calls for one request"
             )
         # A batch is one numerical call on one component: every call in it
-        # performs the same computation through the same entry, so the rank
+        # performs the same computation through the same component, so the rank
         # executes it as a single homogeneous group and returns one result.
-        calls = {(call.kind, call.entry) for call in self.calls}
+        calls = {(call.kind, call.component) for call in self.calls}
         if len(calls) > 1:
             raise invalid_descriptor(
-                "a submission batch mixes call kinds or entries"
+                "a submission batch mixes call kinds or components"
             )
         admitted = [admission.request_key for admission in self.admissions]
         if len(set(admitted)) != len(admitted):

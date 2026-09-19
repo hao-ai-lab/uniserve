@@ -21,7 +21,7 @@ from uniserve.processing import (
     StrideResize,
 )
 from uniserve_worker.foundation.errors import invalid_descriptor
-from uniserve_worker.protocol.call import PipelineStage
+from uniserve_worker.protocol.call import MediaCall
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -40,7 +40,7 @@ class PreparedImage:
 
 def prepare_image(
     processor: ImageProcessor,
-    kind: PipelineStage,
+    kind: MediaCall,
     encoded: str,
     *,
     device: torch.device,
@@ -51,9 +51,7 @@ def prepare_image(
     """
     image = _decode_rgb(encoded)
     transform = (
-        processor.vit
-        if kind is PipelineStage.VISION_ENCODING
-        else processor.vae
+        processor.vit if kind is MediaCall.VISION_ENCODING else processor.vae
     )
     if transform is None:
         raise invalid_descriptor(
@@ -101,7 +99,7 @@ def prepare_image(
 
 def prepare_tensor_image(
     processor: ImageProcessor,
-    kind: PipelineStage,
+    kind: MediaCall,
     image: torch.Tensor,
     *,
     device: torch.device,
@@ -126,9 +124,7 @@ def prepare_tensor_image(
     source_height, source_width = int(value.shape[1]), int(value.shape[2])
 
     transform = (
-        processor.vit
-        if kind is PipelineStage.VISION_ENCODING
-        else processor.vae
+        processor.vit if kind is MediaCall.VISION_ENCODING else processor.vae
     )
     if transform is None:
         raise invalid_descriptor(

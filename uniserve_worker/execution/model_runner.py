@@ -57,7 +57,7 @@ from uniserve_worker.protocol.call import (
     Call,
     ForwardMode,
     ImageParams,
-    PipelineStage,
+    MediaCall,
 )
 from uniserve_worker.protocol.identity import CallId
 from uniserve_worker.protocol.output import ForwardStats
@@ -73,6 +73,7 @@ from ..bootstrap.config import ComponentConfig
 from ..bootstrap.inputs import capability, image_builder, media_builder
 from ..profiling import record_component
 from .batch import ExecutionOutput, InputBatch
+from .component_binding import ComponentBinding, capture_required
 from .denoising_runner import DenoisingRunner
 from .graph_inputs import (
     BatchGraph,
@@ -88,7 +89,6 @@ from .graph_inputs import (
     widen_prefix,
 )
 from .input_buffers import InputBuffers
-from .model_entry import ModelEntry, capture_required
 from .resources import media_state_buffers, output_layouts
 from .rows import ForwardRow
 from .sampling import TokenSelection
@@ -198,7 +198,9 @@ class ModelRunner:
                         axis for axis, _ in config.parallel_config.dimensions
                     ),
                 )
-                bindings[name] = ModelEntry(name, config, group, mesh, device)
+                bindings[name] = ComponentBinding(
+                    name, config, group, mesh, device
+                )
         self.bindings = MappingProxyType(dict(bindings))
         bind_components(model, self.bindings)
         self.state_buffers = media_state_buffers(
@@ -206,8 +208,8 @@ class ModelRunner:
         )
 
         self.entries = {}
-        self._forward_entries = {}
-        self._module_entries = {}
+        self._forward_calls = {}
+        self._module_calls = {}
         self._module_contexts = OrderedDict()
         self._module_pools = {}
         self._module_graphs = {}
@@ -238,14 +240,14 @@ class ModelRunner:
                 for call in binding.calls:
                     if (
                         isinstance(call.module, CausalLM)
-                        and call.entry.method == "forward"
+                        and call.entry_point.method == "forward"
                     ):
                         self._text_calls[id(call.module)] = TextCall(
                             call.module
                         )
                     elif (
                         isinstance(call.module, TextEncoder)
-                        and call.entry.method == "encode"
+                        and call.entry_point.method == "encode"
                     ):
                         device = binding.device
                         self._text_tokens = torch.empty(
@@ -262,8 +264,8 @@ class ModelRunner:
 
                     if not call_kinds((call,)):
                         continue
-                    key = (name, call.path, call.entry.method)
-                    self._module_entries[key] = (binding, call)
+                    key = (name, call.path, call.entry_point.method)
+                    self._module_calls[key] = (binding, call)
 
                     if self.media_builder is not None and isinstance(
                         call.module, Denoiser
@@ -329,7 +331,7 @@ class ModelRunner:
         """
         calls = [
             call
-            for _, call in self._module_entries.values()
+            for _, call in self._module_calls.values()
             if kind in call_kinds((call,))
             and (
                 capability_type is None
@@ -345,19 +347,19 @@ class ModelRunner:
     def _module_call(self, name, method=None):
         """Return the uniquely identified ``(binding.
 
-        call)`` pair for an entry.
+        call)`` pair for a component.
         """
         entries = [
             (binding, call)
             for (entry, _, entry_method), (
                 binding,
                 call,
-            ) in self._module_entries.items()
+            ) in self._module_calls.items()
             if entry == name and (method is None or entry_method == method)
         ]
         if len(entries) != 1:
             raise InputError(
-                f"entry {name!r} requires an unambiguous numerical method"
+                f"component {name!r} requires an unambiguous numerical method"
             )
         return entries[0]
 
@@ -369,7 +371,7 @@ class ModelRunner:
         borrow it are retired.
         """
         binding, call = self._module_call(name, method)
-        key = (name, call.path, call.entry.method, input_signature(size))
+        key = (name, call.path, call.entry_point.method, input_signature(size))
         if key not in self._module_contexts:
             resident = tuple(
                 value for value in self._module_contexts if value[:3] == key[:3]
@@ -377,7 +379,7 @@ class ModelRunner:
             if len(resident) >= self.worker_config.max_request_pool_size:
                 self._retire_module(resident[0])
 
-            stream = self.module_stream(name, method=call.entry.method)
+            stream = self.module_stream(name, method=call.entry_point.method)
             context = ExecutionContext(
                 call.module, attention=self.attention, stream=stream
             )
@@ -411,7 +413,7 @@ class ModelRunner:
             return None
 
         self._initialize_streams(event_slots=2)
-        key = (name, call.path, call.entry.method)
+        key = (name, call.path, call.entry_point.method)
         if key not in self._module_streams:
             # A standalone entry forks the lane stream that covers its call
             # kinds, or creates a full-device stream when lanes are off.
@@ -457,22 +459,22 @@ class ModelRunner:
 
         staged batches bind their own lanes.
         """
-        if (call.entry, call.kind) in self._forward_entries:
+        if (call.component, call.kind) in self._forward_calls:
             return None
         if (
-            call.kind is PipelineStage.LATENT_PREPARATION
-            and (call.entry, PipelineStage.DENOISING) in self._forward_entries
+            call.kind is MediaCall.LATENT_PREPARATION
+            and (call.component, MediaCall.DENOISING) in self._forward_calls
         ):
             return None
         calls = tuple(
             call
-            for (name, _, _), (_, call) in self._module_entries.items()
-            if name == call.entry and call.kind in call_kinds((call,))
+            for (name, _, _), (_, call) in self._module_calls.items()
+            if name == call.entry_point and call.kind in call_kinds((call,))
         )
         if not calls:
             return None
 
-        if call.kind is PipelineStage.LATENT_PREPARATION:
+        if call.kind is MediaCall.LATENT_PREPARATION:
             # Preparation composes the denoiser's initialization with optional
             # conditioning encoders. The denoiser owns this call's stream;
             # its encoder calls retain their ordinary input/output dependencies.
@@ -482,7 +484,9 @@ class ModelRunner:
 
         if len(calls) != 1:
             raise InputError("call requires one bound numerical capability")
-        return self.module_stream(call.entry, method=calls[0].entry.method)
+        return self.module_stream(
+            call.component, method=calls[0].entry_point.method
+        )
 
     def _initialize_streams(self, *, event_slots):
         """Realize execution grants for both staged and standalone.
@@ -551,8 +555,8 @@ class ModelRunner:
     def encoder_kinds(self):
         return frozenset(
             self._encoder_kind(call.module)
-            for _, call in self._module_entries.values()
-            if call.entry.method == "encode"
+            for _, call in self._module_calls.values()
+            if call.entry_point.method == "encode"
         )
 
     @staticmethod
@@ -572,8 +576,8 @@ class ModelRunner:
         """
         found = [
             (name, call)
-            for (name, _, _), (_, call) in self._module_entries.items()
-            if call.entry.method == "encode"
+            for (name, _, _), (_, call) in self._module_calls.items()
+            if call.entry_point.method == "encode"
             and self._encoder_kind(call.module) == kind
         ]
         if len(found) != 1:
@@ -610,7 +614,9 @@ class ModelRunner:
             f"uniserve.model.module rank={self.worker_config.rank} work={name}"
         ):
             binding, call = self._module_call(name, method)
-            context = self.prepare_module(name, size, method=call.entry.method)
+            context = self.prepare_module(
+                name, size, method=call.entry_point.method
+            )
             started, path = time.perf_counter_ns(), "eager"
 
             stream = context.stream
@@ -803,7 +809,7 @@ class ModelRunner:
     ):
         """Bind staged input resources and graph budgets for every capability.
 
-        Creates one ModelEntry per (entry, path, lane) covering a staged
+        Creates one ComponentBinding per (entry, path, lane) covering a staged
         computation kind, with its input buffers, execution context, decode /
         prefill capture shapes, and private CUDA graph memory pools. Callable
         exactly once.
@@ -867,17 +873,17 @@ class ModelRunner:
             ForwardMode.PREFILL,
             ForwardMode.DECODE,
             ForwardMode.VERIFY,
-            PipelineStage.VISION_ENCODING,
-            PipelineStage.LATENT_ENCODING,
-            PipelineStage.IMAGE_DECODING,
+            MediaCall.VISION_ENCODING,
+            MediaCall.LATENT_ENCODING,
+            MediaCall.IMAGE_DECODING,
         }
         if self.image_builder is not None:
-            staged.add(PipelineStage.DENOISING)
+            staged.add(MediaCall.DENOISING)
 
         for (name, path, method), (
             placement,
             call,
-        ) in self._module_entries.items():
+        ) in self._module_calls.items():
             staged_kinds = call_kinds((call,)) & staged
             if not staged_kinds:
                 continue
@@ -885,7 +891,7 @@ class ModelRunner:
             target = (
                 canonical_device(config.generation_device or config.device)
                 if staged_kinds
-                & {PipelineStage.LATENT_ENCODING, PipelineStage.IMAGE_DECODING}
+                & {MediaCall.LATENT_ENCODING, MediaCall.IMAGE_DECODING}
                 else placement.device
             )
             streams = [
@@ -944,7 +950,7 @@ class ModelRunner:
                     if prefill
                     else input_config
                 )
-                entry = ModelEntry(
+                entry = ComponentBinding(
                     name,
                     placement.config,
                     placement.process_group,
@@ -1034,11 +1040,11 @@ class ModelRunner:
 
                 for kind in kinds:
                     key = (name, kind)
-                    if key in self._forward_entries:
+                    if key in self._forward_calls:
                         raise ValueError(
                             f"computation {key} has multiple lane bindings"
                         )
-                    self._forward_entries[key] = entry
+                    self._forward_calls[key] = entry
 
     def batch_forward(self, entry, batch, *, padded=False):
         """Dispatch one staged batch to the numerical call of its capability.
@@ -1297,23 +1303,23 @@ class ModelRunner:
         configured. The staged device is the bound execution entry's device,
         or the compute device when the call has no staged binding.
         """
-        binding = self.bindings.get(call.entry)
+        binding = self.bindings.get(call.component)
         source = (
             canonical_device(self.worker_config.device)
             if binding is None
             else binding.device
         )
         if self.image_builder is not None and call.kind in {
-            PipelineStage.LATENT_PREPARATION,
-            PipelineStage.DENOISING,
-            PipelineStage.IMAGE_DECODING,
+            MediaCall.LATENT_PREPARATION,
+            MediaCall.DENOISING,
+            MediaCall.IMAGE_DECODING,
         }:
             source = canonical_device(
                 self.worker_config.generation_device
                 or self.worker_config.device
             )
 
-        entry = self._forward_entries.get((call.entry, call.kind))
+        entry = self._forward_calls.get((call.component, call.kind))
         return source, source if entry is None else entry.device, source
 
     def warmup(self, storage):
@@ -1362,8 +1368,7 @@ class ModelRunner:
                 ):
                     prepare_decode(self, entry, entry.input_buffers, forward)
                 elif (
-                    phase == "flow"
-                    and PipelineStage.DENOISING in entry.call_kinds
+                    phase == "flow" and MediaCall.DENOISING in entry.call_kinds
                 ):
                     from .flow import prepare_flow
 
@@ -1585,15 +1590,15 @@ class ModelRunner:
         # Rows sharing an entry, forward mode, device, and media shape form
         # one homogeneous numerical call.
         grouped: dict[tuple[object, ...], list[int]] = defaultdict(list)
-        bindings: dict[int, ModelEntry] = {}
+        bindings: dict[int, ComponentBinding] = {}
         for index, (task, call) in enumerate(tasks):
-            entry = self._forward_entries.get((call.entry, task.forward_mode))
+            entry = self._forward_calls.get((call.component, task.forward_mode))
             if entry is None:
                 yield (
                     (index,),
                     invalid_descriptor(
                         f"execution has no {call.kind.value!r} binding "
-                        f"for {call.entry!r}"
+                        f"for {call.component!r}"
                     ),
                 )
                 continue
@@ -1679,7 +1684,7 @@ class ModelRunner:
         started = time.perf_counter_ns()
         graph_eligible = all(
             isinstance(task.forward_mode, ForwardMode)
-            or task.forward_mode is PipelineStage.DENOISING
+            or task.forward_mode is MediaCall.DENOISING
             for task in tasks
         )
         modes = frozenset(task.forward_mode for task in tasks)
@@ -1698,11 +1703,11 @@ class ModelRunner:
             )
             for call in calls
         )
-        entry = self._forward_entries.get((calls[0].entry, forward_mode))
+        entry = self._forward_calls.get((calls[0].component, forward_mode))
         if entry is None:
             raise InputError(
                 f"model runner has no {calls[0].kind.value!r} binding "
-                f"for {calls[0].entry!r}",
+                f"for {calls[0].component!r}",
                 phase="input_staging",
                 route=forward_mode.value,
                 calls=call_keys,
@@ -1717,7 +1722,7 @@ class ModelRunner:
         # timeline, so the range opens before input staging.
         with profile_range(
             f"uniserve.model.forward rank={self.worker_config.rank} "
-            f"work={calls[0].entry}.{forward_mode.value}"
+            f"work={calls[0].component}.{forward_mode.value}"
         ):
             try:
                 if lane_runtime is not None:
@@ -1854,7 +1859,7 @@ def _validate_outputs(
 
 def _input_failure(
     error: BaseException,
-    forward_mode: ForwardMode | PipelineStage,
+    forward_mode: ForwardMode | MediaCall,
     calls: tuple[tuple[int, int, int, CallId], ...],
 ) -> InputError:
     """Classify invalid model inputs with their phase and call.
@@ -1873,7 +1878,7 @@ def _input_failure(
 
 def _execution_failure(
     error: BaseException,
-    forward_mode: ForwardMode | PipelineStage,
+    forward_mode: ForwardMode | MediaCall,
     calls: tuple[tuple[int, int, int, CallId], ...],
 ) -> WorkerError:
     """Classify a model failure and attach the active phase and call.

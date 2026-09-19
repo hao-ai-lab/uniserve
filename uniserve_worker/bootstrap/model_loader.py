@@ -29,7 +29,7 @@ from uniserve.quantization import QuantizationConfig, Quantizer
 from uniserve_models import loading as models
 
 from ..config import WorkerConfig
-from ..execution.model_entry import ModelEntry
+from ..execution.component_binding import ComponentBinding
 from ..foundation.errors import unsupported_setup
 from ..runtime.results import resolve_outputs
 from .components import (
@@ -237,7 +237,7 @@ def attention_parallel(component: ComponentConfig) -> AttentionParallelConfig:
 
 def load_worker_model(
     config: WorkerProcessArgs,
-    bindings: Mapping[str, ModelEntry],
+    bindings: Mapping[str, ComponentBinding],
     *,
     source: models.Config | None,
 ) -> WorkerModel:

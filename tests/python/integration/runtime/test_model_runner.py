@@ -51,7 +51,7 @@ from uniserve_worker.protocol.call import (
     ErrorCode,
     ForwardMode,
     ImageParams,
-    PipelineStage,
+    MediaCall,
     SamplingState,
     TransferMode,
 )
@@ -1337,7 +1337,7 @@ def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thre
         predecessor=root_parent(admission),
         image_base64=encoded,
         encoder_handle=11,
-        entry="vision_encoder",
+        component="vision_encoder",
     )
     try:
         produced = producer.submit(
@@ -1409,7 +1409,7 @@ def test_free_preserves_another_requests_feature_with_the_same_generation() -> (
             predecessor=root_parent(admission),
             image_base64=encoded,
             encoder_handle=11,
-            entry="vision_encoder",
+            component="vision_encoder",
         )
         for index, admission in enumerate(admissions)
     )
@@ -1554,7 +1554,7 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
             predecessor=root_parent(admission),
             image_base64=base64.b64encode(image.getvalue()).decode("ascii"),
             encoder_handle=call_id.batch_id,
-            entry="vision_encoder",
+            component="vision_encoder",
         )
 
     original = encoded_call(CallId(1, 0), (64, 96, 128))
@@ -2064,7 +2064,7 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
         predecessor=observation.call_id,
         image_base64=image_base64,
         encoder_handle=handle,
-        entry="vision_encoder",
+        component="vision_encoder",
     )
     report = finalized_report(
         worker,
@@ -2176,7 +2176,7 @@ def test_resident_image_materialization_preserves_the_decoded_artifact(
             request_key=admission.request_key,
             call_id=CallId(6, 0),
             coordinates=CallCoordinates(),
-            kind=PipelineStage.IMAGE_DECODING,
+            kind=MediaCall.IMAGE_DECODING,
             bounds=Bounds(max_completion_bytes=65_536),
             image_input=image,
         )
@@ -2305,7 +2305,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         predecessor=observation.call_id,
         image_base64=None,
         encoder_handle=10,
-        entry="vision_encoder",
+        component="vision_encoder",
         source_product=diffusion_finalize.image_output,
     )
     encode_report = finalized_report(

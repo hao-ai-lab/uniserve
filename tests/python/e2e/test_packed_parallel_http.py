@@ -57,7 +57,7 @@ def test_ordered_bindings_generate_outputs(
             {"node": "localhost", "device": f"cuda:{device}"}
             for device in (3, 1)
         ],
-        "entries": {"model": {"ranks": [1, 0], "parallel_config": parallel}},
+        "components": {"model": {"ranks": [1, 0], "parallel_config": parallel}},
         "queue_depth": 2,
     }
     command = [

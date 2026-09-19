@@ -100,7 +100,7 @@ impl WorkerSubmission {
 #[derive(Clone)]
 struct BufferRoute {
     worker_index: usize,
-    entry: String,
+    component: String,
 }
 
 /// Dispatch targeted calls and track their independently completed results.
@@ -617,14 +617,16 @@ impl WorkerExecutor {
     }
 
     /// Keep resident references direct when producer and consumer execute in
-    /// the same address spaces. Different multi-rank entries require published
-    /// layouts, including when both entries belong to this WorkerGroup.
+    /// the same address spaces. Different multi-rank components require published
+    /// layouts, including when both components belong to this WorkerGroup.
     fn shares_product_storage(&self, producer: &BufferRoute, consumer_entry: &str) -> bool {
         let entries = &self.workers[producer.worker_index].1.info().components;
-        let source = entries.iter().find(|entry| entry.name == producer.entry);
+        let source = entries
+            .iter()
+            .find(|entry| entry.name == producer.component);
         let destination = entries.iter().find(|entry| entry.name == consumer_entry);
-        if producer.entry == consumer_entry {
-            // A consumer call on the entry that produced the product is aligned
+        if producer.component == consumer_entry {
+            // A consumer call on the component that produced the product is aligned
             // with the round that produced it: the same media units in the same
             // order on the same ranks, so each rank consumes the shard it wrote
             // and no rank needs another's.
@@ -1128,19 +1130,20 @@ impl Executor for WorkerExecutor {
                 );
                 let entries = &self.workers[call_worker].1.info().components;
                 anyhow::ensure!(
-                    entries.is_empty() || entries.iter().any(|binding| binding.name == call.entry),
-                    "call targets unloaded entry {}",
-                    call.entry
+                    entries.is_empty()
+                        || entries.iter().any(|binding| binding.name == call.component),
+                    "call targets unloaded component {}",
+                    call.component
                 );
                 for output in call.output_buffers() {
                     let route = BufferRoute {
                         worker_index: call_worker,
-                        entry: call.entry.clone(),
+                        component: call.component.clone(),
                     };
                     if let Some(existing) = self.buffer_routes.get(&output) {
                         anyhow::ensure!(
                             existing.worker_index == route.worker_index
-                                && existing.entry == route.entry,
+                                && existing.component == route.component,
                             "product identity was routed to conflicting workers"
                         );
                     } else {
@@ -1231,7 +1234,7 @@ impl Executor for WorkerExecutor {
                         continue;
                     };
                     if producer.worker_index == consumer_worker
-                        && self.shares_product_storage(producer, &call.entry)
+                        && self.shares_product_storage(producer, &call.component)
                     {
                         continue;
                     }

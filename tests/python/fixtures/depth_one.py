@@ -42,7 +42,7 @@ from uniserve_worker.protocol.call import (
     DrawLayout,
     ForwardMode,
     ImageParams,
-    PipelineStage,
+    MediaCall,
     Rng,
     TransferMode,
 )
@@ -183,7 +183,7 @@ def _latent_params(call: Call) -> LatentParams:
         start_step=start_step,
         step_count=(
             int(call.bounds.max_tokens)
-            if call.kind is PipelineStage.DENOISING
+            if call.kind is MediaCall.DENOISING
             else 0
         ),
     )
@@ -497,7 +497,7 @@ def execution_batch(
             seq_lens.append(lengths[2] + lengths[1])
             query_lens.append(lengths[1])
             write_kv.append(True)
-        if call.kind is PipelineStage.DENOISING:
+        if call.kind is MediaCall.DENOISING:
             image = _IMAGE_PARAMS[call.request_key]
             main_slot = _REQUEST_POOL_INDICES[call.request_key]
             main_len = 0 if lengths is None else lengths[2]
@@ -582,8 +582,7 @@ def execution_batch(
         latent_params=tuple(
             _latent_params(call)
             for call in calls
-            if call.kind
-            in {PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING}
+            if call.kind in {MediaCall.LATENT_PREPARATION, MediaCall.DENOISING}
             or call.latent_input is not None
         ),
         buffer_allocations=tuple(
@@ -756,9 +755,9 @@ def encode_call(
     predecessor: CallId,
     image_base64: str | None,
     encoder_handle: int,
-    mode: PipelineStage = PipelineStage.VISION_ENCODING,
+    mode: MediaCall = MediaCall.VISION_ENCODING,
     source_product: TensorRef | None = None,
-    entry: str = "model",
+    component: str = "model",
 ) -> Call:
     """An encoder computation with an encoded image or a resident image source.
 
@@ -781,10 +780,10 @@ def encode_call(
         call_id=call_id,
         coordinates=CallCoordinates(),
         kind=mode,
-        # Which entry serves a stage is the model's, not the stage's: a model
+        # Which component serves a call is the model's, not the call's: a model
         # that encodes images from its own component names that component,
         # while one that encodes from its language backbone names "model".
-        entry=entry,
+        component=component,
         bounds=Bounds(max_tokens=64, max_latent_bytes=8_192),
         input_image=image_base64,
         image_input=source_product,
@@ -827,7 +826,7 @@ def diffusion_prepare_call(
         request_key=rk,
         call_id=call_id,
         coordinates=CallCoordinates(),
-        kind=PipelineStage.LATENT_PREPARATION,
+        kind=MediaCall.LATENT_PREPARATION,
         bounds=Bounds(max_tokens=1, max_latent_bytes=latent.max_bytes),
         kv_input=conditioning,
         latent_output=latent,
@@ -865,7 +864,7 @@ def diffusion_step_call(
         request_key=rk,
         call_id=call_id,
         coordinates=CallCoordinates(),
-        kind=PipelineStage.DENOISING,
+        kind=MediaCall.DENOISING,
         bounds=Bounds(max_tokens=int(steps), max_latent_bytes=output.max_bytes),
         kv_input=conditioning,
         latent_input=latent,
@@ -922,7 +921,7 @@ def diffusion_finalize_call(
         request_key=rk,
         call_id=call_id,
         coordinates=CallCoordinates(),
-        kind=PipelineStage.IMAGE_DECODING,
+        kind=MediaCall.IMAGE_DECODING,
         bounds=Bounds(
             max_latent_bytes=(3 * 16 * 16 * 2 if feedback_source else 0),
             max_completion_bytes=65_536,

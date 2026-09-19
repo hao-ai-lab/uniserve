@@ -52,7 +52,7 @@ fn ar_decode_call() -> Call {
         sampling_state: None,
         request_key: request_key(),
         call_id: CallId::new(11, 0),
-        entry: "model".into(),
+        component: "model".into(),
         code: kind,
         bounds: Bounds {
             max_tokens: 1,
@@ -108,7 +108,7 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         sampling_state: None,
         request_key: request_key(),
         call_id,
-        entry: "model".into(),
+        component: "model".into(),
         code: kind,
         bounds: Bounds::default(),
         inputs: Vec::new(),
@@ -181,7 +181,7 @@ fn media_admission(prompt_token_ids: Vec<u32>) -> NewRequest {
         prompt_token_ids,
         DiffusionSamplingParams {
             num_frames: 22,
-            num_decode_chunks: 3,
+            video_units: 3,
             num_inference_steps: 4,
             seed: 17,
         },
@@ -197,10 +197,7 @@ fn execute_round_trip(batch: Batch) -> Batch {
 
 #[test]
 fn forward_columns_preserve_cfg_rows_and_reject_misalignment() {
-    let call = call_for(
-        CallKind::Pipeline(PipelineStage::Denoising),
-        CallId::new(11, 0),
-    );
+    let call = call_for(CallKind::Media(MediaCall::Denoising), CallId::new(11, 0));
     let mut run = batch_with_calls(3, vec![], vec![call]);
     // One alternative-prefix write followed by two denoising rows. Prefix
     // plus query lengths form total attention lengths even for read-only rows.
@@ -229,11 +226,11 @@ fn forward_columns_preserve_cfg_rows_and_reject_misalignment() {
 fn computation_coordinates_survive_physical_dispatch_and_reject_collisions() {
     let batch_id = u64::MAX - 7;
     let first = call_for(
-        CallKind::Pipeline(PipelineStage::TextEncoding),
+        CallKind::Media(MediaCall::TextEncoding),
         CallId::new(batch_id, u32::MAX - 1),
     );
     let mut second = call_for(
-        CallKind::Pipeline(PipelineStage::TextEncoding),
+        CallKind::Media(MediaCall::TextEncoding),
         CallId::new(batch_id, u32::MAX),
     );
     second.request_key = key_for_request(101);
@@ -295,8 +292,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
         }
         if matches!(
             call.code,
-            CallKind::Pipeline(PipelineStage::LatentPreparation)
-                | CallKind::Pipeline(PipelineStage::Denoising)
+            CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
         ) || call.latent_input.is_some()
         {
             run.latent_params.push(LatentParams {
@@ -307,16 +303,16 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
                 height: 1,
                 width: 1,
                 start_step: 0,
-                step_count: u32::from(call.code == CallKind::Pipeline(PipelineStage::Denoising)),
+                step_count: u32::from(call.code == CallKind::Media(MediaCall::Denoising)),
             });
         }
         if matches!(
             call.code,
-            CallKind::Pipeline(
-                PipelineStage::VideoDecoding
-                    | PipelineStage::VideoEncoding
-                    | PipelineStage::AudioDecoding
-                    | PipelineStage::AudioEncoding
+            CallKind::Media(
+                MediaCall::VideoDecoding
+                    | MediaCall::VideoEncoding
+                    | MediaCall::AudioDecoding
+                    | MediaCall::AudioEncoding
             )
         ) {
             run.decode_ranges.push(DecodeRange {
@@ -371,7 +367,7 @@ fn decoder_requires_one_concrete_computation() {
         fbs::CallKindT::default(),
         fbs::CallKindT {
             forward_mode: fbs::ForwardMode::Decode,
-            stage: fbs::PipelineStage::Denoising,
+            media: fbs::MediaCall::Denoising,
             transfer: fbs::TransferMode::None,
         },
         fbs::CallKindT {
@@ -379,7 +375,7 @@ fn decoder_requires_one_concrete_computation() {
             ..Default::default()
         },
         fbs::CallKindT {
-            stage: fbs::PipelineStage(255),
+            media: fbs::MediaCall(255),
             ..Default::default()
         },
     ];
@@ -408,13 +404,13 @@ fn a_batch_carries_one_computation_through_one_entry() {
     let prefill = call_for(CallKind::Forward(ForwardMode::Prefill), CallId::new(1, 1));
     let mixed = batch_with_calls(1, Vec::new(), vec![decode.clone(), prefill]);
     let error = mixed.validate().unwrap_err().to_string();
-    assert!(error.contains("mixes call kinds or entries"), "{error}");
+    assert!(error.contains("mixes call kinds or components"), "{error}");
 
     let mut other_entry = call_for(CallKind::Forward(ForwardMode::Decode), CallId::new(1, 1));
-    other_entry.entry = "encoder".into();
+    other_entry.component = "encoder".into();
     let split = batch_with_calls(1, Vec::new(), vec![decode, other_entry]);
     let error = split.validate().unwrap_err().to_string();
-    assert!(error.contains("mixes call kinds or entries"), "{error}");
+    assert!(error.contains("mixes call kinds or components"), "{error}");
 }
 
 #[test]
@@ -456,10 +452,7 @@ fn decoder_requires_every_call_to_state_its_coordinates() {
 
 #[test]
 fn solver_parameters_round_trip_with_request_or_paged_storage() {
-    let call = call_for(
-        CallKind::Pipeline(PipelineStage::Denoising),
-        CallId::new(101, 0),
-    );
+    let call = call_for(CallKind::Media(MediaCall::Denoising), CallId::new(101, 0));
     let mut run = batch_with_calls(1, Vec::new(), vec![call]);
     assert_eq!(execute_round_trip(run.clone()), run);
     run.latent_params[0].page_table.clear();
@@ -480,8 +473,8 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
         dims: vec![DimBound::Static(8), DimBound::Static(32)],
     };
     for (index, (entry, stage)) in [
-        ("video_decoder", PipelineStage::VideoDecoding),
-        ("audio_decoder", PipelineStage::AudioDecoding),
+        ("video_decoder", MediaCall::VideoDecoding),
+        ("audio_decoder", MediaCall::AudioDecoding),
     ]
     .iter()
     .enumerate()
@@ -509,8 +502,8 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             sampling_state: None,
             request_key: request_key(),
             call_id: CallId::new(56 + index as u64, 0),
-            entry: (*entry).into(),
-            code: CallKind::Pipeline(*stage),
+            component: (*entry).into(),
+            code: CallKind::Media(*stage),
             bounds: Bounds::default(),
             inputs: vec![latent.clone()],
             outputs: Vec::new(),
@@ -940,7 +933,7 @@ fn maximum_media_prompt_round_trips() {
         5,
         vec![admission.clone()],
         vec![call_for(
-            CallKind::Pipeline(PipelineStage::LatentPreparation),
+            CallKind::Media(MediaCall::LatentPreparation),
             CallId::new(12, 0),
         )],
     ));
@@ -1038,7 +1031,7 @@ fn call_sampling_state_preserves_whitelist_presence() {
 #[test]
 fn image_encoder_input_round_trips_and_rejects_an_incompatible_computation() {
     let mut call = ar_decode_call();
-    call.code = CallKind::Pipeline(PipelineStage::VisionEncoding);
+    call.code = CallKind::Media(MediaCall::VisionEncoding);
     call.input_image = Some("iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAGUlEQVR4nGN0SGhgIAUwkaR6VMOohiGlAQCjvQFA6eri4wAAAABJRU5ErkJggg==".into());
     call.token_output = None;
     let batch = batch_with_calls(1, vec![admission()], vec![call.clone()]);
@@ -1054,7 +1047,7 @@ fn image_encoder_input_round_trips_and_rejects_an_incompatible_computation() {
             call.input_image.clone(),
         ),
         (
-            CallKind::Pipeline(PipelineStage::VisionEncoding),
+            CallKind::Media(MediaCall::VisionEncoding),
             Some(String::new().into()),
         ),
     ] {
@@ -1133,7 +1126,7 @@ fn worker_info_round_trips() {
                 layer_offset: 11,
                 ..WorkerInfo::default().kv_cache.unwrap()
             }),
-            components: vec![EntryInfo {
+            components: vec![ComponentInfo {
                 name: "denoiser".into(),
                 config: ComponentConfig::parallel((0..count).rev().collect(), config),
                 outputs: vec![OutputInfo {
@@ -1166,12 +1159,9 @@ fn worker_info_round_trips() {
 #[test]
 fn kv_free_worker_info_round_trips() {
     let info = WorkerInfo {
-        pipeline_components: video_components(),
+        media_components: video_components(),
         num_inference_steps: 4,
-        supported_ops: PipelineStage::VIDEO
-            .into_iter()
-            .map(CallKind::Pipeline)
-            .collect(),
+        supported_ops: MediaCall::VIDEO.into_iter().map(CallKind::Media).collect(),
         kv_cache: None,
         latent_page_units: 64,
         latent_pages: 3,
@@ -1340,7 +1330,7 @@ fn comprehensive_batches() -> Vec<Batch> {
             sampling_state: None,
             request_key: key,
             call_id,
-            entry: "model".into(),
+            component: "model".into(),
             code: kind,
             bounds: Bounds {
                 max_tokens: 7 + index as u32,
@@ -1412,7 +1402,7 @@ fn full_caps() -> WorkerInfo {
     WorkerInfo {
         encoder_cache_entries: 64,
         encoder_entry_bytes: 128 << 20,
-        pipeline_components: video_components(),
+        media_components: video_components(),
         num_inference_steps: 4,
         supported_ops: CallKind::ALL.to_vec(),
         kv_cache: Some(KvCacheInfo {
@@ -1448,19 +1438,19 @@ fn full_caps() -> WorkerInfo {
     }
 }
 
-fn video_components() -> std::collections::BTreeMap<PipelineStage, String> {
+fn video_components() -> std::collections::BTreeMap<MediaCall, String> {
     [
-        (PipelineStage::TextEncoding, "text_encoder"),
-        (PipelineStage::LatentPreparation, "denoiser"),
-        (PipelineStage::Denoising, "denoiser"),
-        (PipelineStage::VideoDecoding, "video_decoder"),
-        (PipelineStage::AudioDecoding, "audio_decoder"),
-        (PipelineStage::VideoEncoding, "output"),
-        (PipelineStage::AudioEncoding, "output"),
-        (PipelineStage::Muxing, "output"),
+        (MediaCall::TextEncoding, "text_encoder"),
+        (MediaCall::LatentPreparation, "denoiser"),
+        (MediaCall::Denoising, "denoiser"),
+        (MediaCall::VideoDecoding, "video_decoder"),
+        (MediaCall::AudioDecoding, "audio_decoder"),
+        (MediaCall::VideoEncoding, "output"),
+        (MediaCall::AudioEncoding, "output"),
+        (MediaCall::Muxing, "output"),
     ]
     .into_iter()
-    .map(|(stage, entry)| (stage, entry.to_owned()))
+    .map(|(call, component)| (call, component.to_owned()))
     .collect()
 }
 

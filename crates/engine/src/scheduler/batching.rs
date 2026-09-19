@@ -4,7 +4,7 @@
 //! budgets, and emits at most one planned call per eligible request.
 
 use super::*;
-use uniserve_worker_ipc::{ForwardMode, PipelineStage, TransferMode};
+use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 
 /// Computes the target decode capacity for a scheduling round.
 fn decode_capacity_target(pos: usize, spec_len: usize) -> usize {
@@ -31,7 +31,7 @@ impl Scheduler {
     /// Charges actual token work, including each denoising step and CFG branch.
     fn computation_token_cost(&self, call: &Call) -> usize {
         match call.code {
-            CallKind::Pipeline(PipelineStage::Denoising) => {
+            CallKind::Media(MediaCall::Denoising) => {
                 let Some(state) = self.running.get(&call.request_key.request_id) else {
                     return 0;
                 };
@@ -48,8 +48,7 @@ impl Scheduler {
     /// Reserves persistent buffers, latent pages, and transfer capacity for one computation.
     fn reserve_generation_resources(&mut self, call: &Call) -> Option<Vec<Allocation>> {
         let id = call.request_key.request_id;
-        if call.code == CallKind::Pipeline(PipelineStage::Denoising) && !self.ensure_flow_prefix(id)
-        {
+        if call.code == CallKind::Media(MediaCall::Denoising) && !self.ensure_flow_prefix(id) {
             return None;
         }
         let uses_transfer = call.bounds.max_transfer_bytes > 0;
@@ -84,8 +83,7 @@ impl Scheduler {
         }
         if matches!(
             call.code,
-            CallKind::Pipeline(PipelineStage::LatentPreparation)
-                | CallKind::Pipeline(PipelineStage::Denoising)
+            CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
         ) && self.worker_tracks_image_latent()
         {
             let latent_units = self
@@ -127,7 +125,7 @@ impl Scheduler {
     ) -> Vec<ExecutionBatch> {
         // One batch per computation: a batch is one numerical call on one
         // component, so a rank receives it as a single homogeneous group. The
-        // entry a call binds to follows from its computation, so the two
+        // component a call binds to follows from its computation, so the two
         // together name one group. Computations keep the order in which their
         // first call was selected.
         let mut code_order: Vec<CallKind> = Vec::new();
@@ -191,7 +189,7 @@ impl Scheduler {
             // dispatches only once that sequence has completed. Denoising
             // steps of different requests are therefore never in flight
             // together, in any lane.
-            if next_type == Some(CallKind::Pipeline(PipelineStage::Denoising))
+            if next_type == Some(CallKind::Media(MediaCall::Denoising))
                 && (self.denoiser_lane_held_by_other(id) || !self.flow_prefix_is_schedulable(id))
             {
                 continue;
@@ -407,27 +405,27 @@ impl Scheduler {
     pub(super) fn assembly_priority(&self, id: RequestId) -> u8 {
         match self.peek_next_call_variant(id) {
             Some(
-                CallKind::Pipeline(PipelineStage::TextEncoding)
-                | CallKind::Pipeline(PipelineStage::VisionEncoding)
-                | CallKind::Pipeline(PipelineStage::LatentEncoding)
+                CallKind::Media(MediaCall::TextEncoding)
+                | CallKind::Media(MediaCall::VisionEncoding)
+                | CallKind::Media(MediaCall::LatentEncoding)
                 | CallKind::Forward(ForwardMode::Prefill),
             ) => 0,
             Some(
                 CallKind::Forward(ForwardMode::Decode)
                 | CallKind::Forward(ForwardMode::Verify)
-                | CallKind::Pipeline(PipelineStage::ImageDecoding)
+                | CallKind::Media(MediaCall::ImageDecoding)
                 | CallKind::Transfer(TransferMode::KvInstall),
             ) => 1,
-            Some(CallKind::Pipeline(
-                PipelineStage::Denoising
-                | PipelineStage::VideoDecoding
-                | PipelineStage::AudioDecoding
-                | PipelineStage::VideoEncoding
-                | PipelineStage::AudioEncoding
-                | PipelineStage::Muxing,
+            Some(CallKind::Media(
+                MediaCall::Denoising
+                | MediaCall::VideoDecoding
+                | MediaCall::AudioDecoding
+                | MediaCall::VideoEncoding
+                | MediaCall::AudioEncoding
+                | MediaCall::Muxing,
             )) => 2,
             Some(
-                CallKind::Pipeline(PipelineStage::LatentPreparation)
+                CallKind::Media(MediaCall::LatentPreparation)
                 | CallKind::Transfer(TransferMode::Tensor)
                 | CallKind::Transfer(TransferMode::KvPublish),
             )
@@ -454,26 +452,26 @@ impl Scheduler {
                 .is_some_and(|item| Some(item.position) == self.num_scheduled_prompt_tokens(id))
         {
             return st.pending_image_step().map(|step| match step {
-                ImageIngestStep::VaeEncode => CallKind::Pipeline(PipelineStage::LatentEncoding),
-                ImageIngestStep::VitEncode => CallKind::Pipeline(PipelineStage::VisionEncoding),
+                ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
+                ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
             });
         }
         Some(match st.phase {
             Phase::Encode => match st.pending_image_step()? {
-                ImageIngestStep::VaeEncode => CallKind::Pipeline(PipelineStage::LatentEncoding),
-                ImageIngestStep::VitEncode => CallKind::Pipeline(PipelineStage::VisionEncoding),
+                ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
+                ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
             },
             Phase::IngestState => CallKind::Forward(ForwardMode::Prefill),
             Phase::Prefill => CallKind::Forward(ForwardMode::Prefill),
             Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
             Phase::CloseKv => CallKind::Forward(ForwardMode::Prefill),
             Phase::PublishKv => CallKind::Transfer(TransferMode::KvPublish),
-            Phase::PrepareGen => CallKind::Pipeline(PipelineStage::LatentPreparation),
+            Phase::PrepareGen => CallKind::Media(MediaCall::LatentPreparation),
             Phase::DenoiseGen if st.num_completed_denoise_steps >= st.req.image.steps => {
-                CallKind::Pipeline(PipelineStage::ImageDecoding)
+                CallKind::Media(MediaCall::ImageDecoding)
             }
-            Phase::DenoiseGen => CallKind::Pipeline(PipelineStage::Denoising),
-            Phase::CommitGen => CallKind::Pipeline(PipelineStage::ImageDecoding),
+            Phase::DenoiseGen => CallKind::Media(MediaCall::Denoising),
+            Phase::CommitGen => CallKind::Media(MediaCall::ImageDecoding),
             Phase::FeedbackEncode => {
                 let feedback = &st.req.image_generation;
                 feedback.feedback_source.as_ref()?;
@@ -482,8 +480,8 @@ impl Scheduler {
                     .get(st.feedback_encoder_index)?
                     .encoder
                 {
-                    ImageIngestStep::VaeEncode => CallKind::Pipeline(PipelineStage::LatentEncoding),
-                    ImageIngestStep::VitEncode => CallKind::Pipeline(PipelineStage::VisionEncoding),
+                    ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
+                    ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
                 }
             }
             Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
@@ -592,16 +590,16 @@ impl Scheduler {
                 Some(KvLengths { visible, input: 1 })
             }
             CallKind::Transfer(TransferMode::KvPublish)
-            | CallKind::Pipeline(PipelineStage::LatentPreparation)
-            | CallKind::Pipeline(PipelineStage::Denoising) => Some(KvLengths { visible, input: 0 }),
+            | CallKind::Media(MediaCall::LatentPreparation)
+            | CallKind::Media(MediaCall::Denoising) => Some(KvLengths { visible, input: 0 }),
             _ => None,
         };
         let start_step = match call.code {
-            CallKind::Pipeline(PipelineStage::LatentPreparation) => Some(0),
-            CallKind::Pipeline(PipelineStage::Denoising) => {
+            CallKind::Media(MediaCall::LatentPreparation) => Some(0),
+            CallKind::Media(MediaCall::Denoising) => {
                 self.num_scheduled_denoise_steps(request_id).map(u32::from)
             }
-            CallKind::Pipeline(PipelineStage::ImageDecoding) => self
+            CallKind::Media(MediaCall::ImageDecoding) => self
                 .running
                 .get(&request_id)
                 .map(|state| u32::from(state.req.image.steps)),
@@ -757,7 +755,7 @@ impl Scheduler {
 
         // Diffusion rows include the positive branch and any negative CFG
         // branch, each bound to its own request-state row.
-        if call.code == CallKind::Pipeline(PipelineStage::Denoising) {
+        if call.code == CallKind::Media(MediaCall::Denoising) {
             let conditioning_tokens = kv_lengths
                 .expect("denoising declares its conditioning KV range")
                 .visible;
@@ -822,8 +820,7 @@ impl Scheduler {
         // exact denoising interval executed by this call.
         if matches!(
             call.code,
-            CallKind::Pipeline(PipelineStage::LatentPreparation)
-                | CallKind::Pipeline(PipelineStage::Denoising)
+            CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
         ) || call.latent_input.is_some()
         {
             let Some(state) = self.running.get(&request_id) else {
@@ -849,7 +846,7 @@ impl Scheduler {
                 self.fatal = true;
                 return None;
             };
-            let step_count = if call.code == CallKind::Pipeline(PipelineStage::Denoising) {
+            let step_count = if call.code == CallKind::Media(MediaCall::Denoising) {
                 call.bounds.max_tokens
             } else {
                 0
@@ -867,7 +864,7 @@ impl Scheduler {
         }
 
         let (worker, entry) = self.select_worker(&call);
-        call.entry = entry;
+        call.component = entry;
 
         let submitted_us = uniserve_core::now_monotonic_us();
         self.register_inflight(

@@ -203,8 +203,8 @@ pub struct ArtifactEvent {
 pub struct DiffusionSamplingParams {
     /// Number of output frames after model-specific alignment.
     pub num_frames: u32,
-    /// Overlapping VAE reconstruction chunks, independent of GPU rank count.
-    pub num_decode_chunks: u32,
+    /// Video media units the decoder reconstructs, independent of GPU rank count.
+    pub video_units: u32,
     /// Number of denoising steps in the trajectory.
     pub num_inference_steps: u32,
     /// Deterministic request-level noise seed.
@@ -220,7 +220,7 @@ pub struct DiffusionRequest {
     pub prompt_token_ids: Vec<u32>,
     /// Scheduler priority.
     pub priority: i32,
-    /// Effective diffusion controls and model-preprocessed chunk count.
+    /// Effective diffusion controls and model-preprocessed media unit count.
     pub sampling: DiffusionSamplingParams,
 }
 
@@ -232,7 +232,7 @@ impl DiffusionRequest {
         }
 
         if self.sampling.num_frames == 0
-            || self.sampling.num_decode_chunks == 0
+            || self.sampling.video_units == 0
             || self.sampling.num_inference_steps == 0
             || self.prompt_token_ids.len() > u32::MAX as usize
         {

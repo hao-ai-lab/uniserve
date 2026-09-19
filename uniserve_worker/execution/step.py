@@ -1,4 +1,4 @@
-"""Execute and commit worker batches at completion-group boundaries."""
+"""Execute and commit worker batches at their completion boundary."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from uniserve_worker.protocol.output import (
 )
 from uniserve_worker.protocol.tensor import DType
 
-from .schedule import execute_groups
+from .schedule import execute_completion
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -93,7 +93,7 @@ def execute_batch(
     """Execute a run, reusing staged inputs when present.
 
     Startup propagates computation errors; service execution reports nonfatal
-    errors per completion group so independent work can still complete.
+    errors as the batch's completion so the worker can keep serving.
     """
     batch = state.batch
     if not state.inputs_ready():
@@ -119,66 +119,51 @@ def execute_batch(
         state.launched = True
         return
 
-    groups = tuple(state.output_groups)
-    completion_groups: list[int] = []
-    for completion_group in groups:
-        try:
-            completion_groups.append(
-                _open_group(
-                    batch,
-                    completion_group,
-                    predicate_values,
-                    kv_cache=kv_cache,
-                    host_tasks=host_tasks,
-                    tensor_store=tensor_store,
-                    worker_info=worker_info,
-                    latent_pool=latent_pool,
-                    media_mux=media_mux,
-                    media_buffers=media_buffers,
-                    output_pool=output_pool,
-                    request_tables=request_tables,
-                    request_pool=request_pool,
-                    model_runner=model_runner,
-                    transfer_backends=transfer_backends,
-                    config=config,
-                    state=state,
-                )
-            )
-        except BaseException as error:
-            classified = _classify_group_failure(
-                completion_group,
-                error,
-                phase="completion group registration",
-                state=state,
-            )
+    completion = BatchState.COMPLETION
+    try:
+        _open_group(
+            batch,
+            completion,
+            predicate_values,
+            kv_cache=kv_cache,
+            host_tasks=host_tasks,
+            tensor_store=tensor_store,
+            worker_info=worker_info,
+            latent_pool=latent_pool,
+            media_mux=media_mux,
+            media_buffers=media_buffers,
+            output_pool=output_pool,
+            request_tables=request_tables,
+            request_pool=request_pool,
+            model_runner=model_runner,
+            transfer_backends=transfer_backends,
+            config=config,
+            state=state,
+        )
+    except BaseException as error:
+        classified = _classify_group_failure(
+            completion,
+            error,
+            phase="completion group registration",
+            state=state,
+        )
+        if propagate_errors or classified.fatal:
+            raise classified
 
-            if propagate_errors or classified.fatal:
-                for completion_group in completion_groups:
-                    _discard_group(
-                        completion_group,
-                        classified,
-                        kv_cache=kv_cache,
-                        tensor_store=tensor_store,
-                        latent_pool=latent_pool,
-                        media_mux=media_mux,
-                        transfer_backends=transfer_backends,
-                        state=state,
-                    )
-                raise classified
-
-            _error_outputs(
-                state,
-                completion_group,
-                classified,
-                started,
-                registration_visible=False,
-                forward_stats=ForwardStats(),
-                request_pool=request_pool,
-            )
+        _error_outputs(
+            state,
+            completion,
+            classified,
+            started,
+            registration_visible=False,
+            forward_stats=ForwardStats(),
+            request_pool=request_pool,
+        )
+        return
 
     try:
-        outcomes, execution_errors = execute_groups(
-            tuple(completion_groups),
+        outcomes, execution_error = execute_completion(
+            completion,
             kv_cache=kv_cache,
             tensor_store=tensor_store,
             worker_info=worker_info,
@@ -195,16 +180,75 @@ def execute_batch(
             state=state,
         )
     except BaseException as error:
+        outcomes, execution_error = None, error
+
+    if outcomes is None:
+        assert execution_error is not None
         classified = _classify_group_failure(
-            groups[0],
-            error,
+            completion,
+            execution_error,
             phase="completion group execution",
             state=state,
         )
+        _discard_group(
+            completion,
+            classified,
+            kv_cache=kv_cache,
+            tensor_store=tensor_store,
+            latent_pool=latent_pool,
+            media_mux=media_mux,
+            transfer_backends=transfer_backends,
+            state=state,
+        )
 
-        for completion_group in completion_groups:
+        if propagate_errors or classified.fatal:
+            raise classified
+
+        _error_outputs(
+            state,
+            completion,
+            classified,
+            state.group_started_ns[completion],
+            registration_visible=state.group_registered[completion],
+            forward_stats=_forward_stats(
+                state.group_forward_stats[completion],
+                state.group_component_us[completion],
+            ),
+            request_pool=request_pool,
+        )
+        return
+
+    try:
+        _commit_group(
+            batch.batch_id,
+            completion,
+            outcomes,
+            started,
+            state=state,
+            kv_cache=kv_cache,
+            tensor_store=tensor_store,
+            worker_info=worker_info,
+            latent_pool=latent_pool,
+            request_pool=request_pool,
+            decode_state=decode_state,
+            config=config,
+        )
+    except BaseException as error:
+        if state.group_published[completion]:
+            classified = _published_group_failure(
+                completion,
+                error,
+                state=state,
+            )
+        else:
+            classified = _classify_group_failure(
+                completion,
+                error,
+                phase="completion group commit",
+                state=state,
+            )
             _discard_group(
-                completion_group,
+                completion,
                 classified,
                 kv_cache=kv_cache,
                 tensor_store=tensor_store,
@@ -217,143 +261,18 @@ def execute_batch(
         if propagate_errors or classified.fatal:
             raise classified
 
-        for completion_group in completion_groups:
-            _error_outputs(
-                state,
-                completion_group,
-                classified,
-                state.group_started_ns[completion_group],
-                registration_visible=state.group_registered[completion_group],
-                forward_stats=_forward_stats(
-                    state.group_forward_stats[completion_group],
-                    state.group_component_us[completion_group],
-                ),
-                request_pool=request_pool,
-            )
-
-        completion_groups.clear()
-        outcomes, execution_errors = {}, {}
-
-    if propagate_errors and execution_errors:
-        first_group = next(
-            completion_group
-            for completion_group in groups
-            if completion_group in execution_errors
+        _error_outputs(
+            state,
+            completion,
+            classified,
+            state.group_started_ns[completion],
+            registration_visible=state.group_registered[completion],
+            forward_stats=_forward_stats(
+                state.group_forward_stats[completion],
+                state.group_component_us[completion],
+            ),
+            request_pool=request_pool,
         )
-        classified = _classify_group_failure(
-            first_group,
-            execution_errors[first_group],
-            phase="completion group execution",
-            state=state,
-        )
-
-        for completion_group in completion_groups:
-            _discard_group(
-                completion_group,
-                classified,
-                kv_cache=kv_cache,
-                tensor_store=tensor_store,
-                latent_pool=latent_pool,
-                media_mux=media_mux,
-                transfer_backends=transfer_backends,
-                state=state,
-            )
-
-        raise classified
-
-    for completion_group in completion_groups:
-        group_error = execution_errors.get(completion_group)
-        if group_error is not None:
-            classified = _classify_group_failure(
-                completion_group,
-                group_error,
-                phase="completion group execution",
-                state=state,
-            )
-            _discard_group(
-                completion_group,
-                classified,
-                kv_cache=kv_cache,
-                tensor_store=tensor_store,
-                latent_pool=latent_pool,
-                media_mux=media_mux,
-                transfer_backends=transfer_backends,
-                state=state,
-            )
-
-            if propagate_errors or classified.fatal:
-                raise classified
-
-            _error_outputs(
-                state,
-                completion_group,
-                classified,
-                state.group_started_ns[completion_group],
-                registration_visible=state.group_registered[completion_group],
-                forward_stats=_forward_stats(
-                    state.group_forward_stats[completion_group],
-                    state.group_component_us[completion_group],
-                ),
-                request_pool=request_pool,
-            )
-            continue
-
-        group_outcomes = outcomes[completion_group]
-        try:
-            _commit_group(
-                batch.batch_id,
-                completion_group,
-                group_outcomes,
-                started,
-                state=state,
-                kv_cache=kv_cache,
-                tensor_store=tensor_store,
-                worker_info=worker_info,
-                latent_pool=latent_pool,
-                request_pool=request_pool,
-                decode_state=decode_state,
-                config=config,
-            )
-        except BaseException as error:
-            if state.group_published[completion_group]:
-                classified = _published_group_failure(
-                    completion_group,
-                    error,
-                    state=state,
-                )
-            else:
-                classified = _classify_group_failure(
-                    completion_group,
-                    error,
-                    phase="completion group commit",
-                    state=state,
-                )
-                _discard_group(
-                    completion_group,
-                    classified,
-                    kv_cache=kv_cache,
-                    tensor_store=tensor_store,
-                    latent_pool=latent_pool,
-                    media_mux=media_mux,
-                    transfer_backends=transfer_backends,
-                    state=state,
-                )
-
-            if propagate_errors or classified.fatal:
-                raise classified
-
-            _error_outputs(
-                state,
-                completion_group,
-                classified,
-                state.group_started_ns[completion_group],
-                registration_visible=state.group_registered[completion_group],
-                forward_stats=_forward_stats(
-                    state.group_forward_stats[completion_group],
-                    state.group_component_us[completion_group],
-                ),
-                request_pool=request_pool,
-            )
 
 
 def _classify_group_failure(
@@ -374,15 +293,11 @@ def _classify_group_failure(
             int(call.request_key.request_epoch),
             call.call_id,
         )
-        for call in state.group_calls(completion_group)
+        for call in state.batch.calls
     )
 
-    # Attach request coordinates when the group holds exactly one call.
-    sole = (
-        state.group_calls(completion_group)[0]
-        if len(state.group_calls(completion_group)) == 1
-        else None
-    )
+    # Attach request coordinates when the batch holds exactly one call.
+    sole = state.batch.calls[0] if len(state.batch.calls) == 1 else None
 
     classified = classify(
         error,
@@ -415,7 +330,7 @@ def _published_group_failure(
             int(call.request_key.request_epoch),
             call.call_id,
         )
-        for call in state.group_calls(completion_group)
+        for call in state.batch.calls
     )
     classified = WorkerError(
         code=WorkerErrorCode.INVARIANT_VIOLATION,
@@ -481,7 +396,7 @@ def _error_outputs(
     """
     completion_code = _completion_error_code(error.code)
     records: list[RequestOutput] = []
-    for call in state.group_calls(completion_group):
+    for call in state.batch.calls:
         # Report execution coordinates only for the matching admitted epoch;
         # a stale descriptor cannot observe a replacement request slot.
         request = request_pool.peek(call.request_key.request_id)

@@ -5,36 +5,36 @@
 //! request and call identities before mutating runtime state.
 
 use super::*;
-use uniserve_worker_ipc::{CallCoordinates, ForwardMode, PipelineStage, TransferMode};
+use uniserve_worker_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode};
 
 impl Scheduler {
-    /// Enumerates loaded entries that can execute the requested call.
+    /// Enumerates loaded components that can execute the requested call.
     ///
-    /// Which entry serves a pipeline stage is the model's to state, not the
+    /// Which component serves a media call is the model's to state, not the
     /// engine's: a worker resolves it from the capabilities its components
-    /// implement and reports it as `pipeline_components`. That report is the
+    /// implement and reports it as `media_components`. That report is the
     /// only authority here, so the engine holds no component vocabulary of its
     /// own and cannot drift from the names a model actually binds. A worker
-    /// that reports no pipeline routing serves one undivided model.
+    /// that reports no media routing serves one undivided model.
     pub(super) fn worker_candidates(
         &self,
         kind: CallKind,
     ) -> impl Iterator<Item = (&crate::WorkerId, &str, &WorkerInfo)> {
-        let entry = match kind {
-            CallKind::Pipeline(stage) => self
+        let component = match kind {
+            CallKind::Media(media_call) => self
                 .info
-                .pipeline_components
-                .get(&stage)
+                .media_components
+                .get(&media_call)
                 .map_or("model", String::as_str),
             _ => "model",
         };
-        self.entry_candidates(kind, entry)
+        self.component_candidates(kind, component)
     }
 
-    pub(super) fn entry_candidates<'a>(
+    pub(super) fn component_candidates<'a>(
         &'a self,
         kind: CallKind,
-        entry: &'a str,
+        component: &'a str,
     ) -> impl Iterator<Item = (&'a crate::WorkerId, &'a str, &'a WorkerInfo)> {
         self.executor
             .info()
@@ -44,8 +44,12 @@ impl Scheduler {
                 if !info.supported_ops.contains(&kind) {
                     return None;
                 }
-                let bound_entry = if info.components.iter().any(|binding| binding.name == entry) {
-                    entry
+                let bound_component = if info
+                    .components
+                    .iter()
+                    .any(|binding| binding.name == component)
+                {
+                    component
                 } else if info.components.is_empty()
                     || info
                         .components
@@ -56,31 +60,33 @@ impl Scheduler {
                 } else {
                     return None;
                 };
-                Some((id, bound_entry, info))
+                Some((id, bound_component, info))
             })
     }
 
-    /// Uses the static entry owner when it has destination capacity.
+    /// Uses the static component owner when it has destination capacity.
     pub(super) fn worker_target(
         &self,
         _request: RequestKey,
         kind: CallKind,
     ) -> Option<(&crate::WorkerId, &str)> {
-        let (id, bound_entry, _) = self.worker_candidates(kind).next()?;
-        self.executor.has_capacity(id).then_some((id, bound_entry))
+        let (id, bound_component, _) = self.worker_candidates(kind).next()?;
+        self.executor
+            .has_capacity(id)
+            .then_some((id, bound_component))
     }
 
-    /// Binds planned work to its configured entry and records request residency.
+    /// Binds planned work to its configured component and records request residency.
     pub(super) fn select_worker(&mut self, call: &Call) -> (crate::WorkerId, String) {
-        let (id, bound_entry) = if call.entry == "model" {
+        let (id, bound_component) = if call.component == "model" {
             self.worker_target(call.request_key, call.code)
         } else {
-            self.entry_candidates(call.code, &call.entry)
+            self.component_candidates(call.code, &call.component)
                 .find(|(id, _, _)| self.executor.has_capacity(id))
-                .map(|(id, entry, _)| (id, entry))
+                .map(|(id, component, _)| (id, component))
         }
-        .expect("planned call retains an executable entry");
-        let target = (id.clone(), bound_entry.to_owned());
+        .expect("planned call retains an executable component");
+        let target = (id.clone(), bound_component.to_owned());
         self.worker_affinity
             .insert((call.request_key, target.1.clone()), target.0.clone());
         target
@@ -357,7 +363,7 @@ impl Scheduler {
     }
 }
 
-/// The stages that read a video stage's products, or `None` for a stage
+/// The calls that read a video call's products, or `None` for a call
 /// outside the video call graph.
 ///
 /// This is the same graph `ready_calls` walks and the input binding reads:
@@ -366,22 +372,22 @@ impl Scheduler {
 /// window feeds its encoder and its encoded unit row feeds the muxer, which
 /// also assembles the encoded audio. The producing rank is told which ranks
 /// read its products from this, because it cannot know on its own.
-pub(crate) fn consuming_stages(stage: PipelineStage) -> Option<&'static [PipelineStage]> {
-    Some(match stage {
-        PipelineStage::TextEncoding => &[PipelineStage::LatentPreparation],
-        PipelineStage::LatentPreparation => &[PipelineStage::Denoising],
-        PipelineStage::Denoising => &[
-            PipelineStage::Denoising,
-            PipelineStage::VideoDecoding,
-            PipelineStage::AudioDecoding,
+pub(crate) fn consuming_calls(media_call: MediaCall) -> Option<&'static [MediaCall]> {
+    Some(match media_call {
+        MediaCall::TextEncoding => &[MediaCall::LatentPreparation],
+        MediaCall::LatentPreparation => &[MediaCall::Denoising],
+        MediaCall::Denoising => &[
+            MediaCall::Denoising,
+            MediaCall::VideoDecoding,
+            MediaCall::AudioDecoding,
         ],
-        PipelineStage::VideoDecoding => &[PipelineStage::VideoEncoding, PipelineStage::Muxing],
-        PipelineStage::VideoEncoding => &[PipelineStage::Muxing],
-        PipelineStage::AudioDecoding => &[PipelineStage::AudioEncoding],
-        PipelineStage::AudioEncoding | PipelineStage::Muxing => &[],
-        PipelineStage::VisionEncoding
-        | PipelineStage::LatentEncoding
-        | PipelineStage::ImageDecoding => return None,
+        MediaCall::VideoDecoding => &[MediaCall::VideoEncoding, MediaCall::Muxing],
+        MediaCall::VideoEncoding => &[MediaCall::Muxing],
+        MediaCall::AudioDecoding => &[MediaCall::AudioEncoding],
+        MediaCall::AudioEncoding | MediaCall::Muxing => &[],
+        MediaCall::VisionEncoding | MediaCall::LatentEncoding | MediaCall::ImageDecoding => {
+            return None;
+        }
     })
 }
 
@@ -451,7 +457,7 @@ impl Scheduler {
     /// the contiguous run that starts where the units it holds end.
     fn ready_encode_rounds(state: &MediaFlowState) -> Vec<u32> {
         let mut rounds = Vec::new();
-        let mut cursor = state.handed_video_chunks;
+        let mut cursor = state.handed_units;
         while let Some(units) = state.encoded_ready.get(&cursor) {
             rounds.push(cursor);
             cursor += units;
@@ -466,7 +472,7 @@ impl Scheduler {
     /// each kind is ready at once: the cursors this returns against advance as
     /// calls are scheduled, so a unit group only becomes ready once its
     /// predecessor is submitted.
-    fn ready_calls(&self, state: &MediaFlowState) -> Vec<PipelineStage> {
+    fn ready_calls(&self, state: &MediaFlowState) -> Vec<MediaCall> {
         let sampling = state.request.sampling;
         let produced = |product: &TensorRef| {
             !self
@@ -478,31 +484,31 @@ impl Scheduler {
                 })
         };
         if !state.text_encoding_scheduled {
-            return vec![PipelineStage::TextEncoding];
+            return vec![MediaCall::TextEncoding];
         }
         if !state.latent_preparation_scheduled {
-            return vec![PipelineStage::LatentPreparation];
+            return vec![MediaCall::LatentPreparation];
         }
         if state.num_scheduled_steps < sampling.num_inference_steps {
-            return vec![PipelineStage::Denoising];
+            return vec![MediaCall::Denoising];
         }
 
         // Consume completed decoder outputs first. Audio and video retain
         // independent readiness and capacity when the other branch is busy.
         let mut ready = Vec::new();
-        if let Some((_, product)) = state.video_segments.get(&state.num_scheduled_video_chunks)
+        if let Some((_, product)) = state.decoded_units.get(&state.scheduled_encode_units)
             && produced(product)
         {
-            ready.push(PipelineStage::VideoEncoding);
+            ready.push(MediaCall::VideoEncoding);
         }
         if !state.audio_encoding_scheduled && state.audio.as_ref().is_some_and(produced) {
-            ready.push(PipelineStage::AudioEncoding);
+            ready.push(MediaCall::AudioEncoding);
         }
-        if state.num_scheduled_decode_chunks < sampling.num_decode_chunks {
-            ready.push(PipelineStage::VideoDecoding);
+        if state.scheduled_decode_units < sampling.video_units {
+            ready.push(MediaCall::VideoDecoding);
         }
         if !state.audio_decoding_scheduled {
-            ready.push(PipelineStage::AudioDecoding);
+            ready.push(MediaCall::AudioDecoding);
         }
         // The muxer consumes media units as they arrive: a muxing call takes
         // the encode rounds that have completed since the last one, in
@@ -510,29 +516,29 @@ impl Scheduler {
         // once every unit and the audio track are in. It waits for completed
         // writes, never just their scheduled counts.
         if !state.muxing_in_flight && !state.muxed {
-            let next_round_ready = state.encoded_ready.contains_key(&state.handed_video_chunks);
+            let next_round_ready = state.encoded_ready.contains_key(&state.handed_units);
             let everything_in = state.audio_encoded
-                && state.handed_video_chunks == sampling.num_decode_chunks
+                && state.handed_units == sampling.video_units
                 && !state.final_muxing_scheduled;
             if next_round_ready || everything_in {
-                ready.push(PipelineStage::Muxing);
+                ready.push(MediaCall::Muxing);
             }
         }
         ready
     }
 
     /// Returns the component whose lanes one media call occupies.
-    fn media_component(&self, stage: PipelineStage) -> Option<String> {
-        self.info.pipeline_components.get(&stage).cloned()
+    fn media_component(&self, media_call: MediaCall) -> Option<String> {
+        self.info.media_components.get(&media_call).cloned()
     }
 
     /// Returns how many media units one call of this kind covers at once.
     ///
     /// A distributed component reconstructs one media unit per rank per round,
     /// so its rank count is the width of a round.
-    fn component_width(&self, work: CallKind, entry: &str) -> u32 {
+    fn component_width(&self, work: CallKind, component: &str) -> u32 {
         let (_, bound, info) = self
-            .entry_candidates(work, entry)
+            .component_candidates(work, component)
             .next()
             .expect("scheduled decoder has a configured owner");
         let component = info
@@ -562,21 +568,21 @@ impl Scheduler {
     }
 
     /// Returns the lanes one media call occupies and how much of each.
-    fn lane_demand(&self, stage: PipelineStage, units: u32) -> LaneDemand {
-        let component = self.media_component(stage);
-        let device_units = match stage {
+    fn lane_demand(&self, media_call: MediaCall, units: u32) -> LaneDemand {
+        let component = self.media_component(media_call);
+        let device_units = match media_call {
             // A device lane is occupied by a decode round. Encoding a media
             // unit is admitted on its rank's host lane, so it overlaps the
             // decode round that follows it rather than excluding it, and the
             // post-processing it begins with rides on the same admission.
-            PipelineStage::VideoDecoding | PipelineStage::AudioDecoding => component
+            MediaCall::VideoDecoding | MediaCall::AudioDecoding => component
                 .as_deref()
                 .and_then(|name| self.device_lane_units(name))
                 .map_or(0, |_| units.max(1)),
             _ => 0,
         };
-        let host_ranks = match stage {
-            PipelineStage::VideoEncoding | PipelineStage::AudioEncoding | PipelineStage::Muxing => {
+        let host_ranks = match media_call {
+            MediaCall::VideoEncoding | MediaCall::AudioEncoding | MediaCall::Muxing => {
                 self.host_lane_ranks(component.as_deref(), units)
             }
             _ => Vec::new(),
@@ -619,7 +625,7 @@ impl Scheduler {
         let mut ledger = LaneLedger::default();
         for (id, queue) in &self.pending_calls {
             for op in queue {
-                let CallKind::Pipeline(stage) = op.call.code else {
+                let CallKind::Media(media_call) = op.call.code else {
                     continue;
                 };
                 let units = match &op.input {
@@ -629,19 +635,19 @@ impl Scheduler {
                     } => range.max_units,
                     _ => 1,
                 };
-                ledger.occupy(&self.lane_demand(stage, units), *id);
+                ledger.occupy(&self.lane_demand(media_call, units), *id);
             }
         }
         ledger
     }
 
     /// Returns whether the rank group that owns one call can accept a batch.
-    fn stage_has_queue_capacity(&self, stage: PipelineStage) -> bool {
+    fn call_has_queue_capacity(&self, media_call: MediaCall) -> bool {
         self.info
-            .pipeline_components
-            .get(&stage)
-            .is_some_and(|entry| {
-                self.entry_candidates(CallKind::Pipeline(stage), entry)
+            .media_components
+            .get(&media_call)
+            .is_some_and(|component| {
+                self.component_candidates(CallKind::Media(media_call), component)
                     .any(|(worker, _, _)| self.executor.has_capacity(worker))
             })
     }
@@ -651,21 +657,22 @@ impl Scheduler {
     /// A decode round covers one media unit on each rank of its component, so
     /// it occupies that component's whole lane unless the track has fewer
     /// units left than the component has ranks.
-    fn call_units(&self, state: &MediaFlowState, stage: PipelineStage) -> u32 {
+    fn call_units(&self, state: &MediaFlowState, media_call: MediaCall) -> u32 {
         let width = || {
-            self.media_component(stage)
+            self.media_component(media_call)
                 .as_deref()
                 .and_then(|name| self.device_lane_units(name))
                 .unwrap_or(1)
         };
-        match stage {
-            PipelineStage::VideoDecoding => width()
-                .min(state.request.sampling.num_decode_chunks - state.num_scheduled_decode_chunks),
-            PipelineStage::AudioDecoding => width(),
+        match media_call {
+            MediaCall::VideoDecoding => {
+                width().min(state.request.sampling.video_units - state.scheduled_decode_units)
+            }
+            MediaCall::AudioDecoding => width(),
             // An encode round covers the media units the decode round produced.
-            PipelineStage::VideoEncoding => state
-                .video_segments
-                .get(&state.num_scheduled_video_chunks)
+            MediaCall::VideoEncoding => state
+                .decoded_units
+                .get(&state.scheduled_encode_units)
                 .map_or(1, |(units, _)| *units),
             _ => 1,
         }
@@ -689,13 +696,13 @@ impl Scheduler {
             {
                 continue;
             }
-            for stage in self.ready_calls(state) {
-                let demand = self.lane_demand(stage, self.call_units(state, stage));
-                if !ledger.admits(&demand, id, self) || !self.stage_has_queue_capacity(stage) {
+            for media_call in self.ready_calls(state) {
+                let demand = self.lane_demand(media_call, self.call_units(state, media_call));
+                if !ledger.admits(&demand, id, self) || !self.call_has_queue_capacity(media_call) {
                     continue;
                 }
                 ledger.occupy(&demand, id);
-                candidates.push((id, stage));
+                candidates.push((id, media_call));
             }
         }
         if candidates.is_empty() {
@@ -708,61 +715,60 @@ impl Scheduler {
             candidate_requests.contains(&command.request_key().request_id)
                 || matches!(command, BatchCommand::Finish { .. })
         });
-        // One batch per stage: a batch is one numerical call on one component,
-        // so a rank receives it as a single homogeneous group. Stages keep the
+        // One batch per media call: a batch is one numerical call on one component,
+        // so a rank receives it as a single homogeneous group. Calls keep the
         // order in which their first call was selected.
-        let mut stage_order = Vec::new();
-        let mut stage_batches: HashMap<PipelineStage, (u64, Vec<(Call, RequestPlacement)>)> =
+        let mut call_order = Vec::new();
+        let mut call_batches: HashMap<MediaCall, (u64, Vec<(Call, RequestPlacement)>)> =
             HashMap::new();
-        for (_, stage) in &candidates {
-            if !stage_batches.contains_key(stage) {
-                stage_batches.insert(*stage, (self.next_batch_id(), Vec::new()));
-                stage_order.push(*stage);
+        for (_, media_call) in &candidates {
+            if !call_batches.contains_key(media_call) {
+                call_batches.insert(*media_call, (self.next_batch_id(), Vec::new()));
+                call_order.push(*media_call);
             }
         }
         let mut admissions = Vec::new();
-        for (id, stage) in candidates.into_iter() {
+        for (id, media_call) in candidates.into_iter() {
             let (batch_id, request_index) = {
-                let (batch_id, calls) = &stage_batches[&stage];
+                let (batch_id, calls) = &call_batches[&media_call];
                 (*batch_id, calls.len())
             };
             let call_id = CallId::new(
                 batch_id,
                 u32::try_from(request_index).expect("selected request count fits the IPC index"),
             );
-            let work = CallKind::Pipeline(stage);
-            let entry = self.info.pipeline_components[&stage].clone();
+            let work = CallKind::Media(media_call);
+            let component = self.info.media_components[&media_call].clone();
             let state = self.media_state(id).expect("media candidate exists");
             let request_key = state.admission.request_key;
             let stateful = work.advances_state();
             let step = state.num_scheduled_steps;
-            let last_step = stage == PipelineStage::Denoising
+            let last_step = media_call == MediaCall::Denoising
                 && step + 1 == state.request.sampling.num_inference_steps;
             // Freeze the actual decode/write interval before advancing scheduled
             // counters. Completion consumes this same range from the submission.
-            let decode = match stage {
-                PipelineStage::VideoDecoding => Some(DecodeRange {
+            let decode = match media_call {
+                MediaCall::VideoDecoding => Some(DecodeRange {
                     request_key,
                     call_id,
-                    cursor: state.num_scheduled_decode_chunks,
-                    max_units: self.component_width(work, &entry).min(
-                        state.request.sampling.num_decode_chunks
-                            - state.num_scheduled_decode_chunks,
-                    ),
+                    cursor: state.scheduled_decode_units,
+                    max_units: self
+                        .component_width(work, &component)
+                        .min(state.request.sampling.video_units - state.scheduled_decode_units),
                 }),
-                PipelineStage::VideoEncoding => Some(DecodeRange {
+                MediaCall::VideoEncoding => Some(DecodeRange {
                     request_key,
                     call_id,
-                    cursor: state.num_scheduled_video_chunks,
-                    max_units: state.video_segments[&state.num_scheduled_video_chunks].0,
+                    cursor: state.scheduled_encode_units,
+                    max_units: state.decoded_units[&state.scheduled_encode_units].0,
                 }),
-                PipelineStage::AudioDecoding => Some(DecodeRange {
+                MediaCall::AudioDecoding => Some(DecodeRange {
                     request_key,
                     call_id,
                     cursor: 0,
-                    max_units: self.component_width(work, &entry),
+                    max_units: self.component_width(work, &component),
                 }),
-                PipelineStage::AudioEncoding => Some(DecodeRange {
+                MediaCall::AudioEncoding => Some(DecodeRange {
                     request_key,
                     call_id,
                     cursor: 0,
@@ -779,61 +785,59 @@ impl Scheduler {
             } else {
                 None
             };
-            let inputs = match stage {
-                PipelineStage::LatentPreparation => vec![
+            let inputs = match media_call {
+                MediaCall::LatentPreparation => vec![
                     state
                         .conditioning
                         .as_ref()
                         .expect("text encoding has declared its conditioning output")
                         .clone(),
                 ],
-                PipelineStage::VideoDecoding => vec![state.latents[0].clone()],
-                PipelineStage::AudioDecoding => vec![state.latents[1].clone()],
-                PipelineStage::VideoEncoding => {
+                MediaCall::VideoDecoding => vec![state.latents[0].clone()],
+                MediaCall::AudioDecoding => vec![state.latents[1].clone()],
+                MediaCall::VideoEncoding => {
                     let range = decode.as_ref().expect("video write has an input range");
-                    vec![state.video_segments[&range.cursor].1.clone()]
+                    vec![state.decoded_units[&range.cursor].1.clone()]
                 }
-                PipelineStage::AudioEncoding => {
+                MediaCall::AudioEncoding => {
                     vec![state.audio.as_ref().expect("audio is ready").clone()]
                 }
                 // The muxer takes the completed encode rounds that follow the
                 // last it was handed, in media unit order; the final call
                 // carries none.
-                PipelineStage::Muxing => Self::ready_encode_rounds(state)
+                MediaCall::Muxing => Self::ready_encode_rounds(state)
                     .into_iter()
-                    .map(|cursor| state.encoded_segments[&cursor].1.clone())
+                    .map(|cursor| state.encoded_units[&cursor].1.clone())
                     .collect(),
                 _ => Vec::new(),
             };
             let mut buffers = Vec::new();
             let mut outputs = Vec::new();
-            if stage == PipelineStage::TextEncoding
+            if media_call == MediaCall::TextEncoding
                 || last_step
                 || matches!(
-                    stage,
-                    PipelineStage::VideoDecoding
-                        | PipelineStage::AudioDecoding
-                        | PipelineStage::VideoEncoding
+                    media_call,
+                    MediaCall::VideoDecoding | MediaCall::AudioDecoding | MediaCall::VideoEncoding
                 )
             {
-                // An entry declares its products in the order its methods do.
-                // The video decoder's entry declares the decoded windows and
+                // A component declares its products in the order its methods do.
+                // The video decoder component declares the decoded windows and
                 // then the media units encoded from them, so a decode round
                 // reserves the first and an encode round the second.
-                let declared: &[u32] = match stage {
+                let declared: &[u32] = match media_call {
                     _ if last_step => &[0, 1],
-                    PipelineStage::VideoEncoding => &[1],
+                    MediaCall::VideoEncoding => &[1],
                     _ => &[0],
                 };
                 for &index in declared {
-                    let reserved = &state.allocations.tensors[&(entry.to_owned(), index)];
+                    let reserved = &state.allocations.tensors[&(component.to_owned(), index)];
                     let mut shape_bound = reserved.shape_bound.clone();
                     // A media unit round writes its own slice of the track's
                     // reservation, whether the slice holds decoded windows or
                     // the units encoded from them.
                     let start = if matches!(
-                        stage,
-                        PipelineStage::VideoDecoding | PipelineStage::VideoEncoding
+                        media_call,
+                        MediaCall::VideoDecoding | MediaCall::VideoEncoding
                     ) {
                         let range = decode.as_ref().expect("a media round has a unit range");
                         shape_bound.dims[0] = DimBound::Static(range.max_units);
@@ -854,7 +858,7 @@ impl Scheduler {
                 }
             }
             let latent = if stateful {
-                let (start_step, step_count) = if stage == PipelineStage::Denoising {
+                let (start_step, step_count) = if media_call == MediaCall::Denoising {
                     (step, 1)
                 } else {
                     (0, 0)
@@ -901,7 +905,7 @@ impl Scheduler {
                 sampling_state: None,
                 request_key,
                 call_id,
-                entry: entry.to_owned(),
+                component: component.to_owned(),
                 code: work,
                 bounds: Bounds::default(),
                 inputs: inputs,
@@ -915,33 +919,33 @@ impl Scheduler {
                 admissions.push(state.admission.clone());
                 state.admission_state = WorkerRegistration::InFlight;
             }
-            match stage {
-                PipelineStage::TextEncoding => {
+            match media_call {
+                MediaCall::TextEncoding => {
                     state.conditioning = call.outputs.first().cloned();
                     state.text_encoding_scheduled = true;
                 }
-                PipelineStage::LatentPreparation => state.latent_preparation_scheduled = true,
-                PipelineStage::Denoising => state.num_scheduled_steps = step + 1,
-                PipelineStage::VideoDecoding => {
+                MediaCall::LatentPreparation => state.latent_preparation_scheduled = true,
+                MediaCall::Denoising => state.num_scheduled_steps = step + 1,
+                MediaCall::VideoDecoding => {
                     let range = decode.as_ref().expect("video decode has an input range");
-                    state.num_scheduled_decode_chunks += range.max_units;
+                    state.scheduled_decode_units += range.max_units;
                     state
-                        .video_segments
+                        .decoded_units
                         .insert(range.cursor, (range.max_units, call.outputs[0].clone()));
                 }
-                PipelineStage::AudioDecoding => {
+                MediaCall::AudioDecoding => {
                     state.audio_decoding_scheduled = true;
                     state.audio = Some(call.outputs[0].clone());
                 }
-                PipelineStage::VideoEncoding => {
+                MediaCall::VideoEncoding => {
                     let range = decode.as_ref().expect("video write has an input range");
-                    state.num_scheduled_video_chunks += range.max_units;
+                    state.scheduled_encode_units += range.max_units;
                     state
-                        .encoded_segments
+                        .encoded_units
                         .insert(range.cursor, (range.max_units, call.outputs[0].clone()));
                 }
-                PipelineStage::AudioEncoding => state.audio_encoding_scheduled = true,
-                PipelineStage::Muxing => {
+                MediaCall::AudioEncoding => state.audio_encoding_scheduled = true,
+                MediaCall::Muxing => {
                     let rounds = Self::ready_encode_rounds(state);
                     if rounds.is_empty() {
                         state.final_muxing_scheduled = true;
@@ -952,18 +956,18 @@ impl Scheduler {
                             .remove(&cursor)
                             .expect("a ready encode round was counted");
                         let (_, product) = state
-                            .encoded_segments
+                            .encoded_units
                             .remove(&cursor)
                             .expect("a ready encode round has its product");
-                        state.handed_video_chunks += units;
+                        state.handed_units += units;
                         state.muxing_inputs.push(product);
                     }
                     state.muxing_in_flight = true;
                 }
-                PipelineStage::VisionEncoding
-                | PipelineStage::LatentEncoding
-                | PipelineStage::ImageDecoding => {
-                    unreachable!("video scheduling selects only its fixed stages")
+                MediaCall::VisionEncoding
+                | MediaCall::LatentEncoding
+                | MediaCall::ImageDecoding => {
+                    unreachable!("video scheduling selects only its fixed calls")
                 }
             }
             if stateful {
@@ -972,8 +976,8 @@ impl Scheduler {
             if last_step {
                 state.latents = call.outputs.clone();
             }
-            let (worker, entry) = self.select_worker(&call);
-            call.entry = entry;
+            let (worker, component) = self.select_worker(&call);
+            call.component = component;
             let placement = RequestPlacement {
                 worker,
                 block_tables: Vec::new(),
@@ -992,9 +996,9 @@ impl Scheduler {
                 submit_at,
                 0,
             );
-            stage_batches
-                .get_mut(&stage)
-                .expect("stage batch exists")
+            call_batches
+                .get_mut(&media_call)
+                .expect("media_call batch exists")
                 .1
                 .push((call, placement));
         }
@@ -1002,13 +1006,13 @@ impl Scheduler {
         // A request's admission travels with the first call that uses it, and
         // the round's retirements travel with the last batch so no earlier call
         // loses the state it still reads.
-        let mut starts: HashMap<PipelineStage, Vec<BatchCommand>> = HashMap::new();
+        let mut starts: HashMap<MediaCall, Vec<BatchCommand>> = HashMap::new();
         for request in admissions {
-            let owner = stage_order
+            let owner = call_order
                 .iter()
                 .copied()
-                .find(|stage| {
-                    stage_batches[stage]
+                .find(|media_call| {
+                    call_batches[media_call]
                         .1
                         .iter()
                         .any(|(call, _)| call.request_key == request.request_key)
@@ -1019,17 +1023,19 @@ impl Scheduler {
                 .or_default()
                 .push(BatchCommand::Start { request });
         }
-        let mut batches = Vec::with_capacity(stage_order.len() + 1);
-        for stage in stage_order {
-            let (batch_id, calls) = stage_batches.remove(&stage).expect("stage batch exists");
-            let batch_commands = starts.remove(&stage).unwrap_or_default();
+        let mut batches = Vec::with_capacity(call_order.len() + 1);
+        for media_call in call_order {
+            let (batch_id, calls) = call_batches
+                .remove(&media_call)
+                .expect("media_call batch exists");
+            let batch_commands = starts.remove(&media_call).unwrap_or_default();
             let batch = ExecutionBatch::new(batch_id, calls, batch_commands, Vec::new());
             if self.trace_enabled() {
                 self.trace_record(json!({
                     "event": "batch_submitted",
                     "at_s": now(),
                     "batch_id": batch.id,
-                    "stage": stage.as_str(),
+                    "call": media_call.as_str(),
                     "batch_size": batch.requests.len(),
                     "request_ids": batch
                         .requests
@@ -1142,7 +1148,7 @@ impl Scheduler {
                 .get(&id)
                 .into_iter()
                 .flatten()
-                .any(|op| op.call.code == CallKind::Pipeline(PipelineStage::Denoising))
+                .any(|op| op.call.code == CallKind::Media(MediaCall::Denoising))
     }
 
     /// Counts prompt tokens accepted or present in pending forward inputs.
@@ -1203,7 +1209,7 @@ impl Scheduler {
                     logical = logical.saturating_add(1);
                     physical = physical.saturating_add(1);
                 }
-                CallKind::Pipeline(PipelineStage::ImageDecoding) => feedback_index = 0,
+                CallKind::Media(MediaCall::ImageDecoding) => feedback_index = 0,
                 _ => {}
             }
         }
@@ -1245,10 +1251,8 @@ impl Scheduler {
         Some(self.pending_calls.get(&id).into_iter().flatten().fold(
             state.num_completed_denoise_steps,
             |steps, pending| match pending.call.code {
-                CallKind::Pipeline(
-                    PipelineStage::LatentPreparation | PipelineStage::ImageDecoding,
-                ) => 0,
-                CallKind::Pipeline(PipelineStage::Denoising) => {
+                CallKind::Media(MediaCall::LatentPreparation | MediaCall::ImageDecoding) => 0,
+                CallKind::Media(MediaCall::Denoising) => {
                     steps.saturating_add(
                         pending.call.bounds.max_tokens.min(u32::from(u16::MAX)) as u16
                     )
@@ -1266,7 +1270,7 @@ impl Scheduler {
         let mut images = 0;
         for pending in self.pending_calls.get(&id).into_iter().flatten() {
             let call = &pending.call;
-            if call.code == CallKind::Pipeline(PipelineStage::ImageDecoding) {
+            if call.code == CallKind::Media(MediaCall::ImageDecoding) {
                 index = 0;
             } else if consumes_image_features(call) && is_feedback_computation(call) {
                 index += 1;
@@ -1337,11 +1341,11 @@ impl Scheduler {
                 }
                 CallKind::Forward(ForwardMode::Prefill) => Phase::PublishKv,
                 CallKind::Transfer(TransferMode::KvPublish) => Phase::PrepareGen,
-                CallKind::Pipeline(PipelineStage::LatentPreparation)
-                | CallKind::Pipeline(PipelineStage::Denoising) => Phase::DenoiseGen,
-                CallKind::Pipeline(PipelineStage::ImageDecoding) => Phase::FeedbackEncode,
-                CallKind::Pipeline(PipelineStage::VisionEncoding)
-                | CallKind::Pipeline(PipelineStage::LatentEncoding)
+                CallKind::Media(MediaCall::LatentPreparation)
+                | CallKind::Media(MediaCall::Denoising) => Phase::DenoiseGen,
+                CallKind::Media(MediaCall::ImageDecoding) => Phase::FeedbackEncode,
+                CallKind::Media(MediaCall::VisionEncoding)
+                | CallKind::Media(MediaCall::LatentEncoding)
                     if is_feedback_computation(call) =>
                 {
                     Phase::FeedbackState
@@ -1542,7 +1546,7 @@ impl Scheduler {
             return None;
         }
         let last = &self.pending_calls.get(&id)?.back()?.call;
-        let chainable = if last.code == CallKind::Pipeline(PipelineStage::ImageDecoding) {
+        let chainable = if last.code == CallKind::Media(MediaCall::ImageDecoding) {
             state.req.feeds_back_images()
                 && state.req.image_generation.feedback_source
                     == Some(uniserve_core::FeedbackSource::DeviceProduct)
@@ -1561,9 +1565,9 @@ impl Scheduler {
             Phase::Prefill | Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
             Phase::CloseKv | Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
             Phase::PublishKv => CallKind::Transfer(TransferMode::KvPublish),
-            Phase::PrepareGen => CallKind::Pipeline(PipelineStage::LatentPreparation),
-            Phase::DenoiseGen => CallKind::Pipeline(PipelineStage::Denoising),
-            Phase::CommitGen => CallKind::Pipeline(PipelineStage::ImageDecoding),
+            Phase::PrepareGen => CallKind::Media(MediaCall::LatentPreparation),
+            Phase::DenoiseGen => CallKind::Media(MediaCall::Denoising),
+            Phase::CommitGen => CallKind::Media(MediaCall::ImageDecoding),
             Phase::FeedbackEncode => {
                 let feedback = &state.req.image_generation;
                 feedback.feedback_source.as_ref()?;
@@ -1572,8 +1576,8 @@ impl Scheduler {
                     .get(self.scheduled_feedback(id)?.0)?
                     .encoder
                 {
-                    ImageIngestStep::VaeEncode => CallKind::Pipeline(PipelineStage::LatentEncoding),
-                    ImageIngestStep::VitEncode => CallKind::Pipeline(PipelineStage::VisionEncoding),
+                    ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
+                    ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
                 }
             }
             Phase::Encode | Phase::IngestState => return None,
@@ -1669,10 +1673,10 @@ impl Scheduler {
             Some(
                 CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode),
             ) => 4,
-            Some(CallKind::Pipeline(PipelineStage::Denoising)) => {
+            Some(CallKind::Media(MediaCall::Denoising)) => {
                 usize::from(self.denoise_step_burst).saturating_add(2)
             }
-            Some(CallKind::Pipeline(PipelineStage::ImageDecoding)) => 3,
+            Some(CallKind::Media(MediaCall::ImageDecoding)) => 3,
             Some(_) | None => 2,
         }
     }
@@ -1770,7 +1774,7 @@ impl Scheduler {
         }
     }
 
-    /// Stages one validated completion until earlier calls for the request are applied.
+    /// Holds one validated completion until earlier calls for the request are applied.
     pub(super) fn stage_completion(
         &mut self,
         mut record: uniserve_worker_ipc::RequestOutput,
@@ -1833,7 +1837,7 @@ impl Scheduler {
         );
     }
 
-    /// Validate a stage result and advance only its completed request fields.
+    /// Validate a media call result and advance only its completed request fields.
     pub(super) fn process_diffusion_result(
         &mut self,
         call: Call,
@@ -1850,12 +1854,12 @@ impl Scheduler {
         let already_failed = matches!(state.terminal_intent, TerminalIntent::Failure(_));
         // Only the final muxing call, the one that carries no media units,
         // returns the artifact; every other call returns none.
-        let media_output_valid = if call.code == CallKind::Pipeline(PipelineStage::Muxing) {
+        let media_output_valid = if call.code == CallKind::Media(MediaCall::Muxing) {
             media.is_some() == call.inputs.is_empty()
         } else {
             media.is_none()
         };
-        let step_valid = call.code != CallKind::Pipeline(PipelineStage::Denoising)
+        let step_valid = call.code != CallKind::Media(MediaCall::Denoising)
             || latent.as_ref().is_some_and(|interval| {
                 record.num_completed_steps == interval.start_step + interval.step_count
             });
@@ -1878,26 +1882,26 @@ impl Scheduler {
                 }
             } else if let Some(state) = self.media_state_mut(id) {
                 match call.code {
-                    CallKind::Pipeline(PipelineStage::Denoising) => {
+                    CallKind::Media(MediaCall::Denoising) => {
                         state.num_completed_steps = record.num_completed_steps;
                     }
-                    CallKind::Pipeline(PipelineStage::VideoEncoding) => {
+                    CallKind::Media(MediaCall::VideoEncoding) => {
                         let range = decode
                             .as_ref()
                             .expect("submitted media write includes its input range");
-                        state.num_encoded_video_chunks += range.max_units;
+                        state.encoded_video_units += range.max_units;
                         state.encoded_ready.insert(range.cursor, range.max_units);
-                        if let Some((_, product)) = state.video_segments.remove(&range.cursor) {
+                        if let Some((_, product)) = state.decoded_units.remove(&range.cursor) {
                             consumed_products.push(product);
                         }
                     }
-                    CallKind::Pipeline(PipelineStage::AudioEncoding) => {
+                    CallKind::Media(MediaCall::AudioEncoding) => {
                         state.audio_encoded = true;
                         if let Some(product) = state.audio.take() {
                             consumed_products.push(product);
                         }
                     }
-                    CallKind::Pipeline(PipelineStage::Muxing) => {
+                    CallKind::Media(MediaCall::Muxing) => {
                         // The muxer has taken these units into the container,
                         // so the encoded products it consumed retire with the
                         // call; the artifact arrives with the final call.
@@ -1910,22 +1914,22 @@ impl Scheduler {
                     _ => {}
                 }
                 let phase = match call.code {
-                    CallKind::Pipeline(PipelineStage::TextEncoding) => "preparing",
-                    CallKind::Pipeline(PipelineStage::LatentPreparation)
-                    | CallKind::Pipeline(PipelineStage::Denoising) => {
+                    CallKind::Media(MediaCall::TextEncoding) => "preparing",
+                    CallKind::Media(MediaCall::LatentPreparation)
+                    | CallKind::Media(MediaCall::Denoising) => {
                         if state.num_completed_steps == state.request.sampling.num_inference_steps {
                             "decoding"
                         } else {
                             "denoising"
                         }
                     }
-                    CallKind::Pipeline(
-                        PipelineStage::VideoDecoding
-                        | PipelineStage::AudioDecoding
-                        | PipelineStage::VideoEncoding
-                        | PipelineStage::AudioEncoding,
+                    CallKind::Media(
+                        MediaCall::VideoDecoding
+                        | MediaCall::AudioDecoding
+                        | MediaCall::VideoEncoding
+                        | MediaCall::AudioEncoding,
                     ) => "decoding",
-                    CallKind::Pipeline(PipelineStage::Muxing) => "finalizing",
+                    CallKind::Media(MediaCall::Muxing) => "finalizing",
                     _ => unreachable!("media request completed a non-media computation"),
                 };
                 let _ = state.event_tx.send(EngineCoreOutput::MediaProgress {
@@ -2101,7 +2105,7 @@ impl Scheduler {
     pub(super) fn apply_result(&mut self, report: BatchResult) {
         let result_batch_id = report.batch_id;
         // Aggregate timings by the stable public metric groups. Multiple concrete
-        // stages in one group count as one returned run, as do multiple requests.
+        // calls in one group count as one returned run, as do multiple requests.
         let mut returned_groups: [Option<(usize, TimingCounters)>; 3] = [None; 3];
         let mut invalid_result = false;
 
@@ -2149,13 +2153,13 @@ impl Scheduler {
                 invalid_result = true;
                 continue;
             };
-            let entry = returned_groups[super::stats::ExecutionDomainStats::index(computation)]
+            let component = returned_groups[super::stats::ExecutionDomainStats::index(computation)]
                 .get_or_insert((0, TimingCounters::default()));
-            entry.0 += 1;
-            entry.1.queued_us = entry.1.queued_us.max(record.timing_counters.queued_us);
-            entry.1.device_us = entry.1.device_us.max(record.timing_counters.device_us);
-            entry.1.copy_us = entry.1.copy_us.max(record.timing_counters.copy_us);
-            entry.1.host_us = entry.1.host_us.max(record.timing_counters.host_us);
+            component.0 += 1;
+            component.1.queued_us = component.1.queued_us.max(record.timing_counters.queued_us);
+            component.1.device_us = component.1.device_us.max(record.timing_counters.device_us);
+            component.1.copy_us = component.1.copy_us.max(record.timing_counters.copy_us);
+            component.1.host_us = component.1.host_us.max(record.timing_counters.host_us);
         }
 
         let calls_complete = self
@@ -2322,7 +2326,7 @@ impl Scheduler {
                 let call_variant = call.code;
                 let roundtrip_us = started.elapsed().as_micros() as u64;
 
-                // Media calls update their independent stage progress immediately;
+                // Media calls update their independent call progress immediately;
                 // generation calls continue through semantic validation.
                 let (image_kv, start_step) = match input {
                     InflightInput::Media { latent, decode } => {
@@ -2475,7 +2479,7 @@ impl Scheduler {
                     .is_some_and(|state| state.terminal_intent.is_terminal())
                     || self.pending_finishes.contains_key(&id);
                 if semantic_blocked {
-                    if call.code == CallKind::Pipeline(PipelineStage::ImageDecoding) {
+                    if call.code == CallKind::Media(MediaCall::ImageDecoding) {
                         self.free_request_latent(id);
                     }
                     self.finish_pending_if_idle(id);
@@ -2527,12 +2531,12 @@ impl Scheduler {
 
                 // Reclaim resources whose lifetime ends at this transition before
                 // making its public output eligible for resolution.
-                let free_flow_prefix = call_variant == CallKind::Pipeline(PipelineStage::Denoising)
+                let free_flow_prefix = call_variant == CallKind::Media(MediaCall::Denoising)
                     && record.status == CallStatus::Ok
                     && self.running.get(&id).is_some_and(|state| {
                         record.num_completed_steps >= u32::from(state.req.image.steps)
                     });
-                if call_variant == CallKind::Pipeline(PipelineStage::Denoising)
+                if call_variant == CallKind::Media(MediaCall::Denoising)
                     && record.status == CallStatus::Ok
                     && let Some(prefix) = self
                         .running
@@ -2541,7 +2545,7 @@ impl Scheduler {
                 {
                     prefix.diffusion_finalized = true;
                 }
-                if call.code == CallKind::Pipeline(PipelineStage::ImageDecoding) {
+                if call.code == CallKind::Media(MediaCall::ImageDecoding) {
                     self.free_request_latent(id);
                 }
                 if free_flow_prefix {
@@ -2549,8 +2553,8 @@ impl Scheduler {
                 }
                 if matches!(
                     call_variant,
-                    CallKind::Pipeline(PipelineStage::Denoising)
-                        | CallKind::Pipeline(PipelineStage::ImageDecoding)
+                    CallKind::Media(MediaCall::Denoising)
+                        | CallKind::Media(MediaCall::ImageDecoding)
                 ) {
                     let consumed_latents = call.latent_input.iter().cloned().collect::<Vec<_>>();
                     if !consumed_latents.is_empty() {

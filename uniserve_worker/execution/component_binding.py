@@ -45,17 +45,17 @@ class Call:
 
     path: str
     module: torch.nn.Module
-    entry: EntryPoint
+    entry_point: EntryPoint
     groups: tuple[Communicator, ...] = ()
 
     @property
     def forward(self) -> Callable[..., Any]:
-        return getattr(self.module, self.entry.method)
+        return getattr(self.module, self.entry_point.method)
 
 
 @dataclass(slots=True, eq=False)
-class ModelEntry:
-    """An entry's placement, local callable and resident execution addresses.
+class ComponentBinding:
+    """A component's placement, local callable and resident execution addresses.
 
     All ranks retain placement for routing and product sizing. Only members
     have a mesh; their callable is attached after checkpoint materialization.
@@ -68,7 +68,7 @@ class ModelEntry:
     mesh: DeviceMesh | None
     device: torch.device
     # The ranks this component's media units are distributed over, ordered by
-    # unit. Only a distributed entry has one, and only on its own members.
+    # unit. Only a distributed component has one, and only on its own members.
     units: Communicator | None = None
     forward: Callable[..., TensorOutput | ExecutionOutput] | None = None
     groups: tuple[Communicator, ...] = ()
@@ -85,19 +85,21 @@ class ModelEntry:
             rank not in self.process_group.ranks for rank in self.config.ranks
         ):
             raise ValueError(
-                f"entry {self.name} members lie outside its Worker"
+                f"component {self.name} members lie outside its Worker"
             )
 
         if self.config.distribution is None:
             if (self.mesh is not None) != self.owns:
-                raise ValueError(f"entry {self.name} requires its local mesh")
+                raise ValueError(
+                    f"component {self.name} requires its local mesh"
+                )
             if self.mesh is not None and (
                 self.mesh.ranks != self.config.ranks
                 or tuple(zip(self.mesh.axes, self.mesh.shape))
                 != self.config.parallel_config.dimensions
             ):
                 raise ValueError(
-                    f"entry {self.name} mesh disagrees with configuration"
+                    f"component {self.name} mesh disagrees with configuration"
                 )
 
         if self.mesh is not None:
@@ -113,7 +115,7 @@ class ModelEntry:
 
     @property
     def owns(self) -> bool:
-        """Whether this process executes the configured entry."""
+        """Whether this process executes the configured component."""
         return self.process_group.global_rank in self.config.ranks
 
     @property

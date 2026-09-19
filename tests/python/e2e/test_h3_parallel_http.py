@@ -1,4 +1,4 @@
-"""Complete media and cancellation across statically assigned H3 entries."""
+"""Complete media and cancellation across statically assigned H3 components."""
 
 from __future__ import annotations
 
@@ -217,7 +217,7 @@ def test_component_bindings_release_cancelled_requests(
             {rank for name in names for rank in worker_config[name]["ranks"]}
         )
         worker_id = names[0]
-        entries = {
+        components = {
             name: {
                 **worker_config[name],
                 "ranks": [
@@ -233,7 +233,7 @@ def test_component_bindings_release_cancelled_requests(
                     {"node": "localhost", "device": f"cuda:{devices[rank]}"}
                     for rank in members
                 ],
-                "entries": entries,
+                "components": components,
                 "queue_depth": 6,
             }
         )

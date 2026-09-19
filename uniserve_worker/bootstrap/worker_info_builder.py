@@ -21,8 +21,8 @@ from uniserve_worker.config import WorkerConfig
 from uniserve_worker.protocol.call import CALL_KINDS, CallKind
 
 from ..config import graph_memory_budget_bytes, graph_padding_block_count
+from ..execution.component_binding import ComponentBinding
 from ..execution.input_buffers import InputBufferConfig
-from ..execution.model_entry import ModelEntry
 from ..execution.resources import media_state_buffers
 from ..foundation.errors import unsupported_setup
 from ..protocol.transfer import WorkerEndpoint
@@ -45,10 +45,10 @@ from .capacity import (
     request_tensor_window,
     vision_tokens,
 )
-from .components import pipeline_components, supported_calls
+from .components import media_components, supported_calls
 from .config import ComponentConfig
 from .inputs import capability, image_builder, media_builder
-from .worker_info import EntryInfo, WorkerInfo
+from .worker_info import ComponentInfo, WorkerInfo
 
 __all__ = [
     "WorkerLayout",
@@ -177,7 +177,7 @@ def build_worker_layout(
     transfer_backends: tuple[str, ...] = ("local",),
     components: tuple[tuple[str, ComponentConfig], ...] = (),
     attention_identity: str | None = None,
-    bindings: Mapping[str, ModelEntry] | None = None,
+    bindings: Mapping[str, ComponentBinding] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
     checkpoint_identity: str = "",
 ) -> WorkerLayout:
@@ -262,11 +262,11 @@ def build_worker_layout(
         ),
         # Advertised routing and advertised work describe the same placement,
         # including a deployment narrowed to a subset of its work variants: a
-        # stage this worker will not accept is a stage it does not route.
-        pipeline_components={
-            stage: entry
-            for stage, entry in pipeline_components(model, held).items()
-            if stage in supported_ops
+        # call this worker will not accept is a call it does not route.
+        media_components={
+            call: component
+            for call, component in media_components(model, held).items()
+            if call in supported_ops
         },
         transfer_backends=transfer_backends,
         fabric_handles=_exports_fabric_handles(worker_config.device),
@@ -279,7 +279,7 @@ def build_worker_layout(
         if layout.encoder_cache_entries
         else 0,
         components=tuple(
-            EntryInfo(name, entry, outputs.get(name, ()))
+            ComponentInfo(name, entry, outputs.get(name, ()))
             for name, entry in components
         ),
     )
@@ -513,7 +513,7 @@ def _token_worker_layout(
         latent_pages=num_latent_pages,
         buffer_pool_bytes=buffer_pool_bytes,
         max_unresolved_ops=unresolved_window,
-        pipeline_components=dict(pipeline_components(model)),
+        media_components=dict(media_components(model)),
         num_inference_steps=0,
         host_lane_capacity=1,
     )
@@ -560,7 +560,7 @@ def _request_tensor_worker_layout(
     queue_depth: int,
     completion_payload_bytes: int,
     endpoint: WorkerEndpoint,
-    bindings: Mapping[str, ModelEntry] | None,
+    bindings: Mapping[str, ComponentBinding] | None,
     checkpoint_identity: str,
 ) -> WorkerLayout:
     """Describe request tensors, products, and persistent capacity."""
@@ -588,7 +588,7 @@ def _request_tensor_worker_layout(
         buffer_pool_bytes=slots
         * product_storage_bytes(resolve_outputs(model, worker_config)),
         max_unresolved_ops=unresolved_window,
-        pipeline_components=dict(pipeline_components(model)),
+        media_components=dict(media_components(model)),
         num_inference_steps=media_builder(model, worker_config).num_steps,
         host_lane_capacity=1,
     )
@@ -620,7 +620,7 @@ def _request_tensor_worker_layout(
         * local_product_storage_bytes(
             resolve_outputs(model, worker_config),
             bindings=bindings or {},
-            pipeline_components=pipeline_components(model),
+            media_components=media_components(model),
             max_unresolved_ops=unresolved_window,
         ),
         latent_width=1,

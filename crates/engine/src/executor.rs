@@ -10,7 +10,7 @@ pub use uniserve_core::{ComponentConfig, ComponentDistribution, ParallelConfig, 
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use uniserve_worker_ipc::{ForwardMode, PipelineStage};
+use uniserve_worker_ipc::{ForwardMode, MediaCall};
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
@@ -129,7 +129,7 @@ impl ExecutionBatch {
             );
             requests.insert(call.request_key);
             WorkerId::new(placement.worker.0.clone())?;
-            anyhow::ensure!(!call.entry.is_empty(), "call requires a computation entry");
+            anyhow::ensure!(!call.component.is_empty(), "call requires a component");
             anyhow::ensure!(
                 identities.insert(call.call_id),
                 "logical batch repeats an call identity"
@@ -272,20 +272,20 @@ impl ExecutorInfo {
 
         let seed_index = kv_indices.first().copied().unwrap_or(0);
         let mut merged = self.workers[seed_index].1.clone();
-        merged.pipeline_components = routed(CallKind::Pipeline(PipelineStage::Denoising))
-            .map(|info| info.pipeline_components.clone())
+        merged.media_components = routed(CallKind::Media(MediaCall::Denoising))
+            .map(|info| info.media_components.clone())
             .unwrap_or_default();
-        merged.num_inference_steps = routed(CallKind::Pipeline(PipelineStage::Denoising))
+        merged.num_inference_steps = routed(CallKind::Media(MediaCall::Denoising))
             .map_or(0, |info| info.num_inference_steps);
         anyhow::ensure!(
             self.workers.iter().all(|(_, info)| {
                 !info
                     .supported_ops
-                    .contains(&CallKind::Pipeline(PipelineStage::Denoising))
-                    || (info.pipeline_components == merged.pipeline_components
+                    .contains(&CallKind::Media(MediaCall::Denoising))
+                    || (info.media_components == merged.media_components
                         && info.num_inference_steps == merged.num_inference_steps)
             }),
-            "workers disagree on pipeline components or diffusion steps"
+            "workers disagree on media components or diffusion steps"
         );
         // Every KV stage must agree on layout. Capacity is the narrowest pool
         // because a lineage may traverse all routed KV stages.
@@ -371,7 +371,7 @@ impl ExecutorInfo {
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
-        let flow = routed(CallKind::Pipeline(PipelineStage::Denoising));
+        let flow = routed(CallKind::Media(MediaCall::Denoising));
         merged.latent_page_units = flow.map_or(0, |info| info.latent_page_units);
         merged.latent_pages = flow.map_or(0, |info| info.latent_pages);
         merged.buffer_pool_bytes = self

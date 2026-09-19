@@ -14,7 +14,7 @@ from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
     ForwardMode,
-    PipelineStage,
+    MediaCall,
     TransferMode,
 )
 
@@ -44,8 +44,8 @@ if TYPE_CHECKING:
     from uniserve_worker.transfer.tickets import Transport
 
 
-def execute_groups(
-    completion_groups: tuple[int, ...],
+def execute_completion(
+    completion_group: int,
     *,
     state: BatchState,
     kv_cache: CacheManager | None,
@@ -61,49 +61,46 @@ def execute_groups(
     sampling_group: Communicator | None,
     tokenizer: PreTrainedTokenizerBase | None,
     config: WorkerConfig,
-) -> tuple[dict[int, tuple[PendingOutput, ...]], dict[int, BaseException]]:
-    """Execute active calls across completion groups and align outcomes.
+) -> tuple[tuple[PendingOutput, ...] | None, BaseException | None]:
+    """Execute the batch's active calls and align outcomes with its call order.
 
-    with original completion group order.
+    Returns the pending outputs in call order and no error, or no outputs and
+    the error that failed the completion.
     """
-    for completion_group in completion_groups:
-        active = tuple(
-            call
-            for call in state.group_calls(completion_group)
-            if state.pending_output(
+    batch_calls = state.batch.calls
+    active = tuple(
+        call
+        for call in batch_calls
+        if state.pending_output(
+            completion_group, call.request_key.request_id
+        ).status
+        is not CallStatus.PREDICATED
+    )
+    with state.group_scope(completion_group):
+        for device in dict.fromkeys(
+            device
+            for call in active
+            for device in model_runner.call_devices(call)
+        ):
+            state.group_buffers[completion_group].begin_device(device)
+
+    outcomes: list[PendingOutput | None] = [None] * len(batch_calls)
+    scheduled: list[tuple[Call, int]] = []
+    locations: list[int] = []
+
+    for call_index, call in enumerate(batch_calls):
+        if (
+            state.pending_output(
                 completion_group, call.request_key.request_id
             ).status
-            is not CallStatus.PREDICATED
-        )
-        with state.group_scope(completion_group):
-            for device in dict.fromkeys(
-                device
-                for call in active
-                for device in model_runner.call_devices(call)
-            ):
-                state.group_buffers[completion_group].begin_device(device)
-
-    grouped: list[list[PendingOutput | None]] = [
-        [None] * len(state.group_calls(completion_group))
-        for completion_group in completion_groups
-    ]
-    scheduled: list[tuple[Call, int]] = []
-    locations: list[tuple[int, int]] = []
-
-    for group_index, completion_group in enumerate(completion_groups):
-        for call_index, call in enumerate(state.group_calls(completion_group)):
-            if (
-                state.pending_output(
-                    completion_group, call.request_key.request_id
-                ).status
-                is CallStatus.PREDICATED
-            ):
-                grouped[group_index][call_index] = _predicated_outcome(
-                    call, completion_group, state=state
-                )
-                continue
-            locations.append((group_index, call_index))
-            scheduled.append((call, completion_group))
+            is CallStatus.PREDICATED
+        ):
+            outcomes[call_index] = _predicated_outcome(
+                call, completion_group, state=state
+            )
+            continue
+        locations.append(call_index)
+        scheduled.append((call, completion_group))
 
     completed, errors = _execute_calls(
         tuple(scheduled),
@@ -123,25 +120,16 @@ def execute_groups(
         state=state,
     )
 
-    for index, outcome in completed.items():
-        group_index, call_index = locations[index]
-        grouped[group_index][call_index] = outcome
+    if (error := errors.get(completion_group)) is not None:
+        return None, error
 
-    outcomes: dict[int, tuple[PendingOutput, ...]] = {}
-    for completion_group, group_outcomes in zip(
-        completion_groups, grouped, strict=True
-    ):
-        group_id = completion_group
-        if group_id in errors:
-            continue
-        if any(outcome is None for outcome in group_outcomes):
-            raise RuntimeError(
-                "successful completion group did not resolve every call"
-            )
-        outcomes[group_id] = tuple(
-            cast(PendingOutput, outcome) for outcome in group_outcomes
+    for index, outcome in completed.items():
+        outcomes[locations[index]] = outcome
+    if any(outcome is None for outcome in outcomes):
+        raise RuntimeError(
+            "successful completion group did not resolve every call"
         )
-    return outcomes, errors
+    return tuple(cast(PendingOutput, outcome) for outcome in outcomes), None
 
 
 def _execute_ready_actions(
@@ -185,7 +173,7 @@ def _execute_ready_actions(
                         state=state,
                     )
                 elif (
-                    call.kind is PipelineStage.LATENT_PREPARATION
+                    call.kind is MediaCall.LATENT_PREPARATION
                     and latent_pool is not None
                 ):
                     result = flow.prepare_latent(
@@ -200,7 +188,7 @@ def _execute_ready_actions(
                         config=config,
                         state=state,
                     )
-                elif call.kind is PipelineStage.TEXT_ENCODING:
+                elif call.kind is MediaCall.TEXT_ENCODING:
                     result = encode.text(
                         call,
                         completion_group,
@@ -248,8 +236,8 @@ def _execute_calls(
     """Execute product dependency frontiers with direct numerical algorithms.
 
     Each index addresses an original call. Only completed products unlock
-    successors; an error suppresses its completion group while independent
-    groups continue. CFG prefixes precede their homogeneous denoiser calls.
+    successors; an error suppresses the rest of the completion. CFG prefixes
+    precede their homogeneous denoiser calls.
     """
     producers = {
         buffer: index
@@ -298,13 +286,13 @@ def _execute_calls(
             for index in frontier
             if isinstance(scheduled[index][0].kind, ForwardMode)
             or scheduled[index][0].kind
-            in {PipelineStage.VISION_ENCODING, PipelineStage.LATENT_ENCODING}
+            in {MediaCall.VISION_ENCODING, MediaCall.LATENT_ENCODING}
             or (
                 latent_pool is not None
                 and scheduled[index][0].kind
                 in {
-                    PipelineStage.DENOISING,
-                    PipelineStage.IMAGE_DECODING,
+                    MediaCall.DENOISING,
+                    MediaCall.IMAGE_DECODING,
                 }
             )
         )

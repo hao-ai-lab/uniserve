@@ -1,4 +1,4 @@
-"""Public numerical entry execution, publication and component participation."""
+"""Public component execution, publication and component participation."""
 
 import threading
 from types import SimpleNamespace
@@ -15,7 +15,7 @@ from uniserve.distributed import Communicator, DeviceMesh
 from uniserve_worker.bootstrap.config import ComponentConfig, ParallelConfig
 from uniserve_worker.bootstrap.worker_info import WorkerInfo
 from uniserve_worker.config import LaneConfig, WorkerConfig
-from uniserve_worker.execution.model_entry import ModelEntry
+from uniserve_worker.execution.component_binding import ComponentBinding
 from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.foundation.errors import InputError
 from uniserve_worker.protocol.batch import (
@@ -32,7 +32,7 @@ from uniserve_worker.protocol.call import (
     Call,
     CallCoordinates,
     CallStatus,
-    PipelineStage,
+    MediaCall,
     TransferMode,
 )
 from uniserve_worker.protocol.identity import CallId, RequestKey
@@ -52,7 +52,7 @@ pytestmark = pytest.mark.integration
 def _encoder_bindings(model, components, device="cpu"):
     group = Communicator(device=torch.device(device))
     return {
-        name: ModelEntry(
+        name: ComponentBinding(
             name,
             config,
             group,
@@ -78,7 +78,7 @@ def test_temporal_output_regions_follow_declared_rank_order(rank, units):
     config = ComponentConfig((3, 1), distribution="temporal_units")
     group = Communicator((0, 1, 2, 3), rank)
     dimensions = ParallelConfig().dimensions
-    binding = ModelEntry(
+    binding = ComponentBinding(
         "reconstruction",
         config,
         group,
@@ -190,7 +190,7 @@ def test_conditioning_executes_only_on_its_declared_pipeline_stage(rank):
     model = EncodedModel()
     config = ComponentConfig((0, 1), ParallelConfig(pipeline_parallel_size=2))
     group = Communicator((0, 1), rank)
-    binding = ModelEntry(
+    binding = ComponentBinding(
         "conditioner",
         config,
         group,
@@ -239,7 +239,7 @@ def test_text_encoder_call_publishes_consumable_conditioning(
         graph_policy="off",
         lanes=(
             LaneConfig(
-                "text", 64, (PipelineStage.TEXT_ENCODING, TransferMode.TENSOR)
+                "text", 64, (MediaCall.TEXT_ENCODING, TransferMode.TENSOR)
             ),
         )
         if execution_device == "green"
@@ -269,8 +269,8 @@ def test_text_encoder_call_publishes_consumable_conditioning(
         request_key=key,
         call_id=CallId(1, 0),
         coordinates=CallCoordinates(),
-        kind=PipelineStage.TEXT_ENCODING,
-        entry="text_encoder",
+        kind=MediaCall.TEXT_ENCODING,
+        component="text_encoder",
         bounds=Bounds(),
         outputs=(reference,),
     )
@@ -338,7 +338,7 @@ def test_text_encoder_call_publishes_consumable_conditioning(
             call_id=CallId(2, 0),
             coordinates=CallCoordinates(),
             kind=TransferMode.TENSOR,
-            entry="text_encoder",
+            component="text_encoder",
             bounds=Bounds(max_transfer_bytes=reference.max_bytes),
             inputs=(reference,),
             outputs=(copied,),
@@ -433,11 +433,11 @@ def test_worker_reports_text_bounds_and_executes_dense_attention_without_kv():
     ) as worker:
         info = WorkerInfo.from_mapping(worker.info.to_mapping())
         assert info.kv_cache is None
-        entry = next(
+        component = next(
             value for value in info.components if value.name == "text_encoder"
         )
-        assert entry.config.ranks == (0,)
-        assert entry.outputs == (
+        assert component.config.ranks == (0,)
+        assert component.outputs == (
             OutputInfo(
                 "conditioning",
                 DType.F32,
@@ -470,8 +470,8 @@ def test_text_encoder_rejects_incompatible_output_declaration(rows, dtype):
             request_key=key,
             call_id=op,
             coordinates=CallCoordinates(),
-            kind=PipelineStage.TEXT_ENCODING,
-            entry="text_encoder",
+            kind=MediaCall.TEXT_ENCODING,
+            component="text_encoder",
             bounds=Bounds(),
             outputs=(output,),
         )

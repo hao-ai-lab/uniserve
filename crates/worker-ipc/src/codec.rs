@@ -11,8 +11,8 @@ use crate::{
     BufferAllocation, BufferId, CachePageAllocation, Call, CallCoordinates, CallId, CallKind,
     CallStatus, DType, DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout,
     ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode,
-    ForwardStats, KvCacheInfo, KvTransfer, LatentParams, Locator, MediaOutput, NewRequest,
-    PipelineStage, RegistrationAck, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
+    ForwardStats, KvCacheInfo, KvTransfer, LatentParams, Locator, MediaCall, MediaOutput,
+    NewRequest, RegistrationAck, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
     SamplingState, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
     TransferHandle, TransferMode, TransferTransport, UmmRequestParams, WorkerEndpoint, WorkerInfo,
     WorkerRequest, WorkerResponse, WorkerResponseError,
@@ -414,7 +414,7 @@ fn diffusion_params_from_table(
 ) -> CodecResult<DiffusionSamplingParams> {
     Ok(DiffusionSamplingParams {
         num_frames: admission.num_frames(),
-        num_decode_chunks: admission.num_decode_chunks(),
+        video_units: admission.video_units(),
         num_inference_steps: admission.num_inference_steps(),
         seed: admission.seed(),
     })
@@ -511,7 +511,7 @@ fn coordinates_to_fb(value: CallCoordinates) -> fbs::CallCoordinatesT {
     }
 }
 
-/// Decodes one computation and its entry binding.
+/// Decodes one computation and its component binding.
 fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
     let call = Call {
         request_key: request_key_from_table(call.request_key(), "call.request_key")?,
@@ -545,7 +545,7 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
                 .unwrap_or_default(),
             force_finish: state.force_finish(),
         }),
-        entry: call.entry().to_owned(),
+        component: call.component().to_owned(),
         code: computation_from_fb(call.code())?,
         bounds: Bounds {
             max_tokens: call.max_tokens(),
@@ -903,7 +903,7 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
                 items
                     .iter()
                     .map(|item| {
-                        Ok(crate::EntryInfo {
+                        Ok(crate::ComponentInfo {
                             name: required_str(item.name(), "component.name")?,
                             config: uniserve_core::ComponentConfig {
                                 ranks: item
@@ -919,7 +919,7 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
                             },
                             outputs: item
                                 .outputs()
-                                .context("entry requires tensor result declarations")?
+                                .context("component requires tensor result declarations")?
                                 .iter()
                                 .map(|output| {
                                     Ok(crate::OutputInfo {
@@ -960,14 +960,14 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
         encoder_entry_bytes: info.encoder_entry_bytes(),
         max_unresolved_ops: info.max_unresolved_ops(),
         host_lane_capacity: info.host_lane_capacity(),
-        pipeline_components: {
+        media_components: {
             let mut components = std::collections::BTreeMap::new();
-            if let Some(bindings) = info.pipeline_components() {
+            if let Some(bindings) = info.media_components() {
                 for binding in bindings {
-                    let stage = pipeline_stage_from_fb(binding.stage())?;
-                    let component = required_str(binding.component(), "pipeline component")?;
-                    if components.insert(stage, component).is_some() {
-                        codec_bail!("duplicate pipeline component binding");
+                    let call = media_call_from_fb(binding.call())?;
+                    let component = required_str(binding.component(), "media component")?;
+                    if components.insert(call, component).is_some() {
+                        codec_bail!("duplicate media component binding");
                     }
                 }
             }
@@ -1330,7 +1330,7 @@ fn umm_params_to_fb(admission: &UmmRequestParams) -> fbs::UmmRequestParamsT {
 fn diffusion_params_to_fb(admission: &DiffusionSamplingParams) -> fbs::DiffusionSamplingParamsT {
     fbs::DiffusionSamplingParamsT {
         num_frames: admission.num_frames,
-        num_decode_chunks: admission.num_decode_chunks,
+        video_units: admission.video_units,
         num_inference_steps: admission.num_inference_steps,
         seed: admission.seed,
     }
@@ -1409,7 +1409,7 @@ fn call_to_fb(call: &Call) -> CodecResult<fbs::CallT> {
                 force_finish: state.force_finish,
             })
         }),
-        entry: call.entry.clone(),
+        component: call.component.clone(),
         code: computation_to_fb(call.code),
         max_tokens: call.bounds.max_tokens,
         max_kv_pages: call.bounds.max_kv_pages,
@@ -1925,7 +1925,7 @@ fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
             info.components
                 .iter()
                 .map(|component| {
-                    Ok(fbs::EntryInfoT {
+                    Ok(fbs::ComponentInfoT {
                         name: Some(component.name.clone()),
                         ranks: Some(
                             component
@@ -1984,11 +1984,11 @@ fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
         encoder_entry_bytes: info.encoder_entry_bytes,
         max_unresolved_ops: info.max_unresolved_ops,
         host_lane_capacity: info.host_lane_capacity,
-        pipeline_components: Some(
-            info.pipeline_components
+        media_components: Some(
+            info.media_components
                 .iter()
-                .map(|(stage, component)| fbs::PipelineComponentT {
-                    stage: pipeline_stage_to_fb(*stage),
+                .map(|(call, component)| fbs::MediaComponentT {
+                    call: media_call_to_fb(*call),
                     component: Some(component.clone()),
                 })
                 .collect(),
@@ -2193,36 +2193,36 @@ fn forward_mode_from_fb(value: fbs::ForwardMode) -> CodecResult<ForwardMode> {
     })
 }
 
-fn pipeline_stage_to_fb(value: PipelineStage) -> fbs::PipelineStage {
+fn media_call_to_fb(value: MediaCall) -> fbs::MediaCall {
     match value {
-        PipelineStage::VisionEncoding => fbs::PipelineStage::VisionEncoding,
-        PipelineStage::LatentEncoding => fbs::PipelineStage::LatentEncoding,
-        PipelineStage::TextEncoding => fbs::PipelineStage::TextEncoding,
-        PipelineStage::LatentPreparation => fbs::PipelineStage::LatentPreparation,
-        PipelineStage::Denoising => fbs::PipelineStage::Denoising,
-        PipelineStage::ImageDecoding => fbs::PipelineStage::ImageDecoding,
-        PipelineStage::VideoDecoding => fbs::PipelineStage::VideoDecoding,
-        PipelineStage::AudioDecoding => fbs::PipelineStage::AudioDecoding,
-        PipelineStage::VideoEncoding => fbs::PipelineStage::VideoEncoding,
-        PipelineStage::AudioEncoding => fbs::PipelineStage::AudioEncoding,
-        PipelineStage::Muxing => fbs::PipelineStage::Muxing,
+        MediaCall::VisionEncoding => fbs::MediaCall::VisionEncoding,
+        MediaCall::LatentEncoding => fbs::MediaCall::LatentEncoding,
+        MediaCall::TextEncoding => fbs::MediaCall::TextEncoding,
+        MediaCall::LatentPreparation => fbs::MediaCall::LatentPreparation,
+        MediaCall::Denoising => fbs::MediaCall::Denoising,
+        MediaCall::ImageDecoding => fbs::MediaCall::ImageDecoding,
+        MediaCall::VideoDecoding => fbs::MediaCall::VideoDecoding,
+        MediaCall::AudioDecoding => fbs::MediaCall::AudioDecoding,
+        MediaCall::VideoEncoding => fbs::MediaCall::VideoEncoding,
+        MediaCall::AudioEncoding => fbs::MediaCall::AudioEncoding,
+        MediaCall::Muxing => fbs::MediaCall::Muxing,
     }
 }
 
-fn pipeline_stage_from_fb(value: fbs::PipelineStage) -> CodecResult<PipelineStage> {
+fn media_call_from_fb(value: fbs::MediaCall) -> CodecResult<MediaCall> {
     Ok(match value {
-        fbs::PipelineStage::VisionEncoding => PipelineStage::VisionEncoding,
-        fbs::PipelineStage::LatentEncoding => PipelineStage::LatentEncoding,
-        fbs::PipelineStage::TextEncoding => PipelineStage::TextEncoding,
-        fbs::PipelineStage::LatentPreparation => PipelineStage::LatentPreparation,
-        fbs::PipelineStage::Denoising => PipelineStage::Denoising,
-        fbs::PipelineStage::ImageDecoding => PipelineStage::ImageDecoding,
-        fbs::PipelineStage::VideoDecoding => PipelineStage::VideoDecoding,
-        fbs::PipelineStage::AudioDecoding => PipelineStage::AudioDecoding,
-        fbs::PipelineStage::VideoEncoding => PipelineStage::VideoEncoding,
-        fbs::PipelineStage::AudioEncoding => PipelineStage::AudioEncoding,
-        fbs::PipelineStage::Muxing => PipelineStage::Muxing,
-        _ => codec_bail!("unknown pipeline_stage {}", value.0),
+        fbs::MediaCall::VisionEncoding => MediaCall::VisionEncoding,
+        fbs::MediaCall::LatentEncoding => MediaCall::LatentEncoding,
+        fbs::MediaCall::TextEncoding => MediaCall::TextEncoding,
+        fbs::MediaCall::LatentPreparation => MediaCall::LatentPreparation,
+        fbs::MediaCall::Denoising => MediaCall::Denoising,
+        fbs::MediaCall::ImageDecoding => MediaCall::ImageDecoding,
+        fbs::MediaCall::VideoDecoding => MediaCall::VideoDecoding,
+        fbs::MediaCall::AudioDecoding => MediaCall::AudioDecoding,
+        fbs::MediaCall::VideoEncoding => MediaCall::VideoEncoding,
+        fbs::MediaCall::AudioEncoding => MediaCall::AudioEncoding,
+        fbs::MediaCall::Muxing => MediaCall::Muxing,
+        _ => codec_bail!("unknown media_call {}", value.0),
     })
 }
 
@@ -2248,7 +2248,7 @@ fn computation_to_fb(value: CallKind) -> fbs::CallKindT {
     let mut encoded = fbs::CallKindT::default();
     match value {
         CallKind::Forward(mode) => encoded.forward_mode = forward_mode_to_fb(mode),
-        CallKind::Pipeline(stage) => encoded.stage = pipeline_stage_to_fb(stage),
+        CallKind::Media(call) => encoded.media = media_call_to_fb(call),
         CallKind::Transfer(mode) => encoded.transfer = transfer_mode_to_fb(mode),
     }
     encoded
@@ -2257,7 +2257,7 @@ fn computation_to_fb(value: CallKind) -> fbs::CallKindT {
 /// Reject missing, conflicting, and unknown tags at the transport boundary.
 fn computation_from_fb(value: &fbs::CallKind) -> CodecResult<CallKind> {
     let present = u8::from(value.forward_mode() != fbs::ForwardMode::None)
-        + u8::from(value.stage() != fbs::PipelineStage::None)
+        + u8::from(value.media() != fbs::MediaCall::None)
         + u8::from(value.transfer() != fbs::TransferMode::None);
     if present != 1 {
         codec_bail!("computation must select exactly one classification");
@@ -2266,8 +2266,8 @@ fn computation_from_fb(value: &fbs::CallKind) -> CodecResult<CallKind> {
         Ok(CallKind::Forward(forward_mode_from_fb(
             value.forward_mode(),
         )?))
-    } else if value.stage() != fbs::PipelineStage::None {
-        Ok(CallKind::Pipeline(pipeline_stage_from_fb(value.stage())?))
+    } else if value.media() != fbs::MediaCall::None {
+        Ok(CallKind::Media(media_call_from_fb(value.media())?))
     } else {
         Ok(CallKind::Transfer(transfer_mode_from_fb(value.transfer())?))
     }

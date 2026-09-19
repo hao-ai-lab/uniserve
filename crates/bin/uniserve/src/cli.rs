@@ -327,7 +327,7 @@ impl SharedRuntimeArgs {
                     &self.device,
                     self.worker_ranks,
                     queue_depth,
-                    WorkerConfig::single_entry("model", self.worker_ranks),
+                    WorkerConfig::single_component("model", self.worker_ranks),
                 )]
             }),
             transfer: self.transfer.clone().unwrap_or_default(),
@@ -548,7 +548,7 @@ mod tests {
     #[test]
     fn serve_accepts_runtime_configuration() {
         let configuration = written_configuration(
-            r#"[{"id":"text","ranks":[{"node":"localhost","device":"cpu"},{"node":"localhost","device":"cpu"}],"entries":{"model":{"ranks":[0,1],"parallel_config":{"tensor_parallel_size":2}}},"queue_depth":1}]"#,
+            r#"[{"id":"text","ranks":[{"node":"localhost","device":"cpu"},{"node":"localhost","device":"cpu"}],"components":{"model":{"ranks":[0,1],"parallel_config":{"tensor_parallel_size":2}}},"queue_depth":1}]"#,
         );
         let parsed = <Cli as clap::Parser>::try_parse_from([
             "uniserve",
@@ -604,9 +604,9 @@ mod tests {
         let workers = args.runtime.workers.expect("the configuration was read");
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].id.0, "text");
-        assert_eq!(workers[0].entries["model"].ranks, vec![0, 1]);
+        assert_eq!(workers[0].components["model"].ranks, vec![0, 1]);
         assert_eq!(
-            workers[0].entries["model"]
+            workers[0].components["model"]
                 .parallel_config
                 .tensor_parallel_size,
             2

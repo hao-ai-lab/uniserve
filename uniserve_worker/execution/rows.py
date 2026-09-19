@@ -8,7 +8,7 @@ from typing import TypeAlias
 import torch
 
 from uniserve_worker.execution.sampling import TokenSelection
-from uniserve_worker.protocol.call import ForwardMode, PipelineStage
+from uniserve_worker.protocol.call import ForwardMode, MediaCall
 from uniserve_worker.protocol.identity import CallId, RequestKey
 
 CallIdentity: TypeAlias = tuple[RequestKey, CallId]
@@ -22,7 +22,7 @@ class ForwardRow:
     staging time; it carries no redundant per-row tensor views.
     """
 
-    forward_mode: ForwardMode | PipelineStage
+    forward_mode: ForwardMode | MediaCall
     token_ids: torch.Tensor | None = None
     token_embeddings: torch.Tensor | None = None
     token_embedding_mask: torch.Tensor | None = None

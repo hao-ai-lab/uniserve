@@ -23,7 +23,7 @@ from uniserve_worker.protocol.batch import TensorPublication
 from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
-    PipelineStage,
+    MediaCall,
 )
 from uniserve_worker.transfer.exports import validate_exports
 
@@ -67,7 +67,7 @@ def _commit_group(
     """
     with state.group_scope(completion_group):
         commit_started = time.perf_counter_ns()
-        calls = state.group_calls(completion_group)
+        calls = state.batch.calls
 
         # All device reads must finish and every staged resource must validate
         # before completion storage becomes immutable or any publication becomes
@@ -133,7 +133,9 @@ def _commit_group(
                     "logprob result exceeds its registered completion capacity"
                 )
 
-            reports_output = config.rank == worker_info.output_rank(call.entry)
+            reports_output = config.rank == worker_info.output_rank(
+                call.component
+            )
             report_products.extend(outcome.products)
             pending = request
             if outcome is not pending:
@@ -365,8 +367,8 @@ def _discard_group(
             pending.abandon()
 
         if media_mux is not None:
-            for call in state.group_calls(completion_group):
-                if call.kind is PipelineStage.LATENT_PREPARATION:
+            for call in state.batch.calls:
+                if call.kind is MediaCall.LATENT_PREPARATION:
                     media_mux.drop(int(call.request_key.request_id))
 
         state.group_buffers[completion_group].abandon()
@@ -382,7 +384,7 @@ def _discard_group(
         if kv_cache is not None:
             kv_cache.release_buffers(
                 call.kv_output
-                for call in state.group_calls(completion_group)
+                for call in state.batch.calls
                 if call.kv_output is not None
             )
 
@@ -398,7 +400,7 @@ def _discard_group(
             latent_pool.release_buffers(
                 tuple(
                     product.buffer_id
-                    for call in state.group_calls(completion_group)
+                    for call in state.batch.calls
                     for product in call.tensor_outputs()
                 )
             )

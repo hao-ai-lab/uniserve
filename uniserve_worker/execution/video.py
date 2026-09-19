@@ -37,7 +37,7 @@ from uniserve_worker.protocol.batch import (
 from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
-    PipelineStage,
+    MediaCall,
 )
 from uniserve_worker.protocol.identity import CallId
 from uniserve_worker.protocol.output import FinishFlags
@@ -83,7 +83,7 @@ def video_shape(runner: ModelRunner, media: DiffusionParams, tokens: int):
         raise invalid_descriptor(str(error)) from error
 
     if (
-        media.num_decode_chunks != len(windows)
+        media.video_units != len(windows)
         or media.num_inference_steps != builder.num_steps
     ):
         raise invalid_descriptor("video request has invalid computation bounds")
@@ -132,7 +132,7 @@ def prepare_call(runner: ModelRunner, trajectory: VideoState, call, storage):
     """
     kind, size = call.kind, trajectory.size
 
-    if kind in {PipelineStage.LATENT_PREPARATION, PipelineStage.DENOISING}:
+    if kind in {MediaCall.LATENT_PREPARATION, MediaCall.DENOISING}:
         if runner.denoising is None:
             raise RuntimeError("rank does not own denoising execution")
         if "denoising" not in trajectory.tensors:
@@ -146,17 +146,19 @@ def prepare_call(runner: ModelRunner, trajectory: VideoState, call, storage):
         context = runner.denoising.prepare_inputs(size, size)
         return trajectory.tensors["denoising"], context
 
-    if kind is PipelineStage.VIDEO_DECODING:
+    if kind is MediaCall.VIDEO_DECODING:
         return {}, runner.prepare_module(
-            call.entry, size.num_frames, method="decode"
+            call.component, size.num_frames, method="decode"
         )
 
-    if kind is PipelineStage.AUDIO_DECODING:
+    if kind is MediaCall.AUDIO_DECODING:
         decoder = runner.component(kind)
         frames = decoder.latent_frames(audio_samples(runner, size.num_frames))
-        return {}, runner.prepare_module(call.entry, frames, method="decode")
+        return {}, runner.prepare_module(
+            call.component, frames, method="decode"
+        )
 
-    if kind is PipelineStage.VIDEO_ENCODING:
+    if kind is MediaCall.VIDEO_ENCODING:
         component = runner.component(kind)
         if "video_overlap" not in trajectory.tensors:
             if storage is None:
@@ -167,7 +169,7 @@ def prepare_call(runner: ModelRunner, trajectory: VideoState, call, storage):
                 component.state_buffers(size.num_frames)
             )
         return trajectory.tensors["video_overlap"], runner.prepare_module(
-            call.entry, size.num_frames, method="forward"
+            call.component, size.num_frames, method="forward"
         )
 
     return {}, None
@@ -338,7 +340,7 @@ def warmup_decoders(runner: ModelRunner) -> None:
             for size in (builder.maximum, *declared_sizes(runner))
         )
     )
-    for (name, _, method), (binding, call) in runner._module_entries.items():
+    for (name, _, method), (binding, call) in runner._module_calls.items():
         if method != "decode":
             continue
         module = call.module
@@ -414,7 +416,7 @@ def warmup_postprocess(
     """
     entries = [
         (name, call)
-        for (name, _, _), (_, call) in runner._module_entries.items()
+        for (name, _, _), (_, call) in runner._module_calls.items()
         if isinstance(call.module, VideoPostprocessor)
     ]
     if not entries:
@@ -440,7 +442,7 @@ def warmup_postprocess(
             count = min(units_per_round, len(windows) - cursor)
             if position < count:
                 unit = cursor + position
-                segments = (
+                unit_outputs = (
                     TensorOutput(
                         torch.zeros(
                             (1, *layout.shape[1:]),
@@ -458,7 +460,7 @@ def warmup_postprocess(
                 )
                 runner.run_module(
                     name,
-                    segments,
+                    unit_outputs,
                     method="forward",
                     size=frames,
                     frames=(windows[unit],),
@@ -508,7 +510,7 @@ def create_media_resources(
     )
     reconstructs = any(
         isinstance(call.module, VideoPostprocessor)
-        for _, call in runner._module_entries.values()
+        for _, call in runner._module_calls.values()
     )
     if not assembles and not reconstructs:
         return None, None
@@ -579,7 +581,7 @@ def validate_batch(
     if postprocessor is None:
         return
     for call in batch.calls:
-        if call.kind is not PipelineStage.LATENT_PREPARATION:
+        if call.kind is not MediaCall.LATENT_PREPARATION:
             continue
         if predecessors.get(call.call_id) != CallId(0, 0):
             raise invalid_descriptor(
@@ -643,7 +645,7 @@ def execute(
     # Media units are encoded on the ranks that reconstruct them; only the
     # muxer rank encodes the audio track and assembles the artifact.
     if (
-        call.kind in {PipelineStage.AUDIO_ENCODING, PipelineStage.MUXING}
+        call.kind in {MediaCall.AUDIO_ENCODING, MediaCall.MUXING}
         and mux is None
     ):
         raise unsupported_setup("artifact assembly has no muxer resources")
@@ -651,7 +653,7 @@ def execute(
 
     tasks: tuple[HostTask, ...] = ()
     products: tuple[TensorPublication, ...] = ()
-    if call.kind is PipelineStage.LATENT_PREPARATION:
+    if call.kind is MediaCall.LATENT_PREPARATION:
         params = trajectory_params(call, state=state)
         if int(params.start_step) != 0 or int(params.step_count) != 0:
             raise invalid_descriptor(
@@ -706,7 +708,7 @@ def execute(
                     non_blocking=True,
                 )
 
-    elif call.kind is PipelineStage.DENOISING:
+    elif call.kind is MediaCall.DENOISING:
         params = trajectory_params(call, state=state)
         start_step, step_count = int(params.start_step), int(params.step_count)
         if start_step != calls.require_progress(request).flow_step:
@@ -730,7 +732,7 @@ def execute(
         if result.stats is None:
             raise RuntimeError("module output has no execution statistics")
         state.group_forward_stats[completion_group].append(result.stats)
-        request.projected_progress = replace(
+        request.progress = replace(
             calls.require_progress(request),
             flow_step=start_step + step_count,
         )
@@ -752,10 +754,10 @@ def execute(
             )
 
     elif call.kind in {
-        PipelineStage.VIDEO_DECODING,
-        PipelineStage.AUDIO_DECODING,
-        PipelineStage.VIDEO_ENCODING,
-        PipelineStage.AUDIO_ENCODING,
+        MediaCall.VIDEO_DECODING,
+        MediaCall.AUDIO_DECODING,
+        MediaCall.VIDEO_ENCODING,
+        MediaCall.AUDIO_ENCODING,
     }:
         params = decode_range(call, state=state)
         inputs = call.inputs
@@ -771,7 +773,7 @@ def execute(
         request.device_reads.append(read)
         if (
             read.region is not None
-            and call.kind is not PipelineStage.VIDEO_ENCODING
+            and call.kind is not MediaCall.VIDEO_ENCODING
         ):
             # Video encoding consumes the media unit this rank decoded, which is
             # a region of the round's product; every other media call consumes a
@@ -783,13 +785,12 @@ def execute(
         cursor, count = params.cursor, params.max_units
         track = (
             MediaTrack.AUDIO
-            if call.kind
-            in {PipelineStage.AUDIO_DECODING, PipelineStage.AUDIO_ENCODING}
+            if call.kind in {MediaCall.AUDIO_DECODING, MediaCall.AUDIO_ENCODING}
             else MediaTrack.VIDEO
         )
         if call.kind in {
-            PipelineStage.VIDEO_DECODING,
-            PipelineStage.AUDIO_DECODING,
+            MediaCall.VIDEO_DECODING,
+            MediaCall.AUDIO_DECODING,
         }:
             # Each rank of a distributed decoder binding owns one media unit
             # of the declared range, on either track.
@@ -801,9 +802,9 @@ def execute(
             windows = (
                 model_runner.video_decoder.frame_slices(media.num_frames)
                 if samples is None
-                else audio_unit_windows(model_runner, call.entry, samples)
+                else audio_unit_windows(model_runner, call.component, samples)
             )
-            binding = model_runner.bindings[call.entry]
+            binding = model_runner.bindings[call.component]
             position = binding.config.ranks.index(
                 binding.process_group.global_rank
             )
@@ -819,7 +820,7 @@ def execute(
 
             if track is MediaTrack.VIDEO:
                 result = model_runner.run_module(
-                    call.entry,
+                    call.component,
                     (read.tensor,),
                     method="decode",
                     size=media.num_frames,
@@ -829,7 +830,7 @@ def execute(
             else:
                 decoder = model_runner.component(call.kind)
                 result = model_runner.run_module(
-                    call.entry,
+                    call.component,
                     (read.tensor,),
                     method="decode",
                     size=decoder.latent_frames(samples),
@@ -854,13 +855,13 @@ def execute(
                 tensor_store=tensor_store,
                 publication_transports=publication_transports,
                 state=state,
-                host=call.kind is PipelineStage.AUDIO_DECODING,
+                host=call.kind is MediaCall.AUDIO_DECODING,
             )
-        elif call.kind is PipelineStage.VIDEO_ENCODING:
+        elif call.kind is MediaCall.VIDEO_ENCODING:
             # The rank that decoded this media unit converts it to RGB on its
             # device lane and encodes it on its host lane, so its input is the
             # shard it published rather than the whole round.
-            binding = model_runner.bindings[call.entry]
+            binding = model_runner.bindings[call.component]
             position = binding.config.ranks.index(
                 binding.process_group.global_rank
             )
@@ -888,7 +889,7 @@ def execute(
                 )
 
             layout = decoder.output_layout(media.num_frames)["video"]
-            segments = (
+            unit_outputs = (
                 TensorOutput(
                     read.tensor[0].unsqueeze(0),
                     replace(
@@ -901,8 +902,8 @@ def execute(
                 ),
             )
             processed = model_runner.run_module(
-                call.entry,
-                segments,
+                call.component,
+                unit_outputs,
                 method="forward",
                 size=media.num_frames,
                 frames=(windows[unit],),
@@ -1060,7 +1061,7 @@ def execute(
     # Reconstruction and mux calls consume products without advancing the
     # diffusion trajectory. Keep their progress absent; denoising retains the
     # step already projected above through the same completion boundary.
-    request.projected_progress = calls.execution_runtime(request, None)
+    request.progress = calls.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
     request.product_generations = calls.output_generations(call)
     request.completion_tasks = tasks

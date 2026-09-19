@@ -1112,7 +1112,7 @@ class PendingOutput:
         # The call states the coordinates it runs at, so the rank reads them
         # rather than deriving them from a predecessor's record. The device
         # state a previous call left behind stays with the request.
-        self.projected_progress: RequestProgress = RequestProgress(
+        self.progress: RequestProgress = RequestProgress(
             logical_position=call.coordinates.logical_position,
             rng_counter=request.rng_counter,
             flow_step=call.coordinates.flow_step,
@@ -1139,7 +1139,7 @@ class PendingOutput:
         self.error_code: ErrorCode | None = None
 
         # Numerical updates are borrowed until the completed group commits to
-        # DecodeState. Host acceptance continues to use projected_progress and
+        # DecodeState. Host acceptance continues to use progress and
         # the completion ranges, independently of these device references.
         self.tensor_exports: dict[BufferId, ExportLocations] = {}
         self.cache_exports: dict[BufferId, ExportLocations] = {}
@@ -1277,7 +1277,7 @@ class PendingOutput:
 
         status = self.status
         error_code = self.error_code
-        runtime = self.projected_progress
+        runtime = self.progress
         tokens = self.committed_tokens
         suppressed = status is CallStatus.PREDICATED
         if not suppressed:

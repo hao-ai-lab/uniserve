@@ -5,7 +5,7 @@
 //! output is named by request epoch, producer call, point, and generation.
 
 use std::collections::HashSet;
-use uniserve_worker_ipc::{CallCoordinates, ForwardMode, PipelineStage, TransferMode};
+use uniserve_worker_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode};
 
 use uniserve_core::{GenerationRequest, ImageIngestStep, RequestId, SamplingParams};
 use uniserve_worker_ipc::{
@@ -142,8 +142,7 @@ pub(super) fn consumes_image_features(call: &Call) -> bool {
 pub(super) fn is_feedback_computation(call: &Call) -> bool {
     (matches!(
         call.code,
-        CallKind::Pipeline(PipelineStage::VisionEncoding)
-            | CallKind::Pipeline(PipelineStage::LatentEncoding)
+        CallKind::Media(MediaCall::VisionEncoding) | CallKind::Media(MediaCall::LatentEncoding)
     ) || consumes_image_features(call))
         && call.completion_output.is_some()
 }
@@ -230,13 +229,13 @@ impl super::RequestState {
                 self.image_conditioning = call.kv_output;
                 self.phase = GenerationPhase::PrepareGen;
             }
-            CallKind::Pipeline(PipelineStage::LatentPreparation)
-            | CallKind::Pipeline(PipelineStage::Denoising) => {
+            CallKind::Media(MediaCall::LatentPreparation)
+            | CallKind::Media(MediaCall::Denoising) => {
                 self.image_latent = call.latent_output.clone();
                 if self.image_latent.is_none() {
                     return Err(GenerationResultError::MissingLatentProduct);
                 }
-                if call.code == CallKind::Pipeline(PipelineStage::LatentPreparation) {
+                if call.code == CallKind::Media(MediaCall::LatentPreparation) {
                     self.num_completed_denoise_steps = 0;
                     self.phase = GenerationPhase::DenoiseGen;
                 } else {
@@ -245,7 +244,7 @@ impl super::RequestState {
                     self.replayable = false;
                 }
             }
-            CallKind::Pipeline(PipelineStage::ImageDecoding) => {
+            CallKind::Media(MediaCall::ImageDecoding) => {
                 // Decoding the artifact releases the trajectory, so the request
                 // leaves the flow and its next call enters at step zero.
                 self.num_completed_denoise_steps = 0;
@@ -255,8 +254,8 @@ impl super::RequestState {
                 self.phase = GenerationPhase::FeedbackEncode;
                 self.replayable = false;
             }
-            CallKind::Pipeline(PipelineStage::VisionEncoding)
-            | CallKind::Pipeline(PipelineStage::LatentEncoding)
+            CallKind::Media(MediaCall::VisionEncoding)
+            | CallKind::Media(MediaCall::LatentEncoding)
                 if is_feedback_computation(call) =>
             {
                 self.feedback_features = call.encoder_output.clone();
@@ -305,7 +304,7 @@ fn computation(request: &GenerationRequest, code: CallKind) -> Call {
         request_key: RequestKey::new(0, request.request_id, 0),
         call_id: CallId::new(0, 0),
         coordinates: CallCoordinates::default(),
-        entry: "model".into(),
+        component: "model".into(),
         code,
         bounds: Bounds {
             max_tokens: 1,
@@ -460,8 +459,8 @@ pub(super) fn plan_encode(
         return Err(PlanningError::MissingImageInput);
     }
     let code = match step {
-        ImageIngestStep::VaeEncode => CallKind::Pipeline(PipelineStage::LatentEncoding),
-        ImageIngestStep::VitEncode => CallKind::Pipeline(PipelineStage::VisionEncoding),
+        ImageIngestStep::VaeEncode => CallKind::Media(MediaCall::LatentEncoding),
+        ImageIngestStep::VitEncode => CallKind::Media(MediaCall::VisionEncoding),
     };
     let mut call = computation(request, code);
     if source.is_none() && !image_base64.is_empty() {
@@ -524,10 +523,7 @@ pub(super) fn plan_diffusion_prepare(
     if !request.generates_images() {
         return Err(PlanningError::GenerationBranchDisabled);
     }
-    let mut call = computation(
-        request,
-        CallKind::Pipeline(PipelineStage::LatentPreparation),
-    );
+    let mut call = computation(request, CallKind::Media(MediaCall::LatentPreparation));
     call.kv_input = Some(conditioning);
     call.latent_output = Some(latent_output(
         0,
@@ -555,7 +551,7 @@ pub(super) fn plan_diffusion_step(
     if !request.generates_images() {
         return Err(PlanningError::GenerationBranchDisabled);
     }
-    let mut call = computation(request, CallKind::Pipeline(PipelineStage::Denoising));
+    let mut call = computation(request, CallKind::Media(MediaCall::Denoising));
     call.bounds.max_tokens = u32::from(step_count.max(1));
     call.kv_input = Some(conditioning);
     call.latent_input = Some(latent);
@@ -576,7 +572,7 @@ pub(super) fn plan_diffusion_finalize(
     if !request.generates_images() {
         return Err(PlanningError::GenerationBranchDisabled);
     }
-    let mut call = computation(request, CallKind::Pipeline(PipelineStage::ImageDecoding));
+    let mut call = computation(request, CallKind::Media(MediaCall::ImageDecoding));
     call.latent_input = Some(latent);
     call.image_output = feedback_image_output(request)?;
     call.completion_output = Some(output_tensor(2, DType::U8));
@@ -597,7 +593,7 @@ fn finish_plan(
         .map(TensorRef::max_bytes)
         .max()
         .unwrap_or(0);
-    let image_completion_bytes = if call.code == CallKind::Pipeline(PipelineStage::ImageDecoding) {
+    let image_completion_bytes = if call.code == CallKind::Media(MediaCall::ImageDecoding) {
         png_base64_bound(request.image.width, request.image.height)?
     } else {
         0
@@ -750,7 +746,7 @@ pub(crate) fn validate_generation_result(
             detail: "call_failed",
         });
     }
-    if call.code == CallKind::Pipeline(PipelineStage::Denoising) {
+    if call.code == CallKind::Media(MediaCall::Denoising) {
         let expected_step = start_step
             .ok_or(GenerationResultError::Progress {
                 detail: "denoise_input_step_missing",
@@ -775,7 +771,7 @@ pub(crate) fn validate_generation_result(
     // Read the PNG header to check the requested dimensions. Full image
     // decoding belongs to the image consumer, outside result processing.
     let image_png = media.and_then(|value| std::str::from_utf8(value.as_bytes()).ok());
-    if call_variant == CallKind::Pipeline(PipelineStage::ImageDecoding) {
+    if call_variant == CallKind::Media(MediaCall::ImageDecoding) {
         if media.is_some_and(|value| value.len() as u64 > call.bounds.max_completion_bytes) {
             return Err(GenerationResultError::Product {
                 detail: "image_capacity_exceeded",

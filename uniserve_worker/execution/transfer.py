@@ -136,9 +136,9 @@ def execute(
         request.cache_installation = (source, output, installed)
 
         outcome = encode.non_state_outcome(call, completion_group, state=state)
-        if outcome.projected_progress is not None:
-            outcome.projected_progress = replace(
-                outcome.projected_progress,
+        if outcome.progress is not None:
+            outcome.progress = replace(
+                outcome.progress,
                 kv_visible_len=int(installed.published_extent),
                 kv_computed_len=int(installed.published_extent),
             )

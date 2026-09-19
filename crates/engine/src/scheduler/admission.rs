@@ -162,20 +162,20 @@ impl Scheduler {
         sampling: uniserve_core::DiffusionSamplingParams,
         num_prompt_tokens: u32,
     ) -> Option<Vec<(String, u32, DType, ShapeBound)>> {
-        use uniserve_worker_ipc::PipelineStage;
+        use uniserve_worker_ipc::MediaCall;
 
         let mut outputs = Vec::new();
         for (role, output_count) in [
-            (PipelineStage::TextEncoding, 1),
-            (PipelineStage::Denoising, 2),
-            // The video decoder's entry declares the decoded windows and the
+            (MediaCall::TextEncoding, 1),
+            (MediaCall::Denoising, 2),
+            // The video decoder component declares the decoded windows and the
             // media units encoded from them; both are indexed by media unit.
-            (PipelineStage::VideoDecoding, 2),
-            (PipelineStage::AudioDecoding, 1),
+            (MediaCall::VideoDecoding, 2),
+            (MediaCall::AudioDecoding, 1),
         ] {
-            let entry = self.info.pipeline_components.get(&role)?;
+            let name = self.info.media_components.get(&role)?;
             let (_, bound, info) = self
-                .entry_candidates(CallKind::Pipeline(role), entry)
+                .component_candidates(CallKind::Media(role), name)
                 .next()?;
             let component = info
                 .components
@@ -186,7 +186,7 @@ impl Scheduler {
             }
             for (index, output) in component.outputs.iter().enumerate() {
                 let mut shape = output.shape_bound.clone();
-                if role == PipelineStage::TextEncoding {
+                if role == MediaCall::TextEncoding {
                     let mut selected = false;
                     for dim in &mut shape.dims {
                         if let DimBound::Device { max } = *dim {
@@ -200,16 +200,16 @@ impl Scheduler {
                     if !selected {
                         return None;
                     }
-                } else if role == PipelineStage::VideoDecoding {
+                } else if role == MediaCall::VideoDecoding {
                     let Some(DimBound::Device { max }) = shape.dims.first().copied() else {
                         return None;
                     };
-                    if sampling.num_decode_chunks == 0 || sampling.num_decode_chunks > max {
+                    if sampling.video_units == 0 || sampling.video_units > max {
                         return None;
                     }
-                    shape.dims[0] = DimBound::Static(sampling.num_decode_chunks);
+                    shape.dims[0] = DimBound::Static(sampling.video_units);
                 }
-                outputs.push((entry.clone(), index as u32, output.dtype, shape));
+                outputs.push((name.clone(), index as u32, output.dtype, shape));
             }
         }
         Some(outputs)
@@ -224,16 +224,16 @@ impl Scheduler {
             });
             return;
         }
-        // A worker reports the entry serving each stage it implements, so a
+        // A worker reports the component serving each media call it implements, so a
         // deployment that assembles an artifact is the one that can serve a
-        // video request; reporting some stage is not enough.
+        // video request; reporting some call is not enough.
         if !self
             .info
-            .pipeline_components
-            .contains_key(&uniserve_worker_ipc::PipelineStage::Muxing)
+            .media_components
+            .contains_key(&uniserve_worker_ipc::MediaCall::Muxing)
         {
             let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
-                message: "worker does not provide video pipeline components".to_string(),
+                message: "worker does not provide the video media components".to_string(),
             });
             return;
         }
@@ -248,7 +248,8 @@ impl Scheduler {
             .is_none()
         {
             let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
-                message: "loaded media entries cannot represent the requested output bounds".into(),
+                message: "loaded media components cannot represent the requested output bounds"
+                    .into(),
             });
             return;
         }
@@ -284,11 +285,16 @@ impl Scheduler {
             let request_epoch = self.next_request_epoch;
             let request_key = RequestKey::new(self.engine_id, id, request_epoch);
             let sampling = submission.request.sampling;
-            if self.info.pipeline_components.iter().any(|(stage, entry)| {
-                !self
-                    .entry_candidates(CallKind::Pipeline(*stage), entry)
-                    .any(|(worker, _, _)| self.executor.is_ready(worker))
-            }) {
+            if self
+                .info
+                .media_components
+                .iter()
+                .any(|(media_call, component)| {
+                    !self
+                        .component_candidates(CallKind::Media(*media_call), component)
+                        .any(|(worker, _, _)| self.executor.is_ready(worker))
+                })
+            {
                 self.waiting_media.insert(id, submission);
                 self.waiting_media_order.push_front(id);
                 break;
@@ -303,7 +309,7 @@ impl Scheduler {
                 .expect("queued media has valid output bounds");
             let mut tensors = HashMap::new();
             let mut reserved = true;
-            for (entry, index, dtype, shape_bound) in outputs {
+            for (component, index, dtype, shape_bound) in outputs {
                 let bytes = shape_bound
                     .max_elements()
                     .saturating_mul(dtype.element_bytes());
@@ -312,7 +318,7 @@ impl Scheduler {
                     break;
                 };
                 tensors.insert(
-                    (entry, index),
+                    (component, index),
                     MediaTensorAllocation {
                         allocation,
                         dtype,
@@ -363,10 +369,10 @@ impl Scheduler {
                     allocations,
                     conditioning: None,
                     latents: Vec::new(),
-                    video_segments: BTreeMap::new(),
-                    encoded_segments: BTreeMap::new(),
+                    decoded_units: BTreeMap::new(),
+                    encoded_units: BTreeMap::new(),
                     encoded_ready: BTreeMap::new(),
-                    handed_video_chunks: 0,
+                    handed_units: 0,
                     muxing_inputs: Vec::new(),
                     audio: None,
                     admission,
@@ -377,9 +383,9 @@ impl Scheduler {
                     latent_preparation_scheduled: false,
                     num_scheduled_steps: 0,
                     num_completed_steps: 0,
-                    num_scheduled_decode_chunks: 0,
-                    num_scheduled_video_chunks: 0,
-                    num_encoded_video_chunks: 0,
+                    scheduled_decode_units: 0,
+                    scheduled_encode_units: 0,
+                    encoded_video_units: 0,
                     audio_decoding_scheduled: false,
                     audio_encoding_scheduled: false,
                     audio_encoded: false,
@@ -676,7 +682,7 @@ impl Scheduler {
         let cache = self.cache();
         self.worker_candidates(CallKind::Forward(ForwardMode::Prefill))
             .filter(|(worker, _, _)| self.executor.is_ready(worker))
-            .map(|(worker, entry, info)| {
+            .map(|(worker, component, info)| {
                 let hit = cache.coordinator.probe_prefix(
                     &cache.block_pool,
                     &state.req.prompt_token_ids,
@@ -685,7 +691,7 @@ impl Scheduler {
                     state.req.cache.isolation_key,
                     &info.endpoint,
                 );
-                ((worker.clone(), entry.to_owned()), hit)
+                ((worker.clone(), component.to_owned()), hit)
             })
             .next()
     }

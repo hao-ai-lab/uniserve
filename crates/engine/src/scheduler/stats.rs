@@ -121,17 +121,15 @@ impl ExecutionDomainStats {
     /// Public metrics aggregate concrete call kinds into three stable labels.
     /// This index is used only for counters, never for execution or lane routing.
     pub(super) const fn index(computation: uniserve_worker_ipc::CallKind) -> usize {
-        use uniserve_worker_ipc::{CallKind, ForwardMode, PipelineStage};
+        use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
         match computation {
             CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify) => 1,
             CallKind::Forward(_)
             | CallKind::Transfer(_)
-            | CallKind::Pipeline(
-                PipelineStage::TextEncoding
-                | PipelineStage::VisionEncoding
-                | PipelineStage::LatentEncoding,
+            | CallKind::Media(
+                MediaCall::TextEncoding | MediaCall::VisionEncoding | MediaCall::LatentEncoding,
             ) => 0,
-            CallKind::Pipeline(_) => 2,
+            CallKind::Media(_) => 2,
         }
     }
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from tests.python.fixtures.launch import worker_args
-from uniserve_worker.protocol.call import ForwardMode, PipelineStage
+from uniserve_worker.protocol.call import ForwardMode, MediaCall
 
 pytestmark = pytest.mark.unit
 
@@ -147,15 +147,15 @@ def test_execution_lanes_reject_duplicate_domain_bindings(tmp_path) -> None:
         ("ar_decode", {ForwardMode.DECODE}),
         (
             "diffusion_decode",
-            {PipelineStage.VIDEO_DECODING, PipelineStage.AUDIO_DECODING},
+            {MediaCall.VIDEO_DECODING, MediaCall.AUDIO_DECODING},
         ),
         (
             "media_append",
-            {PipelineStage.VIDEO_ENCODING, PipelineStage.AUDIO_ENCODING},
+            {MediaCall.VIDEO_ENCODING, MediaCall.AUDIO_ENCODING},
         ),
         (
             "diffusion_finalize",
-            {PipelineStage.IMAGE_DECODING, PipelineStage.MUXING},
+            {MediaCall.IMAGE_DECODING, MediaCall.MUXING},
         ),
     ],
 )
