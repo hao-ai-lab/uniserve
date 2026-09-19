@@ -47,9 +47,26 @@ pub struct SimExecutor {
     progress_tx: Sender<()>,
     progress_rx: Receiver<()>,
     in_flight: usize,
+    /// Whether a result is delivered only to a poll that waits for it.
+    results_on_wait: bool,
+    /// Where the boundary events go while a test observes them.
+    observer: Option<Sender<BatchEvent>>,
     handle: Option<JoinHandle<()>>,
     admissions: HashSet<uniserve_worker_ipc::RequestKey>,
     products: HashSet<TensorRef>,
+}
+
+/// What the simulated executor observed at its boundary, in the order it
+/// happened: a batch the scheduler submitted and a result it was handed back.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BatchEvent {
+    /// A batch as the executor accepted it.
+    Submitted(ExecutionBatch),
+    /// The executor handed this batch's result to the scheduler.
+    Resolved {
+        /// Logical batch identity assigned at submission.
+        batch_id: u64,
+    },
 }
 
 impl SimExecutor {
@@ -66,6 +83,7 @@ impl SimExecutor {
     /// Panics if the simulator thread cannot be spawned.
     pub fn with_depth(mut engine: SimEngine, depth: usize) -> Self {
         let info = engine.info().clone();
+        let results_on_wait = engine.results_on_wait;
         let depth = depth.max(1);
         let (to_worker, jobs) = crossbeam_channel::unbounded();
         let (results_tx, from_worker) = crossbeam_channel::unbounded();
@@ -105,10 +123,23 @@ impl SimExecutor {
             progress_tx,
             progress_rx,
             in_flight: 0,
+            results_on_wait,
+            observer: None,
             handle: Some(handle),
             admissions: HashSet::new(),
             products: HashSet::new(),
         }
+    }
+
+    /// Reports every batch this executor accepts and every result it hands
+    /// back, in order, to the returned receiver.
+    ///
+    /// The receiver disconnects when the executor is dropped, so a reader can
+    /// drain the complete record after the scheduler has closed.
+    pub fn observe(&mut self) -> Receiver<BatchEvent> {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        self.observer = Some(sender);
+        receiver
     }
 
     /// Returns a waker that interrupts executor polling after command enqueue.
@@ -128,6 +159,12 @@ impl SimExecutor {
     ) -> anyhow::Result<Option<(BatchResult, Vec<uniserve_worker_ipc::BatchCommand>)>> {
         if self.handle.is_none() {
             let _ = self.progress_rx.recv_timeout(timeout);
+            return Ok(None);
+        }
+        // A paced simulator answers only a caller that waits: an instantaneous
+        // check observes nothing, so the batches in flight stay in flight until
+        // the scheduler blocks for one of them.
+        if self.results_on_wait && timeout.is_zero() {
             return Ok(None);
         }
         let result = crossbeam_channel::select! {
@@ -213,6 +250,9 @@ impl Executor for SimExecutor {
                 .iter()
                 .flat_map(|(call, _)| call.tensor_outputs().cloned()),
         );
+        if let Some(observer) = &self.observer {
+            let _ = observer.send(BatchEvent::Submitted(batch.clone()));
+        }
         self.to_worker.send(Job::Batch(batch)).map_err(|_| {
             ExecutorSubmitError::Failed(anyhow::anyhow!("sim executor thread gone"))
         })?;
@@ -254,6 +294,11 @@ impl Executor for SimExecutor {
                 }
                 _ => {}
             }
+        }
+        if let Some(observer) = &self.observer {
+            let _ = observer.send(BatchEvent::Resolved {
+                batch_id: result.batch_id,
+            });
         }
         Ok(Some(result))
     }
@@ -357,6 +402,7 @@ pub struct SimEngine {
     text_len: usize,
     fake_eos: u32,
     vocab: usize,
+    results_on_wait: bool,
     requests: HashMap<RequestId, SimRequestState>,
 }
 
@@ -380,6 +426,7 @@ impl SimEngine {
             text_len: DEFAULT_TEXT_LEN,
             fake_eos: FAKE_EOS_TOKEN,
             vocab: SYNTH_VOCAB_SIZE,
+            results_on_wait: false,
             requests: HashMap::new(),
         }
     }
@@ -689,9 +736,19 @@ impl SimEngine {
                 PipelineStage::VideoDecoding
                 | PipelineStage::AudioDecoding
                 | PipelineStage::VideoEncoding
-                | PipelineStage::AudioEncoding
-                | PipelineStage::Muxing,
+                | PipelineStage::AudioEncoding,
             ) => {}
+            CallKind::Pipeline(PipelineStage::Muxing) => {
+                // The muxer assembles the request's encoded media units into
+                // one artifact; the simulator publishes a synthetic payload
+                // that names what it assembled.
+                let payload = format!(
+                    "uniserve-sim-video request={} encoded_units={}",
+                    call.request_key.request_id.0,
+                    call.inputs.len()
+                );
+                record.media_output = Some(publish_media("uniserve-video-", payload.as_bytes())?);
+            }
             CallKind::Pipeline(PipelineStage::ImageDecoding) => {
                 request.flow_step = 0;
                 if let Some(image) = request.image().cloned() {
@@ -701,18 +758,8 @@ impl SimEngine {
                         DEFAULT_IMAGE_HW
                     };
                     let png_base64 = synthetic_png_b64(width, height)?;
-                    use std::io::Write;
-                    let mut storage = tempfile::Builder::new()
-                        .prefix("uniserve-image-")
-                        .tempfile_in("/dev/shm")?;
-                    storage.write_all(png_base64.as_bytes())?;
-                    let (_file, path) = storage.keep()?;
-                    record.media_output = Some(uniserve_worker_ipc::MediaOutput {
-                        handle: uniserve_worker_ipc::ArtifactHandle::PosixShm {
-                            name: path.file_name().unwrap().to_str().unwrap().to_owned(),
-                        },
-                        bytes: png_base64.len() as u64,
-                    });
+                    record.media_output =
+                        Some(publish_media("uniserve-image-", png_base64.as_bytes())?);
                 }
             }
         }
@@ -763,6 +810,17 @@ impl SimEngine {
     /// Sets the number of synthetic tokens emitted before the configured EOS.
     pub fn set_text_len(&mut self, length: usize) {
         self.text_len = length;
+    }
+
+    /// Delivers a result only to a poll that waits for it.
+    ///
+    /// An instantaneous check then never observes a completion, so the
+    /// scheduler sees every batch it submitted in flight until it blocks for
+    /// one, and results arrive one per wait in submission order. This is the
+    /// regime of a device slower than its scheduler, and it makes the order of
+    /// submissions and completions a function of scheduling decisions alone.
+    pub fn set_results_on_wait(&mut self, on: bool) {
+        self.results_on_wait = on;
     }
 
     /// Configures EOS and expands the synthetic vocabulary for control tokens.
@@ -834,6 +892,30 @@ impl SimEngine {
 fn set_kv_lengths(lengths: &mut RequestOutput, visible: u32) {
     lengths.kv_visible_len = visible;
     lengths.kv_computed_len = visible;
+}
+
+/// Publishes bytes as an immutable POSIX shared-memory artifact.
+///
+/// The object is left in place under its generated name; the engine claims it
+/// by that name and unlinks it when it opens the result.
+fn publish_media(prefix: &str, bytes: &[u8]) -> anyhow::Result<uniserve_worker_ipc::MediaOutput> {
+    use std::io::Write;
+
+    let mut storage = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempfile_in("/dev/shm")?;
+    storage.write_all(bytes)?;
+    let (_file, path) = storage.keep()?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("shared-memory artifact has no printable name"))?
+        .to_owned();
+
+    Ok(uniserve_worker_ipc::MediaOutput {
+        handle: uniserve_worker_ipc::ArtifactHandle::PosixShm { name },
+        bytes: bytes.len() as u64,
+    })
 }
 
 /// Encodes a deterministic RGB gradient as a base64 PNG artifact.
