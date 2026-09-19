@@ -166,6 +166,9 @@ table WorkerInfo {
   pipeline_components:[PipelineComponent];
   num_inference_steps:uint;
   host_lane_capacity:uint = 1;
+  // Identity of the loaded checkpoint files. Empty only for the weightless
+  // stub model; every rank serving a checkpoint reports the same value.
+  checkpoint_identity:string;
 }
 
 // Request identities and call records.

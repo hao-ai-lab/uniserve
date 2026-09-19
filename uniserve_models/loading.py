@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
-from collections.abc import Callable, Mapping
+import os
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from importlib import import_module
 from pathlib import Path, PurePosixPath
@@ -60,6 +62,11 @@ class Config(Generic[ConfigT, ModelT]):
     image_processor: ImageProcessor | None
     flow_prompt: FlowPrompt | None
     modules: frozenset[str] | None
+    # Identity of the checkpoint files this closure reads, as defined by
+    # ``checkpoint_identity``. Every rank of one instance must load the same
+    # checkpoint, and the launching side derives the same value for a local
+    # checkpoint directory.
+    checkpoint_identity: str
 
     def __post_init__(self):
         # ``ComponentEntry`` is already immutable, so only the mapping needs
@@ -79,6 +86,125 @@ def _json(path: Path) -> dict:
     if not isinstance(value, dict):
         raise ValueError(f"checkpoint metadata {path} must contain an object")
     return value
+
+
+# Sidecars whose contents enter the checkpoint identity. Every other file,
+# which in practice is a weight shard, contributes only its path and size, so
+# the identity stays cheap for a checkpoint of hundreds of gigabytes.
+_IDENTITY_CONTENT_SUFFIXES = frozenset({".json", ".jinja", ".model", ".txt"})
+
+# Top-level directories that hold training state rather than the served
+# checkpoint; the same exclusion read_config applies when collecting sidecars.
+_IDENTITY_EXCLUDED_DIRECTORIES = frozenset({"optimizer", "original"})
+
+
+def _identity_includes(name: str) -> bool:
+    """Apply the identity's file exclusions to one relative POSIX path."""
+    parts = PurePosixPath(name).parts
+    if any(part.startswith(".") for part in parts):
+        return False
+    return not (len(parts) > 1 and parts[0] in _IDENTITY_EXCLUDED_DIRECTORIES)
+
+
+def _identity_digest(
+    files: Iterable[tuple[str, int]], content: Callable[[str], bytes]
+) -> str:
+    """Digest checkpoint files as the identity rule defines it.
+
+    ``files`` yields relative POSIX paths with their sizes in bytes; ``content``
+    reads the bytes of a sidecar whose contents the identity covers. The
+    digest feeds one SHA-256 with, per file in lexicographic byte order of its
+    path: the path bytes, NUL, the decimal size, NUL, and for a covered
+    sidecar the lowercase hex SHA-256 of its contents followed by NUL.
+    """
+    digest = hashlib.sha256()
+    for name, size in sorted(
+        ((name, size) for name, size in files if _identity_includes(name)),
+        key=lambda entry: os.fsencode(entry[0]),
+    ):
+        digest.update(os.fsencode(name))
+        digest.update(b"\0")
+        digest.update(str(size).encode("ascii"))
+        digest.update(b"\0")
+        if PurePosixPath(name).suffix in _IDENTITY_CONTENT_SUFFIXES:
+            digest.update(
+                hashlib.sha256(content(name)).hexdigest().encode("ascii")
+            )
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _walk_checkpoint(root: Path) -> Iterable[tuple[str, int]]:
+    """Yield every checkpoint file under ``root`` with its size in bytes.
+
+    Hidden entries and the excluded top-level directories are not entered. A
+    symbolic link to a regular file counts as that file, which is how a
+    Hub cache snapshot references its blobs; a link to a directory is not
+    followed, so a checkpoint cannot alias itself into its own identity.
+    """
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                name = Path(entry.path).relative_to(root).as_posix()
+                if not _identity_includes(name):
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    # An excluded top-level directory is pruned here; its
+                    # contents would fail the same predicate one level down.
+                    if (
+                        directory != root
+                        or entry.name not in _IDENTITY_EXCLUDED_DIRECTORIES
+                    ):
+                        pending.append(Path(entry.path))
+                elif entry.is_file():
+                    yield name, entry.stat().st_size
+
+
+def checkpoint_identity(root: Path) -> str:
+    """Identify the checkpoint stored in a local directory.
+
+    The identity is the lowercase hex SHA-256 defined by ``_identity_digest``
+    over every regular file under ``root``. The launching side derives the
+    same value for the directory it names, so a rank that resolves a
+    different checkpoint at the same path is refused by name.
+    """
+    root = Path(root)
+    return _identity_digest(
+        _walk_checkpoint(root), lambda name: (root / name).read_bytes()
+    )
+
+
+def _hub_checkpoint_identity(repository: str, revision: str, io) -> str:
+    """Identify a pinned Hub revision without downloading its weights.
+
+    A snapshot directory holds only the shards this rank has fetched, so the
+    identity takes every file's path and size from the revision's tree and
+    reads sidecar contents through the cache. The result equals
+    ``checkpoint_identity`` of a complete local copy of the revision.
+    """
+    from huggingface_hub import HfApi, hf_hub_download
+
+    files = [
+        (entry.path, int(entry.size))
+        for entry in HfApi().list_repo_tree(
+            repo_id=repository, revision=revision, recursive=True
+        )
+        if getattr(entry, "size", None) is not None
+    ]
+
+    def content(name: str) -> bytes:
+        return Path(
+            hf_hub_download(
+                repo_id=repository,
+                filename=name,
+                revision=revision,
+                cache_dir=io.download_dir,
+            )
+        ).read_bytes()
+
+    return _identity_digest(files, content)
 
 
 def _root(path: str | Path, io: loading.Config):
@@ -395,6 +521,11 @@ def read_config(
         and not name.startswith(("optimizer/", "original/"))
     }
     _fetch(root, sidecars, repository, revision, io)
+    identity = (
+        checkpoint_identity(root)
+        if repository is None
+        else _hub_checkpoint_identity(repository, revision, io)
+    )
     if repository is not None and io.mode != "dummy":
         # Some architectures derive dimensions from checkpoint tensor headers.
         # The package declares those sources before module selection is known.
@@ -531,6 +662,7 @@ def read_config(
         processor,
         package.flow_prompt,
         modules,
+        identity,
     )
 
 
