@@ -170,3 +170,55 @@ def test_norm_rope_prepared_chunks_match_normalized_projections():
             actual[live], expected[live], rtol=2**-7, atol=2**-7
         )
         torch.cuda.synchronize()
+
+
+@torch.inference_mode()
+def test_row_production_over_many_intervals_matches_one_call():
+    """Rows produced interval by interval equal the single-call result.
+
+    Small exchange intervals give several packed segments; the fine
+    attention is launched once for the whole domain and every interval
+    composes its own rows.
+    """
+    torch.manual_seed(2207)
+    projections = torch.randn(
+        256, 5, 4, 128, device="cuda", dtype=torch.bfloat16
+    )
+    q, k, v, gate = projections.unbind(2)
+    valid = torch.tensor([64, 64, 40, 0], device="cuda", dtype=torch.int32)
+    inputs, workspace = _input(valid), _workspace(q)
+    module = vsa.Attention(vsa.BlockAttention(128**-0.5))
+    live = torch.arange(256, device="cuda") < 64 * 2 + 40
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with ExecutionContext(module, stream=stream, vsa="cute") as context:
+        context.prepare(None)
+        batch = module.select(
+            q, k, inputs, selected_tiles=1, workspace=workspace
+        )
+        expected = module(q, k, v, gate, batch, workspace=workspace).clone()
+
+        produced = torch.zeros_like(q)
+        with module.attention._operator(q, batch) as operator:
+            producer = operator.rows(
+                q,
+                k,
+                v,
+                batch,
+                gate=gate,
+                compressed=workspace.compressed_tiles,
+                out=workspace.attention_output,
+                owners=1,
+                chunk_tokens=64,
+                packed=None,
+                scale=module.attention.scale,
+            )
+            for start in range(0, 256, 64):
+                producer(
+                    slice(start, start + 64), (produced[start : start + 64],)
+                )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            produced[live], expected[live], rtol=2e-2, atol=2e-2
+        )
