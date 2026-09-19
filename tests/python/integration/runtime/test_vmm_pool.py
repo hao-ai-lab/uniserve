@@ -7,6 +7,8 @@ import torch
 
 from uniserve_worker.transfer.vmm_pool import (
     ACK_WORD_BYTES,
+    ACKNOWLEDGED,
+    CLAIMED,
     HEADER_BYTES,
     PoolExhaustedError,
     VmmPool,
@@ -51,31 +53,37 @@ def test_a_product_that_does_not_fit_is_refused_by_size(pool: VmmPool) -> None:
         pool.reserve(pool.capacity * 2)
 
 
-def test_a_chunk_is_acknowledged_only_by_the_slots_named_for_it(
-    pool: VmmPool,
-) -> None:
+def test_a_chunk_is_held_only_by_the_slots_reading_it(pool: VmmPool) -> None:
     """Each consuming rank owns one word, addressed by the slot the head gave.
 
-    Owning a word rather than sharing a counter is what lets a consumer
-    acknowledge with a plain store into the chunk it already mapped, with no
-    cross-process atomic and no connection back to the producer.
+    Owning a word rather than sharing a counter is what lets a consumer claim
+    and acknowledge with plain stores into the chunk it already mapped, with
+    no cross-process atomic and no connection back to the producer.
     """
     chunk = pool.reserve(4096)
     named = (3, 7)
 
-    assert not chunk.acknowledged(named), "an unacknowledged chunk is held"
+    # A chunk whose consumers never began reading holds nothing: the producer
+    # sweeps only after the engine retired the publication, and no consumer
+    # claims it after that.
+    assert chunk.settled(named), "an unclaimed chunk is free"
 
-    chunk.acknowledgments[3] = 1
-    assert not chunk.acknowledged(named), "a partly acknowledged chunk is held"
-    # A word outside the named slots is not this product's to acknowledge.
-    chunk.acknowledgments[5] = 1
-    assert not chunk.acknowledged(named), "an unnamed slot does not acknowledge"
+    chunk.acknowledgments[3] = CLAIMED
+    assert not chunk.settled(named), "a chunk being read is held"
+    chunk.acknowledgments[3] = ACKNOWLEDGED
+    assert chunk.settled(named), "an acknowledged read releases the chunk"
 
-    chunk.acknowledgments[7] = 1
-    assert chunk.acknowledged(named), "every named slot has acknowledged"
+    # A word outside the named slots is not this product's to wait on.
+    chunk.acknowledgments[5] = CLAIMED
+    assert chunk.settled(named), "an unnamed slot does not hold the chunk"
+
+    chunk.acknowledgments[7] = CLAIMED
+    assert not chunk.settled(named), "any named reader holds the chunk"
+    chunk.acknowledgments[7] = ACKNOWLEDGED
+    assert chunk.settled(named), "every named reader has finished"
 
     # A product no other rank reads has nothing to wait for.
-    assert chunk.acknowledged(())
+    assert chunk.settled(())
 
 
 def test_a_consumer_addresses_its_word_by_slot_from_the_chunk_offset(
@@ -93,23 +101,28 @@ def test_a_consumer_addresses_its_word_by_slot_from_the_chunk_offset(
     word = pool.mapping.view(torch.uint8)[
         chunk.offset + slot * ACK_WORD_BYTES :
     ][:ACK_WORD_BYTES].view(torch.int32)
-    word.fill_(1)
+    word.fill_(CLAIMED)
+    assert not chunk.settled((slot,))
 
-    assert chunk.acknowledged((slot,))
+    word.fill_(ACKNOWLEDGED)
+    assert chunk.settled((slot,))
 
 
-def test_a_reused_chunk_starts_unacknowledged(pool: VmmPool) -> None:
-    """A chunk's acknowledgments are cleared when its span is handed out again.
+def test_a_reused_chunk_starts_unclaimed(pool: VmmPool) -> None:
+    """A chunk's words are cleared when its span is handed out again.
 
-    Stale acknowledgments would retire a product before its consumers had read
-    it, so the pool clears them at reservation rather than at release.
+    A stale acknowledgment would let the next publication's reader appear
+    finished before it had read, so the pool clears the words at reservation
+    rather than at release.
     """
     first = pool.reserve(4096)
-    first.acknowledgments[:4] = 1
+    first.acknowledgments[:4] = ACKNOWLEDGED
     pool.release(first)
 
     reused = pool.reserve(4096)
     assert reused.offset == first.offset, (
         "the released span is handed out again"
     )
-    assert not reused.acknowledged((0,)), "a reused chunk starts unacknowledged"
+    assert all(word == 0 for word in reused.acknowledgments[:4].tolist()), (
+        "a reused chunk starts unclaimed"
+    )

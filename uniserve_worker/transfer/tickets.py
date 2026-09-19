@@ -45,7 +45,7 @@ from ..protocol.transfer import (
     PosixShmTransfer,
     WorkerEndpoint,
 )
-from . import segment
+from . import segment, vmm_pool
 from .endpoint import Publications, locator_digest
 from .layout import region_view, validate_destination
 from .vmm_pool import ACK_WORD_BYTES, PoolChunk, PoolExhaustedError, VmmPool
@@ -306,11 +306,17 @@ _endpoint_lock = threading.Lock()
 
 
 @cache
-def _acknowledged_word() -> torch.Tensor:
-    """Return the pinned host word a consumer writes to acknowledge a chunk."""
+def _chunk_word(state: int) -> torch.Tensor:
+    """Return the pinned host word a consumer writes into a chunk's header.
+
+    A claim precedes the consumer's first read of the chunk and an
+    acknowledgment follows its last, so a producing rank sweeping a retired
+    publication can tell a consumer that is still reading from one that never
+    began.
+    """
     import torch
 
-    return torch.ones(1, dtype=torch.int32).pin_memory()
+    return torch.full((1,), state, dtype=torch.int32).pin_memory()
 
 
 class TransferTicket:
@@ -790,10 +796,12 @@ class _BoundedTransferPool:
         device = spans[0].device
 
         if device.type != "cuda":
+            if acknowledgment is not None:
+                acknowledgment.copy_(_chunk_word(vmm_pool.CLAIMED))
             for target, value in pairs:
                 target.copy_(value)
             if acknowledgment is not None:
-                acknowledgment.copy_(_acknowledged_word())
+                acknowledgment.copy_(_chunk_word(vmm_pool.ACKNOWLEDGED))
             ticket._complete(destination)
             return
 
@@ -816,6 +824,13 @@ class _BoundedTransferPool:
                     ticket._destination_stream = None
                 if producer is not None:
                     stream.wait_event(producer)
+                if acknowledgment is not None:
+                    # The claim is ordered before the copies on this stream,
+                    # so a producer sweeping a retired publication never
+                    # reuses a chunk this read is about to touch.
+                    acknowledgment.copy_(
+                        _chunk_word(vmm_pool.CLAIMED), non_blocking=True
+                    )
                 for target, value in pairs:
                     if value.device.type == "cpu":
                         from uniserve_kernel.peer_memory import copy_host_device
@@ -829,7 +844,7 @@ class _BoundedTransferPool:
                     # first launch of one in a process pays CUDA module
                     # loading, which a one-word acknowledgment should not.
                     acknowledgment.copy_(
-                        _acknowledged_word(), non_blocking=True
+                        _chunk_word(vmm_pool.ACKNOWLEDGED), non_blocking=True
                     )
                 completed = self._events.acquire(device)
                 self._events.record(completed, device)
@@ -1714,16 +1729,6 @@ class _CudaSource:
     #: Acknowledgment slots of the ranks that read this publication.
     consumers: tuple[int, ...] = ()
 
-    def acknowledged(self) -> bool:
-        """Report whether every consumer of this publication has acknowledged.
-
-        A publication that holds no pool chunk has no header to acknowledge:
-        its consumers close a reader grant instead.
-        """
-        if self.chunk is None:
-            return True
-        return self.chunk.acknowledged(self.consumers)
-
     def events_released(self) -> None:
         # A shareable handle is bytes the publication carried, not a process
         # descriptor this rank owns, so nothing is closed here.
@@ -2098,15 +2103,16 @@ class CudaVmmTransport(Transport):
             chunk.acknowledgments[list(source.consumers)]
             for source, _, chunk in held
         ]
-        acknowledged = (
+        observed = (
             torch.cat(watched).cpu().split([len(words) for words in watched])
         )
 
         waiting = []
-        for (source, pool, chunk), words in zip(
-            held, acknowledged, strict=True
-        ):
-            if bool(words.all()):
+        for (source, pool, chunk), words in zip(held, observed, strict=True):
+            # A chunk returns once no named consumer is still reading it: one
+            # that never claimed its word holds nothing, which is how a
+            # product whose consuming call was never submitted retires.
+            if bool((words != vmm_pool.CLAIMED).all()):
                 pool.release(chunk)
             else:
                 waiting.append(source)
