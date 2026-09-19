@@ -228,6 +228,7 @@ class Worker:
                 transfer_backends=config.data_plane.backends,
                 publication_backends=config.data_plane.publication_backends,
                 worker_id=config.worker_id,
+                checkpoint_identity=loaded.checkpoint_identity,
                 queue_depth=config.ipc.queue_depth,
                 completion_payload_bytes=config.ipc.max_payload_bytes,
                 acknowledgment_slot=config.ipc.acknowledgment_slot,
@@ -266,6 +267,7 @@ class Worker:
         components: tuple[tuple[str, ComponentConfig], ...] = (),
         process_groups: ProcessGroups | None = None,
         bindings: Mapping[str, ModelEntry] | None = None,
+        checkpoint_identity: str = "",
     ) -> None:
         """Allocate execution resources for an already-loaded model.
 
@@ -372,6 +374,7 @@ class Worker:
                 allowed_work_variants=allowed_work_variants,
                 transfer_backends=transfer_backends,
                 components=components,
+                checkpoint_identity=checkpoint_identity,
                 attention_identity=f"{type(attention).__module__}.{type(attention).__qualname__}",
                 # The scheduler's page indices are shared across all
                 # resident layer and head regions, including stages with

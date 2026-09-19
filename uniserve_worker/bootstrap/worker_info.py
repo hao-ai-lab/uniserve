@@ -275,6 +275,10 @@ class WorkerInfo:
     encoder_cache_entries: int = 0
     encoder_entry_bytes: int = 0
     configuration_id: str = ""
+    # Identity of the loaded checkpoint files, distinct from the resolved
+    # execution configuration. The engine requires it from every rank that
+    # serves a checkpoint; a model built in-process without one reports none.
+    checkpoint_identity: str = ""
     components: tuple[EntryInfo, ...] = ()
     device: str = "cpu"
     transfer_backends: tuple[str, ...] = ("local",)
@@ -401,6 +405,12 @@ class WorkerInfo:
 
         if not self.model_name:
             raise invalid_descriptor("worker model name is empty")
+        if self.checkpoint_identity and not _is_sha256_hex(
+            self.checkpoint_identity
+        ):
+            raise invalid_descriptor(
+                "worker checkpoint identity must be a lowercase hex SHA-256"
+            )
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "info") -> WorkerInfo:
@@ -424,6 +434,10 @@ class WorkerInfo:
                 f"{where}.num_inference_steps",
             ),
             configuration_id=str(data.get("configuration_id", "")),
+            checkpoint_identity=_str(
+                data.get("checkpoint_identity", ""),
+                f"{where}.checkpoint_identity",
+            ),
             components=tuple(
                 EntryInfo.from_mapping(item, f"{where}.components[{index}]")
                 for index, item in enumerate(
@@ -505,6 +519,7 @@ class WorkerInfo:
             "fabric_handles": self.fabric_handles,
             "world_size": self.world_size,
             "configuration_id": self.configuration_id,
+            "checkpoint_identity": self.checkpoint_identity,
             "components": [
                 component.to_mapping() for component in self.components
             ],
@@ -581,6 +596,13 @@ def _str(value: object, where: str) -> str:
     if not isinstance(value, str):
         raise invalid_descriptor(f"{where} must be a string")
     return value
+
+
+def _is_sha256_hex(value: str) -> bool:
+    """Report whether text is the lowercase hex form of one SHA-256 digest."""
+    return len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
 
 
 __all__ = [

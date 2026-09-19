@@ -119,6 +119,7 @@ def configuration_identity(
     layout_description = asdict(layout)
     layout_description["info"].pop("endpoint")
     layout_description["info"].pop("configuration_id")
+    layout_description["info"].pop("checkpoint_identity")
     if layout.input_config is not None:
         layout_description["input_config"]["embedding_dtype"] = str(
             layout.input_config.embedding_dtype
@@ -178,13 +179,15 @@ def build_worker_layout(
     attention_identity: str | None = None,
     bindings: Mapping[str, ModelEntry] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
+    checkpoint_identity: str = "",
 ) -> WorkerLayout:
     """Resolve resource dimensions and the capacity report used by the worker.
 
     Model dimensions determine storage reservations. Admission additionally
     obeys the configured call set and every lane's bounds; these
     restrictions do not shrink the storage needed by warmup and graph
-    capture.
+    capture. ``checkpoint_identity`` is reported as loaded; a model built
+    without a checkpoint reports none.
     """
     if queue_depth <= 0:
         raise unsupported_setup("worker pipeline depth must be positive")
@@ -225,6 +228,7 @@ def build_worker_layout(
             queue_depth=queue_depth,
             completion_payload_bytes=completion_payload_bytes,
             endpoint=endpoint,
+            checkpoint_identity=checkpoint_identity,
         )
     else:
         layout = _token_worker_layout(
@@ -236,6 +240,7 @@ def build_worker_layout(
             completion_payload_bytes=completion_payload_bytes,
             endpoint=endpoint,
             capacity_group=capacity_group,
+            checkpoint_identity=checkpoint_identity,
         )
 
     # A shared admission limit must be safe on every eligible lane. Keep it
@@ -299,6 +304,7 @@ def _token_worker_layout(
     completion_payload_bytes: int,
     endpoint: WorkerEndpoint,
     capacity_group: Communicator | None,
+    checkpoint_identity: str,
 ) -> WorkerLayout:
     """Size token inputs, paged KV, and latent storage before admission."""
     encoder_cache_entries = (
@@ -489,6 +495,7 @@ def _token_worker_layout(
     )
     info = WorkerInfo(
         model_name=model_name,
+        checkpoint_identity=checkpoint_identity,
         endpoint=endpoint,
         device=str(worker_config.device),
         world_size=int(worker_config.world_size),
@@ -554,6 +561,7 @@ def _request_tensor_worker_layout(
     completion_payload_bytes: int,
     endpoint: WorkerEndpoint,
     bindings: Mapping[str, ModelEntry] | None,
+    checkpoint_identity: str,
 ) -> WorkerLayout:
     """Describe request tensors, products, and persistent capacity."""
     slots = int(worker_config.max_request_pool_size)
@@ -563,6 +571,7 @@ def _request_tensor_worker_layout(
 
     info = WorkerInfo(
         model_name=model_name,
+        checkpoint_identity=checkpoint_identity,
         endpoint=endpoint,
         device=str(worker_config.device),
         world_size=int(worker_config.world_size),

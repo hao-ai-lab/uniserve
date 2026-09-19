@@ -7,6 +7,7 @@ import json
 import shutil
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -227,8 +228,12 @@ def test_remote_image_architecture_resolves_checkpoint_dimensions_and_transforms
     def files(self, *, repo_id, revision):
         return [path.name for path in remote.iterdir()]
 
+    def tree(self, *, repo_id, revision, recursive):
+        return [_tree_file(path, remote) for path in remote.iterdir()]
+
     monkeypatch.setattr("huggingface_hub.hf_hub_download", download)
     monkeypatch.setattr("huggingface_hub.HfApi.list_repo_files", files)
+    monkeypatch.setattr("huggingface_hub.HfApi.list_repo_tree", tree)
     # Architecture inspection still needs the learned position-table extent,
     # even when no numerical module is selected for loading.
     config = models.read_config("owner/bagel", modules=frozenset())
@@ -238,6 +243,13 @@ def test_remote_image_architecture_resolves_checkpoint_dimensions_and_transforms
     assert config.image_processor.feature_injection.start_token_id == 35
     assert config.image_processor.feature_injection.end_token_id == 36
     assert config.flow_prompt is None
+
+
+def _tree_file(path, remote):
+    """Describe one repository file as the Hub tree listing reports it."""
+    return SimpleNamespace(
+        path=path.relative_to(remote).as_posix(), size=path.stat().st_size
+    )
 
 
 def test_unknown_modular_pipeline_fails_at_discovery(tmp_path):
@@ -329,8 +341,14 @@ def test_remote_snapshot_loads_only_the_closed_payload_set(
         assert revision == snapshot.name
         return inventory
 
+    def tree(self, *, repo_id, revision, recursive):
+        assert repo_id == "owner/model"
+        assert revision == snapshot.name
+        return [_tree_file(remote / name, remote) for name in inventory]
+
     monkeypatch.setattr("huggingface_hub.hf_hub_download", download)
     monkeypatch.setattr("huggingface_hub.HfApi.list_repo_files", files)
+    monkeypatch.setattr("huggingface_hub.HfApi.list_repo_tree", tree)
     io = loading.Config(
         revision="release", download_dir=str(tmp_path / "snapshots")
     )

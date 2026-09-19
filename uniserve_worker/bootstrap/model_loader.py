@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from importlib import import_module
@@ -50,12 +51,35 @@ class WorkerModel:
     tokenizer: Any | None = None
     image_processor: ImageProcessor | None = None
     flow_prompt: FlowPrompt | None = None
+    # Identity of the loaded checkpoint; empty for a model without one.
+    checkpoint_identity: str = ""
+
+
+def verify_checkpoint_identity(
+    expected: str | None, actual: str, *, rank: int, host: str
+) -> None:
+    """Refuse a rank whose loaded checkpoint is not the one the head derived.
+
+    ``expected`` is absent when the launching side could not read the
+    checkpoint locally; the engine then still requires every rank to report
+    the same identity. The refusal names the rank and host so an operator can
+    find the divergent copy.
+    """
+    if expected is None or expected == actual:
+        return
+
+    raise unsupported_setup(
+        f"rank {rank} on host {host} loaded checkpoint {actual}, but the "
+        f"head derived checkpoint {expected}"
+    )
 
 
 def prepare_worker_model(config: WorkerProcessArgs) -> models.Config | None:
     """Resolve the resident checkpoint closure.
 
-    The closure is resolved before creating process groups.
+    The closure is resolved before creating process groups, and its checkpoint
+    identity is verified against the launch expectation before any weight
+    is read.
     """
     if config.use_stub_model:
         return None
@@ -84,6 +108,15 @@ def prepare_worker_model(config: WorkerProcessArgs) -> models.Config | None:
         for call in declared[name]
     )
     source = models.read_config(launch.path, io=config.load, modules=resident)
+
+    # The host name is the same identity the rank's endpoint reports, so the
+    # refusal and the engine's own report name one host.
+    verify_checkpoint_identity(
+        launch.checkpoint_identity,
+        source.checkpoint_identity,
+        rank=config.execution.rank,
+        host=socket.gethostname(),
+    )
 
     return replace(
         source,
@@ -283,6 +316,7 @@ def load_worker_model(
         None if source.tokenizer is None else load_tokenizer(source.tokenizer),
         source.image_processor,
         source.flow_prompt,
+        source.checkpoint_identity,
     )
 
 
