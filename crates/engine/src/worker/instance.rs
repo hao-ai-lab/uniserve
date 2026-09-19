@@ -237,6 +237,42 @@ fn process_world_configuration_id(workers: &[RankProcess]) -> String {
     identity
 }
 
+/// Refuses a placement whose muxer is not on the head's host.
+///
+/// The artifact a muxer publishes is a POSIX shared-memory object the head
+/// opens by name, and such a name resolves in one host's namespace. A muxer
+/// placed elsewhere would fail on the first request, so the placement is
+/// refused at startup, naming the component and the host it was placed on.
+pub(crate) fn refuse_muxer_off_head(
+    head: &str,
+    ranks: &[crate::WorkerRank],
+    entries: &BTreeMap<String, crate::executor::ComponentConfig>,
+    pipeline_components: &BTreeMap<uniserve_worker_ipc::PipelineStage, String>,
+) -> anyhow::Result<()> {
+    let Some(component) = pipeline_components.get(&uniserve_worker_ipc::PipelineStage::Muxing)
+    else {
+        return Ok(());
+    };
+    let placement = entries.get(component).with_context(|| {
+        format!("component {component} serves muxing but the placement binds no such component")
+    })?;
+    for &rank in &placement.ranks {
+        let node = ranks
+            .get(rank)
+            .map(|placed| placed.node.as_str())
+            .with_context(|| {
+                format!("component {component} names rank {rank} outside the placement")
+            })?;
+        anyhow::ensure!(
+            node == head,
+            "component {component} serves muxing on rank {rank} on host {node}, but the head is \
+             on host {head}, and the artifact it publishes is a shared-memory object named in \
+             one host's namespace"
+        );
+    }
+    Ok(())
+}
+
 impl WorkerGroup {
     /// Launch every configured rank and expose the instance after capability agreement.
     pub fn spawn(process_args: WorkerProcessArgs) -> anyhow::Result<Self> {
@@ -317,6 +353,12 @@ impl WorkerGroup {
                 "physical rank {rank} worker info disagree with rank 0"
             );
         }
+        refuse_muxer_off_head(
+            &process_args.host,
+            &process_args.ranks,
+            &process_args.entries,
+            &info.pipeline_components,
+        )?;
         if let Some(cache) = &mut info.kv_cache {
             let regions: Vec<_> = workers
                 .iter()
@@ -1476,5 +1518,70 @@ impl WorkerGroup {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refuse_muxer_off_head;
+    use crate::WorkerRank;
+    use crate::executor::ComponentConfig;
+    use std::collections::BTreeMap;
+    use uniserve_worker_ipc::PipelineStage;
+
+    fn placement(nodes: &[&str]) -> Vec<WorkerRank> {
+        nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| WorkerRank {
+                node: (*node).to_owned(),
+                device: format!("cuda:{index}"),
+            })
+            .collect()
+    }
+
+    fn entries(muxer_ranks: Vec<usize>) -> BTreeMap<String, ComponentConfig> {
+        BTreeMap::from([(
+            "muxer".to_owned(),
+            ComponentConfig::parallel(muxer_ranks, Default::default()),
+        )])
+    }
+
+    fn muxing(component: &str) -> BTreeMap<PipelineStage, String> {
+        BTreeMap::from([(PipelineStage::Muxing, component.to_owned())])
+    }
+
+    #[test]
+    fn a_muxer_on_the_head_host_is_admitted() {
+        let ranks = placement(&["rank-0", "rank-0", "rank-1", "rank-1"]);
+        refuse_muxer_off_head("rank-0", &ranks, &entries(vec![0]), &muxing("muxer"))
+            .expect("a muxer on the head's host serves the artifact the head opens");
+        // A deployment without a muxer publishes no artifact and is unaffected.
+        refuse_muxer_off_head("rank-0", &ranks, &entries(vec![3]), &BTreeMap::new())
+            .expect("a placement without muxing has no artifact to place");
+    }
+
+    #[test]
+    fn a_muxer_off_the_head_host_is_refused_by_name() {
+        let ranks = placement(&["rank-0", "rank-0", "rank-1", "rank-1"]);
+        let error = refuse_muxer_off_head("rank-0", &ranks, &entries(vec![3]), &muxing("muxer"))
+            .expect_err("a muxer on another host cannot publish an artifact the head opens");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("muxer"),
+            "the refusal names the component: {message}"
+        );
+        assert!(
+            message.contains("rank-1"),
+            "the refusal names the muxer's host: {message}"
+        );
+        assert!(
+            message.contains("rank-0"),
+            "the refusal names the head's host: {message}"
+        );
+
+        let error = refuse_muxer_off_head("rank-0", &ranks, &entries(vec![0]), &muxing("output"))
+            .expect_err("a muxing component the placement does not bind is refused");
+        assert!(format!("{error:#}").contains("output"));
     }
 }
