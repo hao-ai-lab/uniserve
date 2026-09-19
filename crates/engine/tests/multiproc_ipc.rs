@@ -2363,6 +2363,7 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "registration_address": "__REGISTRATION__",
     "channel_transport": "iceoryx2",
     "acknowledgment_slot": 0,
+    "host_slots": [0],
     "product_consumers": [],
     "products_cross_hosts": false,
     "worker_id": "worker",
