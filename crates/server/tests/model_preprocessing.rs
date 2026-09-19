@@ -111,7 +111,7 @@ fn try_resolved_model(
             limits,
             sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
             max_model_tokens: 4096,
-            denoise_steps: 0,
+            denoise_steps: 4,
         },
         true,
     )?;

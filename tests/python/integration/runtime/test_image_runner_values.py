@@ -201,7 +201,6 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                     Call(
                         RequestKey(1, slot, 0),
                         CallId(1, index),
-                        None,
                         CallCoordinates(),
                         mode,
                         Bounds(),
@@ -437,7 +436,6 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
             call = Call(
                 RequestKey(1, 0, 0),
                 CallId(1, 0),
-                None,
                 CallCoordinates(),
                 ForwardMode.PREFILL,
                 Bounds(),
@@ -475,7 +473,6 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         call = Call(
             RequestKey(1, 0, 0),
             CallId(1, 0),
-            None,
             CallCoordinates(),
             ForwardMode.PREFILL,
             Bounds(),
@@ -531,7 +528,6 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                         Call(
                             RequestKey(1, 0, 0),
                             CallId(1, 0),
-                            None,
                             CallCoordinates(),
                             ForwardMode.DECODE,
                             Bounds(),
