@@ -388,6 +388,10 @@ struct MediaFlowState {
     audio: Option<TensorRef>,
     admission: NewRequest,
     admission_state: WorkerRegistration,
+    /// When the engine received the request and when it admitted it, so the
+    /// time before a request's first device call can be attributed.
+    queued_at: f64,
+    admitted_at: f64,
     text_encoding_scheduled: bool,
     latent_preparation_scheduled: bool,
     num_scheduled_steps: u32,
@@ -481,6 +485,8 @@ enum DiffusionTerminal {
 struct PendingMedia {
     request: DiffusionRequest,
     event_tx: EventTx,
+    /// When the engine received the request, for the preparing-time record.
+    queued_at: f64,
 }
 
 /// Permissive unified-multimodal limits for a scheduler built without
