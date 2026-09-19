@@ -103,3 +103,53 @@ def test_a_channel_locator_from_another_endpoint_is_refused(
     finally:
         producer.close()
         other.close()
+
+
+def test_a_channel_product_of_media_size_fits_its_publication_bound(
+    events: EventPool,
+) -> None:
+    """The bytes are the product, not the handle.
+
+    A media unit's PCM or encoded bytes are far larger than a transfer handle
+    may be, and they travel on the rank channel whose message caps bound them;
+    the publication's handle bound counts the locator, not the payload.
+    """
+    from uniserve_worker.protocol.batch import TensorPublication
+    from uniserve_worker.protocol.identity import CallId, RequestKey
+    from uniserve_worker.protocol.tensor import (
+        DType,
+        ShapeBound,
+        StaticDim,
+        TensorRef,
+    )
+    from uniserve_worker.protocol.transfer import (
+        DeviceProductTransferValue,
+        TensorTransfer,
+    )
+
+    transport = make_transport(
+        "channel", byte_capacity=1 << 21, ticket_capacity=2, event_pool=events
+    )
+    try:
+        samples = 5 * 32000
+        pcm = torch.zeros(samples, 2, dtype=torch.int16)
+        locator = transport.publish(pcm)
+        publication = TensorPublication(
+            product=TensorRef(
+                request_key=RequestKey(1, 1, 1),
+                producer_call_id=CallId(1, 0),
+                output_index=0,
+                generation=1,
+                dtype=DType.I16,
+                shape_bound=ShapeBound((StaticDim(samples), StaticDim(2))),
+            ),
+            value=DeviceProductTransferValue(
+                height=0,
+                width=0,
+                value_range="",
+                tensor=TensorTransfer(shape=(samples, 2), locations=(locator,)),
+            ),
+        )
+        assert publication.encoded_size_bound() < pcm.numel() * 2
+    finally:
+        transport.close()
