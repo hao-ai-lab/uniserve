@@ -881,7 +881,6 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
     def prompt_op(
         sid: int,
         call_id: CallId,
-        predecessor: CallId,
         tokens: tuple[int, ...],
     ) -> Call:
         """Build one prompt computation with direct token inputs."""
@@ -893,7 +892,6 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
         call = Call(
             request_key=keys[sid],
             call_id=call_id,
-            predecessor=predecessor,
             coordinates=coordinates_for(sid, len(tokens)),
             kind=ForwardMode.PREFILL,
             bounds=Bounds(max_tokens=max(1, len(tokens))),
@@ -917,7 +915,6 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
         return Call(
             request_key=keys[sid],
             call_id=call_id,
-            predecessor=predecessor.call_id,
             coordinates=coordinates_for(sid, 1),
             kind=ForwardMode.DECODE,
             bounds=Bounds(max_tokens=1),
@@ -928,9 +925,8 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
     predecessors: dict[int, Call] = {}
     calls: list[Call] = []
     for sid in request_ids:
-        root = CallId(0, 0)
         call_id = CallId(requests._batch_id + 1, len(calls))
-        call = prompt_op(sid, call_id, root, (0,))
+        call = prompt_op(sid, call_id, (0,))
         calls.append(call)
 
     _execute_warmup(
@@ -1071,7 +1067,6 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                 Call(
                     request_key=key,
                     call_id=call_id,
-                    predecessor=root,
                     coordinates=CallCoordinates(),
                     kind=TransferMode.KV_PUBLISH,
                     bounds=Bounds(max_transfer_bytes=1 << 20),
@@ -1128,7 +1123,6 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                 Call(
                     request_key=key,
                     call_id=call_id,
-                    predecessor=root,
                     coordinates=CallCoordinates(),
                     kind=PipelineStage.LATENT_PREPARATION,
                     bounds=Bounds(
@@ -1182,7 +1176,6 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                     Call(
                         request_key=key,
                         call_id=call_id,
-                        predecessor=flow_predecessors[request_id].call_id,
                         coordinates=CallCoordinates(flow_step=quantum),
                         kind=PipelineStage.DENOISING,
                         bounds=Bounds(

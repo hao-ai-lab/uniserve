@@ -1019,7 +1019,10 @@ class Worker:
         """Start one accepted batch and queue its result."""
         if pending.batch is None:
             raise RuntimeError("accepted execute request lost its batch")
-        batch = BatchState(pending.batch)
+        batch = BatchState(
+            pending.batch,
+            predecessors=self.requests.predecessors(pending.batch.calls),
+        )
         self._batch_submissions[batch.batch_id] = pending
         self.inflight[batch.batch_id] = batch
 
@@ -1327,7 +1330,11 @@ class Worker:
         if batch.batch_id in self.inflight:
             raise invalid_descriptor("batch ID already has an in-flight batch")
 
-        state = BatchState(batch, propagate_errors=propagate_errors)
+        state = BatchState(
+            batch,
+            propagate_errors=propagate_errors,
+            predecessors=self.requests.predecessors(batch.calls),
+        )
         self.inflight[state.batch_id] = state
 
         try:
@@ -1419,11 +1426,11 @@ class Worker:
         consumed = _input_producers(batch)
         self._release_predecessors(
             tuple(
-                (call.request_key, call.predecessor)
+                (call.request_key, predecessor)
                 for call in batch.calls
-                if call.predecessor is not None
-                and call.predecessor.batch_id > 0
-                and (call.request_key, call.predecessor) in consumed
+                if (predecessor := state.predecessor(call)) is not None
+                and predecessor.batch_id > 0
+                and (call.request_key, predecessor) in consumed
             )
         )
 
@@ -1432,10 +1439,7 @@ class Worker:
                 predicate.buffer_id
                 for call in batch.calls
                 if (predicate := call.predicate) is not None
-                and (
-                    call.predecessor is None
-                    or predicate.producer_call_id != call.predecessor
-                )
+                and predicate.producer_call_id != state.predecessor(call)
             )
         )
         state.launched = True
@@ -1456,6 +1460,7 @@ class Worker:
             worker_info=self.info,
             model_runner=self.runner,
             config=self.worker_config,
+            predecessors=state.predecessors,
         )
 
         for command in batch.commands:
@@ -1466,11 +1471,11 @@ class Worker:
         consumed = _input_producers(batch)
         self._release_predecessors(
             tuple(
-                (call.request_key, call.predecessor)
+                (call.request_key, predecessor)
                 for call in batch.calls
-                if call.predecessor is not None
-                and call.predecessor.batch_id > 0
-                and (call.request_key, call.predecessor) not in consumed
+                if (predecessor := state.predecessor(call)) is not None
+                and predecessor.batch_id > 0
+                and (call.request_key, predecessor) not in consumed
             )
         )
         self._release_commands(batch)

@@ -301,10 +301,6 @@ impl<'py> NativeRequestConversion<'py> {
         // Resolve identity, lineage, resource bounds, and product references
         // before constructing the call.
         let request_key = self.request_key(call.request_key)?;
-        let predecessor = call
-            .predecessor
-            .map(|id| self.computation_id(id))
-            .transpose()?;
         let coordinates = self.types.call_coordinates.bind(self.py).call1((
             call.coordinates.logical_position,
             call.coordinates.kv_visible_len,
@@ -377,7 +373,6 @@ impl<'py> NativeRequestConversion<'py> {
             [
                 request_key.into_any(),
                 self.computation_id(call.call_id)?,
-                predecessor.into_pyobject(py)?.into_any(),
                 coordinates.into_any(),
                 self.types.kind(py, call.code),
                 bounds.into_any(),
@@ -1956,7 +1951,6 @@ mod tests {
             }),
             request_key,
             call_id: CallId::new(11, 0),
-            predecessor: Some(CallId::new(0, 0)),
             entry: "model".into(),
             code: CallKind::Forward(ForwardMode::Prefill),
             bounds: Bounds {
@@ -2023,7 +2017,6 @@ mod tests {
             sampling_state: None,
             request_key: media_key,
             call_id: CallId::new(12, 0),
-            predecessor: Some(CallId::new(0, 0)),
             entry: "model".into(),
             code: CallKind::Pipeline(PipelineStage::LatentPreparation),
             bounds: Bounds {
@@ -2067,7 +2060,6 @@ mod tests {
 
             request_key: kv_key,
             call_id: CallId::new(13, 0),
-            predecessor: Some(CallId::new(0, 0)),
             entry: "decoder".into(),
             code: CallKind::Transfer(TransferMode::KvInstall),
             bounds: Bounds {
