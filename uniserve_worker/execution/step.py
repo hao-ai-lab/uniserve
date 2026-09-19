@@ -39,7 +39,6 @@ if TYPE_CHECKING:
     from uniserve_worker.config import WorkerConfig
     from uniserve_worker.execution.model_runner import ModelRunner
     from uniserve_worker.execution.output import OutputPool
-    from uniserve_worker.media.buffers import MediaBuffers
     from uniserve_worker.media.mux import MediaMux
     from uniserve_worker.runtime.block_tables import BlockTables
     from uniserve_worker.runtime.cache_manager import CacheManager
@@ -78,7 +77,6 @@ def execute_batch(
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
-    media_buffers: MediaBuffers | None,
     output_pool: OutputPool,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
@@ -131,7 +129,6 @@ def execute_batch(
             worker_info=worker_info,
             latent_pool=latent_pool,
             media_mux=media_mux,
-            media_buffers=media_buffers,
             output_pool=output_pool,
             request_tables=request_tables,
             request_pool=request_pool,
@@ -170,6 +167,7 @@ def execute_batch(
             latent_pool=latent_pool,
             media_mux=media_mux,
             publication_transports=publication_transports,
+            transports=transfer_backends,
             request_tables=request_tables,
             request_pool=request_pool,
             model_runner=model_runner,

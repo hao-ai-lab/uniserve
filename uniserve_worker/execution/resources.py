@@ -60,6 +60,59 @@ def media_state_buffers(
     return result
 
 
+def decoded_units_layout(model: nn.Module, num_frames: int) -> OutputLayout:
+    """Describe a video decoding round's product: RGB media units.
+
+    Each row holds one media unit's frames at the output raster; a unit
+    shorter than the longest fills its row's leading frames, and the unit
+    division names how many. The rows are host products a host rank's
+    encoder reads in place.
+    """
+    from ..bootstrap.inputs import capability
+
+    decoder = capability(model, VideoDecoder)
+    windows = decoder.frame_slices(num_frames)
+    frames = max(window.stop - window.start for window in windows)
+    shape = (
+        len(windows),
+        frames,
+        decoder.frame_size.height,
+        decoder.frame_size.width,
+        3,
+    )
+    return OutputLayout(
+        shape,
+        torch.uint8,
+        tuple(slice(0, extent) for extent in shape),
+        variable_axes=(0,),
+        value_range=(0, 255),
+    )
+
+
+def encoded_units_layout(model: nn.Module, num_frames: int) -> OutputLayout:
+    """Describe a video encoding round's product: framed encoded unit rows.
+
+    An encoded unit's length is not known when its row is reserved, so a row
+    is bounded by the largest unit and carries its own length.
+    """
+    from ..bootstrap.inputs import capability
+    from ..media.mux import encoded_unit_bytes
+
+    decoder = capability(model, VideoDecoder)
+    windows = decoder.frame_slices(num_frames)
+    row = encoded_unit_bytes(
+        max(window.stop - window.start for window in windows),
+        decoder.frame_size.height,
+        decoder.frame_size.width,
+    )
+    return OutputLayout(
+        (len(windows), row),
+        torch.uint8,
+        (slice(0, len(windows)), slice(0, row)),
+        variable_axes=(0,),
+    )
+
+
 def output_layouts(
     model: nn.Module,
     config: WorkerConfig,
@@ -83,34 +136,16 @@ def output_layouts(
         )
 
     if isinstance(component, VideoPostprocessor):
-        # The rank that converts a media unit to RGB also encodes it, and the
-        # encoded unit is the product the muxer assembles. Its length is not
-        # known when the product is reserved, so a row is bounded and carries
-        # its own length.
-        from ..media.mux import encoded_unit_bytes
-
-        decoder = capability(model, VideoDecoder)
-        builder = media_builder(model, config)
-        count = builder.maximum.num_frames if frames is None else frames
-        windows = decoder.frame_slices(count)
-        row = encoded_unit_bytes(
-            max(window.stop - window.start for window in windows),
-            decoder.frame_size.height,
-            decoder.frame_size.width,
-        )
-        return {
-            "media_units": OutputLayout(
-                (len(windows), row),
-                torch.uint8,
-                (slice(0, len(windows)), slice(0, row)),
-                variable_axes=(0,),
-            )
-        }
+        # The post-processor's RGB media units are the decoding call's
+        # product, declared with the decoder below.
+        return {}
 
     if not isinstance(component, (Denoiser, VideoDecoder, AudioDecoder)):
         return {}
-    if isinstance(component, VideoDecoder) and frames is not None:
-        return component.output_layout(frames)
+    if isinstance(component, VideoDecoder):
+        builder = media_builder(model, config)
+        count = builder.maximum.num_frames if frames is None else frames
+        return {"video": decoded_units_layout(model, count)}
 
     builder = media_builder(model, config)
     if builder is None:
@@ -124,8 +159,6 @@ def output_layouts(
     )
     if isinstance(component, Denoiser):
         return component.output_layout(size)
-    if isinstance(component, VideoDecoder):
-        return component.output_layout(size.num_frames)
 
     # Audio length follows from the video frame count at the declared rates.
     clock = capability(model, VideoPostprocessor)

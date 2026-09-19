@@ -183,6 +183,9 @@ pub struct WorkerGroup {
     last_progress: Instant,
     pending_batches: BTreeMap<u64, PendingBatch>,
     process_args: WorkerProcessArgs,
+    /// Which component serves each media call across every worker of the
+    /// deployment; the executor states it once all workers have reported.
+    media_routing: BTreeMap<uniserve_worker_ipc::MediaCall, String>,
     resident_requests: HashSet<RequestKey>,
     command_wake_pending: bool,
     readiness_changed: bool,
@@ -476,12 +479,13 @@ impl WorkerGroup {
             launchers,
             workers,
             buffers,
-            info,
             depth,
             last_batch_id: None,
             progress_fds,
             last_progress: Instant::now(),
             pending_batches: BTreeMap::new(),
+            media_routing: info.media_components.clone(),
+            info,
             process_args,
             resident_requests: HashSet::new(),
             command_wake_pending: false,
@@ -901,6 +905,47 @@ impl WorkerGroup {
     }
 }
 
+/// Acknowledgment slots of the ranks reading a media product produced on
+/// `rank` of `worker`, where `members` are the ranks executing the call.
+///
+/// The consuming component may belong to another worker, whose ranks all
+/// read the product; on the producing worker the ranks producing their own
+/// copy read that copy instead of another rank's.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn media_consumer_slots(
+    consuming: &[uniserve_worker_ipc::MediaCall],
+    routing: &BTreeMap<uniserve_worker_ipc::MediaCall, String>,
+    worker: &str,
+    components: &BTreeMap<String, crate::ComponentConfig>,
+    peers: &BTreeMap<String, BTreeMap<String, crate::ComponentConfig>>,
+    transfer: &crate::executor::TransferConfig,
+    members: &[usize],
+    rank: usize,
+) -> Vec<u32> {
+    let owner_of = |component: &str| {
+        if let Some(config) = components.get(component) {
+            return Some((worker, config));
+        }
+        peers.iter().find_map(|(id, components)| {
+            components
+                .get(component)
+                .map(|config| (id.as_str(), config))
+        })
+    };
+    let mut slots = BTreeSet::new();
+    for consumer in consuming {
+        let Some((owner, component)) = routing.get(consumer).and_then(|name| owner_of(name)) else {
+            continue;
+        };
+        for &reader in &component.ranks {
+            if owner != worker || (reader != rank && !members.contains(&reader)) {
+                slots.insert(transfer.acknowledgment_slot(owner, reader as u32));
+            }
+        }
+    }
+    slots.into_iter().collect()
+}
+
 impl WorkerGroup {
     /// Acknowledgment slots of the ranks that read the products a call
     /// produces on `rank`, where `members` are the ranks executing the call.
@@ -926,23 +971,32 @@ impl WorkerGroup {
         let Some(consuming) = consuming else {
             return transfer.product_consumers(worker, rank as u32);
         };
-        let mut slots = BTreeSet::new();
-        for consumer in consuming {
-            let Some(component) = self
-                .info
-                .media_components
-                .get(consumer)
-                .and_then(|name| self.process_args.components.get(name))
-            else {
-                continue;
-            };
-            for &reader in &component.ranks {
-                if reader != rank && !members.contains(&reader) {
-                    slots.insert(transfer.acknowledgment_slot(worker, reader as u32));
-                }
-            }
-        }
-        slots.into_iter().collect()
+        media_consumer_slots(
+            consuming,
+            &self.media_routing,
+            worker,
+            &self.process_args.components,
+            &self.process_args.peers,
+            transfer,
+            members,
+            rank,
+        )
+    }
+
+    /// The placement this group was launched with: its ranks' hosts and
+    /// devices, and its components.
+    pub fn placement(
+        &self,
+    ) -> (
+        &[crate::WorkerRank],
+        &BTreeMap<String, crate::ComponentConfig>,
+    ) {
+        (&self.process_args.ranks, &self.process_args.components)
+    }
+
+    /// States the deployment-wide media routing once every worker reported.
+    pub fn set_media_routing(&mut self, routing: BTreeMap<uniserve_worker_ipc::MediaCall, String>) {
+        self.media_routing = routing;
     }
 }
 

@@ -54,6 +54,7 @@ def execute_completion(
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     publication_transports: Mapping[str, Transport],
+    transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
     model_runner: ModelRunner,
@@ -110,6 +111,7 @@ def execute_completion(
         latent_pool=latent_pool,
         media_mux=media_mux,
         publication_transports=publication_transports,
+        transports=transports,
         request_tables=request_tables,
         request_pool=request_pool,
         model_runner=model_runner,
@@ -145,13 +147,15 @@ def _execute_ready_actions(
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     publication_transports: Mapping[str, Transport],
+    transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
     model_runner: ModelRunner,
     config: WorkerConfig,
 ) -> None:
     """Execute a dependency frontier that contains no numerical model calls."""
-    from . import encode, flow, transfer, video
+    from . import encode, flow, host_media, transfer, video
+    from .host_media import HOST_MEDIA_CALLS
 
     for index in frontier:
         call, completion_group = scheduled[index]
@@ -197,12 +201,22 @@ def _execute_ready_actions(
                         model_runner=model_runner,
                         state=state,
                     )
+                elif call.kind in HOST_MEDIA_CALLS:
+                    result = host_media.execute(
+                        call,
+                        completion_group,
+                        tensor_store=tensor_store,
+                        media_mux=media_mux,
+                        publication_transports=publication_transports,
+                        transports=transports,
+                        model_runner=model_runner,
+                        state=state,
+                    )
                 elif model_runner.video_postprocessor is not None:
                     result = video.execute(
                         call,
                         completion_group,
                         tensor_store=tensor_store,
-                        media_mux=media_mux,
                         publication_transports=publication_transports,
                         request_pool=request_pool,
                         model_runner=model_runner,
@@ -225,6 +239,7 @@ def _execute_calls(
     latent_pool: LatentPool | None,
     media_mux: MediaMux | None,
     publication_transports: Mapping[str, Transport],
+    transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
     model_runner: ModelRunner,
@@ -310,6 +325,7 @@ def _execute_calls(
                 latent_pool=latent_pool,
                 media_mux=media_mux,
                 publication_transports=publication_transports,
+                transports=transports,
                 request_tables=request_tables,
                 request_pool=request_pool,
                 model_runner=model_runner,

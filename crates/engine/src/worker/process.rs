@@ -160,6 +160,7 @@ impl Default for WorkerProcessArgs {
             // One local rank running one component. A launch replaces this
             // with the components the model being served declared.
             components: crate::WorkerConfig::single_component("model", 1),
+            peers: Default::default(),
             stub: false,
             queue_depth: 2,
             req_slot_cap: 1 << 20,

@@ -1,9 +1,11 @@
-"""Media unit encoding and artifact assembly scheduled on a rank's host lane.
+"""Media unit encoding and artifact assembly scheduled on a host rank's lane.
 
-Each media unit is encoded where it was reconstructed and the audio track is
-encoded on the muxer rank; assembly concatenates the encoded tracks in the
-mux session's codec process. This module owns the rank-side scheduling: which
-job runs for which call, on which lease, and what its result becomes.
+A host rank encodes the media units it is handed and, when it is the muxer,
+encodes the audio track and concatenates the encoded tracks in the mux
+session's codec process. Every input is a host product borrowed in place from
+the shared-memory segment its producer published. This module owns the
+rank-side scheduling: which job runs for which call, on which borrow, and
+what its result becomes.
 """
 
 from __future__ import annotations
@@ -13,8 +15,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
-
-from uniserve.media.video import Config
 
 from ..foundation.errors import invalid_descriptor
 from ..protocol.identity import CallId, RequestKey
@@ -26,15 +26,15 @@ from .codec_process import (
     MuxAppend,
     MuxFinalize,
     SessionKey,
+    SharedSlice,
     require_media_codecs,
 )
 
 if TYPE_CHECKING:
     import torch
 
-    from ..execution.output import OutputBuffer
     from ..runtime.host_lane import HostLane, HostTask
-    from .buffers import MediaLease
+    from ..transfer.tickets import HostBorrow
 
 __all__ = [
     "AvMuxConfig",
@@ -121,7 +121,7 @@ class MuxSession:
 
 
 class MediaEncoder:
-    """One rank's host encoder for the media units it reconstructs."""
+    """One host rank's encoder for the media units it is handed."""
 
     def __init__(self, *, rank: int) -> None:
         self.rank = rank
@@ -132,23 +132,25 @@ class MediaEncoder:
         *,
         config: AvMuxConfig,
         unit_index: int,
-        frames: torch.Tensor,
-        output: OutputBuffer,
+        source: HostBorrow,
         reservation: HostTask,
-        ring_lease: MediaLease,
         call_id: CallId,
     ) -> HostTask:
-        """Schedule one media unit's encode from a captured output-ring slot.
+        """Schedule one media unit's encode from its borrowed RGB bytes.
 
         The bytes become this call's product when the job completes; the
-        encoded length is not known until then.
+        encoded length is not known until then. The borrow is released, and
+        the producer's segment acknowledged, once the encoder has read it.
         """
         return reservation.configure(
-            EncodeVideoUnit(config, ring_lease.slice(frames)),
+            EncodeVideoUnit(
+                config,
+                SharedSlice(source.segment, source.offset, source.nbytes),
+            ),
             dependencies=(),
-            input_ready=output.ready,
-            input_completion=output.completion_future,
-            release=ring_lease.release,
+            input_ready=None,
+            input_completion=None,
+            release=source.release,
             profile_name=(
                 f"uniserve.host.encode request={_key_label(request_key)} "
                 f"step={call_id.batch_id} "
@@ -166,28 +168,11 @@ class MediaMux:
         self._lane = lane
         self._sessions: dict[RequestKey, MuxSession] = {}
 
-    def open(
-        self,
-        request_key: RequestKey,
-        *,
-        video: Config,
-        frame_rate: int,
-        audio_rate: int,
-        video_unit_frames: tuple[int, ...],
-    ) -> None:
-        """Create the request-owned assembly session."""
+    def open(self, request_key: RequestKey, *, config: AvMuxConfig) -> None:
+        """Create the request-owned assembly session under its settings."""
         if request_key in self._sessions:
             return
-        self._sessions[request_key] = MuxSession(
-            AvMuxConfig(
-                width=int(video.frame.width),
-                height=int(video.frame.height),
-                frame_count=int(video.num_frames),
-                frame_rate=int(frame_rate),
-                audio_rate=int(audio_rate),
-                video_unit_frames=video_unit_frames,
-            )
-        )
+        self._sessions[request_key] = MuxSession(config)
 
     def config(self, request_key: RequestKey) -> AvMuxConfig:
         """Return the container settings this request assembles under."""
@@ -199,15 +184,14 @@ class MediaMux:
     def audio(
         self,
         request_key: RequestKey,
-        pcm: torch.Tensor,
-        output: OutputBuffer,
+        sources: tuple[HostBorrow, ...],
         reservation: HostTask,
-        ring_lease: MediaLease,
         call_id: CallId,
     ) -> HostTask:
-        """Schedule the audio track's encode from a captured ring slot.
+        """Schedule the audio track's encode from its borrowed PCM bytes.
 
-        The ring slot holds raw PCM bytes, which the job reads as stereo int16
+        The borrows hold the raw PCM timeline in sample order, one per
+        decoding rank's publication, which the job reads as stereo int16
         samples. The encoded track is the session's own state rather than a
         result, because only the assembled artifact is this request's output.
         """
@@ -218,12 +202,24 @@ class MediaMux:
             raise invalid_descriptor("audio output is already written")
 
         key = session_key(request_key)
+
+        def release() -> None:
+            for source in sources:
+                source.release()
+
         task = reservation.configure(
-            EncodeAudioTrack(key, session.config, ring_lease.slice(pcm)),
+            EncodeAudioTrack(
+                key,
+                session.config,
+                tuple(
+                    SharedSlice(source.segment, source.offset, source.nbytes)
+                    for source in sources
+                ),
+            ),
             dependencies=(),
-            input_ready=output.ready,
-            input_completion=output.completion_future,
-            release=ring_lease.release,
+            input_ready=None,
+            input_completion=None,
+            release=release,
             profile_name=(
                 f"uniserve.host.encode request={_key_label(request_key)} "
                 f"step={call_id.batch_id} "

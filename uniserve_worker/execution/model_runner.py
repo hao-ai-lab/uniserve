@@ -65,6 +65,7 @@ from uniserve_worker.runtime.results import resolve_outputs
 from uniserve_worker.runtime.staging_buffers import StagingBuffers
 
 from ..bootstrap.components import (
+    VIDEO_ENCODER_COMPONENT,
     bind_components,
     call_kinds,
     describe_components,
@@ -203,6 +204,11 @@ class ModelRunner:
                 )
         self.bindings = MappingProxyType(dict(bindings))
         bind_components(model, self.bindings)
+        # A host rank holds components with no numerical method: it warms
+        # nothing up and captures nothing, and its model is a description.
+        self.numerical = any(
+            binding.calls for binding in self.bindings.values()
+        )
         self.state_buffers = media_state_buffers(
             model, self.bindings, worker_config
         )
@@ -737,19 +743,37 @@ class ModelRunner:
         ):
             return None
 
+        frames = None if media is None else media.num_frames
         results = tuple(
-            (call, name, layout)
+            (call.module, name, layout)
             for call in self._declarations[entry]
             for name, layout in output_layouts(
                 self.model,
                 self.worker_config,
                 call,
-                frames=None if media is None else media.num_frames,
+                frames=frames,
                 prompt_tokens=num_prompt_tokens,
             ).items()
         )
-        call, name, layout = results[output_index]
-        if isinstance(call.module, Denoiser) and any(
+        if entry == VIDEO_ENCODER_COMPONENT:
+            # The video encoder owns no numerical method; its product is the
+            # encoded rows of the media units it is handed.
+            from .resources import encoded_units_layout
+
+            count = (
+                self.media_builder.maximum.num_frames
+                if frames is None
+                else frames
+            )
+            results = (
+                (
+                    None,
+                    "encoded_units",
+                    encoded_units_layout(self.model, count),
+                ),
+            )
+        module, name, layout = results[output_index]
+        if isinstance(module, Denoiser) and any(
             axis.stop == axis.start for axis in layout.local_slice
         ):
             return None
@@ -761,7 +785,7 @@ class ModelRunner:
         # A video layout leads with its unit axis, so the total is read from
         # it; an audio layout leads with samples, so the placement states how
         # many media units its ranks reconstruct together.
-        audio = isinstance(call.module, AudioDecoder)
+        audio = isinstance(module, AudioDecoder)
         total = (
             len(binding.config.ranks) * max(1, binding.config.units_per_rank)
             if audio
@@ -777,7 +801,7 @@ class ModelRunner:
         if audio:
             # An audio media unit is a span of the sample timeline, so this
             # rank publishes the samples of the units it reconstructs.
-            spans = call.module.unit_samples(layout.shape[0], units)
+            spans = module.unit_samples(layout.shape[0], units)
             return replace(
                 layout,
                 local_slice=(

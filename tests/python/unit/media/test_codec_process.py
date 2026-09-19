@@ -1,6 +1,7 @@
-"""Codec jobs run in a codec process against media units in a shared mapping."""
+"""Codec jobs run in a codec process against media units in shared memory."""
 
 import io
+from multiprocessing import shared_memory
 
 import av
 import numpy as np
@@ -14,7 +15,7 @@ from uniserve_worker.media.codec_process import (
     MuxAppend,
     MuxClose,
     MuxFinalize,
-    SharedMapping,
+    Probe,
     SharedSlice,
 )
 
@@ -39,19 +40,32 @@ def codec():
         process.close()
 
 
+@pytest.fixture
+def segment():
+    """One shared-memory segment holding every media unit of a test."""
+    storage = shared_memory.SharedMemory(create=True, size=1 << 20)
+    try:
+        yield storage
+    finally:
+        storage.close()
+        storage.unlink()
+
+
 def _write(
-    mapping: SharedMapping, offset: int, values: np.ndarray
+    segment: shared_memory.SharedMemory, offset: int, values: np.ndarray
 ) -> SharedSlice:
     payload = values.tobytes()
-    mapping.buffer[offset : offset + len(payload)] = payload
-    return SharedSlice(mapping.name, offset, len(payload))
+    segment.buf[offset : offset + len(payload)] = payload
+    return SharedSlice(segment.name, offset, len(payload))
 
 
-def test_units_and_audio_from_a_shared_mapping_assemble_into_an_artifact(
-    codec,
+def test_the_probe_confirms_the_process_serves_its_codecs(codec):
+    assert codec.execute(Probe()) is True
+
+
+def test_units_and_audio_from_shared_memory_assemble_into_an_artifact(
+    codec, segment
 ):
-    from multiprocessing import shared_memory
-
     config = _config()
     red = np.zeros((4, 16, 32, 3), dtype=np.uint8)
     red[..., 0] = 255
@@ -59,27 +73,20 @@ def test_units_and_audio_from_a_shared_mapping_assemble_into_an_artifact(
     blue[..., 2] = 255
     pcm = np.zeros((8000, 2), dtype=np.int16)
 
-    mapping = SharedMapping(
-        "test-media-ring", red.nbytes + blue.nbytes + pcm.nbytes
-    )
-    try:
-        codec.attach(mapping)
-        first = _write(mapping, 0, red)
-        second = _write(mapping, red.nbytes, blue)
-        audio = _write(mapping, red.nbytes + blue.nbytes, pcm)
+    first = _write(segment, 0, red)
+    second = _write(segment, red.nbytes, blue)
+    audio = _write(segment, red.nbytes + blue.nbytes, pcm)
 
-        units = (
-            codec.execute(EncodeVideoUnit(config, first)),
-            codec.execute(EncodeVideoUnit(config, second)),
-        )
-        session = (1, 7, 0)
-        assert codec.execute(EncodeAudioTrack(session, config, audio)) is None
-        # Rounds are appended as they complete; the artifact follows the last.
-        codec.execute(MuxAppend(session, config, units[:1]))
-        codec.execute(MuxAppend(session, config, units[1:]))
-        name, nbytes = codec.execute(MuxFinalize(session))
-    finally:
-        mapping.close()
+    units = (
+        codec.execute(EncodeVideoUnit(config, first)),
+        codec.execute(EncodeVideoUnit(config, second)),
+    )
+    session = (1, 7, 0)
+    assert codec.execute(EncodeAudioTrack(session, config, (audio,))) is None
+    # Rounds are appended as they complete; the artifact follows the last.
+    codec.execute(MuxAppend(session, config, units[:1]))
+    codec.execute(MuxAppend(session, config, units[1:]))
+    name, nbytes = codec.execute(MuxFinalize(session))
 
     artifact = shared_memory.SharedMemory(name=name)
     try:
@@ -99,31 +106,36 @@ def test_units_and_audio_from_a_shared_mapping_assemble_into_an_artifact(
             assert pixels.argmax() == (0 if index < 4 else 2)
 
 
-def test_a_failed_job_answers_its_task_and_the_process_serves_on(codec):
+def test_a_failed_job_answers_its_task_and_the_process_serves_on(
+    codec, segment
+):
     config = _config()
     pixels = np.zeros((4, 16, 32, 3), dtype=np.uint8)
-    mapping = SharedMapping("test-media-ring", pixels.nbytes)
-    try:
-        codec.attach(mapping)
-        source = _write(mapping, 0, pixels)
-        with pytest.raises(ValueError, match="RGB24 dimensions"):
-            codec.execute(
-                EncodeVideoUnit(
-                    config, SharedSlice(mapping.name, 0, 16 * 32 * 3 * 3 + 3)
-                )
+    source = _write(segment, 0, pixels)
+    with pytest.raises(ValueError, match="RGB24 dimensions"):
+        codec.execute(
+            EncodeVideoUnit(
+                config, SharedSlice(segment.name, 0, 16 * 32 * 3 * 3 + 3)
             )
-        with pytest.raises(ValueError, match="outside its shared mapping"):
-            codec.execute(
-                EncodeVideoUnit(
-                    config, SharedSlice(mapping.name, 1, pixels.nbytes)
-                )
+        )
+    with pytest.raises(ValueError, match="outside its shared-memory"):
+        codec.execute(
+            EncodeVideoUnit(
+                config,
+                SharedSlice(segment.name, segment.size - 8, pixels.nbytes),
             )
-        assert len(codec.execute(EncodeVideoUnit(config, source))) > 0
-    finally:
-        mapping.close()
+        )
+    with pytest.raises(FileNotFoundError):
+        codec.execute(
+            EncodeVideoUnit(
+                config,
+                SharedSlice("uniserve-no-such-segment", 0, pixels.nbytes),
+            )
+        )
+    assert len(codec.execute(EncodeVideoUnit(config, source))) > 0
 
 
-def test_a_closed_session_cannot_be_finalized(codec):
+def test_a_closed_session_cannot_be_finalized(codec, segment):
     config = _config()
     session = (1, 9, 0)
     codec.execute(MuxClose(session))
@@ -131,15 +143,8 @@ def test_a_closed_session_cannot_be_finalized(codec):
         codec.execute(MuxFinalize(session))
     # A finalize without audio leaves no half-built session behind either.
     pcm = np.zeros((8000, 2), dtype=np.int16)
-    mapping = SharedMapping("test-media-ring", pcm.nbytes)
-    try:
-        codec.attach(mapping)
-        codec.execute(
-            EncodeAudioTrack(session, config, _write(mapping, 0, pcm))
-        )
-        with pytest.raises(ValueError, match="every media unit"):
-            codec.execute(MuxFinalize(session))
-        with pytest.raises(ValueError, match="no assembly session"):
-            codec.execute(MuxFinalize(session))
-    finally:
-        mapping.close()
+    codec.execute(EncodeAudioTrack(session, config, (_write(segment, 0, pcm),)))
+    with pytest.raises(ValueError, match="every media unit"):
+        codec.execute(MuxFinalize(session))
+    with pytest.raises(ValueError, match="no assembly session"):
+        codec.execute(MuxFinalize(session))

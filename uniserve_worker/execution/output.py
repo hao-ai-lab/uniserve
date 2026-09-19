@@ -29,7 +29,6 @@ from ..foundation.errors import (
     WorkerErrorCode,
     resource_error,
 )
-from ..media.buffers import MediaLease
 from ..media.storage import publish_media_bytes
 from ..profiling import timing_events_enabled
 from ..protocol.batch import LatentParams, TensorPublication
@@ -418,54 +417,6 @@ class OutputBuffer:
             host.copy_(flat.to(device="cpu"))
 
         self._byte_cursor += count
-        return host.view(contiguous.shape)
-
-    def capture_bytes_into(
-        self,
-        value: torch.Tensor,
-        storage: torch.Tensor,
-    ) -> torch.Tensor:
-        """Copy bytes into caller-owned pinned storage under this buffer's.
-
-        events.
-
-        The returned host view is readable only after this buffer completes.
-        Its caller retains the external storage through the final CPU reader.
-        """
-        if value.dtype is not torch.uint8:
-            raise ValueError("completion byte capture requires uint8 storage")
-        if self._sealed:
-            raise _invariant(
-                "completion byte capture was registered after its buffer was "
-                "sealed"
-            )
-        if storage.device.type != "cpu" or storage.dtype is not torch.uint8:
-            raise ValueError(
-                "external completion storage must be a CPU uint8 tensor"
-            )
-
-        contiguous = value.detach().contiguous()
-        count = int(contiguous.numel())
-        if count < 1:
-            raise ValueError("completion byte capture must not be empty")
-        if int(storage.numel()) < count:
-            raise resource_error(
-                "external completion byte storage is too small"
-            )
-
-        host = storage.reshape(-1)[:count]
-        flat = contiguous.reshape(-1)
-        if flat.device.type == "cuda":
-            if not bool(host.is_pinned()):
-                raise _invariant(
-                    "CUDA completion byte copy targets pageable host storage"
-                )
-            device = canonical_device(flat.device)
-            self.register_device(device)
-            self._mark_copy_started(device)
-            host.copy_(flat, non_blocking=True)
-        else:
-            host.copy_(flat.to(device="cpu"))
         return host.view(contiguous.shape)
 
     def _byte_floor(self) -> int:
@@ -1172,7 +1123,6 @@ class PendingOutput:
         # batch and filled when the task completes. Its consumer is scheduled
         # only after this call completes, so the bytes are in place before
         # any rank can read them.
-        self.encoded_unit_row: torch.Tensor | None = None
 
         # Physical latent versions are staged here and committed with the output
         # group.
@@ -1201,7 +1151,9 @@ class PendingOutput:
         self._observed = False
 
         self.completion_tasks: tuple[HostTask, ...] = ()
-        self.media_lease: MediaLease | None = None
+        # Host work that produces this call's products publishes them once
+        # the tasks complete, through this hook, on the worker thread.
+        self.finish: Callable[[tuple[object, ...]], None] | None = None
         self._reports_output = True
         self._media_output: MediaOutput | None = None
         self.value: RequestOutput | None = None
@@ -1282,16 +1234,12 @@ class PendingOutput:
         suppressed = status is CallStatus.PREDICATED
         if not suppressed:
             try:
-                for task in self.completion_tasks:
-                    result = task.result()
-                    if (
-                        isinstance(result, bytes)
-                        and self.encoded_unit_row is not None
-                    ):
-                        from ..media.mux import frame_encoded_unit
-
-                        frame_encoded_unit(result, self.encoded_unit_row)
-                        continue
+                results = tuple(task.result() for task in self.completion_tasks)
+                finish, self.finish = self.finish, None
+                if finish is not None:
+                    finish(results)
+                    results = ()
+                for result in results:
                     if isinstance(result, bytes) and self._reports_output:
                         result = MediaOutput(
                             handle=PosixShmArtifact(
@@ -1441,19 +1389,8 @@ class PendingOutput:
         buffers.
         """
         tasks, self.completion_tasks = self.completion_tasks, ()
+        self.finish = None
         actions = [task.abandon for task in tasks]
-
-        lease, self.media_lease = self.media_lease, None
-        if lease is not None:
-            if self._buffer is None:
-                raise RuntimeError(
-                    "unconsumed media storage lost its producer buffer"
-                )
-            actions.append(
-                partial(
-                    lease.defer_until_ready, self._buffer.completion_future()
-                )
-            )
 
         buffer, self._buffer = self._buffer, None
         if buffer is not None and not self._observed:

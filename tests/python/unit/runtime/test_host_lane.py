@@ -155,7 +155,6 @@ def test_session_jobs_share_one_codec_process_and_discard_ends_a_session() -> (
         EncodeVideoUnit,
         MuxAppend,
         MuxFinalize,
-        SharedMapping,
         SharedSlice,
     )
 
@@ -172,18 +171,18 @@ def test_session_jobs_share_one_codec_process_and_discard_ends_a_session() -> (
     blue = np.zeros((2, 16, 32, 3), dtype=np.uint8)
     blue[..., 2] = 255
     pcm = np.zeros((8000, 2), dtype=np.int16)
-    mapping = SharedMapping(
-        "test-lane-ring", red.nbytes + blue.nbytes + pcm.nbytes
+    segment = shared_memory.SharedMemory(
+        create=True, size=red.nbytes + blue.nbytes + pcm.nbytes
     )
     payload = red.tobytes() + blue.tobytes() + pcm.tobytes()
-    mapping.buffer[: len(payload)] = payload
-    first = SharedSlice(mapping.name, 0, red.nbytes)
-    second = SharedSlice(mapping.name, red.nbytes, blue.nbytes)
-    audio = SharedSlice(mapping.name, red.nbytes + blue.nbytes, pcm.nbytes)
+    segment.buf[: len(payload)] = payload
+    first = SharedSlice(segment.name, 0, red.nbytes)
+    second = SharedSlice(segment.name, red.nbytes, blue.nbytes)
+    audio = SharedSlice(segment.name, red.nbytes + blue.nbytes, pcm.nbytes)
 
     pool = HostLane(max_inflight=8, workers=2, codec=True)
     try:
-        pool.attach(mapping)
+        pool.probe()
         encodes = []
         for source in (first, second):
             task = pool.reserve().configure(EncodeVideoUnit(config, source))
@@ -193,7 +192,7 @@ def test_session_jobs_share_one_codec_process_and_discard_ends_a_session() -> (
 
         session = (1, 5, 0)
         track = pool.reserve().configure(
-            EncodeAudioTrack(session, config, audio), session=session
+            EncodeAudioTrack(session, config, (audio,)), session=session
         )
         track.submit_if_ready()
         # Each append follows the previous one; finalization follows the last
@@ -229,7 +228,7 @@ def test_session_jobs_share_one_codec_process_and_discard_ends_a_session() -> (
         # A discarded session is gone from the process that held it.
         other = (1, 6, 0)
         started = pool.reserve().configure(
-            EncodeAudioTrack(other, config, audio), session=other
+            EncodeAudioTrack(other, config, (audio,)), session=other
         )
         started.submit_if_ready()
         started.promise.result(timeout=30)
@@ -240,4 +239,5 @@ def test_session_jobs_share_one_codec_process_and_discard_ends_a_session() -> (
             late.promise.result(timeout=30)
     finally:
         pool.close()
-        mapping.close()
+        segment.close()
+        segment.unlink()

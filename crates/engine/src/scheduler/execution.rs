@@ -369,9 +369,9 @@ impl Scheduler {
 /// This is the same graph `ready_calls` walks and the input binding reads:
 /// text encoding feeds latent preparation, which opens the denoising ladder;
 /// each step feeds the next and the last feeds both decoders; a decoder's
-/// window feeds its encoder and its encoded unit row feeds the muxer, which
-/// also assembles the encoded audio. The producing rank is told which ranks
-/// read its products from this, because it cannot know on its own.
+/// media units feed their encoder, whose encoded unit rows feed the muxer,
+/// which also assembles the encoded audio. The producing rank is told which
+/// ranks read its products from this, because it cannot know on its own.
 pub(crate) fn consuming_calls(media_call: MediaCall) -> Option<&'static [MediaCall]> {
     Some(match media_call {
         MediaCall::TextEncoding => &[MediaCall::LatentPreparation],
@@ -381,7 +381,7 @@ pub(crate) fn consuming_calls(media_call: MediaCall) -> Option<&'static [MediaCa
             MediaCall::VideoDecoding,
             MediaCall::AudioDecoding,
         ],
-        MediaCall::VideoDecoding => &[MediaCall::VideoEncoding, MediaCall::Muxing],
+        MediaCall::VideoDecoding => &[MediaCall::VideoEncoding],
         MediaCall::VideoEncoding => &[MediaCall::Muxing],
         MediaCall::AudioDecoding => &[MediaCall::AudioEncoding],
         MediaCall::AudioEncoding | MediaCall::Muxing => &[],
@@ -394,13 +394,15 @@ pub(crate) fn consuming_calls(media_call: MediaCall) -> Option<&'static [MediaCa
 /// The lanes one media call occupies while it is in flight.
 ///
 /// A component lane measured in media units carries `units`; every other
-/// component lane is exclusive and admits one request at a time. `host` counts
-/// the tasks the call places on the muxer rank's bounded host executor.
+/// component lane is exclusive and admits one request at a time. `host_ranks`
+/// names the host lanes the call places a task on, one slot on each.
 struct LaneDemand {
     component: Option<String>,
     units: u32,
-    /// Ranks whose host lane this call occupies, one slot on each.
-    host_ranks: Vec<u32>,
+    /// Host lanes this call occupies, each named by its worker and rank with
+    /// the number of tasks the call places on it: one per media unit the
+    /// rank encodes, one for any other host call.
+    host_ranks: Vec<(crate::WorkerId, u32, u32)>,
 }
 
 /// Lane occupancy across the media calls in flight.
@@ -408,19 +410,19 @@ struct LaneDemand {
 struct LaneLedger {
     exclusive: HashMap<String, RequestId>,
     units: HashMap<String, u32>,
-    /// Every rank owns one host lane, so occupancy is counted per rank.
-    host: HashMap<u32, u32>,
+    /// A host rank owns one host lane, so occupancy is counted per rank of
+    /// each worker.
+    host: HashMap<(crate::WorkerId, u32), u32>,
 }
 
 impl LaneLedger {
     /// Returns whether one request's call fits the lanes it occupies.
     fn admits(&self, demand: &LaneDemand, request: RequestId, scheduler: &Scheduler) -> bool {
-        let capacity = scheduler.info.host_lane_capacity.max(1);
-        if demand
-            .host_ranks
-            .iter()
-            .any(|rank| self.host.get(rank).copied().unwrap_or(0) + 1 > capacity)
-        {
+        if demand.host_ranks.iter().any(|(worker, rank, tasks)| {
+            let capacity = scheduler.host_lane_capacity(worker);
+            let key = (worker.clone(), *rank);
+            self.host.get(&key).copied().unwrap_or(0) + tasks > capacity
+        }) {
             return false;
         }
         let Some(component) = demand.component.as_deref() else {
@@ -438,8 +440,8 @@ impl LaneLedger {
 
     /// Marks the lanes one request's call occupies until it completes.
     fn occupy(&mut self, demand: &LaneDemand, request: RequestId) {
-        for rank in &demand.host_ranks {
-            *self.host.entry(*rank).or_default() += 1;
+        for (worker, rank, tasks) in &demand.host_ranks {
+            *self.host.entry((worker.clone(), *rank)).or_default() += tasks;
         }
         let Some(component) = demand.component.as_deref() else {
             return;
@@ -594,30 +596,73 @@ impl Scheduler {
         }
     }
 
-    /// Returns the ranks whose host lane one call of a component occupies.
+    /// Returns the host lanes one call of a component occupies, each named by
+    /// the worker holding the component and the rank within it, with the
+    /// tasks the call places there.
     ///
     /// A distributed component's round runs on as many of its ranks as it has
-    /// media units; any other component runs on all of its ranks.
-    fn host_lane_ranks(&self, component: Option<&str>, units: u32) -> Vec<u32> {
-        let Some(binding) = self
-            .info
-            .components
-            .iter()
-            .find(|binding| Some(binding.name.as_str()) == component)
+    /// media units, each rank taking one task per unit it encodes; any other
+    /// component runs one task on each of its ranks.
+    fn host_lane_ranks(
+        &self,
+        component: Option<&str>,
+        units: u32,
+    ) -> Vec<(crate::WorkerId, u32, u32)> {
+        let Some(component) = component else {
+            return Vec::new();
+        };
+        let Some((worker, bound, info)) = self
+            .component_candidates(CallKind::Media(MediaCall::Muxing), component)
+            .next()
+            .or_else(|| {
+                self.executor.info().workers.iter().find_map(|(id, info)| {
+                    info.components
+                        .iter()
+                        .any(|binding| binding.name == component)
+                        .then_some((id, component, info))
+                })
+            })
         else {
             return Vec::new();
         };
+        let Some(binding) = info.components.iter().find(|binding| binding.name == bound) else {
+            return Vec::new();
+        };
         let ranks = &binding.config.ranks;
-        let width = match binding.config.distribution {
-            Some(_) => (units.max(1) as usize)
-                .div_ceil(binding.config.units_per_rank.max(1))
-                .min(ranks.len()),
-            None => ranks.len(),
+        let per_rank = binding.config.units_per_rank.max(1) as u32;
+        let (width, tasks): (usize, Box<dyn Fn(usize) -> u32>) = match binding.config.distribution {
+            Some(_) => (
+                (units.max(1) as usize)
+                    .div_ceil(per_rank as usize)
+                    .min(ranks.len()),
+                Box::new(move |position: usize| {
+                    let start = position as u32 * per_rank;
+                    units.max(1).saturating_sub(start).min(per_rank)
+                }),
+            ),
+            None => (ranks.len(), Box::new(|_| 1)),
         };
         ranks[..width]
             .iter()
-            .map(|rank| u32::try_from(*rank).expect("a rank index fits the lane ledger"))
+            .enumerate()
+            .map(|(position, rank)| {
+                (
+                    worker.clone(),
+                    u32::try_from(*rank).expect("a rank index fits the lane ledger"),
+                    tasks(position),
+                )
+            })
             .collect()
+    }
+
+    /// Returns the host lane capacity of one worker's ranks.
+    fn host_lane_capacity(&self, worker: &crate::WorkerId) -> u32 {
+        self.executor
+            .info()
+            .workers
+            .iter()
+            .find(|(id, _)| id == worker)
+            .map_or(1, |(_, info)| info.host_lane_capacity.max(1))
     }
 
     /// Accumulates the lanes the media calls in flight occupy.
@@ -820,21 +865,16 @@ impl Scheduler {
                     MediaCall::VideoDecoding | MediaCall::AudioDecoding | MediaCall::VideoEncoding
                 )
             {
-                // A component declares its products in the order its methods do.
-                // The video decoder component declares the decoded windows and
-                // then the media units encoded from them, so a decode round
-                // reserves the first and an encode round the second.
-                let declared: &[u32] = match media_call {
-                    _ if last_step => &[0, 1],
-                    MediaCall::VideoEncoding => &[1],
-                    _ => &[0],
-                };
+                // A component declares its products in the order its methods
+                // do: the denoiser's last step reserves both latents, every
+                // other call its component's first product.
+                let declared: &[u32] = if last_step { &[0, 1] } else { &[0] };
                 for &index in declared {
                     let reserved = &state.allocations.tensors[&(component.to_owned(), index)];
                     let mut shape_bound = reserved.shape_bound.clone();
                     // A media unit round writes its own slice of the track's
-                    // reservation, whether the slice holds decoded windows or
-                    // the units encoded from them.
+                    // reservation, whether the slice holds decoded media units
+                    // or the rows encoded from them.
                     let start = if matches!(
                         media_call,
                         MediaCall::VideoDecoding | MediaCall::VideoEncoding

@@ -33,11 +33,40 @@ from ..protocol.call import (
 )
 from .config import ComponentConfig
 
-# The muxer assembles encoded media units and the encoded audio track into the
-# artifact on its host lane. It owns no numerical method, so the worker declares
-# it rather than the model, which declares numerical components only.
+# Host components run on a host worker's ranks and own no numerical method, so
+# the worker declares them rather than the model, which declares numerical
+# components only. The video encoder encodes the media units the video decoder
+# reconstructs; the muxer encodes the audio track and assembles the artifact.
+VIDEO_ENCODER_COMPONENT = "video_encoder"
 MUXER_COMPONENT = "muxer"
-MUXER_CALL_KINDS = frozenset({MediaCall.AUDIO_ENCODING, MediaCall.MUXING})
+HOST_COMPONENTS: Mapping[str, frozenset[MediaCall]] = {
+    VIDEO_ENCODER_COMPONENT: frozenset({MediaCall.VIDEO_ENCODING}),
+    MUXER_COMPONENT: frozenset({MediaCall.AUDIO_ENCODING, MediaCall.MUXING}),
+}
+#: The calls a host component serves, as a worker reports them.
+MUXER_CALL_KINDS = HOST_COMPONENTS[MUXER_COMPONENT]
+
+
+def is_host_component(name: str) -> bool:
+    """Report whether a component runs on host ranks rather than a device."""
+    return name in HOST_COMPONENTS
+
+
+def codec_workers(components: Mapping[str, ComponentConfig]) -> int:
+    """Count the codec processes a rank holding these components runs.
+
+    One process encodes each media unit the rank takes in a round, and a
+    muxer needs one more for the audio track and the container it assembles
+    while units are still being encoded. A rank holding no host component
+    runs none.
+    """
+    count = 0
+    encoder = components.get(VIDEO_ENCODER_COMPONENT)
+    if encoder is not None:
+        count += max(1, int(encoder.units_per_rank))
+    if MUXER_COMPONENT in components:
+        count += 1
+    return count
 
 
 def call_kinds(calls: Iterable[Call]) -> frozenset[CallKind]:
@@ -55,9 +84,10 @@ def call_kinds(calls: Iterable[Call]) -> frozenset[CallKind]:
         elif isinstance(module, Denoiser) and method == "forward":
             kinds.update((MediaCall.LATENT_PREPARATION, MediaCall.DENOISING))
         elif isinstance(module, VideoPostprocessor) and method == "forward":
-            # The post-processor converts one media unit to RGB on the rank that
-            # decoded it; encoding that unit is the host half of the same call.
-            kinds.add(MediaCall.VIDEO_ENCODING)
+            # The post-processor converts a decoded media unit to RGB on the
+            # rank that decoded it, inside the same decoding call; the RGB
+            # unit is that call's product, which a host rank encodes.
+            kinds.add(MediaCall.VIDEO_DECODING)
         elif method == "encode":
             if isinstance(module, TextEncoder):
                 kinds.add(MediaCall.TEXT_ENCODING)
@@ -156,8 +186,10 @@ def describe_components(
         for items in described.values()
         for call in items
     ):
-        # A model that reconstructs video also needs somewhere to assemble it.
-        described[MUXER_COMPONENT] = ()
+        # A model that reconstructs video also needs its units encoded and
+        # assembled, which host components do.
+        for name in HOST_COMPONENTS:
+            described[name] = ()
     return described
 
 
@@ -179,26 +211,12 @@ def supported_calls(
         }
     calls = tuple(call for items in components.values() for call in items)
     kinds = {TransferMode.TENSOR, *call_kinds(calls)}
-    if MUXER_COMPONENT in components:
-        kinds.update(MUXER_CALL_KINDS)
+    for name, host_kinds in HOST_COMPONENTS.items():
+        if name in components:
+            kinds.update(host_kinds)
     if any(isinstance(call.module, CausalLM) for call in calls):
         kinds.update((TransferMode.KV_PUBLISH, TransferMode.KV_INSTALL))
     return frozenset(kinds)
-
-
-#: The media calls a model that reconstructs video must serve between them.
-VIDEO_CALL_KINDS = frozenset(
-    {
-        MediaCall.TEXT_ENCODING,
-        MediaCall.LATENT_PREPARATION,
-        MediaCall.DENOISING,
-        MediaCall.VIDEO_DECODING,
-        MediaCall.AUDIO_DECODING,
-        MediaCall.VIDEO_ENCODING,
-        MediaCall.AUDIO_ENCODING,
-        MediaCall.MUXING,
-    }
-)
 
 
 def media_components(
@@ -211,7 +229,8 @@ def media_components(
     language backbone, as much as a denoiser placed apart from a muxer -- is
     reported whether or not the model reconstructs video. A call whose
     component this placement does not hold is not reported, because this
-    worker cannot serve it.
+    worker cannot serve it; the engine checks that the video graph is complete
+    across the workers of a deployment.
     """
     components = describe_components(model)
     names = set(held)
@@ -224,34 +243,25 @@ def media_components(
         owned = {
             kind for kind in call_kinds(calls) if isinstance(kind, MediaCall)
         }
-        if name == MUXER_COMPONENT:
-            # The muxer's calls are host tasks with no numerical owner.
-            owned = set(MUXER_CALL_KINDS)
+        if name in HOST_COMPONENTS:
+            # A host component's calls are host tasks with no numerical owner.
+            owned = set(HOST_COMPONENTS[name])
         for call in owned:
             owners.setdefault(call, []).append(name)
 
-    # A call several components implement names no single component, so nothing
-    # can be routed to it and it is not reported.
-    routes = {
-        call: holders[0]
-        for call, holders in owners.items()
-        if len(holders) == 1
-    }
-    if MUXER_COMPONENT not in components:
-        return routes
-
-    # A model that reconstructs video serves every video call, and
-    # each of them from one component.
+    # A call several components implement names no single component, so
+    # nothing can be routed to it.
     for call, holders in owners.items():
         if len(holders) > 1:
             raise unsupported_setup(
-                f"video calls repeat {call.value} computation"
+                f"media calls repeat {call.value} computation"
             )
-    if VIDEO_CALL_KINDS - routes.keys():
-        raise unsupported_setup(
-            "video calls lack required numerical capabilities"
-        )
-    if routes[MediaCall.LATENT_PREPARATION] != routes[MediaCall.DENOISING]:
+    routes = {call: holders[0] for call, holders in owners.items()}
+    if (
+        MediaCall.LATENT_PREPARATION in routes
+        and MediaCall.DENOISING in routes
+        and routes[MediaCall.LATENT_PREPARATION] != routes[MediaCall.DENOISING]
+    ):
         raise unsupported_setup(
             "latent preparation must participate in the denoiser component"
         )
@@ -272,13 +282,21 @@ def validate_components(
     for name, component in components.items():
         calls = declared[name]
         if not calls:
-            if name != MUXER_COMPONENT:
+            if name not in HOST_COMPONENTS:
                 raise unsupported_setup(
                     f"component {name!r} has no numerical methods"
                 )
-            if component.distribution is not None:
+            if name == MUXER_COMPONENT and component.distribution is not None:
                 raise unsupported_setup(
                     "the muxer assembles one artifact and is not distributed"
+                )
+            if name == VIDEO_ENCODER_COMPONENT and (
+                component.distribution not in (None, "temporal_units")
+                or component.units_per_rank < 1
+            ):
+                raise unsupported_setup(
+                    "video encoding distributes by temporal_units with at "
+                    "least one media unit per rank"
                 )
             continue
         if any(isinstance(call.module, VideoDecoder) for call in calls):

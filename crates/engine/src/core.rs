@@ -330,6 +330,11 @@ impl EngineCore {
                 "transfer edge names an unconfigured worker"
             );
         }
+        let peers = config
+            .workers
+            .iter()
+            .map(|worker| (worker.id.to_string(), worker.components.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
         let mut bindings = Vec::new();
         let mut arguments = Vec::new();
         for worker in &config.workers {
@@ -337,6 +342,7 @@ impl EngineCore {
                 worker_id: worker.id.to_string(),
                 ranks: worker.ranks.clone(),
                 components: worker.components.clone(),
+                peers: peers.clone(),
                 queue_depth: worker.queue_depth,
                 transfer: config.transfer.clone(),
                 ..config.worker_process.clone()

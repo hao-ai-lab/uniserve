@@ -7,6 +7,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub use uniserve_core::{ComponentConfig, ComponentDistribution, ParallelConfig, SequenceParallel};
 
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -221,6 +222,45 @@ impl ExecutorInfo {
         Ok(Self { workers: pools })
     }
 
+    /// Resolves which component serves each media call across every worker.
+    ///
+    /// The video graph may span workers: a model worker serves decoding and a
+    /// host worker serves encoding and muxing. Each call is served by one
+    /// component, which several workers may replicate, and a deployment that
+    /// muxes serves the whole video graph between its workers.
+    pub fn media_routing(&self) -> anyhow::Result<BTreeMap<MediaCall, String>> {
+        let mut routing: BTreeMap<MediaCall, (String, &WorkerId)> = BTreeMap::new();
+        for (id, info) in &self.workers {
+            for (call, component) in &info.media_components {
+                if let Some((other, owner)) = routing.get(call) {
+                    anyhow::ensure!(
+                        other == component,
+                        "media call {call:?} is served by component {other} of worker {owner} \
+                         and by component {component} of worker {id}"
+                    );
+                    continue;
+                }
+                routing.insert(*call, (component.clone(), id));
+            }
+        }
+        if routing.contains_key(&MediaCall::Muxing) {
+            let missing = MediaCall::VIDEO
+                .iter()
+                .filter(|call| !routing.contains_key(call))
+                .map(|call| format!("{call:?}"))
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                missing.is_empty(),
+                "a deployment that muxes video serves no component for {}",
+                missing.join(", ")
+            );
+        }
+        Ok(routing
+            .into_iter()
+            .map(|(call, (component, _))| (call, component))
+            .collect())
+    }
+
     /// Returns the sole worker capability record.
     ///
     /// # Panics
@@ -272,20 +312,24 @@ impl ExecutorInfo {
 
         let seed_index = kv_indices.first().copied().unwrap_or(0);
         let mut merged = self.workers[seed_index].1.clone();
-        merged.media_components = routed(CallKind::Media(MediaCall::Denoising))
-            .map(|info| info.media_components.clone())
-            .unwrap_or_default();
+        merged.media_components = self.media_routing()?;
         merged.num_inference_steps = routed(CallKind::Media(MediaCall::Denoising))
             .map_or(0, |info| info.num_inference_steps);
+        // A deployment that assembles video denoises over a fixed ladder,
+        // which the denoising worker reports.
+        anyhow::ensure!(
+            !merged.media_components.contains_key(&MediaCall::Muxing)
+                || merged.num_inference_steps > 0,
+            "a deployment that muxes video reports no diffusion step count"
+        );
         anyhow::ensure!(
             self.workers.iter().all(|(_, info)| {
                 !info
                     .supported_ops
                     .contains(&CallKind::Media(MediaCall::Denoising))
-                    || (info.media_components == merged.media_components
-                        && info.num_inference_steps == merged.num_inference_steps)
+                    || info.num_inference_steps == merged.num_inference_steps
             }),
-            "workers disagree on media components or diffusion steps"
+            "workers disagree on diffusion steps"
         );
         // Every KV stage must agree on layout. Capacity is the narrowest pool
         // because a lineage may traverse all routed KV stages.
@@ -700,48 +744,55 @@ impl TransferConfig {
                 worker.ranks.iter().map(|rank| rank.node.clone()).collect(),
             );
         }
+        // Products flow between the components of one worker and between
+        // workers, a model worker's decoded media units to a host worker's
+        // encoders, so every ordered pair of ranks gets an edge derived from
+        // its coordinates unless the configuration named one.
         for worker in workers {
-            for (source_rank, source) in worker.ranks.iter().enumerate() {
-                for (destination_rank, destination) in worker.ranks.iter().enumerate() {
-                    let source_rank = source_rank as u32;
-                    let destination_rank = destination_rank as u32;
-                    if self.edges.iter().any(|edge| {
-                        edge.source_worker == worker.id
-                            && edge.destination_worker == worker.id
-                            && edge.source_rank.is_none_or(|rank| rank == source_rank)
-                            && edge
-                                .destination_rank
-                                .is_none_or(|rank| rank == destination_rank)
-                    }) {
-                        continue;
+            for peer in workers {
+                for (source_rank, source) in worker.ranks.iter().enumerate() {
+                    for (destination_rank, destination) in peer.ranks.iter().enumerate() {
+                        let source_rank = source_rank as u32;
+                        let destination_rank = destination_rank as u32;
+                        if self.edges.iter().any(|edge| {
+                            edge.source_worker == worker.id
+                                && edge.destination_worker == peer.id
+                                && edge.source_rank.is_none_or(|rank| rank == source_rank)
+                                && edge
+                                    .destination_rank
+                                    .is_none_or(|rank| rank == destination_rank)
+                        }) {
+                            continue;
+                        }
+                        let (device, host) =
+                            if worker.id == peer.id && source_rank == destination_rank {
+                                (Some(TransferBackend::Local), Some(TransferBackend::Local))
+                            } else {
+                                // A fabric handle reaches another host; where the
+                                // devices export a process descriptor instead, the
+                                // physical edge check refuses this edge by name.
+                                let device = (source.device.starts_with("cuda:")
+                                    && destination.device.starts_with("cuda:"))
+                                .then_some(TransferBackend::CudaVmm);
+                                // A shared-memory segment is named in one host's
+                                // namespace, so a host product that leaves its host
+                                // travels on the rank channel's data path.
+                                let host = if source.node == destination.node {
+                                    TransferBackend::Shm
+                                } else {
+                                    TransferBackend::Channel
+                                };
+                                (device, Some(host))
+                            };
+                        self.edges.push(TransferEdge {
+                            source_worker: worker.id.clone(),
+                            source_rank: Some(source_rank),
+                            destination_worker: peer.id.clone(),
+                            destination_rank: Some(destination_rank),
+                            device,
+                            host,
+                        });
                     }
-                    let (device, host) = if source_rank == destination_rank {
-                        (Some(TransferBackend::Local), Some(TransferBackend::Local))
-                    } else {
-                        // A fabric handle reaches another host; where the
-                        // devices export a process descriptor instead, the
-                        // physical edge check refuses this edge by name.
-                        let device = (source.device.starts_with("cuda:")
-                            && destination.device.starts_with("cuda:"))
-                        .then_some(TransferBackend::CudaVmm);
-                        // A shared-memory segment is named in one host's
-                        // namespace, so a host product that leaves its host
-                        // travels on the rank channel's data path.
-                        let host = if source.node == destination.node {
-                            TransferBackend::Shm
-                        } else {
-                            TransferBackend::Channel
-                        };
-                        (device, Some(host))
-                    };
-                    self.edges.push(TransferEdge {
-                        source_worker: worker.id.clone(),
-                        source_rank: Some(source_rank),
-                        destination_worker: worker.id.clone(),
-                        destination_rank: Some(destination_rank),
-                        device,
-                        host,
-                    });
                 }
             }
         }
@@ -1177,6 +1228,84 @@ pub trait Executor: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn media_info(routes: &[(MediaCall, &str)], steps: u32) -> WorkerInfo {
+        let mut info = WorkerInfo::default();
+        info.media_components = routes
+            .iter()
+            .map(|(call, component)| (*call, (*component).to_owned()))
+            .collect();
+        info.supported_ops = routes
+            .iter()
+            .map(|(call, _)| CallKind::Media(*call))
+            .collect();
+        info.num_inference_steps = steps;
+        info
+    }
+
+    #[test]
+    fn media_routing_is_the_union_over_workers() {
+        // A model worker decodes and a host worker encodes and muxes; the
+        // deployment's routing names every video call once.
+        let model = media_info(
+            &[
+                (MediaCall::TextEncoding, "text_encoder"),
+                (MediaCall::LatentPreparation, "denoiser"),
+                (MediaCall::Denoising, "denoiser"),
+                (MediaCall::VideoDecoding, "video_decoder"),
+                (MediaCall::AudioDecoding, "audio_decoder"),
+            ],
+            4,
+        );
+        let host = media_info(
+            &[
+                (MediaCall::VideoEncoding, "video_encoder"),
+                (MediaCall::AudioEncoding, "muxer"),
+                (MediaCall::Muxing, "muxer"),
+            ],
+            0,
+        );
+        let info = ExecutorInfo {
+            workers: vec![
+                (WorkerId("model".to_owned()), model),
+                (WorkerId("host".to_owned()), host),
+            ],
+        };
+        let routing = info.media_routing().expect("the union is complete");
+        assert_eq!(routing.len(), MediaCall::VIDEO.len());
+        assert_eq!(routing[&MediaCall::VideoEncoding], "video_encoder");
+        assert_eq!(routing[&MediaCall::VideoDecoding], "video_decoder");
+    }
+
+    #[test]
+    fn media_routing_refuses_an_incomplete_video_graph_and_a_repeated_call() {
+        let model = media_info(&[(MediaCall::VideoDecoding, "video_decoder")], 4);
+        let host = media_info(&[(MediaCall::Muxing, "muxer")], 0);
+        let info = ExecutorInfo {
+            workers: vec![
+                (WorkerId("model".to_owned()), model.clone()),
+                (WorkerId("host".to_owned()), host),
+            ],
+        };
+        let message = info
+            .media_routing()
+            .expect_err("muxing needs the graph")
+            .to_string();
+        assert!(message.contains("VideoEncoding"), "{message}");
+
+        let other = media_info(&[(MediaCall::VideoDecoding, "decoder")], 4);
+        let info = ExecutorInfo {
+            workers: vec![
+                (WorkerId("model".to_owned()), model),
+                (WorkerId("other".to_owned()), other),
+            ],
+        };
+        let message = info
+            .media_routing()
+            .expect_err("one owner per call")
+            .to_string();
+        assert!(message.contains("VideoDecoding"), "{message}");
+    }
 
     #[test]
     fn a_producer_watches_the_slots_its_consumers_write() {

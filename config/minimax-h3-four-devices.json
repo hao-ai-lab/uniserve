@@ -29,6 +29,19 @@
         "parallel_config": {},
         "distribution": "temporal_units",
         "units_per_rank": 1
+      }
+    },
+    "queue_depth": 6
+  },
+  {
+    "id": "host",
+    "ranks": [{ "node": "localhost", "device": "cpu" }],
+    "components": {
+      "video_encoder": {
+        "ranks": [0],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 4
       },
       "muxer": { "ranks": [0], "parallel_config": {} }
     },

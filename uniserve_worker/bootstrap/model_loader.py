@@ -35,6 +35,7 @@ from ..runtime.results import resolve_outputs
 from .components import (
     bind_components,
     describe_components,
+    is_host_component,
     validate_components,
 )
 from .config import ComponentConfig, WorkerProcessArgs
@@ -268,6 +269,33 @@ def load_worker_model(
     with torch.device("meta"):
         description = source.model_class(source.model)
     declarations = describe_components(description, entries=source.entry_points)
+
+    if all(
+        is_host_component(name) or not declarations.get(name)
+        for name in bindings
+    ):
+        # A host rank holds only host components: it needs the model's
+        # declared media geometry, rates and unit division, which the
+        # weight-less description carries, and no numerical state.
+        bind_components(description, bindings, entries=source.entry_points)
+        worker_config = loaded_worker_config(
+            description, config.execution, config.ipc.queue_depth
+        )
+        outputs = resolve_outputs(description, worker_config)
+        for name, binding in bindings.items():
+            binding.outputs = outputs.get(name, ())
+        logger.info(
+            "described numerical model %s for host work",
+            type(description).__qualname__,
+        )
+        return WorkerModel(
+            description,
+            worker_config,
+            None,
+            source.image_processor,
+            source.flow_prompt,
+            source.checkpoint_identity,
+        )
 
     meshes, attention = {}, {}
     for name, binding in bindings.items():

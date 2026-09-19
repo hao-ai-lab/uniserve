@@ -66,6 +66,9 @@ class BatchState:
     tensor_reads: dict[BufferId, TensorRead] = field(default_factory=dict)
     latent_imports: dict[BufferId, LatentImport] = field(default_factory=dict)
     cache_imports: dict[BufferId, CacheImport] = field(default_factory=dict)
+    # Media inputs a host call reads in place from their producers' segments
+    # at execution; they are neither imported nor staged here.
+    borrowed_inputs: set[BufferId] = field(default_factory=set)
 
     # Completion predicates staged in a sealed buffer and read as booleans.
     predicate_buffer: OutputBuffer | None = None
@@ -328,6 +331,8 @@ class BatchState:
 
     def input_ready(self, buffer: BufferId) -> bool:
         """Query one reserved input without publishing or consuming it."""
+        if buffer in self.borrowed_inputs:
+            return True
         if (read := self.tensor_reads.get(buffer)) is not None:
             return read.imported is None or all(
                 ticket.ready() for ticket in read.imported.tickets

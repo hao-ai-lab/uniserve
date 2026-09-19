@@ -46,6 +46,7 @@ from ..bootstrap.capacity import (
     device_total_bytes,
     resolve_request_capacity,
 )
+from ..bootstrap.components import MUXER_COMPONENT, codec_workers
 from ..bootstrap.distributed import initialize_components
 from ..bootstrap.inputs import capability, image_builder
 from ..bootstrap.model_loader import load_worker_model, prepare_worker_model
@@ -72,8 +73,8 @@ from ..foundation.errors import (
     invalid_descriptor,
     unsupported_setup,
 )
+from ..media.mux import MediaMux
 from ..protocol.batch import Batch, Finish, Free
-from ..protocol.call import MediaCall
 from ..protocol.output import BatchOutput
 from ..protocol.transfer import WorkerEndpoint
 from ..runtime.block_tables import BlockTables
@@ -98,9 +99,6 @@ logger = logging.getLogger(__name__)
 
 _IPC_WAIT_TIMEOUT_US = 60_000_000
 # Calls the host lane executes; their batches run on the host lane's stream.
-_HOST_LANE_CALLS = frozenset(
-    {MediaCall.VIDEO_ENCODING, MediaCall.AUDIO_ENCODING, MediaCall.MUXING}
-)
 # A consumer's acknowledgment lands in published storage with no
 # notification, so a rank holding a retired publication sweeps on this period.
 _ACKNOWLEDGMENT_SWEEP_US = 1_000
@@ -561,16 +559,6 @@ class Worker:
                 )
             )
 
-            # A host-lane batch touches a device only to capture its input
-            # and to fill its product row, but its copies and completion
-            # fences would otherwise queue on the default stream behind the
-            # device lanes' work, so the host lane owns a stream per device.
-            self._host_lane_streams = {
-                device: torch.cuda.Stream(device=device)
-                for device in map(canonical_device, owner_devices)
-                if device.type == "cuda"
-            }
-
             self.device_events = EventPool()
             startup.callback(self.device_events.close)
 
@@ -607,13 +595,15 @@ class Worker:
             )
             startup.callback(self.tensor_store.close)
 
-            # A rank that reconstructs or assembles media runs its codecs in
-            # the lane's codec processes; any other rank's host work is plain
-            # callables, so it spawns none.
+            # A rank holding host components runs its codecs in the lane's
+            # codec processes, one per media unit it encodes at once plus the
+            # muxer's; any other rank's host work is plain callables, so it
+            # spawns none.
+            codecs = codec_workers(dict(components))
             self.host_tasks = HostLane(
-                max_inflight=int(arena.host_lane_inflight),
-                workers=min(4, int(arena.host_lane_inflight)),
-                codec=capability(model, VideoPostprocessor) is not None,
+                max_inflight=codecs or int(arena.host_lane_inflight),
+                workers=codecs or min(4, int(arena.host_lane_inflight)),
+                codec=codecs > 0,
             )
             startup.callback(self.host_tasks.close)
 
@@ -668,28 +658,17 @@ class Worker:
                     max_inflight=int(queue_depth),
                 )
 
-            # Call handlers borrow the resources owned by this rank.
-            from ..execution.video import create_media_resources
-
-            self.media_mux, self.media_buffers = (
-                create_media_resources(
-                    self.runner,
-                    rank=worker_config.rank,
-                    worker_info=info,
-                    state_slots=info.request_slots,
-                    unresolved_window=info.max_unresolved_ops,
-                    host_tasks=self.host_tasks,
-                    pin=torch.device(worker_config.device).type == "cuda",
-                )
-                if capability(model, VideoPostprocessor) is not None
-                else (None, None)
+            # The muxer rank assembles artifacts in its lane's codec process.
+            muxer = self.runner.bindings.get(MUXER_COMPONENT)
+            self.media_mux = (
+                MediaMux(rank=worker_config.rank, lane=self.host_tasks)
+                if muxer is not None
+                and muxer.owns
+                and worker_config.rank == info.output_rank(MUXER_COMPONENT)
+                else None
             )
             if self.media_mux is not None:
                 startup.callback(self.media_mux.close)
-            if self.media_buffers is not None:
-                # Encoders read captured media units where the copy left them.
-                self.host_tasks.attach(self.media_buffers.mapping)
-                startup.callback(self.media_buffers.close)
 
         except BaseException as error:
             try:
@@ -1106,8 +1085,7 @@ class Worker:
                     f"this worker: {names!r}"
                 )
 
-            with self._lane_stream(batch):
-                self._prepare_execution(batch)
+            self._prepare_execution(batch)
 
             if self._advance_execution(batch):
                 if not batch.complete:
@@ -1127,11 +1105,10 @@ class Worker:
         if batch.complete or batch.launched:
             return True
         try:
-            with self._lane_stream(batch):
-                self.advance_inputs(batch)
-                if not batch.inputs_ready():
-                    return False
-                self._execute_prepared(batch)
+            self.advance_inputs(batch)
+            if not batch.inputs_ready():
+                return False
+            self._execute_prepared(batch)
             self._notify_batch(batch)
         except BaseException as error:
             self._fail_run(batch, error)
@@ -1150,42 +1127,39 @@ class Worker:
             self._fail_run(batch, error, context="completion materialization")
 
     def _advance_launched(self, batch: BatchState) -> None:
-        """Materialize and retire one launched batch on its lane's stream."""
-        with self._lane_stream(batch):
-            # CPU work is submitted by the Worker, never by a readiness query.
-            for output in batch.outputs:
-                if isinstance(output, PendingOutput) and output.value is None:
-                    for task in output.completion_tasks:
-                        task.submit_if_ready()
+        """Materialize and retire one launched batch."""
+        # CPU work is submitted by the Worker, never by a readiness query.
+        for output in batch.outputs:
+            if isinstance(output, PendingOutput) and output.value is None:
+                for task in output.completion_tasks:
+                    task.submit_if_ready()
 
-            if not batch.materialized:
-                outputs = tuple(batch.outputs)
-                if any(value is None for value in outputs):
-                    raise RuntimeError(
-                        "launched batch is missing an call output"
-                    )
-                if all(
-                    not isinstance(value, PendingOutput) or value.ready()
+        if not batch.materialized:
+            outputs = tuple(batch.outputs)
+            if any(value is None for value in outputs):
+                raise RuntimeError("launched batch is missing an call output")
+            if all(
+                not isinstance(value, PendingOutput) or value.ready()
+                for value in outputs
+            ):
+                pending = tuple(
+                    value
                     for value in outputs
-                ):
-                    pending = tuple(
-                        value
-                        for value in outputs
-                        if isinstance(value, PendingOutput)
-                    )
-                    values = tuple(
-                        value.materialize()
-                        if isinstance(value, PendingOutput)
-                        else value
-                        for value in outputs
-                    )
-                    self.requests.apply_outputs(pending)
-                    batch.outputs[:] = values
-                    batch.materialized = True
+                    if isinstance(value, PendingOutput)
+                )
+                values = tuple(
+                    value.materialize()
+                    if isinstance(value, PendingOutput)
+                    else value
+                    for value in outputs
+                )
+                self.requests.apply_outputs(pending)
+                batch.outputs[:] = values
+                batch.materialized = True
 
-            if batch.materialized:
-                batch.complete = self._advance_retirement(batch)
-            self._notify_batch(batch)
+        if batch.materialized:
+            batch.complete = self._advance_retirement(batch)
+        self._notify_batch(batch)
 
     def _notify_batch(self, batch: BatchState) -> None:
         """Retire the batch's submission and wake its waiting IPC response."""
@@ -1443,20 +1417,6 @@ class Worker:
         self._close_batch(state)
         return output
 
-    def _lane_stream(self, state: BatchState):
-        """Enter the host lane's stream for a batch that runs on that lane.
-
-        Every other batch keeps the stream it finds current.
-        """
-        calls = state.batch.calls
-        if not calls or calls[0].kind not in _HOST_LANE_CALLS:
-            return nullcontext()
-        device = canonical_device(self.runner.call_devices(calls[0])[0])
-        stream = self._host_lane_streams.get(device)
-        if stream is None:
-            return nullcontext()
-        return torch.cuda.stream(stream)
-
     def _execute_batch(self, state: BatchState) -> None:
         """Execute prepared numerical work.
 
@@ -1494,7 +1454,6 @@ class Worker:
                 worker_info=self.info,
                 latent_pool=self.latent_pool,
                 media_mux=self.media_mux,
-                media_buffers=self.media_buffers,
                 output_pool=self.output_pool,
                 publication_transports=self.publication_transports,
                 request_tables=self.block_tables,
@@ -1809,9 +1768,15 @@ class Worker:
         if self._warmed_up:
             return
 
-        self.runner.warmup(self.requests.tensor_slots)
-        self.runner.capture(tokenizer=self.tokenizer, latents=self.latent_pool)
-        warmup_requests(self)
+        if self.runner.numerical:
+            self.runner.warmup(self.requests.tensor_slots)
+            self.runner.capture(
+                tokenizer=self.tokenizer, latents=self.latent_pool
+            )
+            warmup_requests(self)
+        # A host rank is ready once every codec process answers and loads
+        # its codecs, so a missing codec surfaces here and not under a request.
+        self.host_tasks.probe()
         self.runner.complete_startup()
 
         # Startup scenarios must release their requests before service
@@ -1982,8 +1947,6 @@ class Worker:
         if self.media_mux is not None:
             actions.append(self.media_mux.close)
         actions.append(self.host_tasks.close)
-        if self.media_buffers is not None:
-            actions.append(self.media_buffers.close)
 
         # Stop imports and transports before releasing the storage they borrow.
         if self.kv_cache is not None:
@@ -2037,7 +2000,6 @@ class Worker:
                 self.kv_cache,
                 self.latent_pool,
                 self.media_mux,
-                self.media_buffers,
                 self.output_pool,
                 self.tensor_store,
                 self.buffer_pool,
