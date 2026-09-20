@@ -210,16 +210,24 @@ def allocate_peer_tensor(
 
     allocation = allocate(shape, dtype=dtype, device=group.device)
     handle = allocation.export_handle()
-    if group.size == 1:
-        return allocation.map_peers([handle])
-
     device = torch.device(group.device)
-    if exports_fabric_handles(device.index or 0):
-        return allocation.map_peers(
-            _gathered_handles(group, handle, shape, dtype)
-        )
-    with _rotated_descriptors(group, handle, shape, dtype) as descriptors:
-        return allocation.map_peers(descriptors)
+    fabric = exports_fabric_handles(device.index or 0)
+    try:
+        if group.size == 1:
+            return allocation.map_peers([handle])
+        if fabric:
+            return allocation.map_peers(
+                _gathered_handles(group, handle, shape, dtype)
+            )
+        with _rotated_descriptors(group, handle, shape, dtype) as descriptors:
+            return allocation.map_peers(descriptors)
+    finally:
+        # A descriptor export opens a file this process owns, and the mapping
+        # keeps its own reference to the physical memory. Without this close,
+        # every peer allocation would leak one descriptor for the lifetime of
+        # the worker. A fabric handle opens nothing.
+        if not fabric:
+            os.close(int.from_bytes(handle, sys.byteorder))
 
 
 def allocate_collective_buffer(
