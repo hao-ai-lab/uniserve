@@ -7,6 +7,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
 
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -126,8 +127,18 @@ CUmemGenericAllocationHandle import_handle_bytes(const std::string& exported,
   TORCH_CHECK(exported.size() == handle_bytes(type),
               "peer allocation handle does not match this device's handle type");
   CUmemGenericAllocationHandle handle = 0;
-  check_cuda(cuMemImportFromShareableHandle(
-                 &handle, const_cast<char*>(exported.data()), type),
+  // The two handle types reach the driver differently. A fabric handle is an
+  // opaque structure the driver reads through a pointer, while a POSIX
+  // descriptor is the operating system handle itself and travels by value.
+  // Export writes both into the same byte buffer, so the descriptor has to be
+  // read back out of it here.
+  void* os_handle = const_cast<char*>(exported.data());
+  if (type == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
+    int descriptor = 0;
+    std::memcpy(&descriptor, exported.data(), sizeof(descriptor));
+    os_handle = reinterpret_cast<void*>(static_cast<uintptr_t>(descriptor));
+  }
+  check_cuda(cuMemImportFromShareableHandle(&handle, os_handle, type),
              "import peer allocation handle");
   return handle;
 }
