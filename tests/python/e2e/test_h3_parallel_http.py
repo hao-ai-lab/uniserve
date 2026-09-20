@@ -450,8 +450,14 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         httpx.Client(base_url=base, timeout=600) as client,
     ):
         caps = client.get("/v1/capabilities").json()
-        assert caps["tasks"] == ["t2va"]
         assert caps["model"] == "FastH3"
+        assert caps["video"]["tasks"] == ["t2va"]
+        assert caps["video"]["request_fields"] == [
+            "model",
+            "prompt",
+            "seconds",
+            "seed",
+        ]
         for payload in (
             {"input_reference": "image.png"},
             {"num_inference_steps": 8},
