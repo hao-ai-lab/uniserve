@@ -815,6 +815,14 @@ class _BoundedTransferPool:
         completed = None
         try:
             with torch.cuda.device(device), torch.cuda.stream(stream):
+                if acknowledgment is not None:
+                    # The claim lands before any copy is submitted, so a
+                    # producer sweeping a retired publication cannot hand the
+                    # chunk out again while this read is in flight. The read
+                    # stream is idle here, this thread having synchronized it
+                    # at the end of its previous read, so the four-byte
+                    # blocking copy waits on nothing.
+                    acknowledgment.copy_(_chunk_word(vmm_pool.CLAIMED))
                 # The caller may still be initializing or consuming this
                 # backing. Establish its handoff before exposing copy
                 # readiness, so a later caller wait on our completion cannot
@@ -824,13 +832,6 @@ class _BoundedTransferPool:
                     ticket._destination_stream = None
                 if producer is not None:
                     stream.wait_event(producer)
-                if acknowledgment is not None:
-                    # The claim is ordered before the copies on this stream,
-                    # so a producer sweeping a retired publication never
-                    # reuses a chunk this read is about to touch.
-                    acknowledgment.copy_(
-                        _chunk_word(vmm_pool.CLAIMED), non_blocking=True
-                    )
                 for target, value in pairs:
                     if value.device.type == "cpu":
                         from uniserve_kernel.peer_memory import copy_host_device
