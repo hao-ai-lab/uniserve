@@ -46,6 +46,15 @@ ACKNOWLEDGED = 2
 MAX_ACKNOWLEDGMENT_SLOTS = 64
 #: Bytes reserved at the head of every chunk for its acknowledgments.
 HEADER_BYTES = ACK_WORD_BYTES * MAX_ACKNOWLEDGMENT_SLOTS
+#: Byte alignment of one chunk within its pool.
+#:
+#: A consumer imports the pool's whole allocation and addresses chunks by
+#: offset, so a chunk does not have to begin on a CUDA page. What it does have
+#: to satisfy is the alignment its own contents need: the acknowledgment words
+#: are 32-bit, and payload spans are read as tensors of the product's dtype and
+#: copied in vector widths. This bound covers both and keeps a pool's capacity
+#: proportional to what it carries rather than to the number of products in it.
+CHUNK_ALIGNMENT = 512
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,8 +115,9 @@ class VmmPool:
 
         if capacity_bytes <= 0:
             raise ValueError("a VMM pool needs a positive capacity")
+        # The allocation itself is physical pages; the chunks inside it are
+        # not.
         page = allocation_granularity(device)
-        self._page = page
         self._capacity = ((capacity_bytes + page - 1) // page) * page
         self._allocation = allocate(
             (self._capacity,), dtype=torch.uint8, device=device
@@ -152,7 +162,9 @@ class VmmPool:
         # The header precedes the payload inside one reservation, so a chunk
         # is one span a consumer maps once.
         needed = nbytes + HEADER_BYTES
-        span = ((needed + self._page - 1) // self._page) * self._page
+        span = (
+            (needed + CHUNK_ALIGNMENT - 1) // CHUNK_ALIGNMENT
+        ) * CHUNK_ALIGNMENT
         with self._lock:
             offset = self._free_offset(span)
             if offset is None:
