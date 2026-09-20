@@ -430,8 +430,10 @@ def test_sharded_delivery_progresses_during_independent_device_work() -> None:
     context = mp.get_context("spawn")
     parent, child = context.Pipe()
     events = EventPool()
+    # Each chunk carries its acknowledgment header inside its own reservation,
+    # so three four-mebibyte shards need a little more than twelve mebibytes.
     producer = make_transport(
-        "cuda_vmm", byte_capacity=12 << 20, ticket_capacity=4, event_pool=events
+        "cuda_vmm", byte_capacity=13 << 20, ticket_capacity=4, event_pool=events
     )
     sources = tuple(
         torch.full((1, 1024, 1024), float(index), device="cuda:1")
