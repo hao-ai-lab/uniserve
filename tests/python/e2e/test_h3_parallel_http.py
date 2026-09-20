@@ -128,10 +128,12 @@ EIGHT_RANK_PARALLEL_CONFIGS = {
 }
 
 # Ranks reach devices through this order rather than by identity, so a layout
-# that assumed rank index equals device index would fail. The first four entries
-# name devices of one PCIe island and the last four the other, which is the
-# grouping an eight-rank layout has to span on a two-island host.
-EIGHT_RANK_DENOISER_RANKS = [3, 1, 2, 0, 7, 5, 6, 4]
+# that assumed rank index equals device index would fail. The order permutes
+# device pairs and never the devices inside one, because a host can give peer
+# access only within its own adjacent pairs: a Ulysses group of two occupies one
+# consecutive rank pair, and splitting those across a host's pairs would test
+# nothing about the layout while making every such layout unrunnable there.
+EIGHT_RANK_DENOISER_RANKS = [2, 3, 0, 1, 6, 7, 4, 5]
 
 
 def _eight_rank_worker_config(parallel_kind: str) -> dict:
@@ -308,6 +310,15 @@ def test_component_bindings_release_cancelled_requests(
         raise ValueError(f"unsupported H3 test layout {parallel_kind!r}")
     devices = worker_config.pop("devices")
     visible_devices = max(devices) + 1
+    # Mapping a product into a consumer's device needs peer access between the
+    # two. A host that grants it only within its own device pairs cannot carry
+    # device products between ranks that fall in different pairs, and there the
+    # host mechanism is the one those edges admit.
+    device_products = all(
+        first == second or torch.cuda.can_device_access_peer(first, second)
+        for first in devices
+        for second in devices
+    )
     if torch.cuda.device_count() < visible_devices:
         pytest.skip(
             f"{parallel_kind} needs {visible_devices} devices; "
@@ -395,11 +406,16 @@ def test_component_bindings_release_cancelled_requests(
         str(written_deployment(tmp_path, workers)),
         "--transfer",
         ",".join(
-            # Device products cross workers over VMM handles; the host
-            # worker's ranks have no device, so their edges carry host
-            # products over shared memory only.
+            # Device products cross workers over VMM handles where the
+            # devices can map one another; the host worker's ranks have no
+            # device, so their edges carry host products over shared memory
+            # only.
             f"{source}->{destination}="
-            + ("shm" if "host" in (source, destination) else "cuda_vmm+shm")
+            + (
+                "shm"
+                if "host" in (source, destination) or not device_products
+                else "cuda_vmm+shm"
+            )
             for source, destination in sorted(edges)
         ),
         "--queue-depth",
