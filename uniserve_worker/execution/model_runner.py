@@ -223,7 +223,7 @@ class ModelRunner:
         self._text_calls = {}
 
         self._lane_streams = []
-        self._capture_stream = None
+        self._denoising_stream = None
         self._preparation_stream = None
         self._text_staging = self._text_tokens = None
 
@@ -279,7 +279,7 @@ class ModelRunner:
                         self.denoising = DenoisingRunner(
                             call.module,
                             device=binding.device,
-                            capture_stream=self.capture_stream(),
+                            stream=self.denoising_stream(),
                             groups=call.groups,
                             capacity=worker_config.max_request_pool_size,
                             # Resident requests may carry different numerical
@@ -303,17 +303,18 @@ class ModelRunner:
                 )
             raise
 
-    def capture_stream(self):
-        """Return the lazily created graph-capture stream.
+    def denoising_stream(self):
+        """Return the stream graph-executed denoising computes on.
 
-        or None when graphs are disabled.
+        Prepared denoising sizes run on it and their captured ladders replay
+        there. None when graphs are disabled.
         """
         device = canonical_device(self.worker_config.device)
         if self.worker_config.graph_policy == "off" or device.type != "cuda":
             return None
-        if self._capture_stream is None:
-            self._capture_stream = torch.cuda.Stream(device=device)
-        return self._capture_stream
+        if self._denoising_stream is None:
+            self._denoising_stream = torch.cuda.Stream(device=device)
+        return self._denoising_stream
 
     def _capture_devices(self, device):
         """List CUDA devices besides ``device`` that graphs may allocate on."""
@@ -1431,7 +1432,7 @@ class ModelRunner:
 
         stream.
         """
-        streams = [self._capture_stream, self._preparation_stream]
+        streams = [self._denoising_stream, self._preparation_stream]
         streams.extend(stream.stream for _, stream in self._lane_streams)
         streams.extend(
             stream.stream for stream in self._module_streams.values()

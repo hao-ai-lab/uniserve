@@ -62,11 +62,11 @@ def test_denoising_reprepared_constants_and_slot_sizes_advance_one_step(
     model = LinearDenoiser().to(device)
     model.projection.to(branch_device)
     schedules = model.make_schedules(2, shift=1.0, device=device)
-    capture_stream = torch.cuda.Stream(device=device) if graphs else None
+    stream = torch.cuda.Stream(device=device) if graphs else None
     runner = DenoisingRunner(
         model,
         device=device,
-        capture_stream=capture_stream,
+        stream=stream,
         groups=(),
         capacity=2,
         additional_devices=(torch.device(branch_device),)
@@ -161,7 +161,7 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
         return values, paths
 
     eager = DenoisingRunner(
-        model, device=device, capture_stream=None, groups=(), capacity=2
+        model, device=device, stream=None, groups=(), capacity=2
     )
     try:
         eager.prepare_inputs(size, size)
@@ -176,7 +176,7 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
     runner = DenoisingRunner(
         model,
         device=device,
-        capture_stream=torch.cuda.Stream(device=device),
+        stream=torch.cuda.Stream(device=device),
         groups=(),
         capacity=2,
         shapes=2,

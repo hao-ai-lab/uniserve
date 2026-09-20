@@ -95,7 +95,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         model: Denoiser[InputT, SizeT],
         *,
         device: torch.device,
-        capture_stream: torch.cuda.Stream | None,
+        stream: torch.cuda.Stream | None,
         groups: tuple[Communicator, ...],
         capacity: int,
         shapes: int = 1,
@@ -114,8 +114,8 @@ class DenoisingRunner(Generic[InputT, SizeT]):
             )
 
         self.model, self.device = model, device
-        self.capture_stream, self.groups, self.capacity = (
-            capture_stream,
+        self.stream, self.groups, self.capacity = (
+            stream,
             groups,
             capacity,
         )
@@ -124,7 +124,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
 
         # Captured graphs draw their workspace from per-device memory pools.
         self.device_pools = {}
-        if capture_stream is not None:
+        if stream is not None:
             for target in dict.fromkeys((device, *additional_devices)):
                 with torch.cuda.device(target):
                     self.device_pools[target] = torch.cuda.MemPool()
@@ -149,7 +149,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         self._stages: dict[Hashable, dict[Hashable, torch.Tensor]] = {}
         self._slot_index = (
             torch.zeros(1, dtype=torch.int64, device=device)
-            if capture_stream is not None
+            if stream is not None
             else None
         )
         self._slot_values: dict[int, torch.Tensor] = {}
@@ -159,9 +159,10 @@ class DenoisingRunner(Generic[InputT, SizeT]):
     def captures(self) -> bool:
         """Whether this runner replays captured graphs.
 
-        A runner without a capture stream evaluates every step eagerly.
+        A runner given a stream prepares its sizes on it and captures each
+        ladder step there; a runner without one evaluates every step eagerly.
         """
-        return self.capture_stream is not None
+        return self.stream is not None
 
     def prepare_inputs(
         self, key: Hashable, size: SizeT
@@ -182,7 +183,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                 cache=self.cache,
                 attention=self.attention,
                 matmul=self.matmul,
-                stream=self.capture_stream,
+                stream=self.stream,
             )
             try:
                 if context.stream is not None:
@@ -531,10 +532,8 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         serves every request slot. The caller's samples are unchanged when
         this returns.
         """
-        if self.capture_stream is None:
-            raise RuntimeError(
-                "denoising graph capture requires a capture stream"
-            )
+        if self.stream is None:
+            raise RuntimeError("denoising graph capture requires a stream")
         self._resident_ladder(
             inputs, schedules, state=state, slot=slot, input_key=input_key
         )
@@ -553,7 +552,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
 
         the worker separately commits request progress.
         """
-        if self.capture_stream is None:
+        if self.stream is None:
             context, call = self._call(inputs, schedules, state, input_key)
             with context.activate():
                 return call(), "eager"
