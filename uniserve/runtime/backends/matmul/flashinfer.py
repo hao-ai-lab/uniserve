@@ -55,12 +55,15 @@ class _FlashInferOperator(_Operator):
                 backend="cudnn",
             )
         else:
-            # cuDNN consumes accelerator-swizzled scales; the original linear
-            # scale path uses the existing CuTe GEMM after the same repacking.
+            # cuDNN reads accelerator-swizzled scales in the two- or
+            # three-dimensional form they are produced in; scales repacked
+            # from the linear layout reach it flattened, which it rejects.
+            # CUTLASS accepts that flattened form and is the one FP4 kernel
+            # FlashInfer builds for both SM100 and SM120.
             backend = (
                 "cudnn"
                 if x.scale_layout is ScaleLayout.SWIZZLED_128X4
-                else "cute-dsl"
+                else "cutlass"
             )
             flashinfer.mm_fp4(
                 left["values"],
