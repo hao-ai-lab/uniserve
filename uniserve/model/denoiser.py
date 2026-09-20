@@ -92,7 +92,11 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
     ) -> Mapping[str, tuple[TensorOutput | None, ...]]:
         """Predict each sample.
 
-        Without committing a solver step or request progress.
+        Without committing a solver step or request progress. ``state`` names
+        the sample storage of the request being advanced, which a captured
+        step reads through fixed staging rather than at the request's own
+        addresses; storage a request draws on the host, as ``prepare_latents``
+        receives, is the preparation's and is absent here.
         """
         raise NotImplementedError
 

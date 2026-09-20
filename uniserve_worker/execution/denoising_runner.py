@@ -382,14 +382,16 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         }
         bound = replace(inputs, latents=latents, **others)
         # State names the same slot storage the latents do; a graph reads the
-        # stage that holds it, never a slot's own addresses.
-        bound_state = {}
-        for name, tensor in state.items():
-            located = self._locate(tensor)
-            if located is None:
-                bound_state[name] = tensor
-            else:
-                bound_state[name] = staged(tensor, writeback=False)
+        # stage that holds it, never a slot's own addresses. A field outside
+        # every bank is the slot's own storage, which preparation draws and
+        # reads before any step runs; binding it here would put one slot's
+        # addresses in the captured ladder and give every slot a ladder of its
+        # own, so the step binds the banked state alone.
+        bound_state = {
+            name: staged(tensor, writeback=False)
+            for name, tensor in state.items()
+            if self._locate(tensor) is not None
+        }
         if len(slots) != 1:
             raise ValueError(
                 "a denoising call binds the storage of exactly one slot, not "
