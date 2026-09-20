@@ -396,7 +396,9 @@ def test_video_jobs_retain_content_and_cancel_active_work(
 ) -> None:
     """Exercise async ownership and reuse through the HTTP contract.
 
-    The exercise runs on one deployment.
+    The exercise runs on the documented four-device deployment, whose numerical
+    components share one worker and whose media units are encoded and muxed on
+    a host worker.
     """
     import time
 
@@ -406,14 +408,19 @@ def test_video_jobs_retain_content_and_cancel_active_work(
             "UNISERVE_H3_MODEL must name a supported FastH3 checkpoint "
             "directory; docs/fast_h3/fast_h3.md lists them"
         )
+    deployment = (
+        Path(__file__).resolve().parents[3]
+        / "config"
+        / "minimax-h3-four-devices.json"
+    )
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
     command = [
         str(require_uniserve_binary()),
         "serve",
         model,
-        "--worker-ranks",
-        "4",
+        "--workers",
+        str(deployment),
         "--worker-python",
         sys.executable,
         "--served-model-name",
