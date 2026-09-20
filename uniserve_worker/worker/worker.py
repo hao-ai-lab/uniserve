@@ -1023,6 +1023,7 @@ class Worker:
         if head.kind is RequestKind.SUBMIT and (
             len(self.inflight) >= self.queue_depth
             or (self._collective_component and self._launched_submissions)
+            or self._awaits_local_product(head)
         ):
             return False
 
@@ -1056,6 +1057,31 @@ class Worker:
                 messages.with_message_id(response, pending.request),
             )
         )
+
+    def _awaits_local_product(self, pending: ServiceRequest) -> bool:
+        """Whether an in-flight batch has yet to write a product this reads.
+
+        Preparation resolves a product this rank produced from its own store,
+        so a batch naming one cannot be prepared before the batch producing it
+        has committed. A rank that enters collectives holds one batch in
+        flight and never reaches this; a rank whose components each sit on one
+        rank overlaps preparation with execution, and only the batches that
+        read an unwritten product wait.
+        """
+        batch = pending.batch
+        if batch is None:
+            return False
+        for call in batch.calls:
+            references = call.tensor_inputs()
+            if call.predicate is not None:
+                references = (*references, call.predicate)
+            for reference in references:
+                producer = self.inflight.get(
+                    reference.producer_call_id.batch_id
+                )
+                if producer is not None and not producer.launched:
+                    return True
+        return False
 
     def _launch_execute(self, pending: ServiceRequest) -> None:
         """Start one accepted batch and queue its result."""
