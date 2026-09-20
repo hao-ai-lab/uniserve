@@ -132,7 +132,8 @@ def output_layouts(
         return component.output_layout(
             config.max_sequence_tokens
             if prompt_tokens is None
-            else prompt_tokens
+            else prompt_tokens,
+            getattr(torch, config.model_dtype),
         )
 
     if isinstance(component, VideoPostprocessor):

@@ -247,11 +247,20 @@ class TextEncoder(Encoder[tuple[torch.Tensor, ...]]):
             return None
         return tuple(features.split(counts))
 
-    def output_layout(self, num_tokens: int):
+    def output_layout(self, num_tokens: int, dtype: torch.dtype):
+        """Describe the encoded conditioning this encoder emits.
+
+        ``dtype`` is the numerical dtype the deployment runs the encoder at,
+        which is what its hidden states carry. The caller supplies it because
+        every rank of a deployment declares this product, including the ranks
+        that never materialize the encoder's parameters and could read no
+        representation from them.
+        """
         if type(num_tokens) is not int or num_tokens < 0:
             raise ValueError("text output length must be a nonnegative integer")
+        if not dtype.is_floating_point:
+            raise ValueError("encoded conditioning requires a float dtype")
         shape = (num_tokens, self.network.hidden_size)
-        dtype = next(self.network.parameters()).dtype
         return {
             "conditioning": OutputLayout(
                 shape,
