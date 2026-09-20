@@ -8,6 +8,8 @@ import os
 import socket
 import sys
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -124,21 +126,24 @@ def _gathered_handles(
     return ordered  # type: ignore[return-value]
 
 
+@contextmanager
 def _rotated_descriptors(
     group: Communicator,
     handle: bytes,
     shape: tuple[int, ...],
     dtype: torch.dtype,
-) -> list[bytes]:
-    """Collect every owner's descriptor, in rank order.
+) -> Iterator[list[bytes]]:
+    """Hold every owner's descriptor open, in rank order, for the body.
 
     Where a device exports a POSIX descriptor rather than a fabric handle, the
     handle names a file this process holds open, so it reaches a peer only
     through `SCM_RIGHTS` on a Unix-domain socket. Descriptors rotate around the
     logical rank ring: each hop a rank forwards the descriptor it just received
     to its successor and accepts its predecessor's, so after `size - 1` hops
-    every rank holds one descriptor per owner. All setup finishes before CUDA
-    graph capture.
+    every rank holds one descriptor per owner. A descriptor is only meaningful
+    while it is open, so the collected list is yielded rather than returned and
+    the ring closes once the caller has imported from it. All setup finishes
+    before CUDA graph capture.
     """
     width = len(handle)
     received_descriptors: list[int] = []
@@ -180,7 +185,9 @@ def _rotated_descriptors(
                     owners[(group.rank - hop) % group.size] = current.to_bytes(
                         width, sys.byteorder
                     )
-                return [owners[owner] for owner in range(group.size)]
+                # The descriptors stay open for the caller: each one names a
+                # file this process holds, and mapping a peer's shard reads it.
+                yield [owners[owner] for owner in range(group.size)]
             finally:
                 for descriptor in received_descriptors:
                     os.close(descriptor)
@@ -207,12 +214,12 @@ def allocate_peer_tensor(
         return allocation.map_peers([handle])
 
     device = torch.device(group.device)
-    collect = (
-        _gathered_handles
-        if exports_fabric_handles(device.index or 0)
-        else _rotated_descriptors
-    )
-    return allocation.map_peers(collect(group, handle, shape, dtype))
+    if exports_fabric_handles(device.index or 0):
+        return allocation.map_peers(
+            _gathered_handles(group, handle, shape, dtype)
+        )
+    with _rotated_descriptors(group, handle, shape, dtype) as descriptors:
+        return allocation.map_peers(descriptors)
 
 
 def allocate_collective_buffer(
