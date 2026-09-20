@@ -4,8 +4,9 @@ A file descriptor names an open file of the process that opened it, so the
 bytes of one carry no meaning anywhere else. A device that exports descriptors
 rather than fabric handles therefore has to hand the descriptor itself to its
 readers, which is what these cover: a registered publication is granted, an
-unregistered or withdrawn one is refused, and an endpoint that serves nothing
-is refused rather than hung on.
+unregistered or withdrawn one is refused, an endpoint that serves nothing is
+refused rather than hung on, and a rank's readers are served when they all ask
+at once, which is what a batch of products actually produces.
 """
 
 from __future__ import annotations
@@ -92,3 +93,61 @@ def test_an_endpoint_that_serves_nothing_is_refused() -> None:
         f"uniserve-publications-{uuid.uuid4().hex}", uuid.uuid4().hex
     )
     assert kind == "error" and value == WorkerError.__name__
+
+
+def _fetch_many(endpoint: str, publications: list[str], channel) -> None:
+    """Ask for one publication and report what file it names."""
+    results = []
+    for publication in publications:
+        try:
+            descriptor = fetch(endpoint, publication)
+        except Exception as error:
+            results.append(("error", type(error).__name__))
+            continue
+        try:
+            results.append(("granted", _identity(descriptor)))
+        finally:
+            os.close(descriptor)
+    channel.send(results)
+
+
+def test_concurrent_consumers_are_all_served() -> None:
+    endpoint = f"uniserve-publications-{uuid.uuid4().hex}"
+    grants = DescriptorGrants(endpoint)
+    context = mp.get_context("spawn")
+    readers = 8
+    sources = [tempfile.TemporaryFile() for _ in range(4)]
+    publications = [uuid.uuid4().hex for _ in sources]
+    expected = []
+    try:
+        for publication, source in zip(publications, sources, strict=True):
+            grants.register(publication, source.fileno())
+            expected.append(_identity(source.fileno()))
+
+        # Every reader asks for every publication at the same time, which is
+        # what a rank reading a batch of products from several producers does.
+        pipes = [context.Pipe() for _ in range(readers)]
+        processes = [
+            context.Process(
+                target=_fetch_many, args=(endpoint, publications, child)
+            )
+            for _parent, child in pipes
+        ]
+        for process in processes:
+            process.start()
+        try:
+            for parent, _child in pipes:
+                assert parent.poll(120), "a consumer process never answered"
+                assert parent.recv() == [
+                    ("granted", identity) for identity in expected
+                ]
+        finally:
+            for process in processes:
+                process.join(30)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(10)
+    finally:
+        grants.close()
+        for source in sources:
+            source.close()
