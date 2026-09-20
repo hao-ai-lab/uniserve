@@ -2125,7 +2125,24 @@ class TensorStore:
         """Resolve a committed product and reject stale logical generations."""
         entry = self._products.get(_reference_key(reference))
         if entry is None or not entry.committed:
-            raise invalid_descriptor("unknown device-product reference")
+            # The identity is what distinguishes a product this rank never
+            # held from one whose producing call has not committed yet.
+            # Naming the request's committed products distinguishes a
+            # product this rank never held from one whose producing call has
+            # not committed yet, which read the same way without them.
+            committed = sorted(
+                (key[3].batch_id, key[4])
+                for key, value in self._products.items()
+                if key[1] == int(reference.request_key.request_id)
+                and value.committed
+            )
+            raise invalid_descriptor(
+                f"unknown device-product reference: request "
+                f"{reference.request_key.request_id} produced by "
+                f"{reference.producer_call_id} output "
+                f"{reference.output_index} generation "
+                f"{reference.generation}; committed {committed}"
+            )
         if entry.reference != reference:
             raise invalid_descriptor("stale device-product logical generation")
         return self._require_write_locked(entry)
