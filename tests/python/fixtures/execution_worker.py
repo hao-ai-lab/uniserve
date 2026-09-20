@@ -30,6 +30,7 @@ def execution_worker(
     max_batch_calls: int | None = None,
     components: tuple[tuple[str, ComponentConfig], ...] = (),
     bindings: Mapping[str, ComponentBinding] | None = None,
+    host_slots: tuple[int, ...] = (0, 1),
 ) -> Worker:
     ready = Model().to(device) if model is None else model
     worker_config = replace(
@@ -78,6 +79,9 @@ def execution_worker(
         allowed_work_variants=None,
         transfer_backends=transfer_backends,
         publication_backends=transfer_backends,
+        # The fixture's deployment is one host: the worker's own slot and the
+        # external consumer slot a test names both read over shared memory.
+        host_slots=host_slots,
         worker_id=worker_id,
         queue_depth=queue_depth,
         completion_payload_bytes=1 << 16,
