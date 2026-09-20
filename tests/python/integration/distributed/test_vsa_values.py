@@ -179,9 +179,10 @@ def _run(rank, rendezvous):
             result = tensor((local_end - local_begin, 8, 128), torch.bfloat16)
             stream = torch.cuda.Stream(device=device)
             stream.wait_stream(torch.cuda.current_stream())
-            with ExecutionContext(
-                layer, stream=stream, vsa="cute"
-            ) as execution:
+            # The contract under test is the value each partition produces,
+            # not which kernel produces it, so the provider is the one the
+            # device selects rather than one architecture's kernel.
+            with ExecutionContext(layer, stream=stream) as execution:
                 execution.prepare(None)
 
                 def chunks():
