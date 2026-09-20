@@ -274,7 +274,7 @@ def test_result_publication_rejects_unrepresentable_numerical_outputs(
     from uniserve_worker.runtime.results import resolve_outputs
 
     class FeatureEncoder(TextEncoder):
-        def output_layout(self, num_tokens):
+        def output_layout(self, num_tokens, _deployment_dtype):
             return {
                 "conditioning": OutputLayout(
                     (2, 3),
@@ -300,8 +300,13 @@ def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
     from uniserve_worker.runtime.buffer_pool import BufferPool
 
     model = EncodedModel(Config(hidden_size=7))
+    # The fixture's encoder is built at the default float dtype, which is
+    # what a deployment running it would declare.
     config = WorkerConfig(
-        device="cpu", max_sequence_tokens=3, max_request_pool_size=2
+        device="cpu",
+        max_sequence_tokens=3,
+        max_request_pool_size=2,
+        model_dtype="float32",
     )
     info = build_worker_layout(
         model,
