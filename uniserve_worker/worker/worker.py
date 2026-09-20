@@ -69,6 +69,7 @@ from ..execution.prepare import (
 from ..execution.step import execute_batch
 from ..foundation.errors import (
     WorkerError,
+    WorkerErrorCode,
     classify,
     invalid_descriptor,
     unsupported_setup,
@@ -743,7 +744,7 @@ class Worker:
             group.size > 1
             for binding in self.runner.bindings.values()
             if binding.owns
-            for group in binding.groups
+            for group in binding.communicators
         ) or (self.sampling_group is not None and self.sampling_group.size > 1)
 
     def _init_run_tracking(self) -> None:
@@ -1430,10 +1431,18 @@ class Worker:
         # and host completion may overlap; neither retains old batch identities.
         if self.worker_config.world_size > 1 and batch.calls:
             if batch.collective_seq <= self._last_collective_seq:
-                raise invalid_descriptor(
-                    f"collective sequence does not advance: batch "
-                    f"{batch.batch_id} carries {batch.collective_seq} after "
-                    f"{self._last_collective_seq}"
+                # Peers of an out-of-order batch are already inside the
+                # collective this rank would have joined, so failing only this
+                # batch would leave them waiting for a participant that never
+                # arrives. The rank cannot serve further collective work.
+                raise WorkerError(
+                    code=WorkerErrorCode.INVARIANT_VIOLATION,
+                    message=(
+                        f"collective sequence does not advance: batch "
+                        f"{batch.batch_id} carries {batch.collective_seq} "
+                        f"after {self._last_collective_seq}"
+                    ),
+                    fatal=True,
                 )
             self._last_collective_seq = batch.collective_seq
 
