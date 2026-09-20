@@ -385,7 +385,7 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
         runner = DenoisingRunner(
             model,
             device=device,
-            capture_stream=torch.cuda.Stream(device=device),
+            stream=torch.cuda.Stream(device=device),
             groups=(),
             capacity=2,
         )
