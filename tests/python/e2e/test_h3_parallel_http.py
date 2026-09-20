@@ -14,6 +14,7 @@ import av
 import httpx
 import numpy as np
 import pytest
+import torch
 from transformers import AutoTokenizer
 
 from tests.python.e2e.http_helpers import (
@@ -66,6 +67,95 @@ def _assert_media_values_close(actual: bytes, expected: bytes) -> None:
                 )
 
 
+# Eight-rank denoiser layouts. Every degree product equals eight, and each
+# entry names a distinct way of dividing the sequence, the tensors or the layer
+# range across that many ranks. They are declared apart from the four-rank
+# layouts because they place every numerical component on all eight devices,
+# which is how an eight-device host serves.
+EIGHT_RANK_PARALLEL_CONFIGS = {
+    "ulysses8": {
+        "sequence_parallel": {"kind": "ulysses", "ulysses_degree": 8},
+    },
+    "gather8": {
+        "sequence_parallel": {"kind": "allgather", "allgather_degree": 8},
+    },
+    "ring8": {"sequence_parallel": {"kind": "ring", "ring_degree": 8}},
+    "tensor8": {"tensor_parallel_size": 8},
+    "tensor2_ulysses4": {
+        "tensor_parallel_size": 2,
+        "sequence_parallel": {"kind": "ulysses", "ulysses_degree": 4},
+    },
+    "tensor4_ulysses2": {
+        "tensor_parallel_size": 4,
+        "sequence_parallel": {"kind": "ulysses", "ulysses_degree": 2},
+    },
+    "pipeline2_ulysses4": {
+        "pipeline_parallel_size": 2,
+        "sequence_parallel": {"kind": "ulysses", "ulysses_degree": 4},
+    },
+    "pipeline4_ulysses2": {
+        "pipeline_parallel_size": 4,
+        "sequence_parallel": {"kind": "ulysses", "ulysses_degree": 2},
+    },
+    "hybrid_ulysses4_ring2": {
+        "sequence_parallel": {
+            "kind": "hybrid",
+            "ulysses_degree": 4,
+            "ring_degree": 2,
+        },
+    },
+    "hybrid_ulysses2_ring4": {
+        "sequence_parallel": {
+            "kind": "hybrid",
+            "ulysses_degree": 2,
+            "ring_degree": 4,
+        },
+    },
+    "attention2d_2x4": {
+        "sequence_parallel": {
+            "kind": "attention2d",
+            "attn2d_row_size": 2,
+            "attn2d_col_size": 4,
+        },
+    },
+    "attention2d_4x2": {
+        "sequence_parallel": {
+            "kind": "attention2d",
+            "attn2d_row_size": 4,
+            "attn2d_col_size": 2,
+        },
+    },
+}
+
+# Ranks reach devices through this order rather than by identity, so a layout
+# that assumed rank index equals device index would fail. The first four entries
+# name devices of one PCIe island and the last four the other, which is the
+# grouping an eight-rank layout has to span on a two-island host.
+EIGHT_RANK_DENOISER_RANKS = [3, 1, 2, 0, 7, 5, 6, 4]
+
+
+def _eight_rank_worker_config(parallel_kind: str) -> dict:
+    """Place an eight-rank layout's components on all eight devices."""
+    ranks = list(range(8))
+    return {
+        "devices": ranks,
+        "denoiser": {
+            "ranks": EIGHT_RANK_DENOISER_RANKS,
+            "parallel_config": EIGHT_RANK_PARALLEL_CONFIGS[parallel_kind],
+        },
+        "text_encoder": {
+            "ranks": ranks,
+            "parallel_config": {"tensor_parallel_size": 8},
+        },
+        "video_decoder": {
+            "ranks": ranks,
+            "distribution": "temporal_units",
+            "units_per_rank": 1,
+        },
+        "audio_decoder": {"ranks": [0]},
+    }
+
+
 @pytest.mark.parametrize(
     ("parallel_kind", "precision", "grouping"),
     [
@@ -85,10 +175,15 @@ def _assert_media_values_close(actual: bytes, expected: bytes) -> None:
             "pipeline2",
             "pipeline4",
             "local",
+            *EIGHT_RANK_PARALLEL_CONFIGS,
         )
         for precision in ("quality", "balanced", "performance", "maximum")
     ]
-    + [("ulysses4", "balanced", grouping) for grouping in ("split", "mixed")],
+    + [("ulysses4", "balanced", grouping) for grouping in ("split", "mixed")]
+    + [
+        ("tensor2_ulysses4", "balanced", grouping)
+        for grouping in ("split", "mixed")
+    ],
 )
 def test_component_bindings_release_cancelled_requests(
     tmp_path: Path, parallel_kind: str, precision: str, grouping: str
@@ -207,9 +302,17 @@ def test_component_bindings_release_cancelled_requests(
         worker_config["denoiser"]["parallel_config"] = {
             "tensor_parallel_size": degree
         }
+    elif parallel_kind in EIGHT_RANK_PARALLEL_CONFIGS:
+        worker_config = _eight_rank_worker_config(parallel_kind)
     else:
         raise ValueError(f"unsupported H3 test layout {parallel_kind!r}")
     devices = worker_config.pop("devices")
+    visible_devices = max(devices) + 1
+    if torch.cuda.device_count() < visible_devices:
+        pytest.skip(
+            f"{parallel_kind} needs {visible_devices} devices; "
+            f"this host has {torch.cuda.device_count()}"
+        )
     groups = {
         "whole": [tuple(worker_config)],
         "split": [(name,) for name in worker_config],
@@ -347,7 +450,11 @@ def test_component_bindings_release_cancelled_requests(
         base_url,
         tmp_path / "h3-components.log",
         timeout_s=600,
-        env={"CUDA_VISIBLE_DEVICES": "0,1,2,3"},
+        env={
+            "CUDA_VISIBLE_DEVICES": ",".join(
+                str(index) for index in range(visible_devices)
+            )
+        },
     ):
         # Warm both decode geometries before exercising cancellation. Three
         # disconnects exceed the two provisioned slots and require their reuse.
