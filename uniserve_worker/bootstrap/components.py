@@ -46,6 +46,9 @@ HOST_COMPONENTS: Mapping[str, frozenset[MediaCall]] = {
 #: The calls a host component serves, as a worker reports them.
 MUXER_CALL_KINDS = HOST_COMPONENTS[MUXER_COMPONENT]
 
+#: Distinguishes an attribute a model never declared from one it cleared.
+_MISSING = object()
+
 
 def is_host_component(name: str) -> bool:
     """Report whether a component runs on host ranks rather than a device."""
@@ -135,12 +138,7 @@ def describe_components(
             if key in owners:
                 raise unsupported_setup(f"model repeats numerical method {key}")
             owners[key] = name
-            try:
-                module = model.get_submodule(path)
-            except AttributeError as error:
-                raise unsupported_setup(
-                    f"entry module {path!r} does not exist"
-                ) from error
+            module = _entry_module(model, path)
             if module is None:
                 # The full declaration remains available on ranks where a
                 # first/last-stage submodule has no resident numerical state.
@@ -191,6 +189,30 @@ def describe_components(
         for name in HOST_COMPONENTS:
             described[name] = ()
     return described
+
+
+def _entry_module(model: nn.Module, path: str) -> nn.Module | None:
+    """Resolve a declared entry path, or None where this rank holds no module.
+
+    A pipeline stage that does not participate in a submodule clears the
+    attribute, and ``get_submodule`` reports a cleared attribute the same way
+    it reports a path the model never declared. The caller distinguishes the
+    two: a cleared attribute is answered by the stage rules, a missing one is
+    a model declaration this worker cannot serve.
+    """
+    try:
+        return model.get_submodule(path)
+    except AttributeError as error:
+        parent_path, _, attribute = path.rpartition(".")
+        try:
+            parent = model.get_submodule(parent_path) if parent_path else model
+        except AttributeError:
+            parent = None
+        if parent is not None and getattr(parent, attribute, _MISSING) is None:
+            return None
+        raise unsupported_setup(
+            f"entry module {path!r} does not exist"
+        ) from error
 
 
 def supported_calls(

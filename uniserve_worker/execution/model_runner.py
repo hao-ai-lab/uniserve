@@ -387,7 +387,13 @@ class ModelRunner:
 
             stream = self.module_stream(name, method=call.entry_point.method)
             context = ExecutionContext(
-                call.module, attention=self.attention, stream=stream
+                call.module,
+                attention=self.attention,
+                stream=stream,
+                # A method declared for one pipeline stage runs on that stage
+                # alone, so its preparation opens no binding over a group the
+                # other stages never reach.
+                stage_local=call.entry_point.stage != "all",
             )
             try:
                 if stream is not None:
@@ -1007,6 +1013,7 @@ class ModelRunner:
                             else None,
                             attention=self.attention,
                             stream=None if stream is None else stream.stream,
+                            stage_local=call.entry_point.stage != "all",
                         )
                         # Text staging counts canonical tokens. Spatial codecs
                         # and vision towers expand those into different query
