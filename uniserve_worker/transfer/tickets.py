@@ -1739,14 +1739,23 @@ class _CudaSource:
 
     def events_released(self) -> None:
         # A fabric handle is bytes the publication carried and this rank owns
-        # nothing. A descriptor is an open file of this process: the grant is
-        # withdrawn here, and a direct export's descriptor is closed with it.
-        # A chunk's descriptor belongs to its pool, which outlives this
-        # publication.
-        if self.grants is not None and self.publication_id:
+        # nothing. A descriptor is an open file of this process, and a direct
+        # export's belongs to the publication: the engine retires a
+        # publication only once no named reader is still reading it, so the
+        # grant and the descriptor end here together.
+        #
+        # A chunk's descriptor belongs to its pool, and a chunk outlives its
+        # source by design -- the source was copied into it and is released
+        # while consumers are still reading. Withdrawing that grant here would
+        # refuse a reader that has not imported yet, so it is withdrawn where
+        # the chunk returns to the pool instead.
+        if (
+            self.grants is not None
+            and self.publication_id
+            and self.pool is None
+        ):
             self.grants.release(self.publication_id)
-            if self.pool is None:
-                os.close(int.from_bytes(self.handle, sys.byteorder))
+            os.close(int.from_bytes(self.handle, sys.byteorder))
 
         # This ends the source's lifetime, not the chunk's. A pool publication
         # was copied into its chunk, so the source is the producer's to reuse
@@ -2094,6 +2103,18 @@ class CudaVmmTransport(Transport):
     def set_completion_wake(self, wake: Any) -> None:
         self._reads.set_completion_wake(wake)
 
+    def _release_chunk(self, source: _CudaSource) -> None:
+        """Return one chunk to its pool and withdraw the grant that named it.
+
+        The grant lends the pool's descriptor, which the pool keeps; what ends
+        here is a consumer's right to ask for this chunk, which ends when the
+        chunk can be handed out again.
+        """
+        assert source.pool is not None and source.chunk is not None
+        if source.grants is not None and source.publication_id:
+            source.grants.release(source.publication_id)
+        source.pool.release(source.chunk)
+
     def _reclaim(
         self,
         source: _CudaSource,
@@ -2109,7 +2130,7 @@ class CudaVmmTransport(Transport):
                 self._unacknowledged.append(source)
             else:
                 # No other rank reads this product, so nothing can be waiting.
-                source.pool.release(source.chunk)
+                self._release_chunk(source)
         self._events.defer_release(
             (source.event,), source, completed=source.events_released
         )
@@ -2125,7 +2146,7 @@ class CudaVmmTransport(Transport):
         import torch
 
         held = [
-            (source, source.pool, source.chunk)
+            source
             for source in self._unacknowledged
             if source.pool is not None and source.chunk is not None
         ]
@@ -2135,20 +2156,21 @@ class CudaVmmTransport(Transport):
         # separately would put one device-to-host synchronize per held
         # publication into every retirement pass.
         watched = [
-            chunk.acknowledgments[list(source.consumers)]
-            for source, _, chunk in held
+            source.chunk.acknowledgments[list(source.consumers)]
+            for source in held
+            if source.chunk is not None
         ]
         observed = (
             torch.cat(watched).cpu().split([len(words) for words in watched])
         )
 
         waiting = []
-        for (source, pool, chunk), words in zip(held, observed, strict=True):
+        for source, words in zip(held, observed, strict=True):
             # A chunk returns once no named consumer is still reading it: one
             # that never claimed its word holds nothing, which is how a
             # product whose consuming call was never submitted retires.
             if bool((words != vmm_pool.CLAIMED).all()):
-                pool.release(chunk)
+                self._release_chunk(source)
             else:
                 waiting.append(source)
         self._unacknowledged = waiting
