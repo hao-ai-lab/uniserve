@@ -57,6 +57,26 @@ def _run_groups(rank: int, rendezvous: str, backend: str):
         result = meshes["decoder"].get_group("tp").all_reduce(value.clone())
         torch.testing.assert_close(result, value, rtol=0, atol=0)
 
+        # A temporally distributed component computes each media unit on one
+        # rank, so its mesh states no exchange. Consecutive units still cross
+        # the ring between the ranks holding them, and the binding must report
+        # that ring for callers that decide behavior from participation.
+        (ring,) = tuple(
+            group
+            for group in bindings["decoder"].communicators
+            if group.size > 1
+        )
+        assert ring.ranks == (3, 1)
+        unit_value = torch.tensor([[rank + 1.0]], device=device)
+        torch.testing.assert_close(
+            ring.all_gather(unit_value),
+            torch.tensor(
+                [[member + 1.0] for member in ring.ranks], device=device
+            ),
+            rtol=0,
+            atol=0,
+        )
+
     for mesh in meshes.values():
         for dimension in mesh.axes:
             group = mesh.get_group(dimension)
