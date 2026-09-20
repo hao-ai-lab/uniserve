@@ -14,6 +14,7 @@ import os
 import queue
 import selectors
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -37,6 +38,7 @@ from ..foundation.errors import (
 )
 from ..foundation.shared_memory import allocate_shared_memory
 from ..protocol.transfer import (
+    DESCRIPTOR_HANDLE_BYTES,
     FABRIC_HANDLE_BYTES,
     ChannelTransfer,
     CudaVmmTransfer,
@@ -45,7 +47,8 @@ from ..protocol.transfer import (
     PosixShmTransfer,
     WorkerEndpoint,
 )
-from . import segment, vmm_pool
+from . import descriptor_grants, segment, vmm_pool
+from .descriptor_grants import DescriptorGrants
 from .endpoint import Publications, locator_digest
 from .layout import region_view, validate_destination
 from .vmm_pool import ACK_WORD_BYTES, PoolChunk, PoolExhaustedError, VmmPool
@@ -1729,11 +1732,22 @@ class _CudaSource:
     chunk: PoolChunk | None = None
     #: Acknowledgment slots of the ranks that read this publication.
     consumers: tuple[int, ...] = ()
+    #: Grant table this publication's descriptor is lent from, on a device
+    #: that exports descriptors rather than fabric handles.
+    grants: DescriptorGrants | None = None
+    publication_id: str = ""
 
     def events_released(self) -> None:
-        # A shareable handle is bytes the publication carried, not a process
-        # descriptor this rank owns, so nothing is closed here.
-        #
+        # A fabric handle is bytes the publication carried and this rank owns
+        # nothing. A descriptor is an open file of this process: the grant is
+        # withdrawn here, and a direct export's descriptor is closed with it.
+        # A chunk's descriptor belongs to its pool, which outlives this
+        # publication.
+        if self.grants is not None and self.publication_id:
+            self.grants.release(self.publication_id)
+            if self.pool is None:
+                os.close(int.from_bytes(self.handle, sys.byteorder))
+
         # This ends the source's lifetime, not the chunk's. A pool publication
         # was copied into its chunk, so the source is the producer's to reuse
         # as soon as its own fence drains, however long consumers keep reading
@@ -1977,8 +1991,15 @@ class CudaVmmTransport(Transport):
 
     A consumer maps the producer's allocation from the handle the locator
     carries and, for a pool chunk, writes its acknowledgment word in the
-    chunk's header once its copies retire. Nothing connects back to the
-    producing rank, which is what lets a device product cross hosts.
+    chunk's header once its copies retire. Where the device exports fabric
+    handles nothing connects back to the producing rank, which is what lets a
+    device product cross hosts.
+
+    Where it exports POSIX descriptors instead, the published handle names an
+    open file of the producing process and carries no meaning elsewhere, so a
+    consumer asks this rank for it over the grant socket in
+    `descriptor_grants`. Such a device cannot place an edge across hosts in
+    any case, so that connection costs nothing the fabric case has.
     """
 
     name = "cuda_vmm"
@@ -2007,6 +2028,9 @@ class CudaVmmTransport(Transport):
             | None
         ) = None
         self._bytes = capacity
+        # Grants exist only where the device exports descriptors, so the
+        # socket is bound when the first such publication needs it.
+        self._grants: DescriptorGrants | None = None
         # One bounded pool per device, reserved when that device first
         # publishes, so a rank reserves nothing on a device it never
         # publishes from. The pool is bounded by this rank's transfer byte
@@ -2055,6 +2079,12 @@ class CudaVmmTransport(Transport):
 
     def endpoint(self) -> str:
         return self._publications.name
+
+    def _descriptor_grants(self) -> DescriptorGrants:
+        """Bind this address space's grant socket on first use."""
+        if self._grants is None:
+            self._grants = DescriptorGrants(self.endpoint())
+        return self._grants
 
     def publication_retirement(
         self, locator: Locator
@@ -2254,6 +2284,16 @@ class CudaVmmTransport(Transport):
             # a reader of this call's products has written its acknowledgment,
             # which a consumer on another host can do as well as one here.
             readers = tuple(int(slot) for slot in consumers)
+            publication_id = uuid.uuid4().hex
+            grants = None
+            if len(descriptor) == DESCRIPTOR_HANDLE_BYTES:
+                # The handle is an open file of this process. A consumer can
+                # only receive it over the grant socket, so it is registered
+                # before the locator naming it leaves this rank.
+                grants = self._descriptor_grants()
+                grants.register(
+                    publication_id, int.from_bytes(descriptor, sys.byteorder)
+                )
             publication = _CudaSource(
                 source,
                 event,
@@ -2264,6 +2304,8 @@ class CudaVmmTransport(Transport):
                 pool=pool if chunk is not None else None,
                 chunk=chunk,
                 consumers=readers if chunk is not None else (),
+                grants=grants,
+                publication_id=publication_id,
             )
 
             # Run-length encode first-axis span lengths so the importer can
@@ -2278,7 +2320,7 @@ class CudaVmmTransport(Transport):
                 source=self.source,
                 transport=CudaVmmTransfer(
                     endpoint=self.endpoint(),
-                    publication_id=uuid.uuid4().hex,
+                    publication_id=publication_id,
                     storage_size_bytes=storage_size,
                     storage_offsets_bytes=tuple(
                         storage_offset + span.data_ptr() - first.data_ptr()
@@ -2290,9 +2332,10 @@ class CudaVmmTransport(Transport):
                     ready_event_handle=(
                         bytes(event.ipc_handle()) if interprocess else b""
                     ),
-                    # The allocation handle travels with the publication so a
-                    # consumer imports it directly. A fabric handle reaches
-                    # another host, which a descriptor grant cannot.
+                    # A fabric handle travels with the publication and a
+                    # consumer imports it directly, anywhere in the fabric
+                    # domain. A descriptor travels only so a consumer can tell
+                    # which kind it is; the usable one comes from the grant.
                     allocation_handle=descriptor,
                     # A consumer writes its own slot's word here once its reads
                     # retire. A publication outside the pool carries no header.
@@ -2432,14 +2475,28 @@ class CudaVmmTransport(Transport):
                         )
                     # One mapping owns every span; tensor views share its
                     # deleter.
-                    # The publication carries the shareable handle, so the
-                    # consumer imports it directly rather than being granted a
-                    # descriptor that only reaches the producer's own host.
-                    allocation = import_handle(
-                        prototype,
-                        handle.allocation_handle,
-                        handle.storage_size_bytes,
-                    )
+                    # A fabric handle is importable as published. A descriptor
+                    # names an open file of the producing process, so the
+                    # usable one is received from that rank over its grant
+                    # socket and closed once the allocation, which holds its
+                    # own reference, has been imported.
+                    granted = None
+                    if len(handle.allocation_handle) == DESCRIPTOR_HANDLE_BYTES:
+                        granted = descriptor_grants.fetch(
+                            handle.endpoint, handle.publication_id
+                        )
+                        exported = descriptor_grants.descriptor_bytes(granted)
+                    else:
+                        exported = handle.allocation_handle
+                    try:
+                        allocation = import_handle(
+                            prototype,
+                            exported,
+                            handle.storage_size_bytes,
+                        )
+                    finally:
+                        if granted is not None:
+                            os.close(granted)
                     lengths = (
                         length
                         for length, count in zip(
@@ -2535,6 +2592,9 @@ class CudaVmmTransport(Transport):
             # whole, which is what closing the transport means for them.
             self._unacknowledged.clear()
             self._pools.clear()
+            if self._grants is not None:
+                self._grants.close()
+                self._grants = None
             with _endpoint_lock:
                 _endpoints.pop(self.endpoint(), None)
         if self._failed_publication is not None:
