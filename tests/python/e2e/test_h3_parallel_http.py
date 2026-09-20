@@ -99,6 +99,16 @@ def test_component_bindings_release_cancelled_requests(
             "UNISERVE_H3_MODEL must name a supported FastH3 checkpoint "
             "directory; docs/fast_h3/fast_h3.md lists them"
         )
+    # A layout that holds the whole denoiser on one device cannot also hold a
+    # 15-second activation working set: the single-device warmup exhausts a
+    # 184 GiB device with 178 GB allocated. That layout is qualified at a
+    # five-second maximum; every other layout takes both shapes.
+    shapes = (
+        ((5, 1000, 124),)
+        if parallel_kind == "local"
+        else ((5, 1000, 124), (15, 16384, 362))
+    )
+    max_video_seconds = str(max(seconds for seconds, _, _ in shapes))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     worker_config = {
@@ -302,7 +312,7 @@ def test_component_bindings_release_cancelled_requests(
         "--max-model-len",
         "16384",
         "--max-video-seconds",
-        "15",
+        max_video_seconds,
         # One and two device layouts hold the whole denoiser on each of their
         # ranks and split the 15-second sequence over fewer of them, so their
         # warmup reaches a larger share of the device than the four-device
@@ -317,7 +327,7 @@ def test_component_bindings_release_cancelled_requests(
     tokenizer = AutoTokenizer.from_pretrained(Path(model_value) / "tokenizer")
     point = load_config().benchmarks["minimax-h3-5s-1k"]
     payloads = []
-    for seconds, tokens in ((5, 1000), (15, 16384)):
+    for seconds, tokens, _frames in shapes:
         case = replace(
             point,
             load=replace(point.load, num_prompts=1),
@@ -341,7 +351,9 @@ def test_component_bindings_release_cancelled_requests(
     ):
         # Warm both decode geometries before exercising cancellation. Three
         # disconnects exceed the two provisioned slots and require their reuse.
-        for payload, frames in zip(payloads, (124, 362), strict=True):
+        for payload, (_seconds, _tokens, frames) in zip(
+            payloads, shapes, strict=True
+        ):
             response = httpx.post(
                 f"{base_url}/v1/videos/sync",
                 json=payload,
