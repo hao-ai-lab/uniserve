@@ -375,8 +375,9 @@ def test_cuda_capacity_query_failure_is_not_an_empty_budget(
 
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
 @pytest.mark.parametrize(
-    ("streamed_width", "window_bytes", "full_bytes", "import_bytes"),
-    [(128, 4096, 10_240, 10_240), (130, 4608, 11_520, 15_360)],
+    ("streamed_width", "streamed_bytes"),
+    # Twenty units of the streamed product, aligned to 256 bytes as a whole.
+    [(128, 10_240), (130, 10_496)],
 )
 @pytest.mark.parametrize(
     "worker_entries",
@@ -389,8 +390,8 @@ def test_cuda_capacity_query_failure_is_not_an_empty_budget(
         ("decode", "assemble"),
     ],
 )
-def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
-    rank, worker_entries, streamed_width, window_bytes, full_bytes, import_bytes
+def test_product_capacity_backs_produced_and_consumed_products_whole(
+    rank, worker_entries, streamed_width, streamed_bytes
 ):
     from uniserve.distributed.mesh import DeviceMesh
     from uniserve_worker.bootstrap.capacity import local_product_storage_bytes
@@ -458,57 +459,33 @@ def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(
         MediaCall.VIDEO_DECODING: "decode",
         MediaCall.VIDEO_ENCODING: "assemble",
     }
-    # Two outstanding groups each contain four units. Every allocation is
-    # aligned to 256 bytes, including imported units from a remote worker.
+    # A rank backs what it produces and what a consumer it holds reads, each
+    # whole: the streamed product is not reduced to a window of its rounds,
+    # because rounds stay bound until their consumer has read them. Every
+    # allocation is aligned to 256 bytes.
     expected = {
         ("encode", "predict", "decode", "assemble"): {
-            0: window_bytes,
-            1: 1536 + window_bytes,
+            0: streamed_bytes,
+            1: 1536 + streamed_bytes,
             2: 512,
-            3: 1024 + window_bytes,
+            3: 1024 + streamed_bytes,
         },
         ("encode",): {2: 512},
         ("predict",): {1: 1536},
-        ("decode",): {1: 1024 + window_bytes, 3: 1024 + window_bytes},
-        # An assembler in another worker may import a group spanning every
-        # declared unit; the producer's local grouping cannot bound it.
-        ("assemble",): {0: import_bytes},
+        ("decode",): {1: 1024 + streamed_bytes, 3: 1024 + streamed_bytes},
+        # An assembler in another worker imports the complete product.
+        ("assemble",): {0: streamed_bytes},
         ("decode", "assemble"): {
-            0: window_bytes,
-            1: 1024 + window_bytes,
-            3: 1024 + window_bytes,
+            0: streamed_bytes,
+            1: 1024 + streamed_bytes,
+            3: 1024 + streamed_bytes,
         },
     }[worker_entries]
     assert local_product_storage_bytes(
         outputs,
         bindings=bindings,
         media_components=components,
-        max_unresolved_ops=2,
     ) == expected.get(rank, 0)
-    # A horizon beyond the complete trajectory never reserves extra units.
-    expected_full = {
-        ("encode", "predict", "decode", "assemble"): {
-            0: full_bytes,
-            1: 1536 + full_bytes,
-            2: 512,
-            3: 1024 + full_bytes,
-        },
-        ("encode",): {2: 512},
-        ("predict",): {1: 1536},
-        ("decode",): {1: 1024 + full_bytes, 3: 1024 + full_bytes},
-        ("assemble",): {0: import_bytes},
-        ("decode", "assemble"): {
-            0: full_bytes,
-            1: 1024 + full_bytes,
-            3: 1024 + full_bytes,
-        },
-    }[worker_entries]
-    assert local_product_storage_bytes(
-        outputs,
-        bindings=bindings,
-        media_components=components,
-        max_unresolved_ops=8,
-    ) == expected_full.get(rank, 0)
 
 
 @pytest.mark.parametrize("start,stop", [(2, 5), (5, 5)])

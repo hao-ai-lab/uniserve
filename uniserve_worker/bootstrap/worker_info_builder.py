@@ -633,7 +633,6 @@ def _request_tensor_worker_layout(
             resolve_outputs(model, worker_config),
             bindings=bindings or {},
             media_components=media_components(model),
-            max_unresolved_ops=unresolved_window,
         ),
         latent_width=1,
         latent_dtype="float32",
