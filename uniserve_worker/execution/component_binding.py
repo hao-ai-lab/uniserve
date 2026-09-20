@@ -119,6 +119,20 @@ class ComponentBinding:
         return self.process_group.global_rank in self.config.ranks
 
     @property
+    def communicators(self) -> tuple[Communicator, ...]:
+        """Every group this rank exchanges tensors in for this component.
+
+        A temporally distributed component's numerical mesh is this rank
+        alone, so its mesh groups state no exchange. The ranks holding
+        consecutive media units still exchange their overlap over the unit
+        ring, which is that component's only collective and belongs with the
+        mesh's groups wherever participation decides behavior.
+        """
+        if self.units is None:
+            return self.groups
+        return (*self.groups, self.units)
+
+    @property
     def input_ranks(self) -> tuple[int, ...]:
         """First pipeline-stage input members in configured order."""
         config = self.config
