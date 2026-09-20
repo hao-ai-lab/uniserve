@@ -496,8 +496,9 @@ def _read_shm_publication(channel, slot: int) -> None:
 
     The reader finds everything it needs in the segment: the digest that
     binds it to the locator, the readiness word, and its own acknowledgment
-    word. It holds the segment unacknowledged across the producer's release
-    so retirement is observed to wait for it.
+    word. It claims that word before its first read, as the transport does,
+    and holds the claim across the producer's release so retirement is
+    observed to wait for it.
     """
     from uniserve_worker.transfer import segment
     from uniserve_worker.transfer.endpoint import locator_digest
@@ -511,6 +512,7 @@ def _read_shm_publication(channel, slot: int) -> None:
     try:
         header = memoryview(storage)
         assert segment.digest(header) == locator_digest(locator)
+        segment.claim(header, slot)
         segment.await_ready(header)
         payload = segment.HEADER_BYTES
         data = bytearray(storage[payload : payload + locator.nbytes])
@@ -530,11 +532,12 @@ def _read_shm_publication(channel, slot: int) -> None:
 def test_shm_retirement_waits_for_its_consumers_and_reclaims_capacity(
     source_device: str,
 ) -> None:
-    """A segment returns once every named consumer has acknowledged it.
+    """A segment returns once every consumer that claimed it has acknowledged.
 
     A device-sourced publication returns before its bytes have landed; the
     readers wait on the segment's readiness word instead. Retirement holds the
-    segment and its capacity until both readers have written their words.
+    segment and its capacity until both readers, each of which claimed its
+    word before reading, have acknowledged.
     """
     context = mp.get_context("spawn")
     events = EventPool()
