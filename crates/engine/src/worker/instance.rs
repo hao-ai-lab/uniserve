@@ -385,6 +385,20 @@ impl WorkerGroup {
         let mut info = workers[0].info().clone();
         let mut canonical = info.clone();
         canonical.configuration_id.clear();
+        // A rank's product storage follows the components it holds, which an
+        // asymmetric placement makes rank-specific: a rank that imports a
+        // component's product reserves the whole logical allocation for it,
+        // and a rank that neither produces nor consumes it reserves nothing.
+        // The group reports the smallest, because the engine places work
+        // against one pool per group and must not place more than the
+        // smallest rank can hold.
+        let product_storage = workers
+            .iter()
+            .map(|worker| worker.info().buffer_pool_bytes)
+            .min()
+            .unwrap_or(info.buffer_pool_bytes);
+        info.buffer_pool_bytes = product_storage;
+        canonical.buffer_pool_bytes = product_storage;
         // Checkpoint agreement is checked by name before the generic report
         // comparison, which would otherwise report only that ranks disagree.
         let checkpoints = workers
@@ -415,6 +429,7 @@ impl WorkerGroup {
             normalized.endpoint = canonical.endpoint.clone();
             normalized.device = canonical.device.clone();
             normalized.transfer_backends = canonical.transfer_backends.clone();
+            normalized.buffer_pool_bytes = canonical.buffer_pool_bytes;
             if let (Some(local), Some(reference)) = (&mut normalized.kv_cache, &canonical.kv_cache)
             {
                 local.kv_head_offset = reference.kv_head_offset;
