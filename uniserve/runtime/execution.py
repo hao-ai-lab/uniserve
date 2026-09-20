@@ -85,10 +85,14 @@ def close_stream_collectives(stream, *, aborted: bool = False) -> None:
             binding.close()
 
 
-def _communicators(module):
+def _communicators(module, *, stage_local=False):
     """Discover borrowed communication interfaces.
 
     Discover borrowed communication interfaces in ordinary module attributes.
+    ``stage_local`` excludes the groups that join distinct pipeline stages,
+    for a module one stage holds alone: the stages that do not hold it never
+    prepare it, so opening a binding there would wait for participants that
+    never arrive.
     """
     groups = {}
 
@@ -96,7 +100,13 @@ def _communicators(module):
         if isinstance(value, Communicator):
             groups[value] = value
         elif isinstance(value, DeviceMesh):
-            groups.update((group, group) for group in value._groups.values())
+            # A bound mesh holds a group for every axis combination, including
+            # ones joining distinct pipeline stages.
+            groups.update(
+                (group, group)
+                for axes, group in value._groups.items()
+                if not (stage_local and "pp" in axes)
+            )
         elif isinstance(value, Mapping):
             for member in value.values():
                 if isinstance(member, (Communicator, DeviceMesh)):
@@ -588,8 +598,11 @@ class ExecutionContext(Generic[SizeT]):
         attention="auto",
         vsa="auto",
         matmul="auto",
+        stage_local=False,
     ):
         self.module, self.stream, self.cache = module, stream, cache
+        # A module one pipeline stage holds alone: see _communicators.
+        self._stage_local = stage_local
         self._attention_backend, self._vsa_backend, self._matmul_backend = (
             attention,
             vsa,
@@ -806,7 +819,9 @@ class ExecutionContext(Generic[SizeT]):
 
             pending = (
                 group
-                for group in _communicators(self.module)
+                for group in _communicators(
+                    self.module, stage_local=self._stage_local
+                )
                 if group.size > 1
                 and group._require().group_name not in self._collectives
             )
