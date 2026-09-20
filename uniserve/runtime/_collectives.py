@@ -13,7 +13,12 @@ import torch
 import torch.distributed as dist
 
 from uniserve.distributed.mesh import Communicator
-from uniserve.runtime.cuda import cuda_status, cuda_value, driver
+from uniserve.runtime.cuda import (
+    create_sibling_stream,
+    cuda_value,
+    destroy_stream,
+    driver,
+)
 
 
 class _CollectiveWork:
@@ -90,47 +95,15 @@ class NcclCommunicator:
                 # Reuse the computation's actual context, including its SM
                 # partition. Communication owns a stream, not another resource
                 # partition, and every transfer rejoins its numerical consumer.
-                flags = int(cu.CUstream_flags.CU_STREAM_NON_BLOCKING)
-                if int(green):
-                    raw = cuda_value(
-                        cu.cuGreenCtxStreamCreate(
-                            green, flags, stream.priority
-                        ),
-                        "create partitioned communication stream",
-                    )
-                else:
-                    context = cuda_value(
-                        cu.cuStreamGetCtx(origin), "query stream context"
-                    )
-                    cuda_status(
-                        cu.cuCtxPushCurrent(context),
-                        "enter communication context",
-                    )
-                    try:
-                        raw = cuda_value(
-                            cu.cuStreamCreateWithPriority(
-                                flags, stream.priority
-                            ),
-                            "create communication stream",
-                        )
-                    finally:
-                        cuda_status(
-                            cu.cuCtxPopCurrent(), "leave communication context"
-                        )
-
-                self._raw_transfer = raw
-                self._transfer = torch.cuda.ExternalStream(
-                    int(raw), device=stream.device
+                self._raw_transfer, self._transfer = create_sibling_stream(
+                    stream, "communication"
                 )
         except BaseException as error:
             # Partial construction still attempts every acquired resource's
             # release, recording cleanup failures on the original error.
             if self._raw_transfer is not None:
                 try:
-                    cuda_status(
-                        driver().cuStreamDestroy(self._raw_transfer),
-                        "destroy communication stream",
-                    )
+                    destroy_stream(self._raw_transfer, "communication")
                 except BaseException as cleanup_error:
                     error.add_note(
                         f"Communication stream cleanup failed: "
@@ -469,10 +442,7 @@ class NcclCommunicator:
     def _release_stream(self) -> None:
         """Destroy the communication stream this communicator owns."""
         if self._raw_transfer is not None:
-            cuda_status(
-                driver().cuStreamDestroy(self._raw_transfer),
-                "destroy communication stream",
-            )
+            destroy_stream(self._raw_transfer, "communication")
             self._raw_transfer = None
             self._transfer = self._pending = None
 

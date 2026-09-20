@@ -64,6 +64,54 @@ def cuda_value(result: tuple[Any, ...], call: str) -> Any:
     return result[1]
 
 
+def create_sibling_stream(
+    stream: torch.cuda.Stream, purpose: str
+) -> tuple[Any, torch.cuda.ExternalStream]:
+    """Create a driver stream in ``stream``'s CUDA context.
+
+    The new stream shares the context of ``stream``, including its SM
+    partition when that is a green context, at the same priority and without
+    implicit synchronization against the legacy default stream. A driver
+    stream is never one of PyTorch's pooled streams, so it is distinct from
+    every stream the pool hands out. Returns the raw handle, which the caller
+    destroys with ``destroy_stream``, and the wrapped stream PyTorch
+    dispatches onto. ``purpose`` names the stream in failures.
+    """
+    with torch.cuda.device(stream.device):
+        cu = driver()
+        origin = cu.CUstream(stream.cuda_stream)
+        flags = int(cu.CUstream_flags.CU_STREAM_NON_BLOCKING)
+        green = cuda_value(
+            cu.cuStreamGetGreenCtx(origin), f"query {purpose} stream context"
+        )
+        if int(green):
+            raw = cuda_value(
+                cu.cuGreenCtxStreamCreate(green, flags, stream.priority),
+                f"create partitioned {purpose} stream",
+            )
+        else:
+            context = cuda_value(
+                cu.cuStreamGetCtx(origin), f"query {purpose} stream context"
+            )
+            cuda_status(
+                cu.cuCtxPushCurrent(context), f"enter {purpose} context"
+            )
+            try:
+                raw = cuda_value(
+                    cu.cuStreamCreateWithPriority(flags, stream.priority),
+                    f"create {purpose} stream",
+                )
+            finally:
+                cuda_status(cu.cuCtxPopCurrent(), f"leave {purpose} context")
+
+    return raw, torch.cuda.ExternalStream(int(raw), device=stream.device)
+
+
+def destroy_stream(raw: Any, purpose: str) -> None:
+    """Destroy a driver stream created by ``create_sibling_stream``."""
+    cuda_status(driver().cuStreamDestroy(raw), f"destroy {purpose} stream")
+
+
 def verify_graph_context(
     graph: torch.cuda.CUDAGraph, contexts: frozenset[int]
 ) -> int:
