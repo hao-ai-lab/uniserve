@@ -530,6 +530,328 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
+# The packed NVFP4 checkpoints of the supported set. A packed ModelOpt
+# checkpoint owns its weight and scale contract, so these servers declare no
+# quantization preset; they declare the same activation dtype and every other
+# setting as the fast_h3 suite, so each point compares with its BF16
+# counterpart at the same shape.
+[servers.fasth3-nvfp4-8step-5s-1k]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_8STEP_MODEL:-/workspace/models/FastVideo-FastH3-8-Step-V2-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "${UNISERVE_H3_DEPLOYMENT:-config/minimax-h3-four-devices.json}", "--queue-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--video-graph-shapes", "5x1000", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16"]
+
+[servers.fasth3-nvfp4-8step-5s-1k.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[benchmarks.fasth3-nvfp4-8step-5s-1k]
+server = "fasth3-nvfp4-8step-5s-1k"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_8STEP_MODEL:-/workspace/models/FastVideo-FastH3-8-Step-V2-NVFP4}/tokenizer"
+
+[benchmarks.fasth3-nvfp4-8step-5s-1k.video]
+seconds = 5.0
+prompt_tokens = 1000
+
+[benchmarks.fasth3-nvfp4-8step-5s-1k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.fasth3-nvfp4-8step-5s-1k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[servers.fasth3-nvfp4-8step-5s-10k]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_8STEP_MODEL:-/workspace/models/FastVideo-FastH3-8-Step-V2-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "${UNISERVE_H3_DEPLOYMENT:-config/minimax-h3-four-devices.json}", "--queue-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--video-graph-shapes", "5x10000", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16"]
+
+[servers.fasth3-nvfp4-8step-5s-10k.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[benchmarks.fasth3-nvfp4-8step-5s-10k]
+server = "fasth3-nvfp4-8step-5s-10k"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_8STEP_MODEL:-/workspace/models/FastVideo-FastH3-8-Step-V2-NVFP4}/tokenizer"
+
+[benchmarks.fasth3-nvfp4-8step-5s-10k.video]
+seconds = 5.0
+prompt_tokens = 10000
+
+[benchmarks.fasth3-nvfp4-8step-5s-10k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.fasth3-nvfp4-8step-5s-10k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[servers.fasth3-nvfp4-8step-15s-1k]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_8STEP_MODEL:-/workspace/models/FastVideo-FastH3-8-Step-V2-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "${UNISERVE_H3_DEPLOYMENT:-config/minimax-h3-four-devices.json}", "--queue-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--video-graph-shapes", "15x1000", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16"]
+
+[servers.fasth3-nvfp4-8step-15s-1k.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[benchmarks.fasth3-nvfp4-8step-15s-1k]
+server = "fasth3-nvfp4-8step-15s-1k"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_8STEP_MODEL:-/workspace/models/FastVideo-FastH3-8-Step-V2-NVFP4}/tokenizer"
+
+[benchmarks.fasth3-nvfp4-8step-15s-1k.video]
+seconds = 15.0
+prompt_tokens = 1000
+
+[benchmarks.fasth3-nvfp4-8step-15s-1k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.fasth3-nvfp4-8step-15s-1k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[servers.fasth3-nvfp4-8step-15s-10k]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_8STEP_MODEL:-/workspace/models/FastVideo-FastH3-8-Step-V2-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "${UNISERVE_H3_DEPLOYMENT:-config/minimax-h3-four-devices.json}", "--queue-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--video-graph-shapes", "15x10000", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16"]
+
+[servers.fasth3-nvfp4-8step-15s-10k.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[benchmarks.fasth3-nvfp4-8step-15s-10k]
+server = "fasth3-nvfp4-8step-15s-10k"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_8STEP_MODEL:-/workspace/models/FastVideo-FastH3-8-Step-V2-NVFP4}/tokenizer"
+
+[benchmarks.fasth3-nvfp4-8step-15s-10k.video]
+seconds = 15.0
+prompt_tokens = 10000
+
+[benchmarks.fasth3-nvfp4-8step-15s-10k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.fasth3-nvfp4-8step-15s-10k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[servers.fasth3-nvfp4-4step-5s-1k]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "${UNISERVE_H3_DEPLOYMENT:-config/minimax-h3-four-devices.json}", "--queue-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--video-graph-shapes", "5x1000", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16"]
+
+[servers.fasth3-nvfp4-4step-5s-1k.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[benchmarks.fasth3-nvfp4-4step-5s-1k]
+server = "fasth3-nvfp4-4step-5s-1k"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+
+[benchmarks.fasth3-nvfp4-4step-5s-1k.video]
+seconds = 5.0
+prompt_tokens = 1000
+
+[benchmarks.fasth3-nvfp4-4step-5s-1k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.fasth3-nvfp4-4step-5s-1k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[servers.fasth3-nvfp4-4step-5s-10k]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "${UNISERVE_H3_DEPLOYMENT:-config/minimax-h3-four-devices.json}", "--queue-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--video-graph-shapes", "5x10000", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16"]
+
+[servers.fasth3-nvfp4-4step-5s-10k.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[benchmarks.fasth3-nvfp4-4step-5s-10k]
+server = "fasth3-nvfp4-4step-5s-10k"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+
+[benchmarks.fasth3-nvfp4-4step-5s-10k.video]
+seconds = 5.0
+prompt_tokens = 10000
+
+[benchmarks.fasth3-nvfp4-4step-5s-10k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.fasth3-nvfp4-4step-5s-10k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[servers.fasth3-nvfp4-4step-15s-1k]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "${UNISERVE_H3_DEPLOYMENT:-config/minimax-h3-four-devices.json}", "--queue-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--video-graph-shapes", "15x1000", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16"]
+
+[servers.fasth3-nvfp4-4step-15s-1k.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[benchmarks.fasth3-nvfp4-4step-15s-1k]
+server = "fasth3-nvfp4-4step-15s-1k"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+
+[benchmarks.fasth3-nvfp4-4step-15s-1k.video]
+seconds = 15.0
+prompt_tokens = 1000
+
+[benchmarks.fasth3-nvfp4-4step-15s-1k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.fasth3-nvfp4-4step-15s-1k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[servers.fasth3-nvfp4-4step-15s-10k]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "${UNISERVE_H3_DEPLOYMENT:-config/minimax-h3-four-devices.json}", "--queue-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--video-graph-shapes", "15x10000", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16"]
+
+[servers.fasth3-nvfp4-4step-15s-10k.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[benchmarks.fasth3-nvfp4-4step-15s-10k]
+server = "fasth3-nvfp4-4step-15s-10k"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+
+[benchmarks.fasth3-nvfp4-4step-15s-10k.video]
+seconds = 15.0
+prompt_tokens = 10000
+
+[benchmarks.fasth3-nvfp4-4step-15s-10k.load]
+num_prompts = 3
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.fasth3-nvfp4-4step-15s-10k.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[suites.fast_h3_nvfp4_8step]
+points = ["fasth3-nvfp4-8step-5s-1k", "fasth3-nvfp4-8step-5s-10k", "fasth3-nvfp4-8step-15s-1k", "fasth3-nvfp4-8step-15s-10k"]
+
+[suites.fast_h3_nvfp4_4step]
+points = ["fasth3-nvfp4-4step-5s-1k", "fasth3-nvfp4-4step-5s-10k", "fasth3-nvfp4-4step-15s-1k", "fasth3-nvfp4-4step-15s-10k"]
+
+# Ten resident requests of one shape, for measuring whether host media work
+# (unit encoding and muxing on the host worker) overlaps the device work of
+# later requests. Ten slots require a queue depth of at least three per slot,
+# and the five-second duration ceiling keeps ten slots' product storage within
+# the grant. Every other setting matches the fast_h3 suite's.
+[servers.minimax-h3-saturation]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "${UNISERVE_H3_DEPLOYMENT:-config/minimax-h3-four-devices.json}", "--queue-depth", "32", "--max-batch", "8", "--max-running-requests", "10", "--max-num-batched-tokens", "8", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "5", "--video-graph-shapes", "5x1000", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"${UNISERVE_H3_QUANT_MODE:-balanced}\"}"]
+
+[servers.minimax-h3-saturation.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[benchmarks.minimax-h3-saturation-c1]
+server = "minimax-h3-saturation"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_MINIMAX_H3_MODEL}/tokenizer"
+
+[benchmarks.minimax-h3-saturation-c1.video]
+seconds = 5.0
+prompt_tokens = 1000
+
+[benchmarks.minimax-h3-saturation-c1.load]
+num_prompts = 10
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.minimax-h3-saturation-c1.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.minimax-h3-saturation-c10]
+server = "minimax-h3-saturation"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_MINIMAX_H3_MODEL}/tokenizer"
+
+[benchmarks.minimax-h3-saturation-c10.video]
+seconds = 5.0
+prompt_tokens = 1000
+
+[benchmarks.minimax-h3-saturation-c10.load]
+num_prompts = 10
+request_rate = inf
+max_concurrency = 10
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.minimax-h3-saturation-c10.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[suites.fast_h3_saturation]
+points = ["minimax-h3-saturation-c1", "minimax-h3-saturation-c10"]
+
 [suites.decode-runtime]
 points = [
     "qwen-uniserve-sharegpt-r16",
