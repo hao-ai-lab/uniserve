@@ -8,7 +8,13 @@ from typing import Generic, TypeVar
 
 import torch
 
-from .cuda import cuda_value, driver, verify_graph_context
+from .cuda import (
+    create_sibling_stream,
+    cuda_value,
+    destroy_stream,
+    driver,
+    verify_graph_context,
+)
 from .execution import ExecutionContext
 
 ResultT = TypeVar("ResultT")
@@ -31,6 +37,13 @@ class CUDAGraph(Generic[ResultT]):
     calls require caller-owned MemPools for their additional device allocations.
     Construct each pool with its mapped device current, and retain it until all
     graphs and tensors using its allocations have retired.
+
+    The call computes on the context's stream and the graph replays there, but
+    capture begins and ends on a stream this graph owns, which the computation
+    joins for the capture's duration. PyTorch retires the library workspaces
+    cached for a graph's capture stream when the graph resets, and the
+    context's stream carries every graph captured on the context plus its eager
+    work, so a graph must never make the shared stream its capture stream.
     """
 
     def __init__(
@@ -45,8 +58,13 @@ class CUDAGraph(Generic[ResultT]):
 
         self.context = context
         self.pools = dict(pools or {})
-        self._stream = context.stream or torch.cuda.Stream(
+        self._computation = context.stream or torch.cuda.Stream(
             device=context._device
+        )
+        # A driver stream is never one of the pool's, so no context or lane
+        # stream can coincide with it.
+        self._raw_capture, self._capture = create_sibling_stream(
+            self._computation, "graph capture"
         )
         self._graph = None
         self._output = None
@@ -74,13 +92,12 @@ class CUDAGraph(Generic[ResultT]):
         device = self.context._device
         current = torch.cuda.current_stream(device)
         # Capture observes all work the caller has already submitted.
-        self._stream.wait_stream(current)
+        self._capture.wait_stream(current)
         try:
             with (
                 ExitStack() as scope,
                 torch.cuda.device(device),
-                torch.cuda.stream(self._stream),
-                self.context.activate(),
+                torch.cuda.stream(self._capture),
             ):
                 for target, pool in self.pools.items():
                     if target != device:
@@ -92,16 +109,28 @@ class CUDAGraph(Generic[ResultT]):
                 try:
                     with torch.cuda.graph(
                         graph,
-                        stream=self._stream,
+                        stream=self._capture,
                         pool=None if pool is None else pool.id,
                     ):
-                        output = call()
+                        # The computation stream joins the capture before
+                        # the call's first launch and the capture stream
+                        # rejoins it after the last, so every launch of the
+                        # call, including collectives bound to the
+                        # computation stream, lands in the graph.
+                        self._computation.wait_stream(self._capture)
+                        with (
+                            torch.cuda.stream(self._computation),
+                            self.context.activate(),
+                        ):
+                            output = call()
+                        self._capture.wait_stream(self._computation)
                     graph.instantiate()
 
                     if self.context.stream is not None:
                         cu = driver()
                         streams = (
-                            self._stream,
+                            self._capture,
+                            self._computation,
                             *self.context._transfers.streams.values(),
                         )
                         expected = frozenset(
@@ -118,7 +147,8 @@ class CUDAGraph(Generic[ResultT]):
                         verify_graph_context(graph, expected)
                 finally:
                     if restore is not None:
-                        restore()
+                        with self.context.activate():
+                            restore()
         except BaseException as error:
             try:
                 graph.reset()
@@ -129,7 +159,8 @@ class CUDAGraph(Generic[ResultT]):
             ) from error
         finally:
             # Keep the caller's stream ordered after capture-side work.
-            current.wait_stream(self._stream)
+            current.wait_stream(self._computation)
+            current.wait_stream(self._capture)
 
         self._graph, self._output, self._call = graph, output, call
 
@@ -162,6 +193,12 @@ class CUDAGraph(Generic[ResultT]):
             self._graph = self._output = self._call = None
             self.pools.clear()
             self.context = None
+            if self._raw_capture is not None:
+                # Only capture bookkeeping was ever launched here, and the
+                # caller has ordered its final readers before closing.
+                self._capture.synchronize()
+                destroy_stream(self._raw_capture, "graph capture")
+                self._raw_capture = None
 
     def __enter__(self):
         if self._closed:
