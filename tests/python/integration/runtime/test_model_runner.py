@@ -2502,6 +2502,9 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
     held_header = memoryview(held)
     try:
         segment.await_ready(held_header)
+        # A reader claims its word before its first read; the producer waits
+        # only for readers that claimed.
+        segment.claim(held_header, 1)
         try:
             observation = record_completion(first, first_report)
             second, second_latent = diffusion_step_call(

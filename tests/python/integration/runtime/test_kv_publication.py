@@ -171,6 +171,9 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
                     )
                     header = memoryview(mapping)
                     segment.await_ready(header)
+                    # A reader claims its word before its first read; the
+                    # producer waits only for readers that claimed.
+                    segment.claim(header, 1)
                     held.append((mapping, header))
 
             def acknowledge_held() -> None:
