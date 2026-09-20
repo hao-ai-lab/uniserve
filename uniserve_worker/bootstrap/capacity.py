@@ -32,7 +32,7 @@ from ..execution.input_buffers import InputBufferConfig
 from ..execution.resources import media_state_buffers
 from ..foundation.errors import unsupported_setup
 from ..protocol.call import MediaCall
-from ..protocol.tensor import DeviceDim, OutputInfo
+from ..protocol.tensor import OutputInfo
 from ..runtime.cache_manager import CacheManager
 from ..runtime.results import resolve_outputs
 from ..runtime.tensor_store import TensorStore, device_product_capacity_bytes
@@ -232,19 +232,19 @@ def local_product_storage_bytes(
     *,
     bindings: Mapping[str, ComponentBinding],
     media_components: Mapping[MediaCall, str],
-    max_unresolved_ops: int,
 ) -> int:
-    """Size persistent products from placement, consumers and output horizon.
+    """Size the persistent products this rank backs, from its placement.
 
-    Producers and remote consumers each need a complete logical allocation:
-    disjoint regions may subsequently be imported into that allocation. A
-    temporal-unit component only retains its unresolved groups of leading-axis
-    units. Non-streaming results retain their declared capacity until their
-    consumers finish. Alignment follows BufferPool's allocation rules.
+    A rank backs every product it produces and every product a consumer it
+    holds reads, each at its complete declared extent. The engine reserves a
+    request's products whole when it admits the request, and the store returns
+    a product's storage only once every reader on this rank has retired it, so
+    a product that streams in rounds of media units is still backed whole: the
+    rounds a consumer has not yet read stay bound while later rounds land.
+    Producers and remote consumers each need the complete logical allocation
+    because disjoint regions may subsequently be imported into it. Alignment
+    follows BufferPool's allocation rules.
     """
-    if max_unresolved_ops < 1:
-        raise ValueError("product storage requires a positive output horizon")
-
     consumers: dict[str, set[str]] = {}
     # These are the concrete persistent Tensor consumers of the video path.
     # Denoising state is resident; encoders consume decoded output buffers.
@@ -260,18 +260,11 @@ def local_product_storage_bytes(
         destination = media_components.get(destination_call)
         if source is not None and destination is not None:
             consumers.setdefault(source, set()).add(destination)
-    streamed = {
-        component
-        for call in (
-            MediaCall.VIDEO_DECODING,
-            MediaCall.VIDEO_ENCODING,
-        )
-        if (component := media_components.get(call)) is not None
-    }
+
     total = 0
     for entry, outputs in entry_outputs.items():
-        producer = bindings.get(entry)
         if bindings:
+            producer = bindings.get(entry)
             produces = (
                 producer is not None
                 and producer.process_group.global_rank in producer.output_ranks
@@ -283,36 +276,9 @@ def local_product_storage_bytes(
             if not produces and not consumes:
                 continue
 
-        units_per_call = 1
-        if producer is not None and entry in streamed:
-            config = producer.config
-            units_per_call = len(config.ranks) * config.units_per_rank
-
-        for output in outputs:
-            size = output.max_bytes
-            if entry in streamed:
-                dims = output.shape_bound.dims
-                if not dims or not isinstance(dims[0], DeviceDim):
-                    raise ValueError(
-                        "streamed products require a bounded leading unit axis"
-                    )
-                max_units = dims[0].bound
-                # Remote producers have no placement in this worker's rank
-                # namespace. Cover the complete imported extent, including
-                # allocation alignment if every unit arrives separately.
-                if bindings and producer is None:
-                    group_bytes = size // max_units
-                    live_groups = max_units
-                else:
-                    group_bytes = (
-                        size // max_units * min(max_units, units_per_call)
-                    )
-                    live_groups = min(
-                        ceil_div(max_units, units_per_call),
-                        max_unresolved_ops,
-                    )
-                size = live_groups * ceil_div(group_bytes, 256) * 256
-            total += ceil_div(size, 256) * 256
+        total += sum(
+            ceil_div(output.max_bytes, 256) * 256 for output in outputs
+        )
 
     return total
 
@@ -506,9 +472,6 @@ def model_arena_capacity(
                 resolve_outputs(model, worker_config),
                 bindings=bindings or {},
                 media_components=media_components(model),
-                max_unresolved_ops=request_tensor_window(
-                    depth, request_pool_size
-                ),
             ),
             concurrent_imports=artifact_import_regions(
                 model, worker_config, bindings=bindings or {}
@@ -754,9 +717,6 @@ def resolve_request_capacity(
                     resolve_outputs(model, worker_config),
                     bindings=bindings or {},
                     media_components=media_components(model),
-                    max_unresolved_ops=request_tensor_window(
-                        queue_depth, count
-                    ),
                 )
                 arena = request_tensor_arena_capacity(
                     capacity_config,
