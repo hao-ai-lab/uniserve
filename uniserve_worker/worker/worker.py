@@ -75,7 +75,7 @@ from ..foundation.errors import (
     unsupported_setup,
 )
 from ..media.mux import MediaMux
-from ..protocol.batch import Batch, Finish, Free
+from ..protocol.batch import Batch, Finish, Free, Start
 from ..protocol.output import BatchOutput
 from ..protocol.transfer import WorkerEndpoint
 from ..runtime.block_tables import BlockTables
@@ -1087,10 +1087,7 @@ class Worker:
         """Start one accepted batch and queue its result."""
         if pending.batch is None:
             raise RuntimeError("accepted execute request lost its batch")
-        batch = BatchState(
-            pending.batch,
-            predecessors=self.requests.predecessors(pending.batch.calls),
-        )
+        batch = BatchState(pending.batch)
         self._batch_submissions[batch.batch_id] = pending
         self.inflight[batch.batch_id] = batch
 
@@ -1392,11 +1389,7 @@ class Worker:
         if batch.batch_id in self.inflight:
             raise invalid_descriptor("batch ID already has an in-flight batch")
 
-        state = BatchState(
-            batch,
-            propagate_errors=propagate_errors,
-            predecessors=self.requests.predecessors(batch.calls),
-        )
+        state = BatchState(batch, propagate_errors=propagate_errors)
         self.inflight[state.batch_id] = state
 
         try:
@@ -1536,6 +1529,19 @@ class Worker:
         Also prepares the batch's physical inputs.
         """
         batch = state.batch
+        # A request's first call on this rank arrives with the command that
+        # establishes its lineage, so the lineage is installed before naming
+        # what each call follows. The calls of a request this rank has yet to
+        # admit would otherwise follow nothing.
+        starts = tuple(
+            command for command in batch.commands if isinstance(command, Start)
+        )
+        for command in starts:
+            slots = self.requests.apply_commands((command,))
+            if slots and self.decode_state is not None:
+                self.decode_state.reset(slots)
+
+        state.predecessors = self.requests.predecessors(batch.calls)
         validate_batch(
             batch,
             worker_info=self.info,
@@ -1545,6 +1551,8 @@ class Worker:
         )
 
         for command in batch.commands:
+            if isinstance(command, Start):
+                continue
             slots = self.requests.apply_commands((command,))
             if slots and self.decode_state is not None:
                 self.decode_state.reset(slots)
