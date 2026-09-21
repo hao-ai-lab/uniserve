@@ -58,6 +58,19 @@ class Quantizer:
                 "calibrated amax requires one positive finite NVFP4 scalar"
             )
 
+    @property
+    def requires_complete_source(self) -> bool:
+        """Return whether runtime statistics span the complete input tensor.
+
+        Calibrated NVFP4 owns a frozen checkpoint scale, so independently
+        encoded row intervals retain one common statistical domain without
+        first materializing every row together.
+        """
+        return self.calibrated_amax is None and (
+            self.format == "nvfp4"
+            or (self.format == "fp8" and self.axis is None)
+        )
+
     def _shape(self, shape, dtype):
         """Reject logical shapes and dtypes this encoding cannot represent."""
         if not isinstance(shape, tuple) or any(

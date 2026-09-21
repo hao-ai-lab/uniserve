@@ -112,6 +112,10 @@ def test_calibrated_nvfp4_scale_is_validated_and_frozen():
 
     calibrated = Quantizer("nvfp4", calibrated_amax=24.0)
     assert calibrated.calibrated_amax == 24.0
+    assert not calibrated.requires_complete_source
+    assert Quantizer("nvfp4").requires_complete_source
+    assert Quantizer("fp8").requires_complete_source
+    assert not Quantizer("fp8", axis=0).requires_complete_source
 
 
 @pytest.mark.gpu
