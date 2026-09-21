@@ -1819,31 +1819,17 @@ fn parallel_to_fb(config: &uniserve_core::ParallelConfig) -> fbs::ParallelConfig
                 ulysses_degree: ulysses_degree as u32,
             }))
         }
-        SequenceParallel::Ring { ring_degree } => {
-            fbs::SequenceParallelT::RingSequence(Box::new(fbs::RingSequenceT {
-                ring_degree: ring_degree as u32,
-            }))
-        }
-        SequenceParallel::Hybrid {
-            ulysses_degree,
-            ring_degree,
-        } => fbs::SequenceParallelT::HybridSequence(Box::new(fbs::HybridSequenceT {
-            ulysses_degree: ulysses_degree as u32,
-            ring_degree: ring_degree as u32,
-        })),
         SequenceParallel::Allgather { allgather_degree } => {
             fbs::SequenceParallelT::GatherSequence(Box::new(fbs::GatherSequenceT {
                 allgather_degree: allgather_degree as u32,
             }))
         }
-        SequenceParallel::Attention2d {
-            attn2d_row_size,
-            attn2d_col_size,
+        SequenceParallel::Hybrid {
             ulysses_degree,
-        } => fbs::SequenceParallelT::Attention2dSequence(Box::new(fbs::Attention2dSequenceT {
-            attn2d_row_size: attn2d_row_size as u32,
-            attn2d_col_size: attn2d_col_size as u32,
+            allgather_degree,
+        } => fbs::SequenceParallelT::HybridSequence(Box::new(fbs::HybridSequenceT {
             ulysses_degree: ulysses_degree as u32,
+            allgather_degree: allgather_degree as u32,
         })),
     };
     fbs::ParallelConfigT {
@@ -1865,23 +1851,6 @@ fn parallel_from_fb(config: fbs::ParallelConfig<'_>) -> CodecResult<uniserve_cor
                 ulysses_degree: value.ulysses_degree() as usize,
             }
         }
-        fbs::SequenceParallel::RingSequence => {
-            let value = config
-                .sequence_parallel_as_ring_sequence()
-                .context("missing RingSequence configuration")?;
-            SequenceParallel::Ring {
-                ring_degree: value.ring_degree() as usize,
-            }
-        }
-        fbs::SequenceParallel::HybridSequence => {
-            let value = config
-                .sequence_parallel_as_hybrid_sequence()
-                .context("missing HybridSequence configuration")?;
-            SequenceParallel::Hybrid {
-                ulysses_degree: value.ulysses_degree() as usize,
-                ring_degree: value.ring_degree() as usize,
-            }
-        }
         fbs::SequenceParallel::GatherSequence => {
             let value = config
                 .sequence_parallel_as_gather_sequence()
@@ -1890,14 +1859,13 @@ fn parallel_from_fb(config: fbs::ParallelConfig<'_>) -> CodecResult<uniserve_cor
                 allgather_degree: value.allgather_degree() as usize,
             }
         }
-        fbs::SequenceParallel::Attention2dSequence => {
+        fbs::SequenceParallel::HybridSequence => {
             let value = config
-                .sequence_parallel_as_attention_2d_sequence()
-                .context("missing Attention2dSequence configuration")?;
-            SequenceParallel::Attention2d {
-                attn2d_row_size: value.attn2d_row_size() as usize,
-                attn2d_col_size: value.attn2d_col_size() as usize,
+                .sequence_parallel_as_hybrid_sequence()
+                .context("missing HybridSequence configuration")?;
+            SequenceParallel::Hybrid {
                 ulysses_degree: value.ulysses_degree() as usize,
+                allgather_degree: value.allgather_degree() as usize,
             }
         }
         _ => codec_bail!("unknown sequence parallel strategy"),

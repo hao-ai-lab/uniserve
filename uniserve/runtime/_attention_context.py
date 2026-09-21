@@ -45,9 +45,7 @@ class _ContextPlan:
         axes = layer._attention_parallel
         self.head_axes = () if axes.heads is None else (axes.heads.axis,)
         context_axes = tuple(
-            axis
-            for axis in self.mesh.axes
-            if axis in (axes.context.gather_axis, axes.context.peer_axis)
+            axis for axis in self.mesh.axes if axis == axes.context.gather_axis
         )
         token_axes = tuple(
             axis
@@ -126,41 +124,25 @@ class _ContextPlan:
         if self._transport is None:
             self.key_indices = None
         else:
-            # A peer allocation has page-aligned owner capacity. Gathered
-            # columns occupy its prefix in column order, followed by Ulysses.
-            peer_axis = axes.context.peer_axis
-            gather_axis = axes.context.gather_axis
+            # The gather writes each owner's window in topology order, and
+            # within a window the Ulysses members' tokens follow their own
+            # order, so the map is built by walking owners then head fibers.
             members = self.parallel.key_group.ranks
-            owner_capacity = (
-                self._transport.local_key.shape[0]
-                if self.parallel.mapped
-                else self.keys.capacity * layer._exchange.group.size
-            )
+            owner_capacity = self.keys.capacity * layer._exchange.group.size
             # Walk owners in topology order, pairing each physical slot with
             # the logical token index it carries.
             physical = []
             for owner_index, rank in enumerate(members):
-                columns = (
-                    next(
-                        fiber
-                        for fiber in self.mesh.members((gather_axis,))
-                        if rank in fiber
-                    )
-                    if peer_axis is not None and gather_axis is not None
-                    else (rank,)
-                )
                 offset = owner_index * owner_capacity
-                for column in columns:
-                    heads = next(
-                        fiber
-                        for fiber in self.mesh.members(self.head_axes)
-                        if column in fiber
-                    )
-                    physical.extend(
-                        (offset + slot, index)
-                        for slot, index in self._slots(heads, self.keys)
-                    )
-                    offset += self.keys.capacity * len(heads)
+                heads = next(
+                    fiber
+                    for fiber in self.mesh.members(self.head_axes)
+                    if rank in fiber
+                )
+                physical.extend(
+                    (offset + slot, index)
+                    for slot, index in self._slots(heads, self.keys)
+                )
 
             # Ordering by logical token index turns the slots into a gather map.
             physical.sort(key=lambda item: item[1])
@@ -298,8 +280,8 @@ class _ContextPlan:
         with context_scope({self.parallel: self._transport}):
             key, value = self.parallel.distribute_key_value(key, value)
             if self.key_indices is not None:
-                # Dense kernels consume compact sequences. This copy reads peer
-                # mappings directly; its completion precedes the reuse fence.
+                # Dense kernels consume compact sequences, and the gathered
+                # rows arrive in owner order rather than logical token order.
                 key = key.index_select(0, self.key_indices)
                 value = value.index_select(0, self.key_indices)
             else:
@@ -307,7 +289,6 @@ class _ContextPlan:
                     key[: self.keys.num_tokens],
                     value[: self.keys.num_tokens],
                 )
-            self.parallel.finish_context()
         return key, value
 
     def inputs(self, q, k, v, batch, *, storage):

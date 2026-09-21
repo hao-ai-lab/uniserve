@@ -83,22 +83,6 @@ _LAYOUTS = {
             context=ContextParallelConfig(gather_axis="context")
         ),
     ),
-    "peer2": (
-        (3, 1),
-        (2,),
-        ("context",),
-        AttentionParallelConfig(
-            context=ContextParallelConfig(peer_axis="context")
-        ),
-    ),
-    "peer4": (
-        (3, 1, 2, 0),
-        (4,),
-        ("context",),
-        AttentionParallelConfig(
-            context=ContextParallelConfig(peer_axis="context")
-        ),
-    ),
     "gather_ulysses": (
         (3, 1, 2, 0),
         (2, 2),
@@ -106,16 +90,6 @@ _LAYOUTS = {
         AttentionParallelConfig(
             heads=Ulysses("heads"),
             context=ContextParallelConfig(gather_axis="context"),
-        ),
-    ),
-    "gather_peer": (
-        (3, 1, 2, 0),
-        (2, 2),
-        ("rows", "columns"),
-        AttentionParallelConfig(
-            context=ContextParallelConfig(
-                gather_axis="columns", peer_axis="rows"
-            )
         ),
     ),
     "pp2": ((3, 1), (2,), ("pp",), AttentionParallelConfig()),

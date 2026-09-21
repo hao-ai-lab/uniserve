@@ -133,7 +133,7 @@ def _run(rank, rendezvous, directory, source):
             (1, 1, 4),
             ("pp", "tp", "context"),
             AttentionParallelConfig(
-                context=ContextParallelConfig(peer_axis="context")
+                context=ContextParallelConfig(gather_axis="context")
             ),
         ),
     )

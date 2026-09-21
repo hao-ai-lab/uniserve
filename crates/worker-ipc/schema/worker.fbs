@@ -109,11 +109,9 @@ table WorkerEndpoint {
 
 table LocalSequence {}
 table UlyssesSequence { ulysses_degree:uint = 1; }
-table RingSequence { ring_degree:uint = 1; }
-table HybridSequence { ulysses_degree:uint = 1; ring_degree:uint = 1; }
 table GatherSequence { allgather_degree:uint = 1; }
-table Attention2dSequence { attn2d_row_size:uint = 1; attn2d_col_size:uint = 1; ulysses_degree:uint = 1; }
-union SequenceParallel { LocalSequence, UlyssesSequence, RingSequence, HybridSequence, GatherSequence, Attention2dSequence }
+table HybridSequence { ulysses_degree:uint = 1; allgather_degree:uint = 1; }
+union SequenceParallel { LocalSequence, UlyssesSequence, GatherSequence, HybridSequence }
 table ParallelConfig {
   tensor_parallel_size:uint = 1;
   pipeline_parallel_size:uint = 1;

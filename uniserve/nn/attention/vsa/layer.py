@@ -526,38 +526,12 @@ class Attention(nn.Module):
                     yield slice(start, stop), output
 
     def _context_chunks(self, q, k, v, gate, batch, parallel, workspace):
-        from dataclasses import replace
-
-        owner_tokens = k.shape[0] * (
-            parallel.col_group.size if parallel.col_group is not None else 1
-        )
+        # The gather returns every owner's rows in one compact domain, which
+        # is the domain the batch's tile identifiers already address.
         context_k, context_v = parallel.distribute_key_value(k, v)
 
-        physical = batch
-        if parallel.mapped:
-            transport = parallel.context_buffers
-            owner_tiles = owner_tokens // 64
-            capacity_tiles = transport.local_key.shape[0] // 64
-            transport.valid_sizes.zero_()
-            transport.valid_sizes.view(parallel.key_group.size, capacity_tiles)[
-                :, :owner_tiles
-            ].copy_(
-                batch.valid_sizes.view(parallel.key_group.size, owner_tiles)
-            )
-            # Logical tile IDs index compact owner domains; mapped storage
-            # addresses them within each owner's page-aligned capacity instead.
-            indices = batch.block_indices
-            addresses = torch.div(
-                indices, owner_tiles, rounding_mode="floor"
-            ) * capacity_tiles + indices.remainder(owner_tiles)
-            physical = replace(
-                batch,
-                block_indices=addresses,
-                valid_sizes=transport.valid_sizes,
-            )
-
         self.attention(
-            q, context_k, context_v, physical, out=workspace.attention_output
+            q, context_k, context_v, batch, out=workspace.attention_output
         )
 
         outputs = parallel.output_views(q)
@@ -575,7 +549,6 @@ class Attention(nn.Module):
                 parallel.ulysses_group.rank,
             )
 
-        parallel.finish_context()
         result = parallel.finish_output(outputs)
         start = (
             batch.query_tile_offset * 64

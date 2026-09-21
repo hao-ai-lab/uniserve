@@ -730,8 +730,6 @@ class ExecutionContext(Generic[SizeT]):
             parallel.ulysses_group,
             parallel.context_group,
             parallel.key_group,
-            parallel.col_group,
-            parallel.mapped,
             rows,
             heads,
             head_dim,
@@ -1013,8 +1011,6 @@ class ExecutionContext(Generic[SizeT]):
 
         key = (
             parallel.key_group,
-            parallel.col_group,
-            parallel.mapped,
             rows,
             layer._local_kv_heads,
             layer.head_dim,

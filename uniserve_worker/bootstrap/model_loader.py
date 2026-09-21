@@ -219,20 +219,12 @@ def _weight_config(source, options, execution) -> weights.Config:
 def attention_parallel(component: ComponentConfig) -> AttentionParallelConfig:
     """Translate degree declarations into mathematical attention axes."""
     sequence = component.parallel_config.sequence_parallel
-    heads = (
-        Ulysses()
-        if sequence.kind in {"ulysses", "hybrid", "attention2d"}
+    heads = Ulysses() if sequence.kind in {"ulysses", "hybrid"} else None
+    context = (
+        ContextParallelConfig(gather_axis="cp")
+        if sequence.kind in {"allgather", "hybrid"}
         else None
     )
-    context = None
-    if sequence.kind == "allgather":
-        context = ContextParallelConfig(gather_axis="cp")
-    elif sequence.kind in {"ring", "hybrid"}:
-        context = ContextParallelConfig(peer_axis="cp")
-    elif sequence.kind == "attention2d":
-        context = ContextParallelConfig(
-            gather_axis="cp_col", peer_axis="cp_row"
-        )
     return AttentionParallelConfig(heads=heads, context=context)
 
 

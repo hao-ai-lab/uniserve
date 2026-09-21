@@ -23,11 +23,8 @@ from .config import AttentionParallelConfig
 class AttentionBuffers:
     """Fixed-capacity K/V transport storage, separate from sparse compute.
 
-    Mapped storage exposes ordered peer allocations in one virtual key domain.
-    Each owner has a page-aligned row capacity, which can exceed its active
-    logical rows. Gather storage instead holds a compact replicated key domain.
-    The attention owner retains mapped tensor storage through its final peer
-    read.
+    Gather storage holds a compact replicated key domain: every owner's active
+    rows, in topology order, in this rank's own memory.
     ``valid_sizes`` stores valid-row counts for the layout's explicit block
     size; numerical backends populate it when masking aligned owner capacity.
     """
@@ -132,10 +129,12 @@ class AttentionRowExchange:
 class ParallelAttention(torch.nn.Module):
     """Exchange attention tensors independently of the numerical backend.
 
-    Ulysses partitions heads over the complete sequence. Context bindings
-    gather K/V or expose mapped peer storage; two-dimensional bindings gather
-    columns before publishing row owners. Compute backends retain their mask,
-    selection and softmax semantics. The runtime owns communication storage.
+    Ulysses partitions heads over the complete sequence. A context binding
+    gathers every owner's K/V into each rank, which is what an attention
+    kernel reads fastest: the copy engines move the rows once, where reading
+    a peer's memory inside the kernel pays for every tile it touches. Compute
+    backends retain their mask, selection and softmax semantics. The runtime
+    owns communication storage.
     """
 
     def __init__(
@@ -148,15 +147,7 @@ class ParallelAttention(torch.nn.Module):
 
         heads = () if parallel.heads is None else (parallel.heads.axis,)
         context = parallel.context
-        context_axes = (
-            ()
-            if context is None
-            else tuple(
-                axis
-                for axis in (context.peer_axis, context.gather_axis)
-                if axis is not None
-            )
-        )
+        context_axes = () if context is None else (context.gather_axis,)
         # Validate before ordering by topology: misspelled axes must not
         # silently disappear, and flattened token order follows the declared
         # mesh.
@@ -166,23 +157,7 @@ class ParallelAttention(torch.nn.Module):
         self.ulysses_group = mesh.get_group(heads)
         self.context_group = mesh.get_group(context_axes)
 
-        self.mapped = (
-            context is not None
-            and context.peer_axis is not None
-            and mesh.size(context.peer_axis) > 1
-        )
-        self.col_group = (
-            mesh.get_group(context.gather_axis)
-            if context is not None
-            and context.peer_axis is not None
-            and context.gather_axis is not None
-            else None
-        )
-        self.key_group = (
-            mesh.get_group(context.peer_axis)
-            if context is not None and context.peer_axis is not None
-            else self.context_group
-        )
+        self.key_group = self.context_group
 
     @property
     def context_buffers(self) -> AttentionBuffers | None:
@@ -201,11 +176,12 @@ class ParallelAttention(torch.nn.Module):
         key: torch.Tensor,
         value: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Publish context K/V and return stream-consumable physical views.
+        """Publish this owner's K/V and return the whole context's rows.
 
-        Gathered views cover the active rows. Mapped views include each owner's
-        aligned capacity; the compute backend applies its validity metadata and
-        calls ``finish_context`` before any owner reuses the physical storage.
+        Every owner contributes its own rows and receives all of them, so the
+        returned views cover the active rows of the complete context in
+        topology order and live in this rank's own memory for the attention
+        call to read.
         """
         context = self.context_group
         if context.size == 1:
@@ -213,38 +189,17 @@ class ParallelAttention(torch.nn.Module):
 
         workspace = self.context_buffers
         assert workspace is not None
-        owner_rows = key.shape[0] * (
-            self.col_group.size if self.col_group is not None else 1
-        )
         if (
             key.ndim != 3
             or key.shape != value.shape
             or key.shape[1:] != workspace.local_key.shape[1:]
-            or not 0 < owner_rows <= workspace.local_key.shape[0]
+            or not 0 < key.shape[0] <= workspace.local_key.shape[0]
             or key.dtype != workspace.key.dtype
             or value.dtype != workspace.value.dtype
             or key.device != workspace.key.device
             or value.device != workspace.value.device
         ):
             raise ValueError("context K/V exceeds its declared tensor storage")
-
-        if self.mapped:
-            if self.col_group is not None:
-                rows = key.shape[0] * self.col_group.size
-                self.col_group._all_gather_into_tensor(
-                    workspace.local_key[:rows], key.contiguous()
-                )
-                self.col_group._all_gather_into_tensor(
-                    workspace.local_value[:rows], value.contiguous()
-                )
-            else:
-                rows = key.shape[0]
-                workspace.local_key[:rows].copy_(key)
-                workspace.local_value[:rows].copy_(value)
-            self.key_group._all_gather_into_tensor(
-                workspace.sync_output, workspace.sync_input
-            )
-            return workspace.key, workspace.value
 
         rows = key.shape[0] * context.size
         context_key, context_value = (
@@ -254,17 +209,6 @@ class ParallelAttention(torch.nn.Module):
         context._all_gather_into_tensor(context_key, key.contiguous())
         context._all_gather_into_tensor(context_value, value.contiguous())
         return context_key, context_value
-
-    def finish_context(self) -> None:
-        """Fence all mapped readers before the next K/V publication reuses
-        storage.
-        """  # noqa: D205
-        if self.mapped:
-            workspace = self.context_buffers
-            assert workspace is not None
-            self.key_group._all_gather_into_tensor(
-                workspace.sync_output, workspace.sync_input
-            )
 
     def finish_output(
         self,
