@@ -40,9 +40,17 @@ class AttentionBuffers:
 
 @dataclass(frozen=True)
 class OutputBuffers:
-    """Borrowed peer destinations and fences for attention's row restoration."""
+    """Borrowed destinations and fences for attention's row restoration.
+
+    A layer whose epilogue composes every sequence owner's rows writes each
+    owner's share straight into that owner's storage, and borrows `peers`,
+    one destination per member. That storage exists only where the group's
+    devices can map one another's memory. A layer that computes its own rows
+    and exchanges them afterwards borrows `local` and leaves `peers` empty.
+    """
 
     peers: tuple[torch.Tensor, ...]
+    local: torch.Tensor
     receive: torch.Tensor
     sync_input: torch.Tensor
     sync_output: torch.Tensor
@@ -236,41 +244,74 @@ class ParallelAttention(torch.nn.Module):
             )
         return buffers
 
-    def output_views(self, query: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """Return compact sequence-owner views for this call's query
-        dimensions.
-        """  # noqa: D205
+    def _owner_shape(self, query: torch.Tensor) -> tuple[int, int, int]:
+        """Return one sequence owner's compact output extents."""
         group = self.ulysses_group
         if query.ndim != 3 or query.shape[0] % group.size:
             raise ValueError(
                 "attention output rows must divide Ulysses membership"
             )
-
-        # [tokens / group, heads * group, head_dim]: the row owner's compact
-        # view.
-        shape = (
+        # [tokens / group, heads * group, head_dim].
+        return (
             query.shape[0] // group.size,
             query.shape[1] * group.size,
             query.shape[2],
         )
-        peers = self.output_buffers.peers
-        if len(peers) != group.size or any(
-            peer.ndim != 3
-            or peer.dtype != query.dtype
-            or peer.device != query.device
-            or not peer.is_contiguous()
+
+    @staticmethod
+    def _owner_view(
+        destination: torch.Tensor,
+        query: torch.Tensor,
+        shape: tuple[int, int, int],
+    ) -> torch.Tensor:
+        """Reshape bound storage into one sequence owner's compact output.
+
+        The rows occupy the destination's leading elements, so reading it as
+        one flat run is what lets a single allocation serve every query length
+        up to its capacity. That requires contiguous storage.
+        """
+        if (
+            destination.ndim != 3
+            or destination.dtype != query.dtype
+            or destination.device != query.device
+            or not destination.is_contiguous()
             or any(
                 size > capacity
-                for size, capacity in zip(shape, peer.shape, strict=True)
+                for size, capacity in zip(shape, destination.shape)
             )
-            for peer in peers
         ):
             raise ValueError(
                 "attention output exceeds its bound tensor storage"
             )
-        return tuple(
-            peer.view(-1)[: query.numel()].view(shape) for peer in peers
+        return destination.view(-1)[: query.numel()].view(shape)
+
+    def output_destination(self, query: torch.Tensor) -> torch.Tensor:
+        """Return this rank's own compact output view.
+
+        A layer that exchanges its rows after computing them writes here and
+        never addresses another member's storage.
+        """
+        return self._owner_view(
+            self.output_buffers.local, query, self._owner_shape(query)
         )
+
+    def output_views(self, query: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Return compact sequence-owner views for this call's query
+        dimensions.
+        """  # noqa: D205
+        peers = self.output_buffers.peers
+        if not peers:
+            raise RuntimeError(
+                "this attention layer exchanges its rows rather than "
+                "composing them into peer storage, so it has no peer "
+                "destinations to return"
+            )
+        if len(peers) != self.ulysses_group.size:
+            raise ValueError(
+                "attention peer destinations do not match Ulysses membership"
+            )
+        shape = self._owner_shape(query)
+        return tuple(self._owner_view(peer, query, shape) for peer in peers)
 
 
 # Call-scoped buffer bindings: layers borrow caller-owned storage through these

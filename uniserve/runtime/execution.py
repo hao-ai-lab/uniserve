@@ -755,10 +755,21 @@ class ExecutionContext(Generic[SizeT]):
             self._allocations.extend(outputs.allocations)
 
             group = parallel.ulysses_group
-            if self._collectives is not None and group.size > 1:
+            # Registration hands NCCL a window its zero-CTA all-to-all can
+            # use, and only symmetric storage backs one. A layer exchanging
+            # out of ordinary storage cannot be registered and takes the
+            # ordinary collective; registering it fails the communicator
+            # rather than degrading it. The send buffer is this rank's own
+            # destination either way, since where peer storage exists its own
+            # entry is that same memory.
+            if (
+                self._collectives is not None
+                and group.size > 1
+                and outputs.views[parallel].peers
+            ):
                 buffers = outputs.views[parallel]
                 self._collectives[group._require().group_name].register_buffers(
-                    buffers.peers[group.rank], buffers.receive
+                    buffers.local, buffers.receive
                 )
 
             context = allocate_context_storage(

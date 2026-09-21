@@ -500,10 +500,10 @@ class Attention(nn.Module):
                 scale=self.attention.scale,
             )
             if owners > 1:
-                # Registered destination tensors support the existing paired
-                # owner production and copy-engine head-to-token exchange.
-                outputs = parallel.output_views(q)
-                local_output = outputs[parallel.ulysses_group.rank].view_as(q)
+                # This path computes its own head shards and restores rows
+                # with a copy-engine exchange, so it borrows its own
+                # destination rather than the group's peer storage.
+                local_output = parallel.output_destination(q).view_as(q)
                 exchange = AttentionRowExchange(
                     parallel,
                     local_output,
