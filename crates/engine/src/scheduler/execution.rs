@@ -64,16 +64,72 @@ impl Scheduler {
             })
     }
 
-    /// Uses the static component owner when it has destination capacity.
+    /// Selects one replica while preserving request residency.
+    fn component_target<'a>(
+        &'a self,
+        request: RequestKey,
+        kind: CallKind,
+        component: &'a str,
+    ) -> Option<(&'a crate::WorkerId, &'a str)> {
+        let candidates = self
+            .component_candidates(kind, component)
+            .collect::<Vec<_>>();
+        let bound = candidates.first()?.1;
+
+        // Once a request has used this component, its mutable request state and
+        // graph slot live on that exact replica. Queue pressure may delay the
+        // next call but must never migrate it.
+        if let Some(owner) = self.worker_affinity.get(&(request, bound.to_owned())) {
+            let (id, component, _) = candidates.into_iter().find(|(id, _, _)| *id == owner)?;
+            return self.executor.has_capacity(id).then_some((id, component));
+        }
+
+        // Prefer a worker already selected for another component of this
+        // request. This keeps a replicated H3 denoiser and its media decoders
+        // in one process and avoids publishing their large latent products.
+        let resident = self
+            .worker_affinity
+            .iter()
+            .filter_map(|((key, _), worker)| (*key == request).then_some(worker))
+            .collect::<HashSet<_>>();
+        if let Some((id, component, _)) = candidates
+            .iter()
+            .copied()
+            .find(|(id, _, _)| resident.contains(id))
+        {
+            return self.executor.has_capacity(id).then_some((id, component));
+        }
+
+        // A new lineage goes to the least-resident ready replica. Queue
+        // capacity remains a hard admission condition; residency breaks ties
+        // so a burst fans out instead of filling the first configured worker.
+        candidates
+            .into_iter()
+            .filter(|(id, _, _)| self.executor.has_capacity(id))
+            .min_by_key(|(id, _, _)| {
+                self.worker_affinity
+                    .iter()
+                    .filter_map(|((key, _), worker)| (worker == *id).then_some(*key))
+                    .collect::<HashSet<_>>()
+                    .len()
+            })
+            .map(|(id, component, _)| (id, component))
+    }
+
     pub(super) fn worker_target(
         &self,
-        _request: RequestKey,
+        request: RequestKey,
         kind: CallKind,
     ) -> Option<(&crate::WorkerId, &str)> {
-        let (id, bound_component, _) = self.worker_candidates(kind).next()?;
-        self.executor
-            .has_capacity(id)
-            .then_some((id, bound_component))
+        let component = match kind {
+            CallKind::Media(media_call) => self
+                .info
+                .media_components
+                .get(&media_call)
+                .map_or("model", String::as_str),
+            _ => "model",
+        };
+        self.component_target(request, kind, component)
     }
 
     /// Binds planned work to its configured component and records request residency.
@@ -81,9 +137,7 @@ impl Scheduler {
         let (id, bound_component) = if call.component == "model" {
             self.worker_target(call.request_key, call.code)
         } else {
-            self.component_candidates(call.code, &call.component)
-                .find(|(id, _, _)| self.executor.has_capacity(id))
-                .map(|(id, component, _)| (id, component))
+            self.component_target(call.request_key, call.code, &call.component)
         }
         .expect("planned call retains an executable component");
         let target = (id.clone(), bound_component.to_owned());
@@ -397,7 +451,7 @@ pub(crate) fn consuming_calls(media_call: MediaCall) -> Option<&'static [MediaCa
 /// component lane is exclusive and admits one request at a time. `host_ranks`
 /// names the host lanes the call places a task on, one slot on each.
 struct LaneDemand {
-    component: Option<String>,
+    component: Option<(crate::WorkerId, String)>,
     units: u32,
     /// Host lanes this call occupies, each named by its worker and rank with
     /// the number of tasks the call places on it: one per media unit the
@@ -408,8 +462,8 @@ struct LaneDemand {
 /// Lane occupancy across the media calls in flight.
 #[derive(Default)]
 struct LaneLedger {
-    exclusive: HashMap<String, RequestId>,
-    units: HashMap<String, u32>,
+    exclusive: HashMap<(crate::WorkerId, String), RequestId>,
+    units: HashMap<(crate::WorkerId, String), u32>,
     /// A host rank owns one host lane, so occupancy is counted per rank of
     /// each worker.
     host: HashMap<(crate::WorkerId, u32), u32>,
@@ -425,15 +479,20 @@ impl LaneLedger {
         }) {
             return false;
         }
-        let Some(component) = demand.component.as_deref() else {
+        let Some((worker, component)) = demand.component.as_ref() else {
             return true;
         };
         if demand.units > 0 {
-            let capacity = scheduler.device_lane_units(component).unwrap_or(1);
-            self.units.get(component).copied().unwrap_or(0) + demand.units <= capacity
+            let capacity = scheduler.device_lane_units(worker, component).unwrap_or(1);
+            self.units
+                .get(&(worker.clone(), component.clone()))
+                .copied()
+                .unwrap_or(0)
+                + demand.units
+                <= capacity
         } else {
             self.exclusive
-                .get(component)
+                .get(&(worker.clone(), component.clone()))
                 .is_none_or(|holder| *holder == request)
         }
     }
@@ -443,13 +502,14 @@ impl LaneLedger {
         for (worker, rank, tasks) in &demand.host_ranks {
             *self.host.entry((worker.clone(), *rank)).or_default() += tasks;
         }
-        let Some(component) = demand.component.as_deref() else {
+        let Some((worker, component)) = demand.component.as_ref() else {
             return;
         };
+        let key = (worker.clone(), component.clone());
         if demand.units > 0 {
-            *self.units.entry(component.to_owned()).or_default() += demand.units;
+            *self.units.entry(key).or_default() += demand.units;
         } else {
-            self.exclusive.insert(component.to_owned(), request);
+            self.exclusive.insert(key, request);
         }
     }
 }
@@ -538,17 +598,23 @@ impl Scheduler {
     ///
     /// A distributed component reconstructs one media unit per rank per round,
     /// so its rank count is the width of a round.
-    fn component_width(&self, work: CallKind, component: &str) -> u32 {
+    fn component_width(&self, request: RequestKey, work: CallKind, component: &str) -> u32 {
+        let owner = self.worker_affinity.get(&(request, component.to_owned()));
         let (_, bound, info) = self
             .component_candidates(work, component)
-            .next()
+            .find(|(worker, _, _)| owner.is_none_or(|owner| *worker == owner))
             .expect("scheduled decoder has a configured owner");
         let component = info
             .components
             .iter()
             .find(|component| component.name == bound)
             .expect("scheduled decoder has a loaded component");
-        u32::try_from(component.config.ranks.len())
+        let units_per_rank = if component.config.distribution.is_some() {
+            component.config.units_per_rank.max(1)
+        } else {
+            1
+        };
+        u32::try_from(component.config.ranks.len().saturating_mul(units_per_rank))
             .expect("loaded component rank count fits the decode range")
     }
 
@@ -557,11 +623,17 @@ impl Scheduler {
     /// A component that distributes its work measures its lane in the units its
     /// ranks reconstruct together; every other component's lane is exclusive
     /// and admits one request at a time.
-    fn device_lane_units(&self, component: &str) -> Option<u32> {
-        self.info
-            .components
+    fn device_lane_units(&self, worker: &crate::WorkerId, component: &str) -> Option<u32> {
+        self.executor
+            .info()
+            .workers
             .iter()
-            .find(|binding| binding.name == component)
+            .find(|(id, _)| id == worker)
+            .and_then(|(_, info)| {
+                info.components
+                    .iter()
+                    .find(|binding| binding.name == component)
+            })
             .and_then(|binding| {
                 binding.config.distribution.as_ref().map(|_| {
                     (binding.config.ranks.len() * binding.config.units_per_rank.max(1)) as u32
@@ -570,27 +642,32 @@ impl Scheduler {
     }
 
     /// Returns the lanes one media call occupies and how much of each.
-    fn lane_demand(&self, media_call: MediaCall, units: u32) -> LaneDemand {
+    fn lane_demand(&self, request: RequestKey, media_call: MediaCall, units: u32) -> LaneDemand {
         let component = self.media_component(media_call);
+        let placed_component = component.as_ref().and_then(|component| {
+            self.worker_affinity
+                .get(&(request, component.clone()))
+                .map(|worker| (worker.clone(), component.clone()))
+        });
         let device_units = match media_call {
             // A device lane is occupied by a decode round. Encoding a media
             // unit is admitted on its rank's host lane, so it overlaps the
             // decode round that follows it rather than excluding it, and the
             // post-processing it begins with rides on the same admission.
-            MediaCall::VideoDecoding | MediaCall::AudioDecoding => component
-                .as_deref()
-                .and_then(|name| self.device_lane_units(name))
+            MediaCall::VideoDecoding | MediaCall::AudioDecoding => placed_component
+                .as_ref()
+                .and_then(|(worker, name)| self.device_lane_units(worker, name))
                 .map_or(0, |_| units.max(1)),
             _ => 0,
         };
         let host_ranks = match media_call {
             MediaCall::VideoEncoding | MediaCall::AudioEncoding | MediaCall::Muxing => {
-                self.host_lane_ranks(component.as_deref(), units)
+                self.host_lane_ranks(request, component.as_deref(), units)
             }
             _ => Vec::new(),
         };
         LaneDemand {
-            component,
+            component: placed_component,
             units: device_units,
             host_ranks,
         }
@@ -605,27 +682,28 @@ impl Scheduler {
     /// component runs one task on each of its ranks.
     fn host_lane_ranks(
         &self,
+        request: RequestKey,
         component: Option<&str>,
         units: u32,
     ) -> Vec<(crate::WorkerId, u32, u32)> {
         let Some(component) = component else {
             return Vec::new();
         };
-        let Some((worker, bound, info)) = self
-            .component_candidates(CallKind::Media(MediaCall::Muxing), component)
-            .next()
-            .or_else(|| {
-                self.executor.info().workers.iter().find_map(|(id, info)| {
-                    info.components
-                        .iter()
-                        .any(|binding| binding.name == component)
-                        .then_some((id, component, info))
-                })
-            })
-        else {
+        let owner = self.worker_affinity.get(&(request, component.to_owned()));
+        let Some((worker, info)) = self.executor.info().workers.iter().find(|(id, info)| {
+            owner.is_none_or(|owner| id == owner)
+                && info
+                    .components
+                    .iter()
+                    .any(|binding| binding.name == component)
+        }) else {
             return Vec::new();
         };
-        let Some(binding) = info.components.iter().find(|binding| binding.name == bound) else {
+        let Some(binding) = info
+            .components
+            .iter()
+            .find(|binding| binding.name == component)
+        else {
             return Vec::new();
         };
         let ranks = &binding.config.ranks;
@@ -680,20 +758,23 @@ impl Scheduler {
                     } => range.max_units,
                     _ => 1,
                 };
-                ledger.occupy(&self.lane_demand(media_call, units), *id);
+                ledger.occupy(
+                    &self.lane_demand(op.call.request_key, media_call, units),
+                    *id,
+                );
             }
         }
         ledger
     }
 
     /// Returns whether the rank group that owns one call can accept a batch.
-    fn call_has_queue_capacity(&self, media_call: MediaCall) -> bool {
+    fn call_has_queue_capacity(&self, request: RequestKey, media_call: MediaCall) -> bool {
         self.info
             .media_components
             .get(&media_call)
             .is_some_and(|component| {
-                self.component_candidates(CallKind::Media(media_call), component)
-                    .any(|(worker, _, _)| self.executor.has_capacity(worker))
+                self.component_target(request, CallKind::Media(media_call), component)
+                    .is_some()
             })
     }
 
@@ -706,7 +787,12 @@ impl Scheduler {
         let width = || {
             self.media_component(media_call)
                 .as_deref()
-                .and_then(|name| self.device_lane_units(name))
+                .and_then(|name| {
+                    let worker = self
+                        .worker_affinity
+                        .get(&(state.admission.request_key, name.to_owned()))?;
+                    self.device_lane_units(worker, name)
+                })
                 .unwrap_or(1)
         };
         match media_call {
@@ -742,8 +828,14 @@ impl Scheduler {
                 continue;
             }
             for media_call in self.ready_calls(state) {
-                let demand = self.lane_demand(media_call, self.call_units(state, media_call));
-                if !ledger.admits(&demand, id, self) || !self.call_has_queue_capacity(media_call) {
+                let demand = self.lane_demand(
+                    state.admission.request_key,
+                    media_call,
+                    self.call_units(state, media_call),
+                );
+                if !ledger.admits(&demand, id, self)
+                    || !self.call_has_queue_capacity(state.admission.request_key, media_call)
+                {
                     continue;
                 }
                 ledger.occupy(&demand, id);
@@ -798,7 +890,7 @@ impl Scheduler {
                     call_id,
                     cursor: state.scheduled_decode_units,
                     max_units: self
-                        .component_width(work, &component)
+                        .component_width(request_key, work, &component)
                         .min(state.request.sampling.video_units - state.scheduled_decode_units),
                 }),
                 MediaCall::VideoEncoding => Some(DecodeRange {
@@ -811,7 +903,7 @@ impl Scheduler {
                     request_key,
                     call_id,
                     cursor: 0,
-                    max_units: self.component_width(work, &component),
+                    max_units: self.component_width(request_key, work, &component),
                 }),
                 MediaCall::AudioEncoding => Some(DecodeRange {
                     request_key,
@@ -1018,8 +1110,14 @@ impl Scheduler {
             }
             let (worker, component) = self.select_worker(&call);
             call.component = component;
+            let request_pool_idx = self
+                .media_state(id)
+                .expect("selected media request exists")
+                .allocations
+                .request_slot(&worker);
             let placement = RequestPlacement {
                 worker,
+                request_pool_idx: Some(request_pool_idx),
                 block_tables: Vec::new(),
                 new_cache_pages: Vec::new(),
                 forward: uniserve_worker_ipc::ForwardBatch::default(),
@@ -1081,6 +1179,11 @@ impl Scheduler {
                         .requests
                         .iter()
                         .map(|(call, _)| call.request_key.request_id.0)
+                        .collect::<Vec<_>>(),
+                    "workers": batch
+                        .requests
+                        .iter()
+                        .map(|(_, placement)| placement.worker.0.as_str())
                         .collect::<Vec<_>>(),
                     "admitted_request_ids": batch
                         .admissions()
@@ -1485,6 +1588,15 @@ impl Scheduler {
                     .expect("retiring request exists");
                 for allocation in retiring.buffers.into_values().chain(retiring.allocations) {
                     self.free_allocation(allocation);
+                }
+                for (worker, allocation) in retiring.media_allocations {
+                    match allocation {
+                        Allocation::RequestSlot { .. } => {
+                            self.free_media_request(&worker, allocation)
+                        }
+                        Allocation::Buffer { .. } => self.free_media_buffer(&worker, allocation),
+                        _ => unreachable!("media retirement owns request rows and buffers"),
+                    }
                 }
             }
         }
@@ -2080,7 +2192,8 @@ impl Scheduler {
             id,
             RetiringRequest {
                 request_key,
-                allocations: state.allocations.into_allocations().collect(),
+                allocations: Vec::new(),
+                media_allocations: state.allocations.into_allocations(),
                 buffers: HashMap::new(),
             },
         );

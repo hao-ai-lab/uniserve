@@ -30,6 +30,9 @@ use uniserve_worker_ipc::{
 pub struct RequestPlacement {
     /// Worker routing stays outside the computation sent across IPC.
     pub worker: WorkerId,
+    /// Worker-local request row when a replicated route owns its own address
+    /// space. Unset placements retain the admission's canonical row.
+    pub request_pool_idx: Option<u32>,
     /// KV tables and newly acquired pages used by this computation.
     pub block_tables: Vec<BlockTable>,
     pub new_cache_pages: Vec<CachePageAllocation>,
@@ -215,9 +218,27 @@ impl ExecutorInfo {
             "executor info must contain at least one pool"
         );
         let mut ids = std::collections::HashSet::new();
+        let mut components: BTreeMap<&str, &uniserve_worker_ipc::ComponentInfo> = BTreeMap::new();
+        let model_name = &pools[0].1.model_name;
+        let checkpoint = &pools[0].1.checkpoint_identity;
         for (id, info) in &pools {
             anyhow::ensure!(ids.insert(id), "executor info repeats pool id {id}");
             info.validate()?;
+            anyhow::ensure!(
+                &info.model_name == model_name && &info.checkpoint_identity == checkpoint,
+                "worker {id} loaded a different model or checkpoint"
+            );
+            for component in &info.components {
+                if let Some(other) = components.get(component.name.as_str()) {
+                    anyhow::ensure!(
+                        other.outputs == component.outputs,
+                        "replicas of component {} expose different numerical outputs",
+                        component.name
+                    );
+                } else {
+                    components.insert(&component.name, component);
+                }
+            }
         }
         Ok(Self { workers: pools })
     }
@@ -401,13 +422,42 @@ impl ExecutorInfo {
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
-        merged.request_slots = self
-            .workers
-            .iter()
-            .map(|(_, info)| info.request_slots)
-            .filter(|limit| *limit > 0)
-            .min()
-            .unwrap_or(0);
+        merged.request_slots = if merged.media_components.contains_key(&MediaCall::Muxing) {
+            // A replicated media route owns an independent request-row bank in
+            // every WorkerGroup. End-to-end concurrency is the narrowest sum
+            // of replica capacities among the graph's components.
+            let mut components = BTreeMap::new();
+            for (call, component) in &merged.media_components {
+                components.entry(component.as_str()).or_insert(*call);
+            }
+            components
+                .into_iter()
+                .map(|(component, call)| {
+                    self.workers
+                        .iter()
+                        .filter(|(_, info)| {
+                            info.supported_ops.contains(&CallKind::Media(call))
+                                && info
+                                    .components
+                                    .iter()
+                                    .any(|binding| binding.name == component)
+                        })
+                        .map(|(_, info)| info.request_slots)
+                        .try_fold(0u32, |total, slots| total.checked_add(slots))
+                        .context("media replica request capacity exceeds protocol range")
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?
+                .into_iter()
+                .min()
+                .unwrap_or(0)
+        } else {
+            self.workers
+                .iter()
+                .map(|(_, info)| info.request_slots)
+                .filter(|limit| *limit > 0)
+                .min()
+                .unwrap_or(0)
+        };
         merged.max_unresolved_ops = self
             .workers
             .iter()
@@ -1268,6 +1318,45 @@ mod tests {
             .collect();
         info.num_inference_steps = steps;
         info
+    }
+
+    fn media_replica(id: &str, request_slots: u32) -> (WorkerId, WorkerInfo) {
+        let routes = [
+            (MediaCall::TextEncoding, "text_encoder"),
+            (MediaCall::LatentPreparation, "denoiser"),
+            (MediaCall::Denoising, "denoiser"),
+            (MediaCall::VideoDecoding, "video_decoder"),
+            (MediaCall::VideoEncoding, "video_encoder"),
+            (MediaCall::AudioDecoding, "audio_decoder"),
+            (MediaCall::AudioEncoding, "muxer"),
+            (MediaCall::Muxing, "muxer"),
+        ];
+        let mut info = media_info(&routes, 4);
+        info.endpoint.worker_id = id.to_owned();
+        info.request_slots = request_slots;
+        info.components = routes
+            .iter()
+            .map(|(_, component)| *component)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|name| uniserve_worker_ipc::ComponentInfo {
+                name: name.to_owned(),
+                config: ComponentConfig::parallel(vec![0], ParallelConfig::default()),
+                outputs: Vec::new(),
+            })
+            .collect();
+        (WorkerId(id.to_owned()), info)
+    }
+
+    #[test]
+    fn replicated_media_routes_add_independent_request_capacity() -> anyhow::Result<()> {
+        let info = ExecutorInfo::from_workers(vec![
+            media_replica("replica-0", 2),
+            media_replica("replica-1", 3),
+        ])?;
+
+        assert_eq!(info.runtime_info()?.request_slots, 5);
+        Ok(())
     }
 
     #[test]

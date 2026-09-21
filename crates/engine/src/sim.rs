@@ -1163,6 +1163,7 @@ mod tests {
                 call,
                 crate::executor::RequestPlacement {
                     worker: WorkerId("sim".into()),
+                    request_pool_idx: None,
                     block_tables: Vec::new(),
                     new_cache_pages: Vec::new(),
                     forward: ForwardBatch::default(),

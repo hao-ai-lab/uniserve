@@ -1116,6 +1116,7 @@ impl Scheduler {
                     RetiringRequest {
                         request_key,
                         allocations,
+                        media_allocations: Vec::new(),
                         buffers,
                     },
                 );

@@ -112,6 +112,11 @@ impl RequestPool {
         self.free.is_empty()
     }
 
+    /// Returns the number of request rows that can still be assigned.
+    pub(crate) fn available(&self) -> usize {
+        self.free.len()
+    }
+
     /// Acquires an available slot.
     fn acquire(&mut self) -> Option<u32> {
         let index = self.free.pop()?;
