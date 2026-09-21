@@ -115,11 +115,21 @@ Each GPU decoder has one native media unit per rank, so a one-GPU flow replica r
 
 The queue depths are intentional capacity values. A media request slot retains three unresolved execution windows, and every flow worker must expose at least two resident slots, so each one-GPU flow uses depth 6. The shared TP8 text worker uses depth 24 for eight slots; each of the two TP4 text workers uses depth 12 for four slots. The host worker also uses depth 24 so its shared request-row bank exposes eight slots. The narrowest aggregate component capacity is therefore eight complete routes in either deployment.
 
-The `memory_fraction` on each GPU worker is its per-process static memory ceiling. A text worker and a flow worker intentionally share every GPU, so neither inherits the global `--mem-fraction-static` default. Both supplied layouts grant 0.18 to each text rank and 0.81 to each flow replica; the physical free-memory check still caps their combined allocations. On 96 GB RTX PRO 6000 devices, the TP8 layout retained 7.6–8.9 GiB free after graph capture, while TP4×2 retained 2.1–2.7 GiB. Treat the supplied split as part of the five-second, 1000-token deployment contract and revalidate it when checkpoint precision, maximum duration, prompt bound, graph shapes, or hardware change.
+The `memory_fraction` on each GPU worker is its per-process static memory ceiling. A text worker and a flow worker intentionally share every GPU, so neither inherits the global `--mem-fraction-static` default. Both supplied layouts grant 0.18 to each text rank and 0.81 to each flow replica; the physical free-memory check still caps their combined allocations. On 96 GB RTX PRO 6000 devices, the TP8 layout retained 5.5 GiB or more at the measured concurrency-eight peak. TP4×2 reached 97,244 MiB on the two GPUs holding text rank 0, leaving only 100 MiB; it is a measured maximum-throughput option, not the production default. Treat the supplied split as part of the five-second, 1000-token deployment contract and revalidate it when checkpoint precision, maximum duration, prompt bound, graph shapes, or hardware change.
 
 DP improves throughput only when the offered concurrency keeps multiple replicas occupied. At concurrency one, Ulysses can retain lower latency because all GPUs cooperate on one denoising call; at concurrency eight, DP removes that per-step collective and keeps queueing behind one request from dominating service time. Compare the layouts with the same checkpoint, prompts, duration, graph warmup, and concurrency rather than comparing an uncaptured first request with steady state.
 
 The `fast_h3_dp8` evaluation suite fixes that comparison protocol for the packed four-step checkpoint. It first runs the existing eight-way Ulysses placement with its two latency-oriented resident slots, then the shared-TP8 and replicated-TP4 DP8 placements. All three points use the same checkpoint and eight GPUs, 16 measured requests at concurrency eight after eight warmup requests, five-second outputs, 1000-token prompts, and the same seeds. The Ulysses worker keeps a 0.93 static ceiling; the DP workers use the explicit per-process ceilings validated above because independent text and flow processes share each device. Resolve the commands and paths before starting the serial artifact-producing run:
+
+The reference RTX PRO 6000 Blackwell Server Edition run completed all 16 measured requests in every point and validated every output as 1344×768 H.264 video with stereo 32-kHz AAC audio. The shared-TP8 DP8 layout is the recommended deployment because it more than doubles throughput over Ulysses while retaining useful GPU memory headroom. TP4×2 is 17.1% faster than TP8 in this workload, but its 100 MiB minimum headroom is too small for a general production recommendation.
+
+| Deployment | Videos/s | Video latency p50 | Video latency p95 | Peak single-GPU memory | Change from Ulysses |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Ulysses8 | 0.1235 | 64.221 s | 64.661 s | 45,799 MiB | Control |
+| DP8 + text TP8 | 0.2602 | 28.236 s | 31.552 s | 91,726 MiB | 2.108× throughput; 56.0% lower p50 |
+| DP8 + text TP4×2 | 0.3048 | 26.007 s | 26.346 s | 97,244 MiB | 2.469× throughput; 59.5% lower p50 |
+
+Resolve the commands and paths before starting the serial artifact-producing run:
 
 ```bash
 .venv/bin/uniserve-eval --config uniserve_eval/profiles.toml plan fast_h3_dp8
