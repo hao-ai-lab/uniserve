@@ -15,8 +15,7 @@
       "denoiser": {
         "ranks": [0, 1, 2, 3, 4, 5, 6, 7],
         "parallel_config": {
-          "tensor_parallel_size": 2,
-          "sequence_parallel": { "kind": "ulysses", "ulysses_degree": 4 }
+          "sequence_parallel": { "kind": "ulysses", "ulysses_degree": 8 }
         }
       },
       "text_encoder": {
