@@ -97,22 +97,6 @@ def _run(rank, rendezvous):
                     context=ContextParallelConfig(gather_axis="context"),
                 ),
             ),
-            (
-                (4,),
-                ("context",),
-                AttentionParallelConfig(
-                    context=ContextParallelConfig(peer_axis="context")
-                ),
-            ),
-            (
-                (2, 2),
-                ("rows", "columns"),
-                AttentionParallelConfig(
-                    context=ContextParallelConfig(
-                        gather_axis="columns", peer_axis="rows"
-                    )
-                ),
-            ),
         )
         for shape, axes, config in cases:
             mesh = groups.bind(
@@ -128,10 +112,7 @@ def _run(rank, rendezvous):
                 ()
                 if config.context is None
                 else tuple(
-                    axis
-                    for axis in axes
-                    if axis
-                    in (config.context.gather_axis, config.context.peer_axis)
+                    axis for axis in axes if axis == config.context.gather_axis
                 )
             )
             context = mesh.get_group(context_axes)

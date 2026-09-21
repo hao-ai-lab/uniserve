@@ -153,25 +153,6 @@ def _context(rank, rendezvous, gpu):
                 ),
             ),
         )
-        if gpu:
-            cases += (
-                (
-                    (4,),
-                    ("context",),
-                    AttentionParallelConfig(
-                        context=ContextParallelConfig(peer_axis="context")
-                    ),
-                ),
-                (
-                    (2, 2),
-                    ("columns", "rows"),
-                    AttentionParallelConfig(
-                        context=ContextParallelConfig(
-                            gather_axis="columns", peer_axis="rows"
-                        )
-                    ),
-                ),
-            )
         for shape, axes, parallel in cases:
             mesh = owner.bind(
                 DeviceMesh(

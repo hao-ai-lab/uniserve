@@ -54,10 +54,8 @@ def _positive_degree(name: str, value: object) -> int:
 _SEQUENCE_FIELDS = {
     "local": (),
     "ulysses": ("ulysses_degree",),
-    "ring": ("ring_degree",),
-    "hybrid": ("ulysses_degree", "ring_degree"),
     "allgather": ("allgather_degree",),
-    "attention2d": ("attn2d_row_size", "attn2d_col_size", "ulysses_degree"),
+    "hybrid": ("ulysses_degree", "allgather_degree"),
 }
 
 
@@ -96,17 +94,10 @@ class SequenceConfig:
                 return (("cp", 1), ("ulysses", 1))
             case "ulysses":
                 return (("cp", 1), ("ulysses", self.degrees[0]))
-            case "ring" | "allgather":
+            case "allgather":
                 return (("cp", self.degrees[0]), ("ulysses", 1))
             case "hybrid":
                 return (("cp", self.degrees[1]), ("ulysses", self.degrees[0]))
-            case "attention2d":
-                row, column, ulysses = self.degrees
-                return (
-                    ("cp_row", row),
-                    ("cp_col", column),
-                    ("ulysses", ulysses),
-                )
 
         raise ValueError(f"unknown sequence parallel strategy {self.kind!r}")
 

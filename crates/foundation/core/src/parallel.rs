@@ -20,27 +20,15 @@ pub enum SequenceParallel {
         #[serde(default = "one")]
         ulysses_degree: usize,
     },
-    Ring {
+    Allgather {
         #[serde(default = "one")]
-        ring_degree: usize,
+        allgather_degree: usize,
     },
     Hybrid {
         #[serde(default = "one")]
         ulysses_degree: usize,
         #[serde(default = "one")]
-        ring_degree: usize,
-    },
-    Allgather {
-        #[serde(default = "one")]
         allgather_degree: usize,
-    },
-    Attention2d {
-        #[serde(default = "one")]
-        attn2d_row_size: usize,
-        #[serde(default = "one")]
-        attn2d_col_size: usize,
-        #[serde(default = "one")]
-        ulysses_degree: usize,
     },
 }
 
@@ -50,19 +38,11 @@ impl SequenceParallel {
         let degrees = match *self {
             Self::Local => vec![1],
             Self::Ulysses { ulysses_degree } => vec![ulysses_degree],
-            Self::Ring { ring_degree } => vec![ring_degree],
+            Self::Allgather { allgather_degree } => vec![allgather_degree],
             Self::Hybrid {
                 ulysses_degree,
-                ring_degree,
-            } => vec![ulysses_degree, ring_degree],
-            Self::Allgather { allgather_degree } => vec![allgather_degree],
-            Self::Attention2d {
-                attn2d_row_size,
-                attn2d_col_size,
-                ulysses_degree,
-            } => {
-                vec![attn2d_row_size, attn2d_col_size, ulysses_degree]
-            }
+                allgather_degree,
+            } => vec![ulysses_degree, allgather_degree],
         };
         checked_product(&degrees)
     }

@@ -1097,18 +1097,12 @@ fn worker_info_round_trips() {
     let strategies = [
         SequenceParallel::Local,
         SequenceParallel::Ulysses { ulysses_degree: 2 },
-        SequenceParallel::Ring { ring_degree: 2 },
-        SequenceParallel::Hybrid {
-            ulysses_degree: 2,
-            ring_degree: 2,
-        },
         SequenceParallel::Allgather {
             allgather_degree: 2,
         },
-        SequenceParallel::Attention2d {
-            attn2d_row_size: 2,
-            attn2d_col_size: 2,
+        SequenceParallel::Hybrid {
             ulysses_degree: 2,
+            allgather_degree: 2,
         },
     ];
     for sequence_parallel in strategies {
