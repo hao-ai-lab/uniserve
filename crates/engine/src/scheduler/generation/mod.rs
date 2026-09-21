@@ -5,7 +5,9 @@
 //! output is named by request epoch, producer call, point, and generation.
 
 use std::collections::HashSet;
-use uniserve_worker_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode};
+use uniserve_worker_ipc::{
+    CallCoordinates, DEFAULT_COMPONENT, ForwardMode, MediaCall, TransferMode,
+};
 
 use uniserve_core::{GenerationRequest, ImageIngestStep, RequestId, SamplingParams};
 use uniserve_worker_ipc::{
@@ -304,7 +306,7 @@ fn computation(request: &GenerationRequest, code: CallKind) -> Call {
         request_key: RequestKey::new(0, request.request_id, 0),
         call_id: CallId::new(0, 0),
         coordinates: CallCoordinates::default(),
-        component: "model".into(),
+        component: DEFAULT_COMPONENT.into(),
         code,
         bounds: Bounds {
             max_tokens: 1,
@@ -977,20 +979,4 @@ pub(crate) enum GenerationResultError {
     Token { detail: &'static str },
     #[error("worker logprob result invalid: {detail}")]
     Logprob { detail: &'static str },
-}
-
-impl GenerationResultError {
-    /// Returns structured generation-error details.
-    pub(crate) fn detail(&self) -> &'static str {
-        match self {
-            Self::Status { detail }
-            | Self::Identity { detail }
-            | Self::Progress { detail }
-            | Self::Product { detail }
-            | Self::Token { detail }
-            | Self::Logprob { detail } => detail,
-            Self::MissingCallId => "missing_call_id",
-            Self::MissingLatentProduct => "missing_latent_product",
-        }
-    }
 }

@@ -8,6 +8,7 @@ from .denoiser import Denoiser, ImageDenoiser
 from .encoder import Encoder, PatchEncoder, TextEncoder
 from .inputs import (
     ComponentEntry,
+    DEFAULT_COMPONENT,
     DenoiserInput,
     EmbeddingReplacement,
     EntryPoint,
@@ -25,6 +26,7 @@ __all__ = [
     "DenoiserInput",
     "EmbeddingReplacement",
     "ComponentEntry",
+    "DEFAULT_COMPONENT",
     "EntryPoint",
     "LatentInput",
     "TextInput",

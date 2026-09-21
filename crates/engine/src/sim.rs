@@ -410,14 +410,14 @@ impl SimEngine {
     /// Constructs a simulator with deterministic text and image capabilities.
     pub fn new() -> Self {
         let info = WorkerInfo {
-            supported_ops: CallKind::ALL.to_vec(),
+            supported_calls: CallKind::ALL.to_vec(),
             latent_page_units: 64,
             latent_pages: 1_025,
             buffer_pool_bytes: 257_u64 * (256 << 20),
             encoder_cache_entries: 256,
             encoder_entry_bytes: 256 << 20,
-            max_batch_ops: 1024,
-            max_unresolved_ops: 2,
+            max_batch_calls: 1024,
+            max_unresolved_calls: 2,
             model_name: "sim".to_owned(),
             ..WorkerInfo::default()
         };
@@ -781,7 +781,7 @@ impl SimEngine {
         Ok(record)
     }
 
-    /// Builds a completion for an call resolved entirely by its execution predicate.
+    /// Builds a completion for a call resolved entirely by its execution predicate.
     fn predicated_completion(call: &Call, request: &SimRequestState) -> RequestOutput {
         RequestOutput {
             sampled_logprob: None,

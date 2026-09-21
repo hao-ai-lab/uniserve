@@ -223,10 +223,7 @@ class BatchState:
         )
 
     def inputs_ready(self) -> bool:
-        """Query physical readiness without submitting inputs or executing a.
-
-        model.
-        """
+        """Check readiness without submitting inputs or running the model."""
         return (
             self.inputs_submitted
             and all(

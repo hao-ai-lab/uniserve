@@ -174,8 +174,8 @@ def test_worker_info_projects_model_behavior_and_resource_geometry():
     )
     info = layout.info
 
-    assert ForwardMode.PREFILL in info.supported_ops
-    assert MediaCall.DENOISING in info.supported_ops
+    assert ForwardMode.PREFILL in info.supported_calls
+    assert MediaCall.DENOISING in info.supported_calls
     assert layout.max_vision_feature_bytes == ((512 // 16) ** 2 * 4 * 2)
     assert info.kv_cache is not None
     assert info.kv_cache.num_layers == len(TEST_MODEL.cache_config.layers)

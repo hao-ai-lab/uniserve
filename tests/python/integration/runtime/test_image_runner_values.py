@@ -381,7 +381,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         bindings=bindings,
         sampling_group=group,
         tokenizer=None,
-        allowed_work_variants=supported_calls(model),
+        allowed_calls=supported_calls(model),
         queue_depth=2,
         completion_payload_bytes=1 << 16,
         components=(("model", placement),),
@@ -567,7 +567,9 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 commit_marker_tokens=0,
                 max_cfg_branches=3,
                 latent_page_units=worker.info.latent_page_units,
-                latent_downsample=worker.runner.image_builder.denoiser.downsample,
+                latent_downsample=(
+                    worker.runner.image_builder.denoiser.downsample
+                ),
             )
             encoded = io.BytesIO()
             Image.new("RGB", (16, 16), (64, 96, 128)).save(

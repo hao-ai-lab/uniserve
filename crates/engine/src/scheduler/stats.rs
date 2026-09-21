@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 #[derive(Default)]
 pub struct GeneralStats {
     /// Largest number of calls observed in one submitted batch.
-    pub peak_ops: AtomicUsize,
+    pub peak_calls: AtomicUsize,
     /// Number of scheduler loop iterations completed.
     pub steps: AtomicU64,
     /// Current number of admitted, nonterminal requests.

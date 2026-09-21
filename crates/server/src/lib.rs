@@ -1,6 +1,6 @@
 //! UniServe HTTP frontend, model profiles, request lowering, and output assembly.
 //!
-//! The crate resolves one configuration configuration into shared application
+//! The crate resolves one configuration into shared application
 //! state and exposes OpenAI-compatible routes backed by the in-process engine.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]

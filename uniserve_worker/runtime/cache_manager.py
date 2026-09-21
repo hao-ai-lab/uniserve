@@ -58,10 +58,7 @@ class CacheAccess:
 
 
 class CacheManager:
-    """Coordinate request ownership around a numerical cache without.
-
-    duplicating it.
-    """
+    """Coordinate request ownership around one numerical cache."""
 
     def __init__(
         self,
@@ -244,10 +241,7 @@ class CacheManager:
     def require_reusable(
         self, page_ids: Sequence[int], *, group: int, start: int, length: int
     ) -> None:
-        """Authorize page initialization or independent-stream import before.
-
-        submission.
-        """
+        """Authorize page initialization or stream import before submission."""
         self.require_writable(page_ids, group=group, start=start, length=length)
         if self._execution_dependencies(
             tuple(
@@ -618,10 +612,7 @@ class CacheManager:
     def destination_base(
         self, request_key: RequestKey, destination: str
     ) -> BufferId | None:
-        """Resolve the newest publication published to one destination for.
-
-        a request.
-        """
+        """Resolve the newest publication sent to one destination."""
         value = self._destination_bases.get((request_key, str(destination)))
         return None if value is None else value[0]
 
@@ -809,10 +800,7 @@ class CacheManager:
             ) from None
 
     def resident(self, buffer: BufferId) -> KvTransfer | None:
-        """Look up a resident KV publication without treating absence as.
-
-        an error.
-        """
+        """Look up a resident KV publication; absence is not an error."""
         return self._publications.get(buffer)
 
     def validate_conditioning(

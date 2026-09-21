@@ -13,7 +13,7 @@ use crate::executor::WorkerExecError;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use uniserve_worker_ipc::{Batch, WorkerInfo, WorkerRequest, WorkerResponse};
+use uniserve_worker_ipc::{Batch, DEFAULT_COMPONENT, WorkerInfo, WorkerRequest, WorkerResponse};
 use uniserve_worker_ipc::{Frame, Outstanding, RankChannel};
 
 /// How long the head waits for a rank's socket channel to accept.
@@ -159,7 +159,7 @@ impl Default for WorkerProcessArgs {
             host: "localhost".into(),
             // One local rank running one component. A launch replaces this
             // with the components the model being served declared.
-            components: crate::WorkerConfig::single_component("model", 1),
+            components: crate::WorkerConfig::single_component(DEFAULT_COMPONENT, 1),
             peers: Default::default(),
             stub: false,
             queue_depth: 2,
@@ -302,7 +302,7 @@ impl WorkerProcessArgs {
         fields.insert("world_size".into(), json!(world_size));
         fields.insert("components".into(), serde_json::to_value(components)?);
         fields.insert(
-            "supported_ops".into(),
+            "supported_calls".into(),
             if self.capability_groups.is_empty() {
                 Value::Null
             } else {

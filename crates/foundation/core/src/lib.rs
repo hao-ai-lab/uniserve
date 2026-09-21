@@ -351,7 +351,7 @@ pub struct SamplingParams {
     /// Typical-sampling mass cutoff over the locally-typical set (1.0 == no-op).
     #[serde(default = "default_typical_p")]
     pub typical_p: f32,
-    /// Forced-decoding schedule: point `i` of an call's span is forced to
+    /// Forced-decoding schedule: point `i` of a call's span is forced to
     /// `forced_token_ids[i]` when present, overriding stochastic selection.
     #[serde(default)]
     pub forced_token_ids: Vec<u32>,

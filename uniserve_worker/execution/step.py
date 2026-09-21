@@ -304,7 +304,7 @@ def _classify_group_failure(
         calls=scheduled,
         req_id=None if sole is None else int(sole.request_key.request_id),
         call_id=None if sole is None else sole.call_id,
-        op_kind=None if sole is None else sole.kind.value,
+        call_kind=None if sole is None else sole.kind.value,
         route=str(0),
     )
     _log_group_failure(completion_group, classified, cause=error)
@@ -351,10 +351,7 @@ def _log_group_failure(
     *,
     cause: BaseException | None = None,
 ) -> None:
-    """Log a classified completion group failure with traceback only for.
-
-    diagnostic error classes.
-    """
+    """Log a completion-group failure, adding a diagnostic traceback."""
     capture_trace = should_capture_trace(error.code)
     log = logger.error if capture_trace else logger.warning
     log(

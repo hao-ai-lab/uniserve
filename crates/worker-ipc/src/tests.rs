@@ -347,7 +347,7 @@ fn lane_report(
 }
 
 #[test]
-fn every_work_variant_round_trips_through_ipc() {
+fn every_call_kind_round_trips_through_ipc() {
     let variants = CallKind::ALL;
     for (index, work) in variants.into_iter().enumerate() {
         let call = call_for(work, CallId::new(100 + index as u64, 0));
@@ -1155,7 +1155,7 @@ fn kv_free_worker_info_round_trips() {
     let info = WorkerInfo {
         media_components: video_components(),
         num_inference_steps: 4,
-        supported_ops: MediaCall::VIDEO.into_iter().map(CallKind::Media).collect(),
+        supported_calls: MediaCall::VIDEO.into_iter().map(CallKind::Media).collect(),
         kv_cache: None,
         latent_page_units: 64,
         latent_pages: 3,
@@ -1173,7 +1173,7 @@ fn kv_free_worker_info_round_trips() {
 #[test]
 fn worker_info_rejects_duplicate_set_members() {
     let info = WorkerInfo {
-        supported_ops: vec![
+        supported_calls: vec![
             CallKind::Forward(ForwardMode::Prefill),
             CallKind::Forward(ForwardMode::Decode),
             CallKind::Forward(ForwardMode::Prefill),
@@ -1398,7 +1398,7 @@ fn full_caps() -> WorkerInfo {
         encoder_entry_bytes: 128 << 20,
         media_components: video_components(),
         num_inference_steps: 4,
-        supported_ops: CallKind::ALL.to_vec(),
+        supported_calls: CallKind::ALL.to_vec(),
         kv_cache: Some(KvCacheInfo {
             groups: vec![
                 KvCacheGroup {
@@ -1421,10 +1421,10 @@ fn full_caps() -> WorkerInfo {
         },
         world_size: 2,
         queue_depth: 2,
-        max_batch_ops: 64,
+        max_batch_calls: 64,
         max_batch_tokens: 4096,
         request_slots: 96,
-        max_unresolved_ops: 3,
+        max_unresolved_calls: 3,
         latent_page_units: 64,
         latent_pages: 17,
         model_name: "test-model".into(),

@@ -53,8 +53,6 @@ struct Presentation<'a> {
 enum Instruction {
     /// Start one rank from the descriptor the head derived for it.
     Spawn(Spawn),
-    /// Start one rank again after it exited, under the same identity.
-    Respawn(Spawn),
     /// Stop every rank of one worker group this launcher owns.
     Stop { worker_id: String },
     /// Stop every rank this launcher owns and exit.
@@ -165,7 +163,7 @@ fn supervise(
         let instruction: Instruction = serde_json::from_str(line.trim())
             .with_context(|| format!("decoding an instruction from the head: {}", line.trim()))?;
         match instruction {
-            Instruction::Spawn(spawn) | Instruction::Respawn(spawn) => {
+            Instruction::Spawn(spawn) => {
                 let key = (spawn.worker_id.clone(), spawn.rank);
                 let started = start_rank(args, spawn).with_context(|| {
                     format!("starting rank {} of worker {} on this host", key.1, key.0)

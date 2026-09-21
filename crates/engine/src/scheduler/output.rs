@@ -437,7 +437,7 @@ impl Scheduler {
                 let key = RequestKey::new(self.engine_id, id, state.request_epoch);
                 let worker = self
                     .worker_affinity
-                    .get(&(key, "model".to_owned()))
+                    .get(&(key, DEFAULT_COMPONENT.to_owned()))
                     .expect("prefill has a bound model component");
                 let source = Arc::new(
                     self.executor
@@ -809,28 +809,12 @@ impl Scheduler {
             .and_then(|state| state.block_tables().first())
             .map_or(0, BlockTable::len);
         if !reserves_envelope || allocated_blocks < required_blocks {
-            self.trace_record(json!({
-                "event": "gen_branch_reservation_rejected",
-                "at_s": now(),
-                "request_id": id.0,
-                "required_blocks": required_blocks,
-                "allocated_blocks": allocated_blocks,
-            }));
             self.finish(id, FinishReason::Error);
             return false;
         }
         if let Some(st) = self.running.get_mut(&id) {
             st.image_reservation_pending = false;
         }
-        self.trace_record(json!({
-            "event": "gen_branch_capacity_ready",
-            "at_s": now(),
-            "request_id": id.0,
-            "required_blocks": required_blocks,
-            "allocated_blocks": allocated_blocks,
-            "free_blocks": self.free_blocks(),
-            "reserved_blocks": self.reserved_blocks,
-        }));
         true
     }
 
@@ -902,20 +886,8 @@ impl Scheduler {
             return false;
         }
         let published = self.emit_visible(id, EngineCoreOutput::TextToken { id: tok, logprob });
-        let first_token = published
-            && self
-                .running
-                .get(&id)
-                .is_some_and(|state| state.output.tokens_sent == 0);
         if published && let Some(state) = self.running.get_mut(&id) {
             state.output.tokens_sent = state.output.tokens_sent.saturating_add(1);
-        }
-        if first_token && self.trace_enabled() {
-            self.trace_record(json!({
-                "event": "first_public_token",
-                "at_s": now(),
-                "request_id": id.0,
-            }));
         }
         true
     }
@@ -1150,16 +1122,6 @@ impl Scheduler {
                     .into_iter()
                     .map(|product| product.buffer_id()),
             );
-
-            self.trace_request_finished(super::control::FinishedTrace {
-                id,
-                reason: &reason,
-                stop_reason: stop_reason.as_ref(),
-                prompt_tokens: st.req.prompt_token_ids.len(),
-                completion_tokens: st.num_generated_tokens,
-                images: st.num_generated_images,
-                queue: "running",
-            });
 
             // A full event channel transfers ownership to the retired-output
             // queue, which drains the terminal event under normal backpressure.
