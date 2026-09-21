@@ -45,13 +45,22 @@ def _finish(work: Any, tensor: torch.Tensor) -> None:
 
 
 def _start_all_gather(output: torch.Tensor, input: torch.Tensor, group):
-    """Publish a gather and return its deferred consumer dependency."""
-    bound = stream_collectives(group.group_name)
-    if bound is not None:
-        return bound.start_all_gather(output, input)
-    return dist.all_gather_into_tensor(
-        output, input, group=group, async_op=True
-    )
+    """Publish a gather and return its deferred consumer dependency.
+
+    The range covers the launch rather than the transfer, which is what a
+    profile correlates a device kernel back to. Without it this path's
+    collectives are the only ones in this module a capture cannot name.
+    """
+    with profile_range(
+        f"uniserve.collective kind=all_gather_start "
+        f"group={group.group_name} rank={dist.get_rank()}"
+    ):
+        bound = stream_collectives(group.group_name)
+        if bound is not None:
+            return bound.start_all_gather(output, input)
+        return dist.all_gather_into_tensor(
+            output, input, group=group, async_op=True
+        )
 
 
 @torch.library.custom_op(
