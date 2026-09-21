@@ -119,6 +119,13 @@ The `memory_fraction` on each GPU worker is its per-process static memory share.
 
 DP improves throughput only when the offered concurrency keeps multiple replicas occupied. At concurrency one, Ulysses can retain lower latency because all GPUs cooperate on one denoising call; at concurrency eight, DP removes that per-step collective and keeps queueing behind one request from dominating service time. Compare the layouts with the same checkpoint, prompts, duration, graph warmup, and concurrency rather than comparing an uncaptured first request with steady state.
 
+The `fast_h3_dp8` evaluation suite fixes that comparison protocol for the packed four-step checkpoint. It first runs the existing eight-way Ulysses placement with its two latency-oriented resident slots, then the shared-TP8 and replicated-TP4 DP8 placements. All three points use 16 measured requests at concurrency eight after eight warmup requests, five-second outputs, 1000-token prompts, and the same seeds. Resolve the commands and paths before starting the serial artifact-producing run:
+
+```bash
+.venv/bin/uniserve-eval --config uniserve_eval/profiles.toml plan fast_h3_dp8
+.venv/bin/uniserve-eval --config uniserve_eval/profiles.toml run fast_h3_dp8
+```
+
 The eight-device Ulysses file also does not shard denoiser weights, so every rank holds the whole denoiser, and a rank's residency can exceed the default `--mem-fraction-static` on a 96 GB device at the default `--max-video-seconds 15` and `--max-model-len 16384`. Raise the fraction, or shard the denoiser with `"tensor_parallel_size"`, if that deployment refuses to start with a static memory grant error. For DP8, adjust the text and flow workers' explicit `memory_fraction` values together instead of raising the global default.
 
 Cross-rank products move over the mechanism named for that edge. On a host whose CUDA peer access does not span the deployment -- some platforms grant it only within a device pair -- name the host mechanism for the model worker's product edge with `--transfer model->model=shm`, because the device mechanism maps another rank's allocation and a rank outside the pair cannot.
