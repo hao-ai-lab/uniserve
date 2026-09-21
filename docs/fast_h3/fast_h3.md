@@ -87,7 +87,37 @@ One launcher serves every worker of the deployment that places a rank on its hos
 
 `config/minimax-h3-eight-devices-single-node.json` places the same components on eight devices of one host, so it needs no launcher and starts exactly like the four-device file: eight-way Ulysses denoising, TP8 text encoding, one video and one audio media unit per rank, and a host worker with one rank that encodes all eight media units per round and muxes.
 
-Like the other deployment files it does not shard denoiser weights, so every rank holds the whole denoiser, and a rank's residency can exceed the default `--mem-fraction-static` on a 96 GB device at the default `--max-video-seconds 15` and `--max-model-len 16384`. Raise the fraction, or shard the denoiser with `"tensor_parallel_size"`, if the deployment refuses to start with a static memory grant error.
+## Single-node data parallel serving
+
+The single-node DP8 deployment uses eight independent one-GPU flow workers instead of one eight-rank Ulysses worker. Each flow worker owns a complete denoiser, video decoder, and audio decoder, so eight requests can denoise and decode concurrently without a collective between GPUs. The scheduler selects one flow replica when it admits a request, keeps that request on the same replica through latent preparation, denoising, and device decoding, and accounts its request rows, product buffers, queue, and execution lane in that worker's address space. Replica capacities add; a shared component remains an independently bounded stage of the route.
+
+Packed NVFP4 checkpoints are the intended DP8 weights. Dense BF16 denoiser replication is not expected to fit on 96 GB devices. Start with the shared-TP8 conditioning layout:
+
+```bash
+uniserve serve "$H3_MODEL" \
+  --workers config/minimax-h3-dp8-text-tp8.json \
+  --served-model-name FastH3 \
+  --host 0.0.0.0 \
+  --max-running-requests 8 \
+  --max-batch 8 \
+  --max-num-batched-tokens 8 \
+  --video-graph-shapes 5x1000
+```
+
+The two supplied placements isolate the main topology choices:
+
+| Deployment | Text encoder | Denoiser and device decode | CPU post-processing | Intended use |
+| --- | --- | --- | --- | --- |
+| `minimax-h3-dp8-text-tp8.json` | One TP8 worker shared by all requests | Eight complete one-GPU replicas | One host worker with eight video codec processes and one mux process | Lower text-weight memory per GPU and the conservative starting point; conditioning is one shared stage and its TP collective spans all devices. |
+| `minimax-h3-dp8-text-tp4x2.json` | Two TP4 replicas, one on devices 0–3 and one on devices 4–7 | Eight complete one-GPU replicas | The same shared host worker | Two conditioning requests can run concurrently and each collective stays within a four-GPU island, at the cost of a larger text shard on every GPU. |
+
+Both files configure eight media units per decoder rank and per host video-encoder rank. That makes each one-GPU replica reconstruct a complete eight-unit decode round while the host worker exposes eight bounded codec processes; creating eight separate CPU workers would duplicate mux ownership without increasing the useful codec parallelism. Audio encoding and final MP4 muxing stay serialized per request in the host worker because they are short relative to denoising and need one ordered artifact owner.
+
+The `memory_fraction` on each GPU worker is its per-process static memory share. A text worker and a flow worker intentionally share every GPU, so their shares leave aggregate runtime headroom instead of each claiming the global `--mem-fraction-static` default. The physical free-memory check still caps every allocation. Treat the supplied split as part of the deployment contract and revalidate it when checkpoint precision, maximum duration, prompt bound, or graph shapes change.
+
+DP improves throughput only when the offered concurrency keeps multiple replicas occupied. At concurrency one, Ulysses can retain lower latency because all GPUs cooperate on one denoising call; at concurrency eight, DP removes that per-step collective and keeps queueing behind one request from dominating service time. Compare the layouts with the same checkpoint, prompts, duration, graph warmup, and concurrency rather than comparing an uncaptured first request with steady state.
+
+The eight-device Ulysses file also does not shard denoiser weights, so every rank holds the whole denoiser, and a rank's residency can exceed the default `--mem-fraction-static` on a 96 GB device at the default `--max-video-seconds 15` and `--max-model-len 16384`. Raise the fraction, or shard the denoiser with `"tensor_parallel_size"`, if that deployment refuses to start with a static memory grant error. For DP8, adjust the text and flow workers' explicit `memory_fraction` values together instead of raising the global default.
 
 Cross-rank products move over the mechanism named for that edge. On a host whose CUDA peer access does not span the deployment -- some platforms grant it only within a device pair -- name the host mechanism for the model worker's product edge with `--transfer model->model=shm`, because the device mechanism maps another rank's allocation and a rank outside the pair cannot.
 

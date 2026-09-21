@@ -422,6 +422,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
                     call,
                     RequestPlacement {
                         worker: WorkerId("worker".into()),
+                        request_pool_idx: None,
                         block_tables: batch.block_tables,
                         new_cache_pages: batch.new_cache_pages,
                         forward: batch.forward,
@@ -656,6 +657,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         let call = batch.calls.remove(0);
         let placement = RequestPlacement {
             worker: WorkerId("worker".into()),
+            request_pool_idx: None,
             block_tables: batch.block_tables,
             new_cache_pages: batch.new_cache_pages,
             forward: batch.forward,
@@ -734,6 +736,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
                 call,
                 RequestPlacement {
                     worker: WorkerId("worker".into()),
+                    request_pool_idx: None,
                     block_tables: batch.block_tables,
                     new_cache_pages: batch.new_cache_pages,
                     forward: batch.forward,
@@ -1748,6 +1751,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
                 call,
                 RequestPlacement {
                     worker: WorkerId(worker.into()),
+                    request_pool_idx: None,
                     block_tables: batch.block_tables,
                     new_cache_pages: batch.new_cache_pages,
                     forward: batch.forward,

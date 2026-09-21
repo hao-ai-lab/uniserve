@@ -4,6 +4,22 @@ use super::*;
 use uniserve_worker_ipc::BufferId;
 
 impl Scheduler {
+    pub(super) fn free_media_request(&mut self, worker: &crate::WorkerId, allocation: Allocation) {
+        self.media_memory
+            .get_mut(worker)
+            .expect("media allocation names a loaded worker")
+            .requests
+            .free(allocation);
+    }
+
+    pub(super) fn free_media_buffer(&mut self, worker: &crate::WorkerId, allocation: Allocation) {
+        self.media_memory
+            .get_mut(worker)
+            .expect("media allocation names a loaded worker")
+            .buffers
+            .free(allocation);
+    }
+
     pub(super) fn free_allocation(&mut self, allocation: Allocation) {
         match allocation {
             Allocation::RequestSlot { .. } => self.request_pool.free(allocation),

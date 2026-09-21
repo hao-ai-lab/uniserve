@@ -638,7 +638,8 @@ impl WorkerExecutor {
         calls: &[(Call, RequestPlacement)],
     ) -> anyhow::Result<Vec<NewRequest>> {
         let mut admissions = Vec::new();
-        for (call, _) in calls {
+        let mut rows = HashMap::new();
+        for (call, placement) in calls {
             if self
                 .admitted_workers
                 .contains(&(worker_index, call.request_key))
@@ -651,7 +652,20 @@ impl WorkerExecutor {
                     call.request_key
                 )
             })?;
-            admissions.push(admission.clone());
+            let row = placement
+                .request_pool_idx
+                .unwrap_or(admission.request_pool_idx);
+            if let Some(existing) = rows.insert(call.request_key, row) {
+                anyhow::ensure!(
+                    existing == row,
+                    "worker {worker_index} received conflicting request rows for {:?}",
+                    call.request_key
+                );
+                continue;
+            }
+            let mut admission = admission.clone();
+            admission.request_pool_idx = row;
+            admissions.push(admission);
         }
         Ok(admissions)
     }
@@ -1627,6 +1641,53 @@ mod placement_tests {
             model_components.get("audio_decoder"),
         );
         assert_eq!(slots, [transfer.acknowledgment_slot("host", 0)]);
+    }
+
+    #[test]
+    fn a_shared_producer_names_every_possible_replica_reader() {
+        use crate::executor::TransferConfig;
+        use crate::worker::instance::media_consumer_slots;
+
+        let text = BTreeMap::from([(
+            "text_encoder".to_owned(),
+            ComponentConfig::parallel(vec![0], Default::default()),
+        )]);
+        let denoiser = || {
+            BTreeMap::from([(
+                "denoiser".to_owned(),
+                ComponentConfig::parallel(vec![0], Default::default()),
+            )])
+        };
+        let peers = BTreeMap::from([
+            ("flow-0".to_owned(), denoiser()),
+            ("flow-1".to_owned(), denoiser()),
+            ("text".to_owned(), text.clone()),
+        ]);
+        let routing = BTreeMap::from([(MediaCall::LatentPreparation, "denoiser".to_owned())]);
+        let mut transfer = TransferConfig::default();
+        for worker in ["text", "flow-0", "flow-1"] {
+            transfer.worker_ranks.insert(worker.to_owned(), 1);
+        }
+
+        let slots = media_consumer_slots(
+            &[MediaCall::LatentPreparation],
+            &routing,
+            "text",
+            &text,
+            &peers,
+            &transfer,
+            &[0],
+            0,
+            text.get("text_encoder"),
+        );
+
+        assert_eq!(
+            slots,
+            [
+                transfer.acknowledgment_slot("flow-0", 0),
+                transfer.acknowledgment_slot("flow-1", 0),
+            ]
+        );
     }
 
     #[test]

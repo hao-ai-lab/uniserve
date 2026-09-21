@@ -27,14 +27,17 @@ _NUMPY_DTYPES = {torch.int32: "int32", torch.int64: "int64"}
 def device_memory_budget(
     device: torch.device | str, fraction: float
 ) -> tuple[int, int]:
-    """Return pool and total free bytes.
+    """Return this process's pool grant and the device's total free bytes.
 
-    Return static-pool and total free bytes after loaded CUDA resources
-    settle.
+    The configured fraction is a per-process device share. This distinction
+    matters when independent WorkerGroups share a GPU: each process may size
+    its own pool up to its share, while the physical free-memory bound keeps
+    their aggregate allocations honest.
 
-    The pool budget is ``fraction`` of total memory minus the bytes already
-    occupied, so the static pool and the loaded resources together stay within
-    the requested fraction of the device.
+    Empty cached allocations before measuring so ``memory_reserved`` describes
+    live tensors and runtime allocations owned by this process. CUDA-library
+    allocations that PyTorch does not track remain covered by the physical
+    free-memory bound.
     """
     target = canonical_device(device)
     if target.type != "cuda" or not 0 < fraction <= 1:
@@ -45,7 +48,9 @@ def device_memory_budget(
     torch.cuda.synchronize(target)
     torch.cuda.empty_cache()
     free, total = torch.cuda.mem_get_info(target)
-    return max(0, int(total * fraction) - (total - free)), free
+    process_bytes = torch.cuda.memory_reserved(target)
+    process_grant = max(0, int(total * fraction) - process_bytes)
+    return min(process_grant, free), free
 
 
 def canonical_device(device: torch.device | str) -> torch.device:

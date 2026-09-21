@@ -39,13 +39,19 @@ pub struct WorkerRank {
 }
 
 /// Static computation components and their ordered physical rank membership.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
     pub id: WorkerId,
     pub ranks: Vec<WorkerRank>,
     pub components: BTreeMap<String, ComponentConfig>,
     pub queue_depth: usize,
+    /// Per-rank share of device memory available to this worker process.
+    ///
+    /// Distinct WorkerGroups may share one physical GPU. Their configured
+    /// shares must leave enough aggregate headroom for the device runtime.
+    #[serde(default)]
+    pub memory_fraction: Option<f64>,
 }
 
 impl WorkerConfig {
@@ -56,6 +62,13 @@ impl WorkerConfig {
             "worker {} queue depth must be positive",
             self.id
         );
+        if let Some(fraction) = self.memory_fraction {
+            anyhow::ensure!(
+                fraction.is_finite() && fraction > 0.0 && fraction <= 1.0,
+                "worker {} memory fraction must be finite and in (0, 1]",
+                self.id
+            );
+        }
         Self::validate_members(&self.ranks, &self.components)?;
         Ok(())
     }
@@ -111,20 +124,17 @@ impl WorkerConfig {
         Ok(())
     }
 
-    /// Validates unique WorkerGroup identities and one static owner for each component.
+    /// Validates unique WorkerGroup identities and every local placement.
+    ///
+    /// Component names may repeat across WorkerGroups. Repeated names are
+    /// replicas of the same numerical component; the scheduler binds each
+    /// request to one of them and keeps that affinity for the request lifetime.
     pub fn validate_all(workers: &[Self]) -> anyhow::Result<()> {
         anyhow::ensure!(!workers.is_empty(), "engine requires workers");
         let mut ids = BTreeSet::new();
-        let mut components = BTreeSet::new();
         for worker in workers {
             worker.validate()?;
             anyhow::ensure!(ids.insert(&worker.id), "WorkerGroup identity is repeated");
-            for entry in worker.components.keys() {
-                anyhow::ensure!(
-                    components.insert(entry),
-                    "component {entry} has multiple WorkerGroup owners"
-                );
-            }
         }
         Ok(())
     }
@@ -189,6 +199,7 @@ impl WorkerConfig {
             ranks: placement,
             components,
             queue_depth,
+            memory_fraction: None,
         }
     }
 }
@@ -344,6 +355,9 @@ impl EngineCore {
                 components: worker.components.clone(),
                 peers: peers.clone(),
                 queue_depth: worker.queue_depth,
+                kv_memory_fraction: worker
+                    .memory_fraction
+                    .unwrap_or(config.worker_process.kv_memory_fraction),
                 transfer: config.transfer.clone(),
                 ..config.worker_process.clone()
             });
@@ -651,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn static_bindings_reject_duplicate_identities_and_entry_owners() {
+    fn static_bindings_reject_duplicate_identities_and_allow_component_replicas() {
         let worker = WorkerConfig::placed(
             &["localhost".to_owned()],
             "cuda",
@@ -662,7 +676,7 @@ mod tests {
         let mut other = worker.clone();
         assert!(WorkerConfig::validate_all(&[worker.clone(), other.clone()]).is_err());
         other.id = WorkerId("other".into());
-        assert!(WorkerConfig::validate_all(&[worker.clone(), other.clone()]).is_err());
+        assert!(WorkerConfig::validate_all(&[worker.clone(), other.clone()]).is_ok());
         let entry = other.components.remove("model").unwrap();
         other.components.insert("divided".into(), entry);
         assert!(WorkerConfig::validate_all(&[worker, other]).is_ok());
