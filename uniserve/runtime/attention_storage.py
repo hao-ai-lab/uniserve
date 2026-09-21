@@ -69,20 +69,34 @@ def allocate_output_storage(
             "sync_input": BufferConfig((1,), torch.int32),
             "sync_output": BufferConfig((group.size,), torch.int32),
         }
-        if group not in allocations:
+        # Only a layer with a context partition composes every owner's rows
+        # and writes each share into that owner's storage, which is what
+        # symmetric memory provides and what requires peer access across the
+        # whole group. A plain Ulysses layer computes its own rows and
+        # exchanges them afterwards, so demanding that storage for it would
+        # refuse the layout on a device whose peer access does not span the
+        # group without giving the layer anything it uses.
+        composes_peer_rows = layer.context_group.size > 1
+        key = (group, composes_peer_rows)
+        if key not in allocations:
             allocation = TensorBuffers.allocate(
                 schema,
                 device=group.device,
-                symmetric={"output": group, "receive": group},
+                symmetric=(
+                    {"output": group, "receive": group}
+                    if composes_peer_rows
+                    else {}
+                ),
             )
             # Each rank seeds its own sync slot for the peer rendezvous.
             allocation.view(schema)["sync_input"].fill_(group.rank)
-            allocations[group] = allocation
+            allocations[key] = allocation
 
-        allocation = allocations[group]
+        allocation = allocations[key]
         views = allocation.view(schema)
         bindings[layer] = OutputBuffers(
-            allocation.peers("output"),
+            allocation.peers("output") if composes_peer_rows else (),
+            views["output"],
             views["receive"],
             views["sync_input"],
             views["sync_output"],
