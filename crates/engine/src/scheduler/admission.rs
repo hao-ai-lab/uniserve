@@ -354,9 +354,10 @@ impl Scheduler {
                 self.waiting_media_order.push_front(id);
                 break;
             };
+            let route_workers = routes.values().cloned().collect::<HashSet<_>>();
             let mut request_slots = HashMap::new();
             let mut reserved = true;
-            for worker in routes.values().collect::<HashSet<_>>() {
+            for worker in &route_workers {
                 let allocation = self
                     .media_memory
                     .get_mut(worker)
@@ -390,22 +391,30 @@ impl Scheduler {
                 let bytes = shape_bound
                     .max_elements()
                     .saturating_mul(dtype.element_bytes());
-                let worker = routes[&component].clone();
-                let allocation = self
-                    .media_memory
-                    .get_mut(&worker)
-                    .expect("media route names a loaded worker")
-                    .buffers
-                    .allocate(request_key, bytes, 256);
-                let Ok(allocation) = allocation else {
-                    reserved = false;
+                let mut allocations = HashMap::new();
+                for worker in &route_workers {
+                    let allocation = self
+                        .media_memory
+                        .get_mut(worker)
+                        .expect("media route names a loaded worker")
+                        .buffers
+                        .allocate(request_key, bytes, 256);
+                    let Ok(allocation) = allocation else {
+                        for (allocated_worker, allocation) in std::mem::take(&mut allocations) {
+                            self.free_media_buffer(&allocated_worker, allocation);
+                        }
+                        reserved = false;
+                        break;
+                    };
+                    allocations.insert(worker.clone(), allocation);
+                }
+                if !reserved {
                     break;
-                };
+                }
                 tensors.insert(
                     (component, index),
                     MediaTensorAllocation {
-                        worker,
-                        allocation,
+                        allocations,
                         dtype,
                         shape_bound,
                     },
@@ -413,7 +422,9 @@ impl Scheduler {
             }
             if !reserved {
                 for tensor in tensors.into_values() {
-                    self.free_media_buffer(&tensor.worker, tensor.allocation);
+                    for (worker, allocation) in tensor.allocations {
+                        self.free_media_buffer(&worker, allocation);
+                    }
                 }
                 for (worker, allocation) in request_slots {
                     self.free_media_request(&worker, allocation);
@@ -459,6 +470,7 @@ impl Scheduler {
                     request: submission.request,
                     event_tx: submission.event_tx,
                     allocations,
+                    buffer_bindings: HashMap::new(),
                     conditioning: None,
                     latents: Vec::new(),
                     decoded_units: BTreeMap::new(),

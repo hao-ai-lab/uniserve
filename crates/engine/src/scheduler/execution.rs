@@ -948,8 +948,8 @@ impl Scheduler {
                     .collect(),
                 _ => Vec::new(),
             };
-            let mut buffers = Vec::new();
             let mut outputs = Vec::new();
+            let mut output_starts = Vec::new();
             if media_call == MediaCall::TextEncoding
                 || last_step
                 || matches!(
@@ -985,8 +985,8 @@ impl Scheduler {
                         dtype: reserved.dtype,
                         shape_bound,
                     };
-                    buffers.push(reserved.bind(&product, start));
                     outputs.push(product);
+                    output_starts.push(start);
                 }
             }
             let latent = if stateful {
@@ -1051,6 +1051,13 @@ impl Scheduler {
                 admissions.push(state.admission.clone());
                 state.admission_state = WorkerRegistration::InFlight;
             }
+            for (product, start) in call.outputs.iter().zip(&output_starts) {
+                let replaced = state.buffer_bindings.insert(
+                    product.buffer_id(),
+                    (component.clone(), u32::from(product.output_index), *start),
+                );
+                debug_assert!(replaced.is_none(), "media buffer identity was reused");
+            }
             match media_call {
                 MediaCall::TextEncoding => {
                     state.conditioning = call.outputs.first().cloned();
@@ -1108,8 +1115,20 @@ impl Scheduler {
             if last_step {
                 state.latents = call.outputs.clone();
             }
-            let (worker, component) = self.select_worker(&call);
-            call.component = component;
+            let (worker, selected_component) = self.select_worker(&call);
+            call.component = selected_component;
+            let state = self.media_state(id).expect("selected media request exists");
+            let mut bound = HashSet::new();
+            let buffers = call
+                .buffer_inputs()
+                .chain(call.buffer_outputs())
+                .filter(|product| bound.insert(product.buffer_id()))
+                .map(|product| {
+                    let (component, index, start) = &state.buffer_bindings[&product.buffer_id()];
+                    state.allocations.tensors[&(component.clone(), *index)]
+                        .bind(product, *start, &worker)
+                })
+                .collect();
             let request_pool_idx = self
                 .media_state(id)
                 .expect("selected media request exists")
