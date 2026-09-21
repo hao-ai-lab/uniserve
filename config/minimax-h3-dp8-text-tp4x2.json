@@ -1,7 +1,7 @@
 [
   {
     "id": "text-0",
-    "memory_fraction": 0.22,
+    "memory_fraction": 0.18,
     "ranks": [
       {
         "node": "localhost",
@@ -37,7 +37,7 @@
   },
   {
     "id": "text-1",
-    "memory_fraction": 0.22,
+    "memory_fraction": 0.18,
     "ranks": [
       {
         "node": "localhost",
@@ -73,7 +73,7 @@
   },
   {
     "id": "flow-0",
-    "memory_fraction": 0.71,
+    "memory_fraction": 0.81,
     "ranks": [
       {
         "node": "localhost",
@@ -108,7 +108,7 @@
   },
   {
     "id": "flow-1",
-    "memory_fraction": 0.71,
+    "memory_fraction": 0.81,
     "ranks": [
       {
         "node": "localhost",
@@ -143,7 +143,7 @@
   },
   {
     "id": "flow-2",
-    "memory_fraction": 0.71,
+    "memory_fraction": 0.81,
     "ranks": [
       {
         "node": "localhost",
@@ -178,7 +178,7 @@
   },
   {
     "id": "flow-3",
-    "memory_fraction": 0.71,
+    "memory_fraction": 0.81,
     "ranks": [
       {
         "node": "localhost",
@@ -213,7 +213,7 @@
   },
   {
     "id": "flow-4",
-    "memory_fraction": 0.71,
+    "memory_fraction": 0.81,
     "ranks": [
       {
         "node": "localhost",
@@ -248,7 +248,7 @@
   },
   {
     "id": "flow-5",
-    "memory_fraction": 0.71,
+    "memory_fraction": 0.81,
     "ranks": [
       {
         "node": "localhost",
@@ -283,7 +283,7 @@
   },
   {
     "id": "flow-6",
-    "memory_fraction": 0.71,
+    "memory_fraction": 0.81,
     "ranks": [
       {
         "node": "localhost",
@@ -318,7 +318,7 @@
   },
   {
     "id": "flow-7",
-    "memory_fraction": 0.71,
+    "memory_fraction": 0.81,
     "ranks": [
       {
         "node": "localhost",
@@ -375,6 +375,6 @@
         "parallel_config": {}
       }
     },
-    "queue_depth": 16
+    "queue_depth": 24
   }
 ]
