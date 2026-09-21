@@ -228,10 +228,7 @@ def _decode_rgb(encoded: str) -> Image.Image:
 def _resize_patch_image(
     image: Image.Image, processor: PatchTransform
 ) -> Image.Image:
-    """Resize an image to the processor's bounded aspect-preserving patch.
-
-    grid.
-    """
+    """Resize an image to the processor's bounded patch grid."""
     height, width = _patch_image_shape(processor, image.height, image.width)
     return vision.resize(
         image,
@@ -278,10 +275,7 @@ def _bounded_grid_shape(
     minimum: int,
     maximum: int,
 ) -> tuple[int, int]:
-    """Fit an aspect-preserving patch grid within minimum and maximum token.
-
-    bounds.
-    """
+    """Fit an aspect-preserving patch grid within the token bounds."""
     if min(height, width, factor) < 1:
         raise invalid_descriptor("image dimensions must be positive")
     if max(height, width) / min(height, width) > 200:
@@ -303,10 +297,7 @@ def _bounded_grid_shape(
 
 
 def _resize_stride(image: Image.Image, processor: StrideResize) -> Image.Image:
-    """Resize an image so both dimensions align with the configured spatial.
-
-    stride.
-    """
+    """Resize both image dimensions to the configured spatial stride."""
     width, height = image.size
     scale = min(int(processor.max_size) / max(width, height), 1.0)
     scale = max(scale, int(processor.min_size) / min(width, height))
@@ -388,10 +379,7 @@ def _resize_tensor(
 def _stage(
     value: torch.Tensor, processor: ImageProcessor, device: torch.device
 ) -> torch.Tensor:
-    """Convert preprocessing output to the processor staging dtype and.
-
-    device.
-    """
+    """Convert preprocessing output to the staging dtype and device."""
     dtype = processor.staging_dtype
     if processor.staging_dtype is not None and not isinstance(
         dtype, torch.dtype

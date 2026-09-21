@@ -508,12 +508,8 @@ mod tests {
         assert!(second_snapshot.worker_forward_stats.is_none());
     }
 
-    /// the two maps the worker computes (attention backend / cuda-graph
-    /// runtime mode) must survive the SchedulerStats -> snapshot snapshot/delta instead
-    /// of being silently dropped before they can reach Prometheus.
-    /// the directly-measured per-batch worker compute time and host
-    /// round-trip latency must surface as per-update deltas in the snapshot stats so
-    /// they reach Prometheus.
+    /// Directly measured worker compute and host round-trip latency must
+    /// surface as per-update deltas so they reach Prometheus.
     #[test]
     fn snapshot_surfaces_batch_timing() {
         let stats = SchedulerStats::default();

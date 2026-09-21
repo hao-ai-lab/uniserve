@@ -45,7 +45,7 @@ class TokenSelection(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class SamplingMetadata:
-    """Numerical sampling controls for an call's candidate logits.
+    """Numerical sampling controls for a call's candidate logits.
 
     Parameters and terminal policy apply to the complete call. Only allowed
     tokens, penalty histories, and RNG draws vary along a speculative chain;

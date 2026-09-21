@@ -51,7 +51,7 @@ def required(request: Mapping[str, Any], field: str, kind: RequestKind) -> Any:
     if value is None:
         raise invalid_descriptor(
             f"request {kind.value!r} is missing required field {field!r}",
-            op_kind=kind.value,
+            call_kind=kind.value,
         )
     return value
 
@@ -63,7 +63,7 @@ def integer(request: Mapping[str, Any], field: str, kind: RequestKind) -> int:
         raise invalid_descriptor(
             f"request {kind.value!r} field {field!r} must be a "
             "non-negative integer",
-            op_kind=kind.value,
+            call_kind=kind.value,
         )
     return value
 

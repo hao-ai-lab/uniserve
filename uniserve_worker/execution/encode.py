@@ -636,10 +636,7 @@ def latent_state_row(
     request_tables: BlockTables | None,
     model_runner: ModelRunner,
 ) -> ForwardRow:
-    """Publish encoded image latents and construct the request runtime for.
-
-    diffusion conditioning.
-    """
+    """Publish image latents and build the diffusion-conditioning runtime."""
     builder = model_runner.image_builder
     if builder is None or builder.framing != 2:
         raise invalid_descriptor(

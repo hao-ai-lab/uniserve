@@ -493,7 +493,7 @@ def test_loaded_worker_warmup_retires_its_request_resources(tmp_path):
         worker_config=config,
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
-        allowed_work_variants=supported_calls(model),
+        allowed_calls=supported_calls(model),
         queue_depth=2,
         completion_payload_bytes=1 << 16,
     ) as worker:

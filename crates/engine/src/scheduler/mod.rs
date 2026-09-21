@@ -33,7 +33,6 @@ use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 mod admission;
 mod allocation;
 mod batching;
-pub(crate) mod bench_trace;
 mod control;
 mod execution;
 pub(crate) mod generation;
@@ -71,16 +70,15 @@ use uniserve_core::{BlockId, ImageIngestStep, encoder_cache_key};
 use uniserve_core::{HashAlgo, RequestId, RuntimeFamily};
 use uniserve_worker_ipc::{
     ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
-    CachePageAllocation, Call, CallId, CallKind, CallStatus, DType, DecodeRange, DimBound,
-    ForwardBatch, ForwardStats, LatentParams, NewRequest, RequestKey, SamplingState, ShapeBound,
-    TensorRef, TimingCounters, UmmRequestParams, WorkerInfo,
+    CachePageAllocation, Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange,
+    DimBound, ForwardBatch, ForwardStats, LatentParams, NewRequest, RequestKey, SamplingState,
+    ShapeBound, TensorRef, TimingCounters, UmmRequestParams, WorkerInfo,
 };
 
 use crate::executor::WorkerFailure;
 use crate::scheduler::image_artifact::validate_png_artifact;
-use inflight::{InflightInput, InflightOp, PendingBatch, PendingCompletion, PendingFinish};
+use inflight::{InflightCall, InflightInput, PendingBatch, PendingCompletion, PendingFinish};
 use output::RequestOutput;
-use serde_json::json;
 
 /// Number of denoising steps planned for one scheduling burst by default.
 pub(crate) const DEFAULT_DENOISE_STEP_BURST: u16 = 1;
@@ -390,10 +388,6 @@ struct MediaFlowState {
     audio: Option<TensorRef>,
     admission: NewRequest,
     admission_state: WorkerRegistration,
-    /// When the engine received the request and when it admitted it, so the
-    /// time before a request's first device call can be attributed.
-    queued_at: f64,
-    admitted_at: f64,
     text_encoding_scheduled: bool,
     latent_preparation_scheduled: bool,
     num_scheduled_steps: u32,
@@ -487,8 +481,6 @@ enum DiffusionTerminal {
 struct PendingMedia {
     request: DiffusionRequest,
     event_tx: EventTx,
-    /// When the engine received the request, for the preparing-time record.
-    queued_at: f64,
 }
 
 /// Permissive unified-multimodal limits for a scheduler built without
@@ -541,7 +533,7 @@ pub struct Scheduler {
     num_pending_transfers: usize,
     batch_id: u64,
     next_arrival_seq: u64,
-    pending_calls: HashMap<RequestId, VecDeque<InflightOp>>,
+    pending_calls: HashMap<RequestId, VecDeque<InflightCall>>,
     pending_completions: HashMap<RequestId, BTreeMap<CallId, PendingCompletion>>,
     pending_finishes: HashMap<RequestId, PendingFinish>,
     pending_batches: HashMap<u64, PendingBatch>,
@@ -561,27 +553,13 @@ pub struct Scheduler {
     /// Engine-fatal latch: set when the executor/worker dies;
     /// the control loop exits and the host converts this into engine-dead.
     fatal: bool,
-    trace_sink: Option<crate::scheduler::bench_trace::RuntimeTraceSink>,
     /// Largest number of calls observed in one submitted batch.
-    pub peak_ops_in_batch: usize,
+    pub peak_calls_in_batch: usize,
     /// Shared scheduler counters and latency accumulators.
     pub stats: Arc<SchedulerStats>,
 }
 
 impl Scheduler {
-    /// Serializes the generation decisions consumed by scheduler trace readers.
-    fn generation_trace(request: &GenerationRequest) -> serde_json::Value {
-        serde_json::json!({
-            "und_decode": request.decodes_text(),
-            "und_tokens": request.emits_text(),
-            "gen_output": request.generates_images(),
-            "start_gen_after_context": request.starts_with_image(),
-            "generated_image_feedback": request.feeds_back_images(),
-            "continue_after_gen_commit": request.continues_after_image(),
-            "finish_after_gen_commit": request.finishes_after_image(),
-        })
-    }
-
     /// Determines whether this service's configured model accepts a request family.
     const fn accepts_family(&self, family: RuntimeFamily) -> bool {
         matches!(
@@ -693,42 +671,6 @@ struct KvLengths {
     visible: u32,
 }
 
-/// Serializes worker forward-pass counters into the scheduler trace schema.
-fn worker_forward_stats_trace(stats: &ForwardStats) -> serde_json::Value {
-    json!({
-        "mode_counts": stats.mode_counts,
-        "mode_tokens": stats.mode_tokens,
-        "mode_us": stats.mode_us,
-        "component_us": stats.component_us,
-        "attention_launches": stats.attention_launches,
-        "attention_us": stats.attention_us,
-        "attention_backend_counts": stats.attention_backend_counts,
-        "cuda_graph_captures": stats.cuda_graph_captures,
-        "cuda_graph_replays": stats.cuda_graph_replays,
-        "cuda_graph_misses": stats.cuda_graph_misses,
-        "cuda_graph_fallbacks": stats.cuda_graph_fallbacks,
-        "cuda_graph_unpadded_tokens": stats.cuda_graph_unpadded_tokens,
-        "cuda_graph_padded_tokens": stats.cuda_graph_padded_tokens,
-        "cuda_graph_runtime_mode_counts": stats.cuda_graph_runtime_mode_counts,
-        "text_decode_token_relay_hits": stats.text_decode_token_relay_hits,
-        "text_decode_token_relay_misses": stats.text_decode_token_relay_misses,
-        "text_decode_position_relay_hits": stats.text_decode_position_relay_hits,
-        "text_decode_position_relay_misses": stats.text_decode_position_relay_misses,
-        "flashinfer_decode_plan_calls": stats.flashinfer_decode_plan_calls,
-        "flashinfer_decode_plan_reuses": stats.flashinfer_decode_plan_reuses,
-        "flashinfer_decode_plan_rows": stats.flashinfer_decode_plan_rows,
-        "flashinfer_decode_plan_indices": stats.flashinfer_decode_plan_indices,
-        "flashinfer_decode_graph_plan_calls": stats.flashinfer_decode_graph_plan_calls,
-        "flashinfer_decode_graph_plan_reuses": stats.flashinfer_decode_graph_plan_reuses,
-        "spec_verify_rows": stats.spec_verify_rows,
-        "spec_verify_draft_tokens": stats.spec_verify_draft_tokens,
-        "spec_verify_accepted_tokens": stats.spec_verify_accepted_tokens,
-        "spec_verify_rejected_tokens": stats.spec_verify_rejected_tokens,
-        "spec_verify_committed_tokens": stats.spec_verify_committed_tokens,
-        "spec_verify_path_counts": stats.spec_verify_path_counts,
-    })
-}
-
 /// Computes ceiling division for unsigned values.
 fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
     let divisor = divisor.max(1);
@@ -747,27 +689,6 @@ fn call_output_bound(code: CallKind, bounds: &uniserve_worker_ipc::Bounds) -> us
         CallKind::Media(MediaCall::ImageDecoding) => 3,
         _ => 2,
     }
-}
-
-/// Records the call in the optional benchmark trace.
-fn call_trace(call: &Call) -> serde_json::Value {
-    // A state-advancing call follows the request's chain; other work
-    // completes independently of it.
-    let parent_kind = if call.advances_state() {
-        "call"
-    } else {
-        "none"
-    };
-    json!({
-        "kind": call.code.as_str(),
-            "parent_kind": parent_kind,
-        "predicated": call.predicate.as_ref().is_some(),
-        "inputs": call.tensor_inputs().count(),
-        "outputs": call.tensor_outputs().count(),
-        "max_tokens": call.bounds.max_tokens,
-        "max_kv_pages": call.bounds.max_kv_pages,
-        "output_event_bound": call_output_bound(call.code, &call.bounds),
-    })
 }
 
 /// Reads the denoising burst size from the environment.

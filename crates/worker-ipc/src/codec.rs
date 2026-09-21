@@ -816,7 +816,7 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
             .unwrap_or_default(),
         request_key: request_key_from_table(record.request_key(), "completion.request_key")?,
         call_id: computation_id_from_fb(record.call_id())?,
-        status: op_status_from_fb(record.status())?,
+        status: call_status_from_fb(record.status())?,
         product_generations: record
             .product_generations()
             .map(|items| items.iter().collect())
@@ -938,8 +938,8 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             })
             .transpose()?
             .unwrap_or_default(),
-        supported_ops: info
-            .supported_ops()
+        supported_calls: info
+            .supported_calls()
             .map(|items| {
                 items
                     .iter()
@@ -949,7 +949,7 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             .transpose()?
             .unwrap_or_default(),
         queue_depth: info.queue_depth(),
-        max_batch_ops: info.max_batch_ops(),
+        max_batch_calls: info.max_batch_calls(),
         max_batch_tokens: info.max_batch_tokens(),
         request_slots: info.request_slots(),
         kv_cache: info.kv_cache().map(kv_cache_from_table).transpose()?,
@@ -958,7 +958,7 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
         buffer_pool_bytes: info.buffer_pool_bytes(),
         encoder_cache_entries: info.encoder_cache_entries(),
         encoder_entry_bytes: info.encoder_entry_bytes(),
-        max_unresolved_ops: info.max_unresolved_ops(),
+        max_unresolved_calls: info.max_unresolved_calls(),
         host_lane_capacity: info.host_lane_capacity(),
         media_components: {
             let mut components = std::collections::BTreeMap::new();
@@ -1688,7 +1688,7 @@ fn completion_record_to_fb(record: &RequestOutput) -> fbs::RequestOutputT {
         ),
         request_key: Some(Box::new(request_key_to_fb(record.request_key))),
         call_id: Some(computation_id_to_fb(record.call_id)),
-        status: op_status_to_fb(record.status),
+        status: call_status_to_fb(record.status),
         product_generations: Some(record.product_generations.clone()),
         error_code: record.error_code.map(error_code_to_fb),
         timing_counters: Some(Box::new(fbs::TimingCountersT {
@@ -1933,15 +1933,15 @@ fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
                 })
                 .collect::<CodecResult<Vec<_>>>()?,
         ),
-        supported_ops: Some(
-            info.supported_ops
+        supported_calls: Some(
+            info.supported_calls
                 .iter()
                 .copied()
                 .map(computation_to_fb)
                 .collect(),
         ),
         queue_depth: info.queue_depth,
-        max_batch_ops: info.max_batch_ops,
+        max_batch_calls: info.max_batch_calls,
         max_batch_tokens: info.max_batch_tokens,
         request_slots: info.request_slots,
         kv_cache: info.kv_cache.as_ref().map(kv_cache_to_fb).map(Box::new),
@@ -1950,7 +1950,7 @@ fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
         buffer_pool_bytes: info.buffer_pool_bytes,
         encoder_cache_entries: info.encoder_cache_entries,
         encoder_entry_bytes: info.encoder_entry_bytes,
-        max_unresolved_ops: info.max_unresolved_ops,
+        max_unresolved_calls: info.max_unresolved_calls,
         host_lane_capacity: info.host_lane_capacity,
         media_components: Some(
             info.media_components
@@ -2579,8 +2579,8 @@ fn draw_layout_from_fb(layout: fbs::DrawLayout) -> CodecResult<DrawLayout> {
     })
 }
 
-/// Maps an call status to its stable FlatBuffers discriminant.
-fn op_status_to_fb(status: CallStatus) -> fbs::CallStatus {
+/// Maps a call status to its stable FlatBuffers discriminant.
+fn call_status_to_fb(status: CallStatus) -> fbs::CallStatus {
     match status {
         CallStatus::Ok => fbs::CallStatus::Ok,
         CallStatus::Predicated => fbs::CallStatus::Predicated,
@@ -2589,7 +2589,7 @@ fn op_status_to_fb(status: CallStatus) -> fbs::CallStatus {
 }
 
 /// Decodes a supported FlatBuffers call status.
-fn op_status_from_fb(status: fbs::CallStatus) -> CodecResult<CallStatus> {
+fn call_status_from_fb(status: fbs::CallStatus) -> CodecResult<CallStatus> {
     Ok(match status {
         fbs::CallStatus::Ok => CallStatus::Ok,
         fbs::CallStatus::Predicated => CallStatus::Predicated,

@@ -565,7 +565,7 @@ pub fn header_for_response(resp: &WorkerResponse) -> Header {
 fn verify_header_len(header: Header, actual: usize) -> IpcResult<()> {
     if !is_supported_ipc_version(header.version) {
         ipc_bail!(
-            "unsupported IPC IPC version {}: this build requires {}",
+            "unsupported IPC version {}: this build requires {}",
             header.version,
             IPC_VERSION
         );
