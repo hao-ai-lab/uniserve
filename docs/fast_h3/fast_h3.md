@@ -119,7 +119,7 @@ The `memory_fraction` on each GPU worker is its per-process static memory share.
 
 DP improves throughput only when the offered concurrency keeps multiple replicas occupied. At concurrency one, Ulysses can retain lower latency because all GPUs cooperate on one denoising call; at concurrency eight, DP removes that per-step collective and keeps queueing behind one request from dominating service time. Compare the layouts with the same checkpoint, prompts, duration, graph warmup, and concurrency rather than comparing an uncaptured first request with steady state.
 
-The `fast_h3_dp8` evaluation suite fixes that comparison protocol for the packed four-step checkpoint. It first runs the existing eight-way Ulysses placement with its two latency-oriented resident slots, then the shared-TP8 and replicated-TP4 DP8 placements. All three points use 16 measured requests at concurrency eight after eight warmup requests, five-second outputs, 1000-token prompts, and the same seeds. Resolve the commands and paths before starting the serial artifact-producing run:
+The `fast_h3_dp8` evaluation suite fixes that comparison protocol for the packed four-step checkpoint. It first runs the existing eight-way Ulysses placement with its two latency-oriented resident slots, then the shared-TP8 and replicated-TP4 DP8 placements. The Ulysses process receives the same 0.93 per-device static-memory envelope as the combined DP text and flow processes. All three points use 16 measured requests at concurrency eight after eight warmup requests, five-second outputs, 1000-token prompts, and the same seeds. Resolve the commands and paths before starting the serial artifact-producing run:
 
 ```bash
 .venv/bin/uniserve-eval --config uniserve_eval/profiles.toml plan fast_h3_dp8
