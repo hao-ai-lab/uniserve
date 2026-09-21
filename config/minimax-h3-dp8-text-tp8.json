@@ -77,7 +77,7 @@
         ],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
+        "units_per_rank": 1
       },
       "audio_decoder": {
         "ranks": [
@@ -85,7 +85,7 @@
         ],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
+        "units_per_rank": 1
       }
     },
     "queue_depth": 3
@@ -112,7 +112,7 @@
         ],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
+        "units_per_rank": 1
       },
       "audio_decoder": {
         "ranks": [
@@ -120,7 +120,7 @@
         ],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
+        "units_per_rank": 1
       }
     },
     "queue_depth": 3
@@ -147,7 +147,7 @@
         ],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
+        "units_per_rank": 1
       },
       "audio_decoder": {
         "ranks": [
@@ -155,7 +155,7 @@
         ],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
+        "units_per_rank": 1
       }
     },
     "queue_depth": 3
@@ -182,7 +182,7 @@
         ],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
+        "units_per_rank": 1
       },
       "audio_decoder": {
         "ranks": [
@@ -190,7 +190,7 @@
         ],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
+        "units_per_rank": 1
       }
     },
     "queue_depth": 3
@@ -217,7 +217,7 @@
         ],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
+        "units_per_rank": 1
       },
       "audio_decoder": {
         "ranks": [
@@ -225,7 +225,7 @@
         ],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
+        "units_per_rank": 1
       }
     },
     "queue_depth": 3
@@ -252,7 +252,7 @@
         ],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
+        "units_per_rank": 1
       },
       "audio_decoder": {
         "ranks": [
@@ -260,7 +260,7 @@
         ],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
+        "units_per_rank": 1
       }
     },
     "queue_depth": 3
@@ -287,7 +287,7 @@
         ],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
+        "units_per_rank": 1
       },
       "audio_decoder": {
         "ranks": [
@@ -295,7 +295,7 @@
         ],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
+        "units_per_rank": 1
       }
     },
     "queue_depth": 3
@@ -322,7 +322,7 @@
         ],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
+        "units_per_rank": 1
       },
       "audio_decoder": {
         "ranks": [
@@ -330,7 +330,7 @@
         ],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
+        "units_per_rank": 1
       }
     },
     "queue_depth": 3
