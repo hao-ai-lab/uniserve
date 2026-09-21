@@ -158,6 +158,26 @@ impl Scheduler {
             .expect("executor exposes a valid runtime capacity view");
         let generation_limits = resolve_generation_limits(generation_limits, &info);
         let latent_dtype = worker_float_dtype(Some(model_dtype));
+        let media_memory = executor
+            .info()
+            .workers
+            .iter()
+            .filter(|(_, worker)| {
+                worker
+                    .supported_ops
+                    .iter()
+                    .any(|kind| matches!(kind, CallKind::Media(_)))
+            })
+            .map(|(id, worker)| {
+                (
+                    id.clone(),
+                    MediaMemory {
+                        requests: RequestPool::new(worker.request_slots as usize),
+                        buffers: BufferPool::new(worker.buffer_pool_bytes),
+                    },
+                )
+            })
+            .collect();
 
         // Queue and batch limits cannot exceed the physical executor envelope.
         let max_batch_ops = info.max_batch_ops as usize;
@@ -252,6 +272,7 @@ impl Scheduler {
             latent_pool: LatentPool::new(info.latent_pages, info.latent_page_units),
             reserved_blocks: 0,
             buffer_pool: BufferPool::new(info.buffer_pool_bytes),
+            media_memory,
             encoder_buffers: HashMap::new(),
             info,
             generation_limits,

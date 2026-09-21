@@ -254,6 +254,7 @@ impl FlowPrefixState {
 struct RetiringRequest {
     request_key: RequestKey,
     allocations: Vec<Allocation>,
+    media_allocations: Vec<(crate::WorkerId, Allocation)>,
     buffers: HashMap<BufferId, Allocation>,
 }
 
@@ -417,15 +418,24 @@ struct MediaFlowState {
 
 struct MediaAllocations {
     tensors: HashMap<(String, u32), MediaTensorAllocation>,
-    request_slot: Allocation,
+    request_slots: HashMap<crate::WorkerId, Allocation>,
 }
 
 /// A request reserves each declared result once. Video ranges occupy disjoint
 /// slices of its temporal result, independent of decoder Worker width.
 struct MediaTensorAllocation {
+    worker: crate::WorkerId,
     allocation: Allocation,
     dtype: DType,
     shape_bound: ShapeBound,
+}
+
+/// Independent scheduler address space for one physical media WorkerGroup.
+/// Replicas intentionally reuse row numbers and byte offsets in their own
+/// processes; the worker identity keeps those physical addresses distinct.
+struct MediaMemory {
+    requests: RequestPool,
+    buffers: BufferPool,
 }
 
 impl MediaTensorAllocation {
@@ -448,25 +458,29 @@ impl MediaTensorAllocation {
 }
 
 impl MediaAllocations {
-    /// Returns the request-slot identifier.
-    fn request_slot(&self) -> u32 {
-        self.request_slot
+    /// Returns the request row assigned in one physical worker address space.
+    fn request_slot(&self, worker: &crate::WorkerId) -> u32 {
+        self.request_slots[worker]
             .request_slot()
             .expect("media request slot allocation")
     }
 
-    /// Consumes media layout metadata once only storage lifetime remains.
-    fn into_allocations(self) -> impl Iterator<Item = Allocation> {
+    /// Consumes physical media addresses while retaining their Worker owner.
+    fn into_allocations(self) -> Vec<(crate::WorkerId, Allocation)> {
         self.tensors
             .into_values()
-            .map(|tensor| tensor.allocation)
-            .chain([self.request_slot])
+            .map(|tensor| (tensor.worker, tensor.allocation))
+            .chain(self.request_slots)
+            .collect()
     }
 
     /// Releases the owned request allocation.
     fn free(self, scheduler: &mut Scheduler) {
-        for allocation in self.into_allocations() {
-            scheduler.free_allocation(allocation);
+        for tensor in self.tensors.into_values() {
+            scheduler.free_media_buffer(&tensor.worker, tensor.allocation);
+        }
+        for (worker, allocation) in self.request_slots {
+            scheduler.free_media_request(&worker, allocation);
         }
     }
 }
@@ -529,6 +543,7 @@ pub struct Scheduler {
     latent_pool: LatentPool,
     reserved_blocks: usize,
     buffer_pool: BufferPool,
+    media_memory: HashMap<crate::WorkerId, MediaMemory>,
     encoder_buffers: HashMap<uniserve_worker_ipc::BufferId, Allocation>,
     family: RuntimeFamily,
     ctrl: SpecialTokenIds,

@@ -852,6 +852,76 @@ videos_per_second = "higher"
 [suites.fast_h3_saturation]
 points = ["minimax-h3-saturation-c1", "minimax-h3-saturation-c10"]
 
+# Eight complete NVFP4 denoiser replicas with one sticky request per replica.
+# Both points use the same model, shape, seeds, load, and device set; only the
+# text-encoder topology differs. The suite runs its servers serially.
+[servers.fasth3-dp8-text-tp8]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "config/minimax-h3-dp8-text-tp8.json", "--max-batch", "8", "--max-running-requests", "8", "--max-num-batched-tokens", "8", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "5", "--video-graph-shapes", "5x1000", "--dtype", "bfloat16"]
+
+[servers.fasth3-dp8-text-tp8.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[servers.fasth3-dp8-text-tp4x2]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "config/minimax-h3-dp8-text-tp4x2.json", "--max-batch", "8", "--max-running-requests", "8", "--max-num-batched-tokens", "8", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "5", "--video-graph-shapes", "5x1000", "--dtype", "bfloat16"]
+
+[servers.fasth3-dp8-text-tp4x2.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[benchmarks.fasth3-dp8-text-tp8-c8]
+server = "fasth3-dp8-text-tp8"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+
+[benchmarks.fasth3-dp8-text-tp8-c8.video]
+seconds = 5.0
+prompt_tokens = 1000
+
+[benchmarks.fasth3-dp8-text-tp8-c8.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 8
+warmup_requests = 8
+seed = 1000
+
+[benchmarks.fasth3-dp8-text-tp8-c8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.fasth3-dp8-text-tp4x2-c8]
+server = "fasth3-dp8-text-tp4x2"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+
+[benchmarks.fasth3-dp8-text-tp4x2-c8.video]
+seconds = 5.0
+prompt_tokens = 1000
+
+[benchmarks.fasth3-dp8-text-tp4x2-c8.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 8
+warmup_requests = 8
+seed = 1000
+
+[benchmarks.fasth3-dp8-text-tp4x2-c8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[suites.fast_h3_dp8]
+points = ["fasth3-dp8-text-tp8-c8", "fasth3-dp8-text-tp4x2-c8"]
+
 [suites.decode-runtime]
 points = [
     "qwen-uniserve-sharegpt-r16",

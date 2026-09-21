@@ -790,11 +790,12 @@ def check_startup_memory(
         )
         total = device_total_bytes(device)
         remaining = max(0, product_bytes - tensor_store.resident_bytes(device))
-        if remaining > available or total - free > int(
+        process_bytes = torch.cuda.memory_reserved(canonical_device(device))
+        if remaining > available or process_bytes + remaining > int(
             total * worker_config.kv_memory_fraction
         ):
             raise unsupported_setup(
                 f"initialized runtime on {device} exceeds its static memory "
-                f"grant: {total - free} resident bytes and {remaining} "
-                f"reserved product bytes"
+                f"grant: {process_bytes} process-resident bytes, {free} "
+                f"device-free bytes, and {remaining} reserved product bytes"
             )
