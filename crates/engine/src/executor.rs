@@ -1320,18 +1320,13 @@ mod tests {
         info
     }
 
-    fn media_replica(id: &str, request_slots: u32) -> (WorkerId, WorkerInfo) {
-        let routes = [
-            (MediaCall::TextEncoding, "text_encoder"),
-            (MediaCall::LatentPreparation, "denoiser"),
-            (MediaCall::Denoising, "denoiser"),
-            (MediaCall::VideoDecoding, "video_decoder"),
-            (MediaCall::VideoEncoding, "video_encoder"),
-            (MediaCall::AudioDecoding, "audio_decoder"),
-            (MediaCall::AudioEncoding, "muxer"),
-            (MediaCall::Muxing, "muxer"),
-        ];
-        let mut info = media_info(&routes, 4);
+    fn media_pool(
+        id: &str,
+        routes: &[(MediaCall, &str)],
+        steps: u32,
+        request_slots: u32,
+    ) -> (WorkerId, WorkerInfo) {
+        let mut info = media_info(routes, steps);
         info.endpoint.worker_id = id.to_owned();
         info.request_slots = request_slots;
         info.components = routes
@@ -1348,6 +1343,24 @@ mod tests {
         (WorkerId(id.to_owned()), info)
     }
 
+    fn media_replica(id: &str, request_slots: u32) -> (WorkerId, WorkerInfo) {
+        media_pool(
+            id,
+            &[
+                (MediaCall::TextEncoding, "text_encoder"),
+                (MediaCall::LatentPreparation, "denoiser"),
+                (MediaCall::Denoising, "denoiser"),
+                (MediaCall::VideoDecoding, "video_decoder"),
+                (MediaCall::VideoEncoding, "video_encoder"),
+                (MediaCall::AudioDecoding, "audio_decoder"),
+                (MediaCall::AudioEncoding, "muxer"),
+                (MediaCall::Muxing, "muxer"),
+            ],
+            4,
+            request_slots,
+        )
+    }
+
     #[test]
     fn replicated_media_routes_add_independent_request_capacity() -> anyhow::Result<()> {
         let info = ExecutorInfo::from_workers(vec![
@@ -1356,6 +1369,36 @@ mod tests {
         ])?;
 
         assert_eq!(info.runtime_info()?.request_slots, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn shared_media_stages_bound_aggregate_replica_capacity() -> anyhow::Result<()> {
+        let flow = [
+            (MediaCall::LatentPreparation, "denoiser"),
+            (MediaCall::Denoising, "denoiser"),
+            (MediaCall::VideoDecoding, "video_decoder"),
+            (MediaCall::AudioDecoding, "audio_decoder"),
+        ];
+        let info = ExecutorInfo::from_workers(vec![
+            media_pool("text", &[(MediaCall::TextEncoding, "text_encoder")], 0, 8),
+            media_pool("flow-0", &flow, 4, 2),
+            media_pool("flow-1", &flow, 4, 2),
+            media_pool(
+                "host",
+                &[
+                    (MediaCall::VideoEncoding, "video_encoder"),
+                    (MediaCall::AudioEncoding, "muxer"),
+                    (MediaCall::Muxing, "muxer"),
+                ],
+                0,
+                16,
+            ),
+        ])?;
+
+        // The two flow banks contribute four routes. The wider shared text
+        // and host stages must not multiply that end-to-end capacity.
+        assert_eq!(info.runtime_info()?.request_slots, 4);
         Ok(())
     }
 
