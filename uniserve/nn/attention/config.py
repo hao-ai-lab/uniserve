@@ -20,23 +20,17 @@ class Ulysses:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ContextParallelConfig:
-    """Gather K/V, expose peer-owned K/V, or gather before peer publication."""
+    """Gather every owner's K/V along one topology axis.
 
-    gather_axis: str | None = None
-    peer_axis: str | None = None
+    Each rank holds the queries of its own rows and attends against the whole
+    context, so the owners' keys and values are gathered into its memory
+    before the attention call reads them.
+    """
+
+    gather_axis: str
 
     def __post_init__(self) -> None:
-        axes = tuple(
-            axis
-            for axis in (self.gather_axis, self.peer_axis)
-            if axis is not None
-        )
-        if not axes or len(set(axes)) != len(axes):
-            raise ValueError(
-                "context attention requires distinct nonempty axes"
-            )
-        for axis in axes:
-            _axis(axis)
+        _axis(self.gather_axis)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -58,7 +52,6 @@ class AttentionParallelConfig:
         if (
             self.heads is not None
             and self.context is not None
-            and self.heads.axis
-            in (self.context.gather_axis, self.context.peer_axis)
+            and self.heads.axis == self.context.gather_axis
         ):
             raise ValueError("head and context axes must be independent")

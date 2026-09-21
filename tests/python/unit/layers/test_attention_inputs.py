@@ -77,15 +77,17 @@ def test_empty_attention_lengths_and_batches_remain_well_defined():
     assert batch.write_indices.numel() == 0
 
 
-def test_attention_axes_are_distinct_and_context_specifies_a_mechanism():
+def test_attention_axes_are_distinct_and_context_names_its_axis():
     config = AttentionParallelConfig(
         heads=Ulysses("heads"),
-        context=ContextParallelConfig(gather_axis="columns", peer_axis="rows"),
+        context=ContextParallelConfig(gather_axis="columns"),
     )
     assert config.heads.axis == "heads"
     with pytest.raises(ValueError, match="independent"):
-        AttentionParallelConfig(heads=Ulysses("rows"), context=config.context)
-    with pytest.raises(ValueError, match="distinct nonempty"):
+        AttentionParallelConfig(
+            heads=Ulysses("columns"), context=config.context
+        )
+    with pytest.raises(TypeError):
         ContextParallelConfig()
-    with pytest.raises(ValueError, match="distinct nonempty"):
-        ContextParallelConfig(gather_axis="context", peer_axis="context")
+    with pytest.raises(ValueError, match="nonempty"):
+        ContextParallelConfig(gather_axis="")

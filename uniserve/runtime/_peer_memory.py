@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import array
-import math
 import os
 import socket
 import sys
@@ -44,33 +43,6 @@ class SymmetricMemory:
         if tuple(input.shape) != (1,) or tuple(output.shape) != (self.size,):
             raise ValueError(
                 "symmetric-memory fence buffers do not match group membership"
-            )
-        self.coordinator._all_gather_into_tensor(output, input)
-
-
-@dataclass(frozen=True)
-class PeerTensor:
-    """A logically contiguous tensor whose leading-axis storage lives on peers.
-
-    Each owner writes its local allocation. A group fence must complete before
-    kernels read the global view, and again before any owner reuses its local
-    storage. The numerical owner retains both the allocation and its mapping.
-    """
-
-    coordinator: Communicator
-    local: torch.Tensor
-    global_tensor: torch.Tensor
-
-    def fence(self, input: torch.Tensor, output: torch.Tensor) -> None:
-        """Order publication or reader completion.
-
-        Order owner publication or reader completion on the current stream.
-        """
-        if tuple(input.shape) != (1,) or tuple(output.shape) != (
-            self.coordinator.size,
-        ):
-            raise ValueError(
-                "peer-memory fence buffers do not match group membership"
             )
         self.coordinator._all_gather_into_tensor(output, input)
 
@@ -277,41 +249,4 @@ def allocate_symmetric_memory(
             for rank in group.ranks
         )
     workspace = SymmetricMemory(group, local, peers, handle)
-    return workspace
-
-
-def allocate_peer_workspace(
-    group: Communicator,
-    shape: tuple[int, ...],
-    *,
-    dtype: torch.dtype,
-    row_multiple: int,
-) -> PeerTensor:
-    """Map ordered CUDA peer allocations without replicating tensor data."""
-    from uniserve_kernel.peer_memory import allocation_granularity
-
-    if not shape or any(size < 1 for size in shape) or row_multiple < 1:
-        raise ValueError(
-            "peer tensor extents and row alignment must be positive"
-        )
-
-    # Each rank's leading-axis shard must hold a whole number of rows while its
-    # byte size stays a multiple of the VMM allocation granularity, so rows per
-    # shard is the least common multiple of the caller's row multiple and the
-    # rows needed to cover one granularity unit.
-    element_bytes = torch.empty((), dtype=dtype).element_size()
-    row_bytes = math.prod(shape[1:]) * element_bytes
-    granularity = allocation_granularity(group.device)
-    aligned_rows = math.lcm(
-        row_multiple, granularity // math.gcd(row_bytes, granularity)
-    )
-    capacity = ((shape[0] + aligned_rows - 1) // aligned_rows) * aligned_rows
-
-    global_tensor = allocate_peer_tensor(
-        group,
-        (capacity, *shape[1:]),
-        dtype=dtype,
-    )
-    local = global_tensor.narrow(0, group.rank * capacity, capacity)
-    workspace = PeerTensor(group, local, global_tensor)
     return workspace

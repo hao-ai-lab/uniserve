@@ -79,7 +79,6 @@ EIGHT_RANK_PARALLEL_CONFIGS = {
     "gather8": {
         "sequence_parallel": {"kind": "allgather", "allgather_degree": 8},
     },
-    "ring8": {"sequence_parallel": {"kind": "ring", "ring_degree": 8}},
     "tensor8": {"tensor_parallel_size": 8},
     "tensor2_ulysses4": {
         "tensor_parallel_size": 2,
@@ -97,32 +96,18 @@ EIGHT_RANK_PARALLEL_CONFIGS = {
         "pipeline_parallel_size": 4,
         "sequence_parallel": {"kind": "ulysses", "ulysses_degree": 2},
     },
-    "hybrid_ulysses4_ring2": {
+    "hybrid_ulysses4_gather2": {
         "sequence_parallel": {
             "kind": "hybrid",
             "ulysses_degree": 4,
-            "ring_degree": 2,
+            "allgather_degree": 2,
         },
     },
-    "hybrid_ulysses2_ring4": {
+    "hybrid_ulysses2_gather4": {
         "sequence_parallel": {
             "kind": "hybrid",
             "ulysses_degree": 2,
-            "ring_degree": 4,
-        },
-    },
-    "attention2d_2x4": {
-        "sequence_parallel": {
-            "kind": "attention2d",
-            "attn2d_row_size": 2,
-            "attn2d_col_size": 4,
-        },
-    },
-    "attention2d_4x2": {
-        "sequence_parallel": {
-            "kind": "attention2d",
-            "attn2d_row_size": 4,
-            "attn2d_col_size": 2,
+            "allgather_degree": 4,
         },
     },
 }
@@ -167,10 +152,7 @@ def _eight_rank_worker_config(parallel_kind: str) -> dict:
             "ulysses4",
             "gather2",
             "gather4",
-            "ring2",
-            "ring4",
             "hybrid",
-            "attention2d",
             "tensor2_ulysses2",
             "tensor2",
             "tensor4",
@@ -262,23 +244,6 @@ def test_component_bindings_release_cancelled_requests(
                 "allgather_degree": degree,
             }
         }
-    elif parallel_kind in ("ring2", "ring4"):
-        degree = 4 if parallel_kind == "ring4" else 2
-        worker_config["denoiser"]["ranks"] = [3, 1, 2, 0][:degree]
-        worker_config["denoiser"]["parallel_config"] = {
-            "sequence_parallel": {"kind": "ring", "ring_degree": degree}
-        }
-    elif parallel_kind == "attention2d":
-        worker_config["denoiser"] = {
-            "ranks": [3, 1, 2, 0],
-            "parallel_config": {
-                "sequence_parallel": {
-                    "kind": "attention2d",
-                    "attn2d_row_size": 2,
-                    "attn2d_col_size": 2,
-                }
-            },
-        }
     elif parallel_kind == "hybrid":
         worker_config["denoiser"] = {
             "ranks": [3, 1, 2, 0],
@@ -286,7 +251,7 @@ def test_component_bindings_release_cancelled_requests(
                 "sequence_parallel": {
                     "kind": "hybrid",
                     "ulysses_degree": 2,
-                    "ring_degree": 2,
+                    "allgather_degree": 2,
                 }
             },
         }

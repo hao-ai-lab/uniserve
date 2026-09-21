@@ -88,14 +88,7 @@ def parallelize_(
     if attention.heads is not None:
         selected.add(attention.heads.axis)
     if attention.context is not None:
-        selected.update(
-            axis
-            for axis in (
-                attention.context.gather_axis,
-                attention.context.peer_axis,
-            )
-            if axis is not None
-        )
+        selected.add(attention.context.gather_axis)
     if not selected.issubset(mesh.axes) or selected.intersection({"tp", "pp"}):
         raise ValueError(
             "attention requires distinct token axes declared by the mesh"
