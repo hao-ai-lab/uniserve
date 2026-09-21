@@ -372,6 +372,8 @@ struct MediaFlowState {
     request: DiffusionRequest,
     event_tx: EventTx,
     allocations: MediaAllocations,
+    /// Logical products mapped to their reserved component output and unit slice.
+    buffer_bindings: HashMap<BufferId, (String, u32, u32)>,
     conditioning: Option<TensorRef>,
     latents: Vec<TensorRef>,
     /// Decoded media units by the cursor of the round that produced them,
@@ -421,11 +423,11 @@ struct MediaAllocations {
     request_slots: HashMap<crate::WorkerId, Allocation>,
 }
 
-/// A request reserves each declared result once. Video ranges occupy disjoint
-/// slices of its temporal result, independent of decoder Worker width.
+/// A request reserves each declared result in every Worker address space on
+/// its route. Video ranges occupy disjoint slices of the temporal result,
+/// independent of decoder Worker width.
 struct MediaTensorAllocation {
-    worker: crate::WorkerId,
-    allocation: Allocation,
+    allocations: HashMap<crate::WorkerId, Allocation>,
     dtype: DType,
     shape_bound: ShapeBound,
 }
@@ -439,8 +441,13 @@ struct MediaMemory {
 }
 
 impl MediaTensorAllocation {
-    fn bind(&self, product: &TensorRef, start_unit: u32) -> BufferAllocation {
-        let Allocation::Buffer { offset, .. } = &self.allocation else {
+    fn bind(
+        &self,
+        product: &TensorRef,
+        start_unit: u32,
+        worker: &crate::WorkerId,
+    ) -> BufferAllocation {
+        let Allocation::Buffer { offset, .. } = &self.allocations[worker] else {
             unreachable!("media tensor has buffer storage");
         };
         let unit_bytes = match product.shape_bound.dims.first() {
@@ -469,7 +476,7 @@ impl MediaAllocations {
     fn into_allocations(self) -> Vec<(crate::WorkerId, Allocation)> {
         self.tensors
             .into_values()
-            .map(|tensor| (tensor.worker, tensor.allocation))
+            .flat_map(|tensor| tensor.allocations)
             .chain(self.request_slots)
             .collect()
     }
@@ -477,7 +484,9 @@ impl MediaAllocations {
     /// Releases the owned request allocation.
     fn free(self, scheduler: &mut Scheduler) {
         for tensor in self.tensors.into_values() {
-            scheduler.free_media_buffer(&tensor.worker, tensor.allocation);
+            for (worker, allocation) in tensor.allocations {
+                scheduler.free_media_buffer(&worker, allocation);
+            }
         }
         for (worker, allocation) in self.request_slots {
             scheduler.free_media_request(&worker, allocation);

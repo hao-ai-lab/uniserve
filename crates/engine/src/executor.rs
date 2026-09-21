@@ -40,7 +40,8 @@ pub struct RequestPlacement {
     pub forward: ForwardBatch,
     pub latent: Option<LatentParams>,
     pub decode: Option<DecodeRange>,
-    /// Persistent output spans; request retirement retains ownership of readers.
+    /// Worker-local persistent spans for the call's buffer inputs and outputs.
+    /// Request retirement retains every physical reader and writer allocation.
     pub buffers: Vec<BufferAllocation>,
 }
 
@@ -162,9 +163,10 @@ impl ExecutionBatch {
             for buffer in &placement.buffers {
                 buffer.validate()?;
                 anyhow::ensure!(
-                    call.buffer_outputs()
-                        .any(|output| output.buffer_id() == buffer.buffer),
-                    "logical call carries a buffer execution for another output"
+                    call.buffer_inputs()
+                        .chain(call.buffer_outputs())
+                        .any(|tensor| tensor.buffer_id() == buffer.buffer),
+                    "logical call carries a buffer execution for an unrelated tensor"
                 );
             }
         }

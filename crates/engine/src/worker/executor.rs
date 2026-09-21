@@ -116,7 +116,8 @@ pub struct WorkerExecutor {
     admissions: HashMap<RequestKey, NewRequest>,
     admitted_workers: HashSet<(usize, RequestKey)>,
     buffer_routes: HashMap<BufferId, BufferRoute>,
-    buffer_allocations: HashMap<BufferId, BufferAllocation>,
+    /// Persistent buffer addresses are local to a physical Worker address space.
+    buffer_allocations: HashMap<(usize, BufferId), BufferAllocation>,
     buffer_workers: HashMap<BufferId, HashSet<usize>>,
     transfer_products: HashMap<BufferId, TensorPublication>,
     kv_transfers: HashMap<BufferId, KvTransfer>,
@@ -588,6 +589,8 @@ impl WorkerExecutor {
         }
         if lost {
             self.admitted_workers.retain(|(worker, _)| *worker != index);
+            self.buffer_allocations
+                .retain(|(worker, _), _| *worker != index);
             for workers in self.buffer_workers.values_mut() {
                 workers.remove(&index);
             }
@@ -797,9 +800,17 @@ impl WorkerExecutor {
             {
                 continue;
             }
+            // A routed destination may reserve a different address from its
+            // producer. Shared-address layouts omit that override and keep the
+            // producer's allocation, which is the established single-pool path.
             let params = self
                 .buffer_allocations
-                .get(dependency)
+                .get(&(worker_index, *dependency))
+                .or_else(|| {
+                    let producer = self.buffer_routes.get(dependency)?;
+                    self.buffer_allocations
+                        .get(&(producer.worker_index, *dependency))
+                })
                 .copied()
                 .ok_or_else(|| {
                     anyhow::anyhow!(
@@ -1109,7 +1120,8 @@ impl WorkerExecutor {
                     }
                     BatchCommand::Free { buffer } => {
                         self.buffer_workers.remove(&buffer);
-                        self.buffer_allocations.remove(&buffer);
+                        self.buffer_allocations
+                            .retain(|(_, identity), _| *identity != buffer);
                         self.buffer_routes.retain(|identity, _| *identity != buffer);
                         self.kv_transfers.remove(&buffer);
                         self.transfer_products
@@ -1140,7 +1152,7 @@ impl WorkerExecutor {
         self.kv_transfers
             .retain(|buffer, _| buffer.owner != request || retained.contains(buffer));
         self.buffer_allocations
-            .retain(|buffer, _| buffer.owner != request || retained.contains(buffer));
+            .retain(|(_, buffer), _| buffer.owner != request || retained.contains(buffer));
         self.buffer_workers
             .retain(|buffer, _| buffer.owner != request || retained.contains(buffer));
     }
@@ -1276,24 +1288,26 @@ impl Executor for WorkerExecutor {
                         .or_default()
                         .insert(call_worker);
                 }
-                for output in call.buffer_outputs() {
-                    let params = placement
-                        .buffers
-                        .iter()
-                        .find(|params| params.buffer == output.buffer_id())
-                        .copied()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "persistent product {:?} has no scheduler params",
-                                output
-                            )
-                        })?;
-                    if let Some(existing) = self.buffer_allocations.insert(params.buffer, params) {
+                for params in &placement.buffers {
+                    if let Some(existing) = self
+                        .buffer_allocations
+                        .insert((call_worker, params.buffer), *params)
+                    {
                         anyhow::ensure!(
-                            existing == params,
-                            "buffer identity was assigned conflicting allocations"
+                            existing == *params,
+                            "buffer identity was assigned conflicting worker-local allocations"
                         );
                     }
+                }
+                for output in call.buffer_outputs() {
+                    anyhow::ensure!(
+                        placement
+                            .buffers
+                            .iter()
+                            .any(|params| params.buffer == output.buffer_id()),
+                        "persistent product {:?} has no scheduler params",
+                        output
+                    );
                 }
                 call_routes.insert(
                     (call.request_key, call.call_id),
