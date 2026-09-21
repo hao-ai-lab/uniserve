@@ -11,6 +11,7 @@ from uniserve.distributed import Communicator
 from uniserve.model import (
     CausalLM,
     ComponentEntry,
+    DEFAULT_COMPONENT,
     EntryPoint,
     ImageDecoder,
     PatchEncoder,
@@ -200,7 +201,7 @@ def entry_points(config: Config):
     """Declare the numerical methods serving ranks may invoke on this model."""
     return MappingProxyType(
         {
-            "model": ComponentEntry(
+            DEFAULT_COMPONENT: ComponentEntry(
                 "",
                 (
                     EntryPoint("forward"),

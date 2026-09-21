@@ -168,10 +168,7 @@ class LatentPool:
 
     @contextmanager
     def startup_values(self, rows: int, units: int):
-        """Borrow the existing step buffer for numerical startup before.
-
-        admission.
-        """
+        """Borrow the step buffer for numerical startup before admission."""
         if any(self._slot_pages) or self._imports or self._sources:
             raise RuntimeError("startup scratch requires an idle latent pool")
 

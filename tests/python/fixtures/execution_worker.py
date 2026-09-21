@@ -76,7 +76,7 @@ def execution_worker(
         worker_config=worker_config,
         attention="torch",
         tokenizer=None,
-        allowed_work_variants=None,
+        allowed_calls=None,
         transfer_backends=transfer_backends,
         publication_backends=transfer_backends,
         # The fixture's deployment is one host: the worker's own slot and the

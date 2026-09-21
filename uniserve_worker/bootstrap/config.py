@@ -357,7 +357,7 @@ class WorkerProcessArgs:
     """Aggregates the validated launch configuration for one worker rank."""
 
     worker_id: str
-    supported_ops: frozenset[CallKind]
+    supported_calls: frozenset[CallKind]
     ipc: WorkerIpcConfig
     local_rank: int
     distributed_backend: str | None
@@ -375,7 +375,7 @@ class WorkerProcessArgs:
 
         Values resolve into immutable worker launch configuration.
         """
-        supported_ops = _parse_supported_ops(namespace.supported_ops)
+        supported_calls = _parse_supported_calls(namespace.supported_calls)
         device = _normalize_device(namespace.device)
         generation_device = _parse_mesh(
             str(namespace.mesh or ""),
@@ -403,7 +403,7 @@ class WorkerProcessArgs:
 
         return cls(
             worker_id=str(namespace.worker_id),
-            supported_ops=supported_ops,
+            supported_calls=supported_calls,
             ipc=WorkerIpcConfig(
                 registration_address=str(namespace.registration_address),
                 channel_transport=str(namespace.channel_transport),
@@ -499,8 +499,8 @@ def _load_config(namespace: argparse.Namespace) -> IOConfig:
     )
 
 
-def _parse_supported_ops(value: object) -> frozenset[CallKind]:
-    """Resolve launch capability selectors to concrete call_kinds.
+def _parse_supported_calls(value: object) -> frozenset[CallKind]:
+    """Resolve launch capability selectors to concrete call kinds.
 
     The capability group names are a worker-side vocabulary that the launching
     side does not model, so it narrows the set only when it has a reason to.
@@ -522,7 +522,7 @@ def _parse_supported_ops(value: object) -> frozenset[CallKind]:
             f"unknown call in supported calls {value!r}"
         ) from error
     if len(set(calls)) != len(calls):
-        raise ValueError("--supported-ops contains duplicate calls")
+        raise ValueError("supported calls contain duplicate entries")
     return frozenset(calls)
 
 

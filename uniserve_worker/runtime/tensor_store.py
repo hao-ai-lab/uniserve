@@ -91,7 +91,8 @@ def _invariant(message: str) -> WorkerError:
     )
 
 
-# Logical product identity: (engine, request, epoch, producer op, output index).
+# Logical product identity:
+# (engine, request, epoch, producer call, output index).
 _ReferenceKey = tuple[int, int, int, CallId, int]
 _CallKey = tuple[RequestKey, CallId]
 _SlotStorageKey = tuple[str, tuple[int, ...], torch.dtype]
@@ -2279,10 +2280,7 @@ class TensorStore:
         released_events: dict[int, tuple[torch.cuda.Event, int]] = {}
 
         def release_event(event: torch.cuda.Event) -> None:
-            """Accumulate one pooled-event reference for release after.
-
-            reclamation.
-            """
+            """Retain one pooled event for release after reclamation."""
             identity = id(event)
             current = released_events.get(identity)
             if current is None:

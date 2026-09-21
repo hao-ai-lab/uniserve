@@ -165,6 +165,6 @@ def test_launch_capabilities_select_concrete_computations(
     config = worker_args(
         tmp_path,
         max_batch_tokens=8192,
-        supported_ops=selector,
+        supported_calls=selector,
     )
-    assert config.supported_ops == expected
+    assert config.supported_calls == expected

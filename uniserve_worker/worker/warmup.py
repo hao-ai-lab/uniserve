@@ -368,7 +368,7 @@ def _execute_warmup(
             )
             parts.append(
                 f"request={completion.request_key.request_id} "
-                f"op={completion.call_id} code={code}"
+                f"call={completion.call_id} code={code}"
             )
         details = ", ".join(parts)
         raise RuntimeError(f"startup warmup execution failed: {details}")
@@ -793,7 +793,7 @@ def warmup_requests(worker: Worker) -> None:
     requests = _WarmupRequests(worker)
 
     if torch.device(worker.worker_config.device).type == "cuda":
-        if ForwardMode.PREFILL in worker.info.supported_ops:
+        if ForwardMode.PREFILL in worker.info.supported_calls:
             _warmup_tokens(requests)
             logger.info("completed token runtime warmup")
 
@@ -832,7 +832,7 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
         CallCoordinates,
     )
 
-    variants = requests.worker.info.supported_ops
+    variants = requests.worker.info.supported_calls
     if ForwardMode.PREFILL not in variants:
         return
 
@@ -997,7 +997,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         not {
             MediaCall.LATENT_PREPARATION,
             MediaCall.DENOISING,
-        }.issubset(requests.worker.info.supported_ops)
+        }.issubset(requests.worker.info.supported_calls)
         or generation is None
     ):
         return

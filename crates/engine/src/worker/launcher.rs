@@ -163,10 +163,10 @@ impl LauncherRegistry {
     ///
     /// The head cannot name itself: its placement identity need not resolve on
     /// another host, and a bound wildcard address names no interface. But a
-    /// launcher connected here from its own host, so the local end of that
-    /// connection is by construction an address of this host that that host
-    /// routes to, and it is what the rendezvous and registration addresses
-    /// this head hands to remote ranks have to be built from.
+    /// launcher has already connected to this listener, so the connection's
+    /// local address is a head address reachable from a launcher host. The
+    /// rendezvous and registration addresses handed to remote ranks must use
+    /// that address.
     pub(crate) fn reachable_host(&self) -> anyhow::Result<std::net::IpAddr> {
         let launcher = self
             .hosts

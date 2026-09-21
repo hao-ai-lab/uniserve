@@ -7,38 +7,18 @@ impl Scheduler {
     /// Validates and queues one token-generation request or rejects it synchronously.
     pub(super) fn enqueue(&mut self, req: GenerationRequest, event_tx: EventTx) {
         if self.cache.is_none() {
-            self.trace_record(json!({
-                "event": "request_rejected",
-                "at_s": now(),
-                "request_id": req.request_id.0,
-                "reason": "missing_kv_resources",
-            }));
             let _ = event_tx.send(EngineCoreOutput::Rejected {
                 message: "generation request requires worker KV resources".into(),
             });
             return;
         }
         if let Err(error) = req.validate() {
-            self.trace_record(json!({
-                "event": "request_rejected",
-                "at_s": now(),
-                "request_id": req.request_id.0,
-                "reason": "invalid_request",
-                "detail": format!("{error:?}"),
-            }));
             let _ = event_tx.send(EngineCoreOutput::Rejected {
                 message: format!("invalid generation request: {error:?}"),
             });
             return;
         }
         if let Some(feature) = self.missing_required_feature(&req) {
-            self.trace_record(json!({
-                "event": "request_rejected",
-                "at_s": now(),
-                "request_id": req.request_id.0,
-                "reason": "missing_worker_feature",
-                "detail": format!("{feature}"),
-            }));
             let _ = event_tx.send(EngineCoreOutput::Rejected {
                 message: format!(
                     "generation request requires worker feature `{feature}`, but the worker does not support it"
@@ -47,13 +27,6 @@ impl Scheduler {
             return;
         }
         if let Err(error) = req.validate_resources(&self.generation_limits) {
-            self.trace_record(json!({
-                "event": "request_rejected",
-                "at_s": now(),
-                "request_id": req.request_id.0,
-                "reason": "model_capacity_exceeded",
-                "detail": error.to_string(),
-            }));
             let _ = event_tx.send(EngineCoreOutput::Rejected {
                 message: format!("invalid generation resource requirements: {error}"),
             });
@@ -65,21 +38,6 @@ impl Scheduler {
         // in-flight request. Reject the new submit with a typed event.
         let waiting = self.pending_request_count() + self.output.retained_len();
         if waiting >= self.config.max_num_waiting {
-            self.trace_record(json!({
-                "event": "request_rejected",
-                "at_s": now(),
-                "request_id": req.request_id.0,
-                "reason": "queue_full",
-                "waiting": waiting,
-                "max_num_waiting": self.config.max_num_waiting,
-                "behavior": {
-                    "und_decode": req.decodes_text(),
-                    "und_tokens": format!("{:?}", req.emits_text()),
-                    "gen_output": req.generates_images(),
-                    "generated_image_feedback": req.feeds_back_images(),
-                },
-                "prompt_tokens": req.prompt_token_ids.len(),
-            }));
             let _ = event_tx.send(EngineCoreOutput::Rejected {
                 message: "scheduler waiting queue is full".into(),
             });
@@ -143,7 +101,6 @@ impl Scheduler {
             req,
         };
         self.next_request_epoch = self.next_request_epoch.saturating_add(1);
-        self.trace_request_queued(&st, "pending");
         let request_id = st.req.request_id;
         let position = match self.config.policy {
             SchedulingPolicy::Fcfs => self.waiting_order.len(),
@@ -351,18 +308,8 @@ impl Scheduler {
             )
             .expect("validated media admission");
             let root = CallId::new(0, 0);
-            // The interval from receipt to admission is the queue wait; what
-            // follows until the first device call is the engine's and the
-            // rank's preparation, which the batch trace attributes.
-            let admitted_at = now();
-            self.trace_record(json!({
-                "event": "request_admitted",
-                "at_s": admitted_at,
-                "request_id": id.0,
-                "queue": "media",
-                "queued_at": submission.queued_at,
-                "queue_wait_us": ((admitted_at - submission.queued_at) * 1e6) as u64,
-            }));
+            // The interval from receipt to admission is the queue wait. The
+            // engine and rank own the preparation that follows.
             self.running_media.insert(
                 id,
                 MediaFlowState {
@@ -379,8 +326,6 @@ impl Scheduler {
                     audio: None,
                     admission,
                     admission_state: WorkerRegistration::Unsubmitted,
-                    queued_at: submission.queued_at,
-                    admitted_at,
                     text_encoding_scheduled: false,
                     latent_preparation_scheduled: false,
                     num_scheduled_steps: 0,
@@ -428,12 +373,6 @@ impl Scheduler {
     /// Returns whether the worker tracks image-latent capacity.
     pub(super) fn worker_tracks_image_latent(&self) -> bool {
         self.info.latent_page_units > 0 && self.info.latent_pages > 1
-    }
-
-    /// Returns the worker used image-latent capacity.
-    pub(super) fn worker_image_latent_used(&self) -> u64 {
-        (self.latent_pool.used_pages() as u64)
-            .saturating_mul(u64::from(self.info.latent_page_units))
     }
 
     /// Computes image-latent capacity required by a request.
@@ -582,16 +521,6 @@ impl Scheduler {
                 if need > self.usable_blocks() {
                     let id = self.waiting_order.pop_front().unwrap();
                     let st = self.waiting.remove(&id).unwrap();
-                    self.trace_record(json!({
-                        "event": "request_rejected",
-                        "at_s": now(),
-                        "request_id": st.req.request_id.0,
-                        "reason": "too_large",
-                        "needed_blocks": need,
-                        "usable_blocks": self.usable_blocks(),
-                        "generation": Self::generation_trace(&st.req),
-                        "prompt_tokens": st.req.prompt_token_ids.len(),
-                    }));
                     let _ = st.output.event_tx.send(EngineCoreOutput::Rejected {
                         message: "request exceeds total KV capacity".into(),
                     });
@@ -635,16 +564,6 @@ impl Scheduler {
                 if n > text_usable_blocks * bs {
                     let id = self.waiting_order.pop_front().unwrap();
                     let st = self.waiting.remove(&id).unwrap();
-                    self.trace_record(json!({
-                        "event": "request_rejected",
-                        "at_s": now(),
-                        "request_id": st.req.request_id.0,
-                        "reason": "too_large",
-                        "needed_blocks": first_chunk_blocks,
-                        "usable_blocks": text_usable_blocks,
-                        "generation": Self::generation_trace(&st.req),
-                        "prompt_tokens": st.req.prompt_token_ids.len(),
-                    }));
                     let _ = st.output.event_tx.send(EngineCoreOutput::Rejected {
                         message: "request exceeds total KV capacity".into(),
                     });
@@ -754,14 +673,6 @@ impl Scheduler {
             .queue_wait_us_max
             .fetch_max(queue_wait_us, Ordering::Relaxed);
 
-        // Snapshot trace fields before moving the request into runtime storage.
-        let generation = Self::generation_trace(&st.req);
-        let phase = st.phase;
-        let prompt_tokens = st.req.prompt_token_ids.len();
-        let max_tokens = st.req.max_und_tokens;
-        let priority = st.req.priority;
-        let reserve_worstcase = st.reserve_worstcase;
-        let worstcase_blocks = st.max_reserved_kv_blocks;
         let encoder_entries = st.req.num_encoder_cache_entries();
         if st.output.enqueue(EngineCoreOutput::Scheduled {
             queued_at: q,
@@ -777,26 +688,6 @@ impl Scheduler {
         self.reserved_encoder_entries = self
             .reserved_encoder_entries
             .saturating_add(encoder_entries);
-
-        self.trace_record(json!({
-            "event": "request_admitted",
-            "at_s": scheduled_at,
-            "request_id": id.0,
-            "queued_at_s": q,
-            "queue_wait_s": scheduled_at - q,
-            "generation": generation,
-            "phase": phase,
-            "prompt_tokens": prompt_tokens,
-            "max_tokens": max_tokens,
-            "priority": priority,
-            "reserve_worstcase": reserve_worstcase,
-            "worstcase_blocks": worstcase_blocks,
-            "running": self.running.len(),
-            "pending": self.waiting_order.len(),
-            "free_blocks": self.free_blocks(),
-            "reserved_blocks": self.reserved_blocks,
-            "reserved_encoder_entries": self.reserved_encoder_entries,
-        }));
 
         // Prefix-cache acquisition pins every reused block to this request's
         // newly installed block tables.

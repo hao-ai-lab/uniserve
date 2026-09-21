@@ -136,7 +136,6 @@ impl RequestPool {
 /// Fixed-size page allocator for request-owned latent storage.
 pub(crate) struct LatentPool {
     page_units: u32,
-    capacity: usize,
     free: Vec<u32>,
 }
 
@@ -145,7 +144,6 @@ impl LatentPool {
     pub(crate) fn new(num_pages: u32, page_units: u32) -> Self {
         Self {
             page_units,
-            capacity: num_pages.saturating_sub(1) as usize,
             free: (1..num_pages).rev().collect(),
         }
     }
@@ -180,11 +178,6 @@ impl LatentPool {
     /// Returns exclusively owned pages after the allocation retires.
     fn release(&mut self, pages: Vec<u32>) {
         self.free.extend(pages.into_iter().rev());
-    }
-
-    /// Returns the number of allocated pages.
-    pub(crate) fn used_pages(&self) -> usize {
-        self.capacity - self.free.len()
     }
 }
 
@@ -493,7 +486,6 @@ mod tests {
         };
         assert_eq!(pages, &held_pages);
         assert_eq!(*units, 4);
-        assert_eq!(pool.used_pages(), 2);
         pool.free(second);
         pool.grow(&mut first, 12).unwrap();
         let Allocation::Latent { pages, units, .. } = &first else {
@@ -503,7 +495,6 @@ mod tests {
         assert_eq!(*units, 12);
         assert_eq!(pages.len(), 3);
         pool.free(first);
-        assert_eq!(pool.used_pages(), 0);
         assert!(pool.allocate(owner(2), 12).is_ok());
     }
 }

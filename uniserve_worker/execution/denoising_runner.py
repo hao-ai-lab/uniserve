@@ -242,7 +242,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
             ).synchronize()
 
     def bind_bank(self, bank: Mapping[str, torch.Tensor]) -> None:
-        """Name the request slot storage captured graphs index into.
+        """Name the request-slot storage indexed by captured graphs.
 
         Each value is one field's bank with a leading axis of `capacity` slot
         rows; a request's tensors are prefixes of its row. A graph gathers the
@@ -261,7 +261,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
     def _locate(
         self, tensor: torch.Tensor
     ) -> tuple[str, int | None, torch.Tensor | None] | None:
-        """Find the bank field and slot row a tensor is a span of.
+        """Find the bank field and slot row containing a tensor span.
 
         A slot tensor is one contiguous span of its row: a size's leading
         prefix, or a sequence-parallel rank's shard inside it. Returns the

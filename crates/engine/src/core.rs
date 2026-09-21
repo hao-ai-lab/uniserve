@@ -4,6 +4,8 @@
 //! a transport-independent [`EngineHandle`] to request producers.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(any(feature = "testing", test))]
+use uniserve_worker_ipc::DEFAULT_COMPONENT;
 use uniserve_worker_ipc::ForwardMode;
 
 use serde::{Deserialize, Serialize};
@@ -200,7 +202,7 @@ pub struct EngineConfig {
     pub runtime_family: RuntimeFamily,
     /// Model generation requirements, intersected with loaded worker capacities.
     pub generation_limits: GenerationLimits,
-    /// Maximum number of ops assembled into a single forward batch.
+    /// Maximum number of calls assembled into a single forward batch.
     pub max_batch: usize,
     /// Maximum number of tokens scheduled in one engine step.
     pub max_num_batched_tokens: usize,
@@ -246,7 +248,7 @@ impl EngineConfig {
                 "cpu",
                 1,
                 2,
-                WorkerConfig::single_component("model", 1),
+                WorkerConfig::single_component(DEFAULT_COMPONENT, 1),
             )
             .ranks,
             block_size: 64,
@@ -270,7 +272,7 @@ impl EngineConfig {
                 "cpu",
                 1,
                 2,
-                WorkerConfig::single_component("model", 1),
+                WorkerConfig::single_component(DEFAULT_COMPONENT, 1),
             )],
             transfer: TransferConfig::default(),
             worker_process,
@@ -451,7 +453,7 @@ impl EngineCore {
 
     /// Returns whether the worker can sample autoregressive tokens.
     pub fn supports_token_sampling(&self) -> bool {
-        self.info.supported_ops.iter().any(|mode| {
+        self.info.supported_calls.iter().any(|mode| {
             matches!(
                 mode,
                 uniserve_worker_ipc::CallKind::Forward(ForwardMode::Decode)
@@ -626,7 +628,7 @@ mod tests {
             "cuda",
             8,
             2,
-            WorkerConfig::single_component("model", 8),
+            WorkerConfig::single_component(DEFAULT_COMPONENT, 8),
         );
 
         let nodes: Vec<_> = worker.ranks.iter().map(|rank| rank.node.as_str()).collect();
@@ -657,13 +659,13 @@ mod tests {
             "cuda",
             1,
             2,
-            WorkerConfig::single_component("model", 1),
+            WorkerConfig::single_component(DEFAULT_COMPONENT, 1),
         );
         let mut other = worker.clone();
         assert!(WorkerConfig::validate_all(&[worker.clone(), other.clone()]).is_err());
         other.id = WorkerId("other".into());
         assert!(WorkerConfig::validate_all(&[worker.clone(), other.clone()]).is_err());
-        let entry = other.components.remove("model").unwrap();
+        let entry = other.components.remove(DEFAULT_COMPONENT).unwrap();
         other.components.insert("divided".into(), entry);
         assert!(WorkerConfig::validate_all(&[worker, other]).is_ok());
     }

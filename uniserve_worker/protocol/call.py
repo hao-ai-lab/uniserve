@@ -10,6 +10,7 @@ from functools import lru_cache
 from typing import TypeAlias, cast
 
 from uniserve import sampling
+from uniserve.model import DEFAULT_COMPONENT
 
 from ..foundation.errors import invalid_descriptor
 from . import identity, tensor
@@ -99,7 +100,7 @@ def computation(value: object, where: str) -> CallKind:
 
 
 class CallStatus(StrEnum):
-    """Classifies an call result.
+    """Classifies a call result.
 
     The result is successful, predicated away, or failed.
     """
@@ -550,7 +551,7 @@ class Call:
     kind: CallKind
     bounds: Bounds
     # Name of the worker model component that executes this computation.
-    component: str = "model"
+    component: str = DEFAULT_COMPONENT
 
     # Tensor dataflow: generic inputs/outputs plus role-specific endpoints.
     inputs: tuple[tensor.TensorRef, ...] = ()
@@ -1129,7 +1130,9 @@ class SamplingState:
 # allocating error-location strings. A non-matching value returns ``None`` so
 # the caller applies the canonical validated constructor and its precise error.
 
-_DRAW_LAYOUT_BY_VALUE: Mapping[str, DrawLayout] = DrawLayout._value2member_map_  # type: ignore[assignment]
+_DRAW_LAYOUT_BY_VALUE: Mapping[str, DrawLayout] = (
+    DrawLayout._value2member_map_  # type: ignore[assignment]
+)
 
 
 # Each returns the decoded record for a well-formed IPC value and ``None``

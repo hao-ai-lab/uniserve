@@ -422,10 +422,7 @@ def _validate_completion_products(
     call: Call,
     products: tuple[TensorPublication, ...],
 ) -> None:
-    """Validate completion payloads against every product declared by the.
-
-    call.
-    """
+    """Validate completions against every product declared by the call."""
     declared = {output: output for output in call.tensor_outputs()}
     for product in products:
         reference = declared.get(product.product)

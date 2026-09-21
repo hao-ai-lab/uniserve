@@ -47,7 +47,7 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
     .into_iter()
     .collect();
     let mut worker = WorkerGroup::spawn(args)?;
-    let supported = worker.info().supported_ops.clone();
+    let supported = worker.info().supported_calls.clone();
     assert!(supported.contains(&CallKind::Forward(ForwardMode::Prefill)));
     assert!(supported.contains(&CallKind::Media(MediaCall::VisionEncoding)));
     assert_eq!(
@@ -1110,7 +1110,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     let info = executor.info();
     assert_eq!(info.endpoint.rank, 0);
     assert_eq!(info.world_size, WORLD_SIZE as u32);
-    assert_eq!(info.max_batch_ops, 256);
+    assert_eq!(info.max_batch_calls, 256);
     assert_eq!(info.max_batch_tokens, 256);
     assert_eq!(info.queue_depth as usize, QUEUE_DEPTH);
 
@@ -2382,7 +2382,7 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
             ]
         }
     },
-    "supported_ops": null,
+    "supported_calls": null,
     "transfer_backends": "local",
     "publish_backends": "local",
     "distributed_init_method": null,

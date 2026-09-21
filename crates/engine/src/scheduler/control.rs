@@ -1,17 +1,6 @@
-//! Cancellation, terminal cleanup, and lifecycle trace handling.
+//! Cancellation, terminal cleanup, and lifecycle handling.
 
 use super::*;
-
-/// Terminal request facts recorded in a scheduler trace event.
-pub(super) struct FinishedTrace<'a> {
-    pub id: RequestId,
-    pub reason: &'a FinishReason,
-    pub stop_reason: Option<&'a uniserve_core::StopReason>,
-    pub prompt_tokens: usize,
-    pub completion_tokens: usize,
-    pub images: usize,
-    pub queue: &'static str,
-}
 
 impl Scheduler {
     /// Removes the queued media identity while preserving FIFO order for its peers.
@@ -90,20 +79,7 @@ impl Scheduler {
                             self.enqueue(request, event_tx)
                         }
                         Request::Diffusion(request) => {
-                            let queued_at = super::now();
-                            self.trace_record(json!({
-                                "event": "request_queued",
-                                "at_s": queued_at,
-                                "request_id": request.request_id.0,
-                                "queue": "media",
-                                "prompt_tokens": request.prompt_token_ids.len(),
-                                "seconds": request.sampling.video_units,
-                            }));
-                            self.enqueue_media(PendingMedia {
-                                request,
-                                event_tx,
-                                queued_at,
-                            })
+                            self.enqueue_media(PendingMedia { request, event_tx })
                         }
                     }
                 }
@@ -226,15 +202,6 @@ impl Scheduler {
             } else {
                 FinishReason::Cancelled
             };
-            self.trace_request_finished(FinishedTrace {
-                id,
-                reason: &reason,
-                stop_reason: None,
-                prompt_tokens: st.req.prompt_token_ids.len(),
-                completion_tokens: 0,
-                images: 0,
-                queue: "pending",
-            });
             let _ = st.output.event_tx.send(EngineCoreOutput::Finished {
                 reason,
                 stop_reason: None,
@@ -288,71 +255,5 @@ impl Scheduler {
         state.output.tokens_acked = output_token_count;
         state.output.decoder_boundaries.clear();
         state.terminal_intent = TerminalIntent::Finish(FinishReason::Stop);
-    }
-
-    /// Returns mutable access to the active trace record.
-    pub(super) fn trace_record(&mut self, record: serde_json::Value) {
-        if let Some(sink) = self.trace_sink.as_mut() {
-            sink.record(&record);
-        }
-    }
-
-    /// Returns whether call tracing is enabled.
-    pub(super) fn trace_enabled(&self) -> bool {
-        self.trace_sink.is_some()
-    }
-
-    /// Records a complete scheduler-trace snapshot when a request enters a queue.
-    pub(super) fn trace_request_queued(&mut self, st: &RequestState, queue: &'static str) {
-        self.trace_record(json!({
-            "event": "request_queued",
-            "at_s": st.queued_at,
-            "request_id": st.req.request_id.0,
-            "trace_id": st.req.request_id.0,
-            "queue": queue,
-            "generation": Self::generation_trace(&st.req),
-            "initial_phase": st.phase,
-            "prompt_tokens": st.req.prompt_token_ids.len(),
-            "max_tokens": st.req.max_und_tokens,
-            "priority": st.req.priority,
-            "reserve_worstcase": st.reserve_worstcase,
-            "worstcase_blocks": st.max_reserved_kv_blocks,
-            "image": {
-                "steps": st.req.image.steps,
-                "max_images": st.req.image.max_images,
-                "height": st.req.image.height,
-                "width": st.req.image.width,
-                "retain_images": st.req.image.retain_images,
-            },
-            "pending": self.waiting_order.len(),
-            "running": self.running.len(),
-        }));
-    }
-
-    /// Records terminal request accounting in the scheduler trace.
-    pub(super) fn trace_request_finished(&mut self, trace: FinishedTrace<'_>) {
-        let FinishedTrace {
-            id,
-            reason,
-            stop_reason,
-            prompt_tokens,
-            completion_tokens,
-            images,
-            queue,
-        } = trace;
-        self.trace_record(json!({
-            "event": "request_finished",
-            "at_s": now(),
-            "request_id": id.0,
-            "reason": reason,
-            "stop_reason": stop_reason,
-            "queue": queue,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "images": images,
-            "pending": self.waiting_order.len(),
-            "running": self.running.len(),
-            "in_flight": self.pending_batches.len(),
-        }));
     }
 }

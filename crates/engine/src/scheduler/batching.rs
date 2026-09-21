@@ -195,23 +195,23 @@ impl Scheduler {
                 continue;
             }
             // Build one call when its exact resident resources fit.
-            let op_budget = if mixed_prefill {
+            let call_budget = if mixed_prefill {
                 budget.min(mixed_left)
             } else {
                 budget
             };
-            if let Some(mut op) = self.next_generation_computation(id, op_budget) {
+            if let Some(mut call) = self.next_generation_computation(id, call_budget) {
                 let planned_us = uniserve_core::now_monotonic_us();
                 if mixed_prefill {
-                    mixed_left = mixed_left.saturating_sub(self.computation_token_cost(&op));
+                    mixed_left = mixed_left.saturating_sub(self.computation_token_cost(&call));
                 }
-                budget = budget.saturating_sub(self.computation_token_cost(&op));
-                let Some(reserved_buffers) = self.reserve_generation_resources(&op) else {
-                    self.record_domain_backpressure(op.code);
+                budget = budget.saturating_sub(self.computation_token_cost(&call));
+                let Some(reserved_buffers) = self.reserve_generation_resources(&call) else {
+                    self.record_domain_backpressure(call.code);
                     if let Some(state) = self.running.get_mut(&id) {
                         state.num_kv_blocks_sent = state
                             .num_kv_blocks_sent
-                            .saturating_sub(op.bounds.max_kv_pages as usize);
+                            .saturating_sub(call.bounds.max_kv_pages as usize);
                     }
                     tracing::debug!(
                         request_id = id.0,
@@ -219,7 +219,7 @@ impl Scheduler {
                     );
                     continue;
                 };
-                let code = op.code;
+                let code = call.code;
                 if !code_batches.contains_key(&code) {
                     let batch_id = self.next_batch_id();
                     code_batches.insert(
@@ -230,8 +230,8 @@ impl Scheduler {
                 }
                 let request_index = u32::try_from(code_batches[&code].requests.len())
                     .expect("selected request count fits the IPC index");
-                op.call_id = CallId::new(code_batches[&code].id, request_index);
-                op.coordinates = self
+                call.call_id = CallId::new(code_batches[&code].id, request_index);
+                call.coordinates = self
                     .projected_coordinates(id)
                     .expect("scheduled request retains its running state");
                 let finish_token_ids = self
@@ -274,11 +274,10 @@ impl Scheduler {
                     .remove(&code)
                     .expect("computation batch exists");
                 let prepared = self.prepare_generation_call(
-                    op,
+                    call,
                     reserved_buffers,
                     admitted,
                     planned_us,
-                    submit_at,
                     &mut batch,
                 );
                 code_batches.insert(code, batch);
@@ -495,7 +494,6 @@ impl Scheduler {
         reserved_buffers: Vec<Allocation>,
         admitted: bool,
         planned_us: u64,
-        submit_at: Instant,
         batch: &mut ExecutionBatch,
     ) -> Option<()> {
         let request_id = call.request_key.request_id;
@@ -545,7 +543,7 @@ impl Scheduler {
                 .pending_calls
                 .get(&request_id)
                 .and_then(|queue| queue.back())
-                .map(|op| &op.call)
+                .map(|call| &call.call)
             else {
                 tracing::error!(
                     request_id = request_id.0,
@@ -878,7 +876,6 @@ impl Scheduler {
                 },
                 start_step: latent.as_ref().map(|input| input.start_step),
             },
-            submit_at,
             submitted_us.saturating_sub(planned_us),
         );
         batch.requests.push((
@@ -911,10 +908,10 @@ impl Scheduler {
 
         // Snapshot scheduler gauges at the batch boundary before ownership moves
         // into the executor.
-        self.peak_ops_in_batch = self.peak_ops_in_batch.max(batch.requests.len());
+        self.peak_calls_in_batch = self.peak_calls_in_batch.max(batch.requests.len());
         self.stats
             .general
-            .peak_ops
+            .peak_calls
             .fetch_max(batch.requests.len(), Ordering::Relaxed);
         self.stats.general.steps.fetch_add(1, Ordering::Relaxed);
         self.stats
@@ -929,43 +926,6 @@ impl Scheduler {
             .kv_cache
             .free_blocks
             .store(self.free_blocks(), Ordering::Relaxed);
-        if self.trace_enabled() {
-            let trace_ops = batch
-                .requests
-                .iter()
-                .map(|(call, placement)| {
-                    json!({
-                        "request_id": call.request_key.request_id.0,
-                        "call_id": call.call_id,
-                        "call": call_trace(call),
-                        "forward": placement.forward,
-                        "latent": placement.latent,
-                    })
-                })
-                .collect::<Vec<_>>();
-            self.trace_record(json!({
-                "event": "batch_submitted",
-                "at_s": now(),
-                "batch_id": batch.id,
-                "batch_size": batch.requests.len(),
-                "request_ids": batch.requests.iter().map(|(call, _)| call.request_key.request_id.0).collect::<Vec<_>>(),
-                "admitted_request_ids": batch.admissions().map(|request| request.request_key.request_id.0).collect::<Vec<_>>(),
-                "commands": batch.commands,
-                "ops": trace_ops,
-                "scheduler": {
-                    "policy": self.config.policy,
-                    "max_batch": self.config.max_batch,
-                    "max_num_batched_tokens": self.config.max_num_batched_tokens,
-                },
-                "running": self.running.len(),
-                "pending": self.waiting_order.len(),
-                "in_flight_before_submit": self.pending_batches.len() + 1,
-                "free_blocks": self.free_blocks(),
-                "reserved_blocks": self.reserved_blocks,
-                "worker_image_latent_active": self.worker_image_latent_used(),
-                "worker_image_latent_capacity": self.info.latent_capacity_units(),
-            }));
-        }
         self.register_pending_batch(&batch, submit_at);
         batch
     }
