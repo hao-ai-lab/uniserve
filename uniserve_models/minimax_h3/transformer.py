@@ -140,11 +140,7 @@ class TransformerLayer(nn.Module):
             self.mlp.down.input_quantizer,
         )
         if any(
-            value is not None
-            and (
-                value.format == "nvfp4"
-                or (value.format == "fp8" and value.axis is None)
-            )
+            value is not None and value.requires_complete_source
             for value in quantizers
         ):
             outputs = tuple(value for _, value in attended)
