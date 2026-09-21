@@ -860,7 +860,7 @@ points = ["minimax-h3-saturation-c1", "minimax-h3-saturation-c10"]
 [servers.fasth3-ulysses8]
 host = "127.0.0.1"
 port = 18083
-command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "config/minimax-h3-eight-devices-single-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "5", "--video-graph-shapes", "5x1000", "--mem-fraction-static", "${UNISERVE_H3_MEM_FRACTION:-0.70}", "--dtype", "bfloat16"]
+command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "config/minimax-h3-eight-devices-single-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "5", "--video-graph-shapes", "5x1000", "--mem-fraction-static", "${UNISERVE_H3_ULYSSES_MEM_FRACTION:-0.93}", "--dtype", "bfloat16"]
 
 [servers.fasth3-ulysses8.environment]
 CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
