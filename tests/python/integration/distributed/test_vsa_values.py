@@ -54,6 +54,36 @@ def _reference(projections, valid):
     return (fine.transpose(0, 1) + gate.double() * compressed).to(q.dtype), live
 
 
+def _paired_order(size):
+    """Order ranks so the fastest-varying axis stays inside a peer pair.
+
+    A context partition composes every sequence owner's rows into that owner's
+    storage, which needs peer access across the Ulysses axis. Some hosts grant
+    that only inside device pairs, so members are paired by what the devices
+    can actually do. Each pair is emitted in reverse so the order still differs
+    from the device order, which is what makes the partitions below exercise
+    logical membership rather than backend rank order.
+    """
+    remaining = list(range(size))
+    order = []
+    while remaining:
+        first = remaining.pop(0)
+        partner = next(
+            (
+                peer
+                for peer in remaining
+                if torch.cuda.can_device_access_peer(first, peer)
+            ),
+            None,
+        )
+        if partner is None:
+            order.append(first)
+            continue
+        remaining.remove(partner)
+        order.extend((partner, first))
+    return tuple(order)
+
+
 def _run(rank, rendezvous):
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -98,11 +128,10 @@ def _run(rank, rendezvous):
                 ),
             ),
         )
+        ranks = _paired_order(4)
         for shape, axes, config in cases:
             mesh = groups.bind(
-                DeviceMesh(
-                    ranks=(3, 1, 0, 2), shape=shape, axes=axes, rank=rank
-                ),
+                DeviceMesh(ranks=ranks, shape=shape, axes=axes, rank=rank),
                 device=device,
             )
             heads = mesh.get_group(
