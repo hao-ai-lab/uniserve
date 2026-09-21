@@ -407,6 +407,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             ranks: args.ranks.clone(),
             components: args.components.clone(),
             queue_depth: args.queue_depth,
+            memory_fraction: None,
         }])?;
         args.transfer = transfer.clone();
         let mut executor = WorkerExecutor::try_new(
@@ -2081,17 +2082,25 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         rng: None,
     };
     let mut retained = Batch::new(15, vec![next], vec![retained]);
-    retained
-        .buffer_allocations
-        .push(uniserve_worker_ipc::BufferAllocation {
+    // The source product lives at offset zero on encoder-1. Its destination
+    // address on encoder-0 is independent and must not collide with the new
+    // output that this call writes at offset zero in encoder-0's address space.
+    retained.buffer_allocations.extend([
+        uniserve_worker_ipc::BufferAllocation {
             buffer: retained.calls[0]
                 .encoder_output
                 .as_ref()
                 .unwrap()
                 .buffer_id(),
+            offset: 0,
+            bytes: 8192,
+        },
+        uniserve_worker_ipc::BufferAllocation {
+            buffer: feature.buffer_id(),
             offset: 8192,
             bytes: 8192,
-        });
+        },
+    ]);
     executor.submit(bind(retained, "encoder-0"))?;
     let retained = poll_logical(&mut executor)?.context("retained product was not readable")?;
     assert_eq!(retained.results[0].output.status, CallStatus::Ok);
