@@ -71,7 +71,7 @@ fn qwen3_without_prompt_boundary_waits_for_reasoning_start() {
     let tokenizer = reasoning_tokenizer();
     let mut parser = Qwen3ReasoningParser::new(tokenizer).unwrap();
 
-    let delta = parser.push("reason</think>answer").unwrap();
+    let delta = parser.push("reason</think>answer");
     assert_eq!(delta.reasoning, None);
     assert_eq!(delta.content.as_deref(), Some("reason</think>answer"));
 }
@@ -83,15 +83,12 @@ fn qwen3_prompt_boundaries_select_the_initial_output_region() {
     let end = token_id(&tokenizer, "</think>");
 
     let mut content = Qwen3ReasoningParser::new(Arc::clone(&tokenizer)).unwrap();
-    content.initialize(&[end]).unwrap();
-    assert_eq!(
-        content.push("answer").unwrap().content.as_deref(),
-        Some("answer")
-    );
+    content.initialize(&[end]);
+    assert_eq!(content.push("answer").content.as_deref(), Some("answer"));
 
     let mut reasoning = Qwen3ReasoningParser::new(tokenizer).unwrap();
-    reasoning.initialize(&[start]).unwrap();
-    let delta = reasoning.push("reason</think>answer").unwrap();
+    reasoning.initialize(&[start]);
+    let delta = reasoning.push("reason</think>answer");
     assert_eq!(delta.reasoning.as_deref(), Some("reason"));
     assert_eq!(delta.content.as_deref(), Some("answer"));
 }
@@ -103,8 +100,8 @@ fn qwen3_prompt_scan_stops_at_the_last_special_token() {
     let prompt_end = token_id(&tokenizer, "<|im_end|>");
     let mut parser = Qwen3ReasoningParser::new(tokenizer).unwrap();
 
-    parser.initialize(&[start, prompt_end]).unwrap();
-    let delta = parser.push("answer").unwrap();
+    parser.initialize(&[start, prompt_end]);
+    let delta = parser.push("answer");
     assert_eq!(delta.reasoning, None);
     assert_eq!(delta.content.as_deref(), Some("answer"));
 }

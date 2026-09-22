@@ -10,60 +10,31 @@ use uniserve_worker_ipc::{RequestKey, WorkerInfo};
 
 use crate::kv::{BlockPool, BlockTable, KvCacheCoordinator};
 
-/// Owned backing for one resource, consumed when its final reader retires.
+/// Owned request row, returned only after its request epoch retires.
 #[derive(Debug)]
-pub(crate) enum Allocation {
-    RequestSlot {
-        owner: RequestKey,
-        index: u32,
-    },
-    Kv {
-        owner: RequestKey,
-        tables: Vec<BlockTable>,
-    },
-    Latent {
-        owner: RequestKey,
-        pages: Vec<u32>,
-        units: u64,
-    },
-    Buffer {
-        owner: RequestKey,
-        offset: u64,
-        bytes: u64,
-    },
+pub(crate) struct RequestSlot {
+    pub(crate) index: u32,
 }
 
-impl Allocation {
-    /// Request epoch that originally acquired the backing.
-    pub(crate) const fn owner(&self) -> RequestKey {
-        match self {
-            Self::RequestSlot { owner, .. }
-            | Self::Kv { owner, .. }
-            | Self::Latent { owner, .. }
-            | Self::Buffer { owner, .. } => *owner,
-        }
-    }
+/// KV page references retain shared prefixes through ordinary ownership.
+#[derive(Debug)]
+pub(crate) struct KvAllocation {
+    pub(crate) tables: Vec<BlockTable>,
+}
 
-    pub(crate) fn request_slot(&self) -> Option<u32> {
-        match self {
-            Self::RequestSlot { index, .. } => Some(*index),
-            _ => None,
-        }
-    }
+/// Pages and capacity of a latent trajectory.
+#[derive(Debug)]
+pub(crate) struct LatentPages {
+    pub(crate) pages: Vec<u32>,
+    pub(crate) units: u64,
+}
 
-    pub(crate) fn kv_tables(&self) -> Option<&[BlockTable]> {
-        match self {
-            Self::Kv { tables, .. } => Some(tables),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn kv_tables_mut(&mut self) -> Option<&mut Vec<BlockTable>> {
-        match self {
-            Self::Kv { tables, .. } => Some(tables),
-            _ => None,
-        }
-    }
+/// A byte span whose publication may outlive its producing request.
+#[derive(Debug)]
+pub(crate) struct BufferSpan {
+    pub(crate) owner: RequestKey,
+    pub(crate) offset: u64,
+    pub(crate) bytes: u64,
 }
 
 /// Allocation failure identifying the exhausted resource class.
@@ -286,16 +257,14 @@ impl BufferPool {
 
 impl RequestPool {
     /// Reserve one stable positive row for an admitted request epoch.
-    pub(crate) fn allocate(&mut self, owner: RequestKey) -> Result<Allocation, OutOfMemory> {
+    pub(crate) fn allocate(&mut self) -> Result<RequestSlot, OutOfMemory> {
         let index = self.acquire().ok_or(OutOfMemory::RequestSlots)?;
-        Ok(Allocation::RequestSlot { owner, index })
+        Ok(RequestSlot { index })
     }
 
     /// Return a row after all participating workers acknowledge its release.
-    pub(crate) fn free(&mut self, allocation: Allocation) {
-        let Allocation::RequestSlot { index, .. } = allocation else {
-            panic!("request pool received another resource class");
-        };
+    pub(crate) fn free(&mut self, allocation: RequestSlot) {
+        let RequestSlot { index, .. } = allocation;
         self.release(index)
             .expect("request row remains allocated until release");
     }
@@ -303,31 +272,21 @@ impl RequestPool {
 
 impl LatentPool {
     /// Reserve the physical pages of one latent trajectory atomically.
-    pub(crate) fn allocate(
-        &mut self,
-        owner: RequestKey,
-        units: u64,
-    ) -> Result<Allocation, OutOfMemory> {
+    pub(crate) fn allocate(&mut self, units: u64) -> Result<LatentPages, OutOfMemory> {
         let mut pages = Vec::new();
         if !self.reserve(&mut pages, units) {
             return Err(OutOfMemory::Latent);
         }
-        Ok(Allocation::Latent {
-            owner,
-            pages,
-            units,
-        })
+        Ok(LatentPages { pages, units })
     }
 
     /// Grow without moving existing pages; failure leaves the allocation intact.
     pub(crate) fn grow(
         &mut self,
-        allocation: &mut Allocation,
+        allocation: &mut LatentPages,
         requested: u64,
     ) -> Result<(), OutOfMemory> {
-        let Allocation::Latent { pages, units, .. } = allocation else {
-            return Err(OutOfMemory::InvalidAllocation);
-        };
+        let LatentPages { pages, units, .. } = allocation;
         if !self.reserve(pages, requested) {
             return Err(OutOfMemory::Latent);
         }
@@ -336,10 +295,8 @@ impl LatentPool {
     }
 
     /// Return trajectory pages after their physical consumers have finished.
-    pub(crate) fn free(&mut self, allocation: Allocation) {
-        let Allocation::Latent { pages, .. } = allocation else {
-            panic!("latent pool received another resource class");
-        };
+    pub(crate) fn free(&mut self, allocation: LatentPages) {
+        let LatentPages { pages, .. } = allocation;
         self.release(pages);
     }
 }
@@ -351,12 +308,12 @@ impl BufferPool {
         owner: RequestKey,
         bytes: u64,
         alignment: u32,
-    ) -> Result<Allocation, OutOfMemory> {
+    ) -> Result<BufferSpan, OutOfMemory> {
         if bytes == 0 || alignment == 0 || !alignment.is_power_of_two() {
             return Err(OutOfMemory::InvalidAllocation);
         }
         let offset = self.reserve(bytes, alignment).ok_or(OutOfMemory::Buffer)?;
-        Ok(Allocation::Buffer {
+        Ok(BufferSpan {
             owner,
             offset,
             bytes,
@@ -364,35 +321,31 @@ impl BufferPool {
     }
 
     /// Return the complete span after its publication and transport readers retire.
-    pub(crate) fn free(&mut self, allocation: Allocation) {
-        let Allocation::Buffer { offset, bytes, .. } = allocation else {
-            panic!("buffer pool received another resource class");
-        };
+    pub(crate) fn free(&mut self, allocation: BufferSpan) {
+        let BufferSpan { offset, bytes, .. } = allocation;
         self.release(offset, bytes);
     }
 }
 
 impl KVCacheManager {
     /// Acquire one page table per loaded KV group with atomic initial capacity.
-    pub(crate) fn allocate(
-        &self,
-        owner: RequestKey,
-        tokens: u32,
-    ) -> Result<Allocation, OutOfMemory> {
+    pub(crate) fn allocate(&self, tokens: u32) -> Result<KvAllocation, OutOfMemory> {
         let mut tables = (0..self.block_pool.num_groups())
             .map(|group| BlockTable::new(group, self.block_pool.block_size()))
             .collect::<Vec<_>>();
         self.coordinator
             .ensure_capacity(&self.block_pool, &mut tables, tokens as usize)
             .ok_or(OutOfMemory::Kv)?;
-        Ok(Allocation::Kv { owner, tables })
+        Ok(KvAllocation { tables })
     }
 
     /// Grow all cache groups atomically while retaining shared prefix references.
-    pub(crate) fn grow(&self, allocation: &mut Allocation, tokens: u32) -> Result<(), OutOfMemory> {
-        let Allocation::Kv { tables, .. } = allocation else {
-            return Err(OutOfMemory::InvalidAllocation);
-        };
+    pub(crate) fn grow(
+        &self,
+        allocation: &mut KvAllocation,
+        tokens: u32,
+    ) -> Result<(), OutOfMemory> {
+        let KvAllocation { tables, .. } = allocation;
         self.coordinator
             .ensure_capacity(&self.block_pool, tables, tokens as usize)
             .ok_or(OutOfMemory::Kv)?;
@@ -420,18 +373,14 @@ mod tests {
     #[test]
     fn request_rows_remain_exclusive_until_release() {
         let mut pool = RequestPool::new(2);
-        let first = pool.allocate(owner(1)).unwrap();
-        let second = pool.allocate(owner(2)).unwrap();
-        assert_ne!(first.request_slot(), second.request_slot());
-        assert!(first.request_slot().unwrap() > 0);
-        assert!(matches!(
-            pool.allocate(owner(3)),
-            Err(OutOfMemory::RequestSlots)
-        ));
+        let first = pool.allocate().unwrap();
+        let second = pool.allocate().unwrap();
+        assert_ne!(first.index, second.index);
+        assert!(first.index > 0);
+        assert!(matches!(pool.allocate(), Err(OutOfMemory::RequestSlots)));
         pool.free(first);
-        let replacement = pool.allocate(owner(3)).unwrap();
-        assert_ne!(replacement.request_slot(), second.request_slot());
-        assert_eq!(replacement.owner(), owner(3));
+        let replacement = pool.allocate().unwrap();
+        assert_ne!(replacement.index, second.index);
         pool.free(second);
         pool.free(replacement);
     }
@@ -441,22 +390,16 @@ mod tests {
         let mut pool = BufferPool::new(1024);
         let first = pool.allocate(owner(1), 200, 256).unwrap();
         let second = pool.allocate(owner(2), 200, 256).unwrap();
-        let Allocation::Buffer {
+        let BufferSpan {
             offset: start,
             bytes,
             ..
-        } = &first
-        else {
-            unreachable!()
-        };
-        let Allocation::Buffer {
+        } = &first;
+        let BufferSpan {
             offset: other,
             bytes: other_bytes,
             ..
-        } = &second
-        else {
-            unreachable!()
-        };
+        } = &second;
         assert_eq!(start % 256, 0);
         assert_eq!(other % 256, 0);
         assert!(start + bytes <= *other || other + other_bytes <= *start);
@@ -472,34 +415,25 @@ mod tests {
     #[test]
     fn latent_growth_preserves_pages_and_failed_reservations() {
         let mut pool = LatentPool::new(4, 4);
-        let mut first = pool.allocate(owner(1), 4).unwrap();
-        let second = pool.allocate(owner(1), 4).unwrap();
-        let Allocation::Latent { pages, .. } = &first else {
-            unreachable!()
-        };
+        let mut first = pool.allocate(4).unwrap();
+        let second = pool.allocate(4).unwrap();
+        let LatentPages { pages, .. } = &first;
         let held_pages = pages.clone();
-        let Allocation::Latent {
+        let LatentPages {
             pages: other_pages, ..
-        } = &second
-        else {
-            unreachable!()
-        };
+        } = &second;
         assert!(pages.iter().all(|page| !other_pages.contains(page)));
         assert_eq!(pool.grow(&mut first, 12), Err(OutOfMemory::Latent));
-        let Allocation::Latent { pages, units, .. } = &first else {
-            unreachable!()
-        };
+        let LatentPages { pages, units, .. } = &first;
         assert_eq!(pages, &held_pages);
         assert_eq!(*units, 4);
         pool.free(second);
         pool.grow(&mut first, 12).unwrap();
-        let Allocation::Latent { pages, units, .. } = &first else {
-            unreachable!()
-        };
+        let LatentPages { pages, units, .. } = &first;
         assert!(pages.starts_with(&held_pages));
         assert_eq!(*units, 12);
         assert_eq!(pages.len(), 3);
         pool.free(first);
-        assert!(pool.allocate(owner(2), 12).is_ok());
+        assert!(pool.allocate(12).is_ok());
     }
 }

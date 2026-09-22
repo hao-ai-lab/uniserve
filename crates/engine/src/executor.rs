@@ -355,7 +355,7 @@ impl ExecutorInfo {
             "workers disagree on diffusion steps"
         );
         // Every KV stage must agree on layout. Capacity is the narrowest pool
-        // because a lineage may traverse all routed KV stages.
+        // because a request may traverse all routed KV stages.
         if let Some(first_index) = kv_indices.first().copied() {
             let first = &self.workers[first_index].1;
             let first_kv = first
@@ -509,10 +509,11 @@ pub struct CallResult {
 #[derive(Debug)]
 pub struct WorkerResult {
     pub batch_id: u64,
+    /// Every participating rank has retired this batch, including command-only ranks.
+    pub done: bool,
     pub results: Vec<CallResult>,
     /// Tensor publications remain owned by the executor's transfer consumers.
     pub products: Vec<TensorPublication>,
-    pub registration: uniserve_worker_ipc::RegistrationAck,
     pub worker_exec_us: Option<u64>,
     pub forward_stats: Option<uniserve_worker_ipc::ForwardStats>,
 }
@@ -541,9 +542,9 @@ impl WorkerResult {
             .collect();
         Self {
             batch_id: report.batch_id,
+            done: true,
             results,
             products: report.products,
-            registration: report.registration,
             worker_exec_us: report.worker_exec_us,
             forward_stats: report.forward_stats,
         }
@@ -563,7 +564,7 @@ pub enum CommandOutcome {
 pub struct CommandResult {
     /// Position among lifecycle commands, excluding request admissions.
     pub command_index: u32,
-    /// Request lineage targeted by the command.
+    /// Request targeted by the command.
     pub request_key: RequestKey,
     /// A failed command retains physical ownership until a subsequent release succeeds.
     pub outcome: CommandOutcome,

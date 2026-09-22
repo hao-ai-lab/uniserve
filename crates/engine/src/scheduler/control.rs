@@ -44,7 +44,7 @@ impl Scheduler {
                     .remove(&id)
                     .expect("scheduler waiting order names runtime state");
                 ids.push(st.req.request_id);
-                let _ = st.output.event_tx.send(EngineCoreOutput::Finished {
+                let _ = st.output.events.event_tx.send(EngineCoreOutput::Finished {
                     reason: FinishReason::Aborted,
                     stop_reason: None,
                     prompt_tokens: st.req.prompt_token_ids.len(),
@@ -125,14 +125,6 @@ impl Scheduler {
         selected
     }
 
-    /// Enqueues a request directly for deterministic engine-loop tests.
-    #[doc(hidden)]
-    pub fn submit_for_test(&mut self, request: GenerationRequest) -> EventRx {
-        let (event_tx, event_rx) = event_channel();
-        self.enqueue(request, event_tx);
-        event_rx
-    }
-
     /// Records cancellation or abortion across queued, media, and running request states.
     pub(super) fn mark_cancelled(
         &mut self,
@@ -202,7 +194,7 @@ impl Scheduler {
             } else {
                 FinishReason::Cancelled
             };
-            let _ = st.output.event_tx.send(EngineCoreOutput::Finished {
+            let _ = st.output.events.event_tx.send(EngineCoreOutput::Finished {
                 reason,
                 stop_reason: None,
                 prompt_tokens: st.req.prompt_token_ids.len(),

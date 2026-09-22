@@ -422,9 +422,8 @@ pub(super) struct RankProcess {
     world_size: u32,
     expected_components: std::collections::BTreeMap<String, uniserve_core::ComponentConfig>,
     pending: HashMap<u64, PendingRecord>,
-    ready: VecDeque<WorkerResult>,
+    ready: VecDeque<anyhow::Result<WorkerResult>>,
     next_message_id: u64,
-    command_wake_pending: bool,
     shutdown_sent: bool,
     /// Edge-triggered worker-death watcher: fires the scheduler park's death
     /// wake when the child exits. `None` when polling or when `pidfd` could not
@@ -679,7 +678,6 @@ impl PendingRank {
             pending: HashMap::new(),
             ready: VecDeque::new(),
             next_message_id: 1,
-            command_wake_pending: false,
             shutdown_sent: false,
             death_watcher,
         })
@@ -819,16 +817,21 @@ impl RankProcess {
     ) -> anyhow::Result<Outstanding> {
         let deadline = Instant::now() + timeout;
         loop {
-            let pending = self.client.send_request_attempt(req)?;
-            if self.client.is_connected(&pending) {
+            let pending = match self.client.send_request_attempt(req) {
+                Ok(pending) => Some(pending),
+                Err(uniserve_worker_ipc::IpcError::WouldBlock) => None,
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(pending) = pending
+                && self.client.is_connected(&pending)
+            {
                 return Ok(pending);
             }
-            drop(pending);
             self.check_worker(context)?;
             if Instant::now() >= deadline {
                 bail!("worker IPC service had no connected server during {context}");
             }
-            std::thread::sleep(Duration::from_millis(20));
+            self.client.wait_wake(Duration::from_millis(20))?;
         }
     }
 
@@ -845,6 +848,10 @@ impl RankProcess {
             if let Some(frame) = self.client.try_recv_response(pending)? {
                 return Ok(frame);
             }
+            anyhow::ensure!(
+                started.elapsed() < Duration::from_secs(300),
+                "worker response timed out during {context}"
+            );
             if last_worker_check.elapsed() >= WORKER_CHECK_INTERVAL {
                 self.check_worker(context)?;
                 last_worker_check = Instant::now();
@@ -939,7 +946,7 @@ impl RankProcess {
             "worker result batch id mismatch: expected {batch_id}, got {}",
             report.batch_id
         );
-        self.ready.push_back(report);
+        self.ready.push_back(Ok(report));
         Ok(())
     }
 
@@ -948,7 +955,7 @@ impl RankProcess {
     /// A shared-memory channel multiplexes every wake onto one listener; a
     /// socket channel carries only results and raises the engine's own wakes
     /// on a second descriptor.
-    pub(crate) fn progress_fds(&self) -> Vec<i32> {
+    pub(crate) fn progress_fds(&self) -> Vec<libc::pollfd> {
         self.client.progress_fds()
     }
 }
@@ -969,9 +976,16 @@ impl RankProcess {
         let message_id = self.alloc_call_id();
         let mut req = WorkerRequest::submit(batch);
         req.set_call_id(Some(message_id));
-        let pending = self
-            .send_request_checked(&req, "batch submit")
-            .map_err(BatchSubmitError::Failed)?;
+        let pending = match self.client.send_request_attempt(&req) {
+            Ok(pending) => pending,
+            Err(uniserve_worker_ipc::IpcError::WouldBlock) => {
+                return Err(BatchSubmitError::WouldBlock(match req {
+                    WorkerRequest::Submit { batch, .. } => batch,
+                    _ => unreachable!(),
+                }));
+            }
+            Err(error) => return Err(BatchSubmitError::Failed(error.into())),
+        };
         self.pending.insert(
             message_id,
             PendingRecord {
@@ -982,49 +996,34 @@ impl RankProcess {
         Ok(())
     }
 
-    /// Drives IPC progress until a result, command wake, worker death, or timeout.
+    /// Returns completed responses before failing outstanding work on disconnect.
     pub(super) fn poll_batch(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
-        if self.command_wake_pending {
-            return Ok(None);
-        }
-        let (_, mut wakes) = self.drain_ready()?;
-        self.command_wake_pending |= wakes.command;
-        self.check_worker("executor poll")?;
-        if self.command_wake_pending || wakes.death {
-            return Ok(None);
-        }
-        if let Some(result) = self.ready.pop_front() {
-            return Ok(Some(result));
-        }
-        if timeout.is_zero() {
-            return Ok(None);
-        }
         let deadline = Instant::now() + timeout;
         loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(None);
-            }
-            wakes = self
-                .client
-                .wait_wake((deadline - now).min(WORKER_CHECK_INTERVAL))?;
-            let (_, queued_wakes) = self.drain_ready()?;
-            wakes.command |= queued_wakes.command;
-            wakes.death |= queued_wakes.death;
-            self.command_wake_pending |= wakes.command;
-            self.check_worker("executor poll")?;
-            if self.command_wake_pending || wakes.death {
-                return Ok(None);
-            }
             if let Some(result) = self.ready.pop_front() {
-                return Ok(Some(result));
+                return result.map(Some);
             }
+            let (_, wakes) = match self.drain_ready() {
+                Ok(progress) => progress,
+                Err(error) => {
+                    // Complete replies remain ahead of a trailing transport or
+                    // decoding error in the same drain.
+                    self.ready.push_back(Err(error));
+                    continue;
+                }
+            };
+            if !self.ready.is_empty() {
+                continue;
+            }
+            self.check_worker("executor poll")?;
+            anyhow::ensure!(!wakes.death, "worker rank channel disconnected");
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            self.client
+                .wait_wake(remaining.min(WORKER_CHECK_INTERVAL))?;
         }
-    }
-
-    /// Consumes the pending command-wake notification.
-    pub(crate) fn take_command_wake(&mut self) -> bool {
-        std::mem::take(&mut self.command_wake_pending)
     }
 
     /// Drains outstanding calls, requests graceful shutdown, and bounds forced termination.

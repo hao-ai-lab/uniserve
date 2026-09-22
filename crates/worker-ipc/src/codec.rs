@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 
 use flatbuffers::FlatBufferBuilder;
+
+mod encode;
 use uniserve_core::{BlockId, KvCacheGroup, KvGroupKind, RequestId, SamplingParams, TokenLogprob};
 
 use crate::schema::uniserve::ipc as fbs;
@@ -12,10 +14,10 @@ use crate::{
     CallStatus, DType, DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout,
     ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode,
     ForwardStats, KvCacheInfo, KvTransfer, LatentParams, Locator, MediaCall, MediaOutput,
-    NewRequest, RegistrationAck, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
-    SamplingState, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
-    TransferHandle, TransferMode, TransferTransport, UmmRequestParams, WorkerEndpoint, WorkerInfo,
-    WorkerRequest, WorkerResponse, WorkerResponseError,
+    NewRequest, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng, SamplingState,
+    ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters, TransferHandle,
+    TransferMode, TransferTransport, WorkerEndpoint, WorkerInfo, WorkerRequest, WorkerResponse,
+    WorkerResponseError,
 };
 
 /// Result type returned by FlatBuffers codec calls.
@@ -102,9 +104,11 @@ macro_rules! codec_ensure {
 
 /// Encodes a validated worker request as a FlatBuffers frame.
 pub fn encode_request(request: &WorkerRequest) -> CodecResult<Vec<u8>> {
-    let object = request_to_fb(request)?;
+    if let Some(batch) = request.batch() {
+        batch.validate()?;
+    }
     let mut builder = FlatBufferBuilder::new();
-    let root = object.pack(&mut builder);
+    let root = encode::request(&mut builder, request);
     builder.finish(root, None);
     Ok(builder.finished_data().to_vec())
 }
@@ -117,9 +121,13 @@ pub fn decode_request(bytes: &[u8]) -> CodecResult<WorkerRequest> {
 
 /// Encodes a validated worker response as a FlatBuffers frame.
 pub fn encode_response(response: &WorkerResponse) -> CodecResult<Vec<u8>> {
-    let object = response_to_fb(response)?;
+    match response {
+        WorkerResponse::Info { info, .. } => info.validate()?,
+        WorkerResponse::Result { result, .. } => result.validate()?,
+        WorkerResponse::Ok { .. } | WorkerResponse::Error { .. } => {}
+    }
     let mut builder = FlatBufferBuilder::new();
-    let root = object.pack(&mut builder);
+    let root = encode::response(&mut builder, response);
     builder.finish(root, None);
     Ok(builder.finished_data().to_vec())
 }
@@ -367,7 +375,7 @@ fn admission_from_table(admission: fbs::NewRequest<'_>) -> CodecResult<NewReques
             .map(|ids| ids.iter().collect())
             .unwrap_or_default(),
         ar: admission.ar().map(ar_params_from_table).transpose()?,
-        umm: admission.umm().map(umm_params_from_table).transpose()?,
+        image: admission.image().map(image_from_table).transpose()?,
         diffusion: admission
             .diffusion()
             .map(diffusion_params_from_table)
@@ -394,17 +402,6 @@ fn ar_params_from_table(admission: fbs::ArRequestParams<'_>) -> CodecResult<ArRe
             .map(|items| items.iter().collect())
             .unwrap_or_default(),
         initial_position: admission.initial_position(),
-    })
-}
-
-/// Decodes unified-multimodal admission parameters and requires image settings.
-fn umm_params_from_table(admission: fbs::UmmRequestParams<'_>) -> CodecResult<UmmRequestParams> {
-    Ok(UmmRequestParams {
-        image: image_from_table(
-            admission
-                .image()
-                .context("unified-multimodal request has no image parameters")?,
-        )?,
     })
 }
 
@@ -499,16 +496,6 @@ fn coordinates_from_table(table: Option<fbs::CallCoordinates<'_>>) -> CodecResul
         kv_computed_len: value.kv_computed_len(),
         flow_step: value.flow_step(),
     })
-}
-
-/// Writes the coordinates a call states.
-fn coordinates_to_fb(value: CallCoordinates) -> fbs::CallCoordinatesT {
-    fbs::CallCoordinatesT {
-        logical_position: value.logical_position,
-        kv_visible_len: value.kv_visible_len,
-        kv_computed_len: value.kv_computed_len,
-        flow_step: value.flow_step,
-    }
 }
 
 /// Decodes one computation and its component binding.
@@ -607,7 +594,7 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
     Ok(call)
 }
 
-/// Decodes one control-command union and validates its lineage constraints.
+/// Decodes one control-command union and validates its request constraints.
 fn command_from_table(envelope: fbs::BatchCommandEnvelope<'_>) -> CodecResult<BatchCommand> {
     // The FlatBuffers discriminator selects the only payload table permitted
     // to contribute command fields.
@@ -748,12 +735,6 @@ fn run_result_from_table(report: fbs::BatchOutput<'_>) -> CodecResult<BatchOutpu
             })
             .transpose()?
             .unwrap_or_default(),
-        registration: RegistrationAck {
-            visible: report
-                .registration()
-                .map(|ack| ack.visible())
-                .context("completion report has no registration acknowledgement")?,
-        },
         worker_exec_us: report.worker_exec_us(),
         forward_stats: report.forward_stats().map(forward_stats_from_table),
     };
@@ -1044,22 +1025,11 @@ fn sampling_from_table(sampling: fbs::SamplingParams<'_>) -> CodecResult<Samplin
             .map(|items| items.iter().collect())
             .unwrap_or_default(),
     };
-    validate_sampling(&sampling)?;
     Ok(sampling)
 }
 
 /// Decodes image-generation parameters and rejects non-finite controls.
 fn image_from_table(image: fbs::ImageParams<'_>) -> CodecResult<uniserve_core::ImageParams> {
-    for value in [
-        image.cfg_text_scale(),
-        image.cfg_img_scale(),
-        image.cfg_renorm_min(),
-        image.cfg_interval_lo(),
-        image.cfg_interval_hi(),
-        image.timestep_shift(),
-    ] {
-        codec_ensure!(value.is_finite(), "image parameters must be finite");
-    }
     Ok(uniserve_core::ImageParams {
         steps: image.steps(),
         cfg_text_scale: image.cfg_text_scale(),
@@ -1195,376 +1165,10 @@ where
         .with_context(|| format!("{label} is invalid"))
 }
 
-/// Converts a validated request into its FlatBuffers object representation.
-fn request_to_fb(request: &WorkerRequest) -> CodecResult<fbs::WorkerRequestT> {
-    let batch = match request {
-        WorkerRequest::Info { .. } | WorkerRequest::Close { .. } => None,
-        WorkerRequest::Submit { batch, .. } => {
-            batch.validate()?;
-            Some(batch)
-        }
-    };
-    Ok(fbs::WorkerRequestT {
-        kind: request_kind_to_fb(request.kind()),
-        message_id: request.message_id(),
-        batch: batch.map(batch_to_fb).transpose()?.map(Box::new),
-    })
-}
-
-/// Converts a response into the payload branch selected by its response kind.
-fn response_to_fb(response: &WorkerResponse) -> CodecResult<fbs::WorkerResponseT> {
-    // Split the closed Rust enum into mutually exclusive FlatBuffers fields.
-    let (info, result, error) = match response {
-        WorkerResponse::Info { info, .. } => (Some(info), None, None),
-        WorkerResponse::Result { result, .. } => (None, Some(result), None),
-        WorkerResponse::Ok { .. } => (None, None, None),
-        WorkerResponse::Error { error, .. } => (None, None, Some(error)),
-    };
-    Ok(fbs::WorkerResponseT {
-        kind: response_kind_to_fb(response.kind()),
-        message_id: response.message_id(),
-        info: info.map(info_to_fb).transpose()?.map(Box::new),
-        result: result.map(run_result_to_fb).transpose()?.map(Box::new),
-        message: error.map(|error| error.message.clone()),
-        code: error.and_then(|error| error.code.clone()),
-        fatal: error.map(|error| error.fatal),
-        phase: error.and_then(|error| error.phase.clone()),
-        route: error.and_then(|error| error.route.clone()),
-        calls: Some(
-            error
-                .into_iter()
-                .flat_map(|error| &error.calls)
-                .map(error_call_to_fb)
-                .collect(),
-        ),
-    })
-}
-
-fn batch_to_fb(run: &Batch) -> CodecResult<fbs::BatchT> {
-    run.validate()?;
-
-    Ok(fbs::BatchT {
-        batch_id: run.batch_id,
-        collective_seq: run.collective_seq,
-
-        // Preserve executable graph order in the serialized vectors.
-        calls: Some(
-            run.calls
-                .iter()
-                .map(call_to_fb)
-                .collect::<CodecResult<_>>()?,
-        ),
-
-        // Scheduler-owned params metadata is already validated as a unit.
-        block_tables: Some(run.block_tables.iter().map(block_table_to_fb).collect()),
-        new_cache_pages: Some(
-            run.new_cache_pages
-                .iter()
-                .map(cache_page_allocation_to_fb)
-                .collect(),
-        ),
-        forward_call_indices: Some(run.forward.call_indices.clone()),
-        request_pool_indices: Some(run.forward.request_pool_indices.clone()),
-        seq_lens: Some(run.forward.seq_lens.clone()),
-        query_lens: Some(run.forward.query_lens.clone()),
-        write_kv: Some(run.forward.write_kv.clone()),
-        latent_params: Some(run.latent_params.iter().map(latent_params_to_fb).collect()),
-        decode_ranges: Some(run.decode_ranges.iter().map(decode_range_to_fb).collect()),
-        buffer_allocations: Some(
-            run.buffer_allocations
-                .iter()
-                .map(buffer_allocation_to_fb)
-                .collect(),
-        ),
-
-        // Controls and host inputs retain submission order.
-        commands: Some(
-            run.commands
-                .iter()
-                .map(|command| fbs::BatchCommandEnvelopeT {
-                    command: command_to_fb(command),
-                })
-                .collect(),
-        ),
-        kv_inputs: Some(run.kv_inputs.iter().map(kv_transfer_to_fb).collect()),
-        input_products: Some(
-            run.input_products
-                .iter()
-                .map(tensor_publication_to_fb)
-                .collect::<CodecResult<_>>()?,
-        ),
-    })
-}
-
-/// Converts a validated admission and its selected parameter family.
-fn admission_to_fb(admission: &NewRequest) -> CodecResult<fbs::NewRequestT> {
-    admission.validate()?;
-    Ok(fbs::NewRequestT {
-        request_key: Some(Box::new(request_key_to_fb(admission.request_key))),
-        request_pool_idx: admission.request_pool_idx,
-        prompt_token_ids: Some(admission.prompt_token_ids.clone()),
-        ar: admission
-            .ar
-            .as_ref()
-            .map(ar_params_to_fb)
-            .transpose()?
-            .map(Box::new),
-        umm: admission.umm.as_ref().map(umm_params_to_fb).map(Box::new),
-        diffusion: admission
-            .diffusion
-            .as_ref()
-            .map(diffusion_params_to_fb)
-            .map(Box::new),
-    })
-}
-
-/// Converts autoregressive admission parameters into their wire table.
-fn ar_params_to_fb(admission: &ArRequestParams) -> CodecResult<fbs::ArRequestParamsT> {
-    Ok(fbs::ArRequestParamsT {
-        sampling: Some(Box::new(sampling_to_fb(&admission.sampling)?)),
-        negative_token_ids: Some(admission.negative_token_ids.clone()),
-        finish_token_ids: Some(admission.finish_token_ids.clone()),
-        initial_position: admission.initial_position,
-    })
-}
-
-/// Converts unified-multimodal admission parameters into their wire table.
-fn umm_params_to_fb(admission: &UmmRequestParams) -> fbs::UmmRequestParamsT {
-    fbs::UmmRequestParamsT {
-        image: Some(Box::new(image_to_fb(&admission.image))),
-    }
-}
-
-/// Converts diffusion admission parameters and resolved geometry.
-fn diffusion_params_to_fb(admission: &DiffusionSamplingParams) -> fbs::DiffusionSamplingParamsT {
-    fbs::DiffusionSamplingParamsT {
-        num_frames: admission.num_frames,
-        video_units: admission.video_units,
-        num_inference_steps: admission.num_inference_steps,
-        seed: admission.seed,
-    }
-}
-
-/// Converts a logical KV block table while preserving page order.
-fn block_table_to_fb(table: &BlockTable) -> fbs::BlockTableT {
-    fbs::BlockTableT {
-        request_pool_idx: table.request_pool_idx,
-        group_id: table.group_id,
-        page_ids: Some(table.page_ids.iter().map(|page| page.0).collect()),
-        allocated_tokens: table.allocated_tokens,
-    }
-}
-
-/// Converts newly assigned KV pages into their wire table.
-fn cache_page_allocation_to_fb(allocation: &CachePageAllocation) -> fbs::CachePageAllocationT {
-    fbs::CachePageAllocationT {
-        request_pool_idx: allocation.request_pool_idx,
-        group_id: allocation.group_id,
-        page_ids: Some(allocation.page_ids.iter().map(|page| page.0).collect()),
-    }
-}
-
-/// Converts a latent-page params into its wire table.
-fn latent_params_to_fb(params: &LatentParams) -> fbs::LatentParamsT {
-    fbs::LatentParamsT {
-        request_key: Some(Box::new(request_key_to_fb(params.request_key))),
-        call_id: Some(computation_id_to_fb(params.call_id)),
-        page_table: Some(params.page_table.clone()),
-        latent_units: params.latent_units,
-        height: params.height,
-        width: params.width,
-        start_step: params.start_step,
-        step_count: params.step_count,
-    }
-}
-
-/// Converts a diffusion decoder params into its wire table.
-fn decode_range_to_fb(params: &DecodeRange) -> fbs::DecodeRangeT {
-    fbs::DecodeRangeT {
-        request_key: Some(Box::new(request_key_to_fb(params.request_key))),
-        call_id: Some(computation_id_to_fb(params.call_id)),
-        cursor: params.cursor,
-        max_units: params.max_units,
-    }
-}
-
-/// Converts a persistent-buffer byte span into its wire table.
-fn buffer_allocation_to_fb(params: &BufferAllocation) -> fbs::BufferAllocationT {
-    fbs::BufferAllocationT {
-        buffer: Some(Box::new(buffer_id_to_fb(params.buffer))),
-        offset: params.offset,
-        bytes: params.bytes,
-    }
-}
-
-/// Encodes one validated computation directly into its wire table.
-fn call_to_fb(call: &Call) -> CodecResult<fbs::CallT> {
-    call.validate()?;
-    Ok(fbs::CallT {
-        request_key: Some(Box::new(request_key_to_fb(call.request_key))),
-        call_id: Some(computation_id_to_fb(call.call_id)),
-        coordinates: Some(Box::new(coordinates_to_fb(call.coordinates))),
-        input_token_ids: Some(call.input_token_ids.clone()),
-        consumer_slots: Some(call.consumer_slots.clone()),
-        input_image: call.input_image.as_deref().map(str::to_owned),
-        kv_input: call.kv_input.map(buffer_id_to_fb).map(Box::new),
-        kv_output: call.kv_output.map(buffer_id_to_fb).map(Box::new),
-        sampling_state: call.sampling_state.as_ref().map(|state| {
-            Box::new(fbs::SamplingStateT {
-                allowed_token_ids: state.allowed_token_ids.clone(),
-                suppressed_token_ids: Some(state.suppressed_token_ids.clone()),
-                finish_token_ids: Some(state.finish_token_ids.clone()),
-                transition_token_ids: Some(state.transition_token_ids.clone()),
-                force_finish: state.force_finish,
-            })
-        }),
-        component: call.component.clone(),
-        code: computation_to_fb(call.code),
-        max_tokens: call.bounds.max_tokens,
-        max_kv_pages: call.bounds.max_kv_pages,
-        max_latent_bytes: call.bounds.max_latent_bytes,
-        max_completion_bytes: call.bounds.max_completion_bytes,
-        max_transfer_bytes: call.bounds.max_transfer_bytes,
-        inputs: Some(
-            call.inputs
-                .iter()
-                .map(tensor_ref_to_fb)
-                .collect::<CodecResult<_>>()?,
-        ),
-        outputs: Some(
-            call.outputs
-                .iter()
-                .map(tensor_ref_to_fb)
-                .collect::<CodecResult<_>>()?,
-        ),
-        token_input: call
-            .token_input
-            .as_ref()
-            .map(tensor_ref_to_fb)
-            .transpose()?
-            .map(Box::new),
-        token_output: call
-            .token_output
-            .as_ref()
-            .map(tensor_ref_to_fb)
-            .transpose()?
-            .map(Box::new),
-        vision_input: call
-            .vision_input
-            .as_ref()
-            .map(tensor_ref_to_fb)
-            .transpose()?
-            .map(Box::new),
-        latent_feature_input: call
-            .latent_feature_input
-            .as_ref()
-            .map(tensor_ref_to_fb)
-            .transpose()?
-            .map(Box::new),
-        encoder_output: call
-            .encoder_output
-            .as_ref()
-            .map(tensor_ref_to_fb)
-            .transpose()?
-            .map(Box::new),
-        latent_input: call
-            .latent_input
-            .as_ref()
-            .map(tensor_ref_to_fb)
-            .transpose()?
-            .map(Box::new),
-        latent_output: call
-            .latent_output
-            .as_ref()
-            .map(tensor_ref_to_fb)
-            .transpose()?
-            .map(Box::new),
-        image_input: call
-            .image_input
-            .as_ref()
-            .map(tensor_ref_to_fb)
-            .transpose()?
-            .map(Box::new),
-        image_output: call
-            .image_output
-            .as_ref()
-            .map(tensor_ref_to_fb)
-            .transpose()?
-            .map(Box::new),
-        completion_output: call
-            .completion_output
-            .as_ref()
-            .map(tensor_ref_to_fb)
-            .transpose()?
-            .map(Box::new),
-        transition_output: call
-            .transition_output
-            .as_ref()
-            .map(tensor_ref_to_fb)
-            .transpose()?
-            .map(Box::new),
-        predicate: call
-            .predicate
-            .as_ref()
-            .map(tensor_ref_to_fb)
-            .transpose()?
-            .map(Box::new),
-        rng: call.rng.as_ref().map(rng_to_fb).map(Box::new),
-    })
-}
-
-/// Converts a validated control command into its tagged wire union.
-fn command_to_fb(command: &BatchCommand) -> fbs::BatchCommandT {
-    // The closed Rust enum guarantees exactly one command payload table.
-    match command {
-        BatchCommand::Start { request } => {
-            fbs::BatchCommandT::StartCommand(Box::new(fbs::StartCommandT {
-                request: Some(Box::new(
-                    admission_to_fb(request).expect("validated start request"),
-                )),
-            }))
-        }
-        BatchCommand::Finish {
-            request_key,
-            retained_buffers,
-        } => fbs::BatchCommandT::FinishCommand(Box::new(fbs::FinishCommandT {
-            request_key: Some(Box::new(request_key_to_fb(*request_key))),
-            retained_buffers: Some(
-                retained_buffers
-                    .iter()
-                    .copied()
-                    .map(buffer_id_to_fb)
-                    .collect(),
-            ),
-        })),
-        BatchCommand::Free { buffer } => {
-            fbs::BatchCommandT::FreeCommand(Box::new(fbs::FreeCommandT {
-                buffer: Some(Box::new(buffer_id_to_fb(*buffer))),
-            }))
-        }
-    }
-}
-
 /// Decodes a logical computation identity without depending on physical run numbering.
 fn computation_id_from_fb(id: Option<&fbs::CallId>) -> CodecResult<CallId> {
     let id = id.context("computation identity is missing")?;
     Ok(CallId::new(id.batch_id(), id.request_index()))
-}
-
-fn computation_id_to_fb(id: CallId) -> fbs::CallIdT {
-    fbs::CallIdT {
-        batch_id: id.batch_id,
-        request_index: id.request_index,
-    }
-}
-
-/// Converts a request identity into its FlatBuffers object representation.
-fn request_key_to_fb(request_key: RequestKey) -> fbs::RequestKeyT {
-    fbs::RequestKeyT {
-        engine_id: request_key.engine_id,
-        request_id: request_key.request_id.0,
-        request_epoch: request_key.request_epoch,
-    }
 }
 
 /// Decodes and validates a persistent-buffer identity.
@@ -1577,16 +1181,6 @@ fn buffer_id_from_table(buffer: fbs::BufferId<'_>) -> CodecResult<BufferId> {
     };
     id.validate()?;
     Ok(id)
-}
-
-/// Converts a persistent-buffer identity into its wire table.
-fn buffer_id_to_fb(buffer: BufferId) -> fbs::BufferIdT {
-    fbs::BufferIdT {
-        owner: Some(Box::new(request_key_to_fb(buffer.owner))),
-        producer_call_id: Some(computation_id_to_fb(buffer.producer_call_id)),
-        output_index: buffer.output_index,
-        generation: buffer.generation,
-    }
 }
 
 /// Flattens shape bounds into extents and a single dynamic-axis marker.
@@ -1607,156 +1201,12 @@ fn shape_bound_to_parts(shape: &ShapeBound) -> (Vec<u32>, i32) {
     (extents, dynamic_axis)
 }
 
-/// Converts tensor identity and bounded geometry into its wire table.
-fn tensor_ref_to_fb(tensor: &TensorRef) -> CodecResult<fbs::TensorRefT> {
-    tensor.validate()?;
-    let (extents, dynamic_axis) = shape_bound_to_parts(&tensor.shape_bound);
-    Ok(fbs::TensorRefT {
-        id: Box::new(buffer_id_to_fb(tensor.buffer_id())),
-        dtype: dtype_to_fb(tensor.dtype),
-        extents: Some(extents),
-        dynamic_axis,
-    })
-}
-
-/// Converts deterministic random coordinates into their wire table.
-fn rng_to_fb(rng: &Rng) -> fbs::RngT {
-    fbs::RngT {
-        seed: rng.seed,
-        semantic_index_base: rng.semantic_index_base,
-        draw_layout: draw_layout_to_fb(rng.draw_layout),
-    }
-}
-
-/// Converts a completion report into its FlatBuffers object representation.
-fn run_result_to_fb(report: &BatchOutput) -> CodecResult<fbs::BatchOutputT> {
-    report.validate()?;
-    Ok(fbs::BatchOutputT {
-        batch_id: report.batch_id,
-        completions: Some(
-            report
-                .completions
-                .iter()
-                .map(completion_record_to_fb)
-                .collect(),
-        ),
-        products: Some(
-            report
-                .products
-                .iter()
-                .map(tensor_publication_to_fb)
-                .collect::<CodecResult<_>>()?,
-        ),
-        registration: Some(Box::new(fbs::RegistrationAckT {
-            visible: report.registration.visible,
-        })),
-        worker_exec_us: report.worker_exec_us,
-        forward_stats: report
-            .forward_stats
-            .as_ref()
-            .map(forward_stats_to_fb)
-            .map(Box::new),
-    })
-}
-
 /// Converts the completion fields into their wire table.
 fn token_logprob_from_fb(entry: &fbs::TokenLogprob) -> TokenLogprob {
     TokenLogprob {
         token_id: entry.token_id(),
         logprob: entry.logprob(),
         rank: entry.rank(),
-    }
-}
-
-fn token_logprob_to_fb(entry: &TokenLogprob) -> fbs::TokenLogprobT {
-    fbs::TokenLogprobT {
-        token_id: entry.token_id,
-        logprob: entry.logprob,
-        rank: entry.rank,
-    }
-}
-
-fn completion_record_to_fb(record: &RequestOutput) -> fbs::RequestOutputT {
-    fbs::RequestOutputT {
-        sampled_logprob: record.sampled_logprob,
-        top_logprobs: Some(
-            record
-                .top_logprobs
-                .iter()
-                .map(token_logprob_to_fb)
-                .collect(),
-        ),
-        prompt_logprobs: Some(
-            record
-                .prompt_logprobs
-                .iter()
-                .map(|entries| fbs::PositionLogprobsT {
-                    entries: Some(entries.iter().map(token_logprob_to_fb).collect()),
-                })
-                .collect(),
-        ),
-        request_key: Some(Box::new(request_key_to_fb(record.request_key))),
-        call_id: Some(computation_id_to_fb(record.call_id)),
-        status: call_status_to_fb(record.status),
-        product_generations: Some(record.product_generations.clone()),
-        error_code: record.error_code.map(error_code_to_fb),
-        timing_counters: Some(Box::new(fbs::TimingCountersT {
-            queued_us: record.timing_counters.queued_us,
-            device_us: record.timing_counters.device_us,
-            copy_us: record.timing_counters.copy_us,
-            host_us: record.timing_counters.host_us,
-        })),
-        code: computation_to_fb(record.code),
-        position: record.position,
-        kv_visible_len: record.kv_visible_len,
-        kv_computed_len: record.kv_computed_len,
-        num_completed_steps: record.num_completed_steps,
-        committed_tokens: Some(record.committed_tokens.clone()),
-        finish_flags: Some(Box::new(fbs::FinishFlagsT {
-            eos: record.finish_flags.eos,
-            length: record.finish_flags.length,
-            stop: record.finish_flags.stop,
-        })),
-        kv_output: record
-            .kv_output
-            .as_ref()
-            .map(kv_transfer_to_fb)
-            .map(Box::new),
-        media_output: record
-            .media_output
-            .as_ref()
-            .map(media_output_to_fb)
-            .map(Box::new),
-    }
-}
-
-/// Converts media metadata and its transport-specific artifact handle.
-fn media_output_to_fb(output: &MediaOutput) -> fbs::MediaOutputT {
-    fbs::MediaOutputT {
-        handle: match &output.handle {
-            ArtifactHandle::PosixShm { name } => {
-                fbs::ArtifactHandleT::PosixShmArtifact(Box::new(fbs::PosixShmArtifactT {
-                    name: Some(name.clone()),
-                }))
-            }
-        },
-        bytes: output.bytes,
-    }
-}
-
-/// Converts a tensor publication into its wire descriptor.
-fn tensor_publication_to_fb(payload: &TensorPublication) -> CodecResult<fbs::TensorPublicationT> {
-    Ok(fbs::TensorPublicationT {
-        product: Some(Box::new(tensor_ref_to_fb(&payload.product)?)),
-        value: Some(Box::new(transfer_handle_to_fb(&payload.value))),
-    })
-}
-
-/// Converts an error's request and call identity into its wire table.
-fn error_call_to_fb(call: &ErrorCallIdentity) -> fbs::ErrorCallIdentityT {
-    fbs::ErrorCallIdentityT {
-        request_key: Some(Box::new(request_key_to_fb(call.request_key))),
-        call_id: Some(computation_id_to_fb(call.call_id)),
     }
 }
 
@@ -1787,24 +1237,6 @@ fn kv_cache_from_table(config: fbs::KVCacheInfo<'_>) -> CodecResult<KvCacheInfo>
     })
 }
 
-/// Converts KV-cache capacity and group geometry into their wire table.
-fn kv_cache_to_fb(config: &KvCacheInfo) -> fbs::KVCacheInfoT {
-    fbs::KVCacheInfoT {
-        block_size: config.block_size,
-        num_blocks: config.num_blocks,
-        num_layers: config.num_layers,
-        total_layers: config.total_layers,
-        layer_offset: config.layer_offset,
-        num_kv_heads: config.num_kv_heads,
-        total_kv_heads: config.total_kv_heads,
-        kv_head_offset: config.kv_head_offset,
-        head_dim: config.head_dim,
-        bytes_per_token: config.bytes_per_token,
-        groups: Some(config.groups.iter().map(kv_group_to_fb).collect()),
-        dtype: Some(config.dtype.as_str().to_owned()),
-    }
-}
-
 fn distribution_from_fb(
     value: fbs::ComponentDistribution,
 ) -> CodecResult<Option<uniserve_core::ComponentDistribution>> {
@@ -1814,37 +1246,6 @@ fn distribution_from_fb(
             Ok(Some(uniserve_core::ComponentDistribution::TemporalUnits))
         }
         _ => codec_bail!("unknown component distribution"),
-    }
-}
-
-fn parallel_to_fb(config: &uniserve_core::ParallelConfig) -> fbs::ParallelConfigT {
-    use uniserve_core::SequenceParallel;
-    let sequence_parallel = match config.sequence_parallel {
-        SequenceParallel::Local => {
-            fbs::SequenceParallelT::LocalSequence(Box::new(fbs::LocalSequenceT {}))
-        }
-        SequenceParallel::Ulysses { ulysses_degree } => {
-            fbs::SequenceParallelT::UlyssesSequence(Box::new(fbs::UlyssesSequenceT {
-                ulysses_degree: ulysses_degree as u32,
-            }))
-        }
-        SequenceParallel::Allgather { allgather_degree } => {
-            fbs::SequenceParallelT::GatherSequence(Box::new(fbs::GatherSequenceT {
-                allgather_degree: allgather_degree as u32,
-            }))
-        }
-        SequenceParallel::Hybrid {
-            ulysses_degree,
-            allgather_degree,
-        } => fbs::SequenceParallelT::HybridSequence(Box::new(fbs::HybridSequenceT {
-            ulysses_degree: ulysses_degree as u32,
-            allgather_degree: allgather_degree as u32,
-        })),
-    };
-    fbs::ParallelConfigT {
-        tensor_parallel_size: config.tensor_parallel_size as u32,
-        pipeline_parallel_size: config.pipeline_parallel_size as u32,
-        sequence_parallel,
     }
 }
 
@@ -1884,276 +1285,6 @@ fn parallel_from_fb(config: fbs::ParallelConfig<'_>) -> CodecResult<uniserve_cor
         pipeline_parallel_size: config.pipeline_parallel_size() as usize,
         sequence_parallel,
     })
-}
-
-/// Converts validated worker capabilities into their wire table.
-fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
-    info.validate()?;
-    Ok(fbs::WorkerInfoT {
-        model_name: Some(info.model_name.clone()),
-        endpoint: Some(Box::new(endpoint_to_fb(&info.endpoint))),
-        device: Some(info.device.clone()),
-        transfer_backends: Some(info.transfer_backends.clone()),
-        fabric_handles: info.fabric_handles,
-        world_size: info.world_size,
-        model_dtype: Some(info.model_dtype.clone()),
-        attention_backend: Some(info.attention_backend.clone()),
-        weight_formats: Some(info.weight_formats.clone()),
-        activation_formats: Some(info.activation_formats.clone()),
-        checkpoint_identity: Some(info.checkpoint_identity.clone()),
-        components: Some(
-            info.components
-                .iter()
-                .map(|component| {
-                    Ok(fbs::ComponentInfoT {
-                        name: Some(component.name.clone()),
-                        ranks: Some(
-                            component
-                                .config
-                                .ranks
-                                .iter()
-                                .map(|&rank| rank as u64)
-                                .collect(),
-                        ),
-                        parallel_config: Some(Box::new(parallel_to_fb(
-                            &component.config.parallel_config,
-                        ))),
-                        distribution: match component.config.distribution {
-                            None => fbs::ComponentDistribution::Local,
-                            Some(uniserve_core::ComponentDistribution::TemporalUnits) => {
-                                fbs::ComponentDistribution::TemporalUnits
-                            }
-                        },
-                        units_per_rank: component.config.units_per_rank as u32,
-                        outputs: Some(
-                            component
-                                .outputs
-                                .iter()
-                                .map(|output| {
-                                    let (extents, dynamic_axis) =
-                                        shape_bound_to_parts(&output.shape_bound);
-                                    fbs::OutputInfoT {
-                                        name: Some(output.name.clone()),
-                                        dtype: dtype_to_fb(output.dtype),
-                                        extents: Some(extents),
-                                        dynamic_axis,
-                                    }
-                                })
-                                .collect(),
-                        ),
-                    })
-                })
-                .collect::<CodecResult<Vec<_>>>()?,
-        ),
-        supported_calls: Some(
-            info.supported_calls
-                .iter()
-                .copied()
-                .map(computation_to_fb)
-                .collect(),
-        ),
-        queue_depth: info.queue_depth,
-        max_batch_calls: info.max_batch_calls,
-        max_batch_tokens: info.max_batch_tokens,
-        request_slots: info.request_slots,
-        kv_cache: info.kv_cache.as_ref().map(kv_cache_to_fb).map(Box::new),
-        latent_page_units: info.latent_page_units,
-        latent_pages: info.latent_pages,
-        buffer_pool_bytes: info.buffer_pool_bytes,
-        encoder_cache_entries: info.encoder_cache_entries,
-        encoder_entry_bytes: info.encoder_entry_bytes,
-        max_unresolved_calls: info.max_unresolved_calls,
-        host_lane_capacity: info.host_lane_capacity,
-        media_components: Some(
-            info.media_components
-                .iter()
-                .map(|(call, component)| fbs::MediaComponentT {
-                    call: media_call_to_fb(*call),
-                    component: Some(component.clone()),
-                })
-                .collect(),
-        ),
-        num_inference_steps: info.num_inference_steps,
-    })
-}
-
-/// Converts sampling parameters into their FlatBuffers object representation.
-fn sampling_to_fb(sampling: &SamplingParams) -> CodecResult<fbs::SamplingParamsT> {
-    validate_sampling(sampling)?;
-
-    Ok(fbs::SamplingParamsT {
-        // Scalar controls copy directly into the object representation.
-        temperature: sampling.temperature,
-        top_k: sampling.top_k,
-        top_p: sampling.top_p,
-        ignore_eos: sampling.ignore_eos,
-        seed: sampling.seed,
-        min_p: sampling.min_p,
-        repetition_penalty: sampling.repetition_penalty,
-        frequency_penalty: sampling.frequency_penalty,
-        presence_penalty: sampling.presence_penalty,
-
-        // Token-specific controls require owned FlatBuffers vectors.
-        logit_bias: Some(
-            sampling
-                .logit_bias
-                .iter()
-                .map(|(token_id, bias)| fbs::TokenBiasT {
-                    token_id: *token_id,
-                    bias: *bias,
-                })
-                .collect(),
-        ),
-        min_tokens: sampling.min_tokens as u64,
-        n_logprobs: sampling.n_logprobs,
-        bad_words_ids: Some(
-            sampling
-                .bad_words_ids
-                .iter()
-                .map(|items| fbs::U32ListT {
-                    items: Some(items.clone()),
-                })
-                .collect(),
-        ),
-        allowed_token_ids: sampling.allowed_token_ids.clone(),
-        return_logprobs: sampling.return_logprobs,
-        return_prompt_logprobs: sampling.return_prompt_logprobs,
-        n_prompt_logprobs: sampling.n_prompt_logprobs,
-        logprob_token_ids: Some(sampling.logprob_token_ids.clone()),
-        typical_p: sampling.typical_p,
-        forced_token_ids: Some(sampling.forced_token_ids.clone()),
-    })
-}
-
-/// Validates floating-point sampling fields before they cross the wire boundary.
-fn validate_sampling(sampling: &SamplingParams) -> CodecResult<()> {
-    for value in [
-        sampling.temperature,
-        sampling.top_p,
-        sampling.min_p,
-        sampling.repetition_penalty,
-        sampling.frequency_penalty,
-        sampling.presence_penalty,
-    ] {
-        codec_ensure!(value.is_finite(), "sampling parameters must be finite");
-    }
-    for (_, value) in &sampling.logit_bias {
-        codec_ensure!(value.is_finite(), "logit bias must be finite");
-    }
-    codec_ensure!(
-        sampling.typical_p.is_finite() && sampling.typical_p > 0.0 && sampling.typical_p <= 1.0,
-        "sampling.typical_p must be in (0, 1]"
-    );
-    Ok(())
-}
-
-/// Converts image-generation parameters into their wire table.
-fn image_to_fb(image: &uniserve_core::ImageParams) -> fbs::ImageParamsT {
-    fbs::ImageParamsT {
-        steps: image.steps,
-        cfg_text_scale: image.cfg_text_scale,
-        cfg_img_scale: image.cfg_img_scale,
-        cfg_renorm_type: Some(image.cfg_renorm_type.as_str().to_owned()),
-        cfg_renorm_min: image.cfg_renorm_min,
-        cfg_interval_lo: image.cfg_interval.0,
-        cfg_interval_hi: image.cfg_interval.1,
-        timestep_shift: image.timestep_shift,
-        height: image.height,
-        width: image.width,
-        seed: image.seed,
-        negative_prompt: Some(image.negative_prompt.clone()),
-        max_images: image.max_images,
-        image_prompts: Some(image.image_prompts.clone()),
-        retain_images: image.retain_images,
-    }
-}
-
-/// Converts forward-path counters into their wire table.
-fn forward_stats_to_fb(stats: &ForwardStats) -> fbs::ForwardStatsT {
-    fbs::ForwardStatsT {
-        // Aggregate execution-mode counters.
-        mode_counts: Some(map_to_fb(&stats.mode_counts)),
-        mode_tokens: Some(map_to_fb(&stats.mode_tokens)),
-        mode_us: Some(map_to_fb(&stats.mode_us)),
-
-        // Attention backend activity.
-        attention_launches: stats.attention_launches,
-        attention_us: stats.attention_us,
-        attention_backend_counts: Some(map_to_fb(&stats.attention_backend_counts)),
-
-        // CUDA graph lifecycle and padding behavior.
-        cuda_graph_captures: stats.cuda_graph_captures,
-        cuda_graph_replays: stats.cuda_graph_replays,
-        cuda_graph_misses: stats.cuda_graph_misses,
-        cuda_graph_fallbacks: stats.cuda_graph_fallbacks,
-        cuda_graph_unpadded_tokens: stats.cuda_graph_unpadded_tokens,
-        cuda_graph_padded_tokens: stats.cuda_graph_padded_tokens,
-        cuda_graph_runtime_mode_counts: Some(map_to_fb(&stats.cuda_graph_runtime_mode_counts)),
-
-        // Decode relay cache effectiveness.
-        text_decode_token_relay_hits: stats.text_decode_token_relay_hits,
-        text_decode_token_relay_misses: stats.text_decode_token_relay_misses,
-        text_decode_position_relay_hits: stats.text_decode_position_relay_hits,
-        text_decode_position_relay_misses: stats.text_decode_position_relay_misses,
-
-        // FlashInfer planning activity.
-        flashinfer_decode_plan_calls: stats.flashinfer_decode_plan_calls,
-        flashinfer_decode_plan_reuses: stats.flashinfer_decode_plan_reuses,
-        flashinfer_decode_plan_rows: stats.flashinfer_decode_plan_rows,
-        flashinfer_decode_plan_indices: stats.flashinfer_decode_plan_indices,
-        flashinfer_decode_graph_plan_calls: stats.flashinfer_decode_graph_plan_calls,
-        flashinfer_decode_graph_plan_reuses: stats.flashinfer_decode_graph_plan_reuses,
-
-        // Speculative-verification outcomes.
-        spec_verify_rows: stats.spec_verify_rows,
-        spec_verify_draft_tokens: stats.spec_verify_draft_tokens,
-        spec_verify_accepted_tokens: stats.spec_verify_accepted_tokens,
-        spec_verify_rejected_tokens: stats.spec_verify_rejected_tokens,
-        spec_verify_committed_tokens: stats.spec_verify_committed_tokens,
-        spec_verify_path_counts: Some(map_to_fb(&stats.spec_verify_path_counts)),
-
-        // Per-component timing totals.
-        component_us: Some(map_to_fb(&stats.component_us)),
-    }
-}
-
-/// Converts a deterministic counter map into ordered key-value tables.
-fn map_to_fb(map: &BTreeMap<String, u64>) -> Vec<fbs::StringU64PairT> {
-    map.iter()
-        .map(|(key, value)| fbs::StringU64PairT {
-            key: Some(key.clone()),
-            value: *value,
-        })
-        .collect()
-}
-
-/// Converts full-attention or sliding-window KV group geometry.
-fn kv_group_to_fb(group: &KvCacheGroup) -> fbs::KvGroupT {
-    match group.kind {
-        KvGroupKind::Full => fbs::KvGroupT {
-            num_blocks: group.num_blocks,
-            kind: fbs::KvGroupKind::Full,
-            window: 0,
-            sink: 0,
-        },
-        KvGroupKind::SlidingWindow { window, sink } => fbs::KvGroupT {
-            num_blocks: group.num_blocks,
-            kind: fbs::KvGroupKind::SlidingWindow,
-            window,
-            sink,
-        },
-    }
-}
-
-/// Converts physical process coordinates into their wire table.
-fn endpoint_to_fb(endpoint: &WorkerEndpoint) -> fbs::WorkerEndpointT {
-    fbs::WorkerEndpointT {
-        worker_id: Some(endpoint.worker_id.clone()),
-        rank: endpoint.rank,
-        node: Some(endpoint.node.clone()),
-        address_space: Some(endpoint.address_space.clone()),
-        incarnation: Some(endpoint.incarnation.clone()),
-    }
 }
 
 fn forward_mode_to_fb(value: ForwardMode) -> fbs::ForwardMode {
@@ -2223,13 +1354,13 @@ fn transfer_mode_from_fb(value: fbs::TransferMode) -> CodecResult<TransferMode> 
     })
 }
 
-/// Encode exactly one classification in a three-byte inline wire struct.
-fn computation_to_fb(value: CallKind) -> fbs::CallKindT {
-    let mut encoded = fbs::CallKindT::default();
+/// Encodes exactly one computation in the inline wire classification.
+fn computation_to_fb(value: CallKind) -> fbs::CallKind {
+    let mut encoded = fbs::CallKind::default();
     match value {
-        CallKind::Forward(mode) => encoded.forward_mode = forward_mode_to_fb(mode),
-        CallKind::Media(call) => encoded.media = media_call_to_fb(call),
-        CallKind::Transfer(mode) => encoded.transfer = transfer_mode_to_fb(mode),
+        CallKind::Forward(mode) => encoded.set_forward_mode(forward_mode_to_fb(mode)),
+        CallKind::Media(call) => encoded.set_media(media_call_to_fb(call)),
+        CallKind::Transfer(mode) => encoded.set_transfer(transfer_mode_to_fb(mode)),
     }
     encoded
 }
@@ -2368,13 +1499,6 @@ fn tensor_transfer_from_table(value: fbs::TensorTransfer<'_>) -> CodecResult<Ten
     Ok(tensor)
 }
 
-fn tensor_transfer_to_fb(value: &TensorTransfer) -> fbs::TensorTransferT {
-    fbs::TensorTransferT {
-        shape: Some(value.shape.clone()),
-        locations: Some(value.locations.iter().map(transfer_locator_to_fb).collect()),
-    }
-}
-
 /// Decodes a product-family transfer union and all referenced locators.
 fn transfer_handle_from_table(value: fbs::TransferHandle<'_>) -> CodecResult<TransferHandle> {
     // The outer union selects product-family metadata; every physical tensor
@@ -2434,115 +1558,6 @@ fn transfer_handle_from_table(value: fbs::TransferHandle<'_>) -> CodecResult<Tra
         }
         other => codec_bail!("unknown transfer payload variant {}", other.0),
     })
-}
-
-/// Converts common tensor metadata and one transport coordinate set.
-fn transfer_locator_to_fb(value: &Locator) -> fbs::LocatorT {
-    // Populate transport-independent tensor metadata before selecting the
-    // coordinate family stored in the shared FlatBuffers table.
-    let mut output = fbs::LocatorT {
-        source: Some(Box::new(endpoint_to_fb(&value.source))),
-        nbytes: value.nbytes,
-        dtype: Some(value.dtype.clone()),
-        shape: Some(value.shape.clone()),
-        device: Some(value.device.clone()),
-        offset: Some(value.offset.clone()),
-        ..Default::default()
-    };
-
-    match &value.transport {
-        TransferTransport::Local { endpoint, key } => {
-            output.transport = fbs::TransferTransportKind::Local;
-            output.endpoint = Some(endpoint.clone());
-            output.key = *key;
-        }
-        TransferTransport::PosixShm { endpoint, name } => {
-            output.transport = fbs::TransferTransportKind::PosixShm;
-            output.endpoint = Some(endpoint.clone());
-            output.name = Some(name.clone());
-        }
-        TransferTransport::CudaVmm {
-            endpoint,
-            publication_id,
-            storage_size_bytes,
-            storage_offsets_bytes,
-            span_lengths,
-            span_counts,
-            tensor_stride,
-            ready_event_handle,
-            allocation_handle,
-            acknowledgment_offset,
-        } => {
-            output.transport = fbs::TransferTransportKind::CudaVmm;
-            output.endpoint = Some(endpoint.clone());
-            output.publication_id = Some(publication_id.clone());
-            output.storage_size_bytes = *storage_size_bytes;
-            output.storage_offsets_bytes = Some(storage_offsets_bytes.clone());
-            output.span_lengths = Some(span_lengths.clone());
-            output.span_counts = Some(span_counts.clone());
-            output.tensor_stride = Some(tensor_stride.clone());
-            output.ready_event_handle = Some(ready_event_handle.clone());
-            output.allocation_handle = Some(allocation_handle.clone());
-            output.acknowledgment_offset = *acknowledgment_offset;
-        }
-        TransferTransport::Channel { endpoint, payload } => {
-            output.transport = fbs::TransferTransportKind::Channel;
-            output.endpoint = Some(endpoint.clone());
-            output.payload = Some(payload.clone());
-        }
-    }
-
-    output
-}
-
-/// Converts a transfer handle into its product-family wire union.
-fn transfer_handle_to_fb(value: &TransferHandle) -> fbs::TransferHandleT {
-    // The product family selects a self-contained transfer metadata table;
-    // physical tensor order is preserved within each family.
-    let value = match value {
-        TransferHandle::Encoder {
-            height,
-            width,
-            payload_kind,
-            tensor,
-        } => fbs::TransferDataT::EncoderTransfer(Box::new(fbs::EncoderTransferT {
-            height: *height,
-            width: *width,
-            payload_kind: match payload_kind {
-                FeatureKind::Vision => fbs::FeatureKind::Vision,
-                FeatureKind::Latent => fbs::FeatureKind::Latent,
-            },
-            tensor: Some(Box::new(tensor_transfer_to_fb(tensor))),
-        })),
-
-        TransferHandle::DeviceProduct {
-            height,
-            width,
-            value_range,
-            tensor,
-        } => fbs::TransferDataT::DeviceProductTransfer(Box::new(fbs::DeviceProductTransferT {
-            height: *height,
-            width: *width,
-            value_range: Some(value_range.clone()),
-            tensor: Some(Box::new(tensor_transfer_to_fb(tensor))),
-        })),
-
-        TransferHandle::Latent {
-            height,
-            width,
-            latent_units,
-            step,
-            tensor,
-        } => fbs::TransferDataT::LatentTransfer(Box::new(fbs::LatentTransferT {
-            height: *height,
-            width: *width,
-            latent_units: *latent_units,
-            step: *step,
-            tensor: Some(Box::new(tensor_transfer_to_fb(tensor))),
-        })),
-    };
-
-    fbs::TransferHandleT { value }
 }
 
 /// Maps an element type to its stable FlatBuffers discriminant.
@@ -2709,29 +1724,4 @@ fn kv_transfer_from_table(transfer: fbs::KvTransfer<'_>) -> CodecResult<KvTransf
             .context("KV transfer compute dtype is missing")?
             .to_owned(),
     })
-}
-
-fn kv_transfer_to_fb(transfer: &KvTransfer) -> fbs::KvTransferT {
-    let KvTransfer {
-        tensors,
-        source,
-        destination,
-        base,
-        base_extent,
-        published_extent,
-        group_id,
-        compute_dtype,
-        page_size,
-    } = transfer;
-    fbs::KvTransferT {
-        tensors: Some(tensors.iter().map(tensor_transfer_to_fb).collect()),
-        source: Some(Box::new(buffer_id_to_fb(*source))),
-        destination: Some(destination.clone()),
-        base: base.map(buffer_id_to_fb).map(Box::new),
-        base_extent: *base_extent,
-        published_extent: *published_extent,
-        group_id: *group_id,
-        compute_dtype: Some(compute_dtype.clone()),
-        page_size: *page_size,
-    }
 }

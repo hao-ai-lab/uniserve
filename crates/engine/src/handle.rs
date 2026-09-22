@@ -124,7 +124,7 @@ impl EventTx {
 }
 
 /// Bounded engine-to-caller event receiver. Releasing one channel slot wakes
-/// the scheduler so an output-capacity-stalled lineage becomes runnable without
+/// the scheduler so an output-capacity-stalled request becomes runnable without
 /// polling.
 pub struct EventRx {
     inner: mpsc::Receiver<EngineCoreOutput>,
@@ -136,7 +136,7 @@ pub struct EventRx {
 }
 
 struct EventCancellation {
-    tx: crossbeam_channel::Sender<Command>,
+    handle: EngineHandle,
     request_id: RequestId,
     acknowledge_on_receive: bool,
 }
@@ -216,7 +216,7 @@ impl EventRx {
             return;
         }
         if let Some(cancellation) = self.cancellation.as_ref() {
-            let _ = cancellation.tx.send(Command::Acknowledge {
+            let _ = cancellation.handle.send(Command::Acknowledge {
                 request_id: cancellation.request_id,
                 output_token_count: self.text_tokens_received,
             });
@@ -244,7 +244,7 @@ impl EventRx {
                 output_token_count: self.text_tokens_received,
             },
         };
-        let _ = cancellation.tx.send(command);
+        let _ = cancellation.handle.send(command);
     }
 
     /// Disarms cancellation and invokes the completion callback exactly once.
@@ -260,7 +260,7 @@ impl Drop for EventRx {
     /// Releases resources owned by this value.
     fn drop(&mut self) {
         if let Some(cancellation) = self.cancellation.take() {
-            let _ = cancellation.tx.send(Command::Cancel {
+            let _ = cancellation.handle.send(Command::Cancel {
                 request_id: cancellation.request_id,
                 output_token_count: Some(self.acknowledged_token_count),
             });
@@ -272,12 +272,6 @@ impl Drop for EventRx {
     }
 }
 
-/// Creates a bounded request event channel with cancellation tracking.
-pub(crate) fn event_channel() -> (EventTx, EventRx) {
-    event_channel_with_waker(uniserve_core::CommandWaker::noop(), None)
-}
-
-/// Creates an event channel connected to a wake descriptor.
 fn event_channel_with_waker(
     waker: uniserve_core::CommandWaker,
     cancellation: Option<EventCancellation>,
@@ -383,7 +377,7 @@ impl EngineHandle {
         let (event_tx, event_rx) = event_channel_with_waker(
             self.waker.clone(),
             Some(EventCancellation {
-                tx: self.tx.clone(),
+                handle: self.clone(),
                 request_id,
                 acknowledge_on_receive,
             }),

@@ -100,6 +100,8 @@ def test_cancelled_import_releases_pages_after_pending_read_retires() -> None:
             write.completion.result(timeout=5)
         write.retirement.result(timeout=5)
         assert pool.retirement_ready(requests=(source.owner,))
+        parent.send("settled")
+        assert parent.poll(5) and parent.recv()
         pool.zero_pages(0, (1,))
         for actual in pool.cache.state(pool.layers[0]).read(
             (1,), start=0, length=256

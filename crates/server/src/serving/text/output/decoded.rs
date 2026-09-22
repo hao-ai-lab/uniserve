@@ -203,7 +203,7 @@ impl DecodeState<'_> {
                     internal_token_count: 0,
                     finish_reason: FinishReason::with_stop_reason(
                         uniserve_core::FinishReason::Stop,
-                        Some(StopReason::Text(stop_string)),
+                        Some(StopReason::String(stop_string)),
                     ),
                 }),
             })
@@ -441,7 +441,7 @@ pub async fn decoded_text_event_stream(
                             .to_string(),
                     });
                 }
-                let finish_reason = text_finish_reason(reason, stop_reason);
+                let finish_reason = FinishReason::with_stop_reason(reason, stop_reason);
 
                 let (last_chunk, text) = state.decoder.flush(None)?;
                 let full_text = tracing::enabled!(Level::TRACE).then(|| text.clone());
@@ -479,10 +479,13 @@ pub async fn decoded_text_event_stream(
                 .await;
                 return Ok(());
             }
-            // Rejection and engine errors are terminal protocol failures for the
-            // text decoder and preserve the engine-supplied message.
-            EngineCoreOutput::Rejected { message }
-            | EngineCoreOutput::Error { message }
+            EngineCoreOutput::Rejected { message } => {
+                return Err(Error::Rejected {
+                    request_id,
+                    message,
+                });
+            }
+            EngineCoreOutput::Error { message }
             | EngineCoreOutput::ArtifactUnavailable { message } => {
                 return Err(Error::MalformedOutput {
                     request_id: request_id.clone(),
@@ -505,23 +508,6 @@ pub async fn decoded_text_event_stream(
     }
 
     Err(Error::StreamClosedBeforeTerminalOutput { request_id })
-}
-
-/// Returns the text finish reason represented by a generation event.
-fn text_finish_reason(
-    reason: uniserve_core::FinishReason,
-    stop_reason: Option<uniserve_core::StopReason>,
-) -> FinishReason {
-    if reason == uniserve_core::FinishReason::Stop {
-        return FinishReason::with_stop_reason(
-            reason,
-            stop_reason.map(|reason| match reason {
-                uniserve_core::StopReason::Token(id) => StopReason::TokenId(id),
-                uniserve_core::StopReason::String(value) => StopReason::Text(value),
-            }),
-        );
-    }
-    FinishReason::new(reason)
 }
 
 /// Returns the suffix byte count retained to detect cross-chunk stop strings.

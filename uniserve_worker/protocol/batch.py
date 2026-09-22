@@ -362,7 +362,7 @@ class NewRequest:
         Also parses its optional execution-family parameter sets.
         """
         data = _map(value, where)
-        image_data = data.get("umm")
+        image_data = data.get("image")
         admission = cls(
             request_key=identity.RequestKey.from_mapping(
                 data.get("request_key"), f"{where}.request_key"
@@ -382,8 +382,8 @@ class NewRequest:
                 None
                 if image_data is None
                 else call.ImageParams.from_mapping(
-                    _map(image_data, f"{where}.umm").get("image", {}),
-                    f"{where}.umm.image",
+                    image_data,
+                    f"{where}.image",
                 )
             ),
             diffusion=(
@@ -408,9 +408,7 @@ class NewRequest:
             "ar": None
             if self.generation is None
             else self.generation.to_mapping(),
-            "umm": None
-            if self.image is None
-            else {"image": self.image.to_mapping()},
+            "image": None if self.image is None else self.image.to_mapping(),
             "diffusion": None
             if self.diffusion is None
             else self.diffusion.to_mapping(),
@@ -1116,31 +1114,6 @@ class Batch:
             ],
             "kv_inputs": [value.to_mapping() for value in self.kv_inputs],
         }
-
-
-@dataclass(frozen=True, slots=True)
-class RegistrationAck:
-    """Reports whether a lane publication is visible to consumers."""
-
-    visible: bool = False
-
-    @classmethod
-    def from_mapping(
-        cls, value: object, where: str = "registration"
-    ) -> RegistrationAck:
-        """Parse registration visibility.
-
-        Reports whether registration effects became visible to successor
-        runs.
-        """
-        data = _map(value, where)
-        return cls(
-            visible=_bool(data.get("visible", False), f"{where}.visible")
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Serialize registration visibility for IPC."""
-        return {"visible": self.visible}
 
 
 @dataclass(frozen=True, slots=True)

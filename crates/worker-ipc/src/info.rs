@@ -213,7 +213,7 @@ pub struct WorkerInfo {
     pub encoder_cache_entries: u32,
     /// Maximum bytes in one encoder feature product, independent of pool size.
     pub encoder_entry_bytes: u64,
-    /// Maximum unresolved calls per request lineage.
+    /// Maximum unresolved calls per request.
     pub max_unresolved_calls: u32,
     /// Concurrent host-lane tasks this rank's bounded host executor admits.
     #[serde(default)]

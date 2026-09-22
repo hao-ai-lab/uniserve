@@ -143,22 +143,17 @@ pub struct WorkerProcessArgs {
 }
 
 /// Parks until one descriptor becomes readable or `timeout` expires.
-pub(crate) fn park_descriptors(fds: &[i32], timeout: std::time::Duration) -> anyhow::Result<()> {
+pub(crate) fn park_descriptors(
+    fds: &[libc::pollfd],
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
     if fds.is_empty() {
         std::thread::park_timeout(timeout);
         return Ok(());
     }
     #[cfg(target_os = "linux")]
     {
-        let mut pollfds = fds
-            .iter()
-            .copied()
-            .map(|fd| libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            })
-            .collect::<Vec<_>>();
+        let mut pollfds = fds.to_vec();
         let timeout_ms = timeout
             .as_millis()
             .saturating_add(u128::from(

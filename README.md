@@ -110,6 +110,9 @@ curl -s http://127.0.0.1:8000/v1/images/generations \
   }'
 ```
 
+Each image response entry carries `b64_json`, pixel `height` and `width`, and the encoded PNG byte count `bytes`; `revised_prompt` is included when available. Request timing starts before preprocessing and includes queueing and generation.
+
+
 ## Serving configuration
 
 | Option | Default | Purpose |

@@ -14,11 +14,15 @@ use uniserve_server::profile::tokenizer::HuggingFaceTokenizer;
 use uniserve_server::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use uniserve_server::serving::{
-    AbortReason, FinishStatus, InputProcessor, RequestLifecycleState, RequestOutput,
-    ServedSamplingControl, ServingRuntime, StopCause, TextPromptRequest,
+    FinishStatus, InputProcessor, RequestLifecycleState, RequestOutput, ServedSamplingControl,
+    ServingRuntime, StopCause, TextPromptRequest,
 };
 
 fn runtime() -> ServingRuntime {
+    runtime_with_worker(SimEngine::new())
+}
+
+fn runtime_with_worker(worker: SimEngine) -> ServingRuntime {
     let vocabulary = (0_u32..128)
         .map(|id| (char::from_u32(id).unwrap().to_string(), id))
         .collect::<Vocab>();
@@ -36,7 +40,7 @@ fn runtime() -> ServingRuntime {
     let client = Arc::new(
         EngineClient::connect_with_executor(
             EngineConfig::sim("sim-model"),
-            Box::new(SimExecutor::new(SimEngine::new())),
+            Box::new(SimExecutor::new(worker)),
         )
         .unwrap(),
     );
@@ -167,7 +171,7 @@ fn controls_and_disconnection_release_requests_during_preprocessing() {
             } else {
                 runtime.cancel(id).await.unwrap();
                 if id == "abort" {
-                    runtime.abort(id, AbortReason::Admin).await.unwrap();
+                    runtime.abort(id).await.unwrap();
                     runtime.cancel(id).await.unwrap();
                 }
                 let mut stream = pending.await.unwrap();
@@ -187,6 +191,76 @@ fn controls_and_disconnection_release_requests_during_preprocessing() {
         assert_eq!(runtime.metrics_snapshot().aborted, 1);
         release_tx.send(()).unwrap();
         occupied.await.unwrap();
+        runtime.shutdown().await.unwrap();
+    });
+}
+
+#[tokio::test]
+async fn chat_admission_rejection_remains_a_bad_request() {
+    let mut worker = SimEngine::new();
+    worker.set_num_blocks(2);
+    let runtime = runtime_with_worker(worker);
+    let request = serde_json::from_value(serde_json::json!({
+        "model": "sim-model",
+        "messages": [{"role": "user", "content": "a".repeat(1024)}],
+        "max_completion_tokens": 8
+    }))
+    .unwrap();
+    let stream = runtime
+        .generate_chat("rejected-chat".into(), request)
+        .await
+        .unwrap();
+    let error = uniserve_server::openai::chat_completions::collect_chat_completion(
+        stream,
+        "rejected-chat".to_string(),
+        "sim-model".to_string(),
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        runtime.request_stats("rejected-chat").unwrap().state,
+        RequestLifecycleState::Rejected
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[test]
+fn successful_total_includes_time_waiting_for_preprocessing() {
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    executor.block_on(async {
+        let runtime = runtime();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let occupied = tokio::task::spawn_blocking(move || {
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        ready_rx.await.unwrap();
+        let mut pending = Box::pin(runtime.generate_text(request("timed")));
+        assert!(poll!(pending.as_mut()).is_pending());
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        release_tx.send(()).unwrap();
+        occupied.await.unwrap();
+        let mut stream = pending.await.unwrap();
+        let mut timing = None;
+        while let Some(event) = stream.next().await {
+            if let RequestOutput::Usage { timings, .. } = event.unwrap() {
+                timing = Some(timings);
+            }
+        }
+        let timing = timing.unwrap();
+        assert!(timing.total_us >= timing.compile_us, "{timing:?}");
         runtime.shutdown().await.unwrap();
     });
 }

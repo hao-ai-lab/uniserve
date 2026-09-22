@@ -5,11 +5,11 @@ use serde::{Deserialize, Serialize};
 use crate::{RequestId, SharedMedia};
 use std::sync::Arc;
 
-/// Terminal cause for one engine generation lineage.
+/// Terminal cause for one generation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
-    /// The requested generation program completed normally.
+    /// Generation completed normally.
     Completed,
     /// An end-of-sequence token ended text generation.
     Eos,
@@ -119,8 +119,6 @@ pub enum EngineCoreOutput {
         width: u32,
         /// PNG payload size in bytes.
         bytes: u64,
-        /// Lowercase hexadecimal SHA-256 digest of the PNG bytes.
-        sha256: String,
         /// Base64-encoded PNG payload.
         pixels_png_b64: String,
     },

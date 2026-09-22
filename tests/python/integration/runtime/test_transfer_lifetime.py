@@ -977,9 +977,11 @@ def test_cancelled_pending_shards_release_destination_after_read_retirement(
         assert ticket.ready()
         with pytest.raises(WorkerError, match="cancelled"):
             ticket.result()
-        # No DMA started while the producer was pending. Cancellation ends
-        # the real read and releases the reservation without waiting for it.
-        assert retired.wait(5), "cancelled physical read did not retire"
+        # Waiting for unread source bytes is cancellable. A retired read
+        # releases its destination, capacity and producer claim together.
+        assert retired.wait(5), "cancelled unread transfer did not retire"
+        parent.send("settled")
+        assert parent.poll(5) and parent.recv()
         parent.send("exit")
         process.join(30)
         assert process.exitcode == 0

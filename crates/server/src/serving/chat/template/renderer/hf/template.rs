@@ -150,7 +150,6 @@ mod tests {
             ChatTemplateContentFormatOption::Auto,
         )
         .unwrap();
-        assert_eq!(template.content_format(), ChatTemplateContentFormat::String);
         let result = template.apply(TemplateContext::default()).unwrap();
         assert_eq!(result, "[]");
     }

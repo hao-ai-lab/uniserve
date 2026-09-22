@@ -20,9 +20,9 @@ use uniserve_worker_ipc::{
     BufferAllocation, BufferId, CachePageAllocation, Call, CallId, CallKind, CallStatus, DType,
     DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout, ErrorCallIdentity, ErrorCode,
     FeatureKind, FinishFlags, ForwardStats, KvTransfer, LatentParams, Locator, MediaOutput,
-    NewRequest, RegistrationAck, RequestKey, RequestKind, RequestOutput, ShapeBound,
-    TensorPublication, TensorRef, TensorTransfer, TimingCounters, TransferHandle,
-    TransferTransport, WorkerEndpoint, WorkerRequest, WorkerResponse, WorkerResponseError,
+    NewRequest, RequestKey, RequestKind, RequestOutput, ShapeBound, TensorPublication, TensorRef,
+    TensorTransfer, TimingCounters, TransferHandle, TransferTransport, WorkerEndpoint,
+    WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
 #[cfg(test)]
@@ -724,9 +724,9 @@ fn admission_to_py<'py>(
     dict.set_item(
         intern!(py, "image"),
         admission
-            .umm
+            .image
             .as_ref()
-            .map(|branch| image_to_py(py, &branch.image))
+            .map(|branch| image_to_py(py, branch))
             .transpose()?,
     )?;
     dict.set_item(
@@ -1138,12 +1138,6 @@ fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<BatchOutput> {
     for item in products.iter() {
         payloads.push(tensor_publication_from_py(&item)?);
     }
-    // Decode aggregate acknowledgements and optional instrumentation metadata.
-    let registration = get(dict, intern!(py, "registration"))?;
-    let registration = registration.cast::<PyDict>().ok()?;
-    let registration = RegistrationAck {
-        visible: bool_of(&get(registration, intern!(py, "visible"))?)?,
-    };
     let forward_stats = match dict.get_item(intern!(py, "forward_stats")).ok()? {
         None => None,
         Some(value) if value.is_none() => None,
@@ -1153,7 +1147,6 @@ fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<BatchOutput> {
         batch_id: u64_of(&get(dict, intern!(py, "batch_id"))?)?,
         completions: records,
         products: payloads,
-        registration,
         worker_exec_us: opt_u64(dict, intern!(py, "worker_exec_us"))?,
         forward_stats,
     })
@@ -2018,7 +2011,7 @@ mod tests {
                 kv_output: None,
             }],
             products: Vec::new(),
-            registration: RegistrationAck { visible: true },
+
             worker_exec_us: Some(12),
             forward_stats: None,
         });
@@ -2052,7 +2045,7 @@ mod tests {
             batch_id,
             completions: Vec::new(),
             products: Vec::new(),
-            registration: RegistrationAck { visible: true },
+
             worker_exec_us: None,
             forward_stats: None,
         });

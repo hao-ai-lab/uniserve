@@ -19,21 +19,15 @@ use uniserve_worker_ipc::{
     TensorPublication,
 };
 
-/// One call's expected worker and result family until its batch retires.
-struct PendingCall {
-    worker: usize,
-    /// Whether the batch carrying this computation has been dispatched.
+/// One worker's outstanding submission; returned calls leave this record.
+struct PendingWorker {
     submitted: bool,
-    kind: uniserve_worker_ipc::CallKind,
-    completed: bool,
+    calls: HashMap<(RequestKey, uniserve_worker_ipc::CallId), uniserve_worker_ipc::CallKind>,
 }
 
 /// Dispatch and receipts for one scheduler batch.
 struct PendingBatch {
-    /// Workers this batch is dispatched to and has not yet returned from.
-    submitted_workers: HashSet<usize>,
-    expected_workers: u64,
-    calls: HashMap<(RequestKey, uniserve_worker_ipc::CallId), PendingCall>,
+    workers: HashMap<usize, PendingWorker>,
     commands: Vec<BatchCommand>,
     command_outcomes: HashMap<u32, CommandOutcome>,
 }
@@ -110,7 +104,6 @@ pub struct WorkerExecutor {
     executor_info: ExecutorInfo,
     depth: usize,
     command_wake: crate::handle::WakeSignal,
-    progress_fds: Vec<i32>,
     pending: BTreeMap<u64, PendingBatch>,
     ready: VecDeque<BatchResult>,
     admissions: HashMap<RequestKey, NewRequest>,
@@ -201,21 +194,9 @@ impl WorkerExecutor {
         transfer: TransferConfig,
     ) -> anyhow::Result<Self> {
         let command_wake = crate::handle::WakeSignal::new()?;
-        let progress_fds = std::iter::once(command_wake.descriptor())
-            .chain(
-                workers
-                    .iter()
-                    .flat_map(|(_, worker)| worker.progress_fds().iter().copied()),
-            )
-            .collect();
         anyhow::ensure!(
             !workers.is_empty(),
             "WorkerExecutor needs at least one worker"
-        );
-        anyhow::ensure!(
-            workers.len() <= u64::BITS as usize,
-            "WorkerExecutor supports at most {} workers",
-            u64::BITS
         );
 
         let mut routing = HashMap::new();
@@ -376,7 +357,6 @@ impl WorkerExecutor {
             executor_info,
             depth,
             command_wake,
-            progress_fds,
             pending: BTreeMap::new(),
             ready: VecDeque::new(),
             admissions: HashMap::new(),
@@ -394,25 +374,23 @@ impl WorkerExecutor {
         })
     }
 
-    /// Returns the mask bit assigned to a command worker.
-    fn worker_bit(index: usize) -> u64 {
-        1u64 << index
-    }
-
     /// Refreshes physical discovery after replacement; other instance counters remain intact.
     fn refresh_worker(&mut self, index: usize) {
         self.executor_info.workers[index].1 = self.workers[index].1.info().clone();
-        self.refresh_progress_fds();
     }
 
-    fn refresh_progress_fds(&mut self) {
-        self.progress_fds = std::iter::once(self.command_wake.descriptor())
-            .chain(
-                self.workers
-                    .iter()
-                    .flat_map(|(_, worker)| worker.progress_fds().iter().copied()),
-            )
-            .collect();
+    fn progress_fds(&self) -> Vec<libc::pollfd> {
+        std::iter::once(libc::pollfd {
+            fd: self.command_wake.descriptor(),
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .chain(
+            self.workers
+                .iter()
+                .flat_map(|(_, worker)| worker.progress_fds()),
+        )
+        .collect()
     }
 
     /// Reconciles abandoned work and its dependents while retaining live physical owners.
@@ -430,9 +408,12 @@ impl WorkerExecutor {
             .then(|| loss.execution.as_ref().and_then(|error| error.batch_id))
             .flatten()
             .filter(|batch_id| {
-                self.pending
-                    .get(batch_id)
-                    .is_some_and(|pending_batch| pending_batch.submitted_workers.contains(&index))
+                self.pending.get(batch_id).is_some_and(|pending_batch| {
+                    pending_batch
+                        .workers
+                        .get(&index)
+                        .is_some_and(|worker| worker.submitted)
+                })
             });
         let mut retired = loss.retired.iter().copied().collect::<HashSet<_>>();
         let failed_calls = retired
@@ -481,15 +462,12 @@ impl WorkerExecutor {
                 buffers.insert(*buffer);
             }
         }
-        for pending_batch in self.pending.values() {
-            requests.extend(
-                pending_batch
-                    .calls
-                    .iter()
-                    .filter_map(|((request, _), worker)| {
-                        (lost && worker.worker == index).then_some(*request)
-                    }),
-            );
+        if lost {
+            for pending in self.pending.values() {
+                if let Some(worker) = pending.workers.get(&index) {
+                    requests.extend(worker.calls.keys().map(|(request, _)| *request));
+                }
+            }
         }
         // Abandoning an unstarted producer also invalidates its future buffers.
         // Already running work on another instance keeps its real completion path.
@@ -542,23 +520,16 @@ impl WorkerExecutor {
             *queue = active;
         }
         for (batch_id, pending_batch) in &mut self.pending {
-            if lost || failed_run == Some(*batch_id) {
-                pending_batch.submitted_workers.remove(&index);
-            }
-            retired.extend(pending_batch.calls.iter().filter_map(|(identity, worker)| {
-                ((lost || (worker.submitted && failed_run == Some(*batch_id)))
-                    && worker.worker == index
-                    && !worker.completed)
-                    .then_some((*batch_id, identity.0, identity.1))
-            }));
-            for worker_index in 0..self.workers.len() {
-                let running = pending_batch.submitted_workers.contains(&worker_index);
-                let queued = self.worker_submissions[worker_index]
-                    .iter()
-                    .any(|submission| submission.batch.id == *batch_id);
-                if !running && !queued {
-                    pending_batch.expected_workers &= !Self::worker_bit(worker_index);
-                }
+            if let Some(worker) = pending_batch.workers.get_mut(&index)
+                && (lost || (worker.submitted && failed_run == Some(*batch_id)))
+            {
+                retired.extend(
+                    worker
+                        .calls
+                        .keys()
+                        .map(|identity| (*batch_id, identity.0, identity.1)),
+                );
+                worker.submitted = false;
             }
             pending_batch.set_command_outcome(&requests, CommandOutcome::Retired);
         }
@@ -574,17 +545,11 @@ impl WorkerExecutor {
                 .pending
                 .get_mut(&batch_id)
                 .context("retired call has no pending batch")?;
-            anyhow::ensure!(
-                pending_batch
-                    .calls
-                    .get(&(request, call))
-                    .is_some_and(|call| !call.completed),
-                "completed call cannot be abandoned"
-            );
-            anyhow::ensure!(
-                pending_batch.calls.remove(&(request, call)).is_some(),
-                "abandoned call is not pending"
-            );
+            let removed = pending_batch
+                .workers
+                .values_mut()
+                .any(|worker| worker.calls.remove(&(request, call)).is_some());
+            anyhow::ensure!(removed, "abandoned call is not pending");
             loss.retired.push((batch_id, request, call));
         }
         if lost {
@@ -595,18 +560,28 @@ impl WorkerExecutor {
                 workers.remove(&index);
             }
         }
+        for (batch_id, pending) in &mut self.pending {
+            pending.workers.retain(|worker_index, worker| {
+                worker.submitted
+                    || !worker.calls.is_empty()
+                    || self.worker_submissions[*worker_index]
+                        .iter()
+                        .any(|submission| submission.batch.id == *batch_id)
+            });
+        }
         let batches = self.pending.keys().copied().collect::<Vec<_>>();
         for batch_id in batches {
             if self
                 .pending
                 .get(&batch_id)
-                .is_some_and(|pending| pending.expected_workers == 0)
+                .is_some_and(|pending| pending.workers.is_empty())
             {
                 self.publish_result(WorkerResult {
                     batch_id,
+                    done: true,
                     results: Vec::new(),
                     products: Vec::new(),
-                    registration: uniserve_worker_ipc::RegistrationAck { visible: true },
+
                     worker_exec_us: None,
                     forward_stats: None,
                 })?;
@@ -682,8 +657,14 @@ impl WorkerExecutor {
             .chain(
                 self.pending
                     .values()
-                    .flat_map(|pending_batch| pending_batch.calls.iter())
-                    .filter_map(|((key, _), call)| (*key == request).then_some(call.worker)),
+                    .flat_map(|pending| pending.workers.iter())
+                    .filter_map(|(worker_index, worker)| {
+                        worker
+                            .calls
+                            .keys()
+                            .any(|(key, _)| *key == request)
+                            .then_some(*worker_index)
+                    }),
             )
             .chain(
                 self.buffer_workers
@@ -860,14 +841,12 @@ impl WorkerExecutor {
             .pending
             .get_mut(&batch.id)
             .context("submitted batch is not pending")?;
-        pending.submitted_workers.insert(worker_index);
-        for (call, _) in &batch.requests {
-            pending
-                .calls
-                .get_mut(&(call.request_key, call.call_id))
-                .context("submitted computation is not pending")?
-                .submitted = true;
-        }
+        let worker = pending
+            .workers
+            .get_mut(&worker_index)
+            .context("submitted worker is not pending")?;
+        anyhow::ensure!(!worker.submitted, "worker batch was submitted twice");
+        worker.submitted = true;
         self.admitted_workers
             .extend(request_keys.into_iter().map(|key| (worker_index, key)));
         Ok(true)
@@ -924,9 +903,6 @@ impl WorkerExecutor {
                     Ok(report) => report,
                     Err(error) => return Err(error),
                 };
-                if self.workers[worker_index].1.take_command_wake() {
-                    self.command_wake_pending = true;
-                }
                 let Some(report) = report else {
                     break;
                 };
@@ -977,50 +953,36 @@ impl WorkerExecutor {
             .cloned()
             .collect();
         let batch_id = report.batch_id;
-        let worker_bit = Self::worker_bit(worker_index);
         {
             let pending_batch = self
                 .pending
                 .get_mut(&batch_id)
                 .ok_or_else(|| anyhow::anyhow!("worker returned unknown batch {batch_id}"))?;
+            let worker = pending_batch
+                .workers
+                .get(&worker_index)
+                .context("worker returned an unexpected batch")?;
             anyhow::ensure!(
-                pending_batch.submitted_workers.remove(&worker_index),
-                "worker returned a batch it was not executing"
+                worker.submitted,
+                "worker returned a batch before submission"
             );
-            anyhow::ensure!(
-                pending_batch.expected_workers & worker_bit != 0,
-                "worker {worker_index} returned a duplicate or unexpected result for batch {batch_id}"
-            );
+            let mut seen = HashSet::new();
             for completion in &report.results {
                 let identity = (completion.output.request_key, completion.output.call_id);
-                let call = pending_batch
+                let kind = worker
                     .calls
-                    .get_mut(&identity)
+                    .get(&identity)
                     .context("worker returned an unknown call")?;
+                anyhow::ensure!(seen.insert(identity), "worker returned a duplicate call");
                 anyhow::ensure!(
-                    call.worker == worker_index && call.submitted && !call.completed,
-                    "worker {worker_index} returned a duplicate or unexpected call for batch {batch_id}"
-                );
-                anyhow::ensure!(
-                    completion.output.code == call.kind,
+                    completion.output.code == *kind,
                     "worker returned a computation code that disagrees with its call"
                 );
-                call.completed = true;
             }
-            // A batch returns one result, so its every call completes with it.
             anyhow::ensure!(
-                pending_batch
-                    .calls
-                    .values()
-                    .all(|call| call.worker != worker_index || !call.submitted || call.completed),
+                !report.done || seen.len() == worker.calls.len(),
                 "worker {worker_index} ended batch {batch_id} before every call completed"
             );
-            let queued = self.worker_submissions[worker_index]
-                .iter()
-                .any(|submission| submission.batch.id == batch_id);
-            if !queued {
-                pending_batch.expected_workers &= !worker_bit;
-            }
         }
         for product in report.products.drain(..) {
             let route = self
@@ -1064,6 +1026,27 @@ impl WorkerExecutor {
                     .insert(publication.source, publication.clone());
             }
         }
+        // Keep outstanding identities available to recovery until all returned
+        // publications have passed their owner and layout checks.
+        let pending = self
+            .pending
+            .get_mut(&batch_id)
+            .context("result has no pending batch")?;
+        if report.done {
+            pending.workers.remove(&worker_index);
+        } else {
+            // Computation can finish before command-only ranks acknowledge.
+            // Keep that worker's ownership until its terminal report arrives.
+            let worker = pending
+                .workers
+                .get_mut(&worker_index)
+                .context("result has no pending worker")?;
+            for completion in &report.results {
+                worker
+                    .calls
+                    .remove(&(completion.output.request_key, completion.output.call_id));
+            }
+        }
         self.publish_result(report)?;
         if !failed_calls.is_empty() {
             // Keep the actual failed completion and all accepted independent work.
@@ -1089,11 +1072,7 @@ impl WorkerExecutor {
             .pending
             .get(&batch_id)
             .context("result has no pending batch")?;
-        let done = pending.expected_workers == 0;
-        anyhow::ensure!(
-            !done || pending.calls.values().all(|call| call.completed),
-            "worker execution finished without every planned call"
-        );
+        let done = pending.workers.is_empty();
         let mut result = logical_result(report, done, &pending.commands);
         for receipt in &mut result.command_results {
             receipt.outcome = pending
@@ -1139,7 +1118,7 @@ impl WorkerExecutor {
         Ok(())
     }
 
-    /// Retires lineage routing while preserving independently owned product locations.
+    /// Retires request routing while preserving independently owned product locations.
     fn forget_request(&mut self, request: RequestKey, retained: &HashSet<BufferId>) {
         self.admissions
             .retain(|request_key, _| *request_key != request);
@@ -1309,15 +1288,7 @@ impl Executor for WorkerExecutor {
                         output
                     );
                 }
-                call_routes.insert(
-                    (call.request_key, call.call_id),
-                    PendingCall {
-                        worker: call_worker,
-                        submitted: false,
-                        kind: call.code,
-                        completed: false,
-                    },
-                );
+                call_routes.insert((call.request_key, call.call_id), call_worker);
                 for input in call.input_buffers() {
                     input_routes
                         .entry(input)
@@ -1348,7 +1319,7 @@ impl Executor for WorkerExecutor {
                 }
             }
             for (call, _) in &batch.requests {
-                let consumer_worker = call_routes[&(call.request_key, call.call_id)].worker;
+                let consumer_worker = call_routes[&(call.request_key, call.call_id)];
                 for input in call.input_buffers() {
                     self.buffer_workers
                         .entry(input)
@@ -1388,7 +1359,7 @@ impl Executor for WorkerExecutor {
             }
 
             for (call, placement) in batch.requests {
-                let worker = call_routes[&(call.request_key, call.call_id)].worker;
+                let worker = call_routes[&(call.request_key, call.call_id)];
                 worker_ops[worker].push((call, placement));
             }
 
@@ -1421,7 +1392,7 @@ impl Executor for WorkerExecutor {
                 }
             }
 
-            let mut expected_workers = 0;
+            let mut pending_workers = HashMap::new();
             for (worker_index, (((calls, commands), input_products), dependencies)) in worker_ops
                 .into_iter()
                 .zip(worker_commands)
@@ -1436,7 +1407,16 @@ impl Executor for WorkerExecutor {
                     );
                     continue;
                 }
-                expected_workers |= Self::worker_bit(worker_index);
+                pending_workers.insert(
+                    worker_index,
+                    PendingWorker {
+                        submitted: false,
+                        calls: calls
+                            .iter()
+                            .map(|(call, _)| ((call.request_key, call.call_id), call.code))
+                            .collect(),
+                    },
+                );
                 // Keep call-owned resources together while dependencies wait.
                 // Rank indices and collective order are derived at physical submission.
                 self.worker_submissions[worker_index].push_back(WorkerSubmission::build(
@@ -1451,9 +1431,7 @@ impl Executor for WorkerExecutor {
             self.pending.insert(
                 batch_id,
                 PendingBatch {
-                    submitted_workers: HashSet::new(),
-                    expected_workers,
-                    calls: call_routes,
+                    workers: pending_workers,
                     commands: batch
                         .commands
                         .iter()
@@ -1467,13 +1445,14 @@ impl Executor for WorkerExecutor {
             if self
                 .pending
                 .get(&batch_id)
-                .is_some_and(|pending| pending.expected_workers == 0)
+                .is_some_and(|pending| pending.workers.is_empty())
             {
                 self.publish_result(WorkerResult {
                     batch_id,
+                    done: true,
                     results: Vec::new(),
                     products: Vec::new(),
-                    registration: uniserve_worker_ipc::RegistrationAck { visible: true },
+
                     worker_exec_us: None,
                     forward_stats: None,
                 })?;
@@ -1528,7 +1507,7 @@ impl Executor for WorkerExecutor {
         if timeout.is_zero() {
             return Ok(None);
         }
-        crate::worker::park_descriptors(&self.progress_fds, timeout)?;
+        crate::worker::park_descriptors(&self.progress_fds(), timeout)?;
         if let Err(error) = self.pump() {
             return Err(self.reconcile_worker_failure(error)?.into());
         }
@@ -1549,7 +1528,6 @@ impl Executor for WorkerExecutor {
                 first_error = Some(error);
             }
         }
-        self.refresh_progress_fds();
         if let Some(error) = first_error {
             Err(error)
         } else {

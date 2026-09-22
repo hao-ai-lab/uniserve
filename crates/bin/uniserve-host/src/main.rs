@@ -40,11 +40,6 @@ struct Args {
 #[derive(Serialize)]
 struct Presentation<'a> {
     host: &'a str,
-    /// A port of this host that the group's first rank may bind its
-    /// collective rendezvous on, when that rank is placed here. The head
-    /// cannot reserve a port on another machine, and the store must be bound
-    /// where its owning rank runs.
-    rendezvous_port: u16,
 }
 
 /// One instruction the head sends a launcher.
@@ -53,6 +48,8 @@ struct Presentation<'a> {
 enum Instruction {
     /// Start one rank from the descriptor the head derived for it.
     Spawn(Spawn),
+    /// Reserve a collective store endpoint for one group.
+    Reserve { worker_id: String },
     /// Stop every rank of one worker group this launcher owns.
     Stop { worker_id: String },
     /// Stop every rank this launcher owns and exit.
@@ -114,17 +111,8 @@ fn main() -> anyhow::Result<()> {
         .context("splitting the head connection for writing")?;
     let mut reader = BufReader::new(stream);
 
-    // The head places ranks by host identity, so the launcher says which host
-    // it is before it can be given anything to run, and names a free port of
-    // this host for a rendezvous the head may place here.
-    let rendezvous_port = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
-        .context("reserving a rendezvous port on this host")?
-        .local_addr()
-        .context("reading the reserved rendezvous port")?
-        .port();
     let presentation = serde_json::to_string(&Presentation {
         host: &args.host_identity,
-        rendezvous_port,
     })?;
     writer
         .write_all(format!("{presentation}\n").as_bytes())
@@ -150,20 +138,60 @@ fn supervise(
     args: &Args,
     ranks: &mut HashMap<RankKey, Rank>,
 ) -> anyhow::Result<()> {
-    let mut line = String::new();
+    // Keep partial JSON across read timeouts. Exit reporting must not depend on
+    // another instruction arriving, including while that instruction is partial.
+    reader
+        .get_ref()
+        .set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
+    let mut line = Vec::new();
+    let mut rendezvous: HashMap<String, (u16, Option<std::net::TcpListener>)> = HashMap::new();
     loop {
-        line.clear();
-        let read = reader
-            .read_line(&mut line)
-            .context("reading an instruction from the head")?;
+        report_exits(writer, ranks)?;
+        let read = match reader.read_until(b'\n', &mut line) {
+            Ok(read) => read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error).context("reading an instruction from the head"),
+        };
         if read == 0 {
             tracing::info!("head connection closed; terminating this host's ranks");
             return Ok(());
         }
-        let instruction: Instruction = serde_json::from_str(line.trim())
-            .with_context(|| format!("decoding an instruction from the head: {}", line.trim()))?;
+        let instruction: Instruction =
+            serde_json::from_slice(&line).context("decoding an instruction from the head")?;
+        line.clear();
         match instruction {
+            Instruction::Reserve { worker_id } => {
+                rendezvous.remove(&worker_id);
+                // Keep the reservation until rank zero starts, and never hand
+                // another live group the same port during its startup window.
+                let listener = loop {
+                    let listener =
+                        std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
+                    let port = listener.local_addr()?.port();
+                    if rendezvous.values().all(|(used, _)| *used != port) {
+                        break listener;
+                    }
+                };
+                let port = listener.local_addr()?.port();
+                let response = serde_json::json!({"worker_id": worker_id, "port": port});
+                rendezvous.insert(worker_id, (port, Some(listener)));
+                writeln!(writer, "{response}")?;
+            }
             Instruction::Spawn(spawn) => {
+                if spawn.rank == 0
+                    && let Some((_, reservation)) = rendezvous.get_mut(&spawn.worker_id)
+                {
+                    reservation.take();
+                }
                 let key = (spawn.worker_id.clone(), spawn.rank);
                 let started = start_rank(args, spawn).with_context(|| {
                     format!("starting rank {} of worker {} on this host", key.1, key.0)
@@ -182,6 +210,7 @@ fn supervise(
                     .filter_map(|key| ranks.remove(&key).map(|rank| (key, rank)))
                     .collect();
                 terminate(&mut group);
+                rendezvous.remove(&worker_id);
                 tracing::info!(worker = %worker_id, "head asked this host to stop a worker's ranks");
             }
             Instruction::Terminate => {

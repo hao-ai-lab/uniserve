@@ -1,11 +1,10 @@
 //! Build-time generation of Rust bindings for the worker FlatBuffers schema.
 
-/// Compiles the schema with the owned-object API used by the IPC codec.
-fn main() {
+/// Compiles the worker schema for borrowed tables and direct builders.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flatc = flatc_fork::flatc();
     flatbuffers_build::BuilderOptions::new_with_files(["schema/worker.fbs"])
         .set_compiler(flatc.to_string_lossy())
-        .gen_object_api()
-        .compile()
-        .expect("worker FlatBuffers schema generation failed");
+        .compile()?;
+    Ok(())
 }

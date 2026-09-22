@@ -2,30 +2,9 @@
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
-use prometheus_client::metrics::histogram::Histogram;
 use uniserve_observability_derive::MetricFamily;
 
-use crate::{F64Gauge, HistogramFamily, U64Counter, U64Gauge};
-
-const KV_CACHE_RESIDENCY_BUCKETS: [f64; 21] = [
-    0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0,
-    120.0, 300.0, 600.0, 1200.0, 1800.0,
-];
-
-/// Builds the histogram used for KV-block allocation lifetime.
-fn kv_block_lifetime_histogram() -> Histogram {
-    Histogram::new(KV_CACHE_RESIDENCY_BUCKETS.iter().copied())
-}
-
-/// Builds the histogram used for idle time immediately before KV eviction.
-fn kv_block_idle_before_evict_histogram() -> Histogram {
-    Histogram::new(KV_CACHE_RESIDENCY_BUCKETS.iter().copied())
-}
-
-/// Builds the histogram used for gaps between accesses to one KV block.
-fn kv_block_reuse_gap_histogram() -> Histogram {
-    Histogram::new(KV_CACHE_RESIDENCY_BUCKETS.iter().copied())
-}
+use crate::{F64Gauge, U64Counter, U64Gauge};
 
 /// Labels identifying one model and engine instance.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -422,47 +401,4 @@ pub struct SchedulerMetrics {
              (the denominator for per-batch averages of worker_exec_us / batch_roundtrip_us)."
     )]
     pub batch_timing_count: Family<EngineLabels, U64Counter>,
-
-    // Per-engine performance / MFU counters.
-    /// Estimated floating-point calls per GPU.
-    #[metric(
-        name = "uniserve:estimated_flops_per_gpu",
-        help = "Estimated number of floating point calls per GPU (for Model Flops Utilization calculations)."
-    )]
-    pub estimated_flops_per_gpu: Family<EngineLabels, U64Counter>,
-    /// Estimated memory bytes read per GPU.
-    #[metric(
-        name = "uniserve:estimated_read_bytes_per_gpu",
-        help = "Estimated number of bytes read from memory per GPU (for Model Flops Utilization calculations)."
-    )]
-    pub estimated_read_bytes_per_gpu: Family<EngineLabels, U64Counter>,
-    /// Estimated memory bytes written per GPU.
-    #[metric(
-        name = "uniserve:estimated_write_bytes_per_gpu",
-        help = "Estimated number of bytes written to memory per GPU (for Model Flops Utilization calculations)."
-    )]
-    pub estimated_write_bytes_per_gpu: Family<EngineLabels, U64Counter>,
-
-    // Sampled KV-cache residency histograms.
-    /// KV block lifetime from allocation to eviction.
-    #[metric(
-        name = "uniserve:kv_block_lifetime_seconds",
-        help = "Histogram of KV cache block lifetime from allocation to eviction. Sampled metrics (controlled by --kv-cache-metrics-sample).",
-        init = Family::new_with_constructor(kv_block_lifetime_histogram as fn() -> Histogram)
-    )]
-    pub kv_block_lifetime_seconds: HistogramFamily,
-    /// KV block idle time immediately before eviction.
-    #[metric(
-        name = "uniserve:kv_block_idle_before_evict_seconds",
-        help = "Histogram of idle time before KV cache block eviction. Sampled metrics (controlled by --kv-cache-metrics-sample).",
-        init = Family::new_with_constructor(kv_block_idle_before_evict_histogram as fn() -> Histogram)
-    )]
-    pub kv_block_idle_before_evict_seconds: HistogramFamily,
-    /// Time between consecutive accesses to a KV block.
-    #[metric(
-        name = "uniserve:kv_block_reuse_gap_seconds",
-        help = "Histogram of time gaps between consecutive KV cache block accesses. Only the most recent accesses are recorded (ring buffer). Sampled metrics (controlled by --kv-cache-metrics-sample).",
-        init = Family::new_with_constructor(kv_block_reuse_gap_histogram as fn() -> Histogram)
-    )]
-    pub kv_block_reuse_gap_seconds: HistogramFamily,
 }

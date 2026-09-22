@@ -28,9 +28,6 @@ impl Qwen3ChatOutputProcessor {
             matches!(request.tool_choice, ChatToolChoice::Auto) && !request.tools.is_empty();
         let tool_parser = if tool_parsing_enabled {
             let parser = Qwen3XmlToolParser::new(&request.tools);
-            if parser.preserve_special_tokens() {
-                request.decode_options.skip_special_tokens = false;
-            }
             Some(parser)
         } else {
             None
@@ -43,12 +40,6 @@ impl Qwen3ChatOutputProcessor {
                 name: "qwen3".to_string(),
                 error: Box::new(error),
             })?;
-        if reasoning_parser
-            .as_ref()
-            .is_some_and(Qwen3ReasoningParser::preserve_special_tokens)
-        {
-            request.decode_options.skip_special_tokens = false;
-        }
         Ok(Self {
             reasoning_parser,
             tool_parser,

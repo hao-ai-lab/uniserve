@@ -56,11 +56,12 @@ use crate::scheduler::generation::{
     GenerationPhase as Phase, consumes_image_features, is_feedback_computation, is_prompt_extend,
 };
 
-use crate::handle::{
-    Command, EVENT_BUFFER_CAPACITY, EventRx, EventSendError, EventTx, event_channel,
-};
+use crate::handle::{Command, EVENT_BUFFER_CAPACITY, EventSendError, EventTx};
 use crate::kv::{BlockPool, BlockTable, KvCacheCoordinator};
-use crate::memory::{Allocation, BufferPool, KVCacheManager, LatentPool, RequestPool};
+use crate::memory::{
+    BufferPool, BufferSpan, KVCacheManager, KvAllocation, LatentPages, LatentPool, RequestPool,
+    RequestSlot,
+};
 use crossbeam_channel::Receiver;
 use uniserve_core::{
     ArtifactEvent, DiffusionRequest, EngineCoreOutput, FinishReason, GenerationRequest, MediaKind,
@@ -72,7 +73,7 @@ use uniserve_worker_ipc::{
     ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
     CachePageAllocation, Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange,
     DimBound, ForwardBatch, ForwardStats, LatentParams, NewRequest, RequestKey, SamplingState,
-    ShapeBound, TensorRef, TimingCounters, UmmRequestParams, WorkerInfo,
+    ShapeBound, TensorRef, TimingCounters, WorkerInfo,
 };
 
 use crate::executor::WorkerFailure;
@@ -103,7 +104,6 @@ fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<EngineCoreO
         height: metadata.height,
         width: metadata.width,
         bytes: metadata.bytes,
-        sha256: metadata.sha256,
         pixels_png_b64,
     })
 }
@@ -251,54 +251,48 @@ impl FlowPrefixState {
 /// Allocation ownership retained until the exact request epoch closes on every rank.
 struct RetiringRequest {
     request_key: RequestKey,
-    allocations: Vec<Allocation>,
-    media_allocations: Vec<(crate::WorkerId, Allocation)>,
-    buffers: HashMap<BufferId, Allocation>,
+    allocations: Vec<RequestAllocations>,
+    media_allocations: Option<MediaAllocations>,
+    buffers: HashMap<BufferId, BufferSpan>,
 }
 
 struct RequestAllocations {
-    request_slot: Allocation,
-    kv: Allocation,
-    latent: Option<Allocation>,
-    buffers: HashMap<BufferId, Allocation>,
+    request_slot: RequestSlot,
+    kv: KvAllocation,
+    latent: Option<LatentPages>,
+    buffers: HashMap<BufferId, BufferSpan>,
 }
 
 impl RequestAllocations {
     /// Returns the request-slot identifier.
     fn request_slot(&self) -> u32 {
-        self.request_slot
-            .request_slot()
-            .expect("request slot allocation")
+        self.request_slot.index
     }
 
     /// Returns shared access to the request block tables.
     fn block_tables(&self) -> &[BlockTable] {
-        self.kv.kv_tables().expect("KV allocation")
+        &self.kv.tables
     }
 
     /// Returns mutable access to the request block tables.
     fn block_tables_mut(&mut self) -> &mut Vec<BlockTable> {
-        self.kv.kv_tables_mut().expect("KV allocation")
+        &mut self.kv.tables
     }
 
     /// Takes ownership of the request buffer allocation.
-    fn take_buffer(&mut self, id: BufferId) -> Option<Allocation> {
+    fn take_buffer(&mut self, id: BufferId) -> Option<BufferSpan> {
         self.buffers.remove(&id)
     }
 
-    /// Consumes this active layout into the allocation handles needed for reclamation.
-    fn into_allocations(self) -> impl Iterator<Item = Allocation> {
-        self.buffers
-            .into_values()
-            .chain(self.latent)
-            .chain([self.kv, self.request_slot])
-    }
-
-    /// Releases the owned request allocation.
+    /// Releases each resource through its owning pool.
     fn free(self, scheduler: &mut Scheduler) {
-        for allocation in self.into_allocations() {
-            scheduler.free_allocation(allocation);
+        for buffer in self.buffers.into_values() {
+            scheduler.buffer_pool.free(buffer);
         }
+        if let Some(latent) = self.latent {
+            scheduler.latent_pool.free(latent);
+        }
+        scheduler.request_pool.free(self.request_slot);
     }
 }
 
@@ -368,7 +362,7 @@ impl RequestState {
 
 struct MediaFlowState {
     request: DiffusionRequest,
-    event_tx: EventTx,
+    output: output::EventJournal,
     allocations: MediaAllocations,
     /// Logical products mapped to their reserved component output and unit slice.
     buffer_bindings: HashMap<BufferId, (String, u32, u32)>,
@@ -414,14 +408,14 @@ struct MediaFlowState {
 
 struct MediaAllocations {
     tensors: HashMap<(String, u32), MediaTensorAllocation>,
-    request_slots: HashMap<crate::WorkerId, Allocation>,
+    request_slots: HashMap<crate::WorkerId, RequestSlot>,
 }
 
 /// A request reserves each declared result in every Worker address space on
 /// its route. Video ranges occupy disjoint slices of the temporal result,
 /// independent of decoder Worker width.
 struct MediaTensorAllocation {
-    allocations: HashMap<crate::WorkerId, Allocation>,
+    allocations: HashMap<crate::WorkerId, BufferSpan>,
     dtype: DType,
     shape_bound: ShapeBound,
 }
@@ -441,9 +435,7 @@ impl MediaTensorAllocation {
         start_unit: u32,
         worker: &crate::WorkerId,
     ) -> BufferAllocation {
-        let Allocation::Buffer { offset, .. } = &self.allocations[worker] else {
-            unreachable!("media tensor has buffer storage");
-        };
+        let offset = self.allocations[worker].offset;
         let unit_bytes = match product.shape_bound.dims.first() {
             Some(DimBound::Static(units)) if start_unit > 0 => {
                 product.max_bytes() / u64::from(*units)
@@ -461,18 +453,7 @@ impl MediaTensorAllocation {
 impl MediaAllocations {
     /// Returns the request row assigned in one physical worker address space.
     fn request_slot(&self, worker: &crate::WorkerId) -> u32 {
-        self.request_slots[worker]
-            .request_slot()
-            .expect("media request slot allocation")
-    }
-
-    /// Consumes physical media addresses while retaining their Worker owner.
-    fn into_allocations(self) -> Vec<(crate::WorkerId, Allocation)> {
-        self.tensors
-            .into_values()
-            .flat_map(|tensor| tensor.allocations)
-            .chain(self.request_slots)
-            .collect()
+        self.request_slots[worker].index
     }
 
     /// Releases the owned request allocation.
@@ -545,7 +526,7 @@ pub struct Scheduler {
     reserved_blocks: usize,
     buffer_pool: BufferPool,
     media_memory: HashMap<crate::WorkerId, MediaMemory>,
-    encoder_buffers: HashMap<uniserve_worker_ipc::BufferId, Allocation>,
+    encoder_buffers: HashMap<uniserve_worker_ipc::BufferId, BufferSpan>,
     family: RuntimeFamily,
     ctrl: SpecialTokenIds,
     waiting: HashMap<RequestId, RequestState>,
@@ -564,7 +545,7 @@ pub struct Scheduler {
     denoise_step_burst: u16,
     latent_dtype: Option<DType>,
     pending_commands: VecDeque<BatchCommand>,
-    pending_buffer_frees: HashMap<BufferId, Allocation>,
+    pending_buffer_frees: HashMap<BufferId, BufferSpan>,
     engine_id: u64,
     next_product_generation: u64,
     next_request_epoch: u64,
@@ -577,8 +558,6 @@ pub struct Scheduler {
     /// Engine-fatal latch: set when the executor/worker dies;
     /// the control loop exits and the host converts this into engine-dead.
     fatal: bool,
-    /// Largest number of calls observed in one submitted batch.
-    pub peak_calls_in_batch: usize,
     /// Shared scheduler counters and latency accumulators.
     pub stats: Arc<SchedulerStats>,
 }
@@ -727,42 +706,4 @@ fn denoise_step_burst_from_env() -> u16 {
 /// Returns the number of classifier-free-guidance branches.
 fn cfg_branch_count(image: &uniserve_core::ImageParams) -> u8 {
     image.cfg_branch_count()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use uniserve_core::{GenerationConstraint, ImageGenerationConfig, ImageParams, SamplingParams};
-
-    fn request(id: u64, tokens: usize) -> GenerationRequest {
-        let policy = ImageGenerationConfig::default();
-        let constraint = GenerationConstraint::UndOnly;
-        GenerationRequest {
-            request_id: RequestId(id),
-            prompt_token_ids: vec![0; tokens],
-            multimodal_inputs: Default::default(),
-            negative_prompt_token_ids: Vec::new(),
-            constraint,
-            sampling: SamplingParams::default(),
-            image: ImageParams::default(),
-            max_und_tokens: 32,
-            include_stop_token: false,
-            stop_strings: Vec::new(),
-            stop_token_ids: Vec::new(),
-            priority: 0,
-            cache: Default::default(),
-            image_generation: policy,
-        }
-    }
-
-    #[test]
-    fn direct_gen_trigger_stops_a_registered_text_successor() {
-        let mut req = request(1, 8);
-        req.constraint = GenerationConstraint::Default;
-        req.image_generation.trigger = uniserve_core::ImageTrigger::Token { token_id: 4_242 };
-
-        let stops = finish_token_ids(&req, &[151_643, 151_645]);
-
-        assert_eq!(stops, vec![4_242, 151_643, 151_645]);
-    }
 }

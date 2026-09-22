@@ -78,6 +78,7 @@ impl RankChannel {
             SOCKET_CHANNEL => Ok(Self::Socket(Box::new(SocketClient::connect(
                 endpoint,
                 max_payload,
+                depth,
                 timeout,
             )?))),
             other => Err(IpcError::Transport(format!(
@@ -169,10 +170,14 @@ impl RankChannel {
     /// A shared-memory channel multiplexes every wake onto one listener. A
     /// socket carries only the result wake, so the local descriptor its
     /// command and death wakes fire on is polled beside it.
-    pub fn progress_fds(&self) -> Vec<i32> {
+    pub fn progress_fds(&self) -> Vec<libc::pollfd> {
         match self {
-            Self::Shared(client) => vec![client.wake_file_descriptor()],
-            Self::Socket(client) => vec![client.wake_file_descriptor(), client.local_wake_fd()],
+            Self::Shared(client) => vec![libc::pollfd {
+                fd: client.wake_file_descriptor(),
+                events: libc::POLLIN,
+                revents: 0,
+            }],
+            Self::Socket(client) => client.progress_fds(),
         }
     }
 }
@@ -211,6 +216,7 @@ impl RankServer {
             SOCKET_CHANNEL => Ok(Self::Socket(Box::new(SocketServer::bind(
                 name,
                 max_payload,
+                max_inflight,
             )?))),
             other => Err(IpcError::Transport(format!(
                 "a rank cannot serve the channel transport {other}"

@@ -231,7 +231,6 @@ def commit_batch(
         state.record_outputs(
             tuple(records),
             products=tuple(report_products),
-            visible=True,
             execution_us=execution_us,
             stats=stats,
         )

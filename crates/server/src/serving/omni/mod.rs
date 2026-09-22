@@ -426,7 +426,13 @@ pub(super) fn prepare_generation_resources(
     stop: &crate::serving::StopConfig,
     generation: &mut GenerationRequest,
 ) -> OmniResult<()> {
-    generation.sampling = resolve_sampling(controls, generation.sampling.seed)?;
+    generation.sampling = SamplingParams {
+        temperature: DEFAULT_TEMPERATURE,
+        top_p: DEFAULT_TOP_P,
+        top_k: DEFAULT_TOP_K,
+        seed: generation.sampling.seed,
+        ..SamplingParams::default()
+    };
     // Resolve the autoregressive budget only for requests whose behavior can
     // enter text decoding.
     let prompt_tokens = u32::try_from(generation.prompt_token_ids.len())
@@ -445,12 +451,13 @@ pub(super) fn prepare_generation_resources(
 
     // Sampling choices determine logprob delivery and whether prefix-cache
     // reads remain semantically valid for this request.
-    apply_request_sampling(
+    super::sampling::apply_sampling(
         &processor.tokenizer,
         controls,
         stop,
         &mut generation.sampling,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let prompt_logprobs_requested = generation.sampling.prompt_logprobs_requested();
     generation.cache.read &= !prompt_logprobs_requested;
     for image in &mut generation.multimodal_inputs.images {
@@ -493,74 +500,6 @@ pub(super) fn prepare_generation_resources(
 
     generation.validate().map_err(|error| error.to_string())?;
     Ok(())
-}
-
-/// Applies request-specific penalties, masks, and bad-word tokens to profile sampling.
-fn apply_request_sampling(
-    tokenizer: &DynTokenizer,
-    controls: &crate::serving::SamplingConfig,
-    stop: &crate::serving::StopConfig,
-    sampling: &mut SamplingParams,
-) -> OmniResult<()> {
-    sampling.ignore_eos = controls.ignore_eos;
-    sampling.min_tokens = controls.min_tokens.unwrap_or(0) as usize;
-    sampling.min_p = controls.min_p.unwrap_or(0.0);
-    sampling.frequency_penalty = controls.frequency_penalty.unwrap_or(0.0);
-    sampling.presence_penalty = controls.presence_penalty.unwrap_or(0.0);
-    sampling.repetition_penalty = controls.repetition_penalty.unwrap_or(1.0);
-    if let Some(request_bias) = &stop.logit_bias {
-        let mut merged = std::collections::BTreeMap::new();
-        for (token_id, bias) in sampling.logit_bias.drain(..) {
-            merged.insert(token_id, bias);
-        }
-        for (&token_id, &bias) in request_bias {
-            *merged.entry(token_id).or_insert(0.0) += bias;
-        }
-        sampling.logit_bias = merged.into_iter().collect();
-    }
-    sampling.return_logprobs = stop.logprobs.is_some() || stop.logprob_token_ids.is_some();
-    sampling.n_logprobs = stop
-        .logprobs
-        .map_or(0, |count| if count < 0 { u32::MAX } else { count as u32 });
-    sampling.return_prompt_logprobs = stop.prompt_logprobs.is_some();
-    sampling.n_prompt_logprobs = stop
-        .prompt_logprobs
-        .map_or(0, |count| if count < 0 { u32::MAX } else { count as u32 });
-    sampling.logprob_token_ids = stop.logprob_token_ids.clone().unwrap_or_default();
-    sampling.allowed_token_ids = stop.allowed_token_ids.clone();
-    sampling.bad_words_ids = stop
-        .bad_words
-        .iter()
-        .map(|word| tokenizer.encode(word, false).map_err(OmniError::from))
-        .collect::<OmniResult<Vec<_>>>()?;
-    Ok(())
-}
-
-/// Resolves and validates baseline multimodal sampling parameters.
-fn resolve_sampling(
-    controls: &crate::serving::SamplingConfig,
-    seed: Option<u64>,
-) -> OmniResult<SamplingParams> {
-    let temperature = finite(
-        controls.temperature.unwrap_or(DEFAULT_TEMPERATURE),
-        "temperature",
-    )?;
-    if temperature < 0.0 {
-        return Err(OmniError::Invalid(
-            "temperature must be non-negative".to_string(),
-        ));
-    }
-    let top_p = finite(controls.top_p.unwrap_or(DEFAULT_TOP_P), "top_p")?;
-    if !(0.0..=1.0).contains(&top_p) || top_p == 0.0 {
-        return Err(OmniError::Invalid("top_p must be in (0, 1]".to_string()));
-    }
-    Ok(SamplingParams {
-        temperature,
-        top_p,
-        top_k: controls.top_k.unwrap_or(DEFAULT_TOP_K),
-        seed,
-        ..SamplingParams::default()
-    })
 }
 
 /// Merges profile defaults with request image controls and validates generation geometry.

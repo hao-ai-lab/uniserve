@@ -24,7 +24,7 @@ use uniserve_core::{
 };
 use uniserve_worker_ipc::{
     BatchOutput, Call, CallKind, CallStatus, DrawLayout, ErrorCode, FinishFlags, NewRequest,
-    RegistrationAck, RequestOutput, SamplingState, TensorRef, TimingCounters, WorkerInfo,
+    RequestOutput, SamplingState, TensorRef, TimingCounters, WorkerInfo,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -392,7 +392,7 @@ impl SimRequestState {
 
     /// Returns shared access to the simulated image configuration.
     fn image(&self) -> Option<&ImageParams> {
-        self.admission.umm.as_ref().map(|branch| &branch.image)
+        self.admission.image.as_ref()
     }
 }
 
@@ -1007,7 +1007,7 @@ impl SimEngine {
                 })?;
             anyhow::ensure!(
                 call.request_key == request.admission.request_key,
-                "call identity {:?} does not match its admitted lineage",
+                "call identity {:?} does not match its admitted request",
                 call.request_key
             );
             let predicate_value = call
@@ -1060,7 +1060,7 @@ impl SimEngine {
             batch_id,
             completions,
             products: Vec::new(),
-            registration: RegistrationAck { visible: true },
+
             worker_exec_us: None,
             forward_stats: None,
         };

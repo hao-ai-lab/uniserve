@@ -471,6 +471,9 @@ fn queue_depth_is_token_identical() {
 
 #[test]
 fn call_window_metrics_record_the_full_lifecycle() {
+    let (command_tx, commands) = crossbeam_channel::unbounded();
+    let handle = uniserve_engine::EngineHandle::new(command_tx);
+
     let mut sim = SimEngine::new();
     sim.set_queue_depth(2);
     sim.set_text_len(6);
@@ -483,10 +486,10 @@ fn call_window_metrics_record_the_full_lifecycle() {
         GenerationConstraint::UndOnly,
         16,
     );
-    let mut events = scheduler.submit_for_test(request);
+    let mut events = handle.submit(request).unwrap();
     let mut finished = false;
     for _ in 0..512 {
-        scheduler.step();
+        scheduler.step(&commands);
         while let Ok(event) = events.try_recv() {
             if matches!(event, EngineCoreOutput::Finished { .. }) {
                 finished = true;
@@ -498,7 +501,7 @@ fn call_window_metrics_record_the_full_lifecycle() {
     }
     assert!(finished, "request finished");
     for _ in 0..32 {
-        scheduler.step();
+        scheduler.step(&commands);
     }
 
     let active_domains = [
@@ -544,6 +547,9 @@ fn relay_run(
     text_len: usize,
     depth: u32,
 ) -> Vec<u32> {
+    let (command_tx, commands) = crossbeam_channel::unbounded();
+    let handle = uniserve_engine::EngineHandle::new(command_tx);
+
     let mut sim = SimEngine::new();
     sim.set_queue_depth(depth);
     sim.set_text_len(text_len);
@@ -557,11 +563,11 @@ fn relay_run(
         max_und_tokens,
     );
     request.stop_token_ids = stop_token_ids;
-    let mut events = scheduler.submit_for_test(request);
+    let mut events = handle.submit(request).unwrap();
     let mut tokens = Vec::new();
     let mut finished = false;
     for _ in 0..512 {
-        scheduler.step();
+        scheduler.step(&commands);
         while let Ok(event) = events.try_recv() {
             match event {
                 EngineCoreOutput::TextToken { id, .. } => tokens.push(id),
@@ -650,6 +656,9 @@ fn generalized_processor_successors_match_depth_one_before_observation() {
 
 #[test]
 fn image_context_decode_is_depth_invariant() {
+    let (command_tx, commands) = crossbeam_channel::unbounded();
+    let handle = uniserve_engine::EngineHandle::new(command_tx);
+
     let mut runs = Vec::new();
     for queue_depth in [1, 2] {
         let mut sim = SimEngine::new();
@@ -664,11 +673,11 @@ fn image_context_decode_is_depth_invariant() {
             GenerationConstraint::UndOnly,
             16,
         );
-        let mut events = scheduler.submit_for_test(request);
+        let mut events = handle.submit(request).unwrap();
         let mut finish_reason = None;
         let mut tokens = Vec::new();
         for _ in 0..512 {
-            scheduler.step();
+            scheduler.step(&commands);
             while let Ok(event) = events.try_recv() {
                 match event {
                     EngineCoreOutput::TextToken { id, .. } => tokens.push(id),
@@ -1343,6 +1352,9 @@ fn multimodal_encode_then_cache_hit() {
 
 #[test]
 fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
+    let (command_tx, commands) = crossbeam_channel::unbounded();
+    let handle = uniserve_engine::EngineHandle::new(command_tx);
+
     let mut sim = SimEngine::new();
     sim.set_text_len(6);
     sim.set_queue_depth(2);
@@ -1357,15 +1369,15 @@ fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
             12,
         )
     };
-    let mut first = scheduler.submit_for_test(request(1));
-    let mut second = scheduler.submit_for_test(request(2));
+    let mut first = handle.submit(request(1)).unwrap();
+    let mut second = handle.submit(request(2)).unwrap();
     let mut reasons = [None, None];
     let mut text_tokens = [0_usize, 0_usize];
     let mut seen = [Vec::new(), Vec::new()];
     let deadline = Instant::now() + Duration::from_secs(5);
 
     while Instant::now() < deadline {
-        scheduler.step();
+        scheduler.step(&commands);
         for (index, events) in [&mut first, &mut second].into_iter().enumerate() {
             while let Ok(event) = events.try_recv() {
                 seen[index].push(format!("{event:?}"));
@@ -1525,6 +1537,9 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
 
 #[test]
 fn interleave_c4_generated_images_complete() {
+    let (command_tx, commands) = crossbeam_channel::unbounded();
+    let handle = uniserve_engine::EngineHandle::new(command_tx);
+
     let mut sim = SimEngine::new();
     sim.set_queue_depth(2);
     sim.set_text_len(1_000_000);
@@ -1550,7 +1565,7 @@ fn interleave_c4_generated_images_complete() {
             ),
             ImageTrigger::Token { token_id: trigger },
         );
-        events.insert(request_id, scheduler.submit_for_test(request));
+        events.insert(request_id, handle.submit(request).unwrap());
         results.insert(
             request_id,
             Collected {
@@ -1564,7 +1579,7 @@ fn interleave_c4_generated_images_complete() {
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while results.values().any(|result| !result.finished) && Instant::now() < deadline {
-        scheduler.step();
+        scheduler.step(&commands);
         for (id, event_rx) in &mut events {
             while let Ok(event) = event_rx.try_recv() {
                 let result = results.get_mut(id).expect("request result exists");
@@ -2329,6 +2344,9 @@ fn image_budget_suppresses_biased_image_start() {
 /// Every logical KV reservation returns to the block manager after completion.
 #[test]
 fn kv_resources_return_after_completion() {
+    let (command_tx, commands) = crossbeam_channel::unbounded();
+    let handle = uniserve_engine::EngineHandle::new(command_tx);
+
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
     let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
 
@@ -2353,12 +2371,12 @@ fn kv_resources_return_after_completion() {
             *mode,
             16,
         );
-        keep_alive.push(sched.submit_for_test(req));
+        keep_alive.push(handle.submit(req).unwrap());
     }
 
     let mut idle_steps = 0;
     for _ in 0..5000 {
-        let progressed = sched.step();
+        let progressed = sched.step(&commands);
         // converged when several consecutive steps make no progress.
         idle_steps = if progressed { 0 } else { idle_steps + 1 };
         if idle_steps >= 3 {
@@ -2376,24 +2394,29 @@ fn kv_resources_return_after_completion() {
 
 #[test]
 fn cancellation_storm_retires_every_request() {
+    let (command_tx, commands) = crossbeam_channel::unbounded();
+    let handle = uniserve_engine::EngineHandle::new(command_tx);
+
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
     let mut scheduler = Scheduler::new(executor, ctrl(), 32);
     let receivers = (1..=128)
         .map(|request_id| {
-            scheduler.submit_for_test(generation_request(
-                RequestId(request_id),
-                text_input(vec![1, 2, 3]),
-                SamplingParams::default(),
-                ImageParams::default(),
-                GenerationConstraint::UndOnly,
-                8,
-            ))
+            handle
+                .submit(generation_request(
+                    RequestId(request_id),
+                    text_input(vec![1, 2, 3]),
+                    SamplingParams::default(),
+                    ImageParams::default(),
+                    GenerationConstraint::UndOnly,
+                    8,
+                ))
+                .unwrap()
         })
         .collect::<Vec<_>>();
     drop(receivers);
 
     for _ in 0..10_000 {
-        scheduler.step();
+        scheduler.step(&commands);
         if scheduler.stats.general.running.load(Ordering::Relaxed) == 0
             && scheduler.stats.general.pending.load(Ordering::Relaxed) == 0
             && scheduler.stats.general.in_flight.load(Ordering::Relaxed) == 0
@@ -2410,31 +2433,38 @@ fn cancellation_storm_retires_every_request() {
 
 #[test]
 fn slow_client_releases_execution_slots_before_output_capacity_returns() {
+    let (command_tx, commands) = crossbeam_channel::unbounded();
+    let handle = uniserve_engine::EngineHandle::new(command_tx);
+
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(sim));
     let mut scheduler = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
-    let slow_events = scheduler.submit_for_test(generation_request(
-        RequestId(1),
-        text_input(vec![1, 2, 3]),
-        SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        256,
-    ));
-    let mut fast_events = scheduler.submit_for_test(generation_request(
-        RequestId(2),
-        text_input(vec![1, 2, 3]),
-        SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        8,
-    ));
+    let slow_events = handle
+        .submit(generation_request(
+            RequestId(1),
+            text_input(vec![1, 2, 3]),
+            SamplingParams::default(),
+            ImageParams::default(),
+            GenerationConstraint::UndOnly,
+            256,
+        ))
+        .unwrap();
+    let mut fast_events = handle
+        .submit(generation_request(
+            RequestId(2),
+            text_input(vec![1, 2, 3]),
+            SamplingParams::default(),
+            ImageParams::default(),
+            GenerationConstraint::UndOnly,
+            8,
+        ))
+        .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut fast_finished = false;
     while Instant::now() < deadline && !fast_finished {
-        scheduler.step();
+        scheduler.step(&commands);
         while let Ok(event) = fast_events.try_recv() {
             fast_finished |= matches!(event, EngineCoreOutput::Finished { .. });
         }
@@ -2445,7 +2475,7 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     );
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && scheduler.step() {}
+    while Instant::now() < deadline && scheduler.step(&commands) {}
     assert_eq!(
         scheduler.stats.general.in_flight.load(Ordering::Relaxed),
         0,
@@ -2459,7 +2489,7 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
         && (scheduler.stats.general.running.load(Ordering::Relaxed) > 0
             || scheduler.stats.general.in_flight.load(Ordering::Relaxed) > 0)
     {
-        scheduler.step();
+        scheduler.step(&commands);
     }
     assert_eq!(scheduler.stats.general.running.load(Ordering::Relaxed), 0);
     assert_eq!(scheduler.stats.general.in_flight.load(Ordering::Relaxed), 0);

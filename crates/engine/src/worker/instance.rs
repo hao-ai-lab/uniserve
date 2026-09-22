@@ -82,7 +82,7 @@ impl WorkerProcessArgs {
             let first = &self.ranks[0].node;
             Some(match launchers.as_ref() {
                 Some(registry) if *first != self.host => {
-                    super::launcher::lock(registry)?.rendezvous_on(first)?
+                    super::launcher::lock(registry)?.rendezvous_on(first, &self.worker_id)?
                 }
                 _ => super::registration::reserve_rendezvous(head)?,
             })
@@ -184,7 +184,6 @@ pub struct WorkerGroup {
     info: WorkerInfo,
     depth: usize,
     last_batch_id: Option<u64>,
-    progress_fds: Vec<i32>,
     last_progress: Instant,
     pending_batches: BTreeMap<u64, PendingBatch>,
     process_args: WorkerProcessArgs,
@@ -192,9 +191,10 @@ pub struct WorkerGroup {
     /// deployment; the executor states it once all workers have reported.
     media_routing: BTreeMap<uniserve_worker_ipc::MediaCall, String>,
     resident_requests: HashSet<RequestKey>,
-    command_wake_pending: bool,
     readiness_changed: bool,
     closed: bool,
+    /// Rank loss is reported after all already-agreed results have been delivered.
+    failure: Option<anyhow::Error>,
     /// The deployment's launchers of the hosts this instance does not run
     /// on, shared with the other groups. A launcher terminates the ranks it
     /// started when the registry's last owner closes the connection, so the
@@ -354,7 +354,6 @@ impl WorkerGroup {
         mut workers: Vec<RankProcess>,
         launchers: Option<super::launcher::Launchers>,
     ) -> anyhow::Result<Self> {
-        let progress_fds = workers.iter().flat_map(RankProcess::progress_fds).collect();
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
         let world_size =
@@ -495,16 +494,15 @@ impl WorkerGroup {
             buffers,
             depth,
             last_batch_id: None,
-            progress_fds,
             last_progress: Instant::now(),
             pending_batches: BTreeMap::new(),
             media_routing: info.media_components.clone(),
             info,
             process_args,
             resident_requests: HashSet::new(),
-            command_wake_pending: false,
             readiness_changed: false,
             closed: false,
+            failure: None,
         })
     }
 
@@ -513,8 +511,6 @@ impl WorkerGroup {
         for rank in 0..self.workers.len() {
             loop {
                 let result = self.workers[rank].poll_batch(Duration::ZERO);
-                let command_wake = self.workers[rank].take_command_wake();
-                self.command_wake_pending |= command_wake;
                 match result {
                     Ok(Some(result)) => {
                         let batch_id = result.batch_id;
@@ -561,10 +557,12 @@ impl WorkerGroup {
                         self.buffers[rank].push_back(result);
                     }
                     Ok(None) => break,
-                    Err(error) => self.record_rank_error(rank, &error)?,
-                }
-                if command_wake {
-                    break;
+                    Err(error) => {
+                        if let Err(error) = self.record_rank_error(rank, &error) {
+                            self.failure.get_or_insert(error);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -616,7 +614,6 @@ impl WorkerGroup {
             worker.terminate();
         }
         self.workers.clear();
-        self.progress_fds.clear();
         self.clear_execution();
         let recovery = (|| -> anyhow::Result<()> {
             // The group's ranks on other hosts are stopped by their launchers
@@ -642,8 +639,7 @@ impl WorkerGroup {
                 worker.check_worker("WorkerGroup readiness")?;
                 worker.set_startup_cancel(None);
             }
-            let descriptors = workers.iter().flat_map(RankProcess::progress_fds).collect();
-            self.install_replacement(workers, descriptors);
+            self.install_replacement(workers);
             Ok(())
         })();
         self.readiness_changed = true;
@@ -670,10 +666,9 @@ impl WorkerGroup {
     }
 
     /// Installs a capability-compatible replacement rank group and resets rank-local state.
-    fn install_replacement(&mut self, workers: Vec<RankProcess>, progress_fds: Vec<i32>) {
+    fn install_replacement(&mut self, workers: Vec<RankProcess>) {
         self.info.endpoint = workers[0].info().endpoint.clone();
         self.workers = workers;
-        self.progress_fds = progress_fds;
         self.last_progress = Instant::now();
         let ranks = self.process_args.ranks.len();
         self.buffers = (0..ranks).map(|_| VecDeque::new()).collect();
@@ -681,6 +676,7 @@ impl WorkerGroup {
 
     /// Clears execution bookkeeping after physical ownership has retired.
     fn clear_execution(&mut self) {
+        self.failure = None;
         self.pending_batches.clear();
         self.buffers.iter_mut().for_each(VecDeque::clear);
         self.resident_requests.clear();
@@ -723,6 +719,7 @@ impl WorkerGroup {
             );
         }
         let done = remaining.is_empty() && pending.ranks.values().all(|result| result.complete);
+        out.done = done;
         if done {
             // Report each rank's accumulated execution time once, after every
             // rank reports. Ranks execute concurrently, so the batch's duration
@@ -749,8 +746,11 @@ impl WorkerGroup {
     }
 
     /// Returns the file descriptors that signal worker progress.
-    pub(crate) fn progress_fds(&self) -> &[i32] {
-        &self.progress_fds
+    pub(crate) fn progress_fds(&self) -> Vec<libc::pollfd> {
+        self.workers
+            .iter()
+            .flat_map(RankProcess::progress_fds)
+            .collect()
     }
 
     /// Resolves a batch once every rank reports either success or a compatible error.
@@ -1171,9 +1171,10 @@ fn take_rank_calls(
 ) -> anyhow::Result<WorkerResult> {
     let mut output = WorkerResult {
         batch_id: batch.batch_id,
+        done: false,
         results: Vec::with_capacity(identities.len()),
         products: Vec::new(),
-        registration: uniserve_worker_ipc::RegistrationAck { visible: true },
+
         worker_exec_us: None,
         forward_stats: None,
     };
@@ -1190,7 +1191,6 @@ fn take_rank_calls(
         if !selected && !identities.is_empty() {
             continue;
         }
-        output.registration.visible &= report.registration.visible;
         output
             .results
             .extend(report.results.extract_if(.., |completion| {
@@ -1619,9 +1619,6 @@ impl WorkerGroup {
 
     /// Waits for rank progress and returns the next fully agreed physical result.
     pub fn poll_batch(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
-        // A repeated poll acknowledges the preceding wake even for direct
-        // callers that do not use the logical Executor's command ingress.
-        self.command_wake_pending = false;
         if self.closed {
             return Ok(None);
         }
@@ -1636,77 +1633,49 @@ impl WorkerGroup {
     }
 
     fn poll_progress(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
-        if self.command_wake_pending {
-            return Ok(None);
-        }
-        // Idle ranks still report command ingress and process death. Forward
-        // those wakes before the logical Executor parks on the shared descriptors.
-        if self.pending_batches.len() == 0 {
-            self.pump_once()?;
-            if self.command_wake_pending {
-                return Ok(None);
-            }
-            if timeout.is_zero() {
-                return Ok(None);
-            }
-            crate::worker::park_descriptors(&self.progress_fds, timeout)?;
-            self.pump_once()?;
-            if self.command_wake_pending {
-                return Ok(None);
-            }
-            return self.try_join();
-        }
-        self.pump_once()?;
-        if self.command_wake_pending {
-            return Ok(None);
-        }
-        if let Some(result) = self.try_join()? {
-            self.last_progress = Instant::now();
-            return Ok(Some(result));
-        }
-        if timeout.is_zero() {
-            return Ok(None);
-        }
         let deadline = Instant::now() + timeout;
         loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(None);
-            }
-            crate::worker::park_descriptors(&self.progress_fds, deadline - now)?;
-            self.pump_once()?;
-            if self.command_wake_pending {
-                return Ok(None);
-            }
+            // A drain can observe both final replies and rank death. Join every
+            // complete reply before recovery invalidates outstanding ownership.
             if let Some(result) = self.try_join()? {
                 self.last_progress = Instant::now();
                 return Ok(Some(result));
             }
-            if self.pending_batches.len() > 0
-                && self.last_progress.elapsed() >= NEXT_RESULT_DEADLINE
-            {
-                let error = anyhow::anyhow!(
-                    "cooperative workers produced no progress within {:?}",
-                    NEXT_RESULT_DEADLINE
-                );
+            if let Some(error) = self.failure.take() {
                 return Err(error);
             }
+            self.pump_once()?;
+            if let Some(result) = self.try_join()? {
+                self.last_progress = Instant::now();
+                return Ok(Some(result));
+            }
+            if let Some(error) = self.failure.take() {
+                return Err(error);
+            }
+            self.check_progress_deadline()?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            crate::worker::park_descriptors(&self.progress_fds(), remaining)?;
         }
     }
 
-    /// Consumes the pending command-wake notification.
-    pub(crate) fn take_command_wake(&mut self) -> bool {
-        std::mem::take(&mut self.command_wake_pending)
+    fn check_progress_deadline(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.pending_batches.is_empty() || self.last_progress.elapsed() < NEXT_RESULT_DEADLINE,
+            "cooperative workers produced no progress within {:?}",
+            NEXT_RESULT_DEADLINE
+        );
+        Ok(())
     }
 
     fn release_closed_resources(&mut self) {
         // Closed endpoints never trigger serving recovery.
         self.closed = true;
         self.workers.clear();
-        self.progress_fds.clear();
         self.clear_execution();
         self.readiness_changed = true;
-        self.command_wake_pending = true;
     }
 
     /// Closes every rank in the physical worker group.

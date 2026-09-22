@@ -8,7 +8,7 @@ from typing import Any, cast
 
 from ..foundation.errors import invalid_descriptor
 from . import identity, transfer
-from .batch import RegistrationAck, TensorPublication
+from .batch import TensorPublication
 from .call import (
     CallKind,
     CallStatus,
@@ -609,7 +609,6 @@ class BatchOutput:
     batch_id: int
     completions: tuple[RequestOutput, ...] = ()
     products: tuple[TensorPublication, ...] = ()
-    registration: RegistrationAck = field(default_factory=RegistrationAck)
     worker_exec_us: int | None = None
     forward_stats: ForwardStats | None = None
 
@@ -640,9 +639,6 @@ class BatchOutput:
                     _seq(data.get("products", ()), f"{where}.products")
                 )
             ),
-            registration=RegistrationAck.from_mapping(
-                data.get("registration", {}), f"{where}.registration"
-            ),
             worker_exec_us=_optional_uint(
                 data.get("worker_exec_us"), f"{where}.worker_exec_us"
             ),
@@ -664,7 +660,6 @@ class BatchOutput:
             "batch_id": self.batch_id,
             "completions": [value.to_mapping() for value in self.completions],
             "products": [value.to_mapping() for value in self.products],
-            "registration": self.registration.to_mapping(),
             "worker_exec_us": self.worker_exec_us,
             "forward_stats": None
             if self.forward_stats is None

@@ -7,11 +7,12 @@ use std::sync::Arc;
 
 use crate::openai::VideoGenerationRequest;
 use crate::openai::serve_error_to_api;
+use crate::serving::{FinishStatus, RequestOutput};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use uniserve_core::{EngineCoreOutput, FinishReason};
+use futures::StreamExt as _;
 
 use crate::AppState;
 
@@ -28,51 +29,43 @@ pub(crate) async fn videos_sync(
 
     let base_id = resolve_request_id(&headers);
     let request_id = crate::serving::ServeRequestId::new(format!("vid-{base_id}"));
-    let submission = match state
-        .runtime()
-        .model()
-        .preprocess_video_request(&request_id, body)
-    {
-        Ok(request) => request,
-        Err(error) => return error.into_response(),
-    };
-    let mut stream = match state
-        .engine()
-        .submit_media(request_id.into_inner(), submission)
-        .await
-    {
+    let mut stream = match state.runtime().generate_video(request_id, body).await {
         Ok(stream) => stream,
-        Err(error) => {
-            return serve_error_to_api(crate::serving::ServeError::Engine(error)).into_response();
-        }
+        Err(error) => return error.into_response(),
     };
 
     // The synchronous endpoint consumes lifecycle events until the runtime
     // confirms completion and supplies exactly one artifact descriptor.
     let mut artifact = None;
     loop {
-        match stream.next().await {
-            Some(EngineCoreOutput::Artifact(value)) => artifact = Some(value),
-            Some(EngineCoreOutput::Finished {
-                reason: FinishReason::Completed,
+        let event = match stream.next().await.transpose() {
+            Ok(event) => event,
+            Err(error) => return serve_error_to_api(error).into_response(),
+        };
+        match event {
+            Some(RequestOutput::Artifact(value)) => artifact = Some(value),
+            Some(RequestOutput::Finished {
+                reason: FinishStatus::Stop { .. },
                 ..
             }) => break,
-            Some(EngineCoreOutput::Finished { reason, .. }) => {
+            Some(RequestOutput::Finished { reason, .. }) => {
                 return ApiError::server_error(format!(
                     "video generation ended without an artifact: {reason:?}"
                 ))
                 .into_response();
             }
-            Some(EngineCoreOutput::Rejected { message }) => {
+            Some(RequestOutput::Rejected { message, .. }) => {
                 return ApiError::invalid_request(message, None).into_response();
             }
-            Some(
-                EngineCoreOutput::Error { message }
-                | EngineCoreOutput::ArtifactUnavailable { message },
-            ) => {
+            Some(RequestOutput::Failed { message, .. }) => {
                 return ApiError::server_error(message).into_response();
             }
-            Some(EngineCoreOutput::Scheduled { .. } | EngineCoreOutput::MediaProgress { .. }) => {}
+            Some(
+                RequestOutput::Accepted { .. }
+                | RequestOutput::Usage { .. }
+                | RequestOutput::Scheduled { .. }
+                | RequestOutput::MediaProgress { .. },
+            ) => {}
             Some(_) => {
                 return ApiError::server_error(
                     "video runtime emitted an incompatible event".to_string(),
@@ -202,15 +195,23 @@ pub(crate) async fn videos_create(
     VideoBody(body): VideoBody,
 ) -> Response {
     use crate::video_jobs::{VideoFailure, VideoJob, timestamp};
-    let requested_seconds = body.seconds;
     let base_id = resolve_request_id(&headers);
     let request_id = crate::serving::ServeRequestId::new(format!("vid-{base_id}"));
-    let submission = match state
+    let (requested_seconds, sampling) =
+        match state
+            .runtime()
+            .model()
+            .video_sampling(&request_id, body.seconds, body.seed)
+        {
+            Ok(options) => options,
+            Err(error) => return error.into_response(),
+        };
+    let mut stream = match state
         .runtime()
-        .model()
-        .preprocess_video_request(&request_id, body)
+        .generate_video(request_id.clone(), body)
+        .await
     {
-        Ok(request) => request,
+        Ok(stream) => stream,
         Err(error) => return error.into_response(),
     };
     // Public IDs are server-generated; caller request-ID headers cannot collide with retained jobs.
@@ -223,11 +224,11 @@ pub(crate) async fn videos_create(
         completed_at: None,
         expires_at: None,
         seconds: requested_seconds,
-        actual_seconds: f64::from(submission.sampling.num_frames) / 24.0,
+        actual_seconds: f64::from(sampling.num_frames) / 24.0,
         status: "queued",
         phase: "queued".to_owned(),
         completed_steps: 0,
-        total_steps: submission.sampling.num_inference_steps,
+        total_steps: sampling.num_inference_steps,
         error: None,
     };
     let cancellation = match state.videos.insert(record.clone()) {
@@ -245,38 +246,31 @@ pub(crate) async fn videos_create(
     // No await separates reservation and detachment. Dropping this HTTP response cannot abort the job.
     tokio::spawn(async move {
         let result = async {
-            let mut stream = state
-                .engine()
-                .submit_media(id.clone(), submission)
-                .await
-                .map_err(|error| VideoFailure {
-                    code: "submission_failed",
-                    message: error.to_string(),
-                })?;
             let mut artifact = None;
             let mut cancelled = false;
             loop {
                 let event = tokio::select! {
                     event = stream.next() => event,
                     _ = cancellation.cancelled(), if !cancelled => {
-                        stream.cancel();
+                        state.runtime().cancel(request_id.clone()).await.map_err(|error| VideoFailure { code: "cancellation_failed", message: error.to_string() })?;
                         cancelled = true;
                         continue;
                     }
                 };
+                let event = event.transpose().map_err(|error| VideoFailure { code: "generation_failed", message: error.to_string() })?;
                 match event {
-                    Some(EngineCoreOutput::Scheduled { .. }) => {
+                    Some(RequestOutput::Scheduled { .. }) => {
                         state.videos.progress(&id, "encoding", 0)
                     }
-                    Some(EngineCoreOutput::MediaProgress {
+                    Some(RequestOutput::MediaProgress {
                         phase,
                         completed_steps,
                     }) => state.videos.progress(&id, &phase, completed_steps),
-                    Some(EngineCoreOutput::Artifact(value)) => {
+                    Some(RequestOutput::Artifact(value)) => {
                         artifact = Some(value.media);
                     }
-                    Some(EngineCoreOutput::Finished {
-                        reason: FinishReason::Completed,
+                    Some(RequestOutput::Finished {
+                        reason: FinishStatus::Stop { .. },
                         ..
                     }) => {
                         return artifact.ok_or(VideoFailure {
@@ -284,27 +278,19 @@ pub(crate) async fn videos_create(
                             message: "generation completed without an artifact".to_owned(),
                         });
                     }
-                    Some(EngineCoreOutput::Finished { reason, .. }) => {
+                    Some(RequestOutput::Finished { reason, .. }) => {
                         return Err(VideoFailure {
                             code: "generation_terminated",
                             message: format!("generation ended: {reason:?}"),
                         });
                     }
-                    Some(EngineCoreOutput::ArtifactUnavailable { message }) => {
-                        return Err(VideoFailure {
-                            code: "artifact_unavailable",
-                            message,
-                        });
+                    Some(RequestOutput::Rejected { message, .. } | RequestOutput::Failed { message, .. }) => {
+                        return Err(VideoFailure { code: "generation_failed", message });
                     }
-                    Some(
-                        EngineCoreOutput::Rejected { message }
-                        | EngineCoreOutput::Error { message },
-                    ) => {
-                        return Err(VideoFailure {
-                            code: "generation_failed",
-                            message,
-                        });
+                    Some(RequestOutput::Cancelled { .. } | RequestOutput::Aborted { .. }) => {
+                        return Err(VideoFailure { code: "generation_terminated", message: "video generation cancelled".to_owned() });
                     }
+                    Some(RequestOutput::Accepted { .. } | RequestOutput::Usage { .. }) => {}
                     None => {
                         return Err(VideoFailure {
                             code: "generation_stopped",
@@ -433,7 +419,7 @@ mod tests {
         let left = VideoBody::from_request(json, &()).await.unwrap().0;
         let right = VideoBody::from_request(multipart, &()).await.unwrap().0;
         assert_eq!(left, right);
-        assert_eq!(left.seconds, 5.5);
+        assert_eq!(left.seconds, Some(5.5));
         assert_eq!(left.seed, 42);
     }
 

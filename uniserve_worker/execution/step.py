@@ -148,7 +148,6 @@ def execute_batch(
             state,
             classified,
             started,
-            registration_visible=False,
             forward_stats=ForwardStats(),
             request_pool=request_pool,
         )
@@ -199,7 +198,6 @@ def execute_batch(
             state,
             classified,
             state.started_ns,
-            registration_visible=state.registered,
             forward_stats=_forward_stats(
                 state.forward_stats,
                 state.component_us,
@@ -251,7 +249,6 @@ def execute_batch(
             state,
             classified,
             state.started_ns,
-            registration_visible=state.registered,
             forward_stats=_forward_stats(
                 state.forward_stats,
                 state.component_us,
@@ -360,7 +357,6 @@ def _error_outputs(
     error: WorkerError,
     started: int,
     *,
-    registration_visible: bool,
     forward_stats: ForwardStats,
     request_pool: RequestPool,
 ) -> None:
@@ -408,7 +404,6 @@ def _error_outputs(
 
     state.record_outputs(
         tuple(records),
-        visible=registration_visible,
         execution_us=(time.perf_counter_ns() - started) // 1000,
         stats=forward_stats,
     )

@@ -174,7 +174,7 @@ impl Scheduler {
         Some(outputs)
     }
 
-    /// Chooses one physical owner for every component of a media lineage.
+    /// Chooses one physical owner for every component of a media request.
     ///
     /// The denoiser is selected first because it defines the expensive replica
     /// residency. Components co-located with that worker follow it; shared
@@ -320,7 +320,7 @@ impl Scheduler {
                     .get_mut(worker)
                     .expect("media route names a loaded worker")
                     .requests
-                    .allocate(request_key);
+                    .allocate();
                 match allocation {
                     Ok(allocation) => {
                         request_slots.insert(worker.clone(), allocation);
@@ -415,7 +415,7 @@ impl Scheduler {
                 id,
                 MediaFlowState {
                     request: submission.request,
-                    event_tx: submission.event_tx,
+                    output: output::EventJournal::new(submission.event_tx),
                     allocations,
                     buffer_bindings: HashMap::new(),
                     conditioning: None,
@@ -505,20 +505,18 @@ impl Scheduler {
         {
             return true;
         }
-        let Some(state) = self.running.get(&id) else {
+        if !self.running.contains_key(&id) {
+            return false;
+        }
+        let Ok(request_slot) = self.request_pool.allocate() else {
             return false;
         };
-        let request_key = RequestKey::new(self.engine_id, id, state.request_epoch);
-        let Ok(request_slot) = self.request_pool.allocate(request_key) else {
-            return false;
-        };
-        let Ok(kv) = self.cache().allocate(request_key, prefix_tokens as u32) else {
-            self.free_allocation(request_slot);
+        let Ok(kv) = self.cache().allocate(prefix_tokens as u32) else {
+            self.request_pool.free(request_slot);
             return false;
         };
         let new_pages = kv
-            .kv_tables()
-            .expect("flow prefix KV allocation")
+            .tables
             .iter()
             .map(|table| (table.group_id() as u32, table.page_ids()))
             .collect();
@@ -623,7 +621,7 @@ impl Scheduler {
                 if need > self.usable_blocks() {
                     let id = self.waiting_order.pop_front().unwrap();
                     let st = self.waiting.remove(&id).unwrap();
-                    let _ = st.output.event_tx.send(EngineCoreOutput::Rejected {
+                    let _ = st.output.events.event_tx.send(EngineCoreOutput::Rejected {
                         message: "request exceeds total KV capacity".into(),
                     });
                     continue;
@@ -666,7 +664,7 @@ impl Scheduler {
                 if n > text_usable_blocks * bs {
                     let id = self.waiting_order.pop_front().unwrap();
                     let st = self.waiting.remove(&id).unwrap();
-                    let _ = st.output.event_tx.send(EngineCoreOutput::Rejected {
+                    let _ = st.output.events.event_tx.send(EngineCoreOutput::Rejected {
                         message: "request exceeds total KV capacity".into(),
                     });
                     continue;
@@ -744,11 +742,11 @@ impl Scheduler {
         // KV group before the request enters the runnable set.
         let request_slot = self
             .request_pool
-            .allocate(request_key)
+            .allocate()
             .expect("admission checked request-slot capacity");
         let kv = self
             .cache()
-            .allocate(request_key, 0)
+            .allocate(0)
             .expect("empty KV allocation is valid");
         st.allocations = Some(RequestAllocations {
             request_slot,
@@ -776,7 +774,7 @@ impl Scheduler {
             .fetch_max(queue_wait_us, Ordering::Relaxed);
 
         let encoder_entries = st.req.num_encoder_cache_entries();
-        if st.output.enqueue(EngineCoreOutput::Scheduled {
+        if !st.output.events.enqueue(EngineCoreOutput::Scheduled {
             queued_at: q,
             scheduled_at,
         }) {

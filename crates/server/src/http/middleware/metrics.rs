@@ -1,14 +1,13 @@
 //! Middleware that records HTTP status, latency, and body-size metrics.
 
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Instant;
 
-use axum::body::{Body, Bytes, HttpBody};
+use axum::body::Body;
+
+use super::GuardedBody;
 use axum::extract::{MatchedPath, Request};
 use axum::middleware::Next;
 use axum::response::Response;
-use http_body::{Frame, SizeHint};
 use uniserve_observability::{HttpHandlerLabels, HttpRequestLabels, METRICS};
 
 /// Endpoints that will be excluded from HTTP metrics tracking.
@@ -51,11 +50,10 @@ pub(crate) async fn track_http_metrics(req: Request, next: Next) -> Response {
     // fully sent. For streaming (SSE) responses the handler returns the body
     // immediately, so observing at handler-return would record a near-zero
     // duration; deferring to body-end captures the true request duration.
-    // Mirrors the `LoadTrackedBody` pattern in `load.rs`.
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
-        Body::new(MetricsTrackedBody {
+        Body::new(GuardedBody {
             inner: body,
             _guard: guard,
         }),
@@ -96,37 +94,6 @@ impl Drop for MetricsGuard {
             .observe(elapsed);
 
         metrics.http_request_duration_highr_seconds.observe(elapsed);
-    }
-}
-
-/// A wrapper around response bodies that records HTTP metrics by holding a
-/// `MetricsGuard`, which observes the request duration when the body is fully
-/// consumed and dropped.
-struct MetricsTrackedBody {
-    inner: Body,
-    _guard: MetricsGuard,
-}
-
-impl HttpBody for MetricsTrackedBody {
-    type Data = Bytes;
-    type Error = axum::Error;
-
-    /// Polls the wrapped response body for its next frame.
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        Pin::new(&mut self.inner).poll_frame(cx)
-    }
-
-    /// Returns whether the wrapped response body has ended.
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    /// Returns the wrapped response body size estimate.
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
     }
 }
 

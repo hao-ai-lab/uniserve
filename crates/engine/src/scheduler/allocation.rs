@@ -4,7 +4,7 @@ use super::*;
 use uniserve_worker_ipc::BufferId;
 
 impl Scheduler {
-    pub(super) fn free_media_request(&mut self, worker: &crate::WorkerId, allocation: Allocation) {
+    pub(super) fn free_media_request(&mut self, worker: &crate::WorkerId, allocation: RequestSlot) {
         self.media_memory
             .get_mut(worker)
             .expect("media allocation names a loaded worker")
@@ -12,21 +12,12 @@ impl Scheduler {
             .free(allocation);
     }
 
-    pub(super) fn free_media_buffer(&mut self, worker: &crate::WorkerId, allocation: Allocation) {
+    pub(super) fn free_media_buffer(&mut self, worker: &crate::WorkerId, allocation: BufferSpan) {
         self.media_memory
             .get_mut(worker)
             .expect("media allocation names a loaded worker")
             .buffers
             .free(allocation);
-    }
-
-    pub(super) fn free_allocation(&mut self, allocation: Allocation) {
-        match allocation {
-            Allocation::RequestSlot { .. } => self.request_pool.free(allocation),
-            Allocation::Kv { .. } => drop(allocation),
-            Allocation::Latent { .. } => self.latent_pool.free(allocation),
-            Allocation::Buffer { .. } => self.buffer_pool.free(allocation),
-        }
     }
 
     pub(super) fn cache(&self) -> &KVCacheManager {
@@ -49,19 +40,16 @@ impl Scheduler {
     pub(super) fn retain_encoder_buffer(
         &mut self,
         buffer: BufferId,
-        allocation: Allocation,
-    ) -> Result<(), Allocation> {
-        if allocation.owner() != buffer.owner
-            || !matches!(allocation, Allocation::Buffer { .. })
-            || self.encoder_buffers.contains_key(&buffer)
-        {
+        allocation: BufferSpan,
+    ) -> Result<(), BufferSpan> {
+        if allocation.owner != buffer.owner || self.encoder_buffers.contains_key(&buffer) {
             return Err(allocation);
         }
         self.encoder_buffers.insert(buffer, allocation);
         Ok(())
     }
 
-    pub(super) fn take_encoder_buffer(&mut self, buffer: BufferId) -> Option<Allocation> {
+    pub(super) fn take_encoder_buffer(&mut self, buffer: BufferId) -> Option<BufferSpan> {
         self.encoder_buffers.remove(&buffer)
     }
 

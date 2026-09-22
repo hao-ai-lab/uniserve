@@ -138,15 +138,11 @@ static EPOCH: OnceLock<Instant> = OnceLock::new();
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct BlockId(pub u32);
 
-/// Request identity within one engine authority.
+/// Request identity within one engine.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
 )]
 pub struct RequestId(pub u64);
-
-/// Correlation identity for end-to-end lifecycle reconstruction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-pub struct TraceId(pub u64);
 
 /// Logical computation identity, preserved when a scheduler batch is split across workers.
 /// The request index is the ordinal assigned at selection, before physical row packing.
@@ -390,6 +386,12 @@ pub enum SamplingParamsError {
         /// Supplied probability.
         got: f32,
     },
+    /// Typical-sampling probability lies outside `(0, 1]`.
+    #[error("typical_p must be in (0, 1], got {got}")]
+    TypicalP {
+        /// Supplied probability.
+        got: f32,
+    },
     /// Minimum relative probability lies outside `[0, 1]`.
     #[error("min_p must be in [0, 1], got {got}")]
     MinP {
@@ -431,6 +433,7 @@ impl SamplingParams {
         for (field, value) in [
             ("temperature", self.temperature),
             ("top_p", self.top_p),
+            ("typical_p", self.typical_p),
             ("min_p", self.min_p),
             ("repetition_penalty", self.repetition_penalty),
             ("frequency_penalty", self.frequency_penalty),
@@ -460,6 +463,11 @@ impl SamplingParams {
         }
         if !(0.0 < self.top_p && self.top_p <= 1.0) {
             return Err(SamplingParamsError::TopP { got: self.top_p });
+        }
+        if !(0.0 < self.typical_p && self.typical_p <= 1.0) {
+            return Err(SamplingParamsError::TypicalP {
+                got: self.typical_p,
+            });
         }
         if !(0.0..=1.0).contains(&self.min_p) {
             return Err(SamplingParamsError::MinP { got: self.min_p });

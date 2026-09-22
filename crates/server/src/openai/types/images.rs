@@ -76,8 +76,6 @@ pub struct GeneratedImageData {
     pub width: u32,
     /// Encoded image length in bytes.
     pub bytes: u64,
-    /// Lowercase hexadecimal SHA-256 digest of the encoded image.
-    pub sha256: String,
 }
 
 #[cfg(test)]

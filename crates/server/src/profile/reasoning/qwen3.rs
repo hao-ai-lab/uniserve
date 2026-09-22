@@ -21,23 +21,17 @@ impl Qwen3ReasoningParser {
         })
     }
     /// Initializes delimiter state from the rendered prompt suffix.
-    pub fn initialize(&mut self, prompt_token_ids: &[u32]) -> Result<()> {
+    pub fn initialize(&mut self, prompt_token_ids: &[u32]) {
         self.inner.initialize(prompt_token_ids);
-        Ok(())
-    }
-
-    /// Returns whether decoding must preserve reasoning delimiters.
-    pub const fn preserve_special_tokens(&self) -> bool {
-        false
     }
 
     /// Applies one decoded text delta to the parser.
-    pub fn push(&mut self, delta: &str) -> Result<ReasoningDelta> {
-        Ok(self.inner.push(delta))
+    pub fn push(&mut self, delta: &str) -> ReasoningDelta {
+        self.inner.push(delta)
     }
 
     /// Flushes buffered text at end of generation.
-    pub fn finish(&mut self) -> Result<ReasoningDelta> {
-        Ok(self.inner.finish())
+    pub fn finish(&mut self) -> ReasoningDelta {
+        self.inner.finish()
     }
 }

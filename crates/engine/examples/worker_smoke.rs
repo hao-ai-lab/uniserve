@@ -12,6 +12,9 @@ use uniserve_engine::{
 };
 
 fn main() -> anyhow::Result<()> {
+    let (command_tx, commands) = crossbeam_channel::unbounded();
+    let handle = uniserve_engine::EngineHandle::new(command_tx);
+
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
@@ -62,11 +65,11 @@ fn main() -> anyhow::Result<()> {
     reqs.push((mk(3, GenerationConstraint::GenOnly), "image"));
     for (request, kind) in reqs {
         let id = request.request_id;
-        let rx = sched.submit_for_test(request);
+        let rx = handle.submit(request)?;
         rxs.insert(id, (kind, rx));
     }
     for _ in 0..400 {
-        if !sched.step() {
+        if !sched.step(&commands) {
             break;
         }
     }
@@ -94,7 +97,6 @@ fn main() -> anyhow::Result<()> {
             ok = false;
         }
     }
-    println!("peak calls in a batch: {}", sched.peak_calls_in_batch);
     println!(
         "\nTWO-PROCESS IPC SMOKE: {}",
         if ok { "PASS" } else { "FAIL" }

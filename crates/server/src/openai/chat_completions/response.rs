@@ -190,8 +190,7 @@ async fn collect_chat_events(
     // that do not emit structured blocks without duplicating structured output.
     let mut loose_text = String::new();
     let mut loose_reasoning = String::new();
-    let mut saw_text_block = false;
-    let mut saw_reasoning_block = false;
+    let mut structured_text = false;
 
     while let Some(next) = stream.next().await {
         match next.map(openai_terminal_event) {
@@ -211,7 +210,9 @@ async fn collect_chat_events(
                 logprobs: delta_logprobs,
                 ..
             }) => {
-                loose_text.push_str(&text);
+                if !structured_text {
+                    loose_text.push_str(&text);
+                }
                 token_ids.extend(delta_token_ids);
                 if let Some(mut delta_logprobs) = delta_logprobs {
                     logprobs
@@ -222,13 +223,14 @@ async fn collect_chat_events(
                         .append(&mut delta_logprobs.positions);
                 }
             }
-            Ok(RequestOutput::ReasoningDelta { text, .. }) => loose_reasoning.push_str(&text),
-            Ok(RequestOutput::OutputBlockEnd { block, .. }) => {
-                match block.kind() {
-                    AssistantBlockKind::Text => saw_text_block = true,
-                    AssistantBlockKind::Reasoning => saw_reasoning_block = true,
-                    AssistantBlockKind::ToolCall => {}
+            Ok(RequestOutput::ReasoningDelta { text, .. }) => {
+                if !structured_text {
+                    loose_reasoning.push_str(&text);
                 }
+            }
+            Ok(RequestOutput::OutputBlockStart { .. }) => structured_text = true,
+            Ok(RequestOutput::OutputBlockEnd { block, .. }) => {
+                structured_text = false;
                 message.push_block(block);
             }
             Ok(RequestOutput::ImageBegin { image_id, .. }) => {
@@ -307,12 +309,12 @@ async fn collect_chat_events(
         ));
     };
 
-    if !saw_reasoning_block && !loose_reasoning.is_empty() {
+    if !loose_reasoning.is_empty() {
         message.push_block(AssistantContentBlock::Reasoning {
             text: loose_reasoning,
         });
     }
-    if !saw_text_block && !loose_text.is_empty() {
+    if !loose_text.is_empty() {
         message.push_block(AssistantContentBlock::Text { text: loose_text });
     }
 

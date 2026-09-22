@@ -3,8 +3,6 @@
 use crate::serving::text::output::DecodedTextEvent;
 use asynk_strim_attr::{TryYielder, try_stream};
 use futures::{StreamExt as _, pin_mut};
-use thiserror_ext::AsReport as _;
-use tracing::warn;
 
 use crate::profile::reasoning::{Qwen3ReasoningParser, ReasoningDelta};
 use crate::serving::chat::AssistantBlockKind;
@@ -13,21 +11,17 @@ use crate::serving::chat::{Error, Result};
 
 struct ReasoningState {
     parser: Option<Qwen3ReasoningParser>,
-    parser_failed: bool,
 }
 
 impl ReasoningState {
     /// Creates a Qwen reasoning-stream parser.
     fn new(parser: Option<Qwen3ReasoningParser>) -> Self {
-        Self {
-            parser,
-            parser_failed: false,
-        }
+        Self { parser }
     }
 
     /// Processes one text delta through the reasoning parser.
     fn process_delta(&mut self, delta: String) -> Vec<AssistantEvent> {
-        let Some(parser) = self.parser.as_mut().filter(|_| !self.parser_failed) else {
+        let Some(parser) = self.parser.as_mut() else {
             return vec![AssistantEvent::TextDelta {
                 kind: AssistantBlockKind::Text,
                 delta,
@@ -35,44 +29,26 @@ impl ReasoningState {
         };
 
         let mut events = Vec::new();
-        match parser.push(&delta) {
-            Ok(result) => push_reasoning_delta(&mut events, result),
-            Err(error) => {
-                warn!(error = %error.as_report(), "Qwen3 reasoning parsing failed");
-                self.parser_failed = true;
-                push_text_delta(&mut events, AssistantBlockKind::Text, delta);
-            }
-        }
+        push_reasoning_delta(&mut events, parser.push(&delta));
         events
     }
 
     /// Initializes reasoning state from the prompt token sequence.
     fn initialize(&mut self, prompt_token_ids: &[u32]) {
-        let Some(parser) = self.parser.as_mut().filter(|_| !self.parser_failed) else {
+        let Some(parser) = self.parser.as_mut() else {
             return;
         };
-        if let Err(error) = parser.initialize(prompt_token_ids) {
-            warn!(error = %error.as_report(), "Qwen3 reasoning parser initialization failed");
-            self.parser_failed = true;
-        }
+        parser.initialize(prompt_token_ids);
     }
 
     /// Finishes incremental output processing.
     fn finish(&mut self) -> Vec<AssistantEvent> {
-        let Some(parser) = self.parser.as_mut().filter(|_| !self.parser_failed) else {
+        let Some(parser) = self.parser.as_mut() else {
             return Vec::new();
         };
-        match parser.finish() {
-            Ok(result) => {
-                let mut events = Vec::new();
-                push_reasoning_delta(&mut events, result);
-                events
-            }
-            Err(error) => {
-                warn!(error = %error.as_report(), "Qwen3 reasoning parser finalization failed");
-                Vec::new()
-            }
-        }
+        let mut events = Vec::new();
+        push_reasoning_delta(&mut events, parser.finish());
+        events
     }
 }
 

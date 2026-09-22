@@ -188,7 +188,7 @@ impl Scheduler {
 
         config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
 
-        // Unified runtimes reserve one physical slot for the image flow lineage.
+        // Unified runtimes reserve one physical slot for the image flow request.
         let flow_slot_reserve = usize::from(
             info.uses_kv()
                 && info
@@ -270,7 +270,6 @@ impl Scheduler {
             prefer_media: true,
             config,
             fatal: false,
-            peak_calls_in_batch: 0,
             stats,
         }
     }
@@ -376,30 +375,28 @@ impl Scheduler {
             .saturating_add(self.waiting_media_order.len())
     }
 
+    /// All drivers consume the same command ingress before scheduling work.
+    pub(super) fn drain_commands(&mut self, commands: &Receiver<Command>) -> bool {
+        loop {
+            match commands.try_recv() {
+                Ok(command) => {
+                    if self.handle_command(command) {
+                        return true;
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => return false,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => return true,
+            }
+        }
+    }
+
     /// Runs the owner-thread control loop, blocking only when fully idle.
     ///
     /// Returns `true` if the engine died
     /// (executor/worker failure) rather than shutting down gracefully.
     pub fn run(mut self, rx: Receiver<Command>) -> bool {
         loop {
-            // drain pending commands (non-blocking)
-            let mut shutdown = false;
-            loop {
-                match rx.try_recv() {
-                    Ok(cmd) => {
-                        if self.handle_command(cmd) {
-                            shutdown = true;
-                            break;
-                        }
-                    }
-                    Err(crossbeam_channel::TryRecvError::Empty) => break,
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        shutdown = true;
-                        break;
-                    }
-                }
-            }
-            if shutdown {
+            if self.drain_commands(&rx) {
                 break;
             }
 

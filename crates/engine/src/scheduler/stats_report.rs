@@ -117,7 +117,6 @@ impl SchedulerStatsReporter {
             batch_roundtrip_us: delta_batch_roundtrip_us,
             batch_count: delta_batch_count,
             domain_stats: self.domain_stats(stats),
-            ..Default::default()
         }
     }
 
