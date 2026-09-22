@@ -22,17 +22,21 @@ bench-build:
 
 # Lint: fmt + clippy + ruff + mypy
 lint: fmt clippy
-    {{python}} -m ruff check uniserve uniserve_models uniserve_worker uniserve_eval uniserve_kernel/src tests scripts examples
-    {{python}} -m ruff format --check uniserve uniserve_models uniserve_worker uniserve_eval uniserve_kernel/src tests scripts examples
+    {{python}} -m ruff check uniserve uniserve_models uniserve_worker uniserve_eval uniserve_kernels/src tests scripts examples
+    {{python}} -m ruff format --check uniserve uniserve_models uniserve_worker uniserve_eval uniserve_kernels/src tests scripts examples
     {{python}} -m mypy uniserve uniserve_models uniserve_worker uniserve_eval
 
-# Fast Python tests
+# Fast Python tests (CPU only)
 test-python-fast:
-    {{python}} -m pytest -m "unit or architecture"
+    {{python}} -m pytest -m "(unit or architecture) and not gpu"
 
-# Integration Python tests
+# Integration Python tests (CPU only)
 test-python-integration:
-    {{python}} -m pytest -m integration
+    {{python}} -m pytest -m "integration and not gpu"
+
+# Unit and integration Python tests that require a CUDA device
+test-python-cuda:
+    {{python}} -m pytest -m "(unit or integration) and gpu"
 
 # Build the debug binary if missing
 [private]

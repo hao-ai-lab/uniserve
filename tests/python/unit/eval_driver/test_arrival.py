@@ -3,7 +3,11 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from uniserve_eval.load.arrival import run_load
+
+pytestmark = pytest.mark.unit
 
 
 def test_warmup_and_measurement_share_the_submission_concurrency_limit():

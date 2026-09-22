@@ -3,9 +3,9 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from uniserve_kernels.attention.vsa_tiles import compose_to_head_shards
 
 from uniserve.nn.attention import vsa
-from uniserve.ops.video_sparse import compose_to_head_shards
 from uniserve.runtime import ExecutionContext
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
@@ -65,16 +65,19 @@ def test_sparse_attention_heads_preserve_block_mask_and_partial_tiles(heads):
 
 @pytest.mark.parametrize("heads", [7, 14, 28, 56])
 def test_sparse_query_partitions_preserve_complete_key_attention(heads):
-    from uniserve_kernel.sparse_attention import (
-        block_sparse_attention as native_attention,
-    )
+    from uniserve_kernels.attention import vsa_native
+
+    if not vsa_native.supported():
+        pytest.skip("the native sparse kernel requires SM100")
+    vsa_native.load()
 
     torch.manual_seed(972)
-    rows, width = 512, 128
-    query = torch.randn(
-        1, heads, rows, width, device="cuda", dtype=torch.bfloat16
+    rows, width, scale = 512, 128, 0.07
+    # Row-major projections interleave Q/K/V heads, as merged projections do.
+    projected = torch.randn(
+        rows, heads, 3, width, device="cuda", dtype=torch.bfloat16
     )
-    key, value = torch.randn_like(query), torch.randn_like(query)
+    query, key, value = projected.unbind(2)
     valid = torch.tensor(
         [64, 17, 64, 64, 0, 64, 31, 64], device="cuda", dtype=torch.int32
     )
@@ -84,52 +87,59 @@ def test_sparse_query_partitions_preserve_complete_key_attention(heads):
         torch.arange(heads, device="cuda", dtype=torch.int32).view(-1, 1) * 3
         + torch.arange(rows // 64, device="cuda", dtype=torch.int32).view(1, -1)
     ).remainder(4) + 1
-    full = native_attention(query, key, value, indices, counts, valid)
-    strided_key = key.transpose(1, 2).contiguous().transpose(1, 2)
-    strided_value = torch.empty(
-        1, rows, heads, 2, width, device="cuda", dtype=torch.bfloat16
+
+    def attend(q, k, v, selected, selected_counts):
+        out = torch.empty_like(q)
+        vsa_native.block_sparse_attention(
+            q, k, v, out, selected, selected_counts, valid, scale=scale
+        )
+        return out
+
+    full = attend(query, key, value, indices, counts)
+    contiguous = attend(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        indices,
+        counts,
     )
-    strided_value = strided_value[:, :, :, 1].transpose(1, 2)
-    strided_value.copy_(value)
-    strided = native_attention(
-        query, strided_key, strided_value, indices, counts, valid
-    )
-    torch.testing.assert_close(strided, full, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(full, contiguous, rtol=2e-2, atol=2e-2)
     partitions = [
-        native_attention(
-            query[:, :, start:end].contiguous(),
+        attend(
+            query[start:end],
             key,
             value,
             indices[:, start // 64 : end // 64].contiguous(),
             counts[:, start // 64 : end // 64].contiguous(),
-            valid,
         )
         for start, end in ((0, 64), (64, 256), (256, 512))
     ]
     torch.testing.assert_close(
-        torch.cat(partitions, dim=2), full, rtol=2e-2, atol=2e-2
+        torch.cat(partitions), full, rtol=2e-2, atol=2e-2
     )
-    tail_query = query[:, :, :64].contiguous()
+
     tail_indices, tail_counts = (
         indices[:, :1].contiguous(),
         counts[:, :1].contiguous(),
     )
+    captured = torch.empty_like(query[:64])
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = native_attention(
-            tail_query,
-            strided_key,
-            strided_value,
+        vsa_native.block_sparse_attention(
+            query[:64],
+            key,
+            value,
+            captured,
             tail_indices,
             tail_counts,
             valid,
+            scale=scale,
         )
     for _ in range(2):
         graph.replay()
-        torch.testing.assert_close(
-            captured, full[:, :, :64], rtol=2e-2, atol=2e-2
-        )
+        torch.testing.assert_close(captured, full[:64], rtol=2e-2, atol=2e-2)
     graph.reset()
+
     selected = torch.arange(4, device="cuda").view(1, 1, -1) < counts.unsqueeze(
         -1
     )
@@ -140,13 +150,14 @@ def test_sparse_query_partitions_preserve_complete_key_attention(heads):
     mask = mask.repeat_interleave(64, 1).repeat_interleave(64, 2)
     mask &= (
         torch.arange(rows, device="cuda") % 64 < valid.repeat_interleave(64)
-    ).view(1, 1, -1)
+    ).view(1, -1)
     reference = F.scaled_dot_product_attention(
-        query.double(),
-        key.double(),
-        value.double(),
-        attn_mask=mask.unsqueeze(0),
-    )
+        query.transpose(0, 1).double(),
+        key.transpose(0, 1).double(),
+        value.transpose(0, 1).double(),
+        attn_mask=mask,
+        scale=scale,
+    ).transpose(0, 1)
     torch.testing.assert_close(full.double(), reference, rtol=2e-2, atol=2e-2)
 
 

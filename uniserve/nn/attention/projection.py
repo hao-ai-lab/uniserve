@@ -43,6 +43,8 @@ class QKVProjection(nn.Module):
 
 
 class RotaryQKVProjection(QKVProjection):
+    """Normalize Q/K heads and rotate them with one split-half factor pair."""
+
     def __init__(self, projection, query_norm: nn.Module, key_norm: nn.Module):
         super().__init__(projection)
         self.query_norm, self.key_norm = query_norm, key_norm
@@ -51,19 +53,18 @@ class RotaryQKVProjection(QKVProjection):
         if len(cos) != 1 or len(sin) != 1:
             raise ValueError("rotary QKV projection requires one factor pair")
 
-        # Fused path: full-head RMS norms with matching eps and split rotation
-        # over the whole head reduce in one kernel.
+        # Full-head RMS norms with one epsilon are one normalization domain;
+        # the fused call reduces and rotates each head once.
         if (
             isinstance(self.query_norm, RMSNorm)
             and isinstance(self.key_norm, RMSNorm)
             and self.query_norm.eps == self.key_norm.eps
-            and cos[0].shape[-1] * 2 == q.shape[-1]
         ):
             return functional.qk_norm_rope(
                 q,
                 k,
-                self.query_norm.weight,
-                self.key_norm.weight,
+                (self.query_norm.weight,),
+                (self.key_norm.weight,),
                 cos,
                 sin,
                 eps=self.query_norm.eps,
@@ -84,8 +85,8 @@ class AxialQKVProjection(QKVProjection):
     """Rotate head axes with full-head or ordered RMS normalization domains.
 
     An RMSNorm normalizes the complete head. A ModuleList of RMSNorm modules
-    partitions the head in list order; each domain must cover complete rotary
-    axes. Adjacent axes in one domain share the same checkpoint scale tensor.
+    partitions the head into ordered normalization domains; each domain covers
+    complete rotary axes and every axis inside it shares its RMS denominator.
     """
 
     def __init__(
@@ -109,92 +110,76 @@ class AxialQKVProjection(QKVProjection):
             raise ValueError("rotary axes must partition the Q/K head width")
         self.query_norm, self.key_norm = query_norm, key_norm
         self.axis_dims, self.rotations = axis_dims, rotations
+
         if isinstance(query_norm, nn.ModuleList) or isinstance(
             key_norm, nn.ModuleList
         ):
-            query = self._axis_norms(query_norm)
-            key = self._axis_norms(key_norm)
-            if any(
+            for norms in (query_norm, key_norm):
+                if not isinstance(norms, nn.ModuleList) or not all(
+                    isinstance(norm, RMSNorm) for norm in norms
+                ):
+                    raise ValueError(
+                        "partitioned Q/K normalization requires ordered "
+                        "RMSNorm modules"
+                    )
+            if len(query_norm) != len(key_norm) or any(
                 q.weight.shape != k.weight.shape or q.eps != k.eps
-                for q, k in zip(query, key, strict=True)
+                for q, k in zip(query_norm, key_norm, strict=True)
             ):
                 raise ValueError(
                     "query and key normalization domains must align"
                 )
-
-    def _axis_norms(self, norms):
-        """Map each rotary axis to the RMSNorm domain that covers it."""
-        if not isinstance(norms, nn.ModuleList) or not all(
-            isinstance(norm, RMSNorm) for norm in norms
-        ):
-            raise ValueError(
-                "partitioned Q/K normalization requires ordered RMSNorm modules"
-            )
-
-        result = []
-        axis = 0
-        for norm in norms:
-            consumed = 0
-            while axis < len(self.axis_dims) and consumed < norm.weight.numel():
-                consumed += self.axis_dims[axis]
-                result.append(norm)
-                axis += 1
-            if consumed != norm.weight.numel():
+            # Every domain must end on an axis boundary.
+            boundaries = {
+                sum(axis_dims[:index]) for index in range(len(axis_dims) + 1)
+            }
+            ends = [0]
+            for norm in query_norm:
+                ends.append(ends[-1] + norm.weight.numel())
+            if not set(ends) <= boundaries or ends[-1] != projection.head_dim:
                 raise ValueError(
                     "normalization domains must cover complete rotary axes"
                 )
-        if axis != len(self.axis_dims):
-            raise ValueError("normalization domains must cover the whole head")
-        return tuple(result)
+
+    def _domains(self):
+        """Return Q and K RMSNorm domains, or ``None`` for other norms."""
+        norms: list[tuple[nn.Module, ...]] = []
+        for norm in (self.query_norm, self.key_norm):
+            if isinstance(norm, RMSNorm):
+                norms.append((norm,))
+            elif isinstance(norm, nn.ModuleList):
+                norms.append(tuple(norm))
+            else:
+                return None
+        return tuple(norms)
 
     def normalize(self, q, k, cos, sin):
         if len(cos) != len(self.axis_dims) or len(sin) != len(self.axis_dims):
             raise ValueError("each rotary axis requires one factor pair")
 
-        partitioned = isinstance(self.query_norm, nn.ModuleList)
-        if partitioned and all(
-            rotation == "split" for rotation in self.rotations
-        ):
-            from uniserve import ops
-
-            query, key = (
-                self._axis_norms(self.query_norm),
-                self._axis_norms(self.key_norm),
-            )
-            if len({norm.eps for norm in (*query, *key)}) == 1:
-                # Preserve shared normalization identities when several rotary
-                # axes consume one domain; the fused kernel reduces it once.
-                return ops.qk_norm_rope(
-                    q,
-                    k,
-                    tuple(norm.weight for norm in query),
-                    tuple(norm.weight for norm in key),
-                    cos,
-                    sin,
-                    query[0].eps,
-                    axis_dims=self.axis_dims,
-                )
+        # RMS domains with one epsilon and split rotation form one fused call;
+        # the call reduces each domain once across the axes it covers.
+        domains = self._domains()
         if (
-            isinstance(self.query_norm, RMSNorm)
-            and isinstance(self.key_norm, RMSNorm)
-            and self.query_norm.eps == self.key_norm.eps
+            domains is not None
+            and len({norm.eps for norm in (*domains[0], *domains[1])}) == 1
             and all(rotation == "split" for rotation in self.rotations)
         ):
             return functional.qk_norm_rope(
                 q,
                 k,
-                self.query_norm.weight,
-                self.key_norm.weight,
+                tuple(norm.weight for norm in domains[0]),
+                tuple(norm.weight for norm in domains[1]),
                 cos,
                 sin,
-                eps=self.query_norm.eps,
+                eps=domains[0][0].eps,
                 axis_dims=self.axis_dims,
             )
 
         # General path: normalize each norm domain, then rotate each axis.
         outputs = []
         for tensor, norm in ((q, self.query_norm), (k, self.key_norm)):
-            if partitioned:
+            if isinstance(norm, nn.ModuleList):
                 widths = tuple(module.weight.numel() for module in norm)
                 normalized = torch.cat(
                     tuple(

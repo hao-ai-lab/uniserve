@@ -9,14 +9,14 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
-
-from uniserve.distributed import DeviceMesh
-from uniserve.nn import _binding
-from uniserve.ops import video_sparse as ops
-from uniserve.ops.video_sparse_rows import (
+from uniserve_kernels.attention import vsa_tiles
+from uniserve_kernels.attention.vsa_rows import (
     pack_sparse_input_rows,
     prepare_sparse_input_rows,
 )
+
+from uniserve.distributed import DeviceMesh
+from uniserve.nn import _binding
 
 from .inputs import BlockInput, Input, NormRope, Workspace
 
@@ -144,7 +144,7 @@ class _PreparedInput:
         # into the shared exchange layout at the same logical positions.
         self.gate[start:stop].copy_(g)
         tiles = slice(start // 64, stop // 64)
-        ops.pool_qkv_means(
+        vsa_tiles.pool_qkv_means(
             q,
             k,
             v,
@@ -228,7 +228,7 @@ class Attention(nn.Module):
         # attend densely, video tiles to the prefix plus their top-scoring
         # video tiles, padding tiles to one tile.
         indices, counts = workspace.block_indices, workspace.block_counts
-        ops.write_block_map(
+        vsa_tiles.write_block_map(
             scores[:, local_prefix:local_video, prefix:valid],
             inputs.prefix_key_indices,
             inputs.dense_key_indices,
@@ -250,7 +250,7 @@ class Attention(nn.Module):
     ) -> BlockInput:
         """Pool complete Q/K and return the selected key-block domain."""
         offset = self._query_offset(q.shape[0], inputs.padded_tokens)
-        ops.pool_qkv_means(
+        vsa_tiles.pool_qkv_means(
             q,
             k,
             k,
@@ -265,7 +265,7 @@ class Attention(nn.Module):
     def _query_offset(self, query_tokens, key_tokens):
         if query_tokens == key_tokens:
             return 0
-        parallel = getattr(self, "_parallel", None)
+        parallel = getattr(self, "parallel", None)
         if (
             parallel is None
             or query_tokens * parallel.context_group.size != key_tokens
@@ -296,7 +296,7 @@ class Attention(nn.Module):
         scores = workspace.tile_scores
         # One pass over the score storage masks empty key tiles and
         # normalizes each query tile's row in fp32.
-        ops.tile_softmax(scores, batch.valid_sizes)
+        vsa_tiles.tile_softmax(scores, batch.valid_sizes)
         torch.matmul(
             scores,
             workspace.pooled_value.permute(1, 0, 2),
@@ -324,7 +324,7 @@ class Attention(nn.Module):
         """Fuse selected fine attention with the gated dense tile
         compression.
         """  # noqa: D205
-        ops.pool_qkv_means(
+        vsa_tiles.pool_qkv_means(
             q,
             k,
             v,
@@ -339,7 +339,7 @@ class Attention(nn.Module):
         if out is None:
             out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
         self.attention(q, k, v, batch, out=workspace.attention_output)
-        ops.unpack_add_compression(
+        vsa_tiles.unpack_add_compression(
             workspace.attention_output.transpose(0, 1).unsqueeze(0),
             gate,
             workspace.compressed_tiles,
@@ -368,7 +368,7 @@ class Attention(nn.Module):
         """
         from uniserve.nn.attention._parallel import AttentionRowExchange
 
-        parallel = getattr(self, "_parallel", None)
+        parallel = getattr(self, "parallel", None)
         context_size = 1 if parallel is None else parallel.context_group.size
         context_rank = 0 if parallel is None else parallel.context_group.rank
         owners = 1 if parallel is None else parallel.ulysses_group.size
@@ -465,10 +465,10 @@ class Attention(nn.Module):
         if context_size > 1:
             # Complete pooled keys and values across the context partition.
             group = parallel.context_group
-            group._all_gather_into_tensor(
+            group.all_gather_into(
                 workspace.pooled_key, workspace.pooled_key[query_tiles].clone()
             )
-            group._all_gather_into_tensor(
+            group.all_gather_into(
                 workspace.pooled_value,
                 workspace.pooled_value[query_tiles].clone(),
             )
@@ -537,11 +537,11 @@ class Attention(nn.Module):
         outputs = parallel.output_views(q)
         attended = workspace.attention_output.transpose(0, 1).unsqueeze(0)
         if len(outputs) == 1:
-            ops.unpack_add_compression(
+            vsa_tiles.unpack_add_compression(
                 attended, gate, workspace.compressed_tiles, outputs[0]
             )
         else:
-            ops.compose_to_head_shards(
+            vsa_tiles.compose_to_head_shards(
                 attended,
                 gate,
                 workspace.compressed_tiles,

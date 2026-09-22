@@ -13,7 +13,7 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from tests.python.integration.model_loading.test_qwen import _checkpoint
+from tests.python.fixtures.checkpoints import qwen_checkpoint
 from uniserve import loading
 from uniserve.loading import weights
 from uniserve.model import TextInput, TextSize
@@ -141,7 +141,7 @@ def _indexed(root, format):
 def test_indexed_checkpoint_defines_the_complete_numerical_source(
     tmp_path, mode, format
 ):
-    reference = _checkpoint(tmp_path)
+    reference = qwen_checkpoint(tmp_path)
     index = _indexed(tmp_path, format)
     # Unindexed payloads cannot alter the checkpoint selected by the index.
     (
@@ -265,7 +265,7 @@ def test_unknown_modular_pipeline_fails_at_discovery(tmp_path):
 def test_precision_selection_preserves_independent_projection_branches(
     tmp_path, origin
 ):
-    reference = _checkpoint(tmp_path)
+    reference = qwen_checkpoint(tmp_path)
     config = json.loads((tmp_path / "config.json").read_text())
     # Q alone stays dense. Independent K/V and gate/up statistics remain
     # meaningful even when their physical projection can be fused.
@@ -320,7 +320,7 @@ def test_remote_snapshot_loads_only_the_closed_payload_set(
 ):
     remote, snapshot = tmp_path / "remote", tmp_path / "snapshots" / ("a" * 40)
     remote.mkdir()
-    reference = _checkpoint(remote)
+    reference = qwen_checkpoint(remote)
     _indexed(remote, "safetensors")
     (remote / "README.md").write_text("Model description")
     (remote / "unindexed.safetensors").write_bytes(b"unused")
@@ -364,7 +364,7 @@ def test_remote_snapshot_loads_only_the_closed_payload_set(
 
 
 def test_dummy_loading_is_deterministic_without_checkpoint_payload(tmp_path):
-    _checkpoint(tmp_path, tied=True)
+    qwen_checkpoint(tmp_path, tied=True)
     (tmp_path / "model.safetensors").write_bytes(b"invalid checkpoint bytes")
     io = loading.Config(mode="dummy")
     first, second = _load(tmp_path, io), _load(tmp_path, io)

@@ -28,7 +28,8 @@ def test_aborted_worker_returns_before_device_work_and_preserves_its_storage():
             runner = worker.runner
             tokens = torch.tensor([3, 8, 1], device="cuda:0")
             runner.run_encoder("text", tokens)
-            stream = runner.module_stream("text_encoder", method="encode")
+            owner = runner.module_stream("text_encoder", method="encode")
+            stream = owner.stream
             torch.cuda.synchronize()
             with torch.cuda.stream(stream):
                 torch.cuda._sleep(5_000_000_000)

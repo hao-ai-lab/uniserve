@@ -11,9 +11,9 @@ import triton.language as tl
 from uniserve.quantization import QuantizedTensor, ScaleLayout
 from uniserve.tensors import BufferConfig
 
-from . import Backend as _Backend
-from . import MergedOperator as _MergedOperator
-from . import _concatenate
+from .base import Backend as _Backend
+from .base import MergedOperator as _MergedOperator
+from .base import _concatenate
 
 
 def _format(weight):

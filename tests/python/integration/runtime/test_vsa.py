@@ -3,14 +3,23 @@
 They also preserve mutable graph inputs.
 """
 
+from importlib import import_module
+
 import pytest
 import torch
 
 from tests.python.fixtures.vsa import reference_attention
 from uniserve.nn.attention import vsa
-from uniserve.runtime import CUDAGraph, ExecutionContext
+from uniserve.runtime import CUDAGraph, CUDAStream, ExecutionContext
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
+
+
+@pytest.fixture
+def stream():
+    owner = CUDAStream.external(torch.cuda.Stream())
+    yield owner
+    owner.close()
 
 
 def _input(valid):
@@ -50,7 +59,7 @@ def _workspace(q):
 
 @pytest.mark.parametrize("provider", ["cute", "flashinfer", "triton"])
 @torch.inference_mode()
-def test_selection_compression_and_projected_chunks(provider):
+def test_selection_compression_and_projected_chunks(provider, stream):
     torch.manual_seed(518)
     projections = torch.randn(
         256, 7, 4, 128, device="cuda", dtype=torch.bfloat16
@@ -60,8 +69,7 @@ def test_selection_compression_and_projected_chunks(provider):
     inputs, workspace = _input(valid), _workspace(q)
     module = vsa.Attention(vsa.BlockAttention(128**-0.5))
     expected, live = reference_attention(q, k, v, gate, valid)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
+    stream.wait(torch.cuda.current_stream())
     with ExecutionContext(module, stream=stream, vsa=provider) as context:
         context.prepare(None)
         batch = module.select(
@@ -103,8 +111,48 @@ def test_selection_compression_and_projected_chunks(provider):
             )
 
 
+@pytest.mark.parametrize("provider", ["sm100", "cute", "flashinfer", "triton"])
 @torch.inference_mode()
-def test_norm_rope_prepared_chunks_match_normalized_projections():
+def test_projected_chunks_apply_the_layer_softmax_scale(provider, stream):
+    from uniserve.runtime.backends.attention import vsa as providers
+
+    if not import_module(f"{providers.__name__}.{provider}").available(
+        torch.device("cuda")
+    ):
+        pytest.skip(f"VSA provider {provider} is unavailable on this device")
+
+    torch.manual_seed(733)
+    q, k, v, gate = torch.randn(
+        256, 3, 4, 128, device="cuda", dtype=torch.bfloat16
+    ).unbind(2)
+    valid = torch.tensor([64, 23, 64, 0], device="cuda", dtype=torch.int32)
+    inputs, workspace = _input(valid), _workspace(q)
+    scale = 0.021
+    module = vsa.Attention(vsa.BlockAttention(scale))
+    expected, live = reference_attention(q, k, v, gate, valid, scale=scale)
+
+    stream.wait(torch.cuda.current_stream())
+    with ExecutionContext(module, stream=stream, vsa=provider) as context:
+        context.prepare(None)
+        result = torch.empty_like(q)
+        chunks = (
+            (
+                slice(start, stop),
+                tuple(value[start:stop] for value in (q, k, v, gate)),
+            )
+            for start, stop in ((0, 128), (128, 256))
+        )
+        for interval, output in module.forward_chunks(
+            chunks, inputs, selected_tiles=1, workspace=workspace
+        ):
+            result[interval].copy_(output)
+        torch.testing.assert_close(
+            result[live], expected[live], rtol=2e-2, atol=2e-2
+        )
+
+
+@torch.inference_mode()
+def test_norm_rope_prepared_chunks_match_normalized_projections(stream):
     """Raw chunks with a norm-rope attend like pre-normalized chunks."""
     torch.manual_seed(1119)
     projections = torch.randn(
@@ -126,8 +174,8 @@ def test_norm_rope_prepared_chunks_match_normalized_projections():
     normalized_q, normalized_k = qk_norm_rope(
         q,
         k,
-        query_weight,
-        key_weight,
+        (query_weight,),
+        (key_weight,),
         (cos,),
         (sin,),
         eps=1e-6,
@@ -153,8 +201,7 @@ def test_norm_rope_prepared_chunks_match_normalized_projections():
             result[interval].copy_(output)
         return result
 
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
+    stream.wait(torch.cuda.current_stream())
     with ExecutionContext(module, stream=stream, vsa="cute") as context:
         context.prepare(None)
         expected = attend(normalized_q, normalized_k, None).clone()
@@ -173,7 +220,7 @@ def test_norm_rope_prepared_chunks_match_normalized_projections():
 
 
 @torch.inference_mode()
-def test_row_production_over_many_intervals_matches_one_call():
+def test_row_production_over_many_intervals_matches_one_call(stream):
     """Rows produced interval by interval equal the single-call result.
 
     Small exchange intervals give several packed segments; the fine
@@ -190,8 +237,7 @@ def test_row_production_over_many_intervals_matches_one_call():
     module = vsa.Attention(vsa.BlockAttention(128**-0.5))
     live = torch.arange(256, device="cuda") < 64 * 2 + 40
 
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
+    stream.wait(torch.cuda.current_stream())
     with ExecutionContext(module, stream=stream, vsa="cute") as context:
         context.prepare(None)
         batch = module.select(

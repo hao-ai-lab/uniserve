@@ -4,7 +4,12 @@ import torch
 import torch.nn.functional as F
 
 
-def reference_attention(q, k, v, gate, valid):
+def reference_attention(q, k, v, gate, valid, *, scale=128**-0.5):
+    """Evaluate tile selection, fine attention and compression densely.
+
+    ``scale`` multiplies both the pooled tile scores and the fine attention
+    logits, as the softmax scale of the sparse layer does.
+    """
     live = torch.arange(256, device=q.device) % 64 < valid.repeat_interleave(64)
     means = []
     for tensor in (q, k, v):
@@ -16,7 +21,7 @@ def reference_attention(q, k, v, gate, valid):
                 / valid.clamp_min(1).view(4, 1, 1)
             ).permute(1, 0, 2)
         )
-    scores = means[0] @ means[1].transpose(-1, -2) / 128**0.5
+    scores = means[0] @ means[1].transpose(-1, -2) * scale
     selection = scores[:, 1:3, 1:3].argmax(-1) + 1
     mask = torch.zeros(q.shape[1], 256, 256, device=q.device, dtype=torch.bool)
     mask[:, :64, :192] = True
@@ -36,6 +41,7 @@ def reference_attention(q, k, v, gate, valid):
         k.transpose(0, 1).double(),
         v.transpose(0, 1).double(),
         attn_mask=mask,
+        scale=scale,
     )
     compression = (
         scores.masked_fill(valid.view(1, 1, -1) == 0, -torch.inf).softmax(-1)

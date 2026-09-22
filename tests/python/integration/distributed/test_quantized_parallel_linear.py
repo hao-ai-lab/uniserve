@@ -22,6 +22,7 @@ from uniserve.nn import (
 from uniserve.quantization import QuantizationConfig, Quantizer
 from uniserve.runtime import (
     CUDAGraph,
+    CUDAStream,
     ExecutionContext,
     initialize_process_groups,
 )
@@ -106,9 +107,9 @@ def _run(rank, rendezvous, directory, source):
                 # local BF16 product and TP sum contributes one unit roundoff.
                 calls = group.size + 1
                 gamma = calls * 2**-8 / (1 - calls * 2**-8)
-                stream = torch.cuda.Stream(device=device)
-                stream.wait_stream(torch.cuda.current_stream(device))
-                with ExecutionContext(model, stream=stream) as context:
+                stream = CUDAStream.external(torch.cuda.Stream(device=device))
+                stream.wait(torch.cuda.current_stream(device))
+                with stream, ExecutionContext(model, stream=stream) as context:
                     context.prepare(TextSize(128, 1))
                     local = x.chunk(group.size, dim=-1)[group.rank].contiguous()
                     row_result = model.row(local)

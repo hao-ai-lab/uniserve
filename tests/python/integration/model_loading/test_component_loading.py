@@ -211,7 +211,7 @@ def test_contexts_deliver_cross_device_components_with_independent_graphs(
     component_checkpoint, explicit_stream
 ):
     from uniserve.model import TextSize
-    from uniserve.runtime import CUDAGraph, ExecutionContext
+    from uniserve.runtime import CUDAGraph, CUDAStream, ExecutionContext
 
     root, io = component_checkpoint
     model = _load(
@@ -231,9 +231,11 @@ def test_contexts_deliver_cross_device_components_with_independent_graphs(
         pools = tuple(
             {torch.device("cuda:1"): torch.cuda.MemPool()} for _ in range(2)
         )
-    with ExecutionContext(
-        model, stream=streams[0] if explicit_stream else None
-    ) as a:
+    owners = tuple(
+        CUDAStream.external(stream) if explicit_stream else None
+        for stream in streams
+    )
+    with ExecutionContext(model, stream=owners[0]) as a:
         a.prepare(TextSize(1, 1))
         streams[0].wait_stream(torch.cuda.default_stream("cuda:0"))
         torch.testing.assert_close(
@@ -246,9 +248,7 @@ def test_contexts_deliver_cross_device_components_with_independent_graphs(
         )
         with CUDAGraph(context=a, pools=pools[0]) as ga:
             ga.capture(lambda: model(first))
-            with ExecutionContext(
-                model, stream=streams[1] if explicit_stream else None
-            ) as b:
+            with ExecutionContext(model, stream=owners[1]) as b:
                 b.prepare(TextSize(1, 1))
                 streams[1].wait_stream(torch.cuda.default_stream("cuda:0"))
                 torch.testing.assert_close(
@@ -273,3 +273,6 @@ def test_contexts_deliver_cross_device_components_with_independent_graphs(
             assert model(first, out=out) is out
             torch.testing.assert_close(out, first.new_tensor([[8.0, 108.0]]))
         streams[0].synchronize()
+    for owner in owners:
+        if owner is not None:
+            owner.close()

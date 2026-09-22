@@ -9,6 +9,8 @@ from uniserve.sampling import SamplingParams
 from uniserve_worker.sampling.metadata import SamplingMetadata
 from uniserve_worker.sampling.sampler import device_greedy_parameters, sample
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.mark.parametrize(
     "logits,parameters",

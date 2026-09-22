@@ -395,7 +395,7 @@ class ShmTransport(Transport):
             if first.is_cuda:
                 assert signal is not None
                 submitted = True
-                from uniserve_kernel.peer_storage import copy_host_device
+                from uniserve_kernels.peer_storage import copy_host_device
 
                 stream = torch.cuda.current_stream(first.device)
                 for target, value in copy_pairs(source, packed):

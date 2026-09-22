@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from uniserve.nn import Linear
-from uniserve.runtime import ExecutionContext
+from uniserve.runtime import CUDAStream, ExecutionContext
 from uniserve.runtime.cuda_graph import CUDAGraph
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
@@ -14,7 +14,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 def test_closing_a_graph_keeps_its_siblings_replayable():
     """Closing a graph preserves its siblings' eager-equivalent results."""
     device = torch.device("cuda:0")
-    stream = torch.cuda.Stream(device=device)
+    stream = CUDAStream.external(torch.cuda.Stream(device=device))
     module = Linear(256, 256, bias=False).to(
         device=device, dtype=torch.bfloat16
     )
@@ -42,3 +42,4 @@ def test_closing_a_graph_keeps_its_siblings_replayable():
             graph.close()
         torch.cuda.synchronize(device)
         context.close()
+        stream.close()

@@ -13,6 +13,7 @@ from uniserve.nn.attention import AttentionParallelConfig, Ulysses
 from uniserve.quantization import Quantizer
 from uniserve.runtime import (
     CUDAGraph,
+    CUDAStream,
     ExecutionContext,
     initialize_process_groups,
 )
@@ -69,9 +70,9 @@ def _run(rank, rendezvous):
             result = torch.empty(257, 64, device=device, dtype=torch.bfloat16)
             nested_result = torch.empty_like(result)
             local = source[interval].clone()
-            stream = torch.cuda.Stream(device=device)
-            stream.wait_stream(torch.cuda.current_stream(device))
-            with ExecutionContext(layer, stream=stream) as context:
+            stream = CUDAStream.external(torch.cuda.Stream(device=device))
+            stream.wait(torch.cuda.current_stream(device))
+            with stream, ExecutionContext(layer, stream=stream) as context:
                 context.prepare(TextSize(0, 0))
                 empty = torch.cat(
                     [

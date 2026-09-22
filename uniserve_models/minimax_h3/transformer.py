@@ -8,9 +8,8 @@ from itertools import chain
 import torch
 from torch import nn
 
-from uniserve import ops
 from uniserve.distributed import DeviceMesh
-from uniserve.nn import GatedMLP, Linear, Modulation, RMSNorm
+from uniserve.nn import GatedMLP, Linear, Modulation, RMSNorm, functional
 from uniserve.quantization import Quantizer
 
 from .attention import Attention
@@ -71,7 +70,7 @@ class TransformerLayer(nn.Module):
                 # normalization pass writes the copy as it reads the rows.
                 yield (
                     interval,
-                    ops.modulated_rms_norm(
+                    functional.modulated_rms_norm(
                         value,
                         self.norm[0].weight,
                         shift_attn,
@@ -102,15 +101,17 @@ class TransformerLayer(nn.Module):
                 and self.mlp.gate_up.projections["up"].input_quantizer
                 == quantizer
             ):
-                residual, values, scales = ops.gated_residual_rms_norm_fp8(
-                    hidden[local],
-                    update,
-                    gate_attn,
-                    self.norm[1].weight,
-                    shift_mlp,
-                    scale_mlp,
-                    selected,
-                    eps=self.norm[1].eps,
+                residual, values, scales = (
+                    functional.gated_residual_rms_norm_fp8(
+                        hidden[local],
+                        update,
+                        gate_attn,
+                        self.norm[1].weight,
+                        shift_mlp,
+                        scale_mlp,
+                        selected,
+                        eps=self.norm[1].eps,
+                    )
                 )
                 normalized = quantizer.from_tensors(
                     {"values": values, "scale": scales},
@@ -118,7 +119,7 @@ class TransformerLayer(nn.Module):
                     dtype=hidden.dtype,
                 )
             else:
-                residual, normalized = ops.gated_residual_rms_norm(
+                residual, normalized = functional.gated_residual_rms_norm(
                     hidden[local],
                     update,
                     gate_attn,
@@ -128,7 +129,7 @@ class TransformerLayer(nn.Module):
                     selected,
                     eps=self.norm[1].eps,
                 )
-            return ops.gated_residual(
+            return functional.gated_residual(
                 residual, self.mlp(normalized), gate_mlp, selected
             )
 

@@ -7,11 +7,11 @@ from contextlib import contextmanager
 
 import torch
 
-from uniserve.distributed._chunks import _gather_chunks
-from uniserve.distributed.mesh import _finish, _start_all_gather
+from uniserve.distributed.chunks import gather_chunks
 from uniserve.quantization import QuantizedTensor, Quantizer, ScaleLayout
 
-from . import _binding, functional
+from . import _binding
+from .functional._tensors import as_matrix
 
 
 def tensor_statistics(quantizer: Quantizer | None) -> bool:
@@ -54,7 +54,7 @@ def _partition(module, x, token_slice, num_tokens):
     ):
         raise ValueError("token input must match its complete logical shard")
 
-    gathered = getattr(module, "_gather_axes", axes)
+    gathered = getattr(module, "gather_axes", axes)
     if not set(gathered).issubset(axes):
         raise ValueError("projection gather axes must partition input tokens")
     retained = tuple(axis for axis in axes if axis not in gathered)
@@ -144,7 +144,7 @@ def _encoded_gather(module, x, group, capacity, num_tokens):
 @contextmanager
 def materialize_input(module, x, token_slice, num_tokens):
     """Yield the complete gathered input rows for this context coordinate."""
-    x = functional._matrix(x)
+    x = as_matrix(x)
     group, capacity, domain = _partition(module, x, token_slice, num_tokens)
     num_tokens = domain.stop - domain.start
 
@@ -178,7 +178,7 @@ def projection_inputs(
         yield from _stream_inputs(module, x, token_slice, num_tokens)
         return
 
-    x = functional._matrix(x)
+    x = as_matrix(x)
     group, capacity, domain = _partition(module, x, token_slice, num_tokens)
     num_tokens = domain.stop - domain.start
     if group.size == 1 or num_tokens == 0:
@@ -202,7 +202,7 @@ def projection_inputs(
     with _storage(
         module, local.numel() * local.element_size() * group.size, x.device
     ) as storage:
-        for interval, values in _gather_chunks(group, local, storage):
+        for interval, values in gather_chunks(group, local, storage):
             stop = min(interval.stop, num_tokens)
             if interval.start < stop:
                 yield (
@@ -273,7 +273,7 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
         # intervals need not force smaller GEMMs or additional peer
         # publications.
         chunk_rows = _projection_chunk_rows(width, dtype)
-        backend_rank = group._backend_order.index(group.rank)
+        backend_rank = group.backend_order.index(group.rank)
         pending = []
         staged = cursor = 0
         from itertools import chain
@@ -287,8 +287,8 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
                 * width
             ]
             target = target.view(group.size, count, width)
-            work = _start_all_gather(
-                target.flatten(0, 1), target[backend_rank], group._require()
+            work = group.start_all_gather(
+                target.flatten(0, 1), target[backend_rank]
             )
             pending.append((start, count, target, work))
             stop = min(start + count, rows)
@@ -353,9 +353,9 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
 
             # Remote rows become readable once their owners' gathers complete.
             for start, count, target, work in pending:
-                _finish(work, target)
+                work.wait()
                 consumed += 1
-                for physical, logical in enumerate(group._backend_order):
+                for physical, logical in enumerate(group.backend_order):
                     if logical == group.rank:
                         continue
                     begin = domain.start + logical * capacity + start
@@ -367,7 +367,7 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
                         )
         finally:
             for _, _, target, work in pending[consumed:]:
-                _finish(work, target)
+                work.wait()
 
 
 def _check_chunk(interval, value, cursor, stop, width):

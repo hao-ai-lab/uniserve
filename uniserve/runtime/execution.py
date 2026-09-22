@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, MutableMapping
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
 from functools import partial
-from math import prod
 from types import MappingProxyType
 from typing import Generic, TypeVar
-from weakref import WeakKeyDictionary
 
 import torch
 from torch import nn
@@ -18,26 +14,25 @@ from uniserve.distributed import communicators
 from uniserve.model.inputs import TextSize
 from uniserve.nn import _binding
 from uniserve.nn.attention import Attention
-from uniserve.nn.attention.inputs import DenseInput
 from uniserve.nn.attention.vsa import BlockAttention
 from uniserve.nn.linear import (
     ColumnParallelLinear,
     Linear,
     MergedColumnParallelLinear,
 )
-from uniserve.quantization import QuantizedTensor
-from uniserve.runtime._communication import stream_collective_scope
+from uniserve.runtime._collectives import GatherPool
+from uniserve.runtime.communication import stream_collective_scope
 from uniserve.tensors import BufferConfig
 
-from .backends import attention as attention_backend
-from .backends import matmul as matmul_backend
+from .bindings import capturing
+from .bindings.attention import AttentionBinding, ExchangeBuffers
+from .bindings.matmul import MatmulBinding
+from .bindings.vsa import VsaBinding
+from .resources import streams_idle
+from .stream import CUDAStream
 from .tensor_buffers import TensorBuffers
 
 SizeT = TypeVar("SizeT")
-
-
-def _capturing(device):
-    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
 
 
 def _representation(module, inherited):
@@ -50,497 +45,6 @@ def _representation(module, inherited):
     return inherited
 
 
-#: Communicator bindings by the stream they were established on. A binding is
-#: a collective bootstrap, so it is made once per stream and shared by every
-#: context that runs on it.
-_STREAM_COLLECTIVES: MutableMapping[object, dict] = WeakKeyDictionary()
-
-
-def _stream_collectives(stream) -> dict:
-    """Return the bindings established on one stream, creating the record.
-
-    The record is keyed weakly by the stream, so the bindings live exactly as
-    long as the stream that carries them and are released with it rather than
-    with whichever context happened to establish them.
-    """
-    bindings = _STREAM_COLLECTIVES.get(stream)
-    if bindings is None:
-        bindings = {}
-        _STREAM_COLLECTIVES[stream] = bindings
-    return bindings
-
-
-def close_stream_collectives(stream, *, aborted: bool = False) -> None:
-    """Release every binding established on one stream.
-
-    Retiring a communicator normally is collective, so ``aborted`` releases
-    each binding on this rank alone instead. A caller unwinding from a failure
-    passes it: the ranks a collective retirement would wait for are still
-    serving, and waiting for them never returns.
-    """
-    for binding in _STREAM_COLLECTIVES.pop(stream, {}).values():
-        if aborted:
-            binding.abort()
-        else:
-            binding.close()
-
-
-@dataclass(frozen=True)
-class _ExchangeBuffers:
-    tensors: Mapping[str, torch.Tensor]
-
-    def view(self, name, shape, like, *, offset=0):
-        backing = self.tensors[name]
-        # Offsets and extents are byte addresses into the flat uint8 backing.
-        start, size = (
-            offset * like.element_size(),
-            prod(shape) * like.element_size(),
-        )
-        if (
-            start < 0
-            or start + size > backing.numel()
-            or backing.device != like.device
-        ):
-            raise ValueError("attention exchange exceeds its prepared capacity")
-        return backing.narrow(0, start, size).view(like.dtype).view(shape)
-
-
-class _MatmulBinding:
-    """Specialize one numerical call site.
-
-    Specialize one numerical call site while retaining all borrowed backing.
-    """
-
-    def __init__(self, module, backend, max_rows, allocate):
-        self.module, self.backend, self.max_rows = module, backend, max_rows
-        self.allocate = allocate
-        self.operators = {}
-
-    def _prepare(self, dtype, output_dtype, quantizer, rows):
-        if self.max_rows is not None and rows > self.max_rows:
-            raise ValueError("matmul exceeds the prepared token capacity")
-        rows = max(rows, self.max_rows or 0)
-        key = (dtype, output_dtype, quantizer)
-        previous = self.operators.get(key)
-        if previous is not None and previous[0] >= rows:
-            return previous[1]
-
-        if _capturing(self._weight().device):
-            raise RuntimeError(
-                "matmul shape and representation must be prepared before "
-                "capture"
-            )
-
-        options = {
-            "input_dtype": dtype,
-            "input_quantizer": quantizer,
-            "max_rows": rows,
-            "output_dtype": output_dtype,
-        }
-        provider = matmul_backend.resolve(self.backend, self._weight())
-        if isinstance(self.module, MergedColumnParallelLinear):
-            weights = {
-                name: child.weight
-                for name, child in self.module.projections.items()
-            }
-            options["branch_width"] = self.module.branch_width
-            requirements = provider.merged_workspace_buffers(weights, **options)
-            workspace = self.allocate(requirements, self._weight().device)
-            operator = provider.prepare_merged(
-                weights, **options, workspace=workspace
-            )
-        else:
-            weight = self.module.weight
-            requirements = provider.workspace_buffers(weight, **options)
-            workspace = self.allocate(requirements, weight.device)
-            operator = provider.prepare(weight, **options, workspace=workspace)
-
-        self.operators[key] = (rows, operator)
-        return operator
-
-    def _weight(self):
-        if isinstance(self.module, MergedColumnParallelLinear):
-            return next(iter(self.module.projections.values())).weight
-        return self.module.weight
-
-    def quantize(self, x, quantizer, distribution):
-        """Encode a complete logical domain.
-
-        Encode a complete logical domain in this context's activation
-        storage.
-        """
-        operator = self._prepare(x.dtype, x.dtype, quantizer, x.shape[0])
-        target = operator._input_storage(x)
-        return quantizer.quantize(x, distribution=distribution, out=target)
-
-    def __call__(self, x, bias, *, out):
-        destination = (
-            next(iter(out.values())) if isinstance(out, Mapping) else out
-        )
-        quantizer = x.quantizer if isinstance(x, QuantizedTensor) else None
-        return self._prepare(x.dtype, destination.dtype, quantizer, x.shape[0])(
-            x, bias, out=out
-        )
-
-
-class _AttentionBinding:
-    """Specialize one attention call site.
-
-    Specialize one attention call site's operators, plans, and bound
-    metadata.
-    """
-
-    def __init__(
-        self,
-        module,
-        backend,
-        cache,
-        size,
-        device,
-        dtype,
-        allocate,
-        context_transport,
-    ):
-        self.module, self.backend, self.cache, self.size = (
-            module,
-            backend,
-            cache,
-            size,
-        )
-        self.device, self.dtype, self.allocate = device, dtype, allocate
-        self.operators = {}
-        self._bound = set()
-        self._bound_batches = {}
-        self.batch = None
-        self.context_transport = context_transport
-        self.context_plans = {}
-        self.cache_batches = {}
-
-    def _context_plan(self, batch, dtype):
-        from ._attention_context import _ContextPlan
-
-        key = dtype, _ContextPlan.signature(batch)
-        if key not in self.context_plans:
-            if _capturing(self.device):
-                raise RuntimeError(
-                    "prepare context attention metadata before capture"
-                )
-            self.context_plans[key] = _ContextPlan(
-                self.module,
-                batch,
-                cache=self.cache,
-                transport=self.context_transport,
-                allocate=self.allocate,
-                dtype=dtype,
-            )
-        return self.context_plans[key]
-
-    def prepare(self, dtype, size):
-        if self.size is not None and (
-            size.num_tokens > self.size.num_tokens
-            or size.batch_size > self.size.batch_size
-        ):
-            raise ValueError(
-                "attention exceeds the prepared token or batch capacity"
-            )
-
-        previous = self.operators.get(dtype)
-        if previous is not None and (
-            previous.size.num_tokens >= size.num_tokens
-            and previous.size.batch_size >= size.batch_size
-        ):
-            return previous
-
-        if _capturing(self.device):
-            raise RuntimeError(
-                "attention shape and dtype must be prepared before capture"
-            )
-
-        if self.size is not None:
-            size = TextSize(
-                max(size.num_tokens, self.size.num_tokens),
-                max(size.batch_size, self.size.batch_size),
-            )
-
-        options = {
-            "num_heads": self.module._local_heads,
-            "num_kv_heads": self.module._local_kv_heads,
-            "head_dim": self.module.head_dim,
-            "dtype": dtype,
-            "size": size,
-            "cache": self.cache,
-        }
-        provider = attention_backend.resolve(self.backend, device=self.device)
-        requirements = provider.workspace_buffers(**options)
-        operator = provider.prepare(
-            **options, workspace=self.allocate(requirements, self.device)
-        )
-        self.operators[dtype] = operator
-        self._bound.discard(dtype)
-        return operator
-
-    def sequence_inputs(self, batch):
-        """Resolve lengths needed to construct mathematical token partitions."""
-        if (
-            self.module._context is None
-            and self.module._exchange.group.size == 1
-        ):
-            return batch
-        from .backends.attention._sequences import host_lengths
-
-        return host_lengths(
-            batch, prepared=self.batch if _capturing(self.device) else None
-        )
-
-    def bind(self, batch):
-        """Bind numerical metadata before graph capture.
-
-        Bind numerical metadata for every prepared dtype before graph
-        capture.
-        """
-        from .backends.attention._sequences import host_lengths
-
-        batch = self.sequence_inputs(batch)
-        self.batch = batch
-
-        if not isinstance(batch, DenseInput):
-            if batch.queries.num_tokens is not None:
-                self.prepare(
-                    self.dtype,
-                    TextSize(
-                        batch.queries.num_tokens, batch.queries.batch_size
-                    ),
-                )
-            elif self.size is not None:
-                self.prepare(self.dtype, self.size)
-
-        for dtype, operator in self.operators.items():
-            numerical = (
-                batch
-                if self.module._context is None
-                else self._context_plan(batch, dtype).refresh(batch)
-            )
-            if operator.requires_host_lengths(numerical):
-                numerical = host_lengths(numerical)
-            operator.bind(numerical)
-            self._bound_batches[dtype] = numerical
-
-        self._bound.update(self.operators)
-
-    def __call__(self, q, k, v, batch, *, scale, out):
-        from .backends.attention._sequences import host_lengths
-
-        batch = self.sequence_inputs(batch)
-        plan = None
-        storage = _binding.attention_storage.get().get(id(self.module))
-        if self.module._context is not None:
-            plan = self._context_plan(batch, q.dtype)
-            # Plan construction may have grown exchange backing for a longer
-            # key domain than the root's query capacity.
-            storage = _binding.attention_storage.get().get(id(self.module))
-            q, k, v, batch = plan.inputs(q, k, v, batch, storage=storage)
-
-        size = (
-            TextSize(
-                q.shape[0] if q.ndim == 3 else q.shape[0] * q.shape[2],
-                1 if q.ndim == 3 else q.shape[0],
-            )
-            if isinstance(batch, DenseInput)
-            else TextSize(q.shape[0], batch.queries.batch_size)
-        )
-        operator = self.prepare(q.dtype, size)
-
-        # Numerical metadata can be passed directly in eager code. Providers
-        # requiring host planning are bound explicitly before CUDA capture.
-        if _capturing(q.device):
-            if q.dtype not in self._bound:
-                raise RuntimeError(
-                    "bind numerical attention metadata before capture"
-                )
-            if operator.requires_host_lengths(batch):
-                batch = host_lengths(
-                    batch, prepared=self._bound_batches[q.dtype]
-                )
-        else:
-            # Eager callers may pass fresh lengths or mutate borrowed columns
-            # without an explicit bind call. A previous plan for this dtype
-            # does not describe the current batch.
-            if operator.requires_host_lengths(batch):
-                batch = host_lengths(batch)
-            operator.bind(batch)
-            self._bound.add(q.dtype)
-            self._bound_batches[q.dtype] = batch
-
-        result = operator(
-            q,
-            k,
-            v,
-            batch,
-            scale=scale,
-            out=out if plan is None else torch.empty_like(q),
-        )
-        return (
-            result
-            if plan is None
-            else plan.restore(result, storage=storage, out=out)
-        )
-
-    def update_cache(self, k, v, *, indices):
-        """Write current K/V into the bound prefix cache at physical indices."""
-        if self.cache is None:
-            raise RuntimeError("this attention layer has no bound prefix state")
-
-        if self.module._context is not None:
-            from uniserve.nn.attention import SequenceLengths, VarlenInput
-
-            count = indices.numel()
-            if count not in self.cache_batches:
-                if _capturing(indices.device):
-                    raise RuntimeError(
-                        "prepare context cache writes before capture"
-                    )
-                lengths = SequenceLengths.from_lengths(
-                    (count,), device=indices.device
-                )
-                self.cache_batches[count] = VarlenInput(
-                    lengths, lengths, (False,)
-                )
-
-            plan = self._context_plan(self.cache_batches[count], k.dtype)
-            storage = _binding.attention_storage.get().get(id(self.module))
-            k, v = plan.exchange(k, v, storage=storage)
-
-        self.cache.update(k, v, indices=indices)
-
-    def close(self):
-        for operator in self.operators.values():
-            operator.close()
-        self.operators.clear()
-        self._bound_batches.clear()
-        self.context_plans.clear()
-        self.cache_batches.clear()
-        self.batch = self.cache = None
-
-
-class _VsaBinding:
-    """Own one VSA call site's plans and packed input backing.
-
-    Own one VSA call site's plans, mutable query maps, and packed input
-    backing.
-    """
-
-    def __init__(self, backend, allocate, scratch, shared_buffers, exchange):
-        self.backend, self.allocate, self.scratch = backend, allocate, scratch
-        self._shared_buffers, self.exchange = shared_buffers, exchange
-        self.operators, self._buffers = {}, {}
-
-    def prepare(self, pattern, q):
-        key = (q.device, q.dtype, q.shape[1], q.shape[2], pattern)
-        if key not in self.operators:
-            if _capturing(q.device):
-                raise RuntimeError(
-                    "prepare VSA numerical shapes before capture"
-                )
-            from .backends.attention import vsa
-
-            provider = vsa.resolve(self.backend, device=q.device)
-            options = {
-                "num_heads": q.shape[1],
-                "head_dim": q.shape[2],
-                "dtype": q.dtype,
-            }
-            requirements = provider.workspace_buffers(pattern, **options)
-            self.operators[key] = provider.prepare(
-                pattern,
-                **options,
-                workspace=self.scratch(requirements, q.device),
-            )
-
-        return self.operators[key]
-
-    def buffers(self, requirements, device):
-        key = (device, tuple(requirements.items()))
-        if key not in self._buffers:
-            if _capturing(device):
-                raise RuntimeError(
-                    "prepare VSA projected input backing before capture"
-                )
-            self._buffers[key] = self._shared_buffers(
-                {
-                    name: BufferConfig(shape, dtype)
-                    for name, (shape, dtype) in requirements.items()
-                },
-                device,
-            )
-
-        return self._buffers[key]
-
-    def close(self):
-        for operator in self.operators.values():
-            operator.close()
-        self.operators.clear()
-        self._buffers.clear()
-
-
-class _GatherPool:
-    """Lend registered transport buffers until their readers are enqueued.
-
-    Iterators may nest while upstream projections still have unread payloads.
-    Each active borrower receives distinct backing; completed borrowers reuse
-    storage on the context's serialized stream. Graphs retain every allocation.
-    """
-
-    def __init__(self, group, collective):
-        self.group = group
-        self.collective = collective
-        self.buffers = []
-        self.borrowed = set()
-        self.symmetric = (
-            torch.distributed.get_backend(group._require()) == "nccl"
-        )
-
-    @contextmanager
-    def borrow(self, size, device, *, capacity=None):
-        if device != self.group.device:
-            raise ValueError(
-                "projection exchange must use its communicator's device"
-            )
-        if capacity is not None and size > capacity:
-            raise ValueError("projection exchange exceeds the bound workspace")
-        amount = size if capacity is None else capacity
-
-        buffer = next(
-            (
-                value
-                for value in self.buffers
-                if id(value) not in self.borrowed and value.numel() >= amount
-            ),
-            None,
-        )
-        if buffer is None:
-            if _capturing(device):
-                raise RuntimeError(
-                    "prepare projection exchange backing before capture"
-                )
-            if self.symmetric:
-                from ._peer_storage import allocate_collective_buffer
-
-                buffer = allocate_collective_buffer(
-                    (amount,), dtype=torch.uint8, device=device
-                )
-            else:
-                buffer = torch.empty(amount, dtype=torch.uint8, device=device)
-            if self.collective is not None:
-                self.collective.register_buffers(buffer)
-            self.buffers.append(buffer)
-
-        self.borrowed.add(id(buffer))
-        try:
-            yield buffer
-        finally:
-            self.borrowed.remove(id(buffer))
-
-
 class ExecutionContext(Generic[SizeT]):
     """Own one independent invocation domain for shared numerical modules.
 
@@ -550,13 +54,17 @@ class ExecutionContext(Generic[SizeT]):
     Callers retire graphs and asynchronous readers before preparing again or
     closing this owner. A new preparation replaces the previous capacity.
     Weights and externally supplied buffers remain caller-owned.
+
+    ``stream`` is a borrowed :class:`CUDAStream`. Its communication owner
+    holds the communicators, registered windows and window storage every
+    context on the stream shares; this context never retires them.
     """
 
     def __init__(
         self,
         module: nn.Module,
         *,
-        stream=None,
+        stream: CUDAStream | None = None,
         cache=None,
         attention="auto",
         vsa="auto",
@@ -620,19 +128,9 @@ class ExecutionContext(Generic[SizeT]):
         from ._transfers import _Transfers
 
         self._transfers = _Transfers(module, self._device)
-        # Active scopes borrow this mapping. Populate it in place so an
-        # already-entered context uses the same stream bindings during warmup
-        # and capture, including when prepare() discovers more components.
-        # Bindings belong to the stream, not to this context. A communicator
-        # binding is `ncclCommInitRankConfig` behind a broadcast over the
-        # group, so every member has to reach it, and preparation is not a
-        # point where they all do: contexts are keyed by numerical size and a
-        # rank's media unit count decides which sizes it prepares. One stream
-        # serves every size of one computation, so binding there is reached
-        # once, by every rank, when the computation is first warmed.
-        self._collectives = (
-            _stream_collectives(stream) if stream is not None else None
-        )
+        # Streams created for graphs that borrow this context without an
+        # execution stream; their replays read this context's backing.
+        self._graph_streams: set[torch.cuda.Stream] = set()
         self._entered = None
         self._max_tokens = None
         self._closed = False
@@ -686,7 +184,7 @@ class ExecutionContext(Generic[SizeT]):
         return self._vsa_backing[key]
 
     def _vsa_exchange(self, layer, rows, heads, head_dim, dtype):
-        parallel = getattr(layer, "_parallel", None)
+        parallel = getattr(layer, "parallel", None)
         if parallel is None:
             return None
 
@@ -700,7 +198,7 @@ class ExecutionContext(Generic[SizeT]):
             dtype,
         )
         if key not in self._vsa_transport:
-            if _capturing(self._device):
+            if capturing(self._device):
                 raise RuntimeError(
                     "prepare VSA communication storage before capture"
                 )
@@ -709,32 +207,47 @@ class ExecutionContext(Generic[SizeT]):
                 allocate_output_storage,
             )
 
-            outputs = allocate_output_storage(
-                (parallel,),
-                rows=rows,
-                heads=heads,
-                head_dim=head_dim,
-                dtype=dtype,
-            )
-            self._allocations.extend(outputs.allocations)
+            def allocate():
+                return allocate_output_storage(
+                    (parallel,),
+                    rows=rows,
+                    heads=heads,
+                    head_dim=head_dim,
+                    dtype=dtype,
+                )
 
             group = parallel.ulysses_group
             # Registration hands NCCL a window its zero-CTA all-to-all can
-            # use, and only symmetric storage backs one. A layer exchanging
-            # out of ordinary storage cannot be registered and takes the
-            # ordinary collective; registering it fails the communicator
-            # rather than degrading it. The send buffer is this rank's own
-            # destination either way, since where peer storage exists its own
-            # entry is that same storage.
+            # use, and only symmetric storage backs one: a layer whose context
+            # partition composes peer rows. Its storage belongs to the stream,
+            # whose communicator retains the window; other storage belongs to
+            # this context and takes the ordinary collective. The send buffer
+            # is this rank's own destination either way, since where peer
+            # storage exists its own entry is that same storage.
             if (
-                self._collectives is not None
+                self.stream is not None
                 and group.size > 1
-                and outputs.views[parallel].peers
+                and parallel.context_group.size > 1
+                and group._require().group_name
+                in self.stream.communication.communicators
             ):
-                buffers = outputs.views[parallel]
-                self._collectives[group._require().group_name].register_buffers(
-                    buffers.local, buffers.receive
+
+                def registered():
+                    outputs = allocate()
+                    buffers = outputs.views[parallel]
+                    return (
+                        buffers,
+                        outputs.allocations,
+                        (buffers.local, buffers.receive),
+                    )
+
+                output = self.stream.communication.windows(
+                    ("vsa_output", key), group, registered
                 )
+            else:
+                outputs = allocate()
+                self._allocations.extend(outputs.allocations)
+                output = outputs.views[parallel]
 
             context = allocate_context_storage(
                 (parallel,),
@@ -744,10 +257,7 @@ class ExecutionContext(Generic[SizeT]):
                 dtype=dtype,
                 block_size=64,
             )
-            self._vsa_transport[key] = (
-                outputs.views[parallel],
-                context.get(parallel),
-            )
+            self._vsa_transport[key] = (output, context.get(parallel))
 
         output, context = self._vsa_transport[key]
         self._vsa_output[parallel] = output
@@ -785,20 +295,12 @@ class ExecutionContext(Generic[SizeT]):
         max_rows = size.num_tokens if isinstance(size, TextSize) else None
         self._max_tokens = max_rows
 
-        if self._collectives is not None:
-            from uniserve.runtime._collectives import (
-                allocate_stream_collectives,
-            )
-
-            pending = (
-                group
-                for group in self._groups
-                if group.size > 1
-                and group._require().group_name not in self._collectives
-            )
-            self._collectives.update(
-                allocate_stream_collectives(pending, self.stream)
-            )
+        if self.stream is not None:
+            # Communicators belong to the stream and are created once, by the
+            # first preparation on it that uses each group. Every member rank
+            # prepares the stream's computation, even when ranks prepare
+            # different numbers of sizes, so each binding is reached by all.
+            self.stream.communication.bind(self._groups)
 
         with self.activate():
             for name, supplied in (
@@ -832,7 +334,7 @@ class ExecutionContext(Generic[SizeT]):
                 representations[path] = device, dtype
 
                 if isinstance(child, (Linear, MergedColumnParallelLinear)):
-                    binding = _MatmulBinding(
+                    binding = MatmulBinding(
                         child,
                         self._matmul_backend,
                         max_rows,
@@ -866,7 +368,7 @@ class ExecutionContext(Generic[SizeT]):
                 if isinstance(child, ColumnParallelLinear):
                     axes = child.input_distribution.shard_axes(0)
                     group = child.input_distribution.mesh.get_group(
-                        getattr(child, "_gather_axes", axes)
+                        getattr(child, "gather_axes", axes)
                     )
                     if group.size > 1:
                         # Two complete gather slots bound every row/chunk shape.
@@ -880,15 +382,16 @@ class ExecutionContext(Generic[SizeT]):
                             )
                             amount = 2 * rows * child.weight.shape[1] * 4
 
-                        if group not in self._gather_pools:
-                            collective = (self._collectives or {}).get(
-                                group._require().group_name
-                            )
-                            self._gather_pools[group] = _GatherPool(
-                                group, collective
-                            )
-
-                        pool = self._gather_pools[group]
+                        # Registered transport buffers belong to the stream
+                        # whose communicator holds their windows.
+                        if self.stream is not None:
+                            pool = self.stream.communication.gather_pool(group)
+                        else:
+                            if group not in self._gather_pools:
+                                self._gather_pools[group] = GatherPool(
+                                    group, None
+                                )
+                            pool = self._gather_pools[group]
                         self._chunks[id(child)] = partial(
                             pool.borrow, capacity=amount
                         )
@@ -897,7 +400,7 @@ class ExecutionContext(Generic[SizeT]):
                                 pass
 
                 if isinstance(child, BlockAttention):
-                    self._vsa[id(child)] = _VsaBinding(
+                    self._vsa[id(child)] = VsaBinding(
                         self._vsa_backend,
                         self._allocate,
                         self._attention_workspace,
@@ -912,7 +415,7 @@ class ExecutionContext(Generic[SizeT]):
                         state = self.cache.state(child.cache_name)
                         device, dtype = state.key.device, state.key.dtype
 
-                    binding = _AttentionBinding(
+                    binding = AttentionBinding(
                         child,
                         self._attention_backend,
                         state,
@@ -931,7 +434,7 @@ class ExecutionContext(Generic[SizeT]):
                         )
 
     def _prepare_exchange(self, layer, num_tokens, device, dtype):
-        group = layer._exchange.group
+        group = layer.exchange.group
         if group.size == 1:
             return
 
@@ -942,10 +445,10 @@ class ExecutionContext(Generic[SizeT]):
                 (rows * heads * layer.head_dim * dtype.itemsize,), torch.uint8
             )
             for role, heads in (
-                ("query", layer._local_heads),
-                ("key", layer._local_kv_heads),
-                ("value", layer._local_kv_heads),
-                ("output", layer._local_heads),
+                ("query", layer.local_heads),
+                ("key", layer.local_kv_heads),
+                ("value", layer.local_kv_heads),
+                ("output", layer.local_heads),
             )
             for direction in ("send", "receive")
         }
@@ -956,21 +459,21 @@ class ExecutionContext(Generic[SizeT]):
         ):
             return
 
-        self._exchange[id(layer)] = _ExchangeBuffers(
+        self._exchange[id(layer)] = ExchangeBuffers(
             self._allocate(requirements, device)
         )
 
     def _context_transport(self, layer, rows, dtype):
         from .attention_storage import allocate_context_storage
 
-        parallel = layer._context
+        parallel = layer.context_parallel
         if self._max_tokens is not None:
-            members = parallel.context_group.size * layer._exchange.group.size
+            members = parallel.context_group.size * layer.exchange.group.size
             rows = max(
                 rows,
                 (self._max_tokens + members - 1)
                 // members
-                * layer._exchange.group.size,
+                * layer.exchange.group.size,
             )
         self._prepare_exchange(
             layer,
@@ -985,7 +488,7 @@ class ExecutionContext(Generic[SizeT]):
         key = (
             parallel.key_group,
             rows,
-            layer._local_kv_heads,
+            layer.local_kv_heads,
             layer.head_dim,
             dtype,
         )
@@ -993,7 +496,7 @@ class ExecutionContext(Generic[SizeT]):
             self._context_backing[key] = allocate_context_storage(
                 (parallel,),
                 rows=rows,
-                heads=layer._local_kv_heads,
+                heads=layer.local_kv_heads,
                 head_dim=layer.head_dim,
                 dtype=dtype,
                 block_size=1,
@@ -1004,15 +507,25 @@ class ExecutionContext(Generic[SizeT]):
         return buffers
 
     def bind_attention(self, batch):
-        """Bind current batch metadata before capture.
+        """Plan one call's attention metadata on every attention layer.
 
-        Bind current batch metadata on every attention binding before
-        capture.
+        Required before graph capture. In eager execution the next call of
+        each layer on ``batch`` uses these plans instead of planning again;
+        bind again after changing lengths in place. Exact host lengths are
+        read at most once for all layers.
         """
+        from .backends.attention._sequences import host_lengths
+
         self._open()
         with self.activate():
+            mirrored = batch
+            if any(
+                binding.reads_host_lengths(batch)
+                for binding in self._attention.values()
+            ):
+                mirrored = host_lengths(batch)
             for binding in self._attention.values():
-                binding.bind(batch)
+                binding.bind(mirrored, source=batch)
 
     @contextmanager
     def activate(self):
@@ -1032,10 +545,12 @@ class ExecutionContext(Generic[SizeT]):
         )
 
         with ExitStack() as scope:
+            collectives = None
             if self.stream is not None:
                 scope.enter_context(torch.cuda.device(self.stream.device))
-                scope.enter_context(torch.cuda.stream(self.stream))
-            scope.enter_context(stream_collective_scope(self._collectives))
+                scope.enter_context(torch.cuda.stream(self.stream.stream))
+                collectives = self.stream.communication.communicators
+            scope.enter_context(stream_collective_scope(collectives))
             if self._transfers is not None:
                 scope.enter_context(self._transfers.activate())
             from uniserve.nn.attention._parallel import (
@@ -1090,17 +605,45 @@ class ExecutionContext(Generic[SizeT]):
             self._allocations.clear()
             self._scratch.clear()
             self._matmul_scratch.clear()
-            # Bindings outlive this context: they belong to its stream, and
-            # a later context on the same stream reuses them rather than
-            # issuing a bootstrap its peers have no reason to join.
+            # Communicators and registered windows outlive this context: they
+            # belong to its stream, and a later context on the same stream
+            # reuses them rather than issuing a bootstrap its peers have no
+            # reason to join.
             self.constants = self.workspace = MappingProxyType({})
             self._max_tokens = None
+
+    def _idle(self) -> bool:
+        """Report, without waiting, that no submitted work reads the backing.
+
+        Covers the execution stream (the device's current stream without
+        one), cross-device delivery streams, streams of graphs borrowing this
+        context, and the stream's communication transfers.
+        """
+        if self._closed or self._device.type != "cuda":
+            return True
+        streams = [
+            *self._transfers.streams.values(),
+            *self._graph_streams,
+        ]
+        if self.stream is not None:
+            streams.append(self.stream.stream)
+            streams.extend(
+                transfer
+                for communicator in (
+                    self.stream.communication.communicators.values()
+                )
+                if (transfer := communicator.transfer_stream) is not None
+            )
+        else:
+            streams.append(torch.cuda.current_stream(self._device))
+        return streams_idle(streams)
 
     def close(self, *, aborted=False):
         """Release prepared resources and reject subsequent execution.
 
-        Aborted close retains resources and aborts stream collectives without
-        waiting; the owning process must exit before reclaiming them.
+        Aborted close retains every resource without waiting; the owning
+        process must exit before reclaiming them. The borrowed stream keeps
+        its communicators either way.
         """
         if self._closed:
             return
@@ -1109,16 +652,14 @@ class ExecutionContext(Generic[SizeT]):
             from .resources import retain_until_exit
 
             retain_until_exit(self)
-            if self.stream is not None:
-                close_stream_collectives(self.stream, aborted=True)
             return
         try:
             self._release()
         finally:
-            self._collectives = None
             if self._transfers is not None:
                 self._transfers.close()
                 self._transfers = None
+            self._graph_streams.clear()
             self.module = self.cache = None
 
     def __enter__(self):
@@ -1136,7 +677,12 @@ class ExecutionContext(Generic[SizeT]):
         finally:
             self._entered = None
             try:
-                self.close(aborted=exc is not None)
+                # An exception alone does not show that device work is
+                # unfinished. Release normally when every stream that reads
+                # this context's backing has completed; otherwise retain it,
+                # since freeing storage an unfinished access reads is unsafe
+                # and waiting can require a failed peer.
+                self.close(aborted=exc is not None and not self._idle())
             except BaseException as error:
                 if exc is None:
                     raise

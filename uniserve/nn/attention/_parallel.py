@@ -10,8 +10,8 @@ from math import prod
 
 import torch
 
-from uniserve.distributed._chunks import (
-    _ChunkProducer,
+from uniserve.distributed.chunks import (
+    ChunkProducer,
     _produce_chunks,
 )
 from uniserve.distributed.mesh import DeviceMesh
@@ -67,7 +67,7 @@ class AttentionRowExchange:
 
     parallel: ParallelAttention
     tensor: torch.Tensor
-    producer: _ChunkProducer | None
+    producer: ChunkProducer | None
     receive_workspace: torch.Tensor
 
     @staticmethod
@@ -152,6 +152,8 @@ class ParallelAttention(torch.nn.Module):
         parallel: AttentionParallelConfig = AttentionParallelConfig(),
     ) -> None:
         torch.nn.Module.__init__(self)
+        # The mathematical partition this exchange realizes.
+        self.mesh, self.parallel = mesh, parallel
 
         heads = () if parallel.heads is None else (parallel.heads.axis,)
         context = parallel.context
@@ -215,8 +217,8 @@ class ParallelAttention(torch.nn.Module):
             workspace.key[:rows],
             workspace.value[:rows],
         )
-        context._all_gather_into_tensor(context_key, key.contiguous())
-        context._all_gather_into_tensor(context_value, value.contiguous())
+        context.all_gather_into(context_key, key.contiguous())
+        context.all_gather_into(context_value, value.contiguous())
         return context_key, context_value
 
     def finish_output(
@@ -232,7 +234,7 @@ class ParallelAttention(torch.nn.Module):
                 "attention outputs disagree with Ulysses membership"
             )
         buffers = self.output_buffers
-        group._all_gather_into_tensor(buffers.sync_output, buffers.sync_input)
+        group.all_gather_into(buffers.sync_output, buffers.sync_input)
         return outputs[group.rank]
 
     @property

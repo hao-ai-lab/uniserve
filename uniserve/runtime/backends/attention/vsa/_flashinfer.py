@@ -6,14 +6,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
-
-from uniserve.distributed._chunks import _ChunkProducer
-from uniserve.nn.attention.vsa.inputs import Pattern
-from uniserve.ops.video_sparse_rows import (
+from uniserve_kernels.attention.vsa_rows import (
     compose_attention,
     pack_sparse_input_rows,
 )
-from uniserve.runtime.triton import triton_available
+from uniserve_kernels.triton import launchable
+
+from uniserve.distributed.chunks import ChunkProducer
+from uniserve.nn.attention.vsa.inputs import Pattern
 
 try:  # pragma: no cover - worker_config-only CUDA provider.
     import flashinfer as _flashinfer
@@ -219,7 +219,7 @@ def available(device: torch.device | None = None) -> bool:
         if device is not None
         else torch.device("cuda", torch.cuda.current_device())
     )
-    return triton_available(selected)
+    return launchable(selected)
 
 
 def import_error() -> BaseException | None:
@@ -473,7 +473,7 @@ def prepare_rows(
     chunk_rows: int,
     packed: torch.Tensor | None = None,
     scale: float,
-) -> _ChunkProducer:
+) -> ChunkProducer:
     """Prepare full K/V once and produce paired owner query intervals on demand.
 
     All owners share one selected key domain. Queries are packed in transport
@@ -586,6 +586,7 @@ def prepare_rows(
                 selected_tiles,
                 block_sizes=valid_sizes,
                 q2k_block_nums=native_plan.counts,
+                softmax_scale=scale,
                 out=output,
             )
             compose_attention(

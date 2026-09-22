@@ -12,7 +12,7 @@ import torch
 from uniserve.diffusion import DenoisingStep, Schedule
 from uniserve.distributed import Communicator
 from uniserve.model import Denoiser, DenoiserInput
-from uniserve.runtime import ExecutionContext, PrefixCache
+from uniserve.runtime import CUDAStream, ExecutionContext, PrefixCache
 from uniserve_worker.model_executor.component_binding import capture_required
 from uniserve_worker.model_executor.cuda_graph import (
     CUDAGraphRunner,
@@ -91,7 +91,7 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
         model: Denoiser[InputT, SizeT],
         *,
         device: torch.device,
-        stream: torch.cuda.Stream | None,
+        stream: CUDAStream | None,
         groups: tuple[Communicator, ...],
         capacity: int,
         capture: bool = True,
@@ -149,9 +149,7 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
             )
             try:
                 if self.stream is not None:
-                    self.stream.wait_stream(
-                        torch.cuda.current_stream(self.device)
-                    )
+                    self.stream.wait(torch.cuda.current_stream(self.device))
                 with self.graph_storage.allocate(entry):
                     context.prepare(size)
                 self.graph_storage.check()
@@ -180,7 +178,7 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
         """Prepare kernel specializations without advancing the samples."""
         context, call = self._call(inputs, schedules, state, input_key)
         if context.stream is not None:
-            context.stream.wait_stream(torch.cuda.current_stream(self.device))
+            context.stream.wait(torch.cuda.current_stream(self.device))
         with context.activate():
             restore = restore_samples(inputs)
             try:
@@ -428,16 +426,16 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
                 else None
             )
             if context.stream is not None:
-                context.stream.wait_stream(current)
+                context.stream.wait(current)
             try:
                 with context.activate():
                     return call(), "eager"
             finally:
                 if context.stream is not None:
-                    current.wait_stream(context.stream)
+                    current.wait_stream(context.stream.stream)
         graph, context, captured = self._graph(trajectory, index)
         current = torch.cuda.current_stream(self.device)
-        context.stream.wait_stream(current)
+        context.stream.wait(current)
         with context.activate():
             # The trajectory's non-bank tensors have known positions. Keep
             # their correspondence per binding, including new schedule objects.
@@ -446,7 +444,7 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
                 self._slot_value(trajectory.slot), non_blocking=True
             )
             graph.replay(temporal)
-        current.wait_stream(context.stream)
+        current.wait_stream(context.stream.stream)
         return {
             name: tuple(value.tensor for value in values)
             for name, values in live.latents.items()
@@ -466,13 +464,11 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
         if self._closed:
             return
         if aborted:
-            from uniserve.runtime.execution import close_stream_collectives
             from uniserve.runtime.resources import retain_until_exit
 
+            # The borrowed stream's owner retires its communicators.
             self._closed = True
             retain_until_exit(self)
-            if self.stream is not None:
-                close_stream_collectives(self.stream, aborted=True)
             return
         for key in tuple(self.prepared):
             self.release_inputs(key)

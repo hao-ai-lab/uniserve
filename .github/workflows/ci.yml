@@ -28,12 +28,12 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -U pip
-      - run: python -m pip install -e ".[dev,test,bench]"
-      - run: python -m ruff check uniserve uniserve_models uniserve_worker uniserve_eval uniserve_kernel/src tests scripts examples
-      - run: python -m ruff format --check uniserve uniserve_models uniserve_worker uniserve_eval uniserve_kernel/src tests scripts examples
+      - run: python -m pip install -e ./uniserve_kernels -e ".[dev,test,bench]"
+      - run: python -m ruff check uniserve uniserve_models uniserve_worker uniserve_eval uniserve_kernels/src tests scripts examples
+      - run: python -m ruff format --check uniserve uniserve_models uniserve_worker uniserve_eval uniserve_kernels/src tests scripts examples
       - run: python -m mypy uniserve uniserve_models uniserve_worker uniserve_eval
-      - run: python -m pytest -m unit
-      - run: python -m pytest -m integration
+      - run: python -m pytest -m "unit and not gpu"
+      - run: python -m pytest -m "integration and not gpu"
 
   benchmark-smoke:
     runs-on: ubuntu-latest
@@ -47,6 +47,6 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -U pip
-      - run: python -m pip install -e ".[test,bench]"
+      - run: python -m pip install -e ./uniserve_kernels -e ".[test,bench]"
       - run: cargo build -p uniserve-cli
       - run: python -m pytest -m "e2e and not gpu"

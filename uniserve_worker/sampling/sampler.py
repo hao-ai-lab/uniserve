@@ -7,9 +7,9 @@ from collections.abc import Callable, Sequence
 from typing import cast
 
 import torch
+from uniserve_kernels.triton import launchable
 
 from uniserve.distributed.mesh import Communicator
-from uniserve.runtime.triton import triton_available
 from uniserve.sampling import SamplingParams, sample_top_k
 from uniserve.sampling.top_k import top_k_candidates
 from uniserve.tensors import adjacent_view
@@ -361,7 +361,7 @@ def _run_fused_top_k_sampling(
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the compiled fixed-top-k sampler on a CUDA device."""
-    if not triton_available(logits.device):
+    if not launchable(logits.device):
         raise unsupported_setup("fused top-k sampling requires a CUDA device")
     return sample_top_k(
         logits,

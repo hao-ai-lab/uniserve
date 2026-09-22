@@ -12,7 +12,9 @@ from torch.distributed.tensor import Replicate, Shard
 from uniserve.distributed import Communicator, DeviceMesh, Distribution
 from uniserve.quantization import QuantizedTensor, Quantizer
 
-from . import _binding, functional
+from . import _binding
+from .functional._linear import apply_linear, apply_merged_linear
+from .functional._tensors import as_matrix
 
 
 def _distribution(
@@ -36,7 +38,7 @@ def _input(module: Linear, x: torch.Tensor) -> torch.Tensor:
     """  # noqa: D205
     if module.input_quantizer is None or isinstance(x, QuantizedTensor):
         return x
-    matrix = functional._matrix(x)
+    matrix = as_matrix(x)
     binding = _binding.matmul.get().get(id(module))
     if binding is not None:
         return binding.quantize(
@@ -156,7 +158,7 @@ class Linear(nn.Module):
         encoded = _input(self, x)
 
         if encoded is x:
-            return functional._linear(
+            return apply_linear(
                 x,
                 self.weight,
                 self.bias,
@@ -172,7 +174,7 @@ class Linear(nn.Module):
             if out is not None and out.is_contiguous()
             else None
         )
-        result = functional._linear(
+        result = apply_linear(
             encoded,
             self.weight,
             self.bias,
@@ -310,7 +312,7 @@ class RowParallelLinear(Linear):
                 else None
             )
         )
-        result = functional._linear(
+        result = apply_linear(
             encoded,
             self.weight,
             output_dtype=dtype,
@@ -363,7 +365,7 @@ class RowParallelLinear(Linear):
 
         for interval, values in rows:
             encoded = self.input_quantizer.quantize(
-                functional._matrix(values), amax=maximum
+                as_matrix(values), amax=maximum
             )
             yield interval, self(encoded, output_dtype=output_dtype)
 
@@ -444,7 +446,7 @@ class MergedColumnParallelLinear(nn.Module):
 
         encoded = _input(branches[0], x)
         targets = None if encoded is not x or out is None else out
-        values = functional._merged_linear(
+        values = apply_merged_linear(
             encoded,
             {name: branch.weight for name, branch in self.projections.items()},
             {name: branch.bias for name, branch in self.projections.items()},

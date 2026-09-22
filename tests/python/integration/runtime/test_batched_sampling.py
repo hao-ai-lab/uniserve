@@ -310,8 +310,11 @@ def test_verify_commits_every_accepted_position() -> None:
         "cpu",
         pytest.param(
             "cuda:0",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(), reason="CUDA is required"
+            marks=(
+                pytest.mark.gpu,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="CUDA is required"
+                ),
             ),
         ),
     ],

@@ -71,7 +71,7 @@ class BufferPool:
         self._arenas = {}
         for device in self.devices:
             if device.type == "cuda":
-                from uniserve_kernel.peer_storage import empty
+                from uniserve_kernels.peer_storage import empty
 
                 # Publications borrow these persistent allocations directly.
                 # Their physical mappings retire independently of model streams.

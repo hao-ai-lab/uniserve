@@ -4,8 +4,8 @@ import torch
 
 from uniserve.quantization import QuantizedTensor, ScaleLayout
 
-from . import Backend as _IndependentBackend
-from . import Operator as _Operator
+from .base import Backend as _IndependentBackend
+from .base import Operator as _Operator
 from .grouped import Backend as _GroupedBackend
 
 

@@ -2,108 +2,20 @@
 
 import pytest
 import torch
-from safetensors.torch import save_file
 from torch.nn import functional as F
-from transformers import Qwen3Config, Qwen3ForCausalLM
 
-from uniserve import loading
-from uniserve.loading import checkpoint, weights
+from tests.python.fixtures.checkpoints import bagel_checkpoint, load_bagel
 from uniserve.media import image
 from uniserve.model import TextInput, TextSize
 from uniserve.nn.attention import PagedInput, SequenceLengths, VarlenInput
 from uniserve.runtime import ExecutionContext, PrefixCache
-from uniserve_models import bagel, siglip
-from uniserve_models.bagel import vae
 
 pytestmark = pytest.mark.integration
 
 
-def _checkpoint(root):
-    torch.manual_seed(662)
-    config = Qwen3Config(
-        vocab_size=37,
-        hidden_size=32,
-        intermediate_size=48,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        tie_word_embeddings=False,
-        attention_bias=True,
-        max_position_embeddings=64,
-        rms_norm_eps=1e-6,
-        rope_theta=1_000_000.0,
-    )
-    config._attn_implementation = "eager"
-    reference = Qwen3ForCausalLM(config).bfloat16().eval()
-    # BAGEL has Q/K/V biases and an unbiased attention output contraction.
-    for layer in reference.model.layers:
-        layer.self_attn.o_proj.register_parameter("bias", None)
-    state = {}
-    for name, value in reference.state_dict().items():
-        state["language_model." + name] = value
-        if name == "model.norm.weight":
-            state["language_model.model.norm_moe_gen.weight"] = value.clone()
-        elif name.startswith("model.layers."):
-            parts = name.split(".")
-            if parts[3] == "self_attn":
-                parts[4] += "_moe_gen"
-            else:
-                parts[3] += "_moe_gen"
-            # A zero-update flow expert makes its residual identity observable
-            # while text markers still traverse a nonzero independent expert.
-            state["language_model." + ".".join(parts)] = torch.zeros_like(value)
-    for prefix, out_features, in_features in (
-        ("vae2llm", 32, 8),
-        ("llm2vae", 8, 32),
-        ("time_embedder.mlp.0", 32, 256),
-        ("time_embedder.mlp.2", 32, 32),
-    ):
-        state[prefix + ".weight"] = (
-            torch.randn(out_features, in_features) * 0.02
-        ).bfloat16()
-        state[prefix + ".bias"] = (torch.randn(out_features) * 0.01).bfloat16()
-    state["latent_pos_embed.pos_embed"] = (
-        torch.randn(16, 32) * 0.02
-    ).bfloat16()
-    # Declared, unselected vision fields can coexist in the same primary file.
-    state["vit_pos_embed.pos_embed"] = torch.randn(16, 32).bfloat16()
-    save_file(state, root / "ema.safetensors")
-    config = bagel.Config(
-        bagel.TransformerConfig(
-            32, 48, 2, 4, 2, 37, 1e-6, 1_000_000.0, 8, True, 64
-        ),
-        siglip.Config(2, 8, 3, siglip.TransformerConfig(32, 4, 48, 1, 1e-6)),
-        vae.Config(8, 3, 2, 32, 3, (1, 1), 1, 2, 0.5, 0.25),
-        35,
-        36,
-        2,
-        4,
-        1.0,
-        "gelu_pytorch_tanh",
-    )
-    return reference, state, config
-
-
-def _load(root, config):
-    return loading.load_model(
-        bagel.Model,
-        config,
-        checkpoint=(
-            checkpoint.Config(
-                "primary", filenames=("ema.safetensors",)
-            ).resolve(root, io=loading.Config()),
-        ),
-        mapping=bagel.checkpoint_mappings,
-        device="cpu",
-        weights=weights.Config(),
-        modules=frozenset(("text", "denoiser")),
-    ).model
-
-
 def test_text_prefill_decode_and_zero_query_match_qwen_equations(tmp_path):
-    reference, _, config = _checkpoint(tmp_path)
-    model = _load(tmp_path, config)
+    reference, _, config = bagel_checkpoint(tmp_path)
+    model = load_bagel(tmp_path, config)
     assert model.text.backbone is model.denoiser.backbone
     tokens = torch.tensor([1, 4, 8, 3])
     with torch.no_grad():
@@ -139,8 +51,8 @@ def test_text_prefill_decode_and_zero_query_match_qwen_equations(tmp_path):
 
 
 def test_image_markers_use_text_expert_and_flow_preserves_residual(tmp_path):
-    _, state, config = _checkpoint(tmp_path)
-    model = _load(tmp_path, config)
+    _, state, config = bagel_checkpoint(tmp_path)
+    model = load_bagel(tmp_path, config)
     size = image.Config(8, 8)
     from uniserve_worker.bootstrap.inputs import image_builder
 

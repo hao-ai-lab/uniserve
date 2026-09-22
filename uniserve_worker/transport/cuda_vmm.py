@@ -145,9 +145,9 @@ class CudaVmmTransport(Transport):
         acknowledgment_slot: int = 0,
         cross_host_consumers: bool = False,
     ) -> None:
-        from uniserve_kernel.peer_storage import _extension
+        from uniserve_kernels import peer_storage
 
-        _extension()
+        peer_storage.load()
         self.source = source or WorkerEndpoint.local()
         self._events = event_pool
         self._failed_publication: (
@@ -329,7 +329,7 @@ class CudaVmmTransport(Transport):
         host mechanism instead.
         """
         import torch
-        from uniserve_kernel.peer_storage import export_handle
+        from uniserve_kernels.peer_storage import export_handle
 
         source, shape, offset = publication_views(tensor, offset)
         spans = source if isinstance(source, tuple) else (source,)
@@ -576,7 +576,7 @@ class CudaVmmTransport(Transport):
         region: tuple[slice, ...] | None,
     ) -> None:
         import torch
-        from uniserve_kernel.peer_storage import import_handle
+        from uniserve_kernels.peer_storage import import_handle
 
         handle = locator.transport
         assert isinstance(handle, CudaVmmTransfer)
