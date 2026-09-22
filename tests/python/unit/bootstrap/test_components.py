@@ -5,8 +5,8 @@ import torch
 
 from uniserve.model import ComponentEntry, Encoder, EntryPoint
 from uniserve_worker.bootstrap.components import validate_components
-from uniserve_worker.bootstrap.config import ComponentConfig
-from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.config.deployment import ComponentConfig
+from uniserve_worker.errors import WorkerError
 
 pytestmark = pytest.mark.unit
 

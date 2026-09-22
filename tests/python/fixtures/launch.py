@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from uniserve_worker.bootstrap.cli import parse_worker_args
-from uniserve_worker.bootstrap.config import WorkerProcessArgs
+from uniserve_worker.config.deployment import WorkerProcessArgs
 
 # Neutral values for every field the descriptor must carry. They mirror what
 # the engine emits for a single-rank CPU worker.

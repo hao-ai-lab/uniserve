@@ -5,8 +5,10 @@ from itertools import accumulate
 import pytest
 import torch
 
-from uniserve_worker.ops.staging import gather_request_decode_inputs
-from uniserve_worker.runtime.decode_state import DecodeState
+from uniserve_worker.model_executor._decode_inputs import (
+    gather_request_decode_inputs,
+)
+from uniserve_worker.storage.decode_state import DecodeState
 
 pytestmark = [pytest.mark.unit, pytest.mark.gpu]
 

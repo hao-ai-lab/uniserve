@@ -11,13 +11,10 @@ from uniserve.loading import weights
 from uniserve.runtime import PrefixCache
 from uniserve_models import loading as models
 from uniserve_worker.bootstrap.cache import cache_info
-from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.input_buffers import (
-    TokenBufferConfig,
-)
-from uniserve_worker.execution.model_runner import ModelRunner
-from uniserve_worker.execution.rows import TokenRow
-from uniserve_worker.execution.sampling import TokenSelection
+from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.execution.model_executor import ModelExecutor
+from uniserve_worker.model_executor.input_batch import TokenRow
+from uniserve_worker.model_executor.input_buffers import TokenBufferConfig
 from uniserve_worker.protocol.call import (
     Bounds,
     Call,
@@ -25,7 +22,8 @@ from uniserve_worker.protocol.call import (
     ForwardMode,
 )
 from uniserve_worker.protocol.identity import CallId, RequestKey
-from uniserve_worker.runtime.cache_manager import CacheManager
+from uniserve_worker.sampling.metadata import TokenSelection
+from uniserve_worker.storage.kv_cache import KVCacheManager
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -77,13 +75,13 @@ def _text_runner(model, provider, decode_capacity=2):
     cache = PrefixCache(
         model.cache_config, num_blocks=16, block_size=16, device="cuda:0"
     )
-    manager = CacheManager(
+    manager = KVCacheManager(
         cache,
         info=cache_info(model, config, num_blocks=16),
         request_pool_size=4,
         max_blocks_per_request=4,
     )
-    runner = ModelRunner(model, config)
+    runner = ModelExecutor(model, config)
     predicates = torch.tensor([False, True, True, True, True], device="cuda:0")
     try:
         runner.configure_inputs(
@@ -316,9 +314,8 @@ def test_noncausal_prefill_graph_preserves_live_prefixes_and_sequence_outputs(
 @torch.inference_mode()
 def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
     from uniserve_worker.bootstrap.capacity import input_buffer_config
-    from uniserve_worker.execution.model_runner import ModelRunner
-    from uniserve_worker.execution.rows import TokenRow
-    from uniserve_worker.execution.sampling import TokenSelection
+    from uniserve_worker.execution.model_executor import ModelExecutor
+    from uniserve_worker.model_executor.input_batch import TokenRow
     from uniserve_worker.protocol.call import (
         Bounds,
         Call,
@@ -326,6 +323,7 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
         ForwardMode,
     )
     from uniserve_worker.protocol.identity import CallId, RequestKey
+    from uniserve_worker.sampling.metadata import TokenSelection
 
     reference = _save_checkpoint(tmp_path)
     model = models.load_model(
@@ -345,11 +343,11 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
         prefill_graph_token_sizes=(16, 32),
         decode_graph_batch_sizes=(1, 2),
     )
-    runner = ModelRunner(model, config)
+    runner = ModelExecutor(model, config)
     cache = PrefixCache(
         model.cache_config, num_blocks=8, block_size=16, device="cuda:0"
     )
-    manager = CacheManager(
+    manager = KVCacheManager(
         cache,
         info=cache_info(model, config, num_blocks=8),
         request_pool_size=2,

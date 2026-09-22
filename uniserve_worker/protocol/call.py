@@ -9,10 +9,9 @@ from typing import TypeAlias
 
 from uniserve import sampling
 from uniserve.model import DEFAULT_COMPONENT
-
-from ..foundation.errors import invalid_descriptor
-from . import identity, tensor
-from .validation import (
+from uniserve_worker.errors import invalid_descriptor
+from uniserve_worker.protocol import identity, tensor
+from uniserve_worker.protocol.validation import (
     _bool,
     _enum,
     _float,

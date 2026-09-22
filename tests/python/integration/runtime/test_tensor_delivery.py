@@ -15,7 +15,7 @@ import torch
 
 from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
-from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.errors import WorkerError
 from uniserve_worker.protocol.batch import BufferAllocation
 from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.protocol.tensor import (
@@ -26,10 +26,10 @@ from uniserve_worker.protocol.tensor import (
     TensorRef,
 )
 from uniserve_worker.protocol.transfer import TensorTransfer, WorkerEndpoint
-from uniserve_worker.runtime.buffer_pool import BufferPool
-from uniserve_worker.runtime.tensor_store import FeatureMetadata, TensorStore
-from uniserve_worker.transfer.layout import fetch_tensor
-from uniserve_worker.transfer.tickets import make_transports
+from uniserve_worker.storage.buffer_pool import BufferPool
+from uniserve_worker.storage.tensor_store import FeatureMetadata, TensorStore
+from uniserve_worker.transport import make_transports
+from uniserve_worker.transport.fetch import fetch_tensor
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -850,7 +850,7 @@ def test_shm_allocation_failure_preserves_publication_capacity(
     locator = None
 
     def exhausted_filesystem(*_args):
-        raise OSError(errno.ENOSPC, "shared-memory filesystem is full")
+        raise OSError(errno.ENOSPC, "shared-storage filesystem is full")
 
     try:
         with monkeypatch.context() as filesystem:

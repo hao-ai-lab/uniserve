@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .protocol.output import ForwardStats
+    from uniserve_worker.protocol.output import ForwardStats
 
 
 import inspect
@@ -21,8 +21,7 @@ from typing import Any
 
 from uniserve.env import flag_from_value, int_from_value
 from uniserve.profiling import profile_range
-
-from .foundation.errors import WorkerError, should_capture_trace
+from uniserve_worker.errors import WorkerError, should_capture_trace
 
 torch: Any | None
 try:  # torch is an optional import for CPU-only control-plane tests.
@@ -372,7 +371,7 @@ def _forward_stats(
 
     Aggregation happens at completion.
     """
-    from .protocol.output import ForwardStats
+    from uniserve_worker.protocol.output import ForwardStats
 
     stats = ForwardStats.combine(values)
     components = dict(stats.component_us)

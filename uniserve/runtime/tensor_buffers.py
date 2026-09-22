@@ -10,9 +10,9 @@ from typing import Self
 import torch
 
 from uniserve.distributed.mesh import Communicator
-from uniserve.runtime._peer_memory import (
-    SymmetricMemory,
-    allocate_symmetric_memory,
+from uniserve.runtime._peer_storage import (
+    SymmetricStorage,
+    allocate_symmetric_storage,
 )
 from uniserve.tensors import BufferConfig
 
@@ -31,7 +31,7 @@ class TensorBuffers:
             tuple[tuple[str, BufferConfig], ...], Mapping[str, torch.Tensor]
         ] = {}
         self._peers: dict[str, tuple[torch.Tensor, ...]] = {}
-        self._symmetric: list[SymmetricMemory] = []
+        self._symmetric: list[SymmetricStorage] = []
         self._closed = False
 
     @classmethod
@@ -57,7 +57,7 @@ class TensorBuffers:
         configs: Mapping[str, BufferConfig],
         *,
         device: torch.device | str,
-        pin_memory: bool = False,
+        pin_storage: bool = False,
         symmetric: Mapping[str, Communicator] | None = None,
     ) -> TensorBuffers:
         """Allocate capacity, with optional host pinning and ordered peer views.
@@ -85,7 +85,7 @@ class TensorBuffers:
                 else config.shape
             )
             if name in symmetric:
-                allocation = allocate_symmetric_memory(
+                allocation = allocate_symmetric_storage(
                     symmetric[name], shape, dtype=config.dtype
                 )
                 result._symmetric.append(allocation)
@@ -96,7 +96,7 @@ class TensorBuffers:
                     shape,
                     dtype=config.dtype,
                     device="cpu" if config.host else device,
-                    pin_memory=config.host and pin_memory,
+                    pin_memory=config.host and pin_storage,
                 )
         return result
 

@@ -3,7 +3,7 @@
 A host rank encodes the media units it is handed and, when it is the muxer,
 encodes the audio track and concatenates the encoded tracks in the mux
 session's codec process. Every input is a host product borrowed in place from
-the shared-memory segment its producer published. This module owns the
+the shared-storage segment its producer published. This module owns the
 rank-side scheduling: which job runs for which call, on which borrow, and
 what its result becomes.
 """
@@ -16,10 +16,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ..foundation.errors import invalid_descriptor
-from ..protocol.identity import CallId, RequestKey
-from ..protocol.output import MediaOutput, PosixShmArtifact
-from .codec_process import (
+from uniserve_worker.errors import invalid_descriptor
+from uniserve_worker.media.codec_process import (
     AvMuxConfig,
     EncodeAudioTrack,
     EncodeVideoUnit,
@@ -30,12 +28,14 @@ from .codec_process import (
     encoded_video_bytes,
     require_media_codecs,
 )
+from uniserve_worker.protocol.identity import CallId, RequestKey
+from uniserve_worker.protocol.output import MediaOutput, PosixShmArtifact
 
 if TYPE_CHECKING:
     import torch
 
-    from ..runtime.host_lane import HostLane, HostTask
-    from ..transfer.tickets import HostBorrow
+    from uniserve_worker.execution.host import HostLane, HostTask
+    from uniserve_worker.transport.shm import HostBorrow
 
 __all__ = [
     "AvMuxConfig",
@@ -323,7 +323,7 @@ class MediaMux:
 
 
 def _artifact_output(value: object) -> MediaOutput:
-    """Wrap a finalized artifact's shared-memory name and size."""
+    """Wrap a finalized artifact's shared-storage name and size."""
     name, nbytes = value  # type: ignore[misc]
     return MediaOutput(
         handle=PosixShmArtifact(name=str(name)), bytes=int(nbytes)

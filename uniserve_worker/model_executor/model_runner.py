@@ -1,0 +1,381 @@
+"""Prepared numerical calls with owned inputs and graph residency."""
+
+from __future__ import annotations
+
+import time
+from abc import ABC, abstractmethod
+from collections.abc import Mapping
+from dataclasses import replace
+from functools import partial
+from typing import cast
+
+import torch
+
+from uniserve.nn.attention import PagedInput, SegmentedInput
+from uniserve.runtime.cuda_graph import CUDAGraphError
+from uniserve.runtime.resources import close_resources
+from uniserve.tensors import TensorOutput
+from uniserve_worker.errors import ComputeError
+from uniserve_worker.protocol.output import ForwardStats
+
+from .component_binding import capture_required
+from .cuda_graph import (
+    CUDAGraphRunner,
+    Execution,
+    GraphBucket,
+    clone_inputs,
+    input_signature,
+)
+from .graph_inputs import (
+    PrefillShape,
+    capture_batch,
+    replay_batch,
+    widen_prefix,
+)
+from .input_batch import InputBatch
+from .output import ExecutionOutput
+
+
+class ModelRunner(Execution, ABC):
+    """Own one bound numerical capability on a borrowed execution-lane stream.
+
+    The execution owner selects homogeneous work and grants the stream. This
+    runner retains the prepared context, fixed input backing and graph variants;
+    every allocation uses the same worker graph storage budget.
+    """
+
+    def __init__(
+        self,
+        name,
+        call,
+        device,
+        kinds,
+        stream,
+        context,
+        inputs=None,
+        *,
+        storage,
+        devices,
+        prefill_graph=True,
+        cache=None,
+        predicates=None,
+        rank=0,
+    ):
+        super().__init__(context, storage=storage, devices=devices)
+        self.name, self.call, self.device = name, call, device
+        self.model = call.module
+        self.call_kinds, self.cuda_stream = tuple(kinds), stream
+        self.input_buffers = inputs
+        self.graph_storage = storage
+        self.prefill_graph = prefill_graph
+        self.cache, self.decode_predicates = cache, predicates
+        self.rank = rank
+        self.decode_shapes: tuple[int, ...] = ()
+        self.prefill_shapes: tuple[PrefillShape, ...] = ()
+        self.decode_context_blocks = 0
+        self._startup_complete = False
+
+    @abstractmethod
+    def batch_forward(
+        self, batch: InputBatch, *, padded: bool = False
+    ) -> ExecutionOutput:
+        """Evaluate the capability's prepared numerical input.
+
+        Padded batches may include empty rows retained solely for graph shape
+        reuse; their outputs are discarded when replay returns the live rows.
+        """
+        raise NotImplementedError
+
+    def prepare_inputs(self, rows, *, forward_mode, **numerical):
+        """Construct the numerical input view in this runner's fixed backing."""
+        if self.input_buffers is None:
+            raise ValueError("capability has no batched input buffers")
+        return self.input_buffers.prepare_inputs(
+            rows, forward_mode=forward_mode, **numerical
+        )
+
+    def select_graph_shape(self, batch, *, eligible):
+        """Use the exact numerical signature for non-text graph variants."""
+        if not eligible or not self.pools or not self.prefill_graph:
+            return None
+        execution = widen_prefix(batch, self.input_buffers.max_blocks_per_row)
+        attention = getattr(execution.inputs, "attention", None)
+        keyed = execution
+        if isinstance(attention, (PagedInput, SegmentedInput)):
+            keyed = replace(
+                execution,
+                inputs=replace(
+                    execution.inputs,
+                    attention=replace(
+                        attention,
+                        prefixes=replace(
+                            attention.prefixes,
+                            host=None
+                            if attention.prefixes.host is None
+                            else (0,) * len(attention.prefixes.host),
+                        ),
+                    ),
+                ),
+            )
+        return ("exact", input_signature(keyed)), execution, False
+
+    def resources(self):
+        """Numerical constants and workspace borrowed by a standalone call."""
+        return {}
+
+    @torch.inference_mode()
+    def execute_model(self, *args, **kwargs):
+        """Evaluate numerical arguments and return owned results."""
+        context, stream = self.context, self.context.stream
+        if stream is not None:
+            stream.wait_stream(torch.cuda.current_stream(self.device))
+        started, path = time.perf_counter_ns(), "eager"
+        values = (args, kwargs)
+        key = input_signature(values)
+        bucket = self.buckets.get(key)
+        graph = None if bucket is None else bucket.graphs[None]
+        resources = self.resources()
+        with context.activate():
+            if self.pools:
+                missing = capture_required(
+                    graph is None, self.call.groups, self.device
+                )
+                if missing:
+                    self.close_bucket(key)
+                    with self.graph_storage.allocate(self):
+                        static = clone_inputs(values)
+                    graph = CUDAGraphRunner.capture(
+                        context,
+                        static,
+                        lambda inputs: self.call.forward(
+                            *inputs[0], **inputs[1], **resources
+                        ),
+                        pools=self.pools,
+                    )
+                    self.buckets[key] = GraphBucket({None: graph})
+                    self.graph_storage.check()
+                    path = "graph_capture"
+                else:
+                    path = "graph_replay"
+                result = cast(CUDAGraphRunner, graph).replay(values)
+            else:
+                result = self.call.forward(*args, **kwargs, **resources)
+            output = self.result(result).clone()
+        if stream is not None:
+            torch.cuda.current_stream(self.device).wait_stream(stream)
+        elapsed = (time.perf_counter_ns() - started) // 1000
+        return replace(
+            output,
+            stats=ForwardStats(
+                mode_counts={self.name: 1},
+                mode_tokens={self.name: 1},
+                mode_us={self.name: elapsed},
+                component_us={"forward": elapsed},
+                cuda_graph_runtime_mode_counts={path: 1},
+                cuda_graph_captures=int(path == "graph_capture"),
+                cuda_graph_replays=int(path == "graph_replay"),
+            ),
+        )
+
+    def close(self):
+        close_resources(
+            super().close,
+            *(
+                ()
+                if self.input_buffers is None
+                else (self.input_buffers.close,)
+            ),
+        )
+
+    @torch.inference_mode()
+    def eager_batch(self, batch, forward):
+        """Run a staged batch eagerly inside its entry's execution context."""
+        with self.context.activate():
+            attention = getattr(batch.inputs, "attention", None)
+            if attention is not None:
+                self.context.bind_attention(attention)
+            return forward(batch)
+
+    @torch.inference_mode()
+    def capture_batch(self, batch, forward):
+        """Capture a staged batch's graph on the entry stream.
+
+        fenced on both sides.
+        """
+        context = self.context
+        current = (
+            torch.cuda.current_stream(self.device)
+            if self.device.type == "cuda"
+            else None
+        )
+        if context.stream is not None:
+            context.stream.wait_stream(current)
+        try:
+            with context.activate():
+                self._capture_batch(batch, forward)
+        finally:
+            if context.stream is not None:
+                current.wait_stream(context.stream)
+
+    def _capture_batch(self, batch, forward):
+        if self._startup_complete:
+            raise CUDAGraphError("batch capture is outside startup preparation")
+
+        selected = self.select_graph_shape(batch, eligible=True)
+        if selected is None:
+            self.eager_batch(batch, forward)
+            return
+
+        key, execution, padded = selected
+        if key in self.buckets:
+            return
+
+        invoke = partial(self.batch_forward, padded=True) if padded else forward
+        # Text buckets use the entry's stable staging addresses, ordered on
+        # its execution stream. Exact calls can include borrowed request
+        # latents; own those inputs independently of their pool-slot lifetime.
+        with self.graph_storage.allocate(self):
+            static = execution if padded else clone_inputs(execution)
+        graph = capture_batch(
+            self.context,
+            static,
+            invoke,
+            pools=self.pools,
+            cache=self.cache,
+            predicates=self.decode_predicates,
+        )
+        try:
+            self.graph_storage.check()
+        except BaseException:
+            graph.close()
+            raise
+        self.buckets[key] = GraphBucket({None: graph})
+
+    @torch.inference_mode()
+    def run_batch(self, batch, forward, *, eligible, borrow_output=False):
+        with self.context.activate():
+            return self._run_batch(
+                batch,
+                forward,
+                eligible=eligible,
+                borrow_output=borrow_output,
+            )
+
+    def _run_batch(self, batch, forward, *, eligible, borrow_output=False):
+        selected = self.select_graph_shape(batch, eligible=eligible)
+        if selected is None:
+            return replace(
+                self.eager_batch(batch, forward),
+                stats=ForwardStats(cuda_graph_runtime_mode_counts={"eager": 1}),
+            )
+
+        key, execution, bucketed = selected
+        captured = False
+        if key not in self.buckets:
+            # Only configured text buckets may capture at run time; an exact
+            # signature without a resident graph simply runs eager.
+            if not bucketed:
+                return replace(
+                    self.eager_batch(batch, forward),
+                    stats=ForwardStats(
+                        cuda_graph_runtime_mode_counts={"eager": 1}
+                    ),
+                )
+            if self._startup_complete:
+                # A physical bucket can serve additional numerical variants
+                # explicitly prepared through capture_batch. Unconfigured
+                # variants retain eager execution after startup is sealed.
+                configured = key[1][-1] or any(
+                    shape.causal == execution.inputs.attention.causal[0]
+                    and shape.selection is execution.token_selections[0]
+                    for shape in self.prefill_shapes
+                )
+                if not configured:
+                    return replace(
+                        self.eager_batch(batch, forward),
+                        stats=ForwardStats(
+                            cuda_graph_runtime_mode_counts={"eager": 1}
+                        ),
+                    )
+                raise CUDAGraphError(
+                    f"configured graph bucket is not resident: {key!r}"
+                )
+            self.capture_batch(batch, forward)
+            captured = True
+
+        result = replay_batch(
+            self.buckets[key].graphs[None],
+            execution,
+            rows=batch.row_count,
+            borrow=borrow_output,
+        )
+        if batch.decode_force_finish is None:
+            result = replace(result, greedy=None)
+
+        return replace(
+            result,
+            stats=ForwardStats(
+                cuda_graph_runtime_mode_counts={
+                    "graph_capture" if captured else "graph_replay": 1
+                },
+                cuda_graph_captures=int(captured),
+                cuda_graph_replays=int(not captured),
+                cuda_graph_unpadded_tokens=batch.row_count,
+                cuda_graph_padded_tokens=execution.row_count - batch.row_count,
+            ),
+        )
+
+    @staticmethod
+    def result(result):
+        """Normalize a module call result into tensors plus optional layouts."""
+        if isinstance(result, torch.Tensor):
+            result = (result,)
+        if isinstance(result, Mapping):
+            result = tuple(
+                value for values in result.values() for value in values
+            )
+
+        values, layouts = [], []
+        for value in result:
+            if isinstance(value, TensorOutput):
+                values.append(value.tensor)
+                layouts.append(value.layout)
+            elif isinstance(value, torch.Tensor):
+                values.append(value)
+                layouts.append(None)
+            else:
+                raise ComputeError(
+                    "participating numerical call did not return a tensor"
+                )
+        return ExecutionOutput(tuple(values), layouts=tuple(layouts))
+
+
+def runner_type(module):
+    """Select a bound numerical runner from public model capabilities."""
+    from uniserve.model import (
+        AudioDecoder,
+        CausalLM,
+        Denoiser,
+        Encoder,
+        ImageDecoder,
+        VideoDecoder,
+        VideoPostprocessor,
+    )
+    from uniserve.nn.vae import PatchAutoencoder
+
+    from .decoder_runner import DecoderRunner
+    from .diffusion_runner import DiffusionRunner
+    from .encoder_runner import EncoderRunner
+    from .text_runner import TextRunner
+
+    if isinstance(module, CausalLM):
+        return TextRunner
+    if isinstance(module, Denoiser):
+        return DiffusionRunner
+    if isinstance(
+        module, (AudioDecoder, ImageDecoder, VideoDecoder, VideoPostprocessor)
+    ):
+        return DecoderRunner
+    if isinstance(module, (Encoder, PatchAutoencoder)):
+        return EncoderRunner
+    raise TypeError("module has no supported numerical capability")

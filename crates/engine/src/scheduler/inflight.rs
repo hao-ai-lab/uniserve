@@ -49,7 +49,60 @@ pub(super) struct PendingBatch {
     pub(super) prefill: bool,
 }
 
-impl Scheduler {
+/// Owns submitted identities and their lifetime through ordered reconciliation.
+pub(super) struct Inflight {
+    pub(super) pending_submissions: VecDeque<ExecutionBatch>,
+    pub(super) num_pending_transfers: usize,
+    pub(super) batch_id: u64,
+    pub(super) next_arrival_seq: u64,
+    pub(super) pending_calls: HashMap<RequestId, VecDeque<InflightCall>>,
+    pub(super) pending_completions: HashMap<RequestId, BTreeMap<CallId, PendingCompletion>>,
+    pub(super) pending_finishes: HashMap<RequestId, PendingFinish>,
+    pub(super) pending_batches: HashMap<u64, PendingBatch>,
+    pub(super) pending_commands: VecDeque<BatchCommand>,
+}
+
+impl Inflight {
+    pub(super) fn new() -> Self {
+        Self {
+            pending_submissions: VecDeque::new(),
+            num_pending_transfers: 0,
+            batch_id: 0,
+            next_arrival_seq: 1,
+            pending_calls: HashMap::new(),
+            pending_completions: HashMap::new(),
+            pending_finishes: HashMap::new(),
+            pending_batches: HashMap::new(),
+            pending_commands: VecDeque::new(),
+        }
+    }
+
+    /// Registers the call kinds and command receipts owned by one scheduled batch.
+    pub(super) fn register_pending_batch(&mut self, batch: &ExecutionBatch, started: Instant) {
+        self.pending_batches.insert(
+            batch.id,
+            PendingBatch {
+                started,
+                calls: batch
+                    .requests
+                    .iter()
+                    .map(|(call, _)| (call.request_key, call.call_id))
+                    .collect(),
+                commands: batch
+                    .commands
+                    .iter()
+                    .filter(|command| !matches!(command, BatchCommand::Start { .. }))
+                    .cloned()
+                    .collect(),
+                worker_exec_us: 0,
+                prefill: batch
+                    .requests
+                    .iter()
+                    .any(|(call, _)| batch_kind(call.code) == BatchKind::Prefill),
+            },
+        );
+    }
+
     /// Returns and advances the next batch identifier.
     pub(super) fn next_batch_id(&mut self) -> u64 {
         self.batch_id = self.batch_id.saturating_add(1);

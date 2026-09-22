@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TypeAlias
 
-from ..foundation.errors import invalid_descriptor
-from .validation import _map, _nonnegative, _uint
+from uniserve_worker.errors import invalid_descriptor
+from uniserve_worker.protocol.validation import _map, _nonnegative, _uint
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -180,3 +181,6 @@ class BufferId:
             "output_index": self.output_index,
             "generation": self.generation,
         }
+
+
+CallIdentity: TypeAlias = tuple[RequestKey, CallId]

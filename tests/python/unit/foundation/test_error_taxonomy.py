@@ -5,11 +5,7 @@ from __future__ import annotations
 import pytest
 
 from uniserve.runtime import EventPoolError
-from uniserve_worker.foundation.errors import (
-    WorkerError,
-    WorkerErrorCode,
-    classify,
-)
+from uniserve_worker.errors import WorkerError, WorkerErrorCode, classify
 from uniserve_worker.protocol.identity import CallId
 
 pytestmark = pytest.mark.unit
@@ -17,7 +13,7 @@ pytestmark = pytest.mark.unit
 
 # Message variants that the production text/heuristic matcher actually
 # treats as CUDA OOM (case-insensitive substring match against "out of
-# memory", "cuda oom", "cublas_status_alloc_failed"). The cuBLAS
+# storage", "cuda oom", "cublas_status_alloc_failed"). The cuBLAS
 # allocation-failure string is the load-bearing "incl. cuBLAS variant" case.
 OOM_MESSAGE_VARIANTS = [
     "CUDA out of memory. Tried to allocate 2.00 GiB (GPU 0; 39.59 GiB total)",

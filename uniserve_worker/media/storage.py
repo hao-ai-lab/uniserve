@@ -1,6 +1,6 @@
-"""Ownership transfer of immutable media bytes through POSIX shared memory."""
+"""Ownership transfer of immutable media bytes through POSIX shared storage."""
 
-from ..foundation.shared_memory import allocate_shared_memory
+from uniserve_worker.transport.shared_storage import allocate_shared_storage
 
 
 def publish_media_bytes(payload: bytes) -> str:
@@ -11,13 +11,13 @@ def publish_media_bytes(payload: bytes) -> str:
     from multiprocessing import resource_tracker
 
     if not payload:
-        raise ValueError("shared-memory media publication must not be empty")
+        raise ValueError("shared-storage media publication must not be empty")
 
-    shm = allocate_shared_memory(len(payload))
+    shm = allocate_shared_storage(len(payload))
     try:
         buffer = shm.buf
         if buffer is None:
-            raise RuntimeError("shared-memory artifact has no writable buffer")
+            raise RuntimeError("shared-storage artifact has no writable buffer")
         buffer[: len(payload)] = payload
     except BaseException:
         shm.unlink()

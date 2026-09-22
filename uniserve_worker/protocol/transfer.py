@@ -8,9 +8,18 @@ import uuid
 from dataclasses import dataclass
 from typing import TypeAlias
 
-from ..foundation.errors import invalid_descriptor
-from . import identity
-from .validation import _bytes, _int, _ints, _map, _seq, _str, _uint, _uints
+from uniserve_worker.errors import invalid_descriptor
+from uniserve_worker.protocol import identity
+from uniserve_worker.protocol.validation import (
+    _bytes,
+    _int,
+    _ints,
+    _map,
+    _seq,
+    _str,
+    _uint,
+    _uints,
+)
 
 MAX_TRANSFER_HANDLE_BYTES = 64 * 1024
 
@@ -121,7 +130,7 @@ class LocalTransfer:
 
 @dataclass(frozen=True, slots=True)
 class PosixShmTransfer:
-    """Identifies shared-memory storage.
+    """Identifies shared-storage storage.
 
     Also identifies the endpoint that grants ready reads.
     """
@@ -130,9 +139,11 @@ class PosixShmTransfer:
     name: str
 
     def __post_init__(self) -> None:
-        """Validate the shared-memory name and publishing endpoint."""
+        """Validate the shared-storage name and publishing endpoint."""
         if not self.endpoint or not self.name:
-            raise invalid_descriptor("shared-memory transfer handle is invalid")
+            raise invalid_descriptor(
+                "shared-storage transfer handle is invalid"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,7 +208,7 @@ class CudaVmmTransfer:
 class ChannelTransfer:
     """Carry a host product's bytes on the rank channel's data path.
 
-    Shared memory names a segment in one host's namespace, so a product whose
+    Shared storage names a segment in one host's namespace, so a product whose
     consumer is on another host travels as bytes: in the producing rank's
     result, into the head's custody, and out in the consuming rank's batch.
     """

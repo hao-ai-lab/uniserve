@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import io
-import time
 
 import pytest
 from PIL import Image
@@ -22,7 +21,7 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.simulation import expected_successor
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
-from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.errors import WorkerError
 from uniserve_worker.protocol.batch import Finish, Free, NewRequest
 from uniserve_worker.protocol.call import (
     CallCoordinates,
@@ -198,18 +197,7 @@ def test_retained_encoder_product_outlives_its_producer_request(
             calls=(visual,),
             input_products=produced.products,
         )
-        if backends != ("local",):
-            prepared = consumer.submit(batch)
-            assert prepared is not None
-            deadline = time.monotonic() + 5
-            while not prepared.inputs_ready() and time.monotonic() < deadline:
-                consumer.advance_inputs(prepared)
-                time.sleep(0.001)
-            assert prepared.inputs_ready()
-            prepared = finalized_report(consumer, prepared)
-            consumed = prepared
-        else:
-            consumed = finalized_report(consumer, consumer.submit(batch))
+        consumed = finalized_report(consumer, consumer.submit(batch))
         assert consumed.completions[0].status is CallStatus.OK, (
             consumed.completions[0]
         )
@@ -224,7 +212,7 @@ def test_retained_encoder_product_outlives_its_producer_request(
         freed = producer.submit(
             execution_batch(batch_id=4, commands=(Free(product.buffer_id),))
         )
-        assert not freed.complete
+        assert producer.poll(freed) is None
         producer.tensor_store.complete_reads((read,))
         freed = finalized_report(producer, freed)
         with pytest.raises(WorkerError):

@@ -23,21 +23,27 @@ from uniserve.processing import (
     ImageProcessor,
     PatchTransform,
 )
-from uniserve.runtime.device import canonical_device, device_memory_budget
+from uniserve.runtime.device import canonical_device, device_storage_budget
 from uniserve.tensors import BufferConfig
-
-from ..config import WorkerConfig
-from ..execution.component_binding import ComponentBinding
-from ..execution.input_buffers import TokenBufferConfig
-from ..execution.resources import media_state_buffers
-from ..foundation.errors import unsupported_setup
-from ..protocol.call import MediaCall
-from ..protocol.tensor import OutputInfo
-from ..runtime.cache_manager import CacheManager
-from ..runtime.results import resolve_outputs
-from ..runtime.tensor_store import TensorStore, device_product_capacity_bytes
-from .components import media_components
-from .inputs import capability, image_builder, media_builder
+from uniserve_worker.bootstrap.components import media_components
+from uniserve_worker.bootstrap.inputs import (
+    capability,
+    image_builder,
+    media_builder,
+)
+from uniserve_worker.bootstrap.outputs import resolve_outputs
+from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.errors import unsupported_setup
+from uniserve_worker.model_executor.component_binding import ComponentBinding
+from uniserve_worker.model_executor.input_buffers import TokenBufferConfig
+from uniserve_worker.model_executor.resources import media_state_buffers
+from uniserve_worker.protocol.call import MediaCall
+from uniserve_worker.protocol.tensor import OutputInfo
+from uniserve_worker.storage.kv_cache import KVCacheManager
+from uniserve_worker.storage.tensor_store import (
+    TensorStore,
+    device_product_capacity_bytes,
+)
 
 _DEVICE_PRODUCTS_PER_CALL = 6
 _DEVICE_PRODUCT_RETIREMENT_BATCHES = 1
@@ -183,7 +189,7 @@ def tensor_slot_capacity(
         return feasible[-1]
 
     raise RuntimeError(
-        "insufficient device memory for a common request tensor slot count: "
+        "insufficient device storage for a common request tensor slot count: "
         f"candidate range {minimum}..{maximum}, local requirements "
         f"{requirements}, {available_bytes} bytes available"
     )
@@ -461,7 +467,7 @@ def model_arena_capacity(
     slots = depth * max_calls
     if state_buffers is None:
         state_buffers = media_state_buffers(
-            model, bindings or {}, worker_config
+            bindings or {}, media_builder(model, worker_config)
         )
 
     if capability(model, VideoPostprocessor) is not None or state_buffers:
@@ -618,7 +624,7 @@ def derive_runtime_kv_capacity(
     ):
         raise ValueError("KV capacity dimensions must be positive")
     if available_bytes is not None and available_bytes < 0:
-        raise ValueError("KV memory grant must not be negative")
+        raise ValueError("KV storage grant must not be negative")
 
     if kv_token_capacity is not None:
         if kv_token_capacity <= 0:
@@ -630,11 +636,11 @@ def derive_runtime_kv_capacity(
         ) // resident_copies
         if blocks < floor:
             raise ValueError(
-                "device memory grant cannot hold the required KV pool"
+                "device storage grant cannot hold the required KV pool"
             )
     elif device is not None and torch.device(device).type == "cuda":
         raise ValueError(
-            "automatic CUDA KV sizing requires a host memory grant"
+            "automatic CUDA KV sizing requires a host storage grant"
         )
     else:
         blocks = derive_num_blocks(
@@ -649,7 +655,7 @@ def derive_runtime_kv_capacity(
         > available_bytes
     ):
         raise ValueError(
-            "configured KV storage exceeds the device memory grant"
+            "configured KV storage exceeds the device storage grant"
         )
 
     return RuntimeKVCapacity(
@@ -685,17 +691,19 @@ def resolve_request_capacity(
     bindings: Mapping[str, ComponentBinding] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
 ) -> WorkerConfig:
-    """Fit request tensors within the rank's fixed memory grant.
+    """Fit request tensors within the rank's fixed storage grant.
 
     Product arenas are fitted together with the request tensors.
     """
     if canonical_device(worker_config.device).type == "cuda":
-        available, _free = device_memory_budget(
-            worker_config.device, worker_config.kv_memory_fraction
+        available, _free = device_storage_budget(
+            worker_config.device, worker_config.kv_storage_fraction
         )
-        worker_config = replace(worker_config, pool_memory_bytes=available)
+        worker_config = replace(worker_config, pool_storage_bytes=available)
         schema = (
-            media_state_buffers(model, bindings or {}, worker_config)
+            media_state_buffers(
+                bindings or {}, media_builder(model, worker_config)
+            )
             if state_buffers is None
             else state_buffers
         )
@@ -745,7 +753,7 @@ def resolve_request_capacity(
 
 
 def decode_context_blocks(
-    model: nn.Module, worker_config: WorkerConfig, pool: CacheManager | None
+    model: nn.Module, worker_config: WorkerConfig, pool: KVCacheManager | None
 ) -> int:
     """Return the max paged-decode context blocks supported by this worker."""
     if capability(model, CausalLM) is None:
@@ -761,7 +769,7 @@ def decode_context_blocks(
     return min(blocks, max(0, int(pool.info.num_blocks) - 1))
 
 
-def check_startup_memory(
+def check_startup_storage(
     worker_config: WorkerConfig,
     product_capacity_bytes: int,
     tensor_store: TensorStore,
@@ -785,17 +793,17 @@ def check_startup_memory(
     for device in devices:
         if canonical_device(device).type != "cuda":
             continue
-        available, free = device_memory_budget(
-            device, worker_config.kv_memory_fraction
+        available, free = device_storage_budget(
+            device, worker_config.kv_storage_fraction
         )
         total = device_total_bytes(device)
         remaining = max(0, product_bytes - tensor_store.resident_bytes(device))
         process_bytes = torch.cuda.memory_reserved(canonical_device(device))
         if remaining > available or process_bytes + remaining > int(
-            total * worker_config.kv_memory_fraction
+            total * worker_config.kv_storage_fraction
         ):
             raise unsupported_setup(
-                f"initialized runtime on {device} exceeds its static memory "
+                f"initialized runtime on {device} exceeds its static storage "
                 f"grant: {process_bytes} process-resident bytes, {free} "
                 f"device-free bytes, and {remaining} reserved product bytes"
             )

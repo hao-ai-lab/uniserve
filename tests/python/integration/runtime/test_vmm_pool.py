@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.transfer.vmm_pool import (
+from uniserve_worker.transport.vmm_pool import (
     ACK_WORD_BYTES,
     ACKNOWLEDGED,
     CLAIMED,

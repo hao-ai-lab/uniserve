@@ -18,24 +18,22 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from uniserve.media import image as media_image
+from uniserve_worker.errors import (
+    invalid_descriptor,
+    unsupported_call,
+    unsupported_setup,
+)
 from uniserve_worker.execution import calls as calls
-from uniserve_worker.execution.batch_state import BatchState
+from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.commit import discard_batch
 from uniserve_worker.execution.host_media import (
     BORROWED_INPUT_CALLS,
     encoded_unit_positions,
 )
-from uniserve_worker.execution.output import OutputBuffer, PendingOutput
-from uniserve_worker.execution.rows import CallIdentity
-from uniserve_worker.execution.sampling import SAMPLING_COMPLETION_FIELDS
-from uniserve_worker.execution.video import (
+from uniserve_worker.execution.media import (
     validate_batch as validate_video_batch,
 )
-from uniserve_worker.foundation.errors import (
-    invalid_descriptor,
-    unsupported_call,
-    unsupported_setup,
-)
+from uniserve_worker.execution.output import PendingOutput, create_outputs
 from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.batch import (
     Batch,
@@ -48,7 +46,7 @@ from uniserve_worker.protocol.call import (
     MediaCall,
     TransferMode,
 )
-from uniserve_worker.protocol.identity import BufferId, CallId
+from uniserve_worker.protocol.identity import BufferId, CallId, CallIdentity
 from uniserve_worker.protocol.tensor import DType, ShapeBound, TensorRef
 from uniserve_worker.protocol.transfer import (
     DeviceProductTransferValue,
@@ -56,26 +54,28 @@ from uniserve_worker.protocol.transfer import (
     LatentTransferValue,
     PosixShmTransfer,
 )
-from uniserve_worker.runtime.latent_pool import LatentImport
-from uniserve_worker.runtime.tensor_store import (
+from uniserve_worker.sampling.result import SAMPLING_COMPLETION_FIELDS
+from uniserve_worker.storage.latent_pool import LatentImport
+from uniserve_worker.storage.output import OutputBuffer
+from uniserve_worker.storage.tensor_store import (
     FeatureMetadata,
     ImageMetadata,
     TensorRead,
 )
 
 if TYPE_CHECKING:
-    from uniserve_worker.bootstrap.worker_info import WorkerInfo
-    from uniserve_worker.config import WorkerConfig
-    from uniserve_worker.execution.model_runner import ModelRunner
-    from uniserve_worker.execution.output import OutputPool
+    from uniserve_worker.config.execution.execution import WorkerConfig
+    from uniserve_worker.execution.host import HostLane, HostTask
+    from uniserve_worker.execution.model_executor import ModelExecutor
+    from uniserve_worker.execution.request import RequestPool
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.runtime.block_tables import BlockTables
-    from uniserve_worker.runtime.cache_manager import CacheManager
-    from uniserve_worker.runtime.host_lane import HostLane, HostTask
-    from uniserve_worker.runtime.latent_pool import LatentPool
-    from uniserve_worker.runtime.request import RequestPool
-    from uniserve_worker.runtime.tensor_store import TensorStore
-    from uniserve_worker.transfer.tickets import Transport
+    from uniserve_worker.protocol.worker_info import WorkerInfo
+    from uniserve_worker.storage.block_tables import BlockTables
+    from uniserve_worker.storage.kv_cache import KVCacheManager
+    from uniserve_worker.storage.latent_pool import LatentPool
+    from uniserve_worker.storage.output import OutputPool
+    from uniserve_worker.storage.tensor_store import TensorStore
+    from uniserve_worker.transport.interface import Transport
 
 
 logger = logging.getLogger(__name__)
@@ -84,7 +84,7 @@ logger = logging.getLogger(__name__)
 def prepare_batch(
     prepared: BatchState,
     *,
-    kv_cache: CacheManager | None,
+    kv_cache: KVCacheManager | None,
     latent_pool: LatentPool | None,
     request_tables: BlockTables | None,
     request_pool: RequestPool,
@@ -234,13 +234,13 @@ def prepare_batch(
 def prepare_inputs(
     state: BatchState,
     *,
-    kv_cache: CacheManager | None,
+    kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
     latent_pool: LatentPool | None,
     output_pool: OutputPool,
     request_tables: BlockTables | None,
     request_pool: RequestPool,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
     transfer_backends: Mapping[str, Transport],
     config: WorkerConfig,
 ) -> None:
@@ -252,7 +252,7 @@ def prepare_inputs(
     before a destination is reserved; on failure, every input reserved so far
     is released before the error propagates.
     """
-    from . import transfer
+    from uniserve_worker.execution import transfer
 
     batch = state.batch
     entries, kv_entries = state.input_products, state.kv_inputs
@@ -262,7 +262,7 @@ def prepare_inputs(
             "cross-call input requires a configured transport"
         )
 
-    # A video encode borrows a local decoder's shared-memory segment in place.
+    # A video encode borrows a local decoder's shared-storage segment in place.
     # A decoder on another host publishes through the rank channel instead;
     # that value must follow the ordinary import path so execution can stage a
     # local codec input. Select from the physical publication rather than the
@@ -542,7 +542,7 @@ def prepare_inputs(
 
                 # The actual reservation retains tickets before fetch can fail.
                 state.latent_imports[entry.product.buffer_id] = binding
-                from ..transfer.layout import fetch_tensor
+                from uniserve_worker.transport.fetch import fetch_tensor
 
                 fetch_tensor(
                     value.tensor,
@@ -659,7 +659,7 @@ def _prepare_predicates(
     *,
     tensor_store: TensorStore,
     output_pool: OutputPool,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
 ) -> None:
     """Capture completion-valued predicates from local products or prepared.
 
@@ -771,7 +771,7 @@ def reserve_outputs(
     predicate_values: Mapping[CallIdentity, bool],
     *,
     state: BatchState,
-    kv_cache: CacheManager | None,
+    kv_cache: KVCacheManager | None,
     host_tasks: HostLane,
     tensor_store: TensorStore,
     worker_info: WorkerInfo,
@@ -780,7 +780,7 @@ def reserve_outputs(
     output_pool: OutputPool,
     request_tables: BlockTables | None,
     request_pool: RequestPool,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
     transfer_backends: Mapping[str, Transport],
     config: WorkerConfig,
 ) -> None:
@@ -862,8 +862,8 @@ def reserve_outputs(
                     )
                 ),
             )
-            candidates = request_pool.create_outputs(
-                scheduled, request_pool_indices, completion
+            candidates = create_outputs(
+                request_pool, scheduled, request_pool_indices, completion
             )
         except BaseException:
             if completion is not None:
@@ -1026,7 +1026,7 @@ def _reserve_host_tasks(
             continue
 
         pending = state.pending_output(call.request_key.request_id)
-        if pending.completion_tasks:
+        if pending.host.tasks:
             raise invalid_descriptor(
                 "materialization repeats its CPU task identity"
             )
@@ -1049,14 +1049,14 @@ def _reserve_host_tasks(
             for reservation in reservations:
                 reservation.abandon()
             raise
-        pending.completion_tasks = tuple(reservations)
+        pending.host.tasks = tuple(reservations)
 
 
 def validate_batch(
     batch: Batch,
     *,
     worker_info: WorkerInfo,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
     config: WorkerConfig,
     predecessors: Mapping[CallId, CallId | None],
 ) -> None:
@@ -1129,7 +1129,7 @@ def _reserve_outputs(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
 ) -> None:
     """Bind each declared device value to its concrete bounded owner."""
     regions = {}
@@ -1266,7 +1266,7 @@ def _consume_predicates(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
 ) -> None:
     """Resolve call predicates from local device products and register.
 
@@ -1335,7 +1335,7 @@ def _bind_latent_inputs(
     *,
     state: BatchState,
     latent_pool: LatentPool | None,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
 ) -> None:
     """Validate trajectory parameters and bind rank-local latent staging.
 
@@ -1489,24 +1489,24 @@ def _bind_latent_inputs(
         tuple(params.page_table for _identity, params, _slot in rows),
         tuple(int(params.latent_units) for _identity, params, _slot in rows),
         occupied=tuple(
-            output.latent_staging
+            output.latent.staging
             for output in state.outputs
             if isinstance(output, PendingOutput)
-            and output.latent_staging is not None
+            and output.latent.staging is not None
         ),
     )
 
     for (identity, params, slot), value in zip(rows, staged, strict=True):
         request = state.pending_output(identity[0].request_id)
-        request.input_latent_params = params
-        request.latent_staging = value
+        request.latent.input_params = params
+        request.latent.staging = value
 
 
 def _bind_cache_tables(
     scheduled: tuple[Call, ...],
     *,
     state: BatchState,
-    kv_cache: CacheManager | None,
+    kv_cache: KVCacheManager | None,
     request_tables: BlockTables | None,
 ) -> None:
     """Install scheduler tables and retain row-aligned forward coordinates."""
@@ -1655,10 +1655,10 @@ def _stage_input_products(
     input_products: Sequence[TensorPublication],
     *,
     state: BatchState,
-    kv_cache: CacheManager | None,
+    kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
     latent_pool: LatentPool | None,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
 ) -> None:
     """Publish query-ready transferred values into their owning runtime.
 
@@ -1708,8 +1708,8 @@ def _stage_input_products(
                 )
 
             row = state.pending_output(consumers[0].request_key.request_id)
-            params = row.input_latent_params
-            staging = row.latent_staging
+            params = row.latent.input_params
+            staging = row.latent.staging
             if params is None or staging is None:
                 raise invalid_descriptor(
                     "trajectory call has no staged latent inputs"
@@ -1753,7 +1753,7 @@ def _stage_input_products(
                 height=value.height,
                 width=value.width,
             )
-            row.latent_imported = True
+            row.latent.imported = True
             request.progress = replace(
                 calls.require_progress(request), flow_step=value.step
             )

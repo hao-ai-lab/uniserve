@@ -83,7 +83,7 @@ with ExecutionContext(model, cache=cache) as execution:
         retained = result.clone()
 ```
 
-The caller completes readers before replaying a graph or replacing its backing. Captured outputs borrow graph storage; copy results that must survive replay. `capture(..., restore=...)` restores caller-owned mutable inputs after capture when the numerical call updates them. Cross-device graphs retain caller-provided CUDA memory pools for their additional devices. Graphs retire before their execution contexts and pools.
+The caller completes readers before replaying a graph or replacing its backing. Captured outputs borrow graph storage; copy results that must survive replay. `capture(..., restore=...)` restores caller-owned mutable inputs after capture when the numerical call updates them. Cross-device graphs retain caller-provided CUDA storage pools for their additional devices. Graphs retire before their execution contexts and pools.
 
 Components with numerical storage requirements expose `state_buffers(size)`, `constant_buffers(size)` and `workspace_buffers(size)`. These queries return `BufferConfig` values. `TensorBuffers.allocate` creates backing and `view` lends typed tensors. `ExecutionContext.prepare` prepares constants and workspace, or borrows explicitly supplied `TensorBuffers`; the caller allocates persistent state separately. Re-preparing replaces the context's previous resources after their final readers finish.
 
@@ -130,6 +130,6 @@ The latent file contains one FP32 tensor saved with `torch.save`, with shape `[(
 
 `uniserve.loading.load_model` accepts a model constructor, typed configuration, resolved checkpoint sources and a mapping function. `load_weights` applies the same assignment path to an existing module. Mapping functions return `weights.ModuleMapping` values containing `Assignment` records, required and optional parameter names, declared nonresident source names and any checkpoint-derived postprocessing. Shared parameters materialize once, complete-source assignments follow the bound partition, and missing, incomplete or unexpected weights reject loading.
 
-`loading.Config` selects file format, read mode, snapshot revision, file filtering, read concurrency, memory mapping and optional checksums. `checkpoint.Reader` owns scoped file access; `checkpoint.Weight.read` reads a complete tensor or an explicit rectangle. Model constructors consume already-normalized configuration fields. Loading resources close before the materialized numerical model is returned.
+`loading.Config` selects file format, read mode, snapshot revision, file filtering, read concurrency, storage mapping and optional checksums. `checkpoint.Reader` owns scoped file access; `checkpoint.Weight.read` reads a complete tensor or an explicit rectangle. Model constructors consume already-normalized configuration fields. Loading resources close before the materialized numerical model is returned.
 
 Dummy mode initializes deterministic synthetic weights. Parameter-only models do not require checkpoint payloads. When a loading callback derives constants from auxiliary checkpoint tensors, the reader uses checkpoint metadata for their shapes and generates synthetic source values; the callback runs normally and all source assignments retain completeness checks.

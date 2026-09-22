@@ -1,4 +1,4 @@
-//! Demonstrates worker startup, capability negotiation, and shared-memory execution.
+//! Demonstrates worker startup, capability negotiation, and shared-storage execution.
 use std::collections::HashMap;
 
 use uniserve_core::EngineCoreOutput;

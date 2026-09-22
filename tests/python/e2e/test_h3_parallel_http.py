@@ -373,7 +373,7 @@ def test_component_bindings_release_cancelled_requests(
         ",".join(
             # Device products cross workers over VMM handles where the
             # devices can map one another; the host worker's ranks have no
-            # device, so their edges carry host products over shared memory
+            # device, so their edges carry host products over shared storage
             # only.
             f"{source}->{destination}="
             + (

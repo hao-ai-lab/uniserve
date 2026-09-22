@@ -43,9 +43,9 @@ from uniserve_worker.protocol.transfer import (
     Locator,
     PosixShmTransfer,
 )
-from uniserve_worker.transfer import segment
-from uniserve_worker.transfer.endpoint import locator_digest
-from uniserve_worker.transfer.tickets import _open_shared_memory
+from uniserve_worker.transport import segment
+from uniserve_worker.transport.endpoint import locator_digest
+from uniserve_worker.transport.shared_storage import open_shared_storage
 
 
 def _gated_copy(locator: Locator) -> tuple[Locator, shared_memory.SharedMemory]:
@@ -56,7 +56,7 @@ def _gated_copy(locator: Locator) -> tuple[Locator, shared_memory.SharedMemory]:
     the test announces it.
     """
     assert isinstance(locator.transport, PosixShmTransfer)
-    source = _open_shared_memory(
+    source = open_shared_storage(
         locator.transport.name, segment.HEADER_BYTES + locator.nbytes
     )
     try:
@@ -165,7 +165,7 @@ def test_kv_install_waits_for_storage_and_input_without_blocking_independent_wor
             for tensor in resident.tensors:
                 for locator in tensor.locations:
                     assert isinstance(locator.transport, PosixShmTransfer)
-                    mapping = _open_shared_memory(
+                    mapping = open_shared_storage(
                         locator.transport.name,
                         segment.HEADER_BYTES + locator.nbytes,
                     )

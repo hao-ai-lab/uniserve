@@ -4,6 +4,9 @@
 //! generation, optional feedback, and terminal publication. Every planned
 //! output is named by request epoch, producer call, point, and generation.
 
+use super::{EncoderCachePin, FlowPrefixState, Phase, RequestAllocations, TerminalIntent};
+use crate::kv::BlockTable;
+
 use std::collections::HashSet;
 use uniserve_worker_ipc::{
     CallCoordinates, DEFAULT_COMPONENT, ForwardMode, MediaCall, TransferMode,
@@ -156,7 +159,7 @@ pub(super) fn is_prompt_extend(call: &Call) -> bool {
         && call.token_output.is_some()
 }
 
-impl super::RequestState {
+impl RequestState {
     /// Applies one validated computation in request order. Pending identities are
     /// consumed once before this update; inactive successors never reach it.
     pub(crate) fn process_generation_result(
@@ -716,7 +719,7 @@ pub(crate) fn validate_generation_result(
     call: &Call,
     image_kv: Option<(u32, Option<u32>)>,
     start_step: Option<u32>,
-    state: &super::RequestState,
+    state: &RequestState,
     record: &RequestOutput,
     media: Option<&uniserve_core::SharedMedia>,
 ) -> Result<(), GenerationResultError> {
@@ -979,4 +982,139 @@ pub(crate) enum GenerationResultError {
     Token { detail: &'static str },
     #[error("worker logprob result invalid: {detail}")]
     Logprob { detail: &'static str },
+}
+
+/// Engine-owned state for one admitted request.
+pub(crate) struct RequestState {
+    pub req: GenerationRequest,
+    pub(crate) finish_token_ids: Vec<u32>,
+    /// The cached sequence mappings. Each table owns its physical page
+    /// references and therefore has exactly the request's lifetime.
+    pub(super) allocations: Option<RequestAllocations>,
+    pub(super) flow_prefix: Option<FlowPrefixState>,
+    /// Admission generation used to reject results from prior request lifetimes.
+    pub(crate) request_epoch: u64,
+    /// Most recent accepted state-producing call.
+    pub(crate) last_state_call_id: CallId,
+    /// Last device token retained until a consumer is registered.
+    pub(crate) latest_token: Option<TensorRef>,
+    /// A false device predicate invalidated the unresolved successor chain.
+    /// Already-submitted descendants must drain before scheduling resumes from
+    /// the last host-observed execution result.
+    pub(crate) speculative_chain_invalidated: bool,
+    pub(super) output: super::output::RequestOutput,
+    /// Current accepted computation stage; scheduling does not advance it.
+    pub(super) phase: Phase,
+    /// Prompt token range already accepted by the worker.
+    pub(super) num_computed_prompt_tokens: u32,
+    pub(super) num_ingested_images: usize,
+    pub(super) image_encoder_index: usize,
+    pub(super) input_image_features: Option<TensorRef>,
+    pub(super) round_closing: bool,
+    /// Model position and accepted physical KV length differ for image inputs.
+    pub(super) logical_position: u32,
+    pub(super) kv_visible_len: u32,
+    /// Accepted tokens whose KV is initialized. A verifier initializes its
+    /// rejected drafts, so this exceeds the visible extent until the next
+    /// forward makes exactly what it initializes visible.
+    pub(super) kv_computed_len: u32,
+    pub(super) next_token: u32,
+    pub(super) num_generated_tokens: usize,
+    pub(super) image_id: u32,
+    pub(super) num_generated_images: usize,
+    pub(super) image_reservation_pending: bool,
+    pub(super) num_completed_denoise_steps: u16,
+    /// Exact generations retained for conditioning, denoising, and feedback.
+    pub(super) image_conditioning: Option<uniserve_worker_ipc::BufferId>,
+    pub(super) image_latent: Option<TensorRef>,
+    pub(super) feedback_encoder_index: usize,
+    pub(super) feedback_source: Option<TensorRef>,
+    pub(super) feedback_features: Option<TensorRef>,
+    /// Whether the current epoch is registered with its execution workers.
+    pub(super) worker_registered: bool,
+    /// Number of positive-branch KV blocks already delivered to the worker.
+    pub(super) num_kv_blocks_sent: usize,
+    /// Whether admission reserves the complete multimodal KV requirement.
+    pub(super) reserve_worstcase: bool,
+    pub(super) max_reserved_kv_blocks: usize,
+    /// Per-group prefix hashes retained for publishing reusable input blocks.
+    pub(super) prefix_block_hashes: Vec<Vec<u64>>,
+    pub(super) prefix_cached: bool,
+    /// Accepted text and control tokens used by penalties and trigger matching.
+    pub(super) generated_token_ids: Vec<u32>,
+    /// Tokens since the last model round boundary, used by suffix-trigger matching.
+    pub(super) round_token_ids: Vec<u32>,
+    pub(super) text_tokens_since_image: usize,
+    /// Host image bytes retained only while artifact-based feedback needs them.
+    pub(super) feedback_image_b64: Option<String>,
+    /// False after a completed computation creates state unavailable from the input.
+    pub(super) replayable: bool,
+    pub(super) encoder_cache_pins: Vec<EncoderCachePin>,
+    pub(super) transient_encoder_products: Vec<TensorRef>,
+    pub queued_at: f64,
+    pub(crate) terminal_intent: TerminalIntent,
+}
+
+impl RequestState {
+    /// Returns the request allocations.
+    pub(super) fn allocations(&self) -> &RequestAllocations {
+        self.allocations.as_ref().expect("request is admitted")
+    }
+
+    /// Returns mutable access to the request allocations.
+    pub(super) fn allocations_mut(&mut self) -> &mut RequestAllocations {
+        self.allocations.as_mut().expect("request is admitted")
+    }
+
+    /// Returns the request-pool index.
+    pub(super) fn request_pool_idx(&self) -> u32 {
+        self.allocations().request_slot()
+    }
+
+    /// Returns shared access to the request block tables.
+    pub(super) fn block_tables(&self) -> &[BlockTable] {
+        self.allocations().block_tables()
+    }
+
+    /// Returns mutable access to the request block tables.
+    pub(super) fn block_tables_mut(&mut self) -> &mut Vec<BlockTable> {
+        self.allocations_mut().block_tables_mut()
+    }
+
+    /// Returns whether the request includes context images.
+    pub(super) fn has_context_images(&self) -> bool {
+        !self.req.multimodal_inputs.images.is_empty()
+    }
+
+    /// Returns whether execution continues after committing generation output.
+    pub(super) fn continues_after_gen_commit(&self) -> bool {
+        self.req.continues_after_image()
+    }
+
+    /// Returns whether the request can open a generation branch.
+    pub(super) fn can_open_gen_branch(&self) -> bool {
+        self.req.generates_images()
+            && self.num_generated_images < self.req.image.max_images as usize
+    }
+
+    /// Returns whether generation starts after context ingestion.
+    pub(super) fn starts_gen_after_context(&self) -> bool {
+        self.req.starts_with_image() && self.can_open_gen_branch()
+    }
+
+    /// Returns whether the text request can be replayed.
+    pub(crate) fn is_replayable_text(&self) -> bool {
+        self.replayable
+    }
+
+    /// Returns the pending image step, if one exists.
+    pub(super) fn pending_image_step(&self) -> Option<ImageIngestStep> {
+        self.req
+            .multimodal_inputs
+            .images
+            .get(self.num_ingested_images)?
+            .encoders
+            .get(self.image_encoder_index)
+            .map(|input| input.encoder)
+    }
 }

@@ -8,9 +8,12 @@ from uniserve.cache import mha
 from uniserve.math import ceil_div
 from uniserve.model import CausalLM
 from uniserve.quantization import Quantizer
-
-from ..config import WorkerConfig
-from .worker_info import KVCacheInfo, KvGroup, KvGroupKind
+from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.protocol.worker_info import (
+    KVCacheInfo,
+    KvGroup,
+    KvGroupKind,
+)
 
 
 def cache_info(

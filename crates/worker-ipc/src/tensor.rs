@@ -164,11 +164,11 @@ pub enum TransferTransport {
         /// Endpoint-local publication key.
         key: u64,
     },
-    /// POSIX shared-memory publication with endpoint-driven readiness and ownership.
+    /// POSIX shared-storage publication with endpoint-driven readiness and ownership.
     PosixShm {
         /// Publishing address-space incarnation and reader-lease endpoint.
         endpoint: String,
-        /// Shared-memory object name.
+        /// Shared-storage object name.
         name: String,
     },
     /// CUDA publication whose granted reader receives a physical-allocation descriptor.
@@ -204,7 +204,7 @@ pub enum TransferTransport {
     },
     /// A host product carried on the rank channel's data path.
     ///
-    /// Shared memory names a segment in one host's namespace, so a product
+    /// Shared storage names a segment in one host's namespace, so a product
     /// whose consumer is on another host travels as bytes: in the producing
     /// rank's result, into the head's custody, and out in the consuming rank's
     /// batch. The head releases its copy when the buffer is freed.
@@ -763,9 +763,9 @@ impl Locator {
             TransferTransport::PosixShm { endpoint, name } => {
                 ensure_valid!(
                     !endpoint.is_empty(),
-                    "shared-memory transfer endpoint is empty"
+                    "shared-storage transfer endpoint is empty"
                 );
-                ensure_valid!(!name.is_empty(), "shared-memory transfer name is empty");
+                ensure_valid!(!name.is_empty(), "shared-storage transfer name is empty");
             }
             TransferTransport::CudaVmm {
                 endpoint,

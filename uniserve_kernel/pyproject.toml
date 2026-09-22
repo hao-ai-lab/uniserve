@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-peer_memory = [
+peer_storage = [
   "ninja>=1.13",
 ]
 sparse_attention = [
@@ -32,4 +32,4 @@ where = ["src"]
 include = ["uniserve_kernel*"]
 
 [tool.setuptools.package-data]
-uniserve_kernel = ["py.typed", "sparse_attention/csrc/*.cu", "sparse_attention/csrc/*.cuh", "sparse_attention/LICENSE", "peer_memory/csrc/*.cpp"]
+uniserve_kernel = ["py.typed", "sparse_attention/csrc/*.cu", "sparse_attention/csrc/*.cuh", "sparse_attention/LICENSE", "peer_storage/csrc/*.cpp"]

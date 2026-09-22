@@ -52,7 +52,7 @@ impl Scheduler {
             return None;
         }
         let uses_transfer = call.bounds.max_transfer_bytes > 0;
-        if uses_transfer && self.num_pending_transfers >= self.transfer_capacity {
+        if uses_transfer && self.inflight.num_pending_transfers >= self.transfer_capacity {
             return None;
         }
         let request_key = self
@@ -62,18 +62,22 @@ impl Scheduler {
         let Some(request_key) = request_key else {
             return None;
         };
-        if self.worker_target(request_key, call.code).is_none() {
+        if self
+            .placement
+            .worker_target(self.executor.as_ref(), &self.info, request_key, call.code)
+            .is_none()
+        {
             return None;
         }
         let mut buffer_allocations = Vec::new();
         for bytes in call.buffer_outputs().map(TensorRef::max_bytes) {
-            let allocation = match self.buffer_pool.allocate(request_key, bytes, 256) {
+            let allocation = match self.storage.buffer_pool.allocate(request_key, bytes, 256) {
                 Ok(allocation) => allocation,
                 Err(_) => {
                     for allocation in buffer_allocations {
-                        self.buffer_pool.free(allocation);
+                        self.storage.buffer_pool.free(allocation);
                     }
-                    if let Some(product) = self.encoder_cache.evict_one() {
+                    if let Some(product) = self.storage.encoder_cache.evict_one() {
                         self.free_buffers([product.buffer_id()]);
                     }
                     return None;
@@ -95,21 +99,24 @@ impl Scheduler {
             };
             let allocations = state.allocations_mut();
             let result = if let Some(allocation) = allocations.latent.as_mut() {
-                self.latent_pool.grow(allocation, latent_units)
+                self.storage.latent_pool.grow(allocation, latent_units)
             } else {
-                self.latent_pool.allocate(latent_units).map(|allocation| {
-                    allocations.latent = Some(allocation);
-                })
+                self.storage
+                    .latent_pool
+                    .allocate(latent_units)
+                    .map(|allocation| {
+                        allocations.latent = Some(allocation);
+                    })
             };
             if result.is_err() {
                 for allocation in buffer_allocations {
-                    self.buffer_pool.free(allocation);
+                    self.storage.buffer_pool.free(allocation);
                 }
                 return None;
             }
         }
         if uses_transfer {
-            self.num_pending_transfers += 1;
+            self.inflight.num_pending_transfers += 1;
         }
         Some(buffer_allocations)
     }
@@ -187,7 +194,8 @@ impl Scheduler {
             // steps of different requests are therefore never in flight
             // together, in any lane.
             if next_type == Some(CallKind::Media(MediaCall::Denoising))
-                && (self.denoiser_lane_held_by_other(id) || !self.flow_prefix_is_schedulable(id))
+                && (self.inflight.denoiser_lane_held_by_other(id)
+                    || !self.flow_prefix_is_schedulable(id))
             {
                 continue;
             }
@@ -218,7 +226,7 @@ impl Scheduler {
                 };
                 let code = call.code;
                 if !code_batches.contains_key(&code) {
-                    let batch_id = self.next_batch_id();
+                    let batch_id = self.inflight.next_batch_id();
                     code_batches.insert(
                         code,
                         ExecutionBatch::new(batch_id, Vec::new(), Vec::new(), Vec::new()),
@@ -350,7 +358,7 @@ impl Scheduler {
             match batch_kind(call_type) {
                 BatchKind::Decode => {
                     if self.can_schedule_next(id) {
-                        if self.has_pending_calls(id) {
+                        if self.inflight.has_pending_calls(id) {
                             projected_decode_ready = true;
                         } else {
                             committed_decode_ready = true;
@@ -367,6 +375,7 @@ impl Scheduler {
         }
         if prefill_ready
             && self
+                .inflight
                 .pending_batches
                 .values()
                 .filter(|batch| batch.prefill)
@@ -504,7 +513,9 @@ impl Scheduler {
             self.fatal = true;
             return None;
         };
-        if self.has_pending_calls(request_id) && !self.can_queue_successor(request_id, call.code) {
+        if self.inflight.has_pending_calls(request_id)
+            && !self.can_queue_successor(request_id, call.code)
+        {
             tracing::error!(
                 request_id = request_id.0,
                 "scheduler attempted to issue an unsafe projected successor"
@@ -518,7 +529,7 @@ impl Scheduler {
         // either its in-flight predecessor or the latest resolved call.
         // The first call and host-observed transitions use the latest
         // accepted call identity.
-        let projected_successor = self.has_pending_calls(request_id);
+        let projected_successor = self.inflight.has_pending_calls(request_id);
         let reusable_device_token =
             if !projected_successor && self.can_reuse_resolved_token_product(request_id) {
                 latest_token
@@ -535,6 +546,7 @@ impl Scheduler {
                 return None;
             }
             let Some(predecessor) = self
+                .inflight
                 .pending_calls
                 .get(&request_id)
                 .and_then(|queue| queue.back())
@@ -624,7 +636,7 @@ impl Scheduler {
         let mut call_forward = ForwardBatch::default();
         if let Some(lengths) = kv_lengths {
             let table_changed = admitted || new_page_count > 0;
-            for group_id in 0..self.cache().block_pool.num_groups() {
+            for group_id in 0..self.storage.cache().block_pool.num_groups() {
                 let page_ids = self
                     .running
                     .get(&request_id)
@@ -694,7 +706,7 @@ impl Scheduler {
             generation::register_call(&mut call, request_key, &mut self.next_product_generation)
         {
             for allocation in reserved_buffers {
-                self.buffer_pool.free(allocation);
+                self.storage.buffer_pool.free(allocation);
             }
             tracing::error!(
                 request_id = request_id.0,
@@ -714,7 +726,7 @@ impl Scheduler {
             .collect::<Vec<_>>();
         if persistent_outputs.len() != reserved_buffers.len() {
             for allocation in reserved_buffers {
-                self.buffer_pool.free(allocation);
+                self.storage.buffer_pool.free(allocation);
             }
             tracing::error!(
                 request_id = request_id.0,
@@ -727,7 +739,7 @@ impl Scheduler {
         let mut call_buffers = Vec::with_capacity(reserved_buffers.len());
         let Some(state) = self.running.get_mut(&request_id) else {
             for allocation in reserved_buffers {
-                self.buffer_pool.free(allocation);
+                self.storage.buffer_pool.free(allocation);
             }
             self.fatal = true;
             return None;
@@ -850,7 +862,9 @@ impl Scheduler {
             });
         }
 
-        let (worker, entry) = self.select_worker(&call);
+        let (worker, entry) =
+            self.placement
+                .select_worker(self.executor.as_ref(), &self.info, &call);
         call.component = entry;
 
         let submitted_us = uniserve_core::now_monotonic_us();
@@ -893,7 +907,7 @@ impl Scheduler {
         submit_at: Instant,
     ) -> ExecutionBatch {
         if batch.id == 0 {
-            batch.id = self.next_batch_id();
+            batch.id = self.inflight.next_batch_id();
         }
 
         // Snapshot scheduler gauges at the batch boundary before ownership moves
@@ -914,8 +928,8 @@ impl Scheduler {
         self.stats
             .kv_cache
             .free_blocks
-            .store(self.free_blocks(), Ordering::Relaxed);
-        self.register_pending_batch(&batch, submit_at);
+            .store(self.storage.free_blocks(), Ordering::Relaxed);
+        self.inflight.register_pending_batch(&batch, submit_at);
         batch
     }
 
@@ -966,7 +980,7 @@ impl Scheduler {
         let Some(state) = self.running.get_mut(&id) else {
             return false;
         };
-        let Some(cache) = self.cache.as_ref() else {
+        let Some(cache) = self.storage.cache.as_ref() else {
             return false;
         };
         cache
@@ -979,7 +993,7 @@ impl Scheduler {
 
     /// Activates the KV tables reserved for a request.
     pub(super) fn activate_request_tables(&self, id: RequestId) {
-        let kv = self.cache();
+        let kv = self.storage.cache();
         if let Some(state) = self.running.get(&id) {
             for table in state.block_tables() {
                 table.activate(&kv.block_pool);
@@ -1066,12 +1080,12 @@ impl Scheduler {
                 })
             }
             Phase::DecodeUnd => {
-                let projected_successor = self.has_pending_calls(id);
+                let projected_successor = self.inflight.has_pending_calls(id);
                 // Stage minimum-token and force-finish constraints at the
                 // successor's scheduled token position. Device predicates
                 // prevent an inactive descendant from accepting that position.
                 let projected = if projected_successor {
-                    self.num_pending_calls(id)
+                    self.inflight.num_pending_calls(id)
                 } else {
                     0
                 };
@@ -1301,17 +1315,17 @@ impl Scheduler {
             let cache_read = state.req.cache.read;
             let cache_key = encoder_cache_key(image.hash, step_index, step);
             let cached = if cache_read {
-                self.encoder_cache.lookup_product(cache_key)
+                self.storage.encoder_cache.lookup_product(cache_key)
             } else {
                 None
             };
             if let Some(cached_product) = cached {
-                let product = self.encoder_cache.acquire(cache_key)?;
+                let product = self.storage.encoder_cache.acquire(cache_key)?;
                 if product != cached_product {
                     return None;
                 }
                 let Some(state) = self.running.get_mut(&id) else {
-                    let _ = self.encoder_cache.release(cache_key, &product);
+                    let _ = self.storage.encoder_cache.release(cache_key, &product);
                     return None;
                 };
                 state.encoder_cache_pins.push(EncoderCachePin {

@@ -8,8 +8,8 @@ import os
 import signal
 import sys
 
-from .bootstrap.cli import parse_worker_args
-from .bootstrap.launch import run_worker
+from uniserve_worker.bootstrap.cli import parse_worker_args
+from uniserve_worker.bootstrap.launch import run_worker
 
 logger = logging.getLogger(__name__)
 

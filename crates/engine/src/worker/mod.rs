@@ -100,8 +100,8 @@ pub struct WorkerProcessArgs {
     pub quantization_config: serde_json::Value,
     /// Numeric data type used by the KV cache, when explicitly selected.
     pub kv_cache_dtype: Option<uniserve_core::KvCacheDtype>,
-    /// Fraction of available device memory reserved for the KV cache.
-    pub kv_memory_fraction: f64,
+    /// Fraction of available device storage reserved for the KV cache.
+    pub kv_storage_fraction: f64,
     /// Optional device mesh specification for staged model components.
     pub mesh: Option<String>,
     /// Optional process-world communication backend.

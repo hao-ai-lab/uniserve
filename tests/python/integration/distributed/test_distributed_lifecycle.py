@@ -3,6 +3,8 @@
 They also preserve the original failure.
 """
 
+import os
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -13,8 +15,8 @@ from uniserve.runtime.process_groups import initialize_process_groups
 pytestmark = pytest.mark.integration
 
 
-def _construction_scope(rank, directory):
-    for outcome in ("success", "body_error", "cleanup_error"):
+def _construction_scope(rank, directory, outcome):
+    with pytest.MonkeyPatch.context() as patch:
         failure = RuntimeError("execution construction failed")
         destroy_process_group = dist.destroy_process_group
 
@@ -22,7 +24,7 @@ def _construction_scope(rank, directory):
             destroy_process_group(group)
             raise RuntimeError("distributed teardown failed")
 
-        with pytest.MonkeyPatch.context() as patch:
+        try:
             if outcome == "cleanup_error":
                 # PyTorch is the external resource boundary. Release the real
                 # group before reporting a teardown error to the caller.
@@ -36,23 +38,35 @@ def _construction_scope(rank, directory):
                     device="cpu",
                     init_method=f"file://{directory}/{outcome}",
                 ):
-                    if outcome != "success":
+                    if outcome == "body_error":
                         raise failure
                     value = torch.tensor([rank + 1])
                     dist.all_reduce(value)
                     assert value.item() == 3
             except RuntimeError as error:
-                assert error is failure
-                if outcome == "cleanup_error":
-                    assert any(
-                        "distributed teardown failed" in note
-                        for note in error.__notes__
-                    )
+                if outcome == "body_error":
+                    assert error is failure
+                else:
+                    assert outcome == "cleanup_error"
+                    assert str(error) == "distributed teardown failed"
             else:
                 assert outcome == "success"
 
-        assert not dist.is_initialized()
+        finally:
+            patch.undo()
+    if outcome == "body_error":
+        # Aborted scopes retain physical groups until process exit. Peers may
+        # still be serving, so teardown cannot wait on their collectives.
+        assert dist.is_initialized()
+        os._exit(0)
+    assert not dist.is_initialized()
 
 
-def test_distributed_construction_scope_ownership_and_errors(tmp_path):
-    mp.spawn(_construction_scope, args=(str(tmp_path),), nprocs=2, join=True)
+@pytest.mark.parametrize("outcome", ("success", "body_error", "cleanup_error"))
+def test_distributed_construction_scope_ownership_and_errors(tmp_path, outcome):
+    mp.spawn(
+        _construction_scope,
+        args=(str(tmp_path), outcome),
+        nprocs=2,
+        join=True,
+    )

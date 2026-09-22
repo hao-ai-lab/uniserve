@@ -11,7 +11,7 @@ import numpy as np
 
 from ..artifacts import ArtifactWriter
 from ..datasets import load_examples
-from ..load import GpuMemorySampler, WarmupFailure, run_load
+from ..load import GpuStorageSampler, WarmupFailure, run_load
 from ..tasks import get_task
 from ..transport import send_request
 from ..types import (
@@ -43,7 +43,7 @@ async def run_point(
     selection: dict[str, Any] | None = None
     warmup_records: list[RequestRecord] = []
     records: list[RequestRecord] = []
-    sampler: GpuMemorySampler | None = None
+    sampler: GpuStorageSampler | None = None
     duration = 0.0
 
     # Empty streams and the preparing record make partial failures
@@ -106,7 +106,7 @@ async def run_point(
                     scheduled_time=scheduled,
                 )
 
-            sampler = GpuMemorySampler()
+            sampler = GpuStorageSampler()
             sampler.start()
 
             try:

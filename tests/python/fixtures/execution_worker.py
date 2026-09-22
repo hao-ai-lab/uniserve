@@ -10,9 +10,9 @@ import torch
 from tests.python.fixtures.worker_config import stub_worker_config
 from uniserve.distributed.mesh import Communicator
 from uniserve_models.stub import Model, image_processor
-from uniserve_worker.bootstrap.config import ComponentConfig
-from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.component_binding import ComponentBinding
+from uniserve_worker.config.deployment import ComponentConfig
+from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.worker import Worker
 
 
@@ -80,7 +80,7 @@ def execution_worker(
         transfer_backends=transfer_backends,
         publication_backends=transfer_backends,
         # The fixture's deployment is one host: the worker's own slot and the
-        # external consumer slot a test names both read over shared memory.
+        # external consumer slot a test names both read over shared storage.
         host_slots=host_slots,
         worker_id=worker_id,
         queue_depth=queue_depth,

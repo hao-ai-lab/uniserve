@@ -14,7 +14,7 @@ from uniserve.processing import (
     StrideResize,
     TowerTransform,
 )
-from uniserve_worker.execution.image_input import (
+from uniserve_worker.model_executor.image_inputs import (
     prepare_image,
     prepare_tensor_image,
 )

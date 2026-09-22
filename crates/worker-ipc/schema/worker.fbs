@@ -439,7 +439,7 @@ table Locator {
   // its producer's own accounting.
   acknowledgment_offset:long = -1;
   // A host product's bytes, carried on the rank channel's data path. Shared
-  // memory reaches only one host, so a product whose consumer is elsewhere
+  // storage reaches only one host, so a product whose consumer is elsewhere
   // travels in the producing rank's result and the consuming rank's batch.
   payload:[ubyte];
   nbytes:ulong;

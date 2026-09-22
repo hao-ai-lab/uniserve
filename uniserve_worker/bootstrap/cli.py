@@ -15,7 +15,7 @@ from argparse import Namespace
 from collections.abc import Sequence
 from pathlib import Path
 
-from .config import WorkerProcessArgs
+from uniserve_worker.config.deployment import WorkerProcessArgs
 
 # Values the descriptor must carry. A launch that omits one is a contract
 # violation rather than something to paper over with a local default.

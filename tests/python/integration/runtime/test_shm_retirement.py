@@ -10,8 +10,7 @@ import torch
 
 from uniserve.runtime import EventPool
 from uniserve_worker._uniserve_ipc import atomic_load_u32
-from uniserve_worker.transfer import segment
-from uniserve_worker.transfer.tickets import make_transports
+from uniserve_worker.transport import make_transports, segment
 
 pytestmark = pytest.mark.integration
 

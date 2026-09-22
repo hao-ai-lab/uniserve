@@ -12,12 +12,8 @@ from tests.python.fixtures.cache import mha_pool
 from tests.python.fixtures.shm_publication import serve_pending_publication
 from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
-from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.protocol.identity import (
-    BufferId,
-    CallId,
-    RequestKey,
-)
+from uniserve_worker.errors import WorkerError
+from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.transfer import (
     KvTransfer,
     Locator,
@@ -56,7 +52,7 @@ def test_cancelled_import_releases_pages_after_pending_read_retires() -> None:
     process.start()
     child.close()
     try:
-        assert parent.poll(30), "shared-memory publisher did not start"
+        assert parent.poll(30), "shared-storage publisher did not start"
         locator = Locator.from_mapping(parent.recv())
         source = _buffer(1)
         field = TensorTransfer(shape=shape, locations=(locator,))

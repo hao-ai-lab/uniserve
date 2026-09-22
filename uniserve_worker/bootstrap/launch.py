@@ -8,7 +8,7 @@ import os
 import secrets
 import socket
 
-from .config import WorkerProcessArgs
+from uniserve_worker.config.deployment import WorkerProcessArgs
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +22,8 @@ SOCKET_BIND_INTERFACE = "0.0.0.0"
 SOCKET_CHANNEL = "tcp"
 
 try:
-    from .._uniserve_ipc import Server as WorkerIpcEndpoint
-    from .._uniserve_ipc import service_name
+    from uniserve_worker._uniserve_ipc import Server as WorkerIpcEndpoint
+    from uniserve_worker._uniserve_ipc import service_name
 except (
     ImportError
 ) as exc:  # pragma: no cover - depends on the installed native extension.
@@ -37,7 +37,7 @@ def endpoint_name(config: WorkerProcessArgs) -> str:
     """Name this rank's channel endpoint.
 
     The placement decides the mechanism and the rank names the endpoint. A
-    shared-memory endpoint is named by a service distinct across ranks and
+    shared-storage endpoint is named by a service distinct across ranks and
     across successive launches of one rank; a socket endpoint is named by the
     address it binds, so the rank offers the interface to bind on and reports
     the address that binding produced.
@@ -81,7 +81,7 @@ def register_endpoint(config: WorkerProcessArgs, endpoint: str) -> None:
 
 def run_worker(config: WorkerProcessArgs) -> None:
     """Own the IPC endpoint around model construction and the blocking run."""
-    from ..worker import Worker
+    from uniserve_worker.worker import Worker
 
     endpoint_service = endpoint_name(config)
     with WorkerIpcEndpoint(

@@ -42,7 +42,7 @@ from uniserve_models.minimax_h3.conditioning import (
 )
 from uniserve_models.minimax_h3.config import TRANSFORMER_FIELDS
 from uniserve_models.minimax_h3.weights import transformer_component
-from uniserve_worker.runtime.request import RequestPool
+from uniserve_worker.execution.request import RequestPool
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -350,8 +350,8 @@ def test_partitioned_denoising_and_feedback(tmp_path):
 
 @torch.inference_mode()
 def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
-    from uniserve_worker.execution.denoising_runner import DenoisingRunner
-    from uniserve_worker.execution.inputs.media import MediaBuilder
+    from uniserve_worker.model_executor.diffusion_runner import TrajectoryRunner
+    from uniserve_worker.model_executor.media_inputs import MediaBuilder
 
     source = _checkpoint(tmp_path)
     device = torch.device("cuda", 0)
@@ -388,7 +388,7 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
         factory = MediaBuilder(model, max_frames=22, max_text_tokens=65)
         size = factory.size(22, 63)
         matrices = {name: value.to(device) for name, value in source.items()}
-        runner = DenoisingRunner(
+        runner = TrajectoryRunner(
             model,
             device=device,
             stream=torch.cuda.Stream(device=device),
@@ -400,10 +400,10 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
         pool = RequestPool(
             2, state_buffers=factory.capacity_buffers(), device=device
         )
-        runner.bind_bank(pool.bank)
+        runner.bind_bank(pool.storage.bank)
         try:
             context = runner.prepare_inputs(size, size)
-            with pool.tensors(1) as storage:
+            with pool.storage.tensors(1) as storage:
                 views = storage.view(factory.buffers(size))
                 state = {name: views[name] for name in model.modalities}
                 views["text_condition"].zero_()

@@ -897,7 +897,7 @@ fn set_kv_lengths(lengths: &mut RequestOutput, visible: u32) {
     lengths.kv_computed_len = visible;
 }
 
-/// Publishes bytes as an immutable POSIX shared-memory artifact.
+/// Publishes bytes as an immutable POSIX shared-storage artifact.
 ///
 /// The object is left in place under its generated name; the engine claims it
 /// by that name and unlinks it when it opens the result.
@@ -912,7 +912,7 @@ fn publish_media(prefix: &str, bytes: &[u8]) -> anyhow::Result<uniserve_worker_i
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("shared-memory artifact has no printable name"))?
+        .ok_or_else(|| anyhow::anyhow!("shared-storage artifact has no printable name"))?
         .to_owned();
 
     Ok(uniserve_worker_ipc::MediaOutput {

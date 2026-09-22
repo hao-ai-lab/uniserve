@@ -158,7 +158,7 @@ impl Scheduler {
             .expect("executor exposes a valid runtime capacity view");
         let generation_limits = resolve_generation_limits(generation_limits, &info);
         let latent_dtype = worker_float_dtype(Some(model_dtype));
-        let media_memory = executor
+        let media_storage = executor
             .info()
             .workers
             .iter()
@@ -171,7 +171,7 @@ impl Scheduler {
             .map(|(id, worker)| {
                 (
                     id.clone(),
-                    MediaMemory {
+                    MediaStorage {
                         requests: RequestPool::new(worker.request_slots as usize),
                         buffers: BufferPool::new(worker.buffer_pool_bytes),
                     },
@@ -209,7 +209,7 @@ impl Scheduler {
             config.max_batch = config.max_batch.min(max_batch_calls.max(1));
         }
 
-        // Memory and scheduler statistics share the resolved worker capacities.
+        // Storage and scheduler statistics share the resolved worker capacities.
         let cache = KVCacheManager::from_worker_info(&info);
         let stats = Arc::new(SchedulerStats::default());
         stats.kv_cache.num_blocks.store(
@@ -226,19 +226,22 @@ impl Scheduler {
 
         Self {
             executor,
-            pending_submissions: VecDeque::new(),
-            worker_affinity: HashMap::new(),
-            cache,
-            encoder_cache: crate::kv::EncoderCacheManager::new(
-                generation_limits.encoder_cache_entries as usize,
-            ),
-            reserved_encoder_entries: 0,
-            request_pool: RequestPool::new(info.request_slots as usize),
-            latent_pool: LatentPool::new(info.latent_pages, info.latent_page_units),
-            reserved_blocks: 0,
-            buffer_pool: BufferPool::new(info.buffer_pool_bytes),
-            media_memory,
-            encoder_buffers: HashMap::new(),
+            inflight: inflight::Inflight::new(),
+            placement: placement::Placement::default(),
+            storage: allocation::Storage {
+                cache,
+                encoder_cache: crate::kv::EncoderCacheManager::new(
+                    generation_limits.encoder_cache_entries as usize,
+                ),
+                reserved_encoder_entries: 0,
+                request_pool: RequestPool::new(info.request_slots as usize),
+                latent_pool: LatentPool::new(info.latent_pages, info.latent_page_units),
+                reserved_blocks: 0,
+                buffer_pool: BufferPool::new(info.buffer_pool_bytes),
+                media_storage,
+                encoder_buffers: HashMap::new(),
+                pending_buffer_frees: HashMap::new(),
+            },
             info,
             generation_limits,
             family,
@@ -249,17 +252,8 @@ impl Scheduler {
             running_media: HashMap::new(),
             retiring_requests: HashMap::new(),
             transfer_capacity,
-            num_pending_transfers: 0,
-            batch_id: 0,
-            next_arrival_seq: 1,
-            pending_calls: HashMap::new(),
-            pending_completions: HashMap::new(),
-            pending_finishes: HashMap::new(),
-            pending_batches: HashMap::new(),
             denoise_step_burst,
             latent_dtype,
-            pending_commands: VecDeque::new(),
-            pending_buffer_frees: HashMap::new(),
             engine_id: 1,
             next_product_generation: 1,
             next_request_epoch: 1,
@@ -286,14 +280,14 @@ impl Scheduler {
 
     /// Enables or disables reusable prefix caching.
     pub fn set_prefix_cache(&mut self, on: bool) {
-        if let Some(cache) = self.cache.as_mut() {
+        if let Some(cache) = self.storage.cache.as_mut() {
             cache.set_prefix_cache(on);
         }
     }
 
     /// Selects the hash algorithm used for prefix-cache keys.
     pub fn set_hash_algo(&mut self, algo: HashAlgo) {
-        if let Some(cache) = self.cache.as_mut() {
+        if let Some(cache) = self.storage.cache.as_mut() {
             cache.set_hash_algo(algo);
         }
     }
@@ -317,6 +311,7 @@ impl Scheduler {
                     .contains(&CallKind::Media(MediaCall::Denoising)),
         );
         let capacity = self
+            .storage
             .request_pool
             .capacity()
             .saturating_sub(flow_slot_reserve)
@@ -441,7 +436,7 @@ impl Scheduler {
         self.stats
             .general
             .in_flight
-            .store(self.pending_batches.len(), Ordering::Relaxed);
+            .store(self.inflight.pending_batches.len(), Ordering::Relaxed);
         self.publish_cache_stats();
     }
 }

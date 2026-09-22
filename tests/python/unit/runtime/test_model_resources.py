@@ -18,9 +18,9 @@ from uniserve_worker.bootstrap.capacity import (
     request_tensor_window,
     tensor_slot_capacity,
 )
-from uniserve_worker.bootstrap.config import ComponentConfig
-from uniserve_worker.bootstrap.worker_info_builder import build_worker_layout
-from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.bootstrap.report import build_worker_layout
+from uniserve_worker.config.deployment import ComponentConfig
+from uniserve_worker.errors import WorkerError
 from uniserve_worker.protocol.call import ForwardMode, MediaCall
 
 TEST_MODEL = Model()
@@ -90,7 +90,7 @@ def test_tensor_capacity_covers_packed_selections_that_move_between_ranks():
 
 def test_closed_request_storage_rejects_admission_and_borrowing():
     from tests.python.fixtures.depth_one import ar_params
-    from uniserve_worker.runtime.request import RequestPool
+    from uniserve_worker.execution.request import RequestPool
 
     admission = replace(ar_params(71, block_ids=(0,)), request_pool_idx=1)
     pool = RequestPool(
@@ -102,7 +102,7 @@ def test_closed_request_storage_rejects_admission_and_borrowing():
     pool.close()
     pool.close()
     with pytest.raises(RuntimeError, match="closed"):
-        pool.tensors(admission.request_pool_idx)
+        pool.storage.tensors(admission.request_pool_idx)
     with pytest.raises(RuntimeError, match="closed"):
         pool.start(admission)
 
@@ -123,7 +123,7 @@ def test_request_capacity_charges_only_device_storage_against_device_budget():
         )
         == 2
     )
-    with pytest.raises(RuntimeError, match="insufficient device memory"):
+    with pytest.raises(RuntimeError, match="insufficient device storage"):
         tensor_slot_capacity(
             schema,
             Communicator(),
@@ -268,8 +268,8 @@ def test_result_publication_rejects_unrepresentable_numerical_outputs(
     from tests.python.fixtures.encoding import Model as EncodedModel
     from uniserve.model import TextEncoder
     from uniserve.tensors import OutputLayout
-    from uniserve_worker.config import WorkerConfig
-    from uniserve_worker.runtime.results import resolve_outputs
+    from uniserve_worker.bootstrap.outputs import resolve_outputs
+    from uniserve_worker.config.execution import WorkerConfig
 
     class FeatureEncoder(TextEncoder):
         def output_layout(self, num_tokens, _deployment_dtype):
@@ -291,11 +291,11 @@ def test_result_publication_rejects_unrepresentable_numerical_outputs(
 def test_worker_reserves_declared_tensor_results_for_every_request() -> None:
     from tests.python.fixtures.encoding import Config
     from tests.python.fixtures.encoding import Model as EncodedModel
-    from uniserve_worker.config import WorkerConfig
+    from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.protocol.batch import BufferAllocation
     from uniserve_worker.protocol.identity import CallId, RequestKey
     from uniserve_worker.protocol.tensor import StaticDim, TensorRef
-    from uniserve_worker.runtime.buffer_pool import BufferPool
+    from uniserve_worker.storage.buffer_pool import BufferPool
 
     model = EncodedModel(Config(hidden_size=7))
     # The fixture's encoder is built at the default float dtype, which is
@@ -393,8 +393,10 @@ def test_product_capacity_backs_produced_and_consumed_products_whole(
 ):
     from uniserve.distributed.mesh import DeviceMesh
     from uniserve_worker.bootstrap.capacity import local_product_storage_bytes
-    from uniserve_worker.bootstrap.config import ComponentConfig
-    from uniserve_worker.execution.component_binding import ComponentBinding
+    from uniserve_worker.config.deployment import ComponentConfig
+    from uniserve_worker.model_executor.component_binding import (
+        ComponentBinding,
+    )
     from uniserve_worker.protocol.call import MediaCall
     from uniserve_worker.protocol.tensor import (
         DeviceDim,

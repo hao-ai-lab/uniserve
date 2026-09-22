@@ -179,7 +179,7 @@ impl Default for WorkerProcessArgs {
             model_dtype: uniserve_core::ModelDtype::BFloat16,
             quantization_config: serde_json::json!({}),
             kv_cache_dtype: None,
-            kv_memory_fraction: 0.70,
+            kv_storage_fraction: 0.70,
             mesh: None,
             distributed_backend: None,
             lanes: Vec::new(),
@@ -274,14 +274,14 @@ impl WorkerProcessArgs {
         fields.insert("worker_id".into(), json!(self.worker_id));
         fields.insert("registration_address".into(), json!(registration));
         // The placement decides the mechanism and the rank names the endpoint:
-        // a rank on the head's host can offer shared memory, a rank elsewhere
+        // a rank on the head's host can offer shared storage, a rank elsewhere
         // cannot, and only the head knows where a rank was placed.
         fields.insert("channel_transport".into(), json!(channel_transport));
         // A consumer writes its own slot's word in every chunk or segment it
         // reads; the slots a producer watches travel on each producing call.
         fields.insert("acknowledgment_slot".into(), json!(acknowledgment_slot));
         // Which of those slots are on this rank's host decides the mechanism
-        // a host product is published over: shared memory reaches the host,
+        // a host product is published over: shared storage reaches the host,
         // the rank channel reaches the rest.
         fields.insert("host_slots".into(), json!(host_slots));
         // Readiness is a producer synchronize only where an interprocess event
@@ -344,7 +344,7 @@ impl WorkerProcessArgs {
             "kv_cache_dtype".into(),
             json!(self.kv_cache_dtype.as_ref().map(|value| value.as_str())),
         );
-        fields.insert("kv_memory_fraction".into(), json!(self.kv_memory_fraction));
+        fields.insert("kv_memory_fraction".into(), json!(self.kv_storage_fraction));
         fields.insert("kv_token_capacity".into(), json!(self.kv_token_capacity));
         fields.insert(
             "attention_backend".into(),
@@ -952,7 +952,7 @@ impl RankProcess {
 
     /// Returns the descriptors that signal this rank's progress.
     ///
-    /// A shared-memory channel multiplexes every wake onto one listener; a
+    /// A shared-storage channel multiplexes every wake onto one listener; a
     /// socket channel carries only results and raises the engine's own wakes
     /// on a second descriptor.
     pub(crate) fn progress_fds(&self) -> Vec<libc::pollfd> {

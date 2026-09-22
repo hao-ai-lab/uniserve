@@ -41,7 +41,7 @@ def test_independent_producer_notifies_while_another_producer_is_blocked() -> (
     events.retain(slow_done, "cuda:0")
     events.retain(fast_done, "cuda:0")
     try:
-        # A device memory wait controls producer completion without occupying
+        # A device storage wait controls producer completion without occupying
         # CUDA's host callback thread, which also delivers native notifications.
         assert (
             driver.cuStreamWaitValue32_v2(

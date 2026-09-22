@@ -391,7 +391,7 @@ pub(crate) struct WorkerProcessOptions {
     #[arg(long)]
     pub kv_cache_dtype: Option<KvCacheDtype>,
     #[arg(long = "mem-fraction-static", default_value = "0.70")]
-    pub kv_memory_fraction: f64,
+    pub kv_storage_fraction: f64,
     /// Parallelism mesh forwarded to the Python worker, e.g.
     /// `tower=text:cuda:0;gen:cuda:1`.
     #[arg(long, hide = true)]
@@ -445,7 +445,7 @@ impl WorkerProcessOptions {
             model_dtype: self.model_dtype.clone(),
             quantization_config: self.quantization_config.clone(),
             kv_cache_dtype: self.kv_cache_dtype.clone(),
-            kv_memory_fraction: self.kv_memory_fraction.clone(),
+            kv_storage_fraction: self.kv_storage_fraction.clone(),
             mesh: self.worker_mesh.clone(),
             distributed_backend: self.distributed_backend.clone(),
             lanes: self.lanes.clone(),
@@ -604,7 +604,7 @@ mod tests {
         let workers = args.runtime.workers.expect("the configuration was read");
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].id.0, "text");
-        assert_eq!(workers[0].memory_fraction, Some(0.25));
+        assert_eq!(workers[0].storage_fraction, Some(0.25));
         assert_eq!(workers[0].components["model"].ranks, vec![0, 1]);
         assert_eq!(
             workers[0].components["model"]

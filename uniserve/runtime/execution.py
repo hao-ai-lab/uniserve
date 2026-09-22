@@ -523,7 +523,7 @@ class _GatherPool:
                     "prepare projection exchange backing before capture"
                 )
             if self.symmetric:
-                from ._peer_memory import allocate_collective_buffer
+                from ._peer_storage import allocate_collective_buffer
 
                 buffer = allocate_collective_buffer(
                     (amount,), dtype=torch.uint8, device=device
@@ -725,7 +725,7 @@ class ExecutionContext(Generic[SizeT]):
             # ordinary collective; registering it fails the communicator
             # rather than degrading it. The send buffer is this rank's own
             # destination either way, since where peer storage exists its own
-            # entry is that same memory.
+            # entry is that same storage.
             if (
                 self._collectives is not None
                 and group.size > 1

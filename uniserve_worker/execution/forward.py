@@ -12,38 +12,33 @@ import torch
 
 from uniserve.diffusion import Branch
 from uniserve.tensors import OutputLayout
+from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution import calls
-from uniserve_worker.execution.batch_state import BatchState
-from uniserve_worker.execution.image_input import PreparedImage
-from uniserve_worker.execution.output import PendingOutput
-from uniserve_worker.execution.rows import DecodeRow, InputRow
-from uniserve_worker.execution.sample import broadcast_selection
-from uniserve_worker.execution.sample import sample as _sample_task_batch
-from uniserve_worker.foundation.errors import invalid_descriptor
+from uniserve_worker.execution.batch import BatchState
+from uniserve_worker.execution.diffusion_state import ImageState
+from uniserve_worker.execution.output import PendingOutput, capture_samples
+from uniserve_worker.model_executor.image_inputs import DecodeRow, PreparedImage
+from uniserve_worker.model_executor.input_batch import InputRow
 from uniserve_worker.profiling import record_component
-from uniserve_worker.protocol.call import (
-    Call,
-    ForwardMode,
-    MediaCall,
-)
-
-from .diffusion_state import ImageState
-from .output import capture_samples
-from .sampling import SamplerRow, SamplingMetadata
+from uniserve_worker.protocol.call import Call, ForwardMode, MediaCall
+from uniserve_worker.sampling.metadata import SamplingMetadata
+from uniserve_worker.sampling.result import SamplerRow
+from uniserve_worker.sampling.sampler import broadcast_selection
+from uniserve_worker.sampling.sampler import sample as _sample_task_batch
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
     from uniserve.distributed.mesh import Communicator
-    from uniserve_worker.bootstrap.worker_info import WorkerInfo
-    from uniserve_worker.config import WorkerConfig
-    from uniserve_worker.execution.model_runner import ModelRunner
-    from uniserve_worker.runtime.block_tables import BlockTables
-    from uniserve_worker.runtime.cache_manager import CacheManager
-    from uniserve_worker.runtime.decode_state import DecodeState
-    from uniserve_worker.runtime.latent_pool import LatentPool
-    from uniserve_worker.runtime.tensor_store import TensorStore
-    from uniserve_worker.transfer.tickets import Transport
+    from uniserve_worker.config.execution import WorkerConfig
+    from uniserve_worker.execution.model_executor import ModelExecutor
+    from uniserve_worker.protocol.worker_info import WorkerInfo
+    from uniserve_worker.storage.block_tables import BlockTables
+    from uniserve_worker.storage.decode_state import DecodeState
+    from uniserve_worker.storage.kv_cache import KVCacheManager
+    from uniserve_worker.storage.latent_pool import LatentPool
+    from uniserve_worker.storage.tensor_store import TensorStore
+    from uniserve_worker.transport.interface import Transport
 
 
 ForwardValue = tuple[
@@ -62,12 +57,12 @@ SampleCandidate = tuple[
 
 
 def forward_values(
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
     inputs: tuple[tuple[InputRow, Call], ...],
     *,
     state: BatchState,
     retain_sampling: bool = False,
-    cache: CacheManager | None,
+    cache: KVCacheManager | None,
     tables: BlockTables | None,
     states: DecodeState | None,
     sampling_group: Communicator | None,
@@ -83,7 +78,7 @@ def forward_values(
         states=states,
     )
     values: list[ForwardValue | None] = [None] * len(inputs)
-    from .token import graph_decode_samples
+    from uniserve_worker.execution.token import graph_decode_samples
 
     for indexes, output in outputs:
         if isinstance(output, BaseException):
@@ -136,7 +131,7 @@ def _publish_samples(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
@@ -145,7 +140,7 @@ def _publish_samples(
 
     results.
     """
-    from . import token
+    from uniserve_worker.execution import token
 
     if not candidates:
         return
@@ -221,13 +216,13 @@ def initialize_trajectories(
     outcomes: dict[int, PendingOutput],
     *,
     state: BatchState,
-    kv_cache: CacheManager | None,
+    kv_cache: KVCacheManager | None,
     latent_pool: LatentPool,
     request_tables: BlockTables | None,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
 ) -> tuple[dict[int, ImageState], int]:
     """Open diffusion trajectories and return the longest declared interval."""
-    from . import flow
+    from uniserve_worker.execution import diffusion
 
     trajectories: dict[int, ImageState] = {}
     for index in numerical:
@@ -235,7 +230,7 @@ def initialize_trajectories(
         if call.kind is not MediaCall.DENOISING or index in outcomes:
             continue
 
-        trajectories[index] = flow.initialize(
+        trajectories[index] = diffusion.initialize(
             call,
             kv_cache=kv_cache,
             latent_pool=latent_pool,
@@ -248,7 +243,7 @@ def initialize_trajectories(
     for index in trajectories:
         call = scheduled[index]
         request = state.pending_output(call.request_key.request_id)
-        params = request.input_latent_params
+        params = request.latent.input_params
         if params is None:
             raise invalid_descriptor(
                 "diffusion call has no staged latent parameters"
@@ -265,16 +260,16 @@ def prepare_diffusion_step(
     outcomes: dict[int, PendingOutput],
     *,
     state: BatchState,
-    kv_cache: CacheManager | None,
+    kv_cache: KVCacheManager | None,
     latent_pool: LatentPool,
     request_tables: BlockTables | None,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
     tokenizer: PreTrainedTokenizerBase | None,
 ) -> dict[int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]]:
     """Prepare one solver step and materialize any missing CFG prefixes."""
-    from . import flow, token
+    from uniserve_worker.execution import diffusion, token
 
     step_inputs: dict[
         int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]
@@ -287,8 +282,8 @@ def prepare_diffusion_step(
             continue
 
         row = state.pending_output(call.request_key.request_id)
-        params = row.input_latent_params
-        staging = row.latent_staging
+        params = row.latent.input_params
+        staging = row.latent.staging
         if params is None or staging is None:
             raise invalid_descriptor(
                 "trajectory call has no staged latent inputs"
@@ -296,7 +291,7 @@ def prepare_diffusion_step(
         if offset >= int(params.step_count):
             continue
 
-        guide, timestep, next_timestep, prefix_rows = flow.prepare_step(
+        guide, timestep, next_timestep, prefix_rows = diffusion.prepare_step(
             call,
             trajectory,
             int(params.start_step) + offset,
@@ -367,11 +362,11 @@ def prepare_forward_rows(
     tensor_store: TensorStore,
     latent_pool: LatentPool | None,
     request_tables: BlockTables | None,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
     decode_state: DecodeState | None,
 ) -> tuple[list[tuple[int, InputRow]], dict[int, PreparedImage]]:
     """Build homogeneous numerical rows for the current dependency frontier."""
-    from . import encode, flow, token
+    from uniserve_worker.execution import diffusion, image, token
 
     forward: list[tuple[int, InputRow]] = []
     images: dict[int, PreparedImage] = {}
@@ -386,15 +381,15 @@ def prepare_forward_rows(
                 continue
             guide, timestep, _next_timestep = step_inputs[index]
             row = state.pending_output(call.request_key.request_id)
-            params = row.input_latent_params
-            staging = row.latent_staging
+            params = row.latent.input_params
+            staging = row.latent.staging
             if params is None or staging is None:
                 raise invalid_descriptor(
                     "trajectory call has no staged latent inputs"
                 )
 
-            rows = flow.flow_rows(
-                flow.require_inputs(model_runner),
+            rows = diffusion.flow_rows(
+                diffusion.require_inputs(model_runner),
                 trajectories[index],
                 staging.value[: int(params.latent_units)],
                 guide,
@@ -425,7 +420,7 @@ def prepare_forward_rows(
             MediaCall.VISION_ENCODING,
             MediaCall.LATENT_ENCODING,
         }:
-            prepared = encode.prepare_features(
+            prepared = image.prepare_features(
                 call,
                 tensor_store=tensor_store,
                 model_runner=model_runner,
@@ -435,11 +430,11 @@ def prepare_forward_rows(
             forward.append(
                 (
                     index,
-                    encode.encode_row(cast(MediaCall, call.kind), prepared),
+                    image.encode_row(cast(MediaCall, call.kind), prepared),
                 )
             )
         elif call.latent_input is None:
-            outcomes[index] = encode.diffusion_finalize_frames(
+            outcomes[index] = image.diffusion_finalize_frames(
                 call,
                 tensor_store=tensor_store,
                 model_runner=model_runner,
@@ -448,15 +443,15 @@ def prepare_forward_rows(
         else:
             if latent_pool is None:
                 raise RuntimeError("image decoding requires a latent pool")
-            latent = encode.materialization_latent(
+            latent = image.materialization_latent(
                 call,
                 latent_pool=latent_pool,
                 model_runner=model_runner,
                 state=state,
             )
             row = state.pending_output(call.request_key.request_id)
-            params = row.input_latent_params
-            staging = row.latent_staging
+            params = row.latent.input_params
+            staging = row.latent.staging
             if params is None or staging is None:
                 raise invalid_descriptor(
                     "trajectory call has no staged latent inputs"
@@ -493,13 +488,13 @@ def publish_forward_values(
     worker_info: WorkerInfo,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
     config: WorkerConfig,
 ) -> dict[int, list[torch.Tensor]]:
     """Publish completed numerical values and retain diffusion predictions."""
-    from . import encode, token
+    from uniserve_worker.execution import image, token
 
     predictions: dict[int, list[torch.Tensor]] = defaultdict(list)
     samples: list[SampleCandidate] = []
@@ -541,7 +536,7 @@ def publish_forward_values(
                 else:
                     samples.append((index, task, value, selection, None))
         elif index in images:
-            outcomes[index] = encode.publish_features(
+            outcomes[index] = image.publish_features(
                 call,
                 images[index],
                 value,
@@ -556,7 +551,7 @@ def publish_forward_values(
                 raise ValueError(
                     "image decoder must declare its numerical range"
                 )
-            outcomes[index] = encode.publish_image(
+            outcomes[index] = image.publish_image(
                 call,
                 value.detach(),
                 layout.value_range,
@@ -593,14 +588,14 @@ def integrate_predictions(
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
     config: WorkerConfig,
 ) -> None:
     """Advance diffusion solvers and publish trajectories at their final.
 
     step.
     """
-    from . import flow
+    from uniserve_worker.execution import diffusion
 
     for index, values in predictions.items():
         call = scheduled[index]
@@ -609,8 +604,8 @@ def integrate_predictions(
 
         guide, timestep, next_timestep = step_inputs[index]
         row = state.pending_output(call.request_key.request_id)
-        params = row.input_latent_params
-        staging = row.latent_staging
+        params = row.latent.input_params
+        staging = row.latent.staging
         if params is None or staging is None:
             raise invalid_descriptor(
                 "trajectory call has no staged latent inputs"
@@ -618,8 +613,8 @@ def integrate_predictions(
 
         # The solver updates only the model-visible portion of this
         # call's staging, preserving page padding.
-        flow.integrate(
-            flow.require_inputs(model_runner),
+        diffusion.integrate(
+            diffusion.require_inputs(model_runner),
             trajectories[index],
             staging.value[: int(params.latent_units)],
             tuple(values),
@@ -628,7 +623,7 @@ def integrate_predictions(
             next_timestep,
         )
         if offset + 1 == int(params.step_count):
-            outcomes[index] = flow.finish(
+            outcomes[index] = diffusion.finish(
                 call,
                 trajectories[index],
                 worker_info=worker_info,

@@ -24,25 +24,25 @@ else:
 _NUMPY_DTYPES = {torch.int32: "int32", torch.int64: "int64"}
 
 
-def device_memory_budget(
+def device_storage_budget(
     device: torch.device | str, fraction: float
 ) -> tuple[int, int]:
     """Return this process's pool grant and the device's total free bytes.
 
     The configured fraction is a per-process device share. This distinction
     matters when independent WorkerGroups share a GPU: each process may size
-    its own pool up to its share, while the physical free-memory bound keeps
+    its own pool up to its share, while the physical free-storage bound keeps
     their aggregate allocations honest.
 
     Empty cached allocations before measuring so ``memory_reserved`` describes
     live tensors and runtime allocations owned by this process. CUDA-library
     allocations that PyTorch does not track remain covered by the physical
-    free-memory bound.
+    free-storage bound.
     """
     target = canonical_device(device)
     if target.type != "cuda" or not 0 < fraction <= 1:
         raise ValueError(
-            "device memory sizing requires CUDA and a fraction in (0, 1]"
+            "device storage sizing requires CUDA and a fraction in (0, 1]"
         )
 
     torch.cuda.synchronize(target)

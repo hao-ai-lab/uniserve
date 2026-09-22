@@ -29,7 +29,7 @@ The installation builds the `uniserve` binary and the native worker IPC extensio
 
 The three Python packages are installed together. The [Python library guide](docs/python-library.md) shows checkpoint resolution, typed model configuration, explicit loading and direct tensor calls. Its runnable examples produce text logits and reconstruct H3 video through the public computation interfaces.
 
-The `gpu` extra includes FlashAttention-4 and the native `uniserve-kernel` package for CUDA IPC and peer-memory mappings. Install the source workspace with `uv sync --extra gpu`; building these mappings requires a CUDA toolkit compatible with PyTorch, a C++ compiler, and Ninja.
+The `gpu` extra includes FlashAttention-4 and the native `uniserve-kernel` package for CUDA IPC and peer-storage mappings. Install the source workspace with `uv sync --extra gpu`; building these mappings requires a CUDA toolkit compatible with PyTorch, a C++ compiler, and Ninja.
 
 ## Start a server
 
@@ -149,7 +149,7 @@ For text-to-video-and-audio generation with the FastH3 checkpoints, including th
 
 ## Development and verification
 
-The [Worker lifecycle](docs/worker-lifecycle.md) documents Python startup, IPC ownership, synchronous serving, and direct execution.
+The [Worker lifecycle](docs/worker-lifecycle.md) documents Python startup, IPC ownership, synchronous serving, and direct execution through `Worker.submit`, `advance` and `poll`. Submission returns an immutable handle; the shared Executor owns execution state, and Service owns IPC delivery.
 
 The `justfile` exposes the canonical repository checks:
 
@@ -186,7 +186,13 @@ crates/server/                           Model profiles, serving funnel, OpenAI 
 crates/bin/uniserve/                     `serve` and `engine` CLI entrypoints
 uniserve/                                 Numerical layers, loading, and resource binding
 uniserve_models/                          Concrete models, typed configs, and checkpoint catalog
-uniserve_worker/                          Serving execution, batching, and resource ownership
+uniserve_worker/                          Worker lifecycle and rank-local execution
+  protocol/                              Validated batches, calls, WorkerInfo, and IPC envelopes
+  execution/                             Submission, request progress, publication, and retirement
+  model_executor/                        Capability runners, numerical inputs, and CUDA graphs
+  sampling/                              Sampling metadata, execution, and numerical results
+  storage/                               KV, latent, tensor, request-slot, and output backing
+  transport/                             Local, SHM, CUDA VMM, and channel transfers
 uniserve_eval/                            Serving evaluator
 specs/                                    Builder-facing implementation notes
 docs/fast_h3/                             FastH3 deployment cheat sheet and container files

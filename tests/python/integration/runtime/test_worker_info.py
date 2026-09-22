@@ -9,8 +9,8 @@ import pytest
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_config import stub_worker_config
 from uniserve_models.stub import Model, image_processor
-from uniserve_worker.bootstrap.worker_info_builder import build_worker_layout
-from uniserve_worker.config import LaneConfig, WorkerConfig
+from uniserve_worker.bootstrap.report import build_worker_layout
+from uniserve_worker.config.execution import LaneConfig, WorkerConfig
 from uniserve_worker.protocol.call import CALL_KINDS, ForwardMode
 from uniserve_worker.worker import Worker
 
@@ -63,7 +63,7 @@ def test_loaded_worker_identity_distinguishes_incarnations_in_one_process() -> (
                 prefill_cuda_graph=False,
                 flow_graph_batch_sizes=(1,),
                 flow_graph_shapes=((16, 16),),
-                pool_memory_bytes=grant,
+                pool_storage_bytes=grant,
             ),
         )
         try:

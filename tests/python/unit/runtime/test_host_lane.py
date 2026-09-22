@@ -7,9 +7,9 @@ import pytest
 import torch
 
 from uniserve.runtime import EventPool
-from uniserve_worker.execution.output import OutputPool
-from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.runtime.host_lane import HostLane
+from uniserve_worker.errors import WorkerError
+from uniserve_worker.execution.host import HostLane
+from uniserve_worker.storage.output import OutputPool
 
 
 def test_submitted_task_retains_capacity_until_actual_completion() -> None:

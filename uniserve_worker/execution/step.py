@@ -8,17 +8,18 @@ import traceback
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
-from uniserve_worker.execution import calls
-from uniserve_worker.execution.batch_state import BatchState
-from uniserve_worker.execution.commit import commit_batch, discard_batch
-from uniserve_worker.execution.prepare import reserve_outputs
-from uniserve_worker.foundation.errors import (
+from uniserve_worker.errors import (
     WorkerError,
     WorkerErrorCode,
     classify,
     invalid_descriptor,
     should_capture_trace,
 )
+from uniserve_worker.execution import calls
+from uniserve_worker.execution.batch import BatchState
+from uniserve_worker.execution.commit import commit_batch, discard_batch
+from uniserve_worker.execution.prepare import reserve_outputs
+from uniserve_worker.execution.schedule import dispatch_batch
 from uniserve_worker.profiling import _forward_stats
 from uniserve_worker.protocol.call import CallStatus, ErrorCode
 from uniserve_worker.protocol.output import (
@@ -29,25 +30,23 @@ from uniserve_worker.protocol.output import (
 )
 from uniserve_worker.protocol.tensor import DType
 
-from .schedule import dispatch_batch
-
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
     from uniserve.distributed.mesh import Communicator
-    from uniserve_worker.bootstrap.worker_info import WorkerInfo
-    from uniserve_worker.config import WorkerConfig
-    from uniserve_worker.execution.model_runner import ModelRunner
-    from uniserve_worker.execution.output import OutputPool
+    from uniserve_worker.config.execution import WorkerConfig
+    from uniserve_worker.execution.host import HostLane
+    from uniserve_worker.execution.model_executor import ModelExecutor
+    from uniserve_worker.execution.request import RequestPool
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.runtime.block_tables import BlockTables
-    from uniserve_worker.runtime.cache_manager import CacheManager
-    from uniserve_worker.runtime.decode_state import DecodeState
-    from uniserve_worker.runtime.host_lane import HostLane
-    from uniserve_worker.runtime.latent_pool import LatentPool
-    from uniserve_worker.runtime.request import RequestPool
-    from uniserve_worker.runtime.tensor_store import TensorStore
-    from uniserve_worker.transfer.tickets import Transport
+    from uniserve_worker.protocol.worker_info import WorkerInfo
+    from uniserve_worker.storage.block_tables import BlockTables
+    from uniserve_worker.storage.decode_state import DecodeState
+    from uniserve_worker.storage.kv_cache import KVCacheManager
+    from uniserve_worker.storage.latent_pool import LatentPool
+    from uniserve_worker.storage.output import OutputPool
+    from uniserve_worker.storage.tensor_store import TensorStore
+    from uniserve_worker.transport.interface import Transport
 
 
 logger = logging.getLogger(__name__)
@@ -71,7 +70,7 @@ def execute_batch(
     state: BatchState,
     *,
     propagate_errors: bool = False,
-    kv_cache: CacheManager | None,
+    kv_cache: KVCacheManager | None,
     host_tasks: HostLane,
     tensor_store: TensorStore,
     worker_info: WorkerInfo,
@@ -81,7 +80,7 @@ def execute_batch(
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
     tokenizer: PreTrainedTokenizerBase | None,

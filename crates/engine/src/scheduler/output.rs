@@ -426,7 +426,8 @@ impl Scheduler {
                     .expect("prefill request remains active");
                 let key = RequestKey::new(self.engine_id, id, state.request_epoch);
                 let worker = self
-                    .worker_affinity
+                    .placement
+                    .affinity
                     .get(&(key, DEFAULT_COMPONENT.to_owned()))
                     .expect("prefill has a bound model component");
                 let source = Arc::new(
@@ -441,7 +442,11 @@ impl Scheduler {
                         .clone(),
                 );
                 if let Some(st) = self.running.get_mut(&id) {
-                    let kv = self.cache.as_ref().expect("generation has a KV cache");
+                    let kv = self
+                        .storage
+                        .cache
+                        .as_ref()
+                        .expect("generation has a KV cache");
                     cache_prompt_blocks(&kv.coordinator, st, &kv.block_pool, &source);
                 }
 
@@ -644,14 +649,16 @@ impl Scheduler {
                         // Cache ownership transfers the backing allocation out of the
                         // request; uncached products remain request-local transients.
                         let selected_product = if let Some(cache_key) = encoder_cache_key {
-                            if let Some(freed) =
-                                self.encoder_cache.insert(cache_key, feature.clone())
+                            if let Some(freed) = self
+                                .storage
+                                .encoder_cache
+                                .insert(cache_key, feature.clone())
                             {
                                 free_products.push(freed);
                             }
 
-                            let stored =
-                                self.encoder_cache.peek_product(cache_key) == Some(feature.clone());
+                            let stored = self.storage.encoder_cache.peek_product(cache_key)
+                                == Some(feature.clone());
 
                             if stored {
                                 let allocation = self.running.get_mut(&id).and_then(|state| {
@@ -660,19 +667,24 @@ impl Scheduler {
                                 let Some(allocation) = allocation else {
                                     return self.finish(id, FinishReason::Error);
                                 };
-                                if let Err(allocation) =
-                                    self.retain_encoder_buffer(feature.buffer_id(), allocation)
+                                if let Err(allocation) = self
+                                    .storage
+                                    .retain_encoder_buffer(feature.buffer_id(), allocation)
                                 {
-                                    self.pending_buffer_frees
+                                    self.storage
+                                        .pending_buffer_frees
                                         .insert(feature.buffer_id(), allocation);
-                                    self.pending_commands.push_back(BatchCommand::Free {
-                                        buffer: feature.buffer_id(),
-                                    });
+                                    self.inflight
+                                        .pending_commands
+                                        .push_back(BatchCommand::Free {
+                                            buffer: feature.buffer_id(),
+                                        });
                                     return self.finish(id, FinishReason::Error);
                                 }
                             }
 
-                            let Some(product) = self.encoder_cache.acquire(cache_key) else {
+                            let Some(product) = self.storage.encoder_cache.acquire(cache_key)
+                            else {
                                 return self.finish(id, FinishReason::Error);
                             };
                             if let Some(st) = self.running.get_mut(&id) {
@@ -811,7 +823,7 @@ impl Scheduler {
     /// Begins the image.
     pub(super) fn begin_image(&mut self, id: RequestId) {
         self.record_gen_trigger_for_replay(id);
-        let has_unresolved_descendants = self.has_pending_calls(id);
+        let has_unresolved_descendants = self.inflight.has_pending_calls(id);
         if let Some(st) = self.running.get_mut(&id) {
             st.speculative_chain_invalidated |= has_unresolved_descendants;
 
@@ -988,12 +1000,14 @@ impl Scheduler {
                 .running
                 .get(&id)
                 .is_some_and(|state| !state.output.decoder_boundaries.is_empty());
-        if !self.has_pending_calls(id) && !decoder_pending {
+        if !self.inflight.has_pending_calls(id) && !decoder_pending {
             self.finish_with(id, reason, stop_reason);
             return;
         }
-        if !self.pending_finishes.contains_key(&id) || matches!(reason, FinishReason::Error) {
-            self.pending_finishes.insert(
+        if !self.inflight.pending_finishes.contains_key(&id)
+            || matches!(reason, FinishReason::Error)
+        {
+            self.inflight.pending_finishes.insert(
                 id,
                 PendingFinish {
                     reason,
@@ -1005,7 +1019,7 @@ impl Scheduler {
 
     /// Applies a deferred finish once no in-flight work or decoder decision remains.
     pub(super) fn finish_pending_if_idle(&mut self, id: RequestId) {
-        if self.has_pending_calls(id)
+        if self.inflight.has_pending_calls(id)
             || self
                 .running
                 .get(&id)
@@ -1013,7 +1027,7 @@ impl Scheduler {
         {
             return;
         }
-        if let Some(pending) = self.pending_finishes.remove(&id) {
+        if let Some(pending) = self.inflight.pending_finishes.remove(&id) {
             self.finish_with(id, pending.reason, pending.stop_reason);
         }
     }
@@ -1025,7 +1039,7 @@ impl Scheduler {
         reason: FinishReason,
         stop_reason: Option<uniserve_core::StopReason>,
     ) {
-        self.pending_finishes.remove(&id);
+        self.inflight.pending_finishes.remove(&id);
 
         // Report accepted request progress before error teardown removes it.
         if reason == FinishReason::Error
@@ -1052,12 +1066,12 @@ impl Scheduler {
         if let Some(mut st) = self.running.remove(&id) {
             let request_key = RequestKey::new(self.engine_id, id, st.request_epoch);
             if st.worker_registered {
-                let retained_buffers = self.retained_buffers(request_key);
+                let retained_buffers = self.storage.retained_buffers(request_key);
                 let command = BatchCommand::Finish {
                     request_key,
                     retained_buffers,
                 };
-                self.pending_commands.push_back(command);
+                self.inflight.pending_commands.push_back(command);
                 let mut allocation = st.allocations.take().expect("admitted allocations");
                 let buffers = std::mem::take(&mut allocation.buffers);
                 let allocations = st
@@ -1085,11 +1099,13 @@ impl Scheduler {
             // Remove admission reservations before exposing terminal output so
             // the next scheduler step observes the released capacity.
             self.running_order.retain(|request| *request != id);
-            self.reserved_encoder_entries = self
+            self.storage.reserved_encoder_entries = self
+                .storage
                 .reserved_encoder_entries
                 .saturating_sub(st.req.num_encoder_cache_entries());
             if st.reserve_worstcase {
-                self.reserved_blocks = self
+                self.storage.reserved_blocks = self
+                    .storage
                     .reserved_blocks
                     .saturating_sub(st.max_reserved_kv_blocks);
             }
@@ -1098,7 +1114,7 @@ impl Scheduler {
             // physically reclaimable by their owning worker.
             let mut free_encoder_products = std::mem::take(&mut st.transient_encoder_products);
             for pin in &st.encoder_cache_pins {
-                if let Some(product) = self.encoder_cache.release(pin.key, &pin.product) {
+                if let Some(product) = self.storage.encoder_cache.release(pin.key, &pin.product) {
                     free_encoder_products.push(product);
                 }
             }
@@ -1127,10 +1143,10 @@ impl Scheduler {
         // allocations can return to the scheduler immediately.
         if !awaits_close {
             if let Some(prefix) = flow_prefix {
-                prefix.allocations.free(self);
+                prefix.allocations.free(&mut self.storage);
             }
             if let Some(allocations) = allocations {
-                allocations.free(self);
+                allocations.free(&mut self.storage);
             }
         }
     }

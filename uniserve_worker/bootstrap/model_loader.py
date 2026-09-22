@@ -33,15 +33,20 @@ from uniserve.processing import (
 )
 from uniserve.quantization import QuantizationConfig, Quantizer
 from uniserve_models import loading as models
-
-from ..config import WorkerConfig
-from ..execution.component_binding import Call, ComponentBinding
-from ..foundation.errors import unsupported_setup
-from .components import (
+from uniserve_worker.bootstrap.components import (
     is_host_component,
     validate_components,
 )
-from .config import ComponentConfig, WorkerProcessArgs
+from uniserve_worker.config.deployment import (
+    ComponentConfig,
+    WorkerProcessArgs,
+)
+from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.errors import unsupported_setup
+from uniserve_worker.model_executor.component_binding import (
+    Call,
+    ComponentBinding,
+)
 
 logger = logging.getLogger(__name__)
 

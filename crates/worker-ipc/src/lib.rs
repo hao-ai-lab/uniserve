@@ -1,4 +1,4 @@
-//! Versioned scheduler-to-worker protocol and shared-memory transport.
+//! Versioned scheduler-to-worker protocol and shared-storage transport.
 //!
 //! [`NewRequest`] admits static state, [`Batch`] submits planned calls, and
 //! [`BatchOutput`] returns completions and products. [`WorkerInfo`] describes a
@@ -64,7 +64,7 @@ macro_rules! ensure_valid {
     };
 }
 
-/// Shared-memory request-response endpoints and wake events.
+/// Shared-storage request-response endpoints and wake events.
 pub mod channel;
 /// FlatBuffers encoding and decoding for protocol messages.
 pub mod codec;
@@ -77,7 +77,7 @@ pub mod schema {
 }
 
 pub use channel::{
-    Outstanding, RankChannel, RankServer, SHARED_MEMORY_CHANNEL, SOCKET_CHANNEL, Wake,
+    Outstanding, RankChannel, RankServer, SHARED_STORAGE_CHANNEL, SOCKET_CHANNEL, Wake,
 };
 pub use iceoryx::{
     ClientEndpoint, DEFAULT_SERVICE_PREFIX, EVT_COMPLETION, EVT_DEATH, EVT_REQUEST, EVT_RESULT,

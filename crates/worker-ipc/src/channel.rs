@@ -1,6 +1,6 @@
 //! The engine's end of one rank's channel, over either transport.
 //!
-//! A rank on the head's host offers a shared-memory service; a rank elsewhere
+//! A rank on the head's host offers a shared-storage service; a rank elsewhere
 //! offers a socket. The engine addresses both the same way: it sends a request
 //! under an identity and takes the response that carries it back. Which
 //! mechanism a rank offers is data the rank reports at registration, so the
@@ -16,19 +16,19 @@ use crate::request::WorkerRequest;
 use crate::socket::{SocketClient, SocketServer};
 
 /// The mechanism a rank names for its channel at registration.
-pub const SHARED_MEMORY_CHANNEL: &str = "iceoryx2";
+pub const SHARED_STORAGE_CHANNEL: &str = "iceoryx2";
 /// The mechanism a rank off the head's host names for its channel.
 pub const SOCKET_CHANNEL: &str = "tcp";
 
 /// A wake this engine can fire, whichever transport raised the need for it.
 ///
 /// A command and a worker death are raised by threads inside the engine, so
-/// neither travels between processes. A shared-memory channel already owns a
+/// neither travels between processes. A shared-storage channel already owns a
 /// notifier for them; a socket channel raises them on a local descriptor the
 /// engine polls beside the socket.
 #[derive(Clone)]
 pub enum Wake {
-    /// Fires the shared-memory channel's notifier.
+    /// Fires the shared-storage channel's notifier.
     Shared(WakeSender),
     /// Fires a local descriptor this process polls.
     Local(Arc<dyn Fn() + Send + Sync>),
@@ -46,7 +46,7 @@ impl Wake {
 
 /// One request the engine has sent and not yet matched to a response.
 pub enum Outstanding {
-    /// A retained shared-memory request handle.
+    /// A retained shared-storage request handle.
     Shared(Pending),
     /// The identity a socket response will carry.
     Socket(u64),
@@ -54,7 +54,7 @@ pub enum Outstanding {
 
 /// The engine's end of one rank's channel.
 pub enum RankChannel {
-    /// A rank on the head's host, reached through shared memory.
+    /// A rank on the head's host, reached through shared storage.
     Shared(Box<ClientEndpoint>),
     /// A rank elsewhere, reached over a stream socket.
     Socket(Box<SocketClient>),
@@ -70,7 +70,7 @@ impl RankChannel {
         timeout: Duration,
     ) -> IpcResult<Self> {
         match transport {
-            SHARED_MEMORY_CHANNEL => Ok(Self::Shared(Box::new(ClientEndpoint::connect(
+            SHARED_STORAGE_CHANNEL => Ok(Self::Shared(Box::new(ClientEndpoint::connect(
                 endpoint,
                 max_payload,
                 depth,
@@ -139,7 +139,7 @@ impl RankChannel {
 
     /// Reports whether the rank's end of the channel is connected.
     ///
-    /// A shared-memory request is loaned before a server exists to take it, so
+    /// A shared-storage request is loaned before a server exists to take it, so
     /// the engine asks the handle. A socket request could not have been sent
     /// without a connection, so there is nothing further to ask.
     pub fn is_connected(&self, pending: &Outstanding) -> bool {
@@ -167,7 +167,7 @@ impl RankChannel {
 
     /// Returns the descriptors the engine polls for this rank's progress.
     ///
-    /// A shared-memory channel multiplexes every wake onto one listener. A
+    /// A shared-storage channel multiplexes every wake onto one listener. A
     /// socket carries only the result wake, so the local descriptor its
     /// command and death wakes fire on is polled beside it.
     pub fn progress_fds(&self) -> Vec<libc::pollfd> {
@@ -184,12 +184,12 @@ impl RankChannel {
 
 /// A rank's end of its channel, over either transport.
 ///
-/// A rank on the head's host serves a shared-memory endpoint; a rank elsewhere
+/// A rank on the head's host serves a shared-storage endpoint; a rank elsewhere
 /// serves a socket. The head states which mechanism the placement calls for and
 /// the rank names the endpoint, so the rank creates whichever one it was told
 /// to offer and reports the name it chose.
 pub enum RankServer {
-    /// A shared-memory endpoint on the head's host.
+    /// A shared-storage endpoint on the head's host.
     Shared(Box<ServerEndpoint>),
     /// A socket endpoint reachable from another host.
     Socket(Box<SocketServer>),
@@ -198,7 +198,7 @@ pub enum RankServer {
 impl RankServer {
     /// Creates the endpoint this rank will report.
     ///
-    /// `name` is the service name for a shared-memory endpoint and the address
+    /// `name` is the service name for a shared-storage endpoint and the address
     /// to bind for a socket, which is the one value whose meaning differs
     /// between the mechanisms.
     pub fn bind(
@@ -208,7 +208,7 @@ impl RankServer {
         max_inflight: usize,
     ) -> IpcResult<Self> {
         match transport {
-            SHARED_MEMORY_CHANNEL => Ok(Self::Shared(Box::new(ServerEndpoint::bind(
+            SHARED_STORAGE_CHANNEL => Ok(Self::Shared(Box::new(ServerEndpoint::bind(
                 name,
                 max_payload,
                 max_inflight,
@@ -235,7 +235,7 @@ impl RankServer {
     /// Returns the mechanism the rank reports alongside its endpoint.
     pub fn transport(&self) -> &'static str {
         match self {
-            Self::Shared(_) => SHARED_MEMORY_CHANNEL,
+            Self::Shared(_) => SHARED_STORAGE_CHANNEL,
             Self::Socket(_) => SOCKET_CHANNEL,
         }
     }

@@ -407,7 +407,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             ranks: args.ranks.clone(),
             components: args.components.clone(),
             queue_depth: args.queue_depth,
-            memory_fraction: None,
+            storage_fraction: None,
         }])?;
         args.transfer = transfer.clone();
         let mut executor = WorkerExecutor::try_new(
@@ -2241,7 +2241,7 @@ impl Drop for PausedProcess {
     }
 }
 
-/// An external shared-memory publisher the test controls.
+/// An external shared-storage publisher the test controls.
 ///
 /// The segment carries what a consumer needs in its header: the digest of the
 /// locator that names it, and a readiness word the test writes after the
@@ -2253,7 +2253,7 @@ struct SlowShmPublication {
     published: Arc<AtomicBool>,
 }
 
-/// Byte layout of a shared-memory publication's header, as the worker's
+/// Byte layout of a shared-storage publication's header, as the worker's
 /// `transfer.segment` module lays it out.
 const SEGMENT_HEADER_BYTES: u64 = 512;
 const SEGMENT_STATE_OFFSET: u64 = 32;
