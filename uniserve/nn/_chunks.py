@@ -17,12 +17,19 @@ from . import _binding, functional
 def tensor_statistics(quantizer: Quantizer | None) -> bool:
     """Return whether encoding derives scales from whole-tensor statistics.
 
-    nvfp4 and per-tensor FP8 scales span every source value, so encoded
-    transport must wait for the complete input before quantization.
+    Dynamic NVFP4 and per-tensor FP8 scales span every source value, so
+    encoded transport must wait for the complete input before quantization.
+    A calibrated NVFP4 scale is already fixed by its checkpoint and can
+    preserve that domain while encoding bounded row intervals.
     """
-    return quantizer is not None and (
-        quantizer.format == "nvfp4"
-        or (quantizer.format == "fp8" and quantizer.axis is None)
+    return quantizer is not None and quantizer.requires_complete_source
+
+
+def _projection_chunk_rows(width: int, dtype: torch.dtype) -> int:
+    """Bound one projected source interval to an aligned 64 MiB payload."""
+    return max(
+        128,
+        (64 * 1024 * 1024 // (width * dtype.itemsize) // 128) * 128,
     )
 
 
@@ -226,7 +233,16 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
         for interval, value in chunks:
             _check_chunk(interval, value, cursor, token_slice.stop, width)
             cursor = interval.stop
-            yield interval, value
+            # A singleton group has no transport to impose payload bounds.
+            # Preserve the same bound locally so calibrated block-scaled
+            # projections do not materialize full-sequence MLP intermediates.
+            chunk_rows = _projection_chunk_rows(width, value.dtype)
+            for start in range(0, value.shape[0], chunk_rows):
+                stop = min(value.shape[0], start + chunk_rows)
+                yield (
+                    slice(interval.start + start, interval.start + stop),
+                    value[start:stop],
+                )
         if cursor != token_slice.stop:
             raise ValueError(
                 "projection chunks must cover their complete token shard"
@@ -256,9 +272,7 @@ def _stream_inputs(module, chunks, token_slice, num_tokens):
         # Use the same payload bound as complete-input row gathers. Producer
         # intervals need not force smaller GEMMs or additional peer
         # publications.
-        chunk_rows = max(
-            128, (64 * 1024 * 1024 // (width * dtype.itemsize) // 128) * 128
-        )
+        chunk_rows = _projection_chunk_rows(width, dtype)
         backend_rank = group._backend_order.index(group.rank)
         pending = []
         staged = cursor = 0

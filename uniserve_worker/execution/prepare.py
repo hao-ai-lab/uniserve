@@ -54,6 +54,7 @@ from uniserve_worker.protocol.transfer import (
     DeviceProductTransferValue,
     EncoderTransferValue,
     LatentTransferValue,
+    PosixShmTransfer,
 )
 from uniserve_worker.runtime.latent_pool import LatentImport
 from uniserve_worker.runtime.tensor_store import (
@@ -263,14 +264,31 @@ def prepare_inputs(
             "cross-call input requires a configured transport"
         )
 
-    # A video encode reads its media units in place from the segments the
-    # decoding ranks on this host published, so they are borrowed at
-    # execution, not imported.
-    borrowed = {
+    # A video encode borrows a local decoder's shared-memory segment in place.
+    # A decoder on another host publishes through the rank channel instead;
+    # that value must follow the ordinary import path so execution can stage a
+    # local codec input. Select from the physical publication rather than the
+    # GPU model or node name so the same path applies to every placement.
+    borrowed_candidates = {
         product.buffer_id
         for call in batch.calls
         if call.kind in BORROWED_INPUT_CALLS
         for product in call.inputs
+    }
+    shm = transports.get("shm")
+    borrowed = {
+        entry.product.buffer_id
+        for entry in entries
+        if entry.product.buffer_id in borrowed_candidates
+        and isinstance(
+            entry.value, (DeviceProductTransferValue, EncoderTransferValue)
+        )
+        and any(
+            isinstance(location.transport, PosixShmTransfer)
+            and shm is not None
+            and location.source.node == shm.source.node
+            for location in entry.value.tensor.locations
+        )
     }
     state.borrowed_inputs.update(borrowed)
     try:
@@ -426,6 +444,11 @@ def prepare_inputs(
                         ]
                         for location in value.tensor.locations
                         if location.backend in transports
+                        and (
+                            location.backend != "shm"
+                            or location.source.node
+                            == transports[location.backend].source.node
+                        )
                     },
                     metadata=(
                         FeatureMetadata(height=value.height, width=value.width)
@@ -1061,12 +1084,20 @@ def validate_batch(
 
     and call support before staging.
     """
-    if any(
-        params.offset + params.bytes > worker_info.buffer_pool_bytes
-        for params in batch.buffer_allocations
-    ):
+    invalid_buffer = next(
+        (
+            params
+            for params in batch.buffer_allocations
+            if params.offset + params.bytes > worker_info.buffer_pool_bytes
+        ),
+        None,
+    )
+    if invalid_buffer is not None:
         raise invalid_descriptor(
-            "batch buffer params exceeds the worker buffer pool"
+            "batch buffer params exceeds the worker buffer pool: "
+            f"offset={invalid_buffer.offset}, bytes={invalid_buffer.bytes}, "
+            f"capacity={worker_info.buffer_pool_bytes}, "
+            f"buffer={invalid_buffer.buffer}"
         )
 
     if worker_info.components:

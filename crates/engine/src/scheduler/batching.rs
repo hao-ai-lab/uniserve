@@ -885,6 +885,7 @@ impl Scheduler {
             call,
             RequestPlacement {
                 worker,
+                request_pool_idx: None,
                 block_tables: call_block_tables,
                 new_cache_pages: call_new_cache_pages,
                 forward: call_forward,

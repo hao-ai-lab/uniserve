@@ -852,6 +852,423 @@ videos_per_second = "higher"
 [suites.fast_h3_saturation]
 points = ["minimax-h3-saturation-c1", "minimax-h3-saturation-c10"]
 
+# The existing eight-way Ulysses placement is the latency-oriented control:
+# two resident requests share one collective denoiser. The DP placements use
+# eight complete NVFP4 denoiser replicas with one sticky request per replica.
+# Every point uses the same model, shape, seeds, offered load, and device set.
+# The suite runs its servers serially.
+[servers.fasth3-ulysses8]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "config/minimax-h3-eight-devices-single-node.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "5", "--video-graph-shapes", "5x1000", "--mem-fraction-static", "${UNISERVE_H3_ULYSSES_MEM_FRACTION:-0.93}", "--dtype", "bfloat16"]
+
+[servers.fasth3-ulysses8.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[servers.fasth3-dp8-text-tp8]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "config/minimax-h3-dp8-text-tp8.json", "--max-batch", "8", "--max-running-requests", "8", "--max-num-batched-tokens", "8", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "5", "--video-graph-shapes", "5x1000", "--dtype", "bfloat16"]
+
+[servers.fasth3-dp8-text-tp8.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[servers.fasth3-dp8-text-tp4x2]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "config/minimax-h3-dp8-text-tp4x2.json", "--max-batch", "8", "--max-running-requests", "8", "--max-num-batched-tokens", "8", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "5", "--video-graph-shapes", "5x1000", "--dtype", "bfloat16"]
+
+[servers.fasth3-dp8-text-tp4x2.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[servers.fasth3-ulysses4-pareto]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "config/minimax-h3-four-devices.json", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "5", "--video-graph-shapes", "5x1000", "--mem-fraction-static", "${UNISERVE_H3_ULYSSES_MEM_FRACTION:-0.70}", "--dtype", "bfloat16"]
+
+[servers.fasth3-ulysses4-pareto.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[servers.fasth3-dp4-text-tp4]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "config/minimax-h3-dp4-text-tp4.json", "--max-batch", "4", "--max-running-requests", "4", "--max-num-batched-tokens", "4", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "5", "--video-graph-shapes", "5x1000", "--dtype", "bfloat16"]
+
+[servers.fasth3-dp4-text-tp4.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_H3_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
+[benchmarks.fasth3-ulysses8-c8]
+server = "fasth3-ulysses8"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+
+[benchmarks.fasth3-ulysses8-c8.video]
+seconds = 5.0
+prompt_tokens = 1000
+
+[benchmarks.fasth3-ulysses8-c8.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 8
+warmup_requests = 8
+seed = 1000
+
+[benchmarks.fasth3-ulysses8-c8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.fasth3-dp8-text-tp8-c8]
+server = "fasth3-dp8-text-tp8"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+
+[benchmarks.fasth3-dp8-text-tp8-c8.video]
+seconds = 5.0
+prompt_tokens = 1000
+
+[benchmarks.fasth3-dp8-text-tp8-c8.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 8
+warmup_requests = 8
+seed = 1000
+
+[benchmarks.fasth3-dp8-text-tp8-c8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.fasth3-dp8-text-tp4x2-c8]
+server = "fasth3-dp8-text-tp4x2"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+
+[benchmarks.fasth3-dp8-text-tp4x2-c8.video]
+seconds = 5.0
+prompt_tokens = 1000
+
+[benchmarks.fasth3-dp8-text-tp4x2-c8.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 8
+warmup_requests = 8
+seed = 1000
+
+[benchmarks.fasth3-dp8-text-tp4x2-c8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+# Pareto points keep the checkpoint, prompt rows, output duration, graph
+# coverage, and measured sample count fixed while varying only offered
+# concurrency. Warmup is excluded and repeated at every point.
+[benchmarks.pareto-ulysses8-c1]
+server = "fasth3-ulysses8"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+[benchmarks.pareto-ulysses8-c1.video]
+seconds = 5.0
+prompt_tokens = 1000
+[benchmarks.pareto-ulysses8-c1.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 2
+seed = 1000
+[benchmarks.pareto-ulysses8-c1.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.pareto-ulysses8-c2]
+server = "fasth3-ulysses8"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+[benchmarks.pareto-ulysses8-c2.video]
+seconds = 5.0
+prompt_tokens = 1000
+[benchmarks.pareto-ulysses8-c2.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 2
+warmup_requests = 2
+seed = 1000
+[benchmarks.pareto-ulysses8-c2.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.pareto-ulysses8-c4]
+server = "fasth3-ulysses8"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+[benchmarks.pareto-ulysses8-c4.video]
+seconds = 5.0
+prompt_tokens = 1000
+[benchmarks.pareto-ulysses8-c4.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 4
+warmup_requests = 2
+seed = 1000
+[benchmarks.pareto-ulysses8-c4.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.pareto-ulysses8-c8]
+server = "fasth3-ulysses8"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+[benchmarks.pareto-ulysses8-c8.video]
+seconds = 5.0
+prompt_tokens = 1000
+[benchmarks.pareto-ulysses8-c8.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 8
+warmup_requests = 2
+seed = 1000
+[benchmarks.pareto-ulysses8-c8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.pareto-dp8-c1]
+server = "fasth3-dp8-text-tp8"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+[benchmarks.pareto-dp8-c1.video]
+seconds = 5.0
+prompt_tokens = 1000
+[benchmarks.pareto-dp8-c1.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 2
+seed = 1000
+[benchmarks.pareto-dp8-c1.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.pareto-dp8-c2]
+server = "fasth3-dp8-text-tp8"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+[benchmarks.pareto-dp8-c2.video]
+seconds = 5.0
+prompt_tokens = 1000
+[benchmarks.pareto-dp8-c2.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 2
+warmup_requests = 2
+seed = 1000
+[benchmarks.pareto-dp8-c2.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.pareto-dp8-c4]
+server = "fasth3-dp8-text-tp8"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+[benchmarks.pareto-dp8-c4.video]
+seconds = 5.0
+prompt_tokens = 1000
+[benchmarks.pareto-dp8-c4.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 4
+warmup_requests = 2
+seed = 1000
+[benchmarks.pareto-dp8-c4.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.pareto-dp8-c8]
+server = "fasth3-dp8-text-tp8"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+[benchmarks.pareto-dp8-c8.video]
+seconds = 5.0
+prompt_tokens = 1000
+[benchmarks.pareto-dp8-c8.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 8
+warmup_requests = 2
+seed = 1000
+[benchmarks.pareto-dp8-c8.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.pareto-ulysses4-c1]
+server = "fasth3-ulysses4-pareto"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+[benchmarks.pareto-ulysses4-c1.video]
+seconds = 5.0
+prompt_tokens = 1000
+[benchmarks.pareto-ulysses4-c1.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 2
+seed = 1000
+[benchmarks.pareto-ulysses4-c1.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.pareto-ulysses4-c2]
+server = "fasth3-ulysses4-pareto"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+[benchmarks.pareto-ulysses4-c2.video]
+seconds = 5.0
+prompt_tokens = 1000
+[benchmarks.pareto-ulysses4-c2.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 2
+warmup_requests = 2
+seed = 1000
+[benchmarks.pareto-ulysses4-c2.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.pareto-ulysses4-c4]
+server = "fasth3-ulysses4-pareto"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+[benchmarks.pareto-ulysses4-c4.video]
+seconds = 5.0
+prompt_tokens = 1000
+[benchmarks.pareto-ulysses4-c4.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 4
+warmup_requests = 2
+seed = 1000
+[benchmarks.pareto-ulysses4-c4.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.pareto-dp4-c1]
+server = "fasth3-dp4-text-tp4"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+[benchmarks.pareto-dp4-c1.video]
+seconds = 5.0
+prompt_tokens = 1000
+[benchmarks.pareto-dp4-c1.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 2
+seed = 1000
+[benchmarks.pareto-dp4-c1.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.pareto-dp4-c2]
+server = "fasth3-dp4-text-tp4"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+[benchmarks.pareto-dp4-c2.video]
+seconds = 5.0
+prompt_tokens = 1000
+[benchmarks.pareto-dp4-c2.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 2
+warmup_requests = 2
+seed = 1000
+[benchmarks.pareto-dp4-c2.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.pareto-dp4-c4]
+server = "fasth3-dp4-text-tp4"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+tokenizer = "${UNISERVE_H3_NVFP4_4STEP_MODEL:-/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4}/tokenizer"
+[benchmarks.pareto-dp4-c4.video]
+seconds = 5.0
+prompt_tokens = 1000
+[benchmarks.pareto-dp4-c4.load]
+num_prompts = 16
+request_rate = inf
+max_concurrency = 4
+warmup_requests = 2
+seed = 1000
+[benchmarks.pareto-dp4-c4.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[suites.fast_h3_dp8]
+points = ["fasth3-ulysses8-c8", "fasth3-dp8-text-tp8-c8", "fasth3-dp8-text-tp4x2-c8"]
+
+[suites.fast_h3_pareto_ulysses8]
+points = ["pareto-ulysses8-c1", "pareto-ulysses8-c2", "pareto-ulysses8-c4", "pareto-ulysses8-c8"]
+
+[suites.fast_h3_pareto_dp8]
+points = ["pareto-dp8-c1", "pareto-dp8-c2", "pareto-dp8-c4", "pareto-dp8-c8"]
+
+[suites.fast_h3_pareto_ulysses4]
+points = ["pareto-ulysses4-c1", "pareto-ulysses4-c2", "pareto-ulysses4-c4"]
+
+[suites.fast_h3_pareto_dp4]
+points = ["pareto-dp4-c1", "pareto-dp4-c2", "pareto-dp4-c4"]
+
 [suites.decode-runtime]
 points = [
     "qwen-uniserve-sharegpt-r16",
