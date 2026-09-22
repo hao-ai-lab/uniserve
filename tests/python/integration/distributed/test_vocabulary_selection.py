@@ -14,6 +14,7 @@ from uniserve.distributed import DeviceMesh
 from uniserve.model import TextSize, VocabShard
 from uniserve.runtime import (
     CUDAGraph,
+    CUDAStream,
     ExecutionContext,
     initialize_process_groups,
 )
@@ -41,8 +42,11 @@ def _run_vocabulary_selection(rank: int, rendezvous: str) -> None:
             for ranks in ((0, 1), (1, 0))
         )
         current = torch.cuda.current_stream(device)
-        stream = torch.cuda.Stream(device=device)
-        with torch.inference_mode():
+        # Every context below borrows this stream's communicators; the owner
+        # retires them after the last context has closed.
+        owner = CUDAStream.external(torch.cuda.Stream(device=device))
+        stream = owner.stream
+        with owner, torch.inference_mode():
             for mesh in meshes:
                 group = mesh.get_group("tp")
                 for size in (65, 37):
@@ -78,12 +82,12 @@ def _run_vocabulary_selection(rank: int, rendezvous: str) -> None:
                         expected_retained = full[:, :size].clone()
                         continuous.add_(1)
 
-                        # The context owns the stream; this callable has no
-                        # layers or scratch requirements beyond its logits.
+                        # This callable has no layers or scratch requirements
+                        # beyond its logits and its declared communicator.
                         module = nn.Module()
                         module.register_buffer("logits", local)
-                        module.mesh = mesh
-                        with ExecutionContext(module, stream=stream) as context:
+                        module.communication_groups = (group,)
+                        with ExecutionContext(module, stream=owner) as context:
                             context.prepare(
                                 TextSize(num_tokens=6, batch_size=6)
                             )

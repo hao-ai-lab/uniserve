@@ -11,6 +11,8 @@ from uniserve_worker.errors import WorkerError
 from uniserve_worker.execution.host import HostLane
 from uniserve_worker.storage.output import OutputPool
 
+pytestmark = pytest.mark.unit
+
 
 def test_submitted_task_retains_capacity_until_actual_completion() -> None:
     pool = HostLane(max_inflight=1, workers=1)

@@ -89,7 +89,9 @@ def _cache(quantized=False, device="cpu"):
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("device", ("cpu", "cuda"))
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda", marks=pytest.mark.gpu))
+)
 @pytest.mark.parametrize("representation", ("dense", "fp8", "strided"))
 def test_device_block_copies_preserve_snapshots_masks_and_backing_fields(
     device, representation
@@ -205,7 +207,9 @@ def test_aliases_copy_from_original_block_values():
     assert flags.tolist() == [False, True, True]
 
 
-@pytest.mark.parametrize("device", ("cpu", "cuda"))
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda", marks=pytest.mark.gpu))
+)
 @pytest.mark.parametrize("quantized", (False, True))
 def test_zero_blocks_preserves_other_pages_and_layer_state(device, quantized):
     config = Config(

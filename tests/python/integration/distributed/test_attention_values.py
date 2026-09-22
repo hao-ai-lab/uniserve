@@ -1,5 +1,7 @@
 """Public attention preserves token order, GQA replication and empty shards."""
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 import torch.multiprocessing as mp
@@ -15,6 +17,7 @@ from uniserve.nn.attention import (
     Ulysses,
 )
 from uniserve.runtime import (
+    CUDAStream,
     ExecutionContext,
     PrefixCache,
     initialize_process_groups,
@@ -172,12 +175,19 @@ def _context(rank, rendezvous, gpu):
             config = Config(
                 {"attention": mha.Config(2, 64, local_heads, dtype)}
             )
-            stream = torch.cuda.Stream(device=device) if gpu else None
+            stream = (
+                CUDAStream.external(torch.cuda.Stream(device=device))
+                if gpu
+                else None
+            )
             if stream is not None:
-                stream.wait_stream(torch.cuda.current_stream(device))
-            with PrefixCache(
-                config, num_blocks=3, block_size=16, device=device
-            ) as cache:
+                stream.wait(torch.cuda.current_stream(device))
+            with (
+                stream if stream is not None else nullcontext(),
+                PrefixCache(
+                    config, num_blocks=3, block_size=16, device=device
+                ) as cache,
+            ):
                 with ExecutionContext(
                     layer,
                     cache=cache,

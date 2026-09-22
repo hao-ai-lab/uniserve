@@ -111,7 +111,7 @@ class VmmPool:
     """
 
     def __init__(self, device: torch.device, *, capacity_bytes: int) -> None:
-        from uniserve_kernel.peer_storage import (
+        from uniserve_kernels.peer_storage import (
             allocate,
             allocation_granularity,
         )

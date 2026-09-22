@@ -13,12 +13,17 @@ from uniserve.runtime.resources import close_resources
 
 
 class CUDAStream:
-    """Own one CUDA execution stream and optional Green Context resources.
+    """Own one CUDA execution stream and the resources bound to it.
 
     CPU execution has no CUDAStream. Ordinary bindings retain a PyTorch stream;
     partitioned bindings own a native stream and may borrow their parent's
     Green Context. A parent outlives every fork that uses its SM allocation.
     Ingress/output event slots are reused in submission order on the worker.
+
+    The stream also owns its :attr:`communication`: the communicators that
+    enqueue collectives on it, their registered windows and the storage behind
+    them. Execution contexts on the stream borrow these resources, and
+    :meth:`close` retires them collectively with the stream.
     """
 
     def __init__(
@@ -52,6 +57,28 @@ class CUDAStream:
         )
         self._output_events = tuple(
             torch.cuda.Event(blocking=False) for _ in range(event_slots)
+        )
+
+        from ._collectives import StreamCommunication
+
+        self.communication = StreamCommunication(stream)
+
+    @classmethod
+    def external(
+        cls, stream: torch.cuda.Stream, *, event_slots: int = 2
+    ) -> CUDAStream:
+        """Own the resources bound to an existing full-device PyTorch stream.
+
+        The PyTorch stream remains its creator's; closing this owner retires
+        the communicators, windows and storage bound to the stream.
+        """
+        return cls(
+            device=stream.device,
+            stream=stream,
+            sm_count=torch.cuda.get_device_properties(
+                stream.device
+            ).multi_processor_count,
+            event_slots=event_slots,
         )
 
     @property
@@ -151,11 +178,37 @@ class CUDAStream:
                 _destroy_stream(raw)
             raise
 
-    def close(self, *, aborted: bool = False) -> None:
-        """Drain accesses and release native streams and contexts.
+    def __enter__(self) -> CUDAStream:
+        if self._closed:
+            raise CUDAError("CUDA stream is closed")
+        return self
 
-        Aborted close retains those resources without waiting; the owning
-        process must exit before reclaiming them.
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        # Communicator retirement waits on peers this rank cannot observe, so
+        # an exception retains bound communication; an unbound stream closes
+        # normally once its submitted work has finished.
+        from .resources import streams_idle
+
+        try:
+            self.close(
+                aborted=exc is not None
+                and (
+                    bool(self.communication.communicators)
+                    or not streams_idle((self.stream,))
+                )
+            )
+        except BaseException as error:
+            if exc is None:
+                raise
+            exc.add_note(f"CUDA stream cleanup failed: {error!r}")
+
+    def close(self, *, aborted: bool = False) -> None:
+        """Retire bound communication, drain accesses and release the stream.
+
+        Communicator retirement is collective, so every member rank closes its
+        corresponding stream after the contexts and graphs that borrow it.
+        Aborted close retains every resource without waiting for peers or the
+        device; the owning process must exit before reclaiming them.
         """
         if self._closed:
             return
@@ -165,9 +218,10 @@ class CUDAStream:
             from .resources import retain_until_exit
 
             retain_until_exit(self)
+            self.communication.close(aborted=True)
             return
 
-        actions = [self.stream.synchronize]
+        actions = [self.communication.close, self.stream.synchronize]
         if self.raw_stream is not None:
             actions.append(partial(_destroy_stream, self.raw_stream))
         # Only the partition owner destroys the Green Context; forks borrow it.

@@ -20,6 +20,8 @@ from uniserve_worker.model_executor.image_inputs import (
 )
 from uniserve_worker.protocol.call import MediaCall
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.mark.parametrize("normalization", ("signed_unit", "imagenet"))
 @pytest.mark.parametrize("patches", (False, True))

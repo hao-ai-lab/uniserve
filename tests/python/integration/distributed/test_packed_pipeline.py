@@ -9,11 +9,9 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from tests.python.integration.model_loading.test_bagel import (
-    _checkpoint as bagel_checkpoint,
-)
-from tests.python.integration.model_loading.test_sensenova_u1 import (
-    _checkpoint as u1_checkpoint,
+from tests.python.fixtures.checkpoints import (
+    bagel_checkpoint,
+    sensenova_checkpoint,
 )
 from uniserve import loading
 from uniserve.distributed import DeviceMesh
@@ -214,7 +212,7 @@ def test_partitioned_multimodal_calls_preserve_logits_prefix_and_image_values(
     if architecture == "bagel":
         _, _, config = bagel_checkpoint(tmp_path)
     else:
-        reference, _ = u1_checkpoint(tmp_path, torch.bfloat16)
+        reference, _ = sensenova_checkpoint(tmp_path, torch.bfloat16)
         config = reference.config
     mp.spawn(
         _run,

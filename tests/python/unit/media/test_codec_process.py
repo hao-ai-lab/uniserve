@@ -19,6 +19,8 @@ from uniserve_worker.media.codec_process import (
     SharedSlice,
 )
 
+pytestmark = pytest.mark.unit
+
 
 def _config() -> AvMuxConfig:
     return AvMuxConfig(

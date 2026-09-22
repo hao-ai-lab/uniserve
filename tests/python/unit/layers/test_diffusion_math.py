@@ -18,6 +18,8 @@ from uniserve.diffusion import (
     normal_noise,
 )
 
+pytestmark = pytest.mark.unit
+
 
 def test_guidance_interval_uses_unrounded_coordinate():
     schedule = make_schedule(

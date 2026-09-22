@@ -5,10 +5,12 @@ import torch
 
 from uniserve_worker.storage.block_tables import BlockTables
 
-pytestmark = [pytest.mark.unit, pytest.mark.gpu]
+pytestmark = pytest.mark.unit
 
 
-@pytest.mark.parametrize("device", ("cpu", "cuda:0"))
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
+)
 @pytest.mark.parametrize("depth", (1, 3))
 def test_table_updates_and_release_preserve_all_queued_snapshots(device, depth):
     tables = BlockTables(

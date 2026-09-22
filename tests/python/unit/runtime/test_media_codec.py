@@ -1,8 +1,11 @@
 """Decoded temporal windows preserve their current tile without overlap."""
 
+import pytest
 import torch
 
 from uniserve.nn.video import blend_decoded_overlap
+
+pytestmark = pytest.mark.unit
 
 
 def test_decoded_tiles_with_zero_overlap_preserve_the_current_tile():

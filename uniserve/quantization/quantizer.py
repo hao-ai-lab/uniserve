@@ -282,15 +282,20 @@ class Quantizer:
                 and x.is_cuda
                 and x.dtype in {torch.float16, torch.bfloat16}
             ):
-                from ._fp8 import rowwise
+                from uniserve_kernels import quantization
 
-                target = (
-                    self.empty(tuple(x.shape), dtype=x.dtype, device=x.device)
-                    if out is None
-                    else out
-                )
-                fields = target.buffers()
-                if rowwise(x, fields["values"], fields["scale"]):
+                if quantization.can_run_rowwise_fp8(x):
+                    target = (
+                        self.empty(
+                            tuple(x.shape), dtype=x.dtype, device=x.device
+                        )
+                        if out is None
+                        else out
+                    )
+                    fields = target.buffers()
+                    quantization.rowwise_fp8(
+                        x, fields["values"], fields["scale"]
+                    )
                     return target
 
         # A calibrated activation tensor scale is a checkpoint fact. Runtime

@@ -3,6 +3,7 @@
 They do so without shared mutable prefix state.
 """
 
+from contextlib import nullcontext
 from dataclasses import replace
 
 import pytest
@@ -14,7 +15,13 @@ from uniserve.model import TextSize
 from uniserve.nn import Linear
 from uniserve.nn.attention import Attention, PagedInput
 from uniserve.quantization import Quantizer
-from uniserve.runtime import CUDAGraph, ExecutionContext, PrefixCache
+from uniserve.runtime import (
+    CUDAGraph,
+    CUDAStream,
+    ExecutionContext,
+    PrefixCache,
+)
+from uniserve.tensors import BufferConfig
 
 pytestmark = pytest.mark.integration
 
@@ -54,8 +61,13 @@ def test_device_lengths_drive_current_attention_values(
         for _ in range(2)
     )
     layer = Attention(4, 2, 64, cache_name="attention")
-    stream = torch.cuda.Stream(device=device) if graphs else None
+    stream = (
+        CUDAStream.external(torch.cuda.Stream(device=device))
+        if graphs
+        else None
+    )
     with (
+        stream if stream is not None else nullcontext(),
         PrefixCache(
             Config({"attention": mha.Config(2, 64, (0, 1), dtype)}),
             num_blocks=2,
@@ -285,3 +297,121 @@ def test_eager_attention_replans_changed_sequence_boundaries():
             torch.testing.assert_close(
                 actual, torch.cat(expected), rtol=2e-2, atol=2e-2
             )
+
+
+@pytest.mark.gpu
+@torch.inference_mode()
+@pytest.mark.parametrize("provider", ("torch", "flashinfer"))
+def test_bound_metadata_serves_one_call_and_later_changes_are_planned(provider):
+    device = torch.device("cuda", 0)
+    dtype = torch.bfloat16
+    layer = Attention(2, 1, 64, cache_name="attention")
+    config = Config({"attention": mha.Config(1, 64, (0,), dtype)})
+    generator = torch.Generator(device=device).manual_seed(31)
+    q = torch.randn(5, 2, 64, dtype=dtype, device=device, generator=generator)
+    k, v = (
+        torch.randn(5, 1, 64, dtype=dtype, device=device, generator=generator)
+        for _ in range(2)
+    )
+
+    def lengths(counts):
+        return PagedInput.from_blocks(
+            blocks=((0,), (1,)),
+            query_lengths=counts,
+            prefix_lengths=(0, 0),
+            block_size=16,
+            causal=True,
+            device=device,
+        )
+
+    def expected(counts):
+        return torch.cat(
+            [
+                torch.nn.functional.scaled_dot_product_attention(
+                    query.transpose(0, 1).unsqueeze(0),
+                    key.transpose(0, 1).unsqueeze(0),
+                    value.transpose(0, 1).unsqueeze(0),
+                    is_causal=True,
+                    enable_gqa=True,
+                )
+                .squeeze(0)
+                .transpose(0, 1)
+                for query, key, value in zip(
+                    q.split(counts),
+                    k.split(counts),
+                    v.split(counts),
+                    strict=True,
+                )
+            ]
+        )
+
+    # Device-only lengths: every plan reads the live columns.
+    initial = lengths((4, 1))
+    batch = replace(
+        initial,
+        queries=replace(initial.queries, host=None),
+        prefixes=replace(initial.prefixes, host=None),
+    )
+    with (
+        PrefixCache(
+            config, num_blocks=2, block_size=16, device=device
+        ) as cache,
+        ExecutionContext(layer, cache=cache, attention=provider) as context,
+    ):
+        context.prepare(TextSize(5, 2))
+        context.bind_attention(batch)
+        torch.testing.assert_close(
+            layer(q, k, v, batch), expected((4, 1)), rtol=2e-2, atol=2e-2
+        )
+        for counts in ((2, 3), (1, 4)):
+            # Columns change in place without another bind; the next call
+            # plans from the live lengths instead of the bound ones.
+            changed = lengths(counts)
+            batch.queries.values.copy_(changed.queries.values)
+            batch.queries.offsets.copy_(changed.queries.offsets)
+            batch.write_indices.copy_(changed.write_indices)
+            torch.testing.assert_close(
+                layer(q, k, v, batch), expected(counts), rtol=2e-2, atol=2e-2
+            )
+
+
+class _Workspace(nn.Module):
+    """Declare one large workspace buffer and no numerical layers."""
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("anchor", torch.zeros(1, device="cuda:0"))
+
+    def workspace_buffers(self, size):
+        del size
+        return {"scratch": BufferConfig((16 << 20,), torch.uint8)}
+
+
+@pytest.mark.gpu
+@torch.inference_mode()
+@pytest.mark.parametrize("pending", (False, True))
+def test_caller_exception_releases_backing_only_after_its_work_finished(
+    pending,
+):
+    device = torch.device("cuda:0")
+    module = _Workspace()
+    torch.cuda.synchronize(device)
+    baseline = torch.cuda.memory_allocated(device)
+
+    with CUDAStream.external(torch.cuda.Stream(device=device)) as stream:
+        with pytest.raises(ValueError, match="caller"):
+            with ExecutionContext(module, stream=stream) as context:
+                context.prepare(None)
+                context.workspace["scratch"].fill_(1)
+                if pending:
+                    # Keep the stream busy past the exit decision.
+                    torch.cuda._sleep(1 << 30)
+                else:
+                    stream.synchronize()
+                raise ValueError("caller rejected its own input")
+        stream.synchronize()
+
+    retained = torch.cuda.memory_allocated(device) - baseline
+    # Released backing returns to the allocator; storage an unfinished access
+    # may still read stays owned until process exit.
+    assert retained >= (16 << 20) if pending else retained == 0

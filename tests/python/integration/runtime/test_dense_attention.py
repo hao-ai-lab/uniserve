@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from uniserve.nn.attention import Attention, DenseInput
-from uniserve.runtime import CUDAGraph, ExecutionContext
+from uniserve.runtime import CUDAGraph, CUDAStream, ExecutionContext
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -97,11 +97,14 @@ def test_dense_attention_preserves_heads_masks_and_graph_inputs(
     # The existing paged/segmented attention conformance uses 2e-2 for half
     # precision and 2e-5 for FP32 against an independently normalized reference.
     tolerance = 2e-5 if dtype == torch.float32 else 2e-2
-    stream = torch.cuda.Stream(device=device)
-    stream.wait_stream(torch.cuda.current_stream(device))
-    with ExecutionContext(
-        attention, attention=provider, stream=stream
-    ) as context:
+    stream = CUDAStream.external(torch.cuda.Stream(device=device))
+    stream.wait(torch.cuda.current_stream(device))
+    with (
+        stream,
+        ExecutionContext(
+            attention, attention=provider, stream=stream
+        ) as context,
+    ):
         context.prepare(None)
         actual = execute()
         torch.testing.assert_close(

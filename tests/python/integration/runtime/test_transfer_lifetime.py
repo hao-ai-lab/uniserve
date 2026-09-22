@@ -38,7 +38,7 @@ def _await_ticket(ticket):
 
 
 def test_exhausted_vmm_pool_delivers_host_fallback_and_restores_quota():
-    from uniserve_kernel.peer_storage import allocation_granularity
+    from uniserve_kernels.peer_storage import allocation_granularity
 
     from uniserve_worker.transport import make_transports
     from uniserve_worker.transport.publication import publish_tensor
@@ -466,7 +466,7 @@ def _serve_unusable_cuda_handle(channel) -> None:
     """Publish a locator whose handle names no allocation, and hold it."""
     import uuid
 
-    from uniserve_kernel.peer_storage import empty, export_handle
+    from uniserve_kernels.peer_storage import empty, export_handle
 
     from uniserve_worker.protocol.transfer import CudaVmmTransfer
 
@@ -688,7 +688,7 @@ def test_cuda_vmm_publication_read_from_another_host_carries_no_fence() -> None:
     try:
         # Exportable storage, so the publication is the source itself: a
         # crossing decides the fence, not where the product is materialized.
-        from uniserve_kernel.peer_storage import empty
+        from uniserve_kernels.peer_storage import empty
 
         source = empty((1024,), dtype=torch.float32, device=device)
         source.fill_(1.0)
@@ -1187,7 +1187,7 @@ def test_cuda_vmm_publishes_a_row_whose_bytes_arrive_later() -> None:
 
         # The row lives in the worker's exportable arena, as a reserved media
         # unit row does; that is what lets it be published where it lies.
-        from uniserve_kernel.peer_storage import empty
+        from uniserve_kernels.peer_storage import empty
 
         row = empty((256,), dtype=torch.float32, device=torch.device("cuda:0"))
         row.zero_()

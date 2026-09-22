@@ -128,7 +128,7 @@ class ModelRunner(Execution, ABC):
         """Evaluate numerical arguments and return owned results."""
         context, stream = self.context, self.context.stream
         if stream is not None:
-            stream.wait_stream(torch.cuda.current_stream(self.device))
+            stream.wait(torch.cuda.current_stream(self.device))
         started, path = time.perf_counter_ns(), "eager"
         values = (args, kwargs)
         key = input_signature(values)
@@ -162,7 +162,7 @@ class ModelRunner(Execution, ABC):
                 result = self.call.forward(*args, **kwargs, **resources)
             output = self.result(result).clone()
         if stream is not None:
-            torch.cuda.current_stream(self.device).wait_stream(stream)
+            torch.cuda.current_stream(self.device).wait_stream(stream.stream)
         elapsed = (time.perf_counter_ns() - started) // 1000
         return replace(
             output,
@@ -209,13 +209,13 @@ class ModelRunner(Execution, ABC):
             else None
         )
         if context.stream is not None:
-            context.stream.wait_stream(current)
+            context.stream.wait(current)
         try:
             with context.activate():
                 self._capture_batch(batch, forward)
         finally:
             if context.stream is not None:
-                current.wait_stream(context.stream)
+                current.wait_stream(context.stream.stream)
 
     def _capture_batch(self, batch, forward):
         if self._startup_complete:

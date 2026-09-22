@@ -1,0 +1,388 @@
+"""Rotary position rotations and fused Q/K normalization with rotation.
+
+Factors are compact: one ``[..., rotated / 2]`` table per rotary axis over the
+tensor's token axes, broadcast over heads. Arithmetic accumulates in FP32 and
+rounds once to the input dtype.
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+import torch
+
+from ._tensors import check_output, result
+
+
+def _factors_match(x, cos, sin) -> bool:
+    """Check compact factors against the token axes of ``[..., heads, dim]``."""
+    return (
+        cos.shape == sin.shape
+        and cos.ndim == x.ndim - 1
+        and cos.shape[:-1] == x.shape[:-2]
+        and cos.device == x.device
+        and sin.device == x.device
+    )
+
+
+def _rotate(x, cos, sin, rotation):
+    """Rotate the leading ``2 * cos.shape[-1]`` coordinates of FP32 ``x``.
+
+    Factors broadcast over the omitted head axis: ``[..., 1, width / 2]``.
+    Coordinates beyond the rotated width are returned unchanged.
+    """
+    width = cos.shape[-1] * 2
+    if width == 0:
+        return x
+
+    cosine, sine = cos.float().unsqueeze(-2), sin.float().unsqueeze(-2)
+    prefix = x[..., :width]
+    # Split pairs the two half-widths; interleaved pairs adjacent coordinates.
+    first, second = (
+        prefix.chunk(2, dim=-1)
+        if rotation == "split"
+        else (prefix[..., ::2], prefix[..., 1::2])
+    )
+    left, right = first * cosine - second * sine, second * cosine + first * sine
+    rotated = (
+        torch.cat((left, right), dim=-1)
+        if rotation == "split"
+        else torch.stack((left, right), dim=-1).flatten(-2)
+    )
+    if width == x.shape[-1]:
+        return rotated
+    return torch.cat((rotated, x[..., width:]), dim=-1)
+
+
+def apply_rotary(
+    x, cos, sin, *, rotation: Literal["interleaved", "split"], out=None
+):
+    """Rotate the leading coordinates of token/head vectors with compact
+    factors.
+
+    ``x`` has shape ``[..., heads, head_dim]``. ``cos`` and ``sin`` have shape
+    ``[..., rotary_dim / 2]`` over the same token axes; the omitted head axis
+    broadcasts over every head. ``rotation="split"`` pairs coordinate ``i``
+    with ``i + rotary_dim / 2``; ``"interleaved"`` pairs adjacent coordinates.
+    Coordinates from ``rotary_dim`` onward are preserved. Products and sums
+    use FP32 and the result is rounded once to ``x.dtype``.
+
+    ``out`` must match ``x`` in shape, dtype and device and may alias it.
+    """  # noqa: D205
+    if (
+        rotation not in {"interleaved", "split"}
+        or x.ndim < 2
+        or not _factors_match(x, cos, sin)
+        or cos.shape[-1] * 2 > x.shape[-1]
+    ):
+        raise ValueError(
+            "rotary factors must match tokens and a prefix of the head width"
+        )
+
+    if rotation == "split" and cos.shape[-1] * 2 == x.shape[-1]:
+        from uniserve_kernels.rope import can_run_triton_rope, triton_rope
+
+        # The packed kernel writes directly into a contiguous output that does
+        # not share storage with ``x``; other outputs receive its result.
+        target = (
+            torch.empty_like(x, memory_format=torch.contiguous_format)
+            if out is None
+            else out
+        )
+        check_output(x, target)
+        if can_run_triton_rope(x, cos, sin, target):
+            triton_rope(x, cos, sin, target)
+            return target
+        staged = torch.empty_like(x, memory_format=torch.contiguous_format)
+        if out is not None and can_run_triton_rope(x, cos, sin, staged):
+            triton_rope(x, cos, sin, staged)
+            return out.copy_(staged)
+
+    return result(_rotate(x.float(), cos, sin, rotation).to(x.dtype), out)
+
+
+def _domain_axes(widths, axis_dims):
+    """Count the complete rotary axes each normalization domain spans.
+
+    Returns ``None`` unless the domains, in order, cover every axis and each
+    domain ends on an axis boundary.
+    """
+    counts, axis = [], 0
+    for width in widths:
+        start, covered = axis, 0
+        while axis < len(axis_dims) and covered < width:
+            covered += axis_dims[axis]
+            axis += 1
+        if covered != width or axis == start:
+            return None
+        counts.append(axis - start)
+    return tuple(counts) if axis == len(axis_dims) else None
+
+
+def qk_norm_rope(
+    q, k, q_weights, k_weights, cos, sin, *, eps: float, axis_dims, out=None
+):
+    """Normalize Q/K over explicit RMS domains, then rotate each rotary axis.
+
+    ``q`` and ``k`` have shapes ``[..., heads, head_dim]`` and
+    ``[..., kv_heads, head_dim]`` over the same token axes. ``axis_dims``
+    partitions ``head_dim`` into rotary axes. ``q_weights`` and ``k_weights``
+    hold one RMS weight per normalization domain in head order. A domain's
+    width is its weight length and spans consecutive complete axes, so every
+    axis in one domain shares that domain's FP32 variance.
+
+    ``cos`` and ``sin`` hold one compact factor table ``[..., rotated / 2]``
+    per axis. Each axis rotates its leading ``rotated`` coordinates split-half
+    and only normalizes the remainder; zero-width factors leave an axis
+    unrotated. Normalization, scaling and rotation accumulate in FP32 and round
+    once to the input dtype. ``out`` receives the query and key results and may
+    alias ``q`` and ``k``.
+    """
+    widths = tuple(
+        weight.shape[0] if weight.ndim == 1 else -1 for weight in q_weights
+    )
+    counts = (
+        _domain_axes(widths, axis_dims)
+        if isinstance(axis_dims, tuple)
+        else None
+    )
+    if (
+        counts is None
+        or q.ndim < 2
+        or k.ndim != q.ndim
+        or k.shape[:-2] != q.shape[:-2]
+        or k.shape[-1] != q.shape[-1]
+        or k.device != q.device
+        or any(type(width) is not int or width < 1 for width in axis_dims)
+        or sum(axis_dims) != q.shape[-1]
+        or len(cos) != len(axis_dims)
+        or len(sin) != len(axis_dims)
+        or any(
+            not _factors_match(q, cosine, sine) or cosine.shape[-1] * 2 > width
+            for cosine, sine, width in zip(cos, sin, axis_dims, strict=True)
+        )
+        or len(k_weights) != len(q_weights)
+        or any(
+            key.shape != query.shape
+            or query.device != q.device
+            or key.device != q.device
+            for query, key in zip(q_weights, k_weights, strict=True)
+        )
+    ):
+        raise ValueError(
+            "Q/K normalization domains must cover complete rotary axes that "
+            "partition the head width"
+        )
+
+    if out is None:
+        query = torch.empty_like(q, memory_format=torch.contiguous_format)
+        key = torch.empty_like(k, memory_format=torch.contiguous_format)
+    else:
+        query, key = out
+        check_output(q, query)
+        check_output(k, key)
+
+    if q.ndim == 3 and _fused_qk_norm_rope(
+        q, k, q_weights, k_weights, cos, sin, eps, axis_dims, counts, query, key
+    ):
+        return query, key
+
+    # General composition keeps every domain and axis in FP32 and rounds once
+    # while storing, after the complete source has been read.
+    for source, weights, target in ((q, q_weights, query), (k, k_weights, key)):
+        normalized = torch.cat(
+            tuple(
+                part
+                * torch.rsqrt(part.square().mean(-1, keepdim=True) + eps)
+                * weight.float()
+                for part, weight in zip(
+                    source.float().split(widths, dim=-1), weights, strict=True
+                )
+            ),
+            dim=-1,
+        )
+        target.copy_(
+            torch.cat(
+                tuple(
+                    _rotate(part, cosine, sine, "split")
+                    for part, cosine, sine in zip(
+                        normalized.split(axis_dims, dim=-1),
+                        cos,
+                        sin,
+                        strict=True,
+                    )
+                ),
+                dim=-1,
+            )
+        )
+    return query, key
+
+
+def _fused_qk_norm_rope(
+    q, k, q_weights, k_weights, cos, sin, eps, axis_dims, counts, query, key
+) -> bool:
+    """Launch the Triton kernel matching the call's domains and axes.
+
+    Selection follows the declared layout: one domain with one axis, or a
+    rotated leading domain followed by one shared tail domain that is either
+    unrotated or holds two rotated axes. Returns ``False`` when no kernel
+    accepts the tensors.
+    """
+    from uniserve_kernels import rope as kernels
+
+    rotated = tuple(cosine.shape[-1] * 2 for cosine in cos)
+    cos = tuple(cosine.contiguous() for cosine in cos)
+    sin = tuple(sine.contiguous() for sine in sin)
+
+    if counts == (1,) and rotated[0] == axis_dims[0]:
+        if kernels.can_run_triton_qk_rms_norm_rope(
+            q, k, q_weights[0], k_weights[0], cos[0], sin[0], query, key
+        ):
+            kernels.triton_qk_rms_norm_rope(
+                q,
+                k,
+                q_weights[0],
+                k_weights[0],
+                cos[0],
+                sin[0],
+                eps,
+                query,
+                key,
+            )
+            return True
+        return False
+
+    if counts == (1,) and rotated[0]:
+        # The partial kernel updates its operands in place. Both the sources
+        # and the destinations must satisfy it before the sources are copied.
+        if all(
+            kernels.can_run_triton_qk_rms_norm_rope_inplace(
+                query_value,
+                key_value,
+                q_weights[0],
+                k_weights[0],
+                cos[0],
+                sin[0],
+            )
+            for query_value, key_value in ((q, k), (query, key))
+        ):
+            if query is not q:
+                query.copy_(q)
+            if key is not k:
+                key.copy_(k)
+            kernels.triton_qk_rms_norm_rope_inplace(
+                query, key, q_weights[0], k_weights[0], cos[0], sin[0], eps
+            )
+            return True
+        return False
+
+    if (
+        len(counts) != 2
+        or counts[0] != 1
+        or rotated[0] != axis_dims[0]
+        or len(q_weights) != 2
+    ):
+        return False
+
+    if not any(rotated[1:]):
+        if kernels.can_run_triton_qk_split_rms_norm_rope(
+            q, k, q_weights, k_weights, cos[0], sin[0], query, key
+        ):
+            kernels.triton_qk_split_rms_norm_rope(
+                q, k, q_weights, k_weights, cos[0], sin[0], eps, query, key
+            )
+            return True
+        return False
+
+    if (
+        len(axis_dims) == 3
+        and rotated[1:] == axis_dims[1:]
+        and kernels.can_run_triton_qk_multi_axis_rms_norm_rope(
+            q, k, q_weights, k_weights, cos, sin, query, key
+        )
+    ):
+        kernels.triton_qk_multi_axis_rms_norm_rope(
+            q, k, q_weights, k_weights, cos, sin, eps, query, key
+        )
+        return True
+    return False
+
+
+def qk_bias_rms_norm_rope_(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    query_bias: torch.Tensor | None = None,
+    key_bias: torch.Tensor | None = None,
+    value: torch.Tensor | None = None,
+    value_bias: torch.Tensor | None = None,
+    *,
+    eps: float = 1e-5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Bias and RMS-normalize Q/K heads, then rotate them, in place.
+
+    ``query`` and ``key`` have shape ``[..., heads, head_dim]``; biases cover
+    the complete ``heads * head_dim`` projection width. Heads normalize
+    without a learned weight, and compact factors ``[..., rotated / 2]`` rotate
+    the leading coordinates split-half. When supplied, ``value`` receives its
+    bias in the same pass. Arithmetic accumulates in FP32 before each store.
+    """
+    from uniserve_kernels import rope
+
+    if (query_bias is None) != (key_bias is None):
+        raise ValueError("Q/K normalization requires both biases or neither")
+    if (value is None) != (value_bias is None):
+        raise ValueError(
+            "Q/K normalization requires both value and value bias or neither"
+        )
+    if (
+        query.shape != key.shape
+        or query.ndim < 3
+        or query.numel() == 0
+        or query.dtype != key.dtype
+        or not query.is_floating_point()
+        or not _factors_match(query, cos, sin)
+        or not 0 < cos.shape[-1] * 2 <= query.shape[-1]
+        or key.device != query.device
+    ):
+        raise ValueError(
+            "Q/K normalization requires equal floating heads and compact "
+            "factors for a prefix of each head"
+        )
+    heads, head_dim = int(query.shape[-2]), int(query.shape[-1])
+    for bias in (query_bias, key_bias, value_bias):
+        if bias is not None and (
+            bias.numel() != heads * head_dim or bias.device != query.device
+        ):
+            raise ValueError(
+                "projection bias must match the complete head width and device"
+            )
+    if value is not None and (
+        value.shape != query.shape or value.device != query.device
+    ):
+        raise ValueError("value projection must match Q/K shape and device")
+
+    if rope.can_run_qk_bias_rms_norm_rope(
+        query, key, value, cos, sin, query_bias, key_bias, value_bias
+    ):
+        rope.qk_bias_rms_norm_rope_(
+            query, key, cos, sin, query_bias, key_bias, value, value_bias, eps
+        )
+        return query, key
+
+    for target, bias in ((query, query_bias), (key, key_bias)):
+        normalized = target.float()
+        if bias is not None:
+            normalized = normalized + bias.reshape(heads, head_dim).float()
+        normalized = normalized * torch.rsqrt(
+            normalized.square().mean(-1, keepdim=True) + eps
+        )
+        target.copy_(_rotate(normalized, cos, sin, "split"))
+    if value is not None and value_bias is not None:
+        value.copy_(
+            (value.float() + value_bias.reshape(heads, head_dim).float()).to(
+                value.dtype
+            )
+        )
+    return query, key

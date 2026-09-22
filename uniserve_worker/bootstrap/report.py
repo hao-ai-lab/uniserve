@@ -95,7 +95,7 @@ def _exports_fabric_handles(device: object) -> bool:
     resolved = torch.device(str(device))
     if resolved.type != "cuda":
         return False
-    from uniserve_kernel.peer_storage import exports_fabric_handles
+    from uniserve_kernels.peer_storage import exports_fabric_handles
 
     return exports_fabric_handles(resolved.index or 0)
 

@@ -11,6 +11,7 @@ import torch
 from tests.python.fixtures.diffusion import LinearDenoiser, Size
 from tests.python.fixtures.encoding import Model
 from uniserve.model import DenoiserInput, LatentInput
+from uniserve.runtime import CUDAStream, partition_streams
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.diffusion_runner import TrajectoryRunner
@@ -58,8 +59,6 @@ def test_initial_inputs_are_ready_for_consumption_after_preparation(
 def test_denoising_reprepared_constants_and_slot_sizes_advance_one_step(
     graphs, execution
 ):
-    from uniserve.runtime import partition_streams
-
     device = torch.device("cuda:0")
     branch_device = "cuda:0" if execution == "green" else execution
     model = LinearDenoiser().to(device)
@@ -69,9 +68,9 @@ def test_denoising_reprepared_constants_and_slot_sizes_advance_one_step(
         partition_streams(device, (64,))[0] if execution == "green" else None
     )
     stream = (
-        partition.stream
+        partition
         if partition is not None
-        else torch.cuda.Stream(device=device)
+        else CUDAStream.external(torch.cuda.Stream(device=device))
     )
     runner = TrajectoryRunner(
         model,
@@ -131,8 +130,7 @@ def test_denoising_reprepared_constants_and_slot_sizes_advance_one_step(
     finally:
         torch.cuda.current_stream(device).synchronize()
         runner.close()
-        if partition is not None:
-            partition.close()
+        stream.close()
 
 
 @torch.inference_mode()
@@ -202,10 +200,11 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
         torch.cuda.current_stream(device).synchronize()
         eager.close()
 
+    stream = CUDAStream.external(torch.cuda.Stream(device=device))
     runner = TrajectoryRunner(
         model,
         device=device,
-        stream=torch.cuda.Stream(device=device),
+        stream=stream,
         groups=(),
         capacity=2,
         shapes=2,
@@ -234,3 +233,4 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
     finally:
         torch.cuda.current_stream(device).synchronize()
         runner.close()
+        stream.close()

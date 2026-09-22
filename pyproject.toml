@@ -21,6 +21,9 @@ dependencies = [
     "huggingface_hub",
     "diffusers>=0.40",
     "av>=14",
+    # UniServe's own Triton and CuTe device kernels. Native extensions and
+    # their build tools are selected through the kernel package's extras.
+    "uniserve-kernels",
 ]
 
 [project.optional-dependencies]
@@ -39,30 +42,30 @@ bench = [
     "uniserve-eval[datasets]",
 ]
 # Optional accelerator kernels for GPU serving. Model bindings require their
-# declared native capabilities at startup. UniServe kernels live in the
-# independent `uniserve-kernel` pack. The dense, sparse, and quantized
-# providers these packages back are shared runtime capabilities, so they are
-# selected by hardware rather than by model; native builds require a CUDA 13
-# toolkit.
+# declared native capabilities at startup. The extras of the `uniserve-kernels`
+# pack add its native extensions and FlashAttention-4 runtime. The dense,
+# sparse, and quantized providers these packages back are shared runtime
+# capabilities, so they are selected by hardware rather than by model; native
+# builds require a CUDA 13 toolkit.
 gpu = [
     "flashinfer-python==0.6.18",
     "ninja>=1.13",
     "requests[socks]>=2",
-    "uniserve-kernel[peer_storage,sparse_attention,flash_attn_jagged]",
+    "uniserve-kernels[peer_storage,sparse_attention,flash_attn_4]",
 ]
 
 [tool.uv.sources]
-uniserve-kernel = { path = "uniserve_kernel", editable = true }
+uniserve-kernels = { path = "uniserve_kernels", editable = true }
 uniserve-eval = { path = "uniserve_eval", editable = true }
 
 [project.scripts]
 uniserve-worker = "uniserve_worker.main:main"
 
 [tool.setuptools.packages.find]
-# Optional UniServe kernels and the benchmark driver are packaged independently
-# (`uniserve_kernel/pyproject.toml`, `uniserve_eval/pyproject.toml`) so the root
-# serving distribution cannot mask a missing kernel install and does not ship a
-# console script whose dependencies it never declares.
+# UniServe kernels and the benchmark driver are packaged independently
+# (`uniserve_kernels/pyproject.toml`, `uniserve_eval/pyproject.toml`) so the
+# root serving distribution cannot mask a missing kernel install and does not
+# ship a console script whose dependencies it never declares.
 include = ["uniserve", "uniserve.*", "uniserve_models*", "uniserve_worker*"]
 
 # Native worker IPC extension (PyO3).
@@ -81,11 +84,11 @@ testpaths = ["tests/python"]
 addopts = "-ra"
 pythonpath = ["."]
 markers = [
-    "unit: pure local tests without server, GPU, or external model files",
+    "unit: pure local tests without server or external model files",
     "architecture: build-time dependency direction and package layout checks",
     "integration: multi-component tests using fake/simulated backends",
     "e2e: black-box server or worker tests",
-    "gpu: requires real GPU model execution",
+    "gpu: requires a CUDA device; orthogonal to the unit, integration and e2e layers",
     "slow: excluded from the fast local and presubmit suites",
     "model(name): selects a concrete model backend such as sensenova or bagel",
     "sensenova: SenseNova-U1-specific test",

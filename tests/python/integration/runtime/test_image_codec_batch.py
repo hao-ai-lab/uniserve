@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from tests.python.integration.model_loading.test_bagel import _checkpoint
+from tests.python.fixtures.checkpoints import bagel_checkpoint
 from uniserve.media import image
 from uniserve.runtime import PrefixCache
 from uniserve_models import bagel
@@ -27,7 +27,7 @@ pytestmark = pytest.mark.integration
 
 @torch.inference_mode()
 def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
-    _, _, architecture = _checkpoint(tmp_path)
+    _, _, architecture = bagel_checkpoint(tmp_path)
     model = bagel.Model(architecture).eval()
     config = WorkerConfig(
         device="cpu",

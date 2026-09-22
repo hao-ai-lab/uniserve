@@ -62,11 +62,26 @@ def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
     assert config.diffusion.ladder == (1000, 875, 750, 625, 500, 375, 250, 125)
     assert config.diffusion.video_shift == 10
     assert config.diffusion.audio_shift == 3
+    assert config.denoiser.vsa_sparsity == 0.8
     with torch.device("meta"):
         model = Model(config)
-    assert model.denoiser.transformer.modulation.products.shape[0] == 8
-    assert model.denoiser.transformer.modulation.output_products.shape[0] == 8
-    assert model.denoiser.transformer.layers["0"].attention.sparsity == 0.8
+
+    # The first and last evaluations follow the shifted timestep equation
+    # sigma = s t / (1 + (s - 1) t) with t = step / 1000 and each modality's
+    # trained shift; the clean endpoint follows the last evaluation.
+    schedules = model.denoiser.make_schedules(8, shift=None, device="cpu")
+    for name, shift in (("video", 10.0), ("audio", 3.0)):
+        sigmas = schedules[name].sigmas
+        assert sigmas.shape == (9,)
+        for index, step in ((0, 1000), (7, 125)):
+            t = step / 1000
+            expected = shift * t / (1 + (shift - 1) * t)
+            torch.testing.assert_close(
+                sigmas[index], torch.tensor(expected), rtol=0, atol=1e-7
+            )
+        assert sigmas[8] == 0
+    with pytest.raises(ValueError, match="8 evaluations"):
+        model.denoiser.make_schedules(4, shift=None, device="cpu")
 
 
 @pytest.mark.parametrize(

@@ -25,9 +25,9 @@ from uniserve.nn.linear import (
 )
 from uniserve.quantization import QuantizedTensor
 
-from ._tokens import _HeadExchange
 from .distribution import Distribution
 from .mesh import DeviceMesh
+from .tokens import HeadExchange, kv_head_partition
 
 
 def communication_axes(
@@ -340,20 +340,12 @@ def parallelize_(
                 raise ValueError(
                     "query heads must divide the tensor-parallel group"
                 )
-            if child.num_kv_heads >= group.size:
-                if child.num_kv_heads % group.size:
-                    raise ValueError(
-                        "KV heads must divide their tensor-parallel group"
-                    )
-            elif group.size % child.num_kv_heads:
-                raise ValueError(
-                    "KV heads must replicate evenly across tensor-parallel "
-                    "ranks"
-                )
+            heads = kv_head_partition(child.num_kv_heads, group)
             for name in ("k", "v"):
                 kv[id(child.projections[name])] = (
                     child.num_kv_heads,
                     child.head_dim,
+                    heads,
                 )
 
     for child in modules:
@@ -365,7 +357,7 @@ def parallelize_(
                 raise ValueError("VSA cannot change its mathematical partition")
             if bound is None:
                 child.mesh = mesh
-                child._parallel = ParallelAttention(
+                child.parallel = ParallelAttention(
                     mesh=mesh, parallel=attention
                 )
                 child._parallel_mesh, child._attention_parallel = (
@@ -386,24 +378,10 @@ def parallelize_(
                 raise ValueError(
                     "attention query heads must divide tensor parallelism"
                 )
-            if child.num_kv_heads >= group.size:
-                if child.num_kv_heads % group.size:
-                    raise ValueError(
-                        "attention KV heads must divide tensor parallelism"
-                    )
-                heads = child.num_kv_heads // group.size
-                start = group.rank * heads
-            else:
-                # Fewer KV heads than TP ranks: several ranks host adjacent
-                # copies of the same head, indexed by this rank's copy slot.
-                if group.size % child.num_kv_heads:
-                    raise ValueError(
-                        "attention KV replicas must divide tensor parallelism"
-                    )
-                heads = 1
-                start = group.rank // (group.size // child.num_kv_heads)
+            kv_heads = kv_head_partition(child.num_kv_heads, group)
+            heads, start = kv_heads.stop - kv_heads.start, kv_heads.start
 
-            exchange = _HeadExchange(
+            exchange = HeadExchange(
                 mesh.get_group(
                     () if attention.heads is None else attention.heads.axis
                 )
@@ -415,14 +393,14 @@ def parallelize_(
                 )
 
             head_slice = exchange.head_slice(heads)
-            child._local_heads = query_heads // exchange.group.size
-            child._local_kv_heads = head_slice.stop - head_slice.start
-            child._head_indices = tuple(
+            child.local_heads = query_heads // exchange.group.size
+            child.local_kv_heads = head_slice.stop - head_slice.start
+            child.head_indices = tuple(
                 range(start + head_slice.start, start + head_slice.stop)
             )
-            child._exchange = exchange
+            child.exchange = exchange
             if attention.context is not None:
-                child._context = ParallelAttention(
+                child.context_parallel = ParallelAttention(
                     mesh=mesh, parallel=attention
                 )
             child._parallel_mesh = mesh
@@ -486,9 +464,9 @@ def parallelize_(
             weight_dim = 0
             heads = kv.get(id(child))
             if heads is not None and heads[0] < group.size:
-                replicas = group.size // heads[0]
-                start = group.rank // replicas * heads[1]
-                row = slice(start, start + heads[1])
+                # Replicated KV heads: this rank projects its one head.
+                _, head_dim, local = heads
+                row = slice(local.start * head_dim, local.stop * head_dim)
             else:
                 if child.out_features % column_group.size:
                     raise ValueError(
@@ -504,7 +482,7 @@ def parallelize_(
             if projection is not None:
                 if projection[2] is not None:
                     output_places[mesh.axes.index(projection[2])] = Shard(1)
-                child._gather_axes = (
+                child.gather_axes = (
                     () if projection[2] is None else (projection[2],)
                 )
         elif isinstance(child, RowParallelLinear):

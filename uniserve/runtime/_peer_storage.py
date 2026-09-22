@@ -41,7 +41,7 @@ class SymmetricStorage:
             raise ValueError(
                 "symmetric-storage fence buffers do not match group membership"
             )
-        self.coordinator._all_gather_into_tensor(output, input)
+        self.coordinator.all_gather_into(output, input)
 
 
 def _peer_identities(
@@ -175,7 +175,7 @@ def allocate_peer_tensor(
     a handle reaches a peer depends on what the device exports, which is what
     the two collection paths below distinguish.
     """
-    from uniserve_kernel.peer_storage import allocate, exports_fabric_handles
+    from uniserve_kernels.peer_storage import allocate, exports_fabric_handles
 
     allocation = allocate(shape, dtype=dtype, device=group.device)
     handle = allocation.export_handle()

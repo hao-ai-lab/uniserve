@@ -842,7 +842,7 @@ class TensorStore:
                 )
                 self._require_byte_capacity_locked(projected)
                 if device.type == "cuda":
-                    from uniserve_kernel.peer_storage import empty
+                    from uniserve_kernels.peer_storage import empty
 
                     arena = empty((elements,), dtype=dtype, device=device)
                 else:

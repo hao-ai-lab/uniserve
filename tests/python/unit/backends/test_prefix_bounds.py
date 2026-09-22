@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 import torch
-from uniserve_kernel.flash_attn_jagged import compute_prefix_bounds_varlen
+from uniserve_kernels.attention.prefix_bounds import (
+    compute_prefix_bounds_varlen,
+)
+
+pytestmark = pytest.mark.unit
 
 
 def test_varlen_prefix_bounds_ignore_padded_query_values() -> None:
@@ -25,6 +29,7 @@ def test_varlen_prefix_bounds_ignore_padded_query_values() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_varlen_prefix_bounds_capture_and_replay_live_lengths() -> None:
     device = torch.device("cuda")

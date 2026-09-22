@@ -39,7 +39,7 @@ def _plan_workspace(wrapper: Any) -> Iterator[None]:
     allocation plus allocator stream tracking protects both reuse and teardown
     while allowing CPU planning to continue asynchronously.
     """
-    from uniserve_kernel.peer_storage import record_host_usage
+    from uniserve_kernels.peer_storage import record_host_usage
 
     source = torch.empty_like(
         wrapper._pin_memory_int_workspace_buffer, pin_memory=True

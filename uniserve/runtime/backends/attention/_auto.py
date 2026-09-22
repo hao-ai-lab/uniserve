@@ -197,7 +197,7 @@ class Backend(_Backend):
                     "flashinfer"
                 ].config.workspace_size
             )
-        from uniserve_kernel.flash_attn_jagged import available
+        from .flash_attn_4 import available
 
         if available():
             self._factories["flash_attn_4"] = import_module(

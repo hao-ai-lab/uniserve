@@ -5,94 +5,16 @@ import torch
 from safetensors.torch import save_file
 from torch.nn import functional as F
 
+from tests.python.fixtures.checkpoints import sensenova_checkpoint
 from uniserve import loading
-from uniserve.diffusion import NoiseScale
 from uniserve.loading import checkpoint, weights
 from uniserve.media import image
 from uniserve.model import LatentInput, TextInput, TextSize, VisionInput
 from uniserve.nn.attention import PagedInput, SequenceLengths, VarlenInput
 from uniserve.runtime import ExecutionContext, PrefixCache
 from uniserve_models import sensenova_u1 as u1
-from uniserve_models.sensenova_u1 import flow, vision
 
 pytestmark = pytest.mark.integration
-
-
-def _checkpoint(root, dtype):
-    torch.manual_seed(221)
-    config = u1.Config(
-        u1.TransformerConfig(37, 32, 48, 2, 4, 2, 8, ("full_attention",) * 2),
-        vision.Config(16, 32, 0.5, 2, 3, 10000.0),
-        flow.Config(
-            flow.HeadConfig(32, 2, 1.0),
-            False,
-            True,
-            NoiseScale(1.0, "constant", 1, 8),
-        ),
-        64,
-    )
-    state = {}
-
-    def matrix(name, shape, *, bias=False):
-        state[name + ".weight"] = (torch.randn(shape) * 0.02).to(dtype)
-        if bias:
-            state[name + ".bias"] = (torch.randn(shape[0]) * 0.01).to(dtype)
-
-    matrix("language_model.model.embed_tokens", (37, 32))
-    matrix("language_model.lm_head", (37, 32))
-    for suffix in ("", "_mot_gen"):
-        state[f"language_model.model.norm{suffix}.weight"] = torch.ones(
-            32, dtype=dtype
-        )
-        for layer in range(2):
-            prefix = f"language_model.model.layers.{layer}."
-            for norm in ("input_layernorm", "post_attention_layernorm"):
-                state[prefix + norm + suffix + ".weight"] = torch.ones(
-                    32, dtype=dtype
-                )
-            for name, width in (("q", 32), ("k", 16), ("v", 16), ("o", 32)):
-                matrix(prefix + f"self_attn.{name}_proj{suffix}", (width, 32))
-                if suffix:
-                    state[
-                        prefix + f"self_attn.{name}_proj{suffix}.weight"
-                    ].zero_()
-            for name in ("q_norm", "q_norm_hw", "k_norm", "k_norm_hw"):
-                state[prefix + f"self_attn.{name}{suffix}.weight"] = (
-                    1 + torch.randn(4) * 0.1
-                ).to(dtype)
-            for name, shape in (
-                ("gate", (48, 32)),
-                ("up", (48, 32)),
-                ("down", (32, 48)),
-            ):
-                matrix(prefix + f"mlp{suffix}.{name}_proj", shape)
-                if suffix:
-                    state[prefix + f"mlp{suffix}.{name}_proj.weight"].zero_()
-    for prefix in ("vision_model", "fm_modules.vision_model_mot_gen"):
-        matrix(prefix + ".embeddings.patch_embedding", (16, 3, 2, 2), bias=True)
-        matrix(
-            prefix + ".embeddings.dense_embedding", (32, 16, 2, 2), bias=True
-        )
-    for prefix in (
-        "fm_modules.timestep_embedder",
-        "fm_modules.noise_scale_embedder",
-    ):
-        matrix(prefix + ".mlp.0", (32, 256), bias=True)
-        matrix(prefix + ".mlp.2", (32, 32), bias=True)
-    matrix("fm_modules.fm_head.0", (32, 32), bias=True)
-    matrix("fm_modules.fm_head.2", (48, 32), bias=True)
-    save_file(state, root / "model.safetensors")
-    model = loading.load_model(
-        u1.Model,
-        config,
-        checkpoint=(
-            checkpoint.Config("primary").resolve(root, io=loading.Config()),
-        ),
-        mapping=u1.checkpoint_mappings,
-        weights=weights.Config(dtype=dtype),
-        device="cpu",
-    ).model
-    return model, state
 
 
 def _rms(x, weight):
@@ -241,7 +163,7 @@ def _time(value, state, prefix):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_cached_text_matches_axial_attention_equations(tmp_path, dtype):
-    model, state = _checkpoint(tmp_path, dtype)
+    model, state = sensenova_checkpoint(tmp_path, dtype)
     tokens = torch.tensor([1, 5, 2, 8])
     expected = _text(tokens, state)
     with PrefixCache(
@@ -281,7 +203,7 @@ def test_cached_text_matches_axial_attention_equations(tmp_path, dtype):
 def test_images_and_velocity_follow_independent_equations(
     tmp_path, worker_inputs
 ):
-    model, state = _checkpoint(tmp_path, torch.bfloat16)
+    model, state = sensenova_checkpoint(tmp_path, torch.bfloat16)
     pixels = torch.linspace(-1, 1, 3 * 8 * 8).reshape(1, 3, 8, 8).bfloat16()
     grid = torch.tensor([[4, 4]])
     actual = model.vision_encoder.encode(
@@ -362,7 +284,7 @@ def test_tied_vocabulary_uses_the_canonical_embedding_at_pipeline_endpoints(
 
     from uniserve.distributed import DeviceMesh
 
-    template, _ = _checkpoint(tmp_path, torch.float32)
+    template, _ = sensenova_checkpoint(tmp_path, torch.float32)
     config = replace(
         template.config,
         text=replace(template.config.text, tie_word_embeddings=True),

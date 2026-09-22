@@ -374,9 +374,7 @@ class ModelExecutor:
             )
             try:
                 if stream is not None:
-                    stream.wait_stream(
-                        torch.cuda.current_stream(binding.device)
-                    )
+                    stream.wait(torch.cuda.current_stream(binding.device))
                 with self.graph_storage.allocate(entry):
                     context.prepare(size)
                 self.graph_storage.check()
@@ -438,7 +436,7 @@ class ModelExecutor:
                 owner.close()
                 raise
             self._module_streams[key] = owner
-        return self._module_streams[key].stream
+        return self._module_streams[key]
 
     def call_stream(self, call):
         """Select a standalone capability's stream.
@@ -475,9 +473,10 @@ class ModelExecutor:
 
         if len(calls) != 1:
             raise InputError("call requires one bound numerical capability")
-        return self.module_stream(
+        owner = self.module_stream(
             call.component, method=calls[0].entry_point.method
         )
+        return None if owner is None else owner.stream
 
     def _initialize_streams(self, *, event_slots):
         """Realize execution grants for both staged and standalone.
@@ -888,7 +887,7 @@ class ModelExecutor:
                             )
                             else None,
                             attention=self.attention,
-                            stream=None if stream is None else stream.stream,
+                            stream=stream,
                             groups=call.groups,
                         )
                         # Text staging counts canonical tokens. Spatial codecs
@@ -1119,18 +1118,18 @@ class ModelExecutor:
         self._closed = True
 
         if aborted:
-            from uniserve.runtime.execution import close_stream_collectives
             from uniserve.runtime.resources import retain_until_exit
 
+            # Each stream owner retains its communicators, windows and native
+            # stream without waiting for peers or the device.
             retain_until_exit(self)
-            streams = {
-                *(owner.stream for owner in self._module_streams.values()),
-                *(owner.stream for _, owner in self._lane_streams),
-            }
             close_resources(
                 *(
-                    partial(close_stream_collectives, stream, aborted=True)
-                    for stream in streams
+                    partial(owner.close, aborted=True)
+                    for owner in (
+                        *self._module_streams.values(),
+                        *(owner for _, owner in self._lane_streams),
+                    )
                 )
             )
             return
@@ -1141,17 +1140,10 @@ class ModelExecutor:
         for entry in self.entries.values():
             actions.append(entry.close)
 
-        # A stream's communicator bindings are released with it, because they
-        # are shared by every context that ran on it rather than owned by
-        # whichever one established them.
-        from uniserve.runtime.execution import close_stream_collectives
-
-        actions.extend(
-            partial(close_stream_collectives, owner.stream, aborted=aborted)
-            for owner in self._module_streams.values()
-        )
-        # Streams close in reverse creation order so forks retire before
-        # the lane streams they borrow from.
+        # Each stream retires the communicators every context on it shared,
+        # then its native resources. Streams close in reverse creation order
+        # so forks retire before the lane streams they borrow from, on every
+        # rank in the same order.
         actions.extend(
             stream.close
             for stream in reversed(tuple(self._module_streams.values()))

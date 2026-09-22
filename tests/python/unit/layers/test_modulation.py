@@ -4,15 +4,16 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from uniserve import ops
-from uniserve.ops import (
+from uniserve.nn.functional import (
     gated_residual,
     gated_residual_rms_norm,
     gated_residual_rms_norm_fp8,
     modulated_rms_norm,
+    silu_and_mul,
     value_first_swiglu,
     value_first_swiglu_fp8,
 )
+from uniserve.quantization import Quantizer
 
 pytestmark = [
     pytest.mark.unit,
@@ -244,8 +245,16 @@ def test_text_fp8_swiglu_matches_unfused_boundary() -> None:
         device="cuda",
         dtype=torch.bfloat16,
     )
-    expected_activated = ops.silu_and_mul(gate_up)
-    actual_activated_fp8, actual_activated_scale = ops.silu_and_mul_fp8(gate_up)
+    expected_activated = silu_and_mul(gate_up)
+    encoded = Quantizer("fp8", axis=0).quantize(
+        torch.zeros_like(expected_activated)
+    )
+    silu_and_mul(gate_up, out=encoded)
+    buffers = encoded.buffers()
+    actual_activated_fp8, actual_activated_scale = (
+        buffers["values"],
+        buffers["scale"],
+    )
 
     _assert_e4m3_error(
         actual_activated_fp8, actual_activated_scale, expected_activated

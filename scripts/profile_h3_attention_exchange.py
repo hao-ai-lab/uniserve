@@ -5,12 +5,12 @@ import os
 
 import torch
 import torch.distributed as dist
-
-from uniserve.distributed import DeviceMesh
-from uniserve.ops.video_sparse import (
+from uniserve_kernels.attention.vsa_tiles import (
     compose_to_head_shards,
     unpack_add_compression,
 )
+
+from uniserve.distributed import DeviceMesh
 from uniserve.runtime import TensorBuffers, initialize_process_groups
 from uniserve.tensors import BufferConfig
 from uniserve_worker.config.deployment import ParallelConfig, SequenceConfig

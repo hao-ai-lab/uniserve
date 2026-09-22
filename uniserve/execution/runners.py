@@ -37,8 +37,10 @@ ResultT = TypeVar("ResultT")
 class ModelRunner(Generic[ModelT, SizeT]):
     """Run one numerical module through its already-bound execution context.
 
-    The model and context are borrowed. The runner connects the caller's CUDA
-    stream to the context stream without exposing stream policy to the model.
+    The model and context are borrowed; the context's owner decides their
+    lifetime, and calls fail once that context is closed. The runner connects
+    the caller's CUDA stream to the context stream without exposing stream
+    policy to the model.
     """
 
     def __init__(
@@ -50,14 +52,13 @@ class ModelRunner(Generic[ModelT, SizeT]):
             )
         self.model = model
         self.context = context
-        self.closed = False
 
     def warmup(self, size: SizeT) -> None:
-        """Prepare numerical operators and workspace.
+        """Prepare numerical operators and workspace for a maximum size.
 
-        For the requested maximum size.
+        Preparation replaces the context's previous capacity. Every later call
+        must fit within ``size``; preparing again is needed only to change it.
         """
-        self._ensure_open()
         self.context.prepare(size)
 
     def _run(self, call: Callable[..., ResultT], *args, **kwargs) -> ResultT:
@@ -65,43 +66,18 @@ class ModelRunner(Generic[ModelT, SizeT]):
 
         Connect the result to the caller's stream.
         """
-        self._ensure_open()
-        stream = self.context.stream
+        owner = self.context.stream
         caller = None
-        if stream is not None:
-            with torch.cuda.device(stream.device):
-                caller = torch.cuda.current_stream(stream.device)
-                if caller != stream:
-                    stream.wait_stream(caller)
+        if owner is not None:
+            caller = torch.cuda.current_stream(owner.device)
+            owner.wait(caller)
 
         with self.context.activate():
             result = call(*args, **kwargs)
 
-        if caller is not None and caller != stream:
-            caller.wait_stream(stream)
+        if caller is not None and caller != owner.stream:
+            caller.wait_stream(owner.stream)
         return result
-
-    def _ensure_open(self) -> None:
-        if self.closed:
-            raise RuntimeError("model runner is closed")
-
-    def close(self) -> None:
-        """Reject future calls after callers have finished borrowed outputs."""
-        if self.closed:
-            return
-        self.closed = True
-
-    def __enter__(self):
-        self._ensure_open()
-        return self
-
-    def __exit__(self, exc_type, exc, traceback):
-        try:
-            self.close()
-        except BaseException as error:
-            if exc is None:
-                raise
-            exc.add_note(f"Model runner cleanup also failed: {error!r}")
 
 
 class TextRunner(ModelRunner[CausalLM, TextSize]):
@@ -114,6 +90,12 @@ class TextRunner(ModelRunner[CausalLM, TextSize]):
         self.inputs = None
 
     def forward(self, inputs: TextInput) -> torch.Tensor:
+        """Bind this call's attention metadata once, then evaluate the model.
+
+        Attention layers reuse the plans bound here for this call instead of
+        planning again; changed or mutated metadata is bound by the next call.
+        """
+
         def call() -> torch.Tensor:
             self.context.bind_attention(inputs.attention)
             return self.model(inputs)
@@ -131,12 +113,13 @@ class TextRunner(ModelRunner[CausalLM, TextSize]):
 class EncoderRunner(
     ModelRunner[Encoder[InputT], SizeT], Generic[InputT, SizeT]
 ):
-    """Run a homogeneous encoder through prepared numerical resources."""
+    """Run a homogeneous encoder through prepared numerical resources.
 
-    def encode(
-        self, inputs: InputT, *, size: SizeT
-    ) -> tuple[torch.Tensor, ...] | None:
-        self.warmup(size)
+    Prepare the encoder's capacity with :meth:`warmup` before encoding; every
+    call must fit within the prepared size.
+    """
+
+    def encode(self, inputs: InputT) -> tuple[torch.Tensor, ...] | None:
         return self._run(self.model.encode, inputs)
 
 

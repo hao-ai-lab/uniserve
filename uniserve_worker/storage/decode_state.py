@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import torch
+from uniserve_kernels.triton import launchable
 
 from uniserve.runtime.tensor_buffers import TensorBuffers
-from uniserve.runtime.triton import triton_available
 from uniserve.tensors import BufferConfig
 from uniserve_worker.storage import _decode_state as kernels
 
@@ -96,7 +96,7 @@ class DecodeState:
         if (
             kernels.triton is not None
             and self.device.type == "cuda"
-            and triton_available(self.device)
+            and launchable(self.device)
         ):
             self._reset_device_row(0, 0, 0, 0)
             kernels._publish_decode_kernel[(1,)](
@@ -329,7 +329,7 @@ class DecodeState:
         if (
             kernels.triton is not None
             and self.device.type == "cuda"
-            and triton_available(self.device)
+            and launchable(self.device)
         ):
             # Unique validated slots bound count by the owned pool capacity.
             # Mask live rows without specializing on each arriving batch size.
@@ -444,7 +444,7 @@ class DecodeState:
 
         path.
         """
-        if kernels.triton is not None and triton_available(self.device):
+        if kernels.triton is not None and launchable(self.device):
             block_size = 256
             span = max(self.continuation_width, self.vocab_size)
             kernels._reset_row_kernel[(kernels.triton.cdiv(span, block_size),)](

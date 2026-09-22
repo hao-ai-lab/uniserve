@@ -8,7 +8,7 @@ from torch import nn
 from uniserve import cache
 from uniserve.cache import mha
 from uniserve.distributed import Communicator, DeviceMesh
-from uniserve.distributed._tokens import _TokenShard
+from uniserve.distributed.tokens import TokenShard
 from uniserve.nn.attention import Attention, AttentionInput, VarlenInput
 from uniserve.nn.functional import add_rms_norm
 from uniserve.nn.norm import RMSNorm
@@ -74,7 +74,7 @@ class TransformerDecoder(nn.Module):
                     result[child.cache_name] = mha.Config(
                         child.num_kv_heads,
                         child.head_dim,
-                        child._head_indices,
+                        child.head_indices,
                         dtype,
                     )
         return cache.Config(result)
@@ -97,7 +97,7 @@ class TransformerDecoder(nn.Module):
         count = positions.shape[-1]
         if not routes and self._default_route is not None:
             routes = (RouteSpan(self._default_route, 0, count),)
-        partition = _TokenShard(count, self._tokens)
+        partition = TokenShard(count, self._tokens)
         positions = partition.local(positions, dim=positions.ndim - 1)
         if self._pipeline.rank == 0:
             if embeddings is None or embeddings.shape != (

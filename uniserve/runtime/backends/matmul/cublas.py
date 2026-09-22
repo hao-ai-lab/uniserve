@@ -4,7 +4,7 @@ import torch
 
 from uniserve.quantization import QuantizedTensor
 
-from . import Operator as _Operator
+from .base import Operator as _Operator
 from .grouped import Backend as _Backend
 
 

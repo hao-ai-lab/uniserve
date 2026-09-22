@@ -17,7 +17,9 @@ from uniserve.nn.rope import DynamicScaling, LinearScaling, LongRoPEScaling
 pytestmark = pytest.mark.unit
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
 def test_partial_qk_rotation_normalizes_the_complete_head_in_place(device):
     generator = torch.Generator().manual_seed(182)
     projected = torch.randn(67, 3, 4, 128, generator=generator).to(
@@ -54,7 +56,8 @@ def test_partial_qk_rotation_normalizes_the_complete_head_in_place(device):
         actual = qk_norm_rope(
             query,
             key,
-            *weights,
+            weights[:1],
+            weights[1:],
             (cosine,),
             (sine,),
             eps=1e-5,
@@ -103,7 +106,55 @@ def test_partial_rotary_preserves_trailing_features_and_output(rotation):
     torch.testing.assert_close(out, expected)
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
+@pytest.mark.parametrize("rotation", ["split", "interleaved"])
+def test_rotation_rounds_once_from_fp32_products(device, rotation):
+    # BF16 inputs whose products cancel expose any low-precision intermediate.
+    value = torch.tensor(
+        [[[0.77, 1.11, -0.31, 0.48]], [[-1.5, 0.25, 2.0, -0.75]]],
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    cosine = torch.tensor(
+        [[0.91, 0.83], [0.12, -0.99]], dtype=torch.bfloat16, device=device
+    )
+    sine = torch.tensor(
+        [[0.37, -0.42], [0.99, 0.14]], dtype=torch.bfloat16, device=device
+    )
+    expected = _rotate(
+        value.float(), cosine.float(), sine.float(), rotation
+    ).to(torch.bfloat16)
+
+    with torch.inference_mode():
+        actual = apply_rotary(value, cosine, sine, rotation=rotation)
+
+    if device == "cpu":
+        assert torch.equal(actual, expected)
+    else:
+        # Fused multiply-adds may differ in the last FP32 bit before rounding.
+        torch.testing.assert_close(actual, expected, rtol=2**-8, atol=2**-16)
+
+
+@pytest.mark.parametrize("rotation", ["split", "interleaved"])
+def test_rotary_factors_broadcast_over_every_head(rotation):
+    value = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
+    identity = apply_rotary(
+        value, torch.ones(2, 2), torch.zeros(2, 2), rotation=rotation
+    )
+    assert torch.equal(identity, value)
+
+    phase = torch.tensor([[0.5, -1.25], [2.0, 0.75]])
+    torch.testing.assert_close(
+        apply_rotary(value, phase.cos(), phase.sin(), rotation=rotation),
+        _rotate(value, phase.cos(), phase.sin(), rotation),
+    )
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
 def test_dynamic_rotary_calls_do_not_change_another_sequence_frequency_domain(
     device,
 ):
@@ -136,6 +187,7 @@ def test_dynamic_rotary_calls_do_not_change_another_sequence_frequency_domain(
         (torch.bfloat16, torch.float32, (0, 3)),
     ],
 )
+@pytest.mark.gpu
 def test_rotary_factors_preserve_position_views_and_fp32_phase(
     position_dtype, output_dtype, shape
 ):
@@ -171,6 +223,7 @@ def test_rotary_factors_preserve_position_views_and_fp32_phase(
         torch.testing.assert_close(value, reference, rtol=0, atol=0)
 
 
+@pytest.mark.gpu
 def test_rotary_factors_read_changed_positions_on_graph_replay():
     rotary = RotaryEmbedding(128, theta=1000000).cuda()
     positions = torch.arange(40, device="cuda", dtype=torch.int64)
@@ -343,3 +396,270 @@ def test_axial_projection_preserves_independent_normalization_domains():
         network(hidden, cosine, sine), expected, strict=True
     ):
         torch.testing.assert_close(actual, target)
+
+
+def _normalize(value, weight, eps):
+    value = value.double()
+    return (
+        value
+        * torch.rsqrt(value.square().mean(-1, keepdim=True) + eps)
+        * weight.double()
+    )
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
+@pytest.mark.parametrize(
+    "axis_dims", ((6, 2, 2), (96, 48, 48), (128, 64, 64), (512, 256, 256))
+)
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
+def test_shared_domain_normalizes_its_axes_with_one_denominator(
+    device, axis_dims, dtype
+):
+    generator = torch.Generator(device=device).manual_seed(73)
+    width = sum(axis_dims)
+    query = torch.randn(
+        (5, 8, width), generator=generator, device=device, dtype=dtype
+    )
+    key = torch.randn(
+        (5, 2, width), generator=generator, device=device, dtype=dtype
+    )
+    # One weight per domain: the leading axis alone, then both tail axes.
+    weights = tuple(
+        tuple(
+            torch.randn(
+                (size,), generator=generator, device=device, dtype=dtype
+            )
+            for size in (axis_dims[0], sum(axis_dims[1:]))
+        )
+        for _ in range(2)
+    )
+    angles = tuple(
+        torch.randn((5, size // 2), generator=generator, device=device)
+        for size in axis_dims
+    )
+    cosine = tuple(value.cos() for value in angles)
+    sine = tuple(value.sin() for value in angles)
+
+    with torch.inference_mode():
+        actual = qk_norm_rope(
+            query,
+            key,
+            *weights,
+            cosine,
+            sine,
+            eps=1e-6,
+            axis_dims=axis_dims,
+        )
+
+    tolerance = 2e-2 if dtype is torch.bfloat16 else 2e-3
+    for source, domains, result in zip(
+        (query, key), weights, actual, strict=True
+    ):
+        head, tail = source.split((axis_dims[0], sum(axis_dims[1:])), dim=-1)
+        normalized = torch.cat(
+            (
+                _normalize(head, domains[0], 1e-6),
+                _normalize(tail, domains[1], 1e-6),
+            ),
+            dim=-1,
+        )
+        expected = torch.cat(
+            tuple(
+                _rotate(part, cos.double(), sin.double(), "split")
+                for part, cos, sin in zip(
+                    normalized.split(axis_dims, dim=-1),
+                    cosine,
+                    sine,
+                    strict=True,
+                )
+            ),
+            dim=-1,
+        )
+        torch.testing.assert_close(
+            result.double(), expected, rtol=tolerance, atol=tolerance
+        )
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
+@pytest.mark.parametrize("tokens", [1, 5])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_unrotated_domain_is_normalized_without_rotation(device, tokens, dtype):
+    generator = torch.Generator(device=device).manual_seed(7)
+    query = torch.randn(
+        tokens, 8, 128, generator=generator, device=device, dtype=dtype
+    )
+    key = torch.randn(
+        tokens, 2, 128, generator=generator, device=device, dtype=dtype
+    )
+    weights = tuple(
+        tuple(
+            torch.rand(width, generator=generator, device=device).to(dtype)
+            + 0.5
+            for width in (64, 64)
+        )
+        for _ in range(2)
+    )
+    angles = torch.rand(tokens, 32, generator=generator, device=device) * 6.0
+    # A zero-width factor table leaves its axis unrotated.
+    cosine = (angles.cos(), angles.new_empty(tokens, 0))
+    sine = (angles.sin(), angles.new_empty(tokens, 0))
+
+    with torch.inference_mode():
+        actual = qk_norm_rope(
+            query,
+            key,
+            *weights,
+            cosine,
+            sine,
+            eps=1e-6,
+            axis_dims=(64, 64),
+        )
+
+    tolerance = 2e-2 if dtype is torch.bfloat16 else 2e-3
+    for source, domains, result in zip(
+        (query, key), weights, actual, strict=True
+    ):
+        head, tail = source.split((64, 64), dim=-1)
+        expected = torch.cat(
+            (
+                _rotate(
+                    _normalize(head, domains[0], 1e-6),
+                    cosine[0].double(),
+                    sine[0].double(),
+                    "split",
+                ),
+                _normalize(tail, domains[1], 1e-6),
+            ),
+            dim=-1,
+        )
+        torch.testing.assert_close(
+            result.double(), expected, rtol=tolerance, atol=tolerance
+        )
+
+
+def test_normalization_domains_must_end_on_rotary_axis_boundaries():
+    value = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]])
+    factors = (torch.ones(1, 1), torch.ones(1, 1))
+    zeros = (torch.zeros(1, 1), torch.zeros(1, 1))
+    weight = torch.ones(4)
+
+    # One four-wide domain shares a denominator across both axes; two
+    # two-wide domains normalize each axis separately.
+    joint, _ = qk_norm_rope(
+        value,
+        value,
+        (weight,),
+        (weight,),
+        factors,
+        zeros,
+        eps=1e-6,
+        axis_dims=(2, 2),
+    )
+    separate, _ = qk_norm_rope(
+        value,
+        value,
+        (weight[:2], weight[2:]),
+        (weight[:2].clone(), weight[2:].clone()),
+        factors,
+        zeros,
+        eps=1e-6,
+        axis_dims=(2, 2),
+    )
+    torch.testing.assert_close(joint, _normalize(value, weight, 1e-6).float())
+    torch.testing.assert_close(
+        separate,
+        torch.cat(
+            tuple(
+                _normalize(part, weight[:2], 1e-6)
+                for part in value.split(2, dim=-1)
+            ),
+            dim=-1,
+        ).float(),
+    )
+
+    for domains in ((weight, weight), (torch.ones(3), torch.ones(1))):
+        with pytest.raises(ValueError, match="normalization domains"):
+            qk_norm_rope(
+                value,
+                value,
+                domains,
+                domains,
+                factors,
+                zeros,
+                eps=1e-6,
+                axis_dims=(2, 2),
+            )
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
+@pytest.mark.parametrize(
+    "shape", ((1, 3, 1, 128), (17, 64, 8, 128), (3, 5, 2, 96), (2, 3, 1, 1024))
+)
+@pytest.mark.parametrize(
+    "dtype", (torch.bfloat16, torch.float16, torch.float32)
+)
+@pytest.mark.parametrize("in_place", (False, True))
+def test_full_head_rotation_preserves_strided_heads_and_value_rows(
+    device, shape, dtype, in_place
+):
+    tokens, query_heads, key_heads, width = shape
+    generator = torch.Generator(device=device).manual_seed(83)
+    packed = torch.randn(
+        (tokens, query_heads + 2 * key_heads, width),
+        generator=generator,
+        device=device,
+        dtype=dtype,
+    )
+    query, key, value = packed.split((query_heads, key_heads, key_heads), dim=1)
+    original = packed.clone()
+    # Query and key weights may have different storage dtypes. Both affine
+    # transforms belong to the same FP32 normalization/rotation contract.
+    weights = (
+        torch.randn(
+            width, generator=generator, device=device, dtype=torch.float32
+        ),
+        torch.randn(width, generator=generator, device=device, dtype=dtype),
+    )
+    angles = torch.randn(
+        (tokens, width // 2), generator=generator, device=device
+    )
+    cosine, sine = angles.cos(), angles.sin()
+    sources = (query.clone(), key.clone())
+    with torch.inference_mode():
+        actual = qk_norm_rope(
+            query,
+            key,
+            weights[:1],
+            weights[1:],
+            (cosine,),
+            (sine,),
+            eps=1e-6,
+            axis_dims=(width,),
+            out=(query, key) if in_place else None,
+        )
+
+    for source, weight, result in zip(sources, weights, actual, strict=True):
+        expected = _rotate(
+            _normalize(source, weight, 1e-6),
+            cosine.double(),
+            sine.double(),
+            "split",
+        )
+        if dtype is torch.float32:
+            torch.testing.assert_close(result, expected.float())
+        else:
+            tolerance = 2e-2 if dtype is torch.bfloat16 else 2e-3
+            torch.testing.assert_close(
+                result.double(), expected, rtol=tolerance, atol=tolerance
+            )
+    if in_place:
+        assert actual[0] is query and actual[1] is key
+        assert torch.equal(value, original[:, query_heads + key_heads :])
+    else:
+        assert torch.equal(packed, original)

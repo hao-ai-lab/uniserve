@@ -6,8 +6,12 @@ They also preserve wire semantics.
 import pickle
 from dataclasses import replace
 
+import pytest
+
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.tensor import DType, ShapeBound, TensorRef
+
+pytestmark = pytest.mark.unit
 
 
 def test_buffer_lookup_preserves_identity_across_reconstruction_and_versions():

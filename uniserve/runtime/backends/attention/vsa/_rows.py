@@ -6,9 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import torch
-
-from uniserve.nn.attention.vsa.inputs import Pattern
-from uniserve.ops.video_sparse_rows import (
+from uniserve_kernels.attention.vsa_rows import (
     compose_attention,
     pack_sparse_input_rows,
 )
@@ -37,7 +35,6 @@ class _Rows:
         mask_block_indices: torch.Tensor,
         mask_block_count: torch.Tensor,
         valid_sizes: torch.Tensor,
-        pattern: Pattern,
         gate: torch.Tensor,
         compressed: torch.Tensor,
         attention_output: torch.Tensor,
@@ -56,10 +53,6 @@ class _Rows:
         transport destinations. The attention scratch stays borrowed until
         the last interval has been composed.
         """
-        # The row path reads the live device block maps on every call, so the
-        # static pattern carries no information here.
-        del pattern
-
         if (
             query.ndim != 3
             or query.shape != key.shape

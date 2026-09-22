@@ -1,8 +1,8 @@
 """FlashInfer head-flattened BSR with live block IDs and per-key validity."""
 
 import torch
+from uniserve_kernels.attention.vsa_rows import pack_sparse_input_rows
 
-from uniserve.ops.video_sparse_rows import pack_sparse_input_rows
 from uniserve.tensors import BufferConfig
 
 from . import Backend as BaseBackend

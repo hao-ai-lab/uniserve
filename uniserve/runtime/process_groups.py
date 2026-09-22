@@ -37,7 +37,10 @@ class ProcessGroups:
         traceback: TracebackType | None,
     ) -> None:
         try:
-            self.close(aborted=exc_value is not None)
+            # Destroying an owned group can wait on peers this rank cannot
+            # observe, so an exception retains owned groups. Without owned
+            # groups there is nothing whose retirement needs another rank.
+            self.close(aborted=exc_value is not None and bool(self._groups))
         except BaseException as cleanup_error:
             if exc_value is None:
                 raise
@@ -138,6 +141,8 @@ class ProcessGroups:
             from .resources import retain_until_exit
 
             retain_until_exit(self)
+            return
+        if not self._groups:
             return
         if self.device.type == "cuda":
             actions.append(partial(torch.cuda.synchronize, self.device))

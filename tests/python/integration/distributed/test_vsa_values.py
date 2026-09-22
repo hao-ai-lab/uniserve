@@ -18,6 +18,7 @@ from uniserve.nn.attention import (
 )
 from uniserve.runtime import (
     CUDAGraph,
+    CUDAStream,
     ExecutionContext,
     initialize_process_groups,
 )
@@ -187,12 +188,12 @@ def _run(rank, rendezvous):
             local_begin = begin + heads.rank * (query_tokens // heads.size)
             local_end = local_begin + query_tokens // heads.size
             result = tensor((local_end - local_begin, 8, 128), torch.bfloat16)
-            stream = torch.cuda.Stream(device=device)
-            stream.wait_stream(torch.cuda.current_stream())
+            stream = CUDAStream.external(torch.cuda.Stream(device=device))
+            stream.wait(torch.cuda.current_stream())
             # The contract under test is the value each partition produces,
             # not which kernel produces it, so the provider is the one the
             # device selects rather than one architecture's kernel.
-            with ExecutionContext(layer, stream=stream) as execution:
+            with stream, ExecutionContext(layer, stream=stream) as execution:
                 execution.prepare(None)
 
                 def chunks():

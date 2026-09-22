@@ -15,9 +15,8 @@ import torch
 from tests.python.fixtures.model_metadata import neo_metadata
 from uniserve.loading import Config as IOConfig
 from uniserve.media import image
-from uniserve.model import ImageDenoiser, LatentInput
-from uniserve.nn.attention import DenseInput
-from uniserve.processing import BranchSource
+from uniserve.model import LatentInput
+from uniserve.nn.attention import SequenceLengths, VarlenInput
 
 pytestmark = pytest.mark.unit
 
@@ -40,22 +39,15 @@ def _stub_denoiser(tmp_path):
     return Model(Config()).denoiser
 
 
-@pytest.mark.parametrize(
-    "build", [_sensenova_denoiser, _stub_denoiser], ids=["sensenova_u1", "stub"]
-)
-def test_image_denoisers_bind_their_own_typed_input(build, tmp_path):
-    denoiser = build(tmp_path)
-    assert isinstance(denoiser, ImageDenoiser)
-    assert isinstance(denoiser.framing_tokens, int)
-    assert isinstance(denoiser.image_unconditional, BranchSource)
-    assert denoiser.max_sequence_tokens > 0
-
+def _bind(denoiser):
+    """Bind one two-by-two patch image and its framed attention sequence."""
     size = image.Config(
         height=denoiser.downsample * 2, width=denoiser.downsample * 2
     )
     rows, width = denoiser.latent_shape("image", size)
     sample = torch.zeros((rows, width), dtype=torch.float32)
     length = rows + denoiser.framing_tokens
+    lengths = SequenceLengths.from_lengths((length,), device="cpu")
 
     bound = denoiser.bind_inputs(
         latents={"image": (LatentInput(sample, torch.zeros(())),)},
@@ -63,9 +55,31 @@ def test_image_denoisers_bind_their_own_typed_input(build, tmp_path):
         step_index=0,
         positions=(torch.zeros((3, length), dtype=torch.int64),),
         sequence_lengths=(length,),
-        attention=DenseInput(causal=False, mask=None),
+        attention=VarlenInput(lengths, lengths, (False,)),
     )
+    return bound, sample, size
 
+
+@pytest.mark.parametrize(
+    "build", [_sensenova_denoiser, _stub_denoiser], ids=["sensenova_u1", "stub"]
+)
+def test_image_denoisers_bind_borrowed_latents(build, tmp_path):
+    bound, sample, size = _bind(build(tmp_path))
+
+    # Solver updates write the resident latent in place, so the bound input
+    # must borrow it rather than hold a copy.
     assert bound.latents["image"][0].tensor is sample
     assert bound.sizes == (size,)
     assert bound.step_index == 0
+
+
+def test_bound_input_drives_one_prediction_per_latent(tmp_path):
+    denoiser = _stub_denoiser(tmp_path)
+    bound, sample, _ = _bind(denoiser)
+
+    prediction = denoiser(bound, state={}, constants={}, workspace={})
+
+    (output,) = prediction["image"]
+    assert output.tensor.shape == sample.shape
+    assert output.tensor.dtype == denoiser.prediction_dtype
+    assert output.layout.shape == tuple(sample.shape)

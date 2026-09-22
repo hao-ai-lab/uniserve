@@ -7,7 +7,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from uniserve.nn.vision.patching import patchify_batch
+from uniserve.nn.functional import patchify
 from uniserve.nn.vision.position import get_flattened_position_ids_extrapolate
 
 
@@ -53,7 +53,7 @@ class PatchEncoder(nn.Module):
         positions = get_flattened_position_ids_extrapolate(
             height, width, patch, self.position_grid, device=pixels.device
         ).repeat(batch)
-        patches = patchify_batch(pixels, patch).reshape(
+        patches = patchify(pixels, patch_size=patch).reshape(
             -1, patch * patch * channels
         )
         tokens = (height // patch) * (width // patch)

@@ -8,14 +8,10 @@ from dataclasses import replace
 import pytest
 import torch
 
-from tests.python.integration.model_loading.test_bagel import (
-    _checkpoint as bagel_checkpoint,
-)
-from tests.python.integration.model_loading.test_bagel import (
-    _load as load_bagel,
-)
-from tests.python.integration.model_loading.test_sensenova_u1 import (
-    _checkpoint as u1_checkpoint,
+from tests.python.fixtures.checkpoints import (
+    bagel_checkpoint,
+    load_bagel,
+    sensenova_checkpoint,
 )
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.media import image
@@ -61,7 +57,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
         _, _, config = bagel_checkpoint(tmp_path)
         model = load_bagel(tmp_path, config)
     else:
-        model, _ = u1_checkpoint(tmp_path, torch.bfloat16)
+        model, _ = sensenova_checkpoint(tmp_path, torch.bfloat16)
     model.text.to("cuda:0")
     model.denoiser.to("cuda:0")
     if name == "sensenova_u1":
@@ -331,7 +327,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         _, _, architecture = bagel_checkpoint(tmp_path)
         model = load_bagel(tmp_path, architecture)
     else:
-        model, _ = u1_checkpoint(tmp_path, torch.bfloat16)
+        model, _ = sensenova_checkpoint(tmp_path, torch.bfloat16)
     model.text.to("cuda:0")
     model.denoiser.to("cuda:0")
     if name == "sensenova_u1":

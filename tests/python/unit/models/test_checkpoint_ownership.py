@@ -10,9 +10,7 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
 )
 from safetensors.torch import save_file
 
-from tests.python.integration.model_loading.test_bagel import (
-    _checkpoint as bagel_checkpoint,
-)
+from tests.python.fixtures.checkpoints import bagel_checkpoint
 from uniserve import loading
 from uniserve.distributed import DeviceMesh
 from uniserve.loading import checkpoint, weights

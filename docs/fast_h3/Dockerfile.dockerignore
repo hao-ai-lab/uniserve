@@ -14,8 +14,8 @@
 !uniserve_models/**
 !uniserve_worker
 !uniserve_worker/**
-!uniserve_kernel
-!uniserve_kernel/**
+!uniserve_kernels
+!uniserve_kernels/**
 !uniserve_eval
 !uniserve_eval/**
 **/__pycache__

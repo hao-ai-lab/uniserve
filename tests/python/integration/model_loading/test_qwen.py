@@ -5,8 +5,8 @@ Cached decoding agrees with the checkpoint equations as well.
 
 import pytest
 import torch
-from transformers import Qwen3Config, Qwen3ForCausalLM
 
+from tests.python.fixtures.checkpoints import qwen_checkpoint
 from uniserve import loading
 from uniserve.loading import weights
 from uniserve.model import EmbeddingReplacement, TextInput, TextSize
@@ -18,31 +18,9 @@ from uniserve_models import qwen3
 pytestmark = pytest.mark.integration
 
 
-def _checkpoint(root, tied=False, theta=1_000_000.0):
-    config = Qwen3Config(
-        vocab_size=37,
-        hidden_size=32,
-        intermediate_size=48,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        tie_word_embeddings=tied,
-        attention_bias=True,
-        max_position_embeddings=64,
-        rms_norm_eps=1e-6,
-        rope_theta=theta,
-    )
-    config._attn_implementation = "eager"
-    torch.manual_seed(481)
-    model = Qwen3ForCausalLM(config).eval()
-    model.save_pretrained(root)
-    return model
-
-
 @pytest.mark.parametrize("tied,theta", [(False, 10_000.0), (True, 1_000_000.0)])
 def test_checkpoint_prefill_decode_and_selected_logits(tmp_path, tied, theta):
-    reference = _checkpoint(tmp_path, tied, theta)
+    reference = qwen_checkpoint(tmp_path, tied, theta)
     io = loading.Config()
     config = models.read_config(tmp_path, io=io)
     result = models.load_model(
@@ -89,7 +67,7 @@ def test_checkpoint_prefill_decode_and_selected_logits(tmp_path, tied, theta):
 
 
 def test_embedding_replacement_matches_numerical_embedding_input(tmp_path):
-    reference = _checkpoint(tmp_path)
+    reference = qwen_checkpoint(tmp_path)
     io = loading.Config()
     model = loading.load_model(
         qwen3.Model,
@@ -272,7 +250,7 @@ def test_partitioned_checkpoint_decoder_matches_complete_model(
 ):
     import torch.multiprocessing as mp
 
-    reference = _checkpoint(tmp_path, tied=True)
+    reference = qwen_checkpoint(tmp_path, tied=True)
     with torch.no_grad():
         expected = reference(torch.tensor([[1, 3, 9, 2]])).logits
     torch.save(expected, tmp_path / "expected.pt")
@@ -298,7 +276,7 @@ def test_partitioned_checkpoint_decoder_matches_complete_model(
 def test_decoder_without_prefix_storage(tmp_path):
     from uniserve.nn.attention import SequenceLengths, VarlenInput
 
-    reference = _checkpoint(tmp_path)
+    reference = qwen_checkpoint(tmp_path)
     io = loading.Config()
     model = loading.load_model(
         qwen3.Model,
@@ -335,7 +313,7 @@ def test_text_encoder_retains_checkpoint_layers_and_sequence_boundaries(
 ):
     from uniserve.model import TextEncoder
 
-    reference = _checkpoint(tmp_path)
+    reference = qwen_checkpoint(tmp_path)
     io = loading.Config()
     model = loading.load_model(
         qwen3.Model,
@@ -431,7 +409,7 @@ def test_text_encoder_pipeline_restores_sequences_after_empty_token_shards(
 ):
     import torch.multiprocessing as mp
 
-    reference = _checkpoint(tmp_path)
+    reference = qwen_checkpoint(tmp_path)
     sequences = (
         (
             torch.tensor([1, 2, 3]),
@@ -462,7 +440,7 @@ def test_text_encoder_pipeline_restores_sequences_after_empty_token_shards(
 def test_public_partial_loading_exposes_selected_decoder_values(tmp_path):
     from uniserve.nn.attention import SequenceLengths, VarlenInput
 
-    reference = _checkpoint(tmp_path)
+    reference = qwen_checkpoint(tmp_path)
     config = models.read_config(tmp_path, modules=frozenset({"backbone"}))
     loaded = models.load_model(
         config, device="cpu", weights=weights.Config(dtype=torch.float32)

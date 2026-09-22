@@ -16,6 +16,7 @@ from .cuda import (
     verify_graph_context,
 )
 from .execution import ExecutionContext
+from .resources import streams_idle
 
 ResultT = TypeVar("ResultT")
 
@@ -58,9 +59,13 @@ class CUDAGraph(Generic[ResultT]):
 
         self.context = context
         self.pools = dict(pools or {})
-        self._computation = context.stream or torch.cuda.Stream(
-            device=context._device
-        )
+        if context.stream is not None:
+            self._computation = context.stream.stream
+        else:
+            # Replays on this stream read the context's backing, so the
+            # context accounts for it before releasing after a failure.
+            self._computation = torch.cuda.Stream(device=context._device)
+            context._graph_streams.add(self._computation)
         # A driver stream is never one of the pool's, so no context or lane
         # stream can coincide with it.
         self._raw_capture, self._capture = create_sibling_stream(
@@ -198,6 +203,7 @@ class CUDAGraph(Generic[ResultT]):
         finally:
             self._graph = self._output = self._call = None
             self.pools.clear()
+            self.context._graph_streams.discard(self._computation)
             self.context = None
             if self._raw_capture is not None:
                 # Only capture bookkeeping was ever launched here, and the
@@ -213,7 +219,12 @@ class CUDAGraph(Generic[ResultT]):
 
     def __exit__(self, exc_type, exc, traceback):
         try:
-            self.close(aborted=exc is not None)
+            # Release normally after an exception when capture and replay work
+            # has finished; unfinished work keeps the graph's backing alive.
+            self.close(
+                aborted=exc is not None
+                and not streams_idle((self._computation, self._capture))
+            )
         except BaseException as error:
             if exc is None:
                 raise

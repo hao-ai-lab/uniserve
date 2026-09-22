@@ -9,13 +9,14 @@ __all__ = [
 
 
 def ceil_div(value: int, divisor: int) -> int:
-    """Return the ceiling of ``value`` divided by ``divisor``.
+    """Return the ceiling of ``value / divisor`` for a positive divisor.
 
-    The divisor is clamped to ``>= 1`` so a zero or negative ``block_size``
-    cannot raise ``ZeroDivisionError``.
+    Capacity owners validate their own extents; a nonpositive divisor is a
+    caller error rather than a unit-sized capacity.
     """
-    divisor = max(1, int(divisor))
-    return (int(value) + divisor - 1) // divisor
+    if int(divisor) < 1:
+        raise ValueError("ceiling division requires a positive divisor")
+    return -(-int(value) // int(divisor))
 
 
 def bucketed_length(value: int) -> int:

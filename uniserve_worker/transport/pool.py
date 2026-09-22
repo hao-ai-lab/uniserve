@@ -253,7 +253,7 @@ class TransferPool:
                     stream.wait_event(producer)
                 for target, value in pairs:
                     if value.device.type == "cpu":
-                        from uniserve_kernel.peer_storage import (
+                        from uniserve_kernels.peer_storage import (
                             copy_host_device,
                         )
 

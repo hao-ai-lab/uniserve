@@ -77,14 +77,24 @@ class Config(StateConfig):
                 "K/V storage requires a nonnegative block count and "
                 "positive block size"
             )
+        if quantizer is not None and quantizer != Quantizer("fp8", axis=0):
+            raise ValueError(
+                "MHA state supports only FP8 with one scale per block"
+            )
+        # Encoded blocks decode to the layout's compute dtype, and rescaling
+        # rounds resident values through it, so no other logical dtype applies.
+        if (
+            quantizer is not None
+            and dtype is not None
+            and dtype != self.compute_dtype
+        ):
+            raise ValueError(
+                "FP8 K/V storage encodes the layout's compute dtype"
+            )
         dtype = self.compute_dtype if dtype is None else dtype
         if dtype not in {torch.float16, torch.bfloat16, torch.float32}:
             raise ValueError(
                 "K/V storage dtype must be a logical floating-point dtype"
-            )
-        if quantizer is not None and quantizer != Quantizer("fp8", axis=0):
-            raise ValueError(
-                "MHA state supports only FP8 with one scale per block"
             )
 
         # Values are stored as [blocks, tokens, local heads, head dim].
@@ -347,7 +357,7 @@ class State(PrefixState):
         Each FP8 block uses the maximum required by this update and its resident
         scale. Existing values round through the logical dtype before rescaling.
         """
-        from uniserve.runtime.paged_kv_math import paged_kv_write
+        from .paged import paged_kv_write
 
         self._validate_update(key, value, indices)
         if not indices.numel():
@@ -360,7 +370,6 @@ class State(PrefixState):
                 self.key,
                 self.value,
                 indices,
-                None,
                 key,
                 value,
                 cast=key.dtype != self.key.dtype
@@ -449,7 +458,7 @@ class State(PrefixState):
             else tensor
             for tensor in (self.key, self.value)
         )
-        paged_kv_write(*stores, indices, None, *encoded)
+        paged_kv_write(*stores, indices, *encoded)
 
     def transfer_blocks(
         self, block_ids: tuple[int, ...], *, start: int, length: int
