@@ -325,6 +325,91 @@ def _receive_tensor_shards(channel, backends: tuple[str, ...]) -> None:
         channel.close()
 
 
+def _receive_non_peer_cuda_product(channel, destination_device: str) -> None:
+    """Read one CUDA VMM product from a GPU outside this device's peer set."""
+    events = EventPool()
+    consumer = make_transport(
+        "cuda_vmm",
+        byte_capacity=16384,
+        ticket_capacity=2,
+        event_pool=events,
+        source=WorkerEndpoint.local("consumer"),
+    )
+    try:
+        tensor = TensorTransfer.from_mapping(channel.recv())
+        destination = torch.empty(tensor.shape, device=destination_device)
+        _consume(
+            fetch_tensor(
+                tensor,
+                destination,
+                bindings={(tensor.locations[0].source, "cuda_vmm"): consumer},
+            )
+        )
+        channel.send(destination.cpu().tolist())
+    finally:
+        consumer.close()
+        events.close()
+        channel.close()
+
+
+def test_cuda_vmm_stages_between_devices_without_peer_access() -> None:
+    """A same-host VMM product remains deliverable across PCIe islands."""
+    devices = range(torch.cuda.device_count())
+    pair = next(
+        (
+            (source, destination)
+            for source in devices
+            for destination in devices
+            if source != destination
+            and not torch.cuda.can_device_access_peer(destination, source)
+        ),
+        None,
+    )
+    if pair is None:
+        pytest.skip("host exposes peer access between every CUDA device")
+    source_device, destination_device = pair
+
+    context = mp.get_context("spawn")
+    parent, child = context.Pipe()
+    events = EventPool()
+    producer = make_transport(
+        "cuda_vmm",
+        byte_capacity=16384,
+        ticket_capacity=2,
+        event_pool=events,
+        source=WorkerEndpoint.local("producer"),
+    )
+    expected = torch.arange(
+        48, dtype=torch.float32, device=f"cuda:{source_device}"
+    ).reshape(6, 8)
+    location = producer.publish(expected)
+    process = context.Process(
+        target=_receive_non_peer_cuda_product,
+        args=(child, f"cuda:{destination_device}"),
+    )
+    try:
+        process.start()
+        child.close()
+        parent.send(
+            TensorTransfer(
+                shape=tuple(expected.shape), locations=(location,)
+            ).to_mapping()
+        )
+        assert parent.poll(45), "non-peer CUDA product did not arrive"
+        assert parent.recv() == expected.cpu().tolist()
+        process.join(30)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(30)
+        producer.release(location)
+        producer.close()
+        events.close()
+        parent.close()
+        child.close()
+
+
 @pytest.mark.parametrize("fragmented", (False, True))
 @pytest.mark.parametrize("backends", (("cuda_vmm",), ("shm", "cuda_vmm")))
 def test_tensor_delivery_gathers_shards_across_processes(
