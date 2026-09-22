@@ -7,7 +7,7 @@ import pytest
 from tests.python.fixtures.worker_config import stub_worker_config
 from uniserve_models.stub import Model, image_processor
 from uniserve_worker.bootstrap.capacity import derive_runtime_kv_capacity
-from uniserve_worker.bootstrap.worker_info_builder import build_worker_layout
+from uniserve_worker.bootstrap.report import build_worker_layout
 
 TEST_WORKER_CONFIG = stub_worker_config(64, max_batch_tokens=8192)
 
@@ -41,7 +41,7 @@ def _worker_config(*, token_capacity: int | None):
         device="cuda:0",
         block_size=BLOCK_SIZE,
         kv_token_capacity=token_capacity,
-        kv_memory_fraction=STATIC_FRACTION,
+        kv_storage_fraction=STATIC_FRACTION,
     )
 
 
@@ -80,7 +80,7 @@ def test_kv_storage_cannot_exceed_its_grant(tokens):
 
 
 def test_automatic_cuda_kv_capacity_requires_a_host_grant():
-    with pytest.raises(ValueError, match="host memory grant"):
+    with pytest.raises(ValueError, match="host storage grant"):
         derive_runtime_kv_capacity(
             block_size=64,
             kv_token_capacity=None,
@@ -93,7 +93,7 @@ def test_automatic_capacity_charges_request_and_input_storage() -> None:
     model = _model()
     config = replace(
         _worker_config(token_capacity=None),
-        pool_memory_bytes=32 * 1024**3,
+        pool_storage_bytes=32 * 1024**3,
         max_request_pool_size=4,
         max_batch_calls=4,
         max_batch_tokens=64,
@@ -116,7 +116,7 @@ def test_explicit_pages_cannot_displace_resident_encoder_storage() -> None:
     model = _model()
     config = replace(
         _worker_config(token_capacity=64),
-        pool_memory_bytes=32 * 1024**3,
+        pool_storage_bytes=32 * 1024**3,
         max_request_pool_size=4,
         max_batch_calls=4,
         max_batch_tokens=64,

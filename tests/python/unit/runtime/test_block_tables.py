@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from uniserve_worker.runtime.block_tables import BlockTables
+from uniserve_worker.storage.block_tables import BlockTables
 
 pytestmark = [pytest.mark.unit, pytest.mark.gpu]
 

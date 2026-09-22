@@ -11,9 +11,9 @@ import torch
 from tests.python.fixtures.diffusion import LinearDenoiser, Size
 from tests.python.fixtures.encoding import Model
 from uniserve.model import DenoiserInput, LatentInput
-from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.denoising_runner import DenoisingRunner
-from uniserve_worker.execution.model_runner import ModelRunner
+from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.execution.model_executor import ModelExecutor
+from uniserve_worker.model_executor.diffusion_runner import TrajectoryRunner
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -25,7 +25,7 @@ def test_initial_inputs_are_ready_for_consumption_after_preparation(
 ):
     device = torch.device("cuda", 0)
     model = Model().to(device)
-    runner = ModelRunner(model, WorkerConfig(device=str(device)))
+    runner = ModelExecutor(model, WorkerConfig(device=str(device)))
     source = torch.empty(
         4 * 1024 * 1024, dtype=torch.float32, pin_memory=True
     ).fill_(7)
@@ -73,7 +73,7 @@ def test_denoising_reprepared_constants_and_slot_sizes_advance_one_step(
         if partition is not None
         else torch.cuda.Stream(device=device)
     )
-    runner = DenoisingRunner(
+    runner = TrajectoryRunner(
         model,
         device=device,
         stream=stream,
@@ -189,7 +189,7 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
             values[slot] = result["image"][0].clone()
         return values, paths
 
-    eager = DenoisingRunner(
+    eager = TrajectoryRunner(
         model, device=device, stream=None, groups=(), capacity=2
     )
     try:
@@ -202,7 +202,7 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
         torch.cuda.current_stream(device).synchronize()
         eager.close()
 
-    runner = DenoisingRunner(
+    runner = TrajectoryRunner(
         model,
         device=device,
         stream=torch.cuda.Stream(device=device),

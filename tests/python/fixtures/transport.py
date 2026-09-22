@@ -9,11 +9,8 @@ from __future__ import annotations
 
 from uniserve.runtime import EventPool
 from uniserve_worker.protocol.transfer import WorkerEndpoint
-from uniserve_worker.transfer.tickets import (
-    Transport,
-    TransportKind,
-    make_transports,
-)
+from uniserve_worker.transport import make_transports
+from uniserve_worker.transport.interface import Transport, TransportKind
 
 
 def make_transport(

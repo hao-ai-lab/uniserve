@@ -48,12 +48,13 @@ pub struct WorkerConfig {
     pub ranks: Vec<WorkerRank>,
     pub components: BTreeMap<String, ComponentConfig>,
     pub queue_depth: usize,
-    /// Per-rank share of device memory available to this worker process.
+    /// Per-rank share of device storage available to this worker process.
     ///
     /// Distinct WorkerGroups may share one physical GPU. Their configured
     /// shares must leave enough aggregate headroom for the device runtime.
     #[serde(default)]
-    pub memory_fraction: Option<f64>,
+    #[serde(rename = "memory_fraction")]
+    pub storage_fraction: Option<f64>,
 }
 
 impl WorkerConfig {
@@ -64,10 +65,10 @@ impl WorkerConfig {
             "worker {} queue depth must be positive",
             self.id
         );
-        if let Some(fraction) = self.memory_fraction {
+        if let Some(fraction) = self.storage_fraction {
             anyhow::ensure!(
                 fraction.is_finite() && fraction > 0.0 && fraction <= 1.0,
-                "worker {} memory fraction must be finite and in (0, 1]",
+                "worker {} storage fraction must be finite and in (0, 1]",
                 self.id
             );
         }
@@ -201,7 +202,7 @@ impl WorkerConfig {
             ranks: placement,
             components,
             queue_depth,
-            memory_fraction: None,
+            storage_fraction: None,
         }
     }
 }
@@ -357,9 +358,9 @@ impl EngineCore {
                 components: worker.components.clone(),
                 peers: peers.clone(),
                 queue_depth: worker.queue_depth,
-                kv_memory_fraction: worker
-                    .memory_fraction
-                    .unwrap_or(config.worker_process.kv_memory_fraction),
+                kv_storage_fraction: worker
+                    .storage_fraction
+                    .unwrap_or(config.worker_process.kv_storage_fraction),
                 transfer: config.transfer.clone(),
                 ..config.worker_process.clone()
             });

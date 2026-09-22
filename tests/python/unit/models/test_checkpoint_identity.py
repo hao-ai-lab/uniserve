@@ -14,7 +14,7 @@ import pytest
 
 from uniserve_models.loading import checkpoint_identity
 from uniserve_worker.bootstrap.model_loader import verify_checkpoint_identity
-from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.errors import WorkerError
 
 pytestmark = pytest.mark.unit
 

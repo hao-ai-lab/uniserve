@@ -1,4 +1,4 @@
-"""Controlled external shared-memory publisher for physical retirement tests."""
+"""External shared-storage publisher for physical retirement tests."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from uniserve_worker.protocol.transfer import (
     PosixShmTransfer,
     WorkerEndpoint,
 )
-from uniserve_worker.transfer import segment
-from uniserve_worker.transfer.endpoint import locator_digest
+from uniserve_worker.transport import segment
+from uniserve_worker.transport.endpoint import locator_digest
 
 
 def serve_pending_publication(channel, shape=(1024,)) -> None:

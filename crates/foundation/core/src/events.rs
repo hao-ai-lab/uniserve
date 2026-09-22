@@ -185,7 +185,7 @@ pub enum RuntimeFamily {
     Umm,
 }
 
-/// One caller-visible artifact retaining its immutable shared-memory mapping.
+/// One caller-visible artifact retaining its immutable shared-storage mapping.
 #[derive(Debug, Clone)]
 pub struct ArtifactEvent {
     /// Semantic media type of the artifact.
@@ -209,7 +209,7 @@ pub struct DiffusionSamplingParams {
     pub seed: u64,
 }
 
-/// Media request. Final media bytes are returned through shared memory.
+/// Media request. Final media bytes are returned through shared storage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffusionRequest {
     /// Engine request identity.

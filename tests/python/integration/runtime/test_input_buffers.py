@@ -7,14 +7,14 @@ import pytest
 import torch
 
 from uniserve.nn.attention import PagedInput
-from uniserve_worker.execution.input_buffers import (
+from uniserve_worker.model_executor.input_batch import TokenRow
+from uniserve_worker.model_executor.input_buffers import (
     TokenBufferConfig,
     TokenBuffers,
 )
-from uniserve_worker.execution.rows import TokenRow
-from uniserve_worker.execution.sampling import TokenSelection
 from uniserve_worker.protocol.call import ForwardMode
-from uniserve_worker.runtime.decode_state import DecodeState
+from uniserve_worker.sampling.metadata import TokenSelection
+from uniserve_worker.storage.decode_state import DecodeState
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -60,7 +60,7 @@ def test_token_positions_preserve_row_order_across_source_devices(
         device="cuda:0",
     )
     try:
-        batch = buffers.stage(
+        batch = buffers.prepare_inputs(
             rows, forward_mode=ForwardMode.PREFILL, attention=attention
         )
         assert (
@@ -139,7 +139,7 @@ def test_mixed_forward_reads_current_continuation_in_row_order(
                 logical_position=position,
                 sampling_position=position,
             )
-            batch = buffers.stage(
+            batch = buffers.prepare_inputs(
                 rows,
                 forward_mode=ForwardMode.PREFILL,
                 attention=attention,
@@ -228,7 +228,7 @@ def test_indexed_decode_stages_live_tokens_cache_addresses_and_finish_controls()
                 )
                 for slot in order
             )
-            batch = buffers.stage(
+            batch = buffers.prepare_inputs(
                 rows,
                 forward_mode=ForwardMode.DECODE,
                 cache=pool,

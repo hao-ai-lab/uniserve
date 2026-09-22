@@ -175,11 +175,13 @@ def _partitioned(rank, rendezvous, root, shape, axes):
             meshes={"": mesh},
             attention={"": parallel},
         ).model
+        from uniserve.model import EntryPoint
         from uniserve.nn.attention import SequenceLengths, VarlenInput
-        from uniserve_worker.execution.sampling import TokenSelection
-        from uniserve_worker.execution.text import TextCall
+        from uniserve_worker.model_executor.component_binding import Call
+        from uniserve_worker.model_executor.graph_storage import GraphStorage
+        from uniserve_worker.model_executor.text_runner import TextRunner
+        from uniserve_worker.sampling.metadata import TokenSelection
 
-        call = TextCall(model)
         expected = torch.load(root / "expected.pt", weights_only=True)
         with PrefixCache(
             model.cache_config, num_blocks=1, block_size=4, device="cpu"
@@ -188,6 +190,16 @@ def _partitioned(rank, rendezvous, root, shape, axes):
                 model, cache=cache, attention="torch"
             ) as context:
                 context.prepare(TextSize(4, 4))
+                call = TextRunner(
+                    "text",
+                    Call("", model, EntryPoint("forward")),
+                    torch.device("cpu"),
+                    (),
+                    None,
+                    context,
+                    storage=GraphStorage(),
+                    devices=(),
+                )
                 for start, stop in ((0, 3), (3, 4)):
                     batch = PagedInput.from_blocks(
                         blocks=((0,),),
@@ -249,6 +261,7 @@ def _partitioned(rank, rendezvous, root, shape, axes):
                     torch.testing.assert_close(
                         actual, wanted, rtol=1e-5, atol=1e-6
                     )
+                call.close()
 
 
 @pytest.mark.parametrize(

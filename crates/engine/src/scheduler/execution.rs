@@ -8,186 +8,31 @@ use super::*;
 use uniserve_worker_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode};
 
 impl Scheduler {
-    /// Enumerates loaded components that can execute the requested call.
-    ///
-    /// Which component serves a media call is the model's state, not the
-    /// engine's: a worker resolves it from the capabilities its components
-    /// implement and reports it as `media_components`. That report is the
-    /// only authority here. Calls without an explicit media route use the
-    /// protocol's default component for an undivided model.
-    pub(super) fn worker_candidates(
-        &self,
-        kind: CallKind,
-    ) -> impl Iterator<Item = (&crate::WorkerId, &str, &WorkerInfo)> {
-        let component = match kind {
-            CallKind::Media(media_call) => self
-                .info
-                .media_components
-                .get(&media_call)
-                .map_or(DEFAULT_COMPONENT, String::as_str),
-            _ => DEFAULT_COMPONENT,
-        };
-        self.component_candidates(kind, component)
-    }
-
-    pub(super) fn component_candidates<'a>(
-        &'a self,
-        kind: CallKind,
-        component: &'a str,
-    ) -> impl Iterator<Item = (&'a crate::WorkerId, &'a str, &'a WorkerInfo)> {
-        self.executor
-            .info()
-            .workers
-            .iter()
-            .filter_map(move |(id, info)| {
-                if !info.supported_calls.contains(&kind) {
-                    return None;
-                }
-                let bound_component = if info
-                    .components
-                    .iter()
-                    .any(|binding| binding.name == component)
-                {
-                    component
-                } else if info.components.is_empty()
-                    || info
-                        .components
-                        .iter()
-                        .any(|binding| binding.name == DEFAULT_COMPONENT)
-                {
-                    DEFAULT_COMPONENT
-                } else {
-                    return None;
-                };
-                Some((id, bound_component, info))
-            })
-    }
-
-    /// Selects one replica while preserving request residency.
-    fn component_target<'a>(
-        &'a self,
-        request: RequestKey,
-        kind: CallKind,
-        component: &'a str,
-    ) -> Option<(&'a crate::WorkerId, &'a str)> {
-        let candidates = self
-            .component_candidates(kind, component)
-            .collect::<Vec<_>>();
-        let bound = candidates.first()?.1;
-
-        // Once a request has used this component, its mutable request state and
-        // graph slot live on that exact replica. Queue pressure may delay the
-        // next call but must never migrate it.
-        if let Some(owner) = self.worker_affinity.get(&(request, bound.to_owned())) {
-            let (id, component, _) = candidates.into_iter().find(|(id, _, _)| *id == owner)?;
-            return self.executor.has_capacity(id).then_some((id, component));
-        }
-
-        // Prefer a worker already selected for another component of this
-        // request. This keeps a replicated H3 denoiser and its media decoders
-        // in one process and avoids publishing their large latent products.
-        let resident = self
-            .worker_affinity
-            .iter()
-            .filter_map(|((key, _), worker)| (*key == request).then_some(worker))
-            .collect::<HashSet<_>>();
-        if let Some((id, component, _)) = candidates
-            .iter()
-            .copied()
-            .find(|(id, _, _)| resident.contains(id))
-        {
-            return self.executor.has_capacity(id).then_some((id, component));
-        }
-
-        // A new request goes to the least-resident ready replica. Queue
-        // capacity remains a hard admission condition; residency breaks ties
-        // so a burst fans out instead of filling the first configured worker.
-        candidates
-            .into_iter()
-            .filter(|(id, _, _)| self.executor.has_capacity(id))
-            .min_by_key(|(id, _, _)| {
-                self.worker_affinity
-                    .iter()
-                    .filter_map(|((key, _), worker)| (worker == *id).then_some(*key))
-                    .collect::<HashSet<_>>()
-                    .len()
-            })
-            .map(|(id, component, _)| (id, component))
-    }
-
-    pub(super) fn worker_target(
-        &self,
-        request: RequestKey,
-        kind: CallKind,
-    ) -> Option<(&crate::WorkerId, &str)> {
-        let component = match kind {
-            CallKind::Media(media_call) => self
-                .info
-                .media_components
-                .get(&media_call)
-                .map_or("model", String::as_str),
-            _ => "model",
-        };
-        self.component_target(request, kind, component)
-    }
-
-    /// Binds planned work to its configured component and records request residency.
-    pub(super) fn select_worker(&mut self, call: &Call) -> (crate::WorkerId, String) {
-        let (id, bound_component) = if call.component == DEFAULT_COMPONENT {
-            self.worker_target(call.request_key, call.code)
-        } else {
-            self.component_target(call.request_key, call.code, &call.component)
-        }
-        .expect("planned call retains an executable component");
-        let target = (id.clone(), bound_component.to_owned());
-        self.worker_affinity
-            .insert((call.request_key, target.1.clone()), target.0.clone());
-        target
-    }
-
-    /// Includes lifecycle commands in destination ordering, even when a batch has no compute.
-    fn batch_workers(&self, batch: &ExecutionBatch) -> HashSet<crate::WorkerId> {
-        let mut targets = batch
-            .requests
-            .iter()
-            .map(|(_, placement)| placement.worker.clone())
-            .collect::<HashSet<_>>();
-        for command in &batch.commands {
-            targets.extend(
-                self.worker_affinity
-                    .iter()
-                    .filter_map(|((request, _), worker)| {
-                        (*request == command.request_key()).then_some(worker.clone())
-                    }),
-            );
-        }
-        targets
-    }
-
     /// Dispatches queued work while preserving order at every shared destination.
     /// The caller retains blocked destinations for the whole scheduling tick, so
     /// assembling more work cannot repeatedly retry an unavailable worker.
     fn dispatch_submissions(&mut self, blocked_workers: &mut HashSet<crate::WorkerId>) -> bool {
         let mut progressed = false;
-        let pending_count = self.pending_submissions.len();
+        let pending_count = self.inflight.pending_submissions.len();
         for _ in 0..pending_count {
             let batch = self
+                .inflight
                 .pending_submissions
                 .pop_front()
                 .expect("pending count is fixed");
-            let targets = self.batch_workers(&batch);
+            let targets = self.placement.batch_workers(&batch);
             if !targets.is_disjoint(blocked_workers) {
                 // A batch waiting on one destination also orders later work at
                 // its other destinations; independent destinations can proceed.
                 blocked_workers.extend(targets);
-                self.pending_submissions.push_back(batch);
+                self.inflight.pending_submissions.push_back(batch);
                 continue;
             }
             match self.executor.submit(batch) {
                 Ok(()) => progressed = true,
                 Err(ExecutorSubmitError::WouldBlock(batch)) => {
                     blocked_workers.extend(targets);
-                    self.pending_submissions.push_back(batch);
+                    self.inflight.pending_submissions.push_back(batch);
                 }
                 Err(ExecutorSubmitError::Failed(error)) => {
                     // Failure reconciliation owns the pending identities until
@@ -214,32 +59,6 @@ impl Scheduler {
             .any(|(worker, _)| self.executor.has_capacity(worker))
     }
 
-    /// Registers the call kinds and command receipts owned by one scheduled batch.
-    pub(super) fn register_pending_batch(&mut self, batch: &ExecutionBatch, started: Instant) {
-        self.pending_batches.insert(
-            batch.id,
-            PendingBatch {
-                started,
-                calls: batch
-                    .requests
-                    .iter()
-                    .map(|(call, _)| (call.request_key, call.call_id))
-                    .collect(),
-                commands: batch
-                    .commands
-                    .iter()
-                    .filter(|command| !matches!(command, BatchCommand::Start { .. }))
-                    .cloned()
-                    .collect(),
-                worker_exec_us: 0,
-                prefill: batch
-                    .requests
-                    .iter()
-                    .any(|(call, _)| batch_kind(call.code) == BatchKind::Prefill),
-            },
-        );
-    }
-
     /// Releases the request latent.
     fn free_request_latent(&mut self, id: RequestId) {
         let allocation = self
@@ -247,7 +66,7 @@ impl Scheduler {
             .get_mut(&id)
             .and_then(|state| state.allocations_mut().latent.take());
         if let Some(allocation) = allocation {
-            self.latent_pool.free(allocation);
+            self.storage.latent_pool.free(allocation);
         }
     }
     /// Advances scheduler and executor work, blocking only for an outstanding result.
@@ -260,7 +79,7 @@ impl Scheduler {
             return false;
         }
         let progressed = self.step_nonblocking();
-        if progressed || self.pending_batches.is_empty() {
+        if progressed || self.inflight.pending_batches.is_empty() {
             return progressed;
         }
         match self.executor.poll(Duration::from_secs(300)) {
@@ -296,7 +115,7 @@ impl Scheduler {
         self.stats
             .general
             .in_flight
-            .store(self.pending_batches.len(), Ordering::Relaxed);
+            .store(self.inflight.pending_batches.len(), Ordering::Relaxed);
         self.publish_cache_stats();
         progressed
     }
@@ -304,7 +123,7 @@ impl Scheduler {
     /// Drains ready work, admits requests, and fills every available executor slot.
     pub(super) fn refill_executor(&mut self) -> bool {
         let mut progressed = false;
-        self.worker_affinity.retain(|(request, _), _| {
+        self.placement.affinity.retain(|(request, _), _| {
             let id = request.request_id;
             self.running.contains_key(&id)
                 || self.running_media.contains_key(&id)
@@ -338,15 +157,15 @@ impl Scheduler {
             if batches.is_empty() {
                 break;
             }
-            self.pending_submissions.extend(batches);
+            self.inflight.pending_submissions.extend(batches);
             progressed = true;
             self.dispatch_submissions(&mut blocked_workers);
             if self.fatal {
                 return progressed;
             }
         }
-        while self.pending_submissions.is_empty()
-            && !self.pending_commands.is_empty()
+        while self.inflight.pending_submissions.is_empty()
+            && !self.inflight.pending_commands.is_empty()
             && self.a_rank_queue_admits()
         {
             let commands = self.take_commands(|_| true);
@@ -357,7 +176,7 @@ impl Scheduler {
                 ExecutionBatch::new(0, Vec::new(), commands, Vec::new()),
                 Instant::now(),
             );
-            self.pending_submissions.push_back(batch);
+            self.inflight.pending_submissions.push_back(batch);
             progressed = true;
             self.dispatch_submissions(&mut blocked_workers);
             if self.fatal {
@@ -535,6 +354,7 @@ impl Scheduler {
         let sampling = state.request.sampling;
         let produced = |product: &TensorRef| {
             !self
+                .inflight
                 .pending_calls
                 .get(&state.request.request_id)
                 .is_some_and(|calls| {
@@ -597,9 +417,13 @@ impl Scheduler {
     /// A distributed component reconstructs one media unit per rank per round,
     /// so its rank count is the width of a round.
     fn component_width(&self, request: RequestKey, work: CallKind, component: &str) -> u32 {
-        let owner = self.worker_affinity.get(&(request, component.to_owned()));
+        let owner = self
+            .placement
+            .affinity
+            .get(&(request, component.to_owned()));
         let (_, bound, info) = self
-            .component_candidates(work, component)
+            .placement
+            .component_candidates(self.executor.as_ref(), work, component)
             .find(|(worker, _, _)| owner.is_none_or(|owner| *worker == owner))
             .expect("scheduled decoder has a configured owner");
         let component = info
@@ -643,7 +467,8 @@ impl Scheduler {
     fn lane_demand(&self, request: RequestKey, media_call: MediaCall, units: u32) -> LaneDemand {
         let component = self.media_component(media_call);
         let placed_component = component.as_ref().and_then(|component| {
-            self.worker_affinity
+            self.placement
+                .affinity
                 .get(&(request, component.clone()))
                 .map(|worker| (worker.clone(), component.clone()))
         });
@@ -687,7 +512,10 @@ impl Scheduler {
         let Some(component) = component else {
             return Vec::new();
         };
-        let owner = self.worker_affinity.get(&(request, component.to_owned()));
+        let owner = self
+            .placement
+            .affinity
+            .get(&(request, component.to_owned()));
         let Some((worker, info)) = self.executor.info().workers.iter().find(|(id, info)| {
             owner.is_none_or(|owner| id == owner)
                 && info
@@ -744,7 +572,7 @@ impl Scheduler {
     /// Accumulates the lanes the media calls in flight occupy.
     fn lane_occupancy(&self) -> LaneLedger {
         let mut ledger = LaneLedger::default();
-        for (id, queue) in &self.pending_calls {
+        for (id, queue) in &self.inflight.pending_calls {
             for inflight in queue {
                 let CallKind::Media(media_call) = inflight.call.code else {
                     continue;
@@ -771,7 +599,13 @@ impl Scheduler {
             .media_components
             .get(&media_call)
             .is_some_and(|component| {
-                self.component_target(request, CallKind::Media(media_call), component)
+                self.placement
+                    .component_target(
+                        self.executor.as_ref(),
+                        request,
+                        CallKind::Media(media_call),
+                        component,
+                    )
                     .is_some()
             })
     }
@@ -787,7 +621,8 @@ impl Scheduler {
                 .as_deref()
                 .and_then(|name| {
                     let worker = self
-                        .worker_affinity
+                        .placement
+                        .affinity
                         .get(&(state.admission.request_key, name.to_owned()))?;
                     self.device_lane_units(worker, name)
                 })
@@ -858,7 +693,7 @@ impl Scheduler {
             HashMap::new();
         for (_, media_call) in &candidates {
             if !call_batches.contains_key(media_call) {
-                call_batches.insert(*media_call, (self.next_batch_id(), Vec::new()));
+                call_batches.insert(*media_call, (self.inflight.next_batch_id(), Vec::new()));
                 call_order.push(*media_call);
             }
         }
@@ -912,7 +747,8 @@ impl Scheduler {
                 _ => None,
             };
             let predicate = if stateful {
-                self.pending_calls
+                self.inflight
+                    .pending_calls
                     .get(&id)
                     .and_then(|calls| {
                         calls
@@ -1117,7 +953,9 @@ impl Scheduler {
             if last_step {
                 state.latents = call.outputs.clone();
             }
-            let (worker, selected_component) = self.select_worker(&call);
+            let (worker, selected_component) =
+                self.placement
+                    .select_worker(self.executor.as_ref(), &self.info, &call);
             call.component = selected_component;
             let state = self.media_state(id).expect("selected media request exists");
             let mut bound = HashSet::new();
@@ -1188,15 +1026,20 @@ impl Scheduler {
                 .expect("media_call batch exists");
             let batch_commands = starts.remove(&media_call).unwrap_or_default();
             let batch = ExecutionBatch::new(batch_id, calls, batch_commands, Vec::new());
-            self.register_pending_batch(&batch, submit_at);
+            self.inflight.register_pending_batch(&batch, submit_at);
             batches.push(batch);
         }
         // Retirement is its own batch, submitted after the calls of this pass.
         // Its result is the retirement acknowledgement, so no call's result
         // waits for storage the round no longer needs.
         if !commands.is_empty() {
-            let batch = ExecutionBatch::new(self.next_batch_id(), Vec::new(), commands, Vec::new());
-            self.register_pending_batch(&batch, submit_at);
+            let batch = ExecutionBatch::new(
+                self.inflight.next_batch_id(),
+                Vec::new(),
+                commands,
+                Vec::new(),
+            );
+            self.inflight.register_pending_batch(&batch, submit_at);
             batches.push(batch);
         }
         batches
@@ -1215,14 +1058,14 @@ impl Scheduler {
         self.stats
             .kv_cache
             .free_blocks
-            .store(self.free_blocks(), Ordering::Relaxed);
+            .store(self.storage.free_blocks(), Ordering::Relaxed);
         self.stats
             .general
             .in_flight
-            .store(self.pending_batches.len(), Ordering::Relaxed);
+            .store(self.inflight.pending_batches.len(), Ordering::Relaxed);
         // drain the manager's event ring so it doesn't grow unbounded; the
-        // counters below already aggregate it, but draining keeps memory bounded.
-        if let Some(kv) = self.cache.as_ref() {
+        // counters below already aggregate it, but draining bounds queued reports.
+        if let Some(kv) = self.storage.cache.as_ref() {
             let _ = kv.block_pool.drain_events();
             self.stats
                 .kv_cache
@@ -1240,15 +1083,15 @@ impl Scheduler {
         self.stats
             .encoder
             .cache_queries
-            .store(self.encoder_cache.stats.queries, Ordering::Relaxed);
+            .store(self.storage.encoder_cache.stats.queries, Ordering::Relaxed);
         self.stats
             .encoder
             .cache_hits
-            .store(self.encoder_cache.stats.hits, Ordering::Relaxed);
+            .store(self.storage.encoder_cache.stats.hits, Ordering::Relaxed);
         self.stats
             .encoder
             .cached
-            .store(self.encoder_cache.len(), Ordering::Relaxed);
+            .store(self.storage.encoder_cache.len(), Ordering::Relaxed);
     }
 
     /// Resolves at most one ready result so assembly can refill the freed slot
@@ -1277,6 +1120,7 @@ impl Scheduler {
             .is_some_and(|prefix| !prefix.diffusion_finalized);
         !prefix_is_pending
             || !self
+                .inflight
                 .pending_calls
                 .get(&id)
                 .into_iter()
@@ -1288,7 +1132,8 @@ impl Scheduler {
     pub(super) fn num_scheduled_prompt_tokens(&self, id: RequestId) -> Option<u32> {
         let state = self.running.get(&id)?;
         Some(
-            self.pending_calls
+            self.inflight
+                .pending_calls
                 .get(&id)
                 .into_iter()
                 .flatten()
@@ -1310,7 +1155,7 @@ impl Scheduler {
         let mut image_index = state.num_ingested_images;
         let mut encoder_index = state.image_encoder_index;
         let mut feedback_index = state.feedback_encoder_index;
-        for pending in self.pending_calls.get(&id).into_iter().flatten() {
+        for pending in self.inflight.pending_calls.get(&id).into_iter().flatten() {
             let call = &pending.call;
             match call.code {
                 CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => {
@@ -1361,6 +1206,7 @@ impl Scheduler {
         let state = self.running.get(&id)?;
         let (logical_position, kv_visible_len) = self.scheduled_token_lengths(id)?;
         let forward_submitted = self
+            .inflight
             .pending_calls
             .get(&id)
             .into_iter()
@@ -1381,18 +1227,25 @@ impl Scheduler {
     /// Last denoising step covered by submitted intervals, without accepting them.
     pub(super) fn num_scheduled_denoise_steps(&self, id: RequestId) -> Option<u16> {
         let state = self.running.get(&id)?;
-        Some(self.pending_calls.get(&id).into_iter().flatten().fold(
-            state.num_completed_denoise_steps,
-            |steps, pending| match pending.call.code {
-                CallKind::Media(MediaCall::LatentPreparation | MediaCall::ImageDecoding) => 0,
-                CallKind::Media(MediaCall::Denoising) => {
-                    steps.saturating_add(
-                        pending.call.bounds.max_tokens.min(u32::from(u16::MAX)) as u16
-                    )
-                }
-                _ => steps,
-            },
-        ))
+        Some(
+            self.inflight
+                .pending_calls
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .fold(
+                    state.num_completed_denoise_steps,
+                    |steps, pending| match pending.call.code {
+                        CallKind::Media(
+                            MediaCall::LatentPreparation | MediaCall::ImageDecoding,
+                        ) => 0,
+                        CallKind::Media(MediaCall::Denoising) => steps.saturating_add(
+                            pending.call.bounds.max_tokens.min(u32::from(u16::MAX)) as u16,
+                        ),
+                        _ => steps,
+                    },
+                ),
+        )
     }
 
     /// Returns the next feedback encoder index and number of pending image completions.
@@ -1401,7 +1254,7 @@ impl Scheduler {
         let state = self.running.get(&id)?;
         let mut index = state.feedback_encoder_index;
         let mut images = 0;
-        for pending in self.pending_calls.get(&id).into_iter().flatten() {
+        for pending in self.inflight.pending_calls.get(&id).into_iter().flatten() {
             let call = &pending.call;
             if call.code == CallKind::Media(MediaCall::ImageDecoding) {
                 index = 0;
@@ -1418,7 +1271,8 @@ impl Scheduler {
 
     /// Cache conditioning is the latest admitted publication or the accepted request base.
     pub(super) fn kv_conditioning(&self, id: RequestId) -> Option<uniserve_worker_ipc::BufferId> {
-        self.pending_calls
+        self.inflight
+            .pending_calls
             .get(&id)
             .and_then(|pending| pending.iter().rev().find_map(|item| item.call.kv_output))
             .or_else(|| {
@@ -1434,7 +1288,8 @@ impl Scheduler {
         id: RequestId,
         select: impl for<'a> Fn(&'a Call) -> Option<&'a TensorRef>,
     ) -> Option<&TensorRef> {
-        self.pending_calls
+        self.inflight
+            .pending_calls
             .get(&id)?
             .iter()
             .rev()
@@ -1445,7 +1300,11 @@ impl Scheduler {
     /// request progress when no computation remains. No request state is replayed.
     pub(super) fn next_generation_phase(&self, id: RequestId) -> Option<Phase> {
         let state = self.running.get(&id)?;
-        let pending = self.pending_calls.get(&id).and_then(|queue| queue.back());
+        let pending = self
+            .inflight
+            .pending_calls
+            .get(&id)
+            .and_then(|queue| queue.back());
         let phase = match pending.map(|pending| &pending.call) {
             Some(call) => match call.code {
                 CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => Phase::Prefill,
@@ -1512,6 +1371,7 @@ impl Scheduler {
     /// Returns the call that precedes the next state advancement.
     pub(super) fn execution_predecessor(&self, id: RequestId) -> Option<CallId> {
         let call = self
+            .inflight
             .pending_calls
             .get(&id)?
             .iter()
@@ -1534,6 +1394,7 @@ impl Scheduler {
                 // request, or a request awaiting its close acknowledgement.
                 let id = buffer.owner.request_id;
                 let allocation = self
+                    .storage
                     .pending_buffer_frees
                     .remove(buffer)
                     .or_else(|| {
@@ -1549,7 +1410,7 @@ impl Scheduler {
                             .and_then(|state| state.buffers.remove(buffer))
                     });
                 if let Some(allocation) = allocation {
-                    self.buffer_pool.free(allocation);
+                    self.storage.buffer_pool.free(allocation);
                 }
             } else if let BatchCommand::Finish { request_key, .. } = command {
                 let id = request_key.request_id;
@@ -1577,13 +1438,13 @@ impl Scheduler {
                     .remove(&id)
                     .expect("retiring request exists");
                 for buffer in retiring.buffers.into_values() {
-                    self.buffer_pool.free(buffer);
+                    self.storage.buffer_pool.free(buffer);
                 }
                 for allocation in retiring.allocations {
-                    allocation.free(self);
+                    allocation.free(&mut self.storage);
                 }
                 if let Some(media) = retiring.media_allocations {
-                    media.free(self);
+                    media.free(&mut self.storage);
                 }
             }
         }
@@ -1598,6 +1459,7 @@ impl Scheduler {
             return false;
         };
         let Some(queue) = self
+            .inflight
             .pending_calls
             .get(&id)
             .filter(|queue| !queue.is_empty())
@@ -1609,7 +1471,7 @@ impl Scheduler {
         // terminal or relay state makes the projection unsafe.
         if queue.len() >= self.info.max_unresolved_calls as usize
             || state.terminal_intent.is_terminal()
-            || self.pending_finishes.contains_key(&id)
+            || self.inflight.pending_finishes.contains_key(&id)
             || !Self::device_token_relay_eligible(state)
         {
             return false;
@@ -1675,7 +1537,7 @@ impl Scheduler {
 
     /// Determine the next pipelined computation from its submitted predecessor.
     pub(super) fn pending_successor_code(&self, id: RequestId) -> Option<CallKind> {
-        if !self.has_pending_calls(id) {
+        if !self.inflight.has_pending_calls(id) {
             return None;
         }
         let state = self.running.get(&id)?;
@@ -1684,7 +1546,7 @@ impl Scheduler {
         {
             return None;
         }
-        let last = &self.pending_calls.get(&id)?.back()?.call;
+        let last = &self.inflight.pending_calls.get(&id)?.back()?.call;
         let chainable = if last.code == CallKind::Media(MediaCall::ImageDecoding) {
             state.req.feeds_back_images()
                 && state.req.image_generation.feedback_source
@@ -1764,21 +1626,24 @@ impl Scheduler {
 
     /// Returns whether the next call can be scheduled.
     pub(super) fn can_schedule_next(&self, id: RequestId) -> bool {
-        !self.pending_finishes.contains_key(&id)
+        !self.inflight.pending_finishes.contains_key(&id)
             && self.output_window_ready(id)
             && self.running.get(&id).is_some_and(|state| {
                 !state.speculative_chain_invalidated
                     && state.output.decoder_boundaries.len()
                         < self.info.max_unresolved_calls.max(1) as usize
                     && self.peek_next_call_variant(id).is_none_or(|kind| {
-                        self.worker_target(
-                            RequestKey::new(self.engine_id, id, state.request_epoch),
-                            kind,
-                        )
-                        .is_some()
+                        self.placement
+                            .worker_target(
+                                self.executor.as_ref(),
+                                &self.info,
+                                RequestKey::new(self.engine_id, id, state.request_epoch),
+                                kind,
+                            )
+                            .is_some()
                     })
             })
-            && (!self.has_pending_calls(id)
+            && (!self.inflight.has_pending_calls(id)
                 || self
                     .pending_successor_code(id)
                     .is_some_and(|target| self.can_queue_successor(id, target)))
@@ -1794,6 +1659,7 @@ impl Scheduler {
         }
         let available = state.output.events.available_capacity();
         let reserved = self
+            .inflight
             .pending_calls
             .get(&id)
             .into_iter()
@@ -1828,7 +1694,8 @@ impl Scheduler {
         domain.peak_credits.fetch_max(active, Ordering::Relaxed);
         domain.launched_calls.fetch_add(1, Ordering::Relaxed);
         domain.queue_us.fetch_add(queue_us, Ordering::Relaxed);
-        self.pending_calls
+        self.inflight
+            .pending_calls
             .entry(request_id)
             .or_default()
             .push_back(InflightCall { call, input });
@@ -1898,7 +1765,7 @@ impl Scheduler {
 
     /// Fails the inflight domain credits.
     pub(super) fn fail_inflight_domain_credits(&self) {
-        for inflight in self.pending_calls.values().flatten() {
+        for inflight in self.inflight.pending_calls.values().flatten() {
             self.reclaim_domain_credit(inflight.call.code, true);
         }
     }
@@ -1911,12 +1778,13 @@ impl Scheduler {
     ) {
         let id = record.request_key.request_id;
         let call_id = record.call_id;
-        let known = self.pending_calls.get(&id).is_some_and(|queue| {
+        let known = self.inflight.pending_calls.get(&id).is_some_and(|queue| {
             queue.iter().any(|inflight| {
                 inflight.call.request_key == record.request_key && inflight.call.call_id == call_id
             })
         });
         let duplicate = self
+            .inflight
             .pending_completions
             .get(&id)
             .is_some_and(|pending| pending.contains_key(&call_id));
@@ -1943,15 +1811,19 @@ impl Scheduler {
                 None
             }
         };
-        let arrival_seq = self.next_arrival();
-        self.pending_completions.entry(id).or_default().insert(
-            call_id,
-            PendingCompletion {
-                record,
-                media,
-                arrival_seq,
-            },
-        );
+        let arrival_seq = self.inflight.next_arrival();
+        self.inflight
+            .pending_completions
+            .entry(id)
+            .or_default()
+            .insert(
+                call_id,
+                PendingCompletion {
+                    record,
+                    media,
+                    arrival_seq,
+                },
+            );
     }
 
     /// Validate a media call result and advance only its completed request fields.
@@ -2072,7 +1944,7 @@ impl Scheduler {
         }
 
         let terminal = self.media_state(id).and_then(|state| {
-            if self.has_pending_calls(id) {
+            if self.inflight.has_pending_calls(id) {
                 return None;
             }
             if let TerminalIntent::Failure(message) = &state.terminal_intent {
@@ -2129,16 +2001,18 @@ impl Scheduler {
         self.output.retire(id, state.output);
         match state.admission_state {
             WorkerRegistration::Unsubmitted => {
-                state.allocations.free(self);
+                state.allocations.free(&mut self.storage);
                 return;
             }
             _ => {}
         }
         let request_key = state.admission.request_key;
-        self.pending_commands.push_back(BatchCommand::Finish {
-            request_key,
-            retained_buffers: Vec::new(),
-        });
+        self.inflight
+            .pending_commands
+            .push_back(BatchCommand::Finish {
+                request_key,
+                retained_buffers: Vec::new(),
+            });
         self.retiring_requests.insert(
             id,
             RetiringRequest {
@@ -2156,7 +2030,7 @@ impl Scheduler {
         request_key: RequestKey,
         call_id: CallId,
     ) -> Option<(Call, InflightInput)> {
-        let inflight = self.pop_pending_call(request_key, call_id)?;
+        let inflight = self.inflight.pop_pending_call(request_key, call_id)?;
         self.reclaim_domain_credit(inflight.call.code, false);
         Some((inflight.call, inflight.input))
     }
@@ -2171,14 +2045,16 @@ impl Scheduler {
             if !released.insert(buffer) {
                 continue;
             }
-            if let Some(allocation) = self.take_encoder_buffer(buffer) {
-                if let Some(previous) = self.pending_buffer_frees.insert(buffer, allocation) {
+            if let Some(allocation) = self.storage.take_encoder_buffer(buffer) {
+                if let Some(previous) = self.storage.pending_buffer_frees.insert(buffer, allocation)
+                {
                     tracing::error!(?buffer, "buffer free identity was already pending");
-                    self.buffer_pool.free(previous);
+                    self.storage.buffer_pool.free(previous);
                     self.fatal = true;
                 }
             }
-            self.pending_commands
+            self.inflight
+                .pending_commands
                 .push_back(BatchCommand::Free { buffer });
         }
     }
@@ -2215,7 +2091,7 @@ impl Scheduler {
 
         // A completion can mutate state only while its logical batch remains owned
         // by the in-flight window.
-        if !self.pending_batches.contains_key(&result_batch_id) {
+        if !self.inflight.pending_batches.contains_key(&result_batch_id) {
             tracing::error!(
                 batch_id = result_batch_id,
                 "executor returned a result for an unknown logical batch"
@@ -2231,6 +2107,7 @@ impl Scheduler {
             let record = &result.output;
             let identity = (record.request_key, record.call_id);
             let removed = self
+                .inflight
                 .pending_batches
                 .get_mut(&result_batch_id)
                 .is_some_and(|pending| pending.calls.remove(&identity));
@@ -2245,6 +2122,7 @@ impl Scheduler {
                 continue;
             }
             let Some(computation) = self
+                .inflight
                 .pending_calls
                 .get(&record.request_key.request_id)
                 .and_then(|calls| {
@@ -2266,6 +2144,7 @@ impl Scheduler {
         }
 
         let calls_complete = self
+            .inflight
             .pending_batches
             .get(&result_batch_id)
             .is_some_and(|batch| batch.calls.is_empty());
@@ -2285,6 +2164,7 @@ impl Scheduler {
         for result in &report.results {
             let record = &result.output;
             if let Some(computation) = self
+                .inflight
                 .pending_calls
                 .get(&record.request_key.request_id)
                 .and_then(|calls| {
@@ -2306,6 +2186,7 @@ impl Scheduler {
         }
 
         let pending = self
+            .inflight
             .pending_batches
             .get_mut(&result_batch_id)
             .expect("validated batch remains owned until reconciliation");
@@ -2316,6 +2197,7 @@ impl Scheduler {
         let batch_roundtrip_us = pending.started.elapsed().as_micros() as u64;
         let worker_us = if batch_complete {
             let pending = self
+                .inflight
                 .pending_batches
                 .remove(&result_batch_id)
                 .expect("completed batch is owned");
@@ -2327,7 +2209,7 @@ impl Scheduler {
                 if failed {
                     match command {
                         BatchCommand::Finish { .. } | BatchCommand::Free { .. } => {
-                            self.pending_commands.push_back(command);
+                            self.inflight.pending_commands.push_back(command);
                         }
                         BatchCommand::Start { .. } => {}
                     }
@@ -2372,7 +2254,7 @@ impl Scheduler {
         }
 
         loop {
-            let completions = self.take_ready_completions();
+            let completions = self.inflight.take_ready_completions();
             if completions.is_empty() {
                 break;
             }
@@ -2413,6 +2295,7 @@ impl Scheduler {
                 };
 
                 if self
+                    .inflight
                     .pending_finishes
                     .get(&id)
                     .is_some_and(|finish| finish.reason == FinishReason::Error)
@@ -2427,7 +2310,7 @@ impl Scheduler {
                     .get(&id)
                     .is_some_and(|state| state.speculative_chain_invalidated);
                 if discard_invalidated_descendant {
-                    let has_unresolved_descendants = self.has_pending_calls(id);
+                    let has_unresolved_descendants = self.inflight.has_pending_calls(id);
                     if let Some(state) = self.running.get_mut(&id) {
                         state.num_kv_blocks_sent = state
                             .num_kv_blocks_sent
@@ -2468,7 +2351,7 @@ impl Scheduler {
                 // once no in-flight descendant refers to them.
                 if record.status == CallStatus::Ok && !call.advances_state() {
                     let completion_has_device_consumer =
-                        self.pending_calls.get(&id).is_some_and(|queue| {
+                        self.inflight.pending_calls.get(&id).is_some_and(|queue| {
                             queue.iter().any(|inflight| {
                                 inflight
                                     .call
@@ -2499,7 +2382,7 @@ impl Scheduler {
                     .running
                     .get(&id)
                     .is_some_and(|state| state.terminal_intent.is_terminal())
-                    || self.pending_finishes.contains_key(&id);
+                    || self.inflight.pending_finishes.contains_key(&id);
                 if semantic_blocked {
                     if call.code == CallKind::Media(MediaCall::ImageDecoding) {
                         self.free_request_latent(id);
@@ -2531,7 +2414,7 @@ impl Scheduler {
                 } else {
                     None
                 };
-                let retain_device_token = !self.has_pending_calls(id);
+                let retain_device_token = !self.inflight.has_pending_calls(id);
                 if let Some(state) = self.running.get_mut(&id)
                     && advanced
                 {
@@ -2586,7 +2469,7 @@ impl Scheduler {
                     .get(&id)
                     .map_or(0, |state| state.output.tokens_sent);
                 if record.status == CallStatus::Predicated {
-                    let has_unresolved_descendants = self.has_pending_calls(id);
+                    let has_unresolved_descendants = self.inflight.has_pending_calls(id);
                     if let Some(state) = self.running.get_mut(&id) {
                         state.num_kv_blocks_sent = state
                             .num_kv_blocks_sent
@@ -2634,7 +2517,9 @@ impl Scheduler {
                         .decoder_boundaries
                         .push_back(usize::MAX);
                 }
-                if self.running.contains_key(&id) && !self.pending_finishes.contains_key(&id) {
+                if self.running.contains_key(&id)
+                    && !self.inflight.pending_finishes.contains_key(&id)
+                {
                     self.resolve(id, call, record, media.as_deref());
                 }
                 if awaiting_decoder {
@@ -2777,11 +2662,11 @@ impl Scheduler {
 
     /// Fails every submitted call while preserving requests that can be rescheduled.
     pub(super) fn fail_all_inflight(&mut self, msg: &str) {
-        self.pending_submissions.clear();
+        self.inflight.pending_submissions.clear();
         self.fail_inflight_domain_credits();
         // Submitted batches cannot return after this boundary, so their timing
         // and command ownership must be retired together.
-        let (ids, commands) = self.clear_failed_calls();
+        let (ids, commands) = self.inflight.clear_failed_calls();
         self.acknowledge_commands(&commands);
         for id in ids {
             if self.media_state(id).is_some() {
@@ -2800,7 +2685,7 @@ impl Scheduler {
 
     /// Reconciles failed work without resetting allocations owned by live consumers.
     fn fail_after_worker_failure(&mut self, loss: &WorkerFailure) {
-        if let Some(cache) = &self.cache {
+        if let Some(cache) = &self.storage.cache {
             for endpoint in &loss.endpoints {
                 cache.block_pool.invalidate_source(endpoint);
             }
@@ -2809,7 +2694,7 @@ impl Scheduler {
         let mut buffers = loss.buffers.iter().cloned().collect::<HashSet<_>>();
         loop {
             let before = (requests.len(), buffers.len());
-            for batch in &self.pending_submissions {
+            for batch in &self.inflight.pending_submissions {
                 for (call, placement) in &batch.requests {
                     if (!loss.endpoints.is_empty() && placement.worker == loss.worker_id)
                         || call.input_buffers().any(|buffer| buffers.contains(&buffer))
@@ -2825,18 +2710,18 @@ impl Scheduler {
                 break;
             }
         }
-        let reclaimable = self.encoder_cache.invalidate_buffers(&buffers);
+        let reclaimable = self.storage.encoder_cache.invalidate_buffers(&buffers);
         self.free_buffers(reclaimable.into_iter().map(|product| product.buffer_id()));
         let mut retired = loss.retired.clone();
         let mut pending = VecDeque::new();
-        for mut batch in std::mem::take(&mut self.pending_submissions) {
+        for mut batch in std::mem::take(&mut self.inflight.pending_submissions) {
             retired.extend(
                 batch
                     .retire_requests(&requests)
                     .into_iter()
                     .map(|(call, _)| (batch.id, call.request_key, call.call_id)),
             );
-            if let Some(pending) = self.pending_batches.get_mut(&batch.id) {
+            if let Some(pending) = self.inflight.pending_batches.get_mut(&batch.id) {
                 pending.commands = batch
                     .commands
                     .iter()
@@ -2847,7 +2732,7 @@ impl Scheduler {
             pending.push_back(batch);
         }
         for (batch_id, request, call_id) in retired {
-            let Some(inflight) = self.retire_call(batch_id, request, call_id) else {
+            let Some(inflight) = self.inflight.retire_call(batch_id, request, call_id) else {
                 self.fatal = true;
                 tracing::error!(
                     batch_id,
@@ -2861,12 +2746,12 @@ impl Scheduler {
         }
         for batch in pending {
             if batch.requests.is_empty() && batch.commands.is_empty() {
-                self.pending_batches.remove(&batch.id);
+                self.inflight.pending_batches.remove(&batch.id);
             } else {
-                self.pending_submissions.push_back(batch);
+                self.inflight.pending_submissions.push_back(batch);
             }
         }
-        self.pending_commands.retain_mut(|command| {
+        self.inflight.pending_commands.retain_mut(|command| {
             if !requests.contains(&command.request_key()) {
                 return true;
             }
@@ -2876,6 +2761,7 @@ impl Scheduler {
         for request in requests {
             let id = request.request_id;
             let error_emitted = self
+                .inflight
                 .pending_finishes
                 .get(&id)
                 .is_some_and(|finish| finish.reason == FinishReason::Error);
@@ -2896,7 +2782,7 @@ impl Scheduler {
                         },
                     );
                 }
-                self.pending_finishes.insert(
+                self.inflight.pending_finishes.insert(
                     id,
                     PendingFinish {
                         reason: FinishReason::Error,
@@ -2908,6 +2794,7 @@ impl Scheduler {
             // abandoned call. It owns real completion evidence and can drain.
             loop {
                 let Some(call_id) = self
+                    .inflight
                     .pending_calls
                     .get(&id)
                     .and_then(|queue| queue.front())
@@ -2917,6 +2804,7 @@ impl Scheduler {
                     break;
                 };
                 let Some(completion) = self
+                    .inflight
                     .pending_completions
                     .get_mut(&id)
                     .and_then(|values| values.remove(&call_id))
@@ -2930,17 +2818,18 @@ impl Scheduler {
                 self.free_buffers(call.output_buffers());
             }
             if self
+                .inflight
                 .pending_completions
                 .get(&id)
                 .is_some_and(BTreeMap::is_empty)
             {
-                self.pending_completions.remove(&id);
+                self.inflight.pending_completions.remove(&id);
             }
             if self
                 .media_state(id)
                 .is_some_and(|state| state.admission.request_key == request)
             {
-                if !self.has_pending_calls(id) {
+                if !self.inflight.has_pending_calls(id) {
                     self.finish_media(id, DiffusionTerminal::Failed(loss.message.clone()));
                 }
             } else if self.running.contains_key(&id) {
@@ -2951,9 +2840,9 @@ impl Scheduler {
 
     /// Fails every queued and running request and releases scheduler-owned resources.
     pub(super) fn fail_all_running(&mut self, message: &str) {
-        self.pending_submissions.clear();
+        self.inflight.pending_submissions.clear();
         self.fail_inflight_domain_credits();
-        let _ = self.clear_failed_calls();
+        let _ = self.inflight.clear_failed_calls();
         while let Some(id) = self.waiting_media_order.pop_front() {
             let submission = self
                 .waiting_media

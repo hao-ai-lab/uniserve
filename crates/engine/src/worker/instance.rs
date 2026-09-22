@@ -111,10 +111,10 @@ impl WorkerProcessArgs {
                 rank as u32,
                 self.ranks.len() as u32,
                 rendezvous.clone(),
-                // A rank on the head's host can offer shared memory; a rank
+                // A rank on the head's host can offer shared storage; a rank
                 // placed elsewhere has none to offer and serves a socket.
                 if self.ranks[rank].node == self.host {
-                    uniserve_worker_ipc::SHARED_MEMORY_CHANNEL
+                    uniserve_worker_ipc::SHARED_STORAGE_CHANNEL
                 } else {
                     uniserve_worker_ipc::SOCKET_CHANNEL
                 },
@@ -233,7 +233,7 @@ fn call_identity(
 
 /// Refuses a placement whose muxer is not on the head's host.
 ///
-/// The artifact a muxer publishes is a POSIX shared-memory object the head
+/// The artifact a muxer publishes is a POSIX shared-storage object the head
 /// opens by name, and such a name resolves in one host's namespace. A muxer
 /// placed elsewhere would fail on the first request, so the placement is
 /// refused at startup, naming the component and the host it was placed on.
@@ -259,7 +259,7 @@ pub(crate) fn refuse_muxer_off_head(
         anyhow::ensure!(
             node == head,
             "component {component} serves muxing on rank {rank} on host {node}, but the head is \
-             on host {head}, and the artifact it publishes is a shared-memory object named in \
+             on host {head}, and the artifact it publishes is a shared-storage object named in \
              one host's namespace"
         );
     }

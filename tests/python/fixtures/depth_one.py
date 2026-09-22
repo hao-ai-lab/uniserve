@@ -17,7 +17,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from uniserve.sampling import SamplingParams
-from uniserve_worker.execution.batch_state import BatchState
+from uniserve_worker.execution.executor import Submission
 
 if TYPE_CHECKING:
     from uniserve_worker.worker import Worker
@@ -46,11 +46,7 @@ from uniserve_worker.protocol.call import (
     Rng,
     TransferMode,
 )
-from uniserve_worker.protocol.identity import (
-    BufferId,
-    CallId,
-    RequestKey,
-)
+from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.output import BatchOutput, RequestOutput
 from uniserve_worker.protocol.tensor import (
     DeviceDim,
@@ -655,7 +651,7 @@ def root_parent(admission: NewRequest) -> CallId:
     return CallId(0, 0)
 
 
-def finalized_report(worker: Worker, state: BatchState) -> BatchOutput:
+def finalized_report(worker: Worker, state: Submission) -> BatchOutput:
     """Drive the public Worker interface until the batch returns its result."""
     deadline = time.monotonic() + 10.0
     while True:

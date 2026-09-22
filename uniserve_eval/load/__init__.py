@@ -1,6 +1,6 @@
 """Exposes request-arrival execution and GPU telemetry sampling."""
 
 from .arrival import LoadResult, WarmupFailure, run_load
-from .gpu import GpuMemorySampler
+from .gpu import GpuStorageSampler
 
-__all__ = ["GpuMemorySampler", "LoadResult", "WarmupFailure", "run_load"]
+__all__ = ["GpuStorageSampler", "LoadResult", "WarmupFailure", "run_load"]

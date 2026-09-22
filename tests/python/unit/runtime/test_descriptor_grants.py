@@ -18,8 +18,8 @@ import uuid
 
 import pytest
 
-from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.transfer.descriptor_grants import DescriptorGrants, fetch
+from uniserve_worker.errors import WorkerError
+from uniserve_worker.transport.descriptor_grants import DescriptorGrants, fetch
 
 pytestmark = [pytest.mark.unit]
 

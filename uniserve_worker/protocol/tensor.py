@@ -7,9 +7,16 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TypeAlias
 
-from ..foundation.errors import invalid_descriptor
-from . import identity
-from .validation import _enum, _map, _seq, _str, _tagged, _uint
+from uniserve_worker.errors import invalid_descriptor
+from uniserve_worker.protocol import identity
+from uniserve_worker.protocol.validation import (
+    _enum,
+    _map,
+    _seq,
+    _str,
+    _tagged,
+    _uint,
+)
 
 
 class DType(StrEnum):

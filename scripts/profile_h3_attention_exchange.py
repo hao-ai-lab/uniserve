@@ -13,7 +13,7 @@ from uniserve.ops.video_sparse import (
 )
 from uniserve.runtime import TensorBuffers, initialize_process_groups
 from uniserve.tensors import BufferConfig
-from uniserve_worker.bootstrap.config import ParallelConfig, SequenceConfig
+from uniserve_worker.config.deployment import ParallelConfig, SequenceConfig
 
 
 def main() -> None:

@@ -1,4 +1,4 @@
-//! Immutable ownership of generated POSIX shared-memory artifacts.
+//! Immutable ownership of generated POSIX shared-storage artifacts.
 
 use std::ffi::CString;
 
@@ -13,7 +13,7 @@ unsafe impl Send for SharedMedia {}
 unsafe impl Sync for SharedMedia {}
 
 impl SharedMedia {
-    /// Claims an immutable POSIX shared-memory object and maps its published extent.
+    /// Claims an immutable POSIX shared-storage object and maps its published extent.
     ///
     /// Opening transfers ownership: the name is unlinked immediately, and bytes
     /// remain readable until this mapping is dropped. Errors after opening also
@@ -27,15 +27,15 @@ impl SharedMedia {
         let bytes = usize::try_from(num_bytes)
             .map_err(|_| "generated media is too large for this host".to_string())?;
         if bytes == 0 || name.is_empty() || name.contains('/') {
-            return Err("generated media has an invalid shared-memory locator".to_string());
+            return Err("generated media has an invalid shared-storage locator".to_string());
         }
         let name = CString::new(format!("/{}", name))
-            .map_err(|_| "generated media has an invalid shared-memory name".to_string())?;
+            .map_err(|_| "generated media has an invalid shared-storage name".to_string())?;
         // SAFETY: name is a valid NUL-terminated POSIX shm name.
         let descriptor = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
         if descriptor < 0 {
             return Err(format!(
-                "failed to open generated media shared memory: {}",
+                "failed to open generated media shared storage: {}",
                 std::io::Error::last_os_error()
             ));
         }
@@ -47,7 +47,7 @@ impl SharedMedia {
             // SAFETY: descriptor is open.
             unsafe { libc::close(descriptor) };
             return Err(format!(
-                "failed to claim generated media shared memory: {error}"
+                "failed to claim generated media shared storage: {error}"
             ));
         }
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -58,7 +58,7 @@ impl SharedMedia {
             // SAFETY: descriptor is open.
             unsafe { libc::close(descriptor) };
             return Err(format!(
-                "failed to inspect generated media shared memory: {error}"
+                "failed to inspect generated media shared storage: {error}"
             ));
         }
         // SAFETY: fstat initialized stat on success.
@@ -70,9 +70,9 @@ impl SharedMedia {
         {
             // SAFETY: descriptor is open.
             unsafe { libc::close(descriptor) };
-            return Err("generated media shared memory is shorter than its locator".to_string());
+            return Err("generated media shared storage is shorter than its locator".to_string());
         }
-        // SAFETY: descriptor names a readable shared-memory object of at least `bytes` bytes.
+        // SAFETY: descriptor names a readable shared-storage object of at least `bytes` bytes.
         let address = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -88,7 +88,7 @@ impl SharedMedia {
         unsafe { libc::close(descriptor) };
         if address == libc::MAP_FAILED {
             return Err(format!(
-                "failed to map generated media shared memory: {}",
+                "failed to map generated media shared storage: {}",
                 std::io::Error::last_os_error()
             ));
         }

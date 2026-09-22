@@ -12,12 +12,11 @@ from tests.python.fixtures.depth_one import finalized_report
 from tests.python.fixtures.encoding import Model as EncodedModel
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve.distributed import Communicator, DeviceMesh
-from uniserve_worker.bootstrap.config import ComponentConfig, ParallelConfig
-from uniserve_worker.bootstrap.worker_info import WorkerInfo
-from uniserve_worker.config import LaneConfig, WorkerConfig
-from uniserve_worker.execution.component_binding import ComponentBinding
-from uniserve_worker.execution.model_runner import ModelRunner
-from uniserve_worker.foundation.errors import InputError
+from uniserve_worker.config.deployment import ComponentConfig, ParallelConfig
+from uniserve_worker.config.execution import LaneConfig, WorkerConfig
+from uniserve_worker.errors import InputError
+from uniserve_worker.execution.model_executor import ModelExecutor
+from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.protocol.batch import (
     Batch,
     BufferAllocation,
@@ -44,7 +43,8 @@ from uniserve_worker.protocol.tensor import (
     StaticDim,
     TensorRef,
 )
-from uniserve_worker.transfer.layout import fetch_tensor
+from uniserve_worker.protocol.worker_info import WorkerInfo
+from uniserve_worker.transport.fetch import fetch_tensor
 
 pytestmark = pytest.mark.integration
 
@@ -92,7 +92,7 @@ def test_temporal_output_regions_follow_declared_rank_order(rank, units):
         else None,
         group.device,
     )
-    runner = ModelRunner(
+    runner = ModelExecutor(
         DecodedModel(DecoderConfig(window=25, height=8, width=12)),
         WorkerConfig(rank=rank, world_size=4),
         bindings={"reconstruction": binding},
@@ -134,7 +134,7 @@ def test_decoder_call_preserves_values_across_independent_execution_owners(
         ),
     )
     runners = [
-        ModelRunner(
+        ModelExecutor(
             model,
             WorkerConfig(device=device),
             bindings=_encoder_bindings(model, components, device),
@@ -202,7 +202,7 @@ def test_conditioning_executes_only_on_its_declared_pipeline_stage(rank):
         ),
         group.device,
     )
-    runner = ModelRunner(
+    runner = ModelExecutor(
         model,
         WorkerConfig(rank=rank, world_size=2),
         bindings={"conditioner": binding},
@@ -357,9 +357,6 @@ def test_text_encoder_call_publishes_consumable_conditioning(
                 ),
             )
         )
-        ready = threading.Event()
-        prepared.on_dependencies_ready(ready.set)
-        assert ready.wait(5)
         prepared = finalized_report(worker, prepared)
         result = prepared
         assert result.completions[0].status is CallStatus.OK
@@ -392,7 +389,7 @@ def test_text_encoder_call_publishes_consumable_conditioning(
 )
 def test_text_entry_stages_successive_bounded_inputs(device):
     model = EncodedModel().to(device)
-    runner = ModelRunner(
+    runner = ModelExecutor(
         model,
         WorkerConfig(device=device, max_sequence_tokens=16),
         bindings=_encoder_bindings(
@@ -404,7 +401,7 @@ def test_text_entry_stages_successive_bounded_inputs(device):
         prompts = ((3, 8, 1), (31,), (0, 5, 19, 7), (1, 2))
         for prompt in prompts:
             result = runner.run_encoder(
-                "text", runner.stage_text_tokens(prompt)
+                "text", runner.prepare_text_tokens(prompt)
             )
             outputs.append(result.values[0])
         for prompt, output in zip(prompts, outputs, strict=True):
@@ -414,7 +411,7 @@ def test_text_entry_stages_successive_bounded_inputs(device):
             )
         for prompt in ((), (1,) * 17):
             with pytest.raises(InputError, match="capacity"):
-                runner.stage_text_tokens(prompt)
+                runner.prepare_text_tokens(prompt)
     finally:
         runner.synchronize()
         runner.close()

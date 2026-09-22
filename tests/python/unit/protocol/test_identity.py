@@ -6,11 +6,7 @@ They also preserve wire semantics.
 import pickle
 from dataclasses import replace
 
-from uniserve_worker.protocol.identity import (
-    BufferId,
-    CallId,
-    RequestKey,
-)
+from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.tensor import DType, ShapeBound, TensorRef
 
 

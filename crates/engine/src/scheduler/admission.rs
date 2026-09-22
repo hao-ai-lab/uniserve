@@ -6,7 +6,7 @@ use uniserve_worker_ipc::ForwardMode;
 impl Scheduler {
     /// Validates and queues one token-generation request or rejects it synchronously.
     pub(super) fn enqueue(&mut self, req: GenerationRequest, event_tx: EventTx) {
-        if self.cache.is_none() {
+        if self.storage.cache.is_none() {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
                 message: "generation request requires worker KV resources".into(),
             });
@@ -134,7 +134,8 @@ impl Scheduler {
         ] {
             let name = self.info.media_components.get(&role)?;
             let (_, bound, info) = self
-                .component_candidates(CallKind::Media(role), name)
+                .placement
+                .component_candidates(self.executor.as_ref(), CallKind::Media(role), name)
                 .next()?;
             let component = info
                 .components
@@ -204,14 +205,16 @@ impl Scheduler {
                 continue;
             }
             let candidates = self
-                .component_candidates(CallKind::Media(call), &component)
+                .placement
+                .component_candidates(self.executor.as_ref(), CallKind::Media(call), &component)
                 .filter(|(worker, _, _)| {
                     self.executor.is_ready(worker)
                         && (selected_workers.contains(*worker)
                             || self
-                                .media_memory
+                                .storage
+                                .media_storage
                                 .get(*worker)
-                                .is_some_and(|memory| memory.requests.available() > 0))
+                                .is_some_and(|storage| storage.requests.available() > 0))
                 })
                 .collect::<Vec<_>>();
             let resident = candidates
@@ -221,12 +224,13 @@ impl Scheduler {
             let chosen = resident.or_else(|| {
                 candidates.into_iter().min_by_key(|(worker, _, _)| {
                     let active = self
-                        .worker_affinity
+                        .placement
+                        .affinity
                         .iter()
                         .filter_map(|((request, _), owner)| (owner == *worker).then_some(*request))
                         .collect::<HashSet<_>>()
                         .len();
-                    let available = self.media_memory[*worker].requests.available();
+                    let available = self.storage.media_storage[*worker].requests.available();
                     (active, usize::MAX - available)
                 })
             })?;
@@ -316,7 +320,8 @@ impl Scheduler {
             let mut reserved = true;
             for worker in &route_workers {
                 let allocation = self
-                    .media_memory
+                    .storage
+                    .media_storage
                     .get_mut(worker)
                     .expect("media route names a loaded worker")
                     .requests
@@ -333,7 +338,7 @@ impl Scheduler {
             }
             if !reserved {
                 for (worker, allocation) in request_slots {
-                    self.free_media_request(&worker, allocation);
+                    self.storage.free_media_request(&worker, allocation);
                 }
                 self.waiting_media.insert(id, submission);
                 self.waiting_media_order.push_front(id);
@@ -351,14 +356,16 @@ impl Scheduler {
                 let mut allocations = HashMap::new();
                 for worker in &route_workers {
                     let allocation = self
-                        .media_memory
+                        .storage
+                        .media_storage
                         .get_mut(worker)
                         .expect("media route names a loaded worker")
                         .buffers
                         .allocate(request_key, bytes, 256);
                     let Ok(allocation) = allocation else {
                         for (allocated_worker, allocation) in std::mem::take(&mut allocations) {
-                            self.free_media_buffer(&allocated_worker, allocation);
+                            self.storage
+                                .free_media_buffer(&allocated_worker, allocation);
                         }
                         reserved = false;
                         break;
@@ -380,11 +387,11 @@ impl Scheduler {
             if !reserved {
                 for tensor in tensors.into_values() {
                     for (worker, allocation) in tensor.allocations {
-                        self.free_media_buffer(&worker, allocation);
+                        self.storage.free_media_buffer(&worker, allocation);
                     }
                 }
                 for (worker, allocation) in request_slots {
-                    self.free_media_request(&worker, allocation);
+                    self.storage.free_media_request(&worker, allocation);
                 }
                 self.waiting_media.insert(id, submission);
                 self.waiting_media_order.push_front(id);
@@ -397,7 +404,8 @@ impl Scheduler {
             let primary_component = self.info.media_components[&MediaCall::Denoising].as_str();
             let request_pool_idx = allocations.request_slot(&routes[primary_component]);
             for (component, worker) in &routes {
-                self.worker_affinity
+                self.placement
+                    .affinity
                     .insert((request_key, component.clone()), worker.clone());
             }
             self.next_request_epoch = self.next_request_epoch.saturating_add(1);
@@ -508,11 +516,11 @@ impl Scheduler {
         if !self.running.contains_key(&id) {
             return false;
         }
-        let Ok(request_slot) = self.request_pool.allocate() else {
+        let Ok(request_slot) = self.storage.request_pool.allocate() else {
             return false;
         };
-        let Ok(kv) = self.cache().allocate(prefix_tokens as u32) else {
-            self.request_pool.free(request_slot);
+        let Ok(kv) = self.storage.cache().allocate(prefix_tokens as u32) else {
+            self.storage.request_pool.free(request_slot);
             return false;
         };
         let new_pages = kv
@@ -527,7 +535,7 @@ impl Scheduler {
             buffers: HashMap::new(),
         };
         let Some(state) = self.running.get_mut(&id) else {
-            allocations.free(self);
+            allocations.free(&mut self.storage);
             return false;
         };
         state.flow_prefix = Some(FlowPrefixState {
@@ -545,7 +553,7 @@ impl Scheduler {
             .get_mut(&id)
             .and_then(|state| state.flow_prefix.take());
         if let Some(prefix) = prefix {
-            prefix.allocations.free(self);
+            prefix.allocations.free(&mut self.storage);
         }
     }
 
@@ -558,7 +566,7 @@ impl Scheduler {
             .running
             .iter()
             .filter(|(id, state)| {
-                state.terminal_intent.is_terminal() && !self.has_pending_calls(**id)
+                state.terminal_intent.is_terminal() && !self.inflight.has_pending_calls(**id)
             })
             .map(|(id, state)| (*id, state.terminal_intent.clone()))
             .collect();
@@ -577,7 +585,7 @@ impl Scheduler {
                 self.media_state(*id)
                     .filter(|state| {
                         state.terminal_intent.is_terminal()
-                            && !self.has_pending_calls(state.request.request_id)
+                            && !self.inflight.has_pending_calls(state.request.request_id)
                     })
                     .map(|state| (state.request.request_id, state.terminal_intent.clone()))
             })
@@ -592,7 +600,7 @@ impl Scheduler {
         }
     }
 
-    /// Admits requests from the queue head while sequence and memory budgets allow.
+    /// Admits requests from the queue head while sequence and storage budgets allow.
     ///
     /// Requests configured for worst-case reservation acquire their full KV capacity here,
     /// keeping that capacity resident for the request lifetime.
@@ -600,7 +608,7 @@ impl Scheduler {
         let bs = self.info.kv_block_size() as usize;
         loop {
             if self.running_request_count() >= self.config.max_num_seqs
-                || self.request_pool.is_empty()
+                || self.storage.request_pool.is_empty()
             {
                 break;
             }
@@ -615,10 +623,11 @@ impl Scheduler {
                 let need = head.max_reserved_kv_blocks;
                 let encoder_entries = head.req.num_encoder_cache_entries();
                 let encoder_ok = self
+                    .storage
                     .reserved_encoder_entries
                     .saturating_add(encoder_entries)
-                    <= self.encoder_cache.budget();
-                if need > self.usable_blocks() {
+                    <= self.storage.encoder_cache.budget();
+                if need > self.storage.usable_blocks() {
                     let id = self.waiting_order.pop_front().unwrap();
                     let st = self.waiting.remove(&id).unwrap();
                     let _ = st.output.events.event_tx.send(EngineCoreOutput::Rejected {
@@ -626,7 +635,7 @@ impl Scheduler {
                     });
                     continue;
                 }
-                if self.free_blocks() >= need && encoder_ok {
+                if self.storage.free_blocks() >= need && encoder_ok {
                     let Some((target, _)) = self.prefill_target(head) else {
                         break;
                     };
@@ -637,13 +646,13 @@ impl Scheduler {
                     // Physically allocate the worst case now: nothing can take
                     // these blocks, so this request can never fail mid-flight.
                     self.ensure_request_capacity(id, need * bs);
-                    self.reserved_blocks += need;
+                    self.storage.reserved_blocks += need;
                     continue;
                 }
             } else {
                 let n = head.req.prompt_token_ids.len();
-                let text_usable_blocks = (0..self.cache().block_pool.num_groups())
-                    .map(|group| self.cache().block_pool.group_capacity(group))
+                let text_usable_blocks = (0..self.storage.cache().block_pool.num_groups())
+                    .map(|group| self.storage.cache().block_pool.group_capacity(group))
                     .min()
                     .unwrap_or_default();
                 let Some((target, prefix_hit)) = self.prefill_target(head) else {
@@ -670,10 +679,11 @@ impl Scheduler {
                     continue;
                 }
                 let capacity_available = prefix_hit.cached_free_blocks.len()
-                    == self.cache().block_pool.num_groups()
+                    == self.storage.cache().block_pool.num_groups()
                     && prefix_hit.cached_free_blocks.iter().enumerate().all(
                         |(group, cached_free)| {
-                            self.cache()
+                            self.storage
+                                .cache()
                                 .block_pool
                                 .free_blocks_in_group(group)
                                 .saturating_sub(*cached_free)
@@ -700,8 +710,13 @@ impl Scheduler {
         &self,
         state: &RequestState,
     ) -> Option<((crate::WorkerId, String), crate::kv::PrefixHit)> {
-        let cache = self.cache();
-        self.worker_candidates(CallKind::Forward(ForwardMode::Prefill))
+        let cache = self.storage.cache();
+        self.placement
+            .worker_candidates(
+                self.executor.as_ref(),
+                &self.info,
+                CallKind::Forward(ForwardMode::Prefill),
+            )
             .filter(|(worker, _, _)| self.executor.is_ready(worker))
             .map(|(worker, component, info)| {
                 let hit = cache.coordinator.probe_prefix(
@@ -735,16 +750,19 @@ impl Scheduler {
             .1
             .endpoint
             .clone();
-        self.worker_affinity
+        self.placement
+            .affinity
             .insert((request_key, target.1), target.0);
 
         // Admission owns the request row and an initially empty table for every
         // KV group before the request enters the runnable set.
         let request_slot = self
+            .storage
             .request_pool
             .allocate()
             .expect("admission checked request-slot capacity");
         let kv = self
+            .storage
             .cache()
             .allocate(0)
             .expect("empty KV allocation is valid");
@@ -785,14 +803,19 @@ impl Scheduler {
         // together so the next scheduling pass observes one coherent admission.
         self.running.insert(id, st);
         self.running_order.push(id);
-        self.reserved_encoder_entries = self
+        self.storage.reserved_encoder_entries = self
+            .storage
             .reserved_encoder_entries
             .saturating_add(encoder_entries);
 
         // Prefix-cache acquisition pins every reused block to this request's
         // newly installed block tables.
         if let Some(st) = self.running.get_mut(&id) {
-            let kv = self.cache.as_ref().expect("generation has a KV cache");
+            let kv = self
+                .storage
+                .cache
+                .as_ref()
+                .expect("generation has a KV cache");
             acquire_cached_prefix(&kv.coordinator, st, &kv.block_pool, &self.stats, &source);
         }
     }

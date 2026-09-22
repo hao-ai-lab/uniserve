@@ -22,10 +22,10 @@ from uniserve_models.minimax_h3.packing import (
     build_packing,
     video_latent_frames,
 )
-from uniserve_worker.bootstrap.config import ComponentConfig
 from uniserve_worker.bootstrap.distributed import initialize_components
-from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.model_runner import ModelRunner
+from uniserve_worker.config.deployment import ComponentConfig
+from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.execution.model_executor import ModelExecutor
 
 pytestmark = [
     pytest.mark.integration,
@@ -68,7 +68,7 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
         model = models.load_model(
             source, device="cuda:0", precision=precision
         ).model
-        runner = ModelRunner(
+        runner = ModelExecutor(
             model,
             WorkerConfig(
                 device="cuda:0",

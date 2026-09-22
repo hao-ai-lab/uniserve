@@ -17,186 +17,12 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use uniserve_worker_ipc::{
-    Batch, BatchCommand, BatchOutput, BlockTable, BufferAllocation, CachePageAllocation, Call,
-    CallId, CallKind, DecodeRange, ForwardBatch, LatentParams, NewRequest, RequestKey,
-    TensorPublication, WorkerInfo,
+    BatchCommand, BatchOutput, CallId, CallKind, RequestKey, TensorPublication, WorkerInfo,
 };
 
-/// Physical placement selected by the scheduler for a computation.
-///
-/// The computation itself is the shared IPC `Call`. These fields describe
-/// its worker and allocations, which are gathered into physical batch arrays.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RequestPlacement {
-    /// Worker routing stays outside the computation sent across IPC.
-    pub worker: WorkerId,
-    /// Worker-local request row when a replicated route owns its own address
-    /// space. Unset placements retain the admission's canonical row.
-    pub request_pool_idx: Option<u32>,
-    /// KV tables and newly acquired pages used by this computation.
-    pub block_tables: Vec<BlockTable>,
-    pub new_cache_pages: Vec<CachePageAllocation>,
-    /// Rows use a local call index until gathered into the physical batch.
-    pub forward: ForwardBatch,
-    pub latent: Option<LatentParams>,
-    pub decode: Option<DecodeRange>,
-    /// Worker-local persistent spans for the call's buffer inputs and outputs.
-    /// Request retirement retains every physical reader and writer allocation.
-    pub buffers: Vec<BufferAllocation>,
-}
+mod batch;
 
-/// One logical executor submission. Its rank projections are derived only inside an executor.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ExecutionBatch {
-    /// Logical batch identity used to correlate partial completions.
-    pub id: u64,
-    /// Shared call kinds paired with physical placement in scheduler order.
-    pub requests: Vec<(Call, RequestPlacement)>,
-    /// Ordered lifecycle and resource commands.
-    pub commands: Vec<BatchCommand>,
-    /// Published transfer descriptors supplied by an external storage owner.
-    pub input_transfers: Vec<TensorPublication>,
-    /// External cache publications consumed by explicit KV installation.
-    pub kv_inputs: Vec<uniserve_worker_ipc::KvTransfer>,
-}
-
-impl ExecutionBatch {
-    /// Constructs a logical executor submission.
-    pub fn new(
-        id: u64,
-        requests: Vec<(Call, RequestPlacement)>,
-        commands: Vec<BatchCommand>,
-        input_transfers: Vec<TensorPublication>,
-    ) -> Self {
-        Self {
-            id,
-            requests,
-            commands,
-            input_transfers,
-            kv_inputs: Vec::new(),
-        }
-    }
-
-    /// Iterates over request admissions carried by batch commands.
-    pub fn admissions(&self) -> impl Iterator<Item = &NewRequest> {
-        self.commands.iter().filter_map(|command| match command {
-            BatchCommand::Start { request } => Some(request),
-            _ => None,
-        })
-    }
-
-    /// Removes unstarted work for terminated epochs while preserving independent calls.
-    /// Their resource descriptions stay attached to the removed calls. Close commands
-    /// retain their physical retirement and reader obligations.
-    pub(crate) fn retire_requests(
-        &mut self,
-        requests: &std::collections::HashSet<RequestKey>,
-    ) -> Vec<(Call, RequestPlacement)> {
-        let (retired, active): (Vec<_>, Vec<_>) = std::mem::take(&mut self.requests)
-            .into_iter()
-            .partition(|(call, _)| requests.contains(&call.request_key));
-        self.requests = active;
-        self.commands.retain_mut(|command| {
-            if !requests.contains(&command.request_key()) {
-                return true;
-            }
-            !matches!(command, BatchCommand::Start { .. })
-        });
-        let inputs = self
-            .requests
-            .iter()
-            .flat_map(|(call, _)| call.tensor_inputs().chain(call.predicate.iter()))
-            .collect::<std::collections::HashSet<_>>();
-        self.input_transfers
-            .retain(|payload| inputs.contains(&payload.product));
-        self.kv_inputs.retain(|publication| {
-            self.requests
-                .iter()
-                .any(|(call, _)| call.kv_input == Some(publication.source))
-        });
-        retired
-    }
-
-    /// Validates call identities, execution ownership, and command payloads.
-    pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.requests.is_empty() || !self.commands.is_empty(),
-            "logical batch must carry at least one call or command"
-        );
-
-        let mut requests = std::collections::HashSet::with_capacity(self.requests.len());
-        let mut identities = std::collections::HashSet::with_capacity(self.requests.len());
-        for (call, placement) in &self.requests {
-            call.validate()?;
-            anyhow::ensure!(
-                call.call_id.batch_id == self.id,
-                "computation identity belongs to another logical batch"
-            );
-            requests.insert(call.request_key);
-            WorkerId::new(placement.worker.0.clone())?;
-            anyhow::ensure!(!call.component.is_empty(), "call requires a component");
-            anyhow::ensure!(
-                identities.insert(call.call_id),
-                "logical batch repeats a call identity"
-            );
-            placement.forward.validate(1)?;
-            for table in &placement.block_tables {
-                table.validate()?;
-            }
-            for pages in &placement.new_cache_pages {
-                pages.validate()?;
-            }
-            if let Some(latent) = &placement.latent {
-                latent.validate()?;
-                anyhow::ensure!(
-                    (latent.request_key, latent.call_id) == (call.request_key, call.call_id),
-                    "logical call carries another call's latent execution"
-                );
-            }
-            if let Some(decode) = &placement.decode {
-                decode.validate()?;
-                anyhow::ensure!(
-                    (decode.request_key, decode.call_id) == (call.request_key, call.call_id),
-                    "logical call carries another call's decode execution"
-                );
-            }
-            for buffer in &placement.buffers {
-                buffer.validate()?;
-                anyhow::ensure!(
-                    call.buffer_inputs()
-                        .chain(call.buffer_outputs())
-                        .any(|tensor| tensor.buffer_id() == buffer.buffer),
-                    "logical call carries a buffer execution for an unrelated tensor"
-                );
-            }
-        }
-
-        let mut admitted = std::collections::HashSet::new();
-        for admission in self.admissions() {
-            admission.validate()?;
-            anyhow::ensure!(
-                admitted.insert(admission.request_key),
-                "logical batch repeats a request start"
-            );
-            anyhow::ensure!(
-                requests.contains(&admission.request_key),
-                "logical batch starts a request without a call"
-            );
-        }
-
-        for command in &self.commands {
-            command.validate()?;
-        }
-
-        for transfer in &self.input_transfers {
-            transfer.validate()?;
-        }
-        for publication in &self.kv_inputs {
-            publication.validate()?;
-        }
-        Ok(())
-    }
-}
+pub use batch::{ExecutionBatch, RequestPlacement};
 
 /// Concrete pool information reported through the execution boundary.
 #[derive(Debug, Clone)]
@@ -672,13 +498,13 @@ pub enum TransferBackend {
     /// Keeps products within one worker process.
     #[default]
     Local,
-    /// Publishes products through POSIX shared memory.
+    /// Publishes products through POSIX shared storage.
     Shm,
     /// Publishes device products through CUDA VMM handles.
     CudaVmm,
     /// Carries a host product's bytes on the rank channel's data path.
     ///
-    /// Shared memory reaches only one host. A product on this edge travels in
+    /// Shared storage reaches only one host. A product on this edge travels in
     /// the producing rank's result and in the consuming rank's batch, so it
     /// crosses hosts wherever the rank channel does.
     Channel,
@@ -781,9 +607,9 @@ impl TransferConfig {
     /// Each rank is a separate process. Its self-edge uses local storage for
     /// both locations. Between two ranks, device products move over CUDA VMM
     /// where both hold a CUDA device, which reaches another host where both
-    /// devices export a fabric handle; host products move over shared memory
+    /// devices export a fabric handle; host products move over shared storage
     /// on one host and over the rank channel across hosts, because a
-    /// shared-memory segment is named in one host's namespace. Explicit bindings take
+    /// shared-storage segment is named in one host's namespace. Explicit bindings take
     /// precedence. Initialized endpoint and backend capabilities are validated
     /// before the executor accepts work, and an edge that would have to cross
     /// hosts without fabric handles is refused by name.
@@ -827,7 +653,7 @@ impl TransferConfig {
                                 let device = (source.device.starts_with("cuda:")
                                     && destination.device.starts_with("cuda:"))
                                 .then_some(TransferBackend::CudaVmm);
-                                // A shared-memory segment is named in one host's
+                                // A shared-storage segment is named in one host's
                                 // namespace, so a host product that leaves its host
                                 // travels on the rank channel's data path.
                                 let host = if source.node == destination.node {
@@ -913,7 +739,7 @@ impl TransferConfig {
     /// rank, across workers, this rank's own included.
     ///
     /// A host product is published over the mechanism that reaches the
-    /// consumers its producing call names: shared memory for a consumer on
+    /// consumers its producing call names: shared storage for a consumer on
     /// the host, the rank channel for one elsewhere. The producing rank is
     /// told which slots share its host so it can tell the two apart; an
     /// unplaced rank shares a host with no one.
@@ -1242,49 +1068,6 @@ pub struct WorkerFailure {
     pub execution: Option<WorkerExecError>,
     /// Human-readable failure description.
     pub message: String,
-}
-
-/// Lowers a logical batch into a validated wire batch.
-pub(crate) fn physical_batch(
-    batch_id: u64,
-    collective_seq: u64,
-    requests: Vec<(Call, RequestPlacement)>,
-    commands: Vec<BatchCommand>,
-    input_products: Vec<TensorPublication>,
-    kv_inputs: Vec<uniserve_worker_ipc::KvTransfer>,
-) -> anyhow::Result<Batch> {
-    let mut block_tables = Vec::new();
-    let mut new_cache_pages = Vec::new();
-    let mut forward = ForwardBatch::default();
-    let mut latent_params = Vec::new();
-    let mut decode_ranges = Vec::new();
-    let mut buffer_allocations = Vec::new();
-    let mut calls = Vec::with_capacity(requests.len());
-    for (call_index, (call, placement)) in requests.into_iter().enumerate() {
-        block_tables.extend(placement.block_tables);
-        new_cache_pages.extend(placement.new_cache_pages);
-        forward.append(placement.forward, call_index as u32);
-        latent_params.extend(placement.latent);
-        decode_ranges.extend(placement.decode);
-        buffer_allocations.extend(placement.buffers);
-        calls.push(call);
-    }
-    let batch = Batch {
-        batch_id,
-        collective_seq,
-        calls,
-        block_tables,
-        new_cache_pages,
-        forward,
-        latent_params,
-        decode_ranges,
-        buffer_allocations,
-        commands,
-        input_products,
-        kv_inputs,
-    };
-    batch.validate()?;
-    Ok(batch)
 }
 
 /// The asynchronous, pipelined boundary the scheduler drives.

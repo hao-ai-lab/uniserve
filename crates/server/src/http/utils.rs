@@ -18,7 +18,7 @@ pub(crate) fn resolve_request_id(headers: &HeaderMap) -> String {
 
 /// Maximum accepted length (in bytes) of a client-supplied request ID. IDs
 /// longer than this are rejected and a fresh ID is generated instead, so a
-/// client cannot use the correlation key as an unbounded-memory or log-injection
+/// client cannot use the correlation key as an unbounded-storage or log-injection
 /// vector.
 const MAX_REQUEST_ID_LEN: usize = 128;
 

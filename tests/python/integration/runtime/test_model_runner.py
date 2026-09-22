@@ -1,4 +1,4 @@
-"""Serial-oracle behavior at the canonical ModelRunner boundary."""
+"""Numerical results and product ownership through the public Worker API."""
 
 from __future__ import annotations
 
@@ -33,8 +33,8 @@ from tests.python.fixtures.simulation import expected_successor
 from uniserve.model import Logits
 from uniserve_models.stub import Model
 from uniserve_models.stub import entry_points as entry_points
-from uniserve_worker.config import LaneConfig, WorkerConfig
-from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.config.execution import LaneConfig, WorkerConfig
+from uniserve_worker.errors import WorkerError
 from uniserve_worker.protocol.batch import (
     BlockTable,
     Free,
@@ -68,8 +68,8 @@ from uniserve_worker.protocol.transfer import (
     EncoderTransferValue,
     TensorTransfer,
 )
-from uniserve_worker.transfer import segment
-from uniserve_worker.transfer.tickets import _open_shared_memory
+from uniserve_worker.transport import segment
+from uniserve_worker.transport.shared_storage import open_shared_storage
 
 pytestmark = pytest.mark.integration
 
@@ -181,7 +181,7 @@ def _prepare_decode(
 
 
 def _media_bytes(record: RequestOutput) -> bytes:
-    """Claim the public shared-memory output.
+    """Claim the public shared-storage output.
 
     The output's encoded image bytes are consumed.
     """
@@ -189,12 +189,12 @@ def _media_bytes(record: RequestOutput) -> bytes:
 
     output = record.media_output
     assert output is not None
-    memory = SharedMemory(name=output.handle.name)
+    storage = SharedMemory(name=output.handle.name)
     try:
-        return bytes(memory.buf[: output.bytes])
+        return bytes(storage.buf[: output.bytes])
     finally:
-        memory.unlink()
-        memory.close()
+        storage.unlink()
+        storage.close()
 
 
 def _finalized_artifact(
@@ -1302,11 +1302,14 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
         current = successor
         observation = record_completion(call, report)
 
-    worker.submit(
-        execution_batch(
-            batch_id=53,
-            commands=(Free(releasable.buffer_id),),
-        )
+    finalized_report(
+        worker,
+        worker.submit(
+            execution_batch(
+                batch_id=53,
+                commands=(Free(releasable.buffer_id),),
+            )
+        ),
     )
     stale_call, _unused = diffusion_step_call(
         admission.request_key,
@@ -1347,11 +1350,6 @@ def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thre
                 calls=(call,),
             )
         )
-        deadline = time.monotonic() + 5.0
-        while not produced.complete and time.monotonic() < deadline:
-            producer.advance()
-            time.sleep(0.001)
-        assert produced.complete
         produced = finalized_report(producer, produced)
         assert len(produced.products) == 1
         transferred = produced.products[0]
@@ -1373,21 +1371,19 @@ def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thre
         )
         prepared = consumer.submit(batch)
         assert prepared is not None
-        deadline = time.monotonic() + 5.0
-        while not prepared.inputs_ready() and time.monotonic() < deadline:
-            consumer.advance_inputs(prepared)
-            time.sleep(0.001)
-        assert prepared.inputs_ready()
         consumed = prepared
         consumed = finalized_report(consumer, consumed)
         assert consumed.completions[0].status is CallStatus.OK
         with pytest.raises(WorkerError, match="no longer owned"):
             consumer.poll(prepared)
-        producer.submit(
-            execution_batch(
-                batch_id=3,
-                commands=(Free(call.encoder_output.buffer_id),),
-            )
+        finalized_report(
+            producer,
+            producer.submit(
+                execution_batch(
+                    batch_id=3,
+                    commands=(Free(call.encoder_output.buffer_id),),
+                )
+            ),
         )
     finally:
         producer.close()
@@ -1428,11 +1424,14 @@ def test_free_preserves_another_requests_feature_with_the_same_generation() -> (
             completion.status is CallStatus.OK
             for completion in produced.completions
         )
-        worker.submit(
-            execution_batch(
-                batch_id=2,
-                commands=(Free(calls[0].encoder_output.buffer_id),),
-            )
+        finalized_report(
+            worker,
+            worker.submit(
+                execution_batch(
+                    batch_id=2,
+                    commands=(Free(calls[0].encoder_output.buffer_id),),
+                )
+            ),
         )
         visual = visual_state_call(
             admissions[1].request_key,
@@ -1524,11 +1523,6 @@ def test_cross_stage_device_product_transfer_preserves_generation_and_value() ->
             )
         )
         assert prepared is not None
-        deadline = time.monotonic() + 5.0
-        while not prepared.inputs_ready() and time.monotonic() < deadline:
-            consumer.advance_inputs(prepared)
-            time.sleep(0.001)
-        assert prepared.inputs_ready()
         prepared = finalized_report(consumer, prepared)
         consumed = prepared
         assert consumed.completions[0].status is CallStatus.OK
@@ -1607,7 +1601,7 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
             ),
         )
 
-        replacement = encoded_call(CallId(3, 0), (192, 160, 32))
+        replacement = encoded_call(CallId(4, 0), (192, 160, 32))
         reuse = execution_batch(
             batch_id=4,
             calls=(replacement,),
@@ -1632,7 +1626,7 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
         released = worker.submit(
             execution_batch(batch_id=5, commands=(Free(output.buffer_id),))
         )
-        assert not released.complete
+        assert worker.poll(released) is None
         ticket.close()
         released = finalized_report(worker, released)
     finally:
@@ -1716,18 +1710,13 @@ def test_tensor_entry_input_preserves_values_through_output_release(
     try:
         prepared = worker.submit(
             execution_batch(
-                batch_id=1,
+                batch_id=2,
                 admissions=(admission,),
                 calls=(call,),
                 input_products=(payload,),
             )
         )
         assert prepared is not None
-        deadline = time.monotonic() + 5
-        while not prepared.inputs_ready() and time.monotonic() < deadline:
-            worker.advance_inputs(prepared)
-            time.sleep(0.001)
-        assert prepared.inputs_ready()
         prepared = finalized_report(worker, prepared)
         report = prepared
         assert report.completions[0].status is CallStatus.OK
@@ -1743,7 +1732,7 @@ def test_tensor_entry_input_preserves_values_through_output_release(
         assert ready.wait(5)
         torch.testing.assert_close(reader.result(), expected, rtol=0, atol=0)
         released = worker.submit(
-            execution_batch(batch_id=2, commands=(Free(output.buffer_id),))
+            execution_batch(batch_id=3, commands=(Free(output.buffer_id),))
         )
         torch.testing.assert_close(reader.result(), expected, rtol=0, atol=0)
         reader.close()
@@ -1837,11 +1826,6 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> (
             )
         )
         assert prepared is not None
-        deadline = time.monotonic() + 5.0
-        while not prepared.inputs_ready() and time.monotonic() < deadline:
-            consumer.advance_inputs(prepared)
-            time.sleep(0.001)
-        assert prepared.inputs_ready()
         prepared = finalized_report(consumer, prepared)
         consumed = prepared
         assert consumed.completions[0].status is CallStatus.OK
@@ -1887,11 +1871,6 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
             commands=(),
         )
     )
-    deadline = time.monotonic() + 5.0
-    while not produced.complete and time.monotonic() < deadline:
-        producer.advance()
-        time.sleep(0.001)
-    assert produced.complete
     produced = finalized_report(producer, produced)
     flow_observation = record_completion(flow, produced)
     exported_latent = final_latent
@@ -1932,7 +1911,7 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
     assert len(transferred) == 1
 
     if publication == "shards":
-        from uniserve_worker.transfer.layout import fetch_tensor
+        from uniserve_worker.transport.fetch import fetch_tensor
 
         descriptor = transferred[0].value
         tensor = descriptor.tensor
@@ -2012,17 +1991,7 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
     )
     prepared = consumer.submit(batch)
     assert prepared is not None
-    deadline = time.monotonic() + 5.0
-    while not prepared.inputs_ready() and time.monotonic() < deadline:
-        consumer.advance_inputs(prepared)
-        time.sleep(0.001)
-    assert prepared.inputs_ready()
     received = prepared
-    deadline = time.monotonic() + 5.0
-    while not received.complete and time.monotonic() < deadline:
-        consumer.advance()
-        time.sleep(0.001)
-    assert received.complete
     received = finalized_report(consumer, received)
     assert received.completions[0].status is CallStatus.OK
     assert received.completions[0].num_completed_steps == 0
@@ -2238,13 +2207,16 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         call_id=CallId(2, 0),
         predecessor=first_observation.call_id,
     )
-    worker.submit(
-        execution_batch(
-            batch_id=2,
-            admissions=(),
-            calls=(publication,),
-            commands=(),
-        )
+    finalized_report(
+        worker,
+        worker.submit(
+            execution_batch(
+                batch_id=2,
+                admissions=(),
+                calls=(publication,),
+                commands=(),
+            )
+        ),
     )
     initial_latent, preparation_observation = _prepare_media(
         worker,
@@ -2287,13 +2259,6 @@ def test_generated_feedback_commits_absolute_visual_token_state():
             commands=(),
         )
     )
-    deadline = time.monotonic() + 5.0
-    while (
-        not diffusion_finalize_report.complete and time.monotonic() < deadline
-    ):
-        worker.advance()
-        time.sleep(0.001)
-    assert diffusion_finalize_report.complete
     diffusion_finalize_report = finalized_report(
         worker, diffusion_finalize_report
     )
@@ -2368,12 +2333,15 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         call_id=CallId(8, 0),
         predecessor=feedback_observation.call_id,
     )
-    worker.submit(
-        execution_batch(
-            batch_id=8,
-            calls=(publication,),
-            commands=(),
-        )
+    finalized_report(
+        worker,
+        worker.submit(
+            execution_batch(
+                batch_id=8,
+                calls=(publication,),
+                commands=(),
+            )
+        ),
     )
     next_latent, _next_preparation_observation = _prepare_media(
         worker,
@@ -2430,8 +2398,6 @@ def test_generated_feedback_commits_absolute_visual_token_state():
 def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_independent_work(  # noqa: E501
     device,
 ):
-    from threading import Event
-
     policy = WorkerConfig(
         prefill_cuda_graph=False,
         graph_policy="off",
@@ -2451,7 +2417,10 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
         else (),
     )
     worker = execution_worker(
-        transfer_backends=("shm",), device=device, execution=policy
+        transfer_backends=("shm",),
+        device=device,
+        execution=policy,
+        queue_depth=2,
     )
     admission = umm_params(
         76, ImageParams(steps=3, height=16, width=16, seed=29)
@@ -2496,7 +2465,7 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
 
     locator = payload.tensor.locations[0]
     prepared = None
-    held = _open_shared_memory(
+    held = open_shared_storage(
         locator.transport.name, segment.HEADER_BYTES + locator.nbytes
     )
     held_header = memoryview(held)
@@ -2542,15 +2511,12 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
                     commands=(Free(first_latent.buffer_id),),
                 )
             )
-            assert not prepared.inputs_ready()
-            woke = Event()
-            prepared.on_dependencies_ready(woke.set)
-            assert not woke.is_set()
+            assert worker.poll(prepared) is None
 
             independent = ar_params(77, block_ids=(7,))
             call = token_call(
                 independent.request_key,
-                call_id=CallId(1, 0),
+                call_id=CallId(6, 0),
                 predecessor=root_parent(independent),
                 mode=ForwardMode.PREFILL,
                 tokens=(3, 4),
@@ -2566,19 +2532,19 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
                 ),
             )
             assert report.completions[0].status is CallStatus.OK
-            assert not prepared.inputs_ready()
+            assert worker.poll(prepared) is None
         finally:
             # The consumer's word lands with no wake; the rank's next pass
             # reclaims the source and the bank writer proceeds.
             segment.acknowledge(held_header, 1)
         worker.advance()
-        assert woke.wait(5), "acknowledged source did not wake the bank writer"
-        assert prepared.inputs_ready()
         prepared = finalized_report(worker, prepared)
         report = prepared
         assert report.completions[0].status is CallStatus.OK
         assert report.completions[0].num_completed_steps == 3
     finally:
+        held_header.release()
+        held.close()
         worker.close()
 
 

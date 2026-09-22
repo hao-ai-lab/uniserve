@@ -5,12 +5,12 @@ import torch
 import torch.multiprocessing as mp
 
 from uniserve.runtime import initialize_process_groups
-from uniserve_worker.bootstrap.config import (
+from uniserve_worker.bootstrap.distributed import initialize_components
+from uniserve_worker.config.deployment import (
     ComponentConfig,
     ParallelConfig,
     SequenceConfig,
 )
-from uniserve_worker.bootstrap.distributed import initialize_components
 
 pytestmark = pytest.mark.integration
 

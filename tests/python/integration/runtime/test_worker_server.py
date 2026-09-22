@@ -5,7 +5,7 @@ The ownership covers concrete execution and completion resources.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
@@ -17,7 +17,8 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
-from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.errors import WorkerError
+from uniserve_worker.execution.executor import Submission
 from uniserve_worker.protocol.batch import Batch, Finish, NewRequest
 from uniserve_worker.protocol.call import Call, ForwardMode
 from uniserve_worker.protocol.identity import CallId, RequestKey
@@ -85,9 +86,15 @@ def test_direct_admission_preserves_identity_and_bounded_delivery():
     commands = (Finish(RequestKey(1, 1, 1)),)
     with execution_worker(queue_depth=1) as worker:
         first = worker.submit(Batch(batch_id=7, commands=commands))
+        with pytest.raises(FrozenInstanceError):
+            first.batch_id = 9
+        with pytest.raises(WorkerError, match="no longer owned"):
+            worker.poll(Submission(first.batch_id))
         with pytest.raises(WorkerError, match="admission queue is full"):
             worker.submit(Batch(batch_id=8, commands=commands))
         assert worker.poll(first).batch_id == 7
+        with pytest.raises(WorkerError, match="no longer owned"):
+            worker.poll(first)
         with pytest.raises(RuntimeError, match="warmup must precede"):
             worker.warmup()
         with pytest.raises(WorkerError, match="must exceed"):

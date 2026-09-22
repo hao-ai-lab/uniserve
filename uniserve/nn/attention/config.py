@@ -23,7 +23,7 @@ class ContextParallelConfig:
     """Gather every owner's K/V along one topology axis.
 
     Each rank holds the queries of its own rows and attends against the whole
-    context, so the owners' keys and values are gathered into its memory
+    context, so the owners' keys and values are gathered into its storage
     before the attention call reads them.
     """
 

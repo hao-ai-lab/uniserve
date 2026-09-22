@@ -5,12 +5,12 @@ import torch
 from uniserve.cache import Config, mha
 from uniserve.quantization import Quantizer
 from uniserve.runtime import PrefixCache
-from uniserve_worker.bootstrap.worker_info import (
+from uniserve_worker.protocol.worker_info import (
     KVCacheInfo,
     KvGroup,
     KvGroupKind,
 )
-from uniserve_worker.runtime.cache_manager import CacheManager
+from uniserve_worker.storage.kv_cache import KVCacheManager
 
 
 def mha_pool(
@@ -76,7 +76,7 @@ def mha_pool(
         groups=(KvGroup(num_pages, KvGroupKind.FULL, 0, 0),),
         dtype=str(store_dtype or dtype).removeprefix("torch."),
     )
-    return CacheManager(
+    return KVCacheManager(
         cache,
         info=info,
         request_pool_size=request_pool_size,

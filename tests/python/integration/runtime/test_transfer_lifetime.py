@@ -12,7 +12,7 @@ import torch
 from tests.python.fixtures.shm_publication import serve_pending_publication
 from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
-from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.errors import WorkerError
 from uniserve_worker.protocol.batch import BufferAllocation
 from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.protocol.tensor import (
@@ -22,10 +22,10 @@ from uniserve_worker.protocol.tensor import (
     TensorRef,
 )
 from uniserve_worker.protocol.transfer import Locator, WorkerEndpoint
-from uniserve_worker.runtime.buffer_pool import BufferPool
-from uniserve_worker.runtime.latent_pool import LatentPool
-from uniserve_worker.runtime.tensor_store import TensorStore
-from uniserve_worker.transfer.layout import region_view
+from uniserve_worker.storage.buffer_pool import BufferPool
+from uniserve_worker.storage.latent_pool import LatentPool
+from uniserve_worker.storage.tensor_store import TensorStore
+from uniserve_worker.transport.layout import region_view
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -38,9 +38,10 @@ def _await_ticket(ticket):
 
 
 def test_exhausted_vmm_pool_delivers_host_fallback_and_restores_quota():
-    from uniserve_kernel.peer_memory import allocation_granularity
+    from uniserve_kernel.peer_storage import allocation_granularity
 
-    from uniserve_worker.transfer.tickets import make_transports, publish_tensor
+    from uniserve_worker.transport import make_transports
+    from uniserve_worker.transport.publication import publish_tensor
 
     device = torch.device("cuda:0")
     page = allocation_granularity(device)
@@ -465,7 +466,7 @@ def _serve_unusable_cuda_handle(channel) -> None:
     """Publish a locator whose handle names no allocation, and hold it."""
     import uuid
 
-    from uniserve_kernel.peer_memory import empty, export_handle
+    from uniserve_kernel.peer_storage import empty, export_handle
 
     from uniserve_worker.protocol.transfer import CudaVmmTransfer
 
@@ -553,13 +554,13 @@ def _read_shm_publication(channel, slot: int) -> None:
     and holds the claim across the producer's release so retirement is
     observed to wait for it.
     """
-    from uniserve_worker.transfer import segment
-    from uniserve_worker.transfer.endpoint import locator_digest
-    from uniserve_worker.transfer.tickets import _open_shared_memory
+    from uniserve_worker.transport import segment
+    from uniserve_worker.transport.endpoint import locator_digest
+    from uniserve_worker.transport.shared_storage import open_shared_storage
 
     channel.send("ready")
     locator = Locator.from_mapping(channel.recv())
-    storage = _open_shared_memory(
+    storage = open_shared_storage(
         locator.transport.name, segment.HEADER_BYTES + locator.nbytes
     )
     try:
@@ -613,7 +614,7 @@ def test_shm_retirement_waits_for_its_consumers_and_reclaims_capacity(
             child.close()
             readers.append((parent, process))
         for channel, _process in readers:
-            assert channel.poll(60), "shared-memory reader did not start"
+            assert channel.poll(60), "shared-storage reader did not start"
             assert channel.recv() == "ready"
         source = torch.arange(1024, dtype=torch.float32, device=source_device)
         if source.is_cuda:
@@ -625,7 +626,7 @@ def test_shm_retirement_waits_for_its_consumers_and_reclaims_capacity(
                 locator = transport.publish(source, consumers=(1, 2))
                 completed.record(stream)
             assert not completed.query(), (
-                "shared-memory publication waited for device completion"
+                "shared-storage publication waited for device completion"
             )
         else:
             locator = transport.publish(source, consumers=(1, 2))
@@ -633,7 +634,7 @@ def test_shm_retirement_waits_for_its_consumers_and_reclaims_capacity(
             channel.send(locator.to_mapping())
         for channel, _process in readers:
             assert channel.poll(30), (
-                "shared-memory reader did not find the segment ready"
+                "shared-storage reader did not find the segment ready"
             )
             assert channel.recv() == "readable"
         retirement = transport.release(locator)
@@ -642,7 +643,7 @@ def test_shm_retirement_waits_for_its_consumers_and_reclaims_capacity(
             with pytest.raises(WorkerError, match="capacity"):
                 transport.publish(source)
             channel.send("consume")
-            assert channel.poll(30), "shared-memory reader did not complete"
+            assert channel.poll(30), "shared-storage reader did not complete"
             assert channel.recv() is True
             process.join(30)
             assert process.exitcode == 0
@@ -670,7 +671,7 @@ def test_cuda_vmm_publication_read_from_another_host_carries_no_fence() -> None:
     """A chunk whose readers are elsewhere is readable when it is published.
 
     An interprocess event handle does not reach another host, and imported VMM
-    memory admits no device-side wait on current drivers, so the producer
+    storage admits no device-side wait on current drivers, so the producer
     synchronizes after copying into the chunk instead and the publication
     carries nothing for a consumer to wait on.
     """
@@ -687,7 +688,7 @@ def test_cuda_vmm_publication_read_from_another_host_carries_no_fence() -> None:
     try:
         # Exportable storage, so the publication is the source itself: a
         # crossing decides the fence, not where the product is materialized.
-        from uniserve_kernel.peer_memory import empty
+        from uniserve_kernel.peer_storage import empty
 
         source = empty((1024,), dtype=torch.float32, device=device)
         source.fill_(1.0)
@@ -803,7 +804,7 @@ def test_shm_producer_failure_fails_its_pending_read_and_preserves_independent_r
     process.start()
     child.close()
     try:
-        assert parent.poll(60), "shared-memory publisher did not start"
+        assert parent.poll(60), "shared-storage publisher did not start"
         locator = Locator.from_mapping(parent.recv())
         pending = consumer.fetch(locator, device=torch.device("cpu"))
         ready = threading.Event()
@@ -943,7 +944,7 @@ def test_cancelled_pending_shards_release_destination_after_read_retirement(
     process.start()
     child.close()
     try:
-        assert parent.poll(60), "shared-memory publisher did not start"
+        assert parent.poll(60), "shared-storage publisher did not start"
         locator = Locator.from_mapping(parent.recv())
         completed_source = producer.publish(torch.full(shard_shape, 3.0))
         completed = consumer.fetch(
@@ -1186,7 +1187,7 @@ def test_cuda_vmm_publishes_a_row_whose_bytes_arrive_later() -> None:
 
         # The row lives in the worker's exportable arena, as a reserved media
         # unit row does; that is what lets it be published where it lies.
-        from uniserve_kernel.peer_memory import empty
+        from uniserve_kernel.peer_storage import empty
 
         row = empty((256,), dtype=torch.float32, device=torch.device("cuda:0"))
         row.zero_()

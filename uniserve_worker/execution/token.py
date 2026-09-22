@@ -10,12 +10,11 @@ import torch
 from uniserve.nn.rng import DRAW_LAYOUT_TARGET, sampling_key, sampling_uniform
 from uniserve.sampling import SamplingParams
 from uniserve.tensors import adjacent_view
-from uniserve_worker.execution.output import PendingOutput
-from uniserve_worker.execution.sampling import TokenSelection
-from uniserve_worker.foundation.errors import (
-    invalid_descriptor,
-    unsupported_setup,
-)
+from uniserve_worker.errors import invalid_descriptor, unsupported_setup
+from uniserve_worker.execution import calls, image
+from uniserve_worker.execution.batch import BatchState
+from uniserve_worker.execution.output import PendingOutput, capture_logprobs
+from uniserve_worker.model_executor.input_batch import TokenRow
 from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
@@ -24,29 +23,23 @@ from uniserve_worker.protocol.call import (
     SamplingState,
 )
 from uniserve_worker.protocol.output import FinishFlags
-from uniserve_worker.runtime.tensor_store import FeatureMetadata, TensorRecord
-
-from . import calls, encode
-from . import sample as sampling
-from .batch_state import BatchState
-from .output import capture_logprobs
-from .rows import TokenRow
-from .sample import broadcast_selection
-from .sampling import (
+from uniserve_worker.sampling import sampler as sampling
+from uniserve_worker.sampling.metadata import SamplingMetadata, TokenSelection
+from uniserve_worker.sampling.result import (
     SamplerOutput,
     SamplerRow,
-    SamplingMetadata,
     sample_columns,
 )
+from uniserve_worker.sampling.sampler import broadcast_selection
+from uniserve_worker.storage.tensor_store import FeatureMetadata, TensorRecord
 
 if TYPE_CHECKING:
     from uniserve.distributed.mesh import Communicator
-
-    from ..runtime.block_tables import BlockTables
-    from ..runtime.decode_state import DecodeState
-    from ..runtime.tensor_store import TensorStore
-    from .inputs.image import ImageBuilder
-    from .model_runner import ModelRunner
+    from uniserve_worker.execution.model_executor import ModelExecutor
+    from uniserve_worker.model_executor.diffusion_inputs import ImageBuilder
+    from uniserve_worker.storage.block_tables import BlockTables
+    from uniserve_worker.storage.decode_state import DecodeState
+    from uniserve_worker.storage.tensor_store import TensorStore
 
 
 def prepare_forward(
@@ -55,7 +48,7 @@ def prepare_forward(
     state: BatchState,
     tensor_store: TensorStore,
     request_tables: BlockTables | None,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
     decode_state: DecodeState | None,
 ) -> TokenRow:
     """Pack autoregressive extension, decode.
@@ -312,7 +305,7 @@ def publish_sample(
                 parameters.return_prompt_logprobs
                 or int(parameters.n_prompt_logprobs) > 0
             ):
-                request.prompt_logprob_ranges = prompt_logprob_details(
+                request.token.prompt_logprob_ranges = prompt_logprob_details(
                     request,
                     start,
                     cast(torch.Tensor, task.token_ids),
@@ -360,7 +353,7 @@ def publish_sample(
                 )
             device_selected = accepted_device.to(dtype=torch.int32) + 1
 
-        request.runtime_cache_length = device_selected + int(task.seq_len)
+        request.token.runtime_cache_length = device_selected + int(task.seq_len)
         publish_runtime_sample(
             request,
             sampled,
@@ -373,12 +366,14 @@ def publish_sample(
             decode_state=decode_state,
         )
 
-        request.draft_tokens = draft
-        request.terminal_prefix = sample_work.terminal_draft_prefix
-        request.base_logical_position = start
-        request.base_rng_counter = calls.require_progress(request).rng_counter
-        request.base_kv_visible = initialized - task.query_tokens
-        request.initialized_kv = initialized
+        request.token.draft_tokens = draft
+        request.token.terminal_prefix = sample_work.terminal_draft_prefix
+        request.token.base_logical_position = start
+        request.token.base_rng_counter = calls.require_progress(
+            request
+        ).rng_counter
+        request.token.base_kv_visible = initialized - task.query_tokens
+        request.token.initialized_kv = initialized
         return token_outcome(
             call,
             tokens=0,
@@ -394,7 +389,7 @@ def _prepare_visual(
     state: BatchState,
     tensor_store: TensorStore,
     request_tables: BlockTables | None,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
 ) -> TokenRow:
     """Resolve image features and interleave them with prompt tokens for model.
 
@@ -423,7 +418,7 @@ def _prepare_visual(
     close_image = call.completion_output is not None
     sample_token = call.token_output is not None
     if call.vision_input is not None:
-        task = encode.vision_state_row(
+        task = image.vision_state_row(
             call,
             read.tensor,
             metadata.height,
@@ -436,7 +431,7 @@ def _prepare_visual(
             state=state,
         )
     else:
-        task = encode.latent_state_row(
+        task = image.latent_state_row(
             call,
             read.tensor,
             metadata.height,
@@ -513,7 +508,7 @@ def _finish_visual(
     image_builder: ImageBuilder | None,
     request_tables: BlockTables | None,
 ) -> PendingOutput:
-    """Finalize visual feature publication and advance the encode call.
+    """Finalize visual feature publication and advance the image call.
 
     state.
     """
@@ -530,9 +525,7 @@ def _finish_visual(
         request.progress = replace(
             calls.require_progress(request), logical_position=position + 1
         )
-    return encode.state_outcome(
-        call, request_tables=request_tables, state=state
-    )
+    return image.state_outcome(call, request_tables=request_tables, state=state)
 
 
 def graph_decode_samples(
@@ -682,7 +675,7 @@ def prompt_logprob_details(
             raise invalid_descriptor(
                 "continued prompt scoring has no preceding logits"
             )
-        pending = request.runtime_prompt_logits
+        pending = request.token.runtime_prompt_logits
         if pending is None:
             pending = states.prompt_logits[slot]
         previous = pending.reshape(1, -1).to(
@@ -692,7 +685,7 @@ def prompt_logprob_details(
         score_logits = torch.cat((previous, logits[:-1]), dim=0)
         targets = tokens
 
-    request.runtime_prompt_logits = logits[-1].detach()
+    request.token.runtime_prompt_logits = logits[-1].detach()
     request.progress = replace(
         calls.require_progress(request), prompt_logits_ready=True
     )
@@ -741,8 +734,8 @@ def token_outcome(
 
     cache = calls.cache_coordinates(request, tables=request_tables)
     initialized = cache[2]
-    if request.draft_tokens is None:
-        published_length = request.runtime_cache_length
+    if request.token.draft_tokens is None:
+        published_length = request.token.runtime_cache_length
         if published_length is None:
             published_length = (
                 int(task.seq_len) + int(tokens)
@@ -756,8 +749,8 @@ def token_outcome(
         visible_value = int(published_length)
         initialized = visible_value
     else:
-        visible_value = int(request.base_kv_visible)
-        initialized = request.initialized_kv
+        visible_value = int(request.token.base_kv_visible)
+        initialized = request.token.initialized_kv
 
     progress = calls.require_progress(request)
     # Publish one complete projection. Device-selected verifier acceptance stays
@@ -767,8 +760,8 @@ def token_outcome(
     request.progress = replace(
         progress,
         logical_position=(
-            request.base_logical_position
-            if request.draft_tokens is not None
+            request.token.base_logical_position
+            if request.token.draft_tokens is not None
             else progress.logical_position
             if logical_position is None
             else logical_position
@@ -783,7 +776,7 @@ def token_outcome(
     request.status = CallStatus.OK
     request.finish_flags = FinishFlags()
     request.product_generations = calls.output_generations(call)
-    request.committed_tokens = committed_tokens
+    request.token.committed_tokens = committed_tokens
     return request
 
 
@@ -890,7 +883,7 @@ def commit_kv(
     if publish_runtime and decode_state is not None:
         if int(task.request_pool_idx) != int(request.request.request_pool_idx):
             raise RuntimeError("token KV update crossed request slots")
-        request.runtime_cache_length = resulting
+        request.token.runtime_cache_length = resulting
 
 
 def resolve_decode_token(
@@ -938,11 +931,11 @@ def publish_runtime_sample(
     """Bind one call's selection for the batch's device state update."""
     if decode_state is None:
         return
-    request.sampled = sample
-    request.runtime_logical_position = logical_position
-    request.runtime_sampling_position = sampling_position
-    request.runtime_penalty_base = penalty_base
-    request.runtime_decode_increment = decode_increment
+    request.token.sampled = sample
+    request.token.runtime_logical_position = logical_position
+    request.token.runtime_sampling_position = sampling_position
+    request.token.runtime_penalty_base = penalty_base
+    request.token.runtime_decode_increment = decode_increment
 
 
 def publish_token_products(
@@ -1205,7 +1198,7 @@ def _candidate_penalty_counts(
 
     storage.
     """
-    sampled = request.sampled
+    sampled = request.token.sampled
     if sampled is None:
         return committed
 

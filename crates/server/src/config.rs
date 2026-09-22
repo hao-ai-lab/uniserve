@@ -209,7 +209,7 @@ impl EngineSettings {
 
     /// Worker IPC slot capacity for a media deployment (72 MiB).
     ///
-    /// A host product stays in a shared-memory segment on its host; across
+    /// A host product stays in a shared-storage segment on its host; across
     /// hosts its bytes ride the rank channel, in the producing rank's result
     /// and in the consuming rank's batch, so the cap admits the largest such
     /// product a rank publishes at once. A native FastH3 decode unit contains

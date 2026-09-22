@@ -65,7 +65,7 @@ struct RequestTypes {
     start: Py<PyAny>,
     finish: Py<PyAny>,
     free: Py<PyAny>,
-    native_batch: Py<PyAny>,
+    batch_from_validated: Py<PyAny>,
     dtypes: [Py<PyAny>; 7],
     draw_layouts: [Py<PyAny>; 3],
     forward_modes: [Py<PyAny>; ForwardMode::ALL.len()],
@@ -160,7 +160,10 @@ impl RequestTypes {
             start: class(&batch, "Start")?,
             finish: class(&batch, "Finish")?,
             free: class(&batch, "Free")?,
-            native_batch: class(&batch, "native_batch")?,
+            batch_from_validated: class(
+                &py.import("uniserve_worker.protocol.construction")?,
+                "batch_from_validated",
+            )?,
 
             // Enum members follow the stable Rust discriminant order used by
             // the indexed accessors below.
@@ -613,7 +616,7 @@ fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>>
             .into_any(),
         ],
     )?;
-    native.types.native_batch.bind(py).call1(arguments)
+    native.types.batch_from_validated.bind(py).call1(arguments)
 }
 
 /// Converts a latent-page params into its Python record.
@@ -1304,7 +1307,7 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
     };
 
     // Media metadata is optional, but a present handle must use the supported
-    // shared-memory transport and complete its nested value mapping.
+    // shared-storage transport and complete its nested value mapping.
     let media_output = if absent_or_none(dict, intern!(py, "media_output"))? {
         None
     } else {
@@ -2065,7 +2068,7 @@ mod tests {
             &service,
             1 << 20,
             4,
-            uniserve_worker_ipc::SHARED_MEMORY_CHANNEL,
+            uniserve_worker_ipc::SHARED_STORAGE_CHANNEL,
         )
         .unwrap();
         let client = ClientEndpoint::connect(&service, 1 << 20, 4).unwrap();

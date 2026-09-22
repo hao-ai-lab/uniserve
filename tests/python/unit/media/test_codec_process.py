@@ -1,4 +1,4 @@
-"""Codec jobs run in a codec process against media units in shared memory."""
+"""Codec jobs run in a codec process against media units in shared storage."""
 
 import io
 from multiprocessing import shared_memory
@@ -42,7 +42,7 @@ def codec():
 
 @pytest.fixture
 def segment():
-    """One shared-memory segment holding every media unit of a test."""
+    """One shared-storage segment holding every media unit of a test."""
     storage = shared_memory.SharedMemory(create=True, size=1 << 20)
     try:
         yield storage
@@ -63,7 +63,7 @@ def test_the_probe_confirms_the_process_serves_its_codecs(codec):
     assert codec.execute(Probe()) is True
 
 
-def test_units_and_audio_from_shared_memory_assemble_into_an_artifact(
+def test_units_and_audio_from_shared_storage_assemble_into_an_artifact(
     codec, segment
 ):
     config = _config()
@@ -118,7 +118,7 @@ def test_a_failed_job_answers_its_task_and_the_process_serves_on(
                 config, SharedSlice(segment.name, 0, 16 * 32 * 3 * 3 + 3)
             )
         )
-    with pytest.raises(ValueError, match="outside its shared-memory"):
+    with pytest.raises(ValueError, match="outside its shared-storage"):
         codec.execute(
             EncodeVideoUnit(
                 config,

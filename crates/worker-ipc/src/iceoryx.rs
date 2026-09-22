@@ -1,4 +1,4 @@
-//! Request-response endpoints built on iceoryx2 shared memory.
+//! Request-response endpoints built on iceoryx2 shared storage.
 //!
 //! Frames carry a fixed header and a FlatBuffers payload. Companion event
 //! services provide blocking wakeups without polling the request rings.
@@ -340,7 +340,7 @@ impl ClientEndpoint {
     /// Attempts one non-blocking pre-encoded frame submission.
     pub fn send_raw_attempt(&self, header: Header, payload: &[u8]) -> IpcResult<Pending> {
         let header = header.for_payload(payload.len(), self.max_payload)?;
-        // Loan exact shared-memory capacity, initialize the header and payload,
+        // Loan exact shared-storage capacity, initialize the header and payload,
         // then transfer ownership to the request-response service.
         let mut request = self
             .client
@@ -562,7 +562,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shared_memory_enforces_the_payload_bound_in_both_directions() {
+    fn shared_storage_enforces_the_payload_bound_in_both_directions() {
         let service = format!("payload-bound-{}", std::process::id());
         let mut server = ServerEndpoint::bind(&service, 256, 2).unwrap();
         let client = ClientEndpoint::connect(&service, 256, 2).unwrap();

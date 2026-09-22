@@ -1,4 +1,4 @@
-//! In-process scheduling, memory management, worker execution, and request control.
+//! In-process scheduling, storage management, worker execution, and request control.
 //!
 //! The crate owns the engine thread and exports request handles, configuration,
 //! execution backends, and statistics. The `testing` feature additionally
@@ -9,11 +9,11 @@ mod core;
 mod executor;
 mod handle;
 mod kv;
-/// Scheduler-owned allocation and worker-params primitives.
-pub mod memory;
 mod scheduler;
 #[cfg(feature = "testing")]
 mod sim;
+/// Scheduler-owned allocation and worker-params primitives.
+pub mod storage;
 mod worker;
 
 pub use crate::core::{EngineConfig, EngineCore, WorkerConfig, WorkerRank};

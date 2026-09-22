@@ -24,7 +24,7 @@ class AttentionBuffers:
     """Fixed-capacity K/V transport storage, separate from sparse compute.
 
     Gather storage holds a compact replicated key domain: every owner's active
-    rows, in topology order, in this rank's own memory.
+    rows, in topology order, in this rank's own storage.
     ``valid_sizes`` stores valid-row counts for the layout's explicit block
     size; numerical backends populate it when masking aligned owner capacity.
     """
@@ -45,7 +45,7 @@ class OutputBuffers:
     A layer whose epilogue composes every sequence owner's rows writes each
     owner's share straight into that owner's storage, and borrows `peers`,
     one destination per member. That storage exists only where the group's
-    devices can map one another's memory. A layer that computes its own rows
+    devices can map one another's storage. A layer that computes its own rows
     and exchanges them afterwards borrows `local` and leaves `peers` empty.
     """
 
@@ -140,7 +140,7 @@ class ParallelAttention(torch.nn.Module):
     Ulysses partitions heads over the complete sequence. A context binding
     gathers every owner's K/V into each rank, which is what an attention
     kernel reads fastest: the copy engines move the rows once, where reading
-    a peer's memory inside the kernel pays for every tile it touches. Compute
+    a peer's storage inside the kernel pays for every tile it touches. Compute
     backends retain their mask, selection and softmax semantics. The runtime
     owns communication storage.
     """
@@ -189,7 +189,7 @@ class ParallelAttention(torch.nn.Module):
 
         Every owner contributes its own rows and receives all of them, so the
         returned views cover the active rows of the complete context in
-        topology order and live in this rank's own memory for the attention
+        topology order and live in this rank's own storage for the attention
         call to read.
         """
         context = self.context_group

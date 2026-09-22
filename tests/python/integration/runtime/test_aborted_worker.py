@@ -16,7 +16,7 @@ def test_aborted_worker_returns_before_device_work_and_preserves_its_storage():
         import torch
         from tests.python.fixtures.encoding import Model
         from tests.python.fixtures.execution_worker import execution_worker
-        from uniserve_worker.config import WorkerConfig
+        from uniserve_worker.config.execution import WorkerConfig
 
         try:
             worker = execution_worker(

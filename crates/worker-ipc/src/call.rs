@@ -757,9 +757,9 @@ pub struct TimingCounters {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "transport", content = "value")]
 pub enum ArtifactHandle {
-    /// Artifact stored in a POSIX shared-memory object.
+    /// Artifact stored in a POSIX shared-storage object.
     PosixShm {
-        /// Shared-memory object name without a path separator.
+        /// Shared-storage object name without a path separator.
         name: String,
     },
 }
@@ -770,7 +770,7 @@ impl ArtifactHandle {
         match self {
             Self::PosixShm { name } => ensure_valid!(
                 !name.is_empty() && !name.contains('/'),
-                "POSIX shared-memory artifact name is invalid"
+                "POSIX shared-storage artifact name is invalid"
             ),
         }
         Ok(())

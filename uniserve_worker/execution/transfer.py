@@ -11,12 +11,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from uniserve import _slices
+from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.execution import calls as calls
+from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.output import PendingOutput
-from uniserve_worker.foundation.errors import (
-    invalid_descriptor,
-    unsupported_setup,
-)
 from uniserve_worker.protocol.batch import TensorPublication
 from uniserve_worker.protocol.call import Call, TransferMode
 from uniserve_worker.protocol.tensor import TensorRef
@@ -28,41 +26,39 @@ from uniserve_worker.protocol.transfer import (
     TensorTransfer,
     TransferValue,
 )
-from uniserve_worker.runtime.latent_pool import LatentExport
-from uniserve_worker.runtime.tensor_store import (
+from uniserve_worker.storage.latent_pool import LatentExport
+from uniserve_worker.storage.tensor_store import (
     FeatureMetadata,
     ImageMetadata,
     device_product_storage,
 )
-from uniserve_worker.transfer.tickets import publish_tensor
-
-from .batch_state import BatchState
+from uniserve_worker.transport.publication import publish_tensor
 
 if TYPE_CHECKING:
-    from uniserve_worker.execution.model_runner import ModelRunner
-    from uniserve_worker.runtime.block_tables import BlockTables
-    from uniserve_worker.runtime.cache_manager import CacheManager
-    from uniserve_worker.runtime.latent_pool import LatentPool
-    from uniserve_worker.runtime.tensor_store import TensorRecord, TensorStore
-    from uniserve_worker.transfer.tickets import Transport
+    from uniserve_worker.execution.model_executor import ModelExecutor
+    from uniserve_worker.storage.block_tables import BlockTables
+    from uniserve_worker.storage.kv_cache import KVCacheManager
+    from uniserve_worker.storage.latent_pool import LatentPool
+    from uniserve_worker.storage.tensor_store import TensorRecord, TensorStore
+    from uniserve_worker.transport.interface import Transport
 
 
 def execute(
     call: Call,
     *,
     state: BatchState,
-    kv_cache: CacheManager | None,
+    kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
     latent_pool: LatentPool | None,
     publication_transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
 ) -> PendingOutput:
     """Execute a tensor transfer or KV publication/install call and stage.
 
     its result.
     """
-    from . import encode
+    from uniserve_worker.execution import image
 
     transports = publication_transports
     if not transports:
@@ -103,7 +99,7 @@ def execute(
             for location in tensor.locations
         )
 
-        outcome = encode.non_state_outcome(call, state=state)
+        outcome = image.non_state_outcome(call, state=state)
         outcome.kv_output = snapshot
     elif mode is TransferMode.KV_INSTALL:
         publications = kv_cache
@@ -127,7 +123,7 @@ def execute(
         )
         request.cache_installation = (source, output, installed)
 
-        outcome = encode.non_state_outcome(call, state=state)
+        outcome = image.non_state_outcome(call, state=state)
         if outcome.progress is not None:
             outcome.progress = replace(
                 outcome.progress,
@@ -169,7 +165,7 @@ def execute(
                 publication_transports=publication_transports,
                 state=state,
             )
-        outcome = encode.non_state_outcome(
+        outcome = image.non_state_outcome(
             call,
             products=(tensor_publication,),
             state=state,
@@ -193,8 +189,8 @@ def _publish_current_latent(
         )
 
     row = state.pending_output(call.request_key.request_id)
-    params = row.input_latent_params
-    staging = row.latent_staging
+    params = row.latent.input_params
+    staging = row.latent.staging
     if params is None or staging is None:
         raise invalid_descriptor("trajectory call has no staged latent inputs")
 
@@ -234,7 +230,7 @@ def publish_latent_source(
 
     reader.
     """
-    params = row.input_latent_params
+    params = row.latent.input_params
     if params is None:
         raise invalid_descriptor("latent publication has no staged parameters")
 
@@ -265,7 +261,7 @@ def publish_latent_source(
         consumers=row.call.consumer_slots,
     )
     request.exported_locators.extend(locations)
-    request.latent_exports[product.buffer_id] = tuple(
+    request.latent.exports[product.buffer_id] = tuple(
         (transports[location.backend], location) for location in locations
     )
 
@@ -332,7 +328,7 @@ def publish_product(
     `consumers` are the acknowledgment slots the producing call names; a
     `host` product is published as host bytes.
     """
-    from .encode import bound_device_write
+    from uniserve_worker.execution.image import bound_device_write
 
     transports = publication_transports
     if not transports:
@@ -531,7 +527,7 @@ def fetch_product(
     *,
     state: BatchState,
     tensor_store: TensorStore,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
 ) -> tuple[torch.Tensor, ImageMetadata | FeatureMetadata | None]:
     """Fetch a transfer handle and stage its typed value for the consuming.
 
@@ -618,11 +614,11 @@ def reserved_unit_rows(
 ):
     """Return the product rows reserved for this rank's encoded media units.
 
-    The rows are filled and published when the host tasks that encode the
+    The rows are filled and published when the host tasks that image the
     units complete. Nothing reads them before then: the muxer's call is
-    scheduled only once every encode round has completed.
+    scheduled only once every image round has completed.
     """
-    from .encode import bound_device_write
+    from uniserve_worker.execution.image import bound_device_write
 
     outputs = call.outputs
     if len(outputs) != 1:

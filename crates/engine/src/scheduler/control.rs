@@ -18,7 +18,7 @@ impl Scheduler {
 
     /// Aborts every queued/gated/running request with a terminal event.
     pub(super) fn abort_all_requests(&mut self) {
-        self.pending_submissions.clear();
+        self.inflight.pending_submissions.clear();
         while let Some(id) = self.waiting_media_order.pop_front() {
             let submission = self
                 .waiting_media
@@ -110,14 +110,14 @@ impl Scheduler {
     ) -> Vec<BatchCommand> {
         let mut blocked = HashSet::new();
         let mut selected = Vec::new();
-        for command in std::mem::take(&mut self.pending_commands) {
+        for command in std::mem::take(&mut self.inflight.pending_commands) {
             let request = command.request_key();
             if blocked.contains(&request)
                 || !include(&command)
                 || !self.executor.command_has_capacity(&command)
             {
                 blocked.insert(request);
-                self.pending_commands.push_back(command);
+                self.inflight.pending_commands.push_back(command);
             } else {
                 selected.push(command);
             }
@@ -158,7 +158,7 @@ impl Scheduler {
                 } else {
                     FinishReason::Cancelled
                 });
-            let drained = !self.has_pending_calls(id);
+            let drained = !self.inflight.has_pending_calls(id);
             if drained {
                 self.finish_media(
                     id,

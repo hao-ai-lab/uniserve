@@ -29,7 +29,7 @@ from typing import Any
 
 import numpy as np
 
-from .storage import publish_media_bytes
+from uniserve_worker.media.storage import publish_media_bytes
 
 __all__ = [
     "AvMuxConfig",
@@ -358,10 +358,10 @@ class AvMuxSession:
 
 @dataclass(frozen=True, slots=True)
 class SharedSlice:
-    """A media unit's bytes inside a POSIX shared-memory segment.
+    """A media unit's bytes inside a POSIX shared-storage segment.
 
     The segment is a host product's publication, named in this host's
-    shared-memory namespace; a codec process maps it for the job that reads
+    shared-storage namespace; a codec process maps it for the job that reads
     it and unmaps it afterwards, so the producer's retirement of the segment
     never waits on a codec process.
     """
@@ -409,7 +409,7 @@ class MuxAppend:
 class MuxFinalize:
     """Mux the session's audio track and publish the artifact.
 
-    The result is the artifact's shared-memory name and its byte count; the
+    The result is the artifact's shared-storage name and its byte count; the
     session is gone afterwards.
     """
 
@@ -442,21 +442,21 @@ class _Session:
 
 
 def _read(source: SharedSlice) -> np.ndarray:
-    """View a media unit's bytes in its shared-memory segment without copying.
+    """View a media unit's bytes in its shared-storage segment without copying.
 
-    The segment is opened by name in this host's shared-memory namespace,
+    The segment is opened by name in this host's shared-storage namespace,
     read-only; the mapping lives as long as the returned view and is released
     with it, so a codec that keeps a frame's storage alive keeps the mapping.
     """
     if source.offset < 0 or source.nbytes < 0:
-        raise ValueError("media unit lies outside its shared-memory segment")
+        raise ValueError("media unit lies outside its shared-storage segment")
     name = source.segment.removeprefix("/")
     descriptor = os.open(f"/dev/shm/{name}", os.O_RDONLY)
     try:
         size = os.fstat(descriptor).st_size
         if source.offset + source.nbytes > size:
             raise ValueError(
-                "media unit lies outside its shared-memory segment"
+                "media unit lies outside its shared-storage segment"
             )
         mapping = mmap.mmap(
             descriptor,
@@ -557,7 +557,7 @@ class CodecProcess:
 
     The process is started as its own interpreter running this module, so it
     inherits nothing of the rank but its environment; the connection is one
-    end of a socket pair. A job names the shared-memory segment it reads, so
+    end of a socket pair. A job names the shared-storage segment it reads, so
     nothing but the job travels. Calls are serialized by a lock, because a
     process runs one job at a time; the host lane keeps one process per
     worker so its capacity is the lane's. Transfer releases the interpreter

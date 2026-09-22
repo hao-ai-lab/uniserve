@@ -3,10 +3,9 @@
 from torch import nn
 
 from uniserve.model import Denoiser, ImageDenoiser, VideoPostprocessor
-
-from ..config import WorkerConfig
-from ..execution.inputs.image import ImageBuilder
-from ..execution.inputs.media import MediaBuilder
+from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.model_executor.diffusion_inputs import ImageBuilder
+from uniserve_worker.model_executor.media_inputs import MediaBuilder
 
 
 def capability(model: nn.Module, kind: type[nn.Module]):

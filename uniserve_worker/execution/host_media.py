@@ -2,7 +2,7 @@
 
 These calls run on host ranks. A video encode consumes the RGB media units
 its rank is handed from a decode round, borrowed in place from the
-shared-memory segment the decoding rank on this host published, so a codec
+shared-storage segment the decoding rank on this host published, so a codec
 process reads the producer's bytes directly; the encoded unit rows are this
 rank's product, published when the encodes complete. An audio encode
 consumes the request's PCM timeline, imported like any product because its
@@ -15,10 +15,11 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
-from uniserve_worker.foundation.errors import (
-    invalid_descriptor,
-    unsupported_setup,
-)
+from uniserve_worker.errors import invalid_descriptor, unsupported_setup
+from uniserve_worker.execution import calls
+from uniserve_worker.execution.batch import BatchState
+from uniserve_worker.execution.host import HostTask
+from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.media.mux import (
     MediaEncoder,
     MediaMux,
@@ -28,25 +29,16 @@ from uniserve_worker.media.mux import (
 from uniserve_worker.protocol.call import Call, CallStatus, MediaCall
 from uniserve_worker.protocol.output import FinishFlags
 from uniserve_worker.protocol.transfer import PosixShmTransfer
-from uniserve_worker.runtime.host_lane import HostTask
-
-from . import calls
-from .batch_state import BatchState
-from .output import PendingOutput
 
 if TYPE_CHECKING:
     import torch
 
-    from uniserve_worker.bootstrap.config import ComponentConfig
+    from uniserve_worker.config.deployment import ComponentConfig
+    from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.protocol.batch import TensorPublication
-    from uniserve_worker.runtime.tensor_store import TensorStore
-    from uniserve_worker.transfer.tickets import (
-        HostBorrow,
-        ShmTransport,
-        Transport,
-    )
-
-    from .model_runner import ModelRunner
+    from uniserve_worker.storage.tensor_store import TensorStore
+    from uniserve_worker.transport.interface import Transport
+    from uniserve_worker.transport.shm import HostBorrow, ShmTransport
 
 __all__ = ["BORROWED_INPUT_CALLS", "HOST_MEDIA_CALLS", "execute"]
 
@@ -67,7 +59,7 @@ def encoded_unit_positions(
     ``units_per_rank`` consecutive positions, the same order the engine used
     to project the call onto its ranks.
     """
-    from .video import decode_range
+    from uniserve_worker.execution.media import decode_range
 
     params = decode_range(call, state=state)
     per_rank = max(1, int(component.units_per_rank))
@@ -93,7 +85,7 @@ def _shm(transports: Mapping[str, Transport]) -> ShmTransport:
     transport = transports.get("shm")
     if transport is None:
         raise unsupported_setup(
-            "host media inputs are borrowed over shared memory, which this "
+            "host media inputs are borrowed over shared storage, which this "
             "rank does not bind"
         )
     return transport  # type: ignore[return-value]
@@ -119,7 +111,7 @@ def _borrow(
 ) -> HostBorrow:
     """Borrow one leading-axis row of a product in place.
 
-    The location holding the row must be a shared-memory segment on this
+    The location holding the row must be a shared-storage segment on this
     host: a host product's other mechanisms carry copies, which an encoder
     reading in place has no use for.
     """
@@ -136,7 +128,7 @@ def _borrow(
             )
             return shm.borrow(location, region)
     raise invalid_descriptor(
-        f"media unit {row} is not published over shared memory on this host: "
+        f"media unit {row} is not published over shared storage on this host: "
         + _locations(publication)
     )
 
@@ -144,23 +136,21 @@ def _borrow(
 def _stage_tensor(value: torch.Tensor) -> HostBorrow:
     """Copy a tensor into a segment of this rank's own for a codec process.
 
-    Codecs read media bytes from a named shared-memory segment. An input
+    Codecs read media bytes from a named shared-storage segment. An input
     imported from another host instead lives in this rank's tensor store, so
     it is copied to a local segment whose borrow unlinks it after the codec has
     read it.
     """
     import torch
 
-    from uniserve_worker.foundation.shared_memory import (
-        allocate_shared_memory,
-    )
-    from uniserve_worker.transfer.tickets import HostBorrow
+    from uniserve_worker.transport.shared_storage import allocate_shared_storage
+    from uniserve_worker.transport.shm import HostBorrow
 
     raw = value.detach().to("cpu").contiguous().view(torch.uint8).reshape(-1)
     nbytes = int(raw.numel())
     if nbytes < 1:
         raise invalid_descriptor("codec input is empty")
-    segment = allocate_shared_memory(nbytes)
+    segment = allocate_shared_storage(nbytes)
     try:
         # The mapping is dropped before the borrow is released, so closing
         # the segment finds no exported buffer.
@@ -187,17 +177,17 @@ def execute(
     media_mux: MediaMux | None,
     publication_transports: Mapping[str, Transport],
     transports: Mapping[str, Transport],
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
 ) -> PendingOutput:
     """Schedule one host media call on the rank's lane."""
-    from . import transfer
-    from .video import mux_config
+    from uniserve_worker.execution import transfer
+    from uniserve_worker.execution.media import mux_config
 
     request = state.pending_output(call.request_key.request_id)
     media = request.request.admission.diffusion
     if media is None:
         raise invalid_descriptor("host media call has no admitted media")
-    reservations = request.completion_tasks
+    reservations = request.host.tasks
     if not reservations:
         raise RuntimeError("host media call has no reserved lane slots")
 
@@ -216,7 +206,7 @@ def execute(
                 "video encoding reserved a different number of lane slots "
                 "than the media units it takes"
             )
-        from .video import decode_range
+        from uniserve_worker.execution.media import decode_range
 
         cursor = int(decode_range(call, state=state).cursor)
         config = mux_config(model_runner, media)
@@ -292,7 +282,9 @@ def execute(
         tensor_store.defer_write(write)
 
         def publish(results: tuple[object, ...]) -> None:
-            from .commit import _validate_completion_products
+            from uniserve_worker.execution.commit import (
+                _validate_completion_products,
+            )
 
             for row, result in zip(rows.unbind(0), results, strict=True):
                 if not isinstance(result, bytes):
@@ -393,7 +385,7 @@ def execute(
     request.progress = calls.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
     request.product_generations = calls.output_generations(call)
-    request.completion_tasks = tasks
-    request.finish = finish
+    request.host.tasks = tasks
+    request.host.finish = finish
     request.products = ()
     return request

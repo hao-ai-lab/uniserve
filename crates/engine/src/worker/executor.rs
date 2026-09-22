@@ -10,7 +10,7 @@ use std::time::Duration;
 use super::{BatchSubmitError, WorkerGroup};
 use crate::executor::{
     BatchResult, CommandOutcome, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
-    RequestPlacement, TransferConfig, WorkerFailure, WorkerId, logical_result, physical_batch,
+    RequestPlacement, TransferConfig, WorkerFailure, WorkerId, logical_result,
 };
 use anyhow::Context;
 use uniserve_core::CommandWaker;
@@ -124,7 +124,7 @@ pub struct WorkerExecutor {
 /// Refuses a placement whose decoded video media units would leave their host.
 ///
 /// A decoded media unit is a host product of tens of megabytes that its
-/// encoder reads through shared memory; the unit decoded on one rank is
+/// encoder reads through shared storage; the unit decoded on one rank is
 /// encoded on the rank holding its index, so both must share a host. A
 /// placement that separates them is refused at startup, naming the ranks,
 /// rather than moving every unit through the head's channel.
@@ -182,7 +182,7 @@ pub(crate) fn refuse_units_crossing_hosts(
             "media unit {position} is decoded by rank {decoding_rank} of worker {decoder_worker} \
              on host {decoding_host} and encoded by rank {encoding_rank} of worker \
              {encoder_worker} on host {encoding_host}; a decoded media unit reaches its encoder \
-             through shared memory and must stay on its host"
+             through shared storage and must stay on its host"
         );
     }
     Ok(())
@@ -328,11 +328,11 @@ impl WorkerExecutor {
                                     );
                                 }
                             }
-                            // Shared memory names a segment in one host's namespace.
+                            // Shared storage names a segment in one host's namespace.
                             crate::executor::TransferBackend::Shm => anyhow::ensure!(
                                 !crosses_hosts,
                                 "transfer edge from worker {} on host {source_host} to worker {} \
-                             on host {destination_host} crosses hosts over shared memory, \
+                             on host {destination_host} crosses hosts over shared storage, \
                              which names a segment in one host's namespace",
                                 edge.source_worker.0,
                                 edge.destination_worker.0,
@@ -763,14 +763,14 @@ impl WorkerExecutor {
         let collective_seq = self.worker_collective_seqs[worker_index]
             .checked_add(1)
             .context("collective sequence space exhausted")?;
-        let mut wire = physical_batch(
-            batch.id,
-            collective_seq,
-            batch.requests.clone(),
+        let mut wire = ExecutionBatch {
+            id: batch.id,
+            requests: batch.requests.clone(),
             commands,
-            inputs,
+            input_transfers: inputs,
             kv_inputs,
-        )?;
+        }
+        .into_protocol(collective_seq)?;
         for dependency in &submission.dependencies {
             if !self.transfer_products.contains_key(dependency)
                 || !wire

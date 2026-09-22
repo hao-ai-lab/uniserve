@@ -5,11 +5,19 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
+from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution import calls
-from uniserve_worker.execution.batch_state import BatchState
+from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.calls import _predicated_outcome
+from uniserve_worker.execution.forward import (
+    forward_values,
+    initialize_trajectories,
+    integrate_predictions,
+    prepare_diffusion_step,
+    prepare_forward_rows,
+    publish_forward_values,
+)
 from uniserve_worker.execution.output import PendingOutput
-from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
@@ -18,36 +26,27 @@ from uniserve_worker.protocol.call import (
     TransferMode,
 )
 
-from .forward import (
-    forward_values,
-    initialize_trajectories,
-    integrate_predictions,
-    prepare_diffusion_step,
-    prepare_forward_rows,
-    publish_forward_values,
-)
-
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
     from uniserve.distributed.mesh import Communicator
-    from uniserve_worker.bootstrap.worker_info import WorkerInfo
-    from uniserve_worker.config import WorkerConfig
-    from uniserve_worker.execution.model_runner import ModelRunner
+    from uniserve_worker.config.execution import WorkerConfig
+    from uniserve_worker.execution.model_executor import ModelExecutor
+    from uniserve_worker.execution.request import RequestPool
     from uniserve_worker.media.mux import MediaMux
-    from uniserve_worker.runtime.block_tables import BlockTables
-    from uniserve_worker.runtime.cache_manager import CacheManager
-    from uniserve_worker.runtime.decode_state import DecodeState
-    from uniserve_worker.runtime.latent_pool import LatentPool
-    from uniserve_worker.runtime.request import RequestPool
-    from uniserve_worker.runtime.tensor_store import TensorStore
-    from uniserve_worker.transfer.tickets import Transport
+    from uniserve_worker.protocol.worker_info import WorkerInfo
+    from uniserve_worker.storage.block_tables import BlockTables
+    from uniserve_worker.storage.decode_state import DecodeState
+    from uniserve_worker.storage.kv_cache import KVCacheManager
+    from uniserve_worker.storage.latent_pool import LatentPool
+    from uniserve_worker.storage.tensor_store import TensorStore
+    from uniserve_worker.transport.interface import Transport
 
 
 def dispatch_batch(
     *,
     state: BatchState,
-    kv_cache: CacheManager | None,
+    kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
@@ -56,7 +55,7 @@ def dispatch_batch(
     transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
     tokenizer: PreTrainedTokenizerBase | None,
@@ -128,7 +127,7 @@ def _execute_ready_actions(
     outcomes: dict[int, PendingOutput],
     *,
     state: BatchState,
-    kv_cache: CacheManager | None,
+    kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
@@ -137,12 +136,18 @@ def _execute_ready_actions(
     transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
     config: WorkerConfig,
 ) -> None:
     """Execute a dependency frontier that contains no numerical model calls."""
-    from . import encode, flow, host_media, transfer, video
-    from .host_media import HOST_MEDIA_CALLS
+    from uniserve_worker.execution import (
+        diffusion,
+        host_media,
+        image,
+        media,
+        transfer,
+    )
+    from uniserve_worker.execution.host_media import HOST_MEDIA_CALLS
 
     for index in frontier:
         call = scheduled[index]
@@ -165,7 +170,7 @@ def _execute_ready_actions(
                 call.kind is MediaCall.LATENT_PREPARATION
                 and latent_pool is not None
             ):
-                result = flow.prepare_latent(
+                result = diffusion.prepare_latent(
                     call,
                     kv_cache=kv_cache,
                     worker_info=worker_info,
@@ -177,7 +182,7 @@ def _execute_ready_actions(
                     state=state,
                 )
             elif call.kind is MediaCall.TEXT_ENCODING:
-                result = encode.text(
+                result = image.text(
                     call,
                     tensor_store=tensor_store,
                     publication_transports=publication_transports,
@@ -195,7 +200,7 @@ def _execute_ready_actions(
                     state=state,
                 )
             elif model_runner.video_postprocessor is not None:
-                result = video.execute(
+                result = media.execute(
                     call,
                     tensor_store=tensor_store,
                     publication_transports=publication_transports,
@@ -212,7 +217,7 @@ def _execute_calls(
     scheduled: tuple[Call, ...],
     *,
     state: BatchState,
-    kv_cache: CacheManager | None,
+    kv_cache: KVCacheManager | None,
     tensor_store: TensorStore,
     worker_info: WorkerInfo,
     latent_pool: LatentPool | None,
@@ -221,7 +226,7 @@ def _execute_calls(
     transports: Mapping[str, Transport],
     request_tables: BlockTables | None,
     request_pool: RequestPool,
-    model_runner: ModelRunner,
+    model_runner: ModelExecutor,
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
     tokenizer: PreTrainedTokenizerBase | None,

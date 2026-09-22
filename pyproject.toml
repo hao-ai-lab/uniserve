@@ -48,7 +48,7 @@ gpu = [
     "flashinfer-python==0.6.18",
     "ninja>=1.13",
     "requests[socks]>=2",
-    "uniserve-kernel[peer_memory,sparse_attention,flash_attn_jagged]",
+    "uniserve-kernel[peer_storage,sparse_attention,flash_attn_jagged]",
 ]
 
 [tool.uv.sources]

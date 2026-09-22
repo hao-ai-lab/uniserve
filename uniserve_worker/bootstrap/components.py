@@ -22,16 +22,18 @@ from uniserve.model import (
     VideoPostprocessor,
 )
 from uniserve.nn.vae import PatchAutoencoder
-
-from ..execution.component_binding import Call, ComponentBinding
-from ..foundation.errors import unsupported_setup
-from ..protocol.call import (
+from uniserve_worker.config.deployment import ComponentConfig
+from uniserve_worker.errors import unsupported_setup
+from uniserve_worker.model_executor.component_binding import (
+    Call,
+    ComponentBinding,
+)
+from uniserve_worker.protocol.call import (
     CallKind,
     ForwardMode,
     MediaCall,
     TransferMode,
 )
-from .config import ComponentConfig
 
 # Host components run on a host worker's ranks and own no numerical method, so
 # the worker declares them rather than the model, which declares numerical

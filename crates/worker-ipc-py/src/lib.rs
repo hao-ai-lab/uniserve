@@ -1,10 +1,10 @@
-//! Python bindings for the worker-side shared-memory IPC endpoint.
+//! Python bindings for the worker-side shared-storage IPC endpoint.
 //!
 //! # Boundary conversions
 //!
 //! Each request crosses two boundaries:
 //!
-//! 1. iceoryx2 carries FlatBuffers frames through shared memory;
+//! 1. iceoryx2 carries FlatBuffers frames through shared storage;
 //! 2. The Rust↔Python FFI boundary, crossed once on the inbound path
 //!    ([`PyServer::recv`] / [`PyServer::try_recv`]) and once on the outbound
 //!    path ([`PyServer::respond`]).
@@ -26,7 +26,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule};
 use pyo3::wrap_pyfunction;
 use pythonize::{depythonize, pythonize};
-use uniserve_worker_ipc::{RankServer, SHARED_MEMORY_CHANNEL, Wake};
+use uniserve_worker_ipc::{RankServer, SHARED_STORAGE_CHANNEL, Wake};
 use uniserve_worker_ipc::{RequestKind, WorkerRequest, WorkerResponse};
 
 #[pyclass(name = "Server")]
@@ -244,11 +244,11 @@ impl PyStreamSignal {
 #[pymethods]
 impl PyServer {
     #[new]
-    #[pyo3(signature = (service_name, max_payload = 1048576, max_inflight = 1, transport = SHARED_MEMORY_CHANNEL))]
+    #[pyo3(signature = (service_name, max_payload = 1048576, max_inflight = 1, transport = SHARED_STORAGE_CHANNEL))]
     /// Binds this rank's channel with bounded payload and inflight capacity.
     ///
     /// `transport` is the mechanism the placement calls for: a rank on the
-    /// head's host serves shared memory, and a rank elsewhere serves a socket,
+    /// head's host serves shared storage, and a rank elsewhere serves a socket,
     /// where `service_name` is the host to bind rather than a service.
     fn new(
         service_name: &str,
@@ -298,7 +298,7 @@ impl PyServer {
 
     /// Returns the endpoint the head binds, which the rank reports.
     ///
-    /// A shared-memory endpoint is the service it was given; a socket endpoint
+    /// A shared-storage endpoint is the service it was given; a socket endpoint
     /// is the address its bind produced, which the caller could not know.
     fn endpoint(&self, service: &str) -> PyResult<String> {
         let state = self
@@ -485,7 +485,7 @@ impl PyServer {
 }
 
 #[pyfunction]
-/// Returns the shared-memory service name for one endpoint identifier.
+/// Returns the shared-storage service name for one endpoint identifier.
 ///
 /// A rank names its own channel endpoint and reports it to the head, so both
 /// sides have to spell the name the same way; this is that one spelling.
@@ -495,7 +495,7 @@ fn service_name(id: &str) -> String {
 
 /// Resolves one aligned 32-bit word inside a writable buffer.
 ///
-/// A shared-memory segment's header words are read and written by different
+/// A shared-storage segment's header words are read and written by different
 /// processes, and the readiness word is written after the payload it
 /// announces. Python cannot order those stores, so the words are accessed
 /// through release and acquire atomics here.
@@ -523,7 +523,7 @@ fn buffer_word(buffer: &PyBuffer<u8>, offset: usize) -> PyResult<*mut u32> {
 
 #[pyfunction]
 /// Stores `value` at `offset` with release ordering, after every earlier
-/// write into any memory this process made.
+/// write into any storage this process made.
 fn atomic_store_u32(buffer: PyBuffer<u8>, offset: usize, value: u32) -> PyResult<()> {
     let word = buffer_word(&buffer, offset)?;
     // SAFETY: `buffer_word` checked alignment and bounds; the buffer stays

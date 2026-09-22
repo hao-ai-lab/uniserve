@@ -1,4 +1,4 @@
-"""Samples host-visible NVIDIA GPU memory and utilization telemetry."""
+"""Samples host-visible NVIDIA GPU storage and utilization telemetry."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def _read_gpu_rows() -> list[dict[str, int]]:
 
 
 @dataclass
-class GpuMemorySampler:
+class GpuStorageSampler:
     """Collects periodic GPU telemetry and aggregate peaks on a background thread."""  # noqa: E501
 
     interval_s: float = 0.5

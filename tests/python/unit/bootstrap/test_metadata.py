@@ -91,13 +91,13 @@ def test_h3_worker_advertises_bounded_media_products():
         media_components,
         supported_calls,
     )
-    from uniserve_worker.config import WorkerConfig
+    from uniserve_worker.bootstrap.outputs import resolve_outputs
+    from uniserve_worker.config.execution import WorkerConfig
     from uniserve_worker.protocol.call import (
         VIDEO_CALLS,
         MediaCall,
         TransferMode,
     )
-    from uniserve_worker.runtime.results import resolve_outputs
 
     with torch.device("meta"):
         model = Model(Config())
@@ -145,9 +145,7 @@ def test_h3_worker_advertises_bounded_media_products():
             products[name].shape_bound.max_elements == torch.Size(shape).numel()
         )
 
-    from uniserve_worker.bootstrap.worker_info_builder import (
-        build_worker_layout,
-    )
+    from uniserve_worker.bootstrap.report import build_worker_layout
 
     info = build_worker_layout(model, config, queue_depth=6).info
     assert info.num_inference_steps == 4
@@ -226,10 +224,8 @@ def test_sensenova_reader_rejects_unimplemented_sliding_attention(tmp_path):
 @pytest.mark.parametrize("storage", ("bfloat16", "float8_e4m3fn"))
 def test_text_worker_reports_exact_cache_capacity(storage):
     from uniserve_models.qwen3 import Config, Model
-    from uniserve_worker.bootstrap.worker_info_builder import (
-        build_worker_layout,
-    )
-    from uniserve_worker.config import WorkerConfig
+    from uniserve_worker.bootstrap.report import build_worker_layout
+    from uniserve_worker.config.execution import WorkerConfig
 
     with torch.device("meta"):
         model = Model(

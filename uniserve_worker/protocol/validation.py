@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
-from ..foundation.errors import invalid_descriptor
+from uniserve_worker.errors import invalid_descriptor
 
 _E = TypeVar("_E", bound=StrEnum)
 

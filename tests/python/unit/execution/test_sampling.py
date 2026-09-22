@@ -6,8 +6,8 @@ import pytest
 import torch
 
 from uniserve.sampling import SamplingParams
-from uniserve_worker.execution.sample import device_greedy_parameters, sample
-from uniserve_worker.execution.sampling import SamplingMetadata
+from uniserve_worker.sampling.metadata import SamplingMetadata
+from uniserve_worker.sampling.sampler import device_greedy_parameters, sample
 
 
 @pytest.mark.parametrize(

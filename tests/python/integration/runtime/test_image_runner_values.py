@@ -23,17 +23,17 @@ from uniserve.model import TextSize
 from uniserve.runtime import ExecutionContext, PrefixCache
 from uniserve_worker.bootstrap.cache import cache_info
 from uniserve_worker.bootstrap.capacity import input_buffer_config
-from uniserve_worker.bootstrap.config import ComponentConfig
-from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.attention import from_blocks
-from uniserve_worker.execution.component_binding import ComponentBinding
-from uniserve_worker.execution.flow import (
+from uniserve_worker.config.deployment import ComponentConfig
+from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.execution.diffusion import (
     flow_rows,
     image_state,
     integrate,
     prefix_row,
 )
-from uniserve_worker.execution.model_runner import ModelRunner
+from uniserve_worker.execution.model_executor import ModelExecutor
+from uniserve_worker.model_executor.attention import from_blocks
+from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.protocol.call import (
     Bounds,
     Call,
@@ -43,8 +43,8 @@ from uniserve_worker.protocol.call import (
     MediaCall,
 )
 from uniserve_worker.protocol.identity import CallId, RequestKey
-from uniserve_worker.runtime.cache_manager import CacheManager
-from uniserve_worker.runtime.latent_pool import LatentPool
+from uniserve_worker.storage.kv_cache import KVCacheManager
+from uniserve_worker.storage.latent_pool import LatentPool
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -125,14 +125,14 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
         flow_graph_shapes=((16, 16),),
         flow_graph_batch_sizes=(1,),
     )
-    runner = ModelRunner(model, config, bindings=bindings)
+    runner = ModelExecutor(model, config, bindings=bindings)
     size = image.Config(16, 16)
     factory = runner.image_builder
     shape = factory.denoiser.latent_shape("image", size)
     cache = PrefixCache(
         model.text.cache_config, num_blocks=8, block_size=16, device="cuda:0"
     )
-    manager = CacheManager(
+    manager = KVCacheManager(
         cache,
         info=cache_info(model.text, config, num_blocks=8),
         request_pool_size=3,
@@ -243,7 +243,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                 causal=(False,) * len(branches),
                 write=(False,) * len(branches),
             )
-            from uniserve_worker.execution.graphs import map_tensors
+            from uniserve_worker.model_executor.cuda_graph import map_tensors
 
             attention = map_tensors(attention, lambda value: value.to("cuda:0"))
             inputs = factory.bind(
@@ -323,8 +323,8 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
     from uniserve.model import EmbeddingReplacement, TextInput
     from uniserve.nn.attention import SequenceLengths, VarlenInput
     from uniserve_worker.bootstrap.components import supported_calls
-    from uniserve_worker.execution.rows import TokenRow
-    from uniserve_worker.execution.sampling import TokenSelection
+    from uniserve_worker.model_executor.input_batch import TokenRow
+    from uniserve_worker.sampling.metadata import TokenSelection
     from uniserve_worker.worker import Worker
 
     if name == "bagel":
@@ -555,7 +555,9 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 root_parent,
             )
             from uniserve.model import VisionInput
-            from uniserve_worker.execution.image_input import prepare_image
+            from uniserve_worker.model_executor.image_inputs import (
+                prepare_image,
+            )
             from uniserve_worker.protocol.call import CallStatus
             from uniserve_worker.protocol.tensor import DeviceDim, ShapeBound
 

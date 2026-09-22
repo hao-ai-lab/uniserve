@@ -16,7 +16,7 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.simulation import expected_successor
 from uniserve.sampling import SamplingParams
-from uniserve_worker.config import WorkerConfig
+from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.protocol.call import (
     CallStatus,
     DrawLayout,
@@ -28,6 +28,7 @@ from uniserve_worker.protocol.identity import CallId
 
 pytestmark = [
     pytest.mark.integration,
+    pytest.mark.gpu,
     pytest.mark.skipif(
         not torch.cuda.is_available(), reason="CUDA is required"
     ),
@@ -134,25 +135,25 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
     warm_admission = ar_params(30, block_ids=(1,))
     warm_call = token_call(
         warm_admission.request_key,
-        call_id=CallId(100, 0),
+        call_id=CallId(1, 0),
         predecessor=root_parent(warm_admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
-    worker.submit(
+    warm_report = worker.submit(
         execution_batch(
-            batch_id=0,
+            batch_id=1,
             admissions=(warm_admission,),
             calls=(warm_call,),
         )
     )
-    torch.cuda.synchronize()
+    finalized_report(worker, warm_report)
     worker.drop_request(30)
 
     admission = ar_params(31, block_ids=(0,))
     predecessor = token_call(
         admission.request_key,
-        call_id=CallId(1, 0),
+        call_id=CallId(2, 0),
         predecessor=root_parent(admission),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
@@ -160,7 +161,7 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
 
     parent_report = worker.submit(
         execution_batch(
-            batch_id=1,
+            batch_id=2,
             admissions=(admission,),
             calls=(predecessor,),
         )
@@ -168,7 +169,7 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
     device_parent = predecessor.call_id
     successor_template = token_call(
         admission.request_key,
-        call_id=CallId(2, 0),
+        call_id=CallId(3, 0),
         predecessor=device_parent,
         mode=ForwardMode.DECODE,
         tokens=(0,),
@@ -178,7 +179,7 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
 
     successor_report = worker.submit(
         execution_batch(
-            batch_id=2,
+            batch_id=3,
             admissions=(),
             calls=(successor,),
         )
@@ -274,7 +275,12 @@ def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
         )
     ]
     calls = [call]
+    completed = []
     for batch_id in range(2, 5):
+        if batch_id == 4:
+            # Delivery releases one admission slot; the successor's product
+            # lease still protects the predecessor's physical token value.
+            completed.append(finalized_report(worker, reports.pop(0)))
         predecessor = calls[-1]
         call = token_call(
             admission.request_key,
@@ -295,9 +301,9 @@ def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
         calls.append(call)
 
     torch.cuda.synchronize()
+    completed.extend(finalized_report(worker, report) for report in reports)
     tokens = tuple(
-        finalized_report(worker, report).completions[0].committed_tokens[0]
-        for report in reports
+        report.completions[0].committed_tokens[0] for report in completed
     )
     expected = []
     current = 4

@@ -18,7 +18,7 @@ from uniserve.runtime import (
     initialize_process_groups,
 )
 from uniserve.sampling import greedy
-from uniserve_worker.execution.batch import ExecutionOutput
+from uniserve_worker.model_executor.output import ExecutionOutput
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

@@ -71,7 +71,7 @@ def allocate_output_storage(
         }
         # Only a layer with a context partition composes every owner's rows
         # and writes each share into that owner's storage, which is what
-        # symmetric memory provides and what requires peer access across the
+        # symmetric storage provides and what requires peer access across the
         # whole group. A plain Ulysses layer computes its own rows and
         # exchanges them afterwards, so demanding that storage for it would
         # refuse the layout on a device whose peer access does not span the

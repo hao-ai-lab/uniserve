@@ -7,10 +7,12 @@ from collections.abc import Mapping
 from uniserve.distributed import DeviceMesh, communication_axes
 from uniserve.model import CausalLM
 from uniserve.runtime.process_groups import ProcessGroups
-
-from ..execution.component_binding import Call, ComponentBinding
-from .config import ComponentConfig
-from .model_loader import attention_parallel
+from uniserve_worker.bootstrap.model_loader import attention_parallel
+from uniserve_worker.config.deployment import ComponentConfig
+from uniserve_worker.model_executor.component_binding import (
+    Call,
+    ComponentBinding,
+)
 
 
 def initialize_components(

@@ -1,6 +1,6 @@
 //! Request algorithms and the single-owner engine control loop.
 //!
-//! The loop combines request progress, scheduler policy, memory params, and
+//! The loop combines request progress, scheduler policy, storage allocations, and
 //! asynchronous executor completions. All mutable engine state stays on its
 //! owner thread.
 //!
@@ -39,6 +39,7 @@ pub(crate) mod generation;
 pub(crate) mod image_artifact;
 mod inflight;
 pub(crate) mod output;
+mod placement;
 mod run;
 
 pub(crate) use crate::executor::{
@@ -58,7 +59,7 @@ use crate::scheduler::generation::{
 
 use crate::handle::{Command, EVENT_BUFFER_CAPACITY, EventSendError, EventTx};
 use crate::kv::{BlockPool, BlockTable, KvCacheCoordinator};
-use crate::memory::{
+use crate::storage::{
     BufferPool, BufferSpan, KVCacheManager, KvAllocation, LatentPages, LatentPool, RequestPool,
     RequestSlot,
 };
@@ -78,7 +79,11 @@ use uniserve_worker_ipc::{
 
 use crate::executor::WorkerFailure;
 use crate::scheduler::image_artifact::validate_png_artifact;
-use inflight::{InflightCall, InflightInput, PendingBatch, PendingCompletion, PendingFinish};
+use allocation::{
+    MediaAllocations, MediaStorage, MediaTensorAllocation, RequestAllocations, RetiringRequest,
+};
+use generation::RequestState;
+use inflight::{InflightCall, InflightInput, PendingCompletion, PendingFinish};
 use output::RequestOutput;
 
 /// Number of denoising steps planned for one scheduling burst by default.
@@ -130,77 +135,6 @@ impl Default for SpecialTokenIds {
     }
 }
 
-/// Engine-owned state for one admitted request.
-pub(crate) struct RequestState {
-    pub req: GenerationRequest,
-    pub(crate) finish_token_ids: Vec<u32>,
-    /// The cached sequence mappings. Each table owns its physical page
-    /// references and therefore has exactly the request's lifetime.
-    allocations: Option<RequestAllocations>,
-    flow_prefix: Option<FlowPrefixState>,
-    /// Admission generation used to reject results from prior request lifetimes.
-    pub(crate) request_epoch: u64,
-    /// Most recent accepted state-producing call.
-    pub(crate) last_state_call_id: CallId,
-    /// Last device token retained until a consumer is registered.
-    pub(crate) latest_token: Option<TensorRef>,
-    /// A false device predicate invalidated the unresolved successor chain.
-    /// Already-submitted descendants must drain before scheduling resumes from
-    /// the last host-observed execution result.
-    pub(crate) speculative_chain_invalidated: bool,
-    output: RequestOutput,
-    /// Current accepted computation stage; scheduling does not advance it.
-    phase: Phase,
-    /// Prompt token range already accepted by the worker.
-    num_computed_prompt_tokens: u32,
-    num_ingested_images: usize,
-    image_encoder_index: usize,
-    input_image_features: Option<TensorRef>,
-    round_closing: bool,
-    /// Model position and accepted physical KV length differ for image inputs.
-    logical_position: u32,
-    kv_visible_len: u32,
-    /// Accepted tokens whose KV is initialized. A verifier initializes its
-    /// rejected drafts, so this exceeds the visible extent until the next
-    /// forward makes exactly what it initializes visible.
-    kv_computed_len: u32,
-    next_token: u32,
-    num_generated_tokens: usize,
-    image_id: u32,
-    num_generated_images: usize,
-    image_reservation_pending: bool,
-    num_completed_denoise_steps: u16,
-    /// Exact generations retained for conditioning, denoising, and feedback.
-    image_conditioning: Option<uniserve_worker_ipc::BufferId>,
-    image_latent: Option<TensorRef>,
-    feedback_encoder_index: usize,
-    feedback_source: Option<TensorRef>,
-    feedback_features: Option<TensorRef>,
-    /// Whether the current epoch is registered with its execution workers.
-    worker_registered: bool,
-    /// Number of positive-branch KV blocks already delivered to the worker.
-    num_kv_blocks_sent: usize,
-    /// Whether admission reserves the complete multimodal KV requirement.
-    reserve_worstcase: bool,
-    max_reserved_kv_blocks: usize,
-    /// Per-group prefix hashes retained for publishing reusable input blocks.
-    prefix_block_hashes: Vec<Vec<u64>>,
-    prefix_cached: bool,
-    /// Accepted text and control tokens used by penalties and trigger matching.
-    generated_token_ids: Vec<u32>,
-    /// Tokens since the last model round boundary, used by suffix-trigger matching.
-    round_token_ids: Vec<u32>,
-    text_tokens_since_image: usize,
-    /// Host image bytes retained only while artifact-based feedback needs them.
-    feedback_image_b64: Option<String>,
-    /// False after a completed computation creates state unavailable from the input.
-    replayable: bool,
-    encoder_cache_pins: Vec<EncoderCachePin>,
-    transient_encoder_products: Vec<TensorRef>,
-    pub queued_at: f64,
-    pub(crate) terminal_intent: TerminalIntent,
-}
-
 /// Request-held reference to a reusable encoder-cache entry.
 struct EncoderCachePin {
     key: u64,
@@ -245,118 +179,6 @@ impl FlowPrefixState {
     /// Returns shared access to the request block tables.
     fn block_tables(&self) -> &[BlockTable] {
         self.allocations.block_tables()
-    }
-}
-
-/// Allocation ownership retained until the exact request epoch closes on every rank.
-struct RetiringRequest {
-    request_key: RequestKey,
-    allocations: Vec<RequestAllocations>,
-    media_allocations: Option<MediaAllocations>,
-    buffers: HashMap<BufferId, BufferSpan>,
-}
-
-struct RequestAllocations {
-    request_slot: RequestSlot,
-    kv: KvAllocation,
-    latent: Option<LatentPages>,
-    buffers: HashMap<BufferId, BufferSpan>,
-}
-
-impl RequestAllocations {
-    /// Returns the request-slot identifier.
-    fn request_slot(&self) -> u32 {
-        self.request_slot.index
-    }
-
-    /// Returns shared access to the request block tables.
-    fn block_tables(&self) -> &[BlockTable] {
-        &self.kv.tables
-    }
-
-    /// Returns mutable access to the request block tables.
-    fn block_tables_mut(&mut self) -> &mut Vec<BlockTable> {
-        &mut self.kv.tables
-    }
-
-    /// Takes ownership of the request buffer allocation.
-    fn take_buffer(&mut self, id: BufferId) -> Option<BufferSpan> {
-        self.buffers.remove(&id)
-    }
-
-    /// Releases each resource through its owning pool.
-    fn free(self, scheduler: &mut Scheduler) {
-        for buffer in self.buffers.into_values() {
-            scheduler.buffer_pool.free(buffer);
-        }
-        if let Some(latent) = self.latent {
-            scheduler.latent_pool.free(latent);
-        }
-        scheduler.request_pool.free(self.request_slot);
-    }
-}
-
-impl RequestState {
-    /// Returns the request allocations.
-    fn allocations(&self) -> &RequestAllocations {
-        self.allocations.as_ref().expect("request is admitted")
-    }
-
-    /// Returns mutable access to the request allocations.
-    fn allocations_mut(&mut self) -> &mut RequestAllocations {
-        self.allocations.as_mut().expect("request is admitted")
-    }
-
-    /// Returns the request-pool index.
-    fn request_pool_idx(&self) -> u32 {
-        self.allocations().request_slot()
-    }
-
-    /// Returns shared access to the request block tables.
-    fn block_tables(&self) -> &[BlockTable] {
-        self.allocations().block_tables()
-    }
-
-    /// Returns mutable access to the request block tables.
-    fn block_tables_mut(&mut self) -> &mut Vec<BlockTable> {
-        self.allocations_mut().block_tables_mut()
-    }
-
-    /// Returns whether the request includes context images.
-    fn has_context_images(&self) -> bool {
-        !self.req.multimodal_inputs.images.is_empty()
-    }
-
-    /// Returns whether execution continues after committing generation output.
-    fn continues_after_gen_commit(&self) -> bool {
-        self.req.continues_after_image()
-    }
-
-    /// Returns whether the request can open a generation branch.
-    fn can_open_gen_branch(&self) -> bool {
-        self.req.generates_images()
-            && self.num_generated_images < self.req.image.max_images as usize
-    }
-
-    /// Returns whether generation starts after context ingestion.
-    fn starts_gen_after_context(&self) -> bool {
-        self.req.starts_with_image() && self.can_open_gen_branch()
-    }
-
-    /// Returns whether the text request can be replayed.
-    pub(crate) fn is_replayable_text(&self) -> bool {
-        self.replayable
-    }
-
-    /// Returns the pending image step, if one exists.
-    fn pending_image_step(&self) -> Option<ImageIngestStep> {
-        self.req
-            .multimodal_inputs
-            .images
-            .get(self.num_ingested_images)?
-            .encoders
-            .get(self.image_encoder_index)
-            .map(|input| input.encoder)
     }
 }
 
@@ -406,69 +228,6 @@ struct MediaFlowState {
     artifact: Option<ArtifactEvent>,
 }
 
-struct MediaAllocations {
-    tensors: HashMap<(String, u32), MediaTensorAllocation>,
-    request_slots: HashMap<crate::WorkerId, RequestSlot>,
-}
-
-/// A request reserves each declared result in every Worker address space on
-/// its route. Video ranges occupy disjoint slices of the temporal result,
-/// independent of decoder Worker width.
-struct MediaTensorAllocation {
-    allocations: HashMap<crate::WorkerId, BufferSpan>,
-    dtype: DType,
-    shape_bound: ShapeBound,
-}
-
-/// Independent scheduler address space for one physical media WorkerGroup.
-/// Replicas intentionally reuse row numbers and byte offsets in their own
-/// processes; the worker identity keeps those physical addresses distinct.
-struct MediaMemory {
-    requests: RequestPool,
-    buffers: BufferPool,
-}
-
-impl MediaTensorAllocation {
-    fn bind(
-        &self,
-        product: &TensorRef,
-        start_unit: u32,
-        worker: &crate::WorkerId,
-    ) -> BufferAllocation {
-        let offset = self.allocations[worker].offset;
-        let unit_bytes = match product.shape_bound.dims.first() {
-            Some(DimBound::Static(units)) if start_unit > 0 => {
-                product.max_bytes() / u64::from(*units)
-            }
-            _ => 0,
-        };
-        BufferAllocation {
-            buffer: product.buffer_id(),
-            offset: offset + u64::from(start_unit) * unit_bytes,
-            bytes: product.max_bytes(),
-        }
-    }
-}
-
-impl MediaAllocations {
-    /// Returns the request row assigned in one physical worker address space.
-    fn request_slot(&self, worker: &crate::WorkerId) -> u32 {
-        self.request_slots[worker].index
-    }
-
-    /// Releases the owned request allocation.
-    fn free(self, scheduler: &mut Scheduler) {
-        for tensor in self.tensors.into_values() {
-            for (worker, allocation) in tensor.allocations {
-                scheduler.free_media_buffer(&worker, allocation);
-            }
-        }
-        for (worker, allocation) in self.request_slots {
-            scheduler.free_media_request(&worker, allocation);
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerRegistration {
     Unsubmitted,
@@ -510,23 +269,15 @@ pub(crate) fn unbounded_umm_generation_limits() -> uniserve_core::GenerationLimi
     }
 }
 
-/// Single-threaded owner of scheduling, memory, execution, and request state.
+/// Single-threaded owner of scheduling, storage, execution, and request state.
 pub struct Scheduler {
     executor: Box<dyn Executor>,
-    pending_submissions: VecDeque<ExecutionBatch>,
-    worker_affinity: HashMap<(RequestKey, String), crate::WorkerId>,
+    inflight: inflight::Inflight,
+    /// Resident resource ownership and reservation accounting.
+    storage: allocation::Storage,
+    placement: placement::Placement,
     info: WorkerInfo,
     generation_limits: uniserve_core::GenerationLimits,
-    /// Resident resource ownership and reservation accounting.
-    cache: Option<KVCacheManager>,
-    encoder_cache: crate::kv::EncoderCacheManager,
-    reserved_encoder_entries: usize,
-    request_pool: RequestPool,
-    latent_pool: LatentPool,
-    reserved_blocks: usize,
-    buffer_pool: BufferPool,
-    media_memory: HashMap<crate::WorkerId, MediaMemory>,
-    encoder_buffers: HashMap<uniserve_worker_ipc::BufferId, BufferSpan>,
     family: RuntimeFamily,
     ctrl: SpecialTokenIds,
     waiting: HashMap<RequestId, RequestState>,
@@ -535,17 +286,8 @@ pub struct Scheduler {
     running_media: HashMap<RequestId, MediaFlowState>,
     retiring_requests: HashMap<RequestId, RetiringRequest>,
     transfer_capacity: usize,
-    num_pending_transfers: usize,
-    batch_id: u64,
-    next_arrival_seq: u64,
-    pending_calls: HashMap<RequestId, VecDeque<InflightCall>>,
-    pending_completions: HashMap<RequestId, BTreeMap<CallId, PendingCompletion>>,
-    pending_finishes: HashMap<RequestId, PendingFinish>,
-    pending_batches: HashMap<u64, PendingBatch>,
     denoise_step_burst: u16,
     latent_dtype: Option<DType>,
-    pending_commands: VecDeque<BatchCommand>,
-    pending_buffer_frees: HashMap<BufferId, BufferSpan>,
     engine_id: u64,
     next_product_generation: u64,
     next_request_epoch: u64,

@@ -5,7 +5,7 @@ Values stay preserved after producer storage is reused.
 
 import torch
 
-from uniserve_worker.execution.batch import ExecutionOutput
+from uniserve_worker.model_executor.output import ExecutionOutput
 
 
 def test_forward_output_clone_preserves_ragged_shapes_dtypes_and_owned_values():

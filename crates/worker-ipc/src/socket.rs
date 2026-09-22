@@ -1,10 +1,10 @@
 //! Rank channel over a stream socket.
 //!
-//! A rank on the head's host reaches the engine through shared memory; a rank
-//! on another host has no shared memory to reach, so it carries the same frames
+//! A rank on the head's host reaches the engine through shared storage; a rank
+//! on another host has no shared storage to reach, so it carries the same frames
 //! over a stream socket. The frames are identical: a [`Header`] followed by its
 //! encoded payload, so the codec, the protocol version and every message shape
-//! are the ones the shared-memory channel uses.
+//! are the ones the shared-storage channel uses.
 //!
 //! Socket readiness advances incoming and outgoing frames. Local process-death
 //! notifications use a separate descriptor.
@@ -27,7 +27,7 @@ const HEADER_BYTES: usize = 16;
 
 /// Encodes a header in a fixed little-endian layout.
 ///
-/// The shared-memory channel hands the header across as a typed value in one
+/// The shared-storage channel hands the header across as a typed value in one
 /// address space. A socket carries bytes between two, so the layout is stated
 /// here rather than borrowed from the compiler's struct layout.
 fn encode_header(header: &Header) -> [u8; HEADER_BYTES] {
@@ -127,7 +127,7 @@ impl FrameReader {
 }
 
 /// Retains partial writes until the socket becomes writable. Queue capacity is
-/// the channel's in-flight depth, so a stalled peer cannot grow memory unboundedly.
+/// the channel's in-flight depth, so a stalled peer cannot grow storage use without bound.
 struct FrameWriter {
     pending: VecDeque<Vec<u8>>,
     offset: usize,

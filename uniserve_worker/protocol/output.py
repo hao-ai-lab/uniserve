@@ -6,17 +6,17 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
-from ..foundation.errors import invalid_descriptor
-from . import identity, transfer
-from .batch import TensorPublication
-from .call import (
+from uniserve_worker.errors import invalid_descriptor
+from uniserve_worker.protocol import identity, transfer
+from uniserve_worker.protocol.batch import TensorPublication
+from uniserve_worker.protocol.call import (
     CallKind,
     CallStatus,
     ErrorCode,
     TransferMode,
     computation,
 )
-from .validation import (
+from uniserve_worker.protocol.validation import (
     _bool,
     _enum,
     _map,
@@ -120,22 +120,22 @@ class TimingCounters:
 
 @dataclass(frozen=True, slots=True)
 class PosixShmArtifact:
-    """Identifies a completed media artifact stored in POSIX shared memory."""
+    """Identifies a completed media artifact stored in POSIX shared storage."""
 
     name: str
 
     def __post_init__(self) -> None:
-        """Validate the shared-memory artifact name and byte length."""
+        """Validate the shared-storage artifact name and byte length."""
         if not self.name or "/" in self.name:
             raise invalid_descriptor(
-                "POSIX shared-memory artifact name is invalid"
+                "POSIX shared-storage artifact name is invalid"
             )
 
     @classmethod
     def from_mapping(
         cls, value: object, where: str = "artifact handle"
     ) -> PosixShmArtifact:
-        """Parse and validate a POSIX shared-memory media handle."""
+        """Parse and validate a POSIX shared-storage media handle."""
         data = _map(value, where)
         if data.get("transport") != "posix_shm":
             raise invalid_descriptor(f"{where}.transport is invalid")
@@ -143,7 +143,7 @@ class PosixShmArtifact:
         return cls(name=_str(payload.get("name"), f"{where}.value.name"))
 
     def to_mapping(self) -> dict[str, object]:
-        """Serialize the shared-memory handle as a tagged transport value."""
+        """Serialize the shared-storage handle as a tagged transport value."""
         return {"transport": "posix_shm", "value": {"name": self.name}}
 
 

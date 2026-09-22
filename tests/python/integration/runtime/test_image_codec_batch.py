@@ -9,9 +9,9 @@ from uniserve.runtime import PrefixCache
 from uniserve_models import bagel
 from uniserve_worker.bootstrap.cache import cache_info
 from uniserve_worker.bootstrap.capacity import input_buffer_config
-from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.model_runner import ModelRunner
-from uniserve_worker.execution.rows import DecodeRow, VisionRow
+from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.execution.model_executor import ModelExecutor
+from uniserve_worker.model_executor.image_inputs import DecodeRow, VisionRow
 from uniserve_worker.protocol.call import (
     Bounds,
     Call,
@@ -19,8 +19,8 @@ from uniserve_worker.protocol.call import (
     MediaCall,
 )
 from uniserve_worker.protocol.identity import CallId, RequestKey
-from uniserve_worker.runtime.cache_manager import CacheManager
-from uniserve_worker.runtime.latent_pool import LatentPool
+from uniserve_worker.storage.kv_cache import KVCacheManager
+from uniserve_worker.storage.latent_pool import LatentPool
 
 pytestmark = pytest.mark.integration
 
@@ -42,11 +42,11 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
         flow_graph_shapes=((16, 16),),
         flow_graph_batch_sizes=(1,),
     )
-    runner = ModelRunner(model, config)
+    runner = ModelExecutor(model, config)
     cache = PrefixCache(
         model.text.cache_config, num_blocks=8, block_size=16, device="cpu"
     )
-    manager = CacheManager(
+    manager = KVCacheManager(
         cache,
         info=cache_info(model.text, config, num_blocks=8),
         request_pool_size=3,

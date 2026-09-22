@@ -752,9 +752,9 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
         .map(|output| {
             let handle = match output.handle_type() {
                 fbs::ArtifactHandle::PosixShmArtifact => {
-                    let handle = output
-                        .handle_as_posix_shm_artifact()
-                        .context("completion media output POSIX shared-memory handle is missing")?;
+                    let handle = output.handle_as_posix_shm_artifact().context(
+                        "completion media output POSIX shared-storage handle is missing",
+                    )?;
                     ArtifactHandle::PosixShm {
                         name: required_str(
                             handle.name(),
@@ -1400,11 +1400,11 @@ fn transfer_locator_from_table(value: fbs::Locator<'_>) -> CodecResult<Locator> 
         TransferTransport::PosixShm {
             endpoint: value
                 .endpoint()
-                .context("shared-memory transfer endpoint is missing")?
+                .context("shared-storage transfer endpoint is missing")?
                 .to_owned(),
             name: value
                 .name()
-                .context("shared-memory transfer name is missing")?
+                .context("shared-storage transfer name is missing")?
                 .to_owned(),
         }
     } else if value.transport() == fbs::TransferTransportKind::CudaVmm {

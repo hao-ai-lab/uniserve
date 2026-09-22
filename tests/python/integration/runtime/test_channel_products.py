@@ -31,7 +31,7 @@ def events() -> EventPool:
 def test_a_channel_product_carries_its_own_bytes(events: EventPool) -> None:
     """The locator is the product, so it needs nothing of the producer.
 
-    Shared memory names a segment in one host's namespace. A locator that
+    Shared storage names a segment in one host's namespace. A locator that
     carries its bytes reaches a consumer wherever the rank channel does,
     because it travels in the producing rank's result and the consuming rank's
     batch like any other value on that channel.
@@ -90,7 +90,7 @@ def test_a_channel_locator_from_another_endpoint_is_refused(
     The bytes are indistinguishable once they travel, so the endpoint is what
     identifies whose publication a locator is.
     """
-    from uniserve_worker.foundation.errors import WorkerError
+    from uniserve_worker.errors import WorkerError
 
     producer = make_transport(
         "channel", byte_capacity=1 << 20, ticket_capacity=2, event_pool=events

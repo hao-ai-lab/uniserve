@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from dataclasses import replace
 
 from tests.python.fixtures.depth_one import (
@@ -308,14 +307,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
 
     candidate_batch = execution_batch(batch_id=4, calls=(candidate,))
     prepared = worker.submit(candidate_batch)
-    assert prepared is not None
-    deadline = time.monotonic() + 1.0
-    while not prepared.inputs_ready() and time.monotonic() < deadline:
-        worker.advance_inputs(prepared)
-        time.sleep(0.0001)
-    assert prepared.inputs_ready()
-    prepared = finalized_report(worker, prepared)
-    candidate_report = prepared
+    candidate_report = finalized_report(worker, prepared)
     parent_report = finalized_report(worker, parent_report)
     parent_completion = parent_report.completions[0]
     candidate_completion = candidate_report.completions[0]

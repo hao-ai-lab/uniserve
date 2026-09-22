@@ -125,7 +125,7 @@ def test_worker_preserves_a_caller_owned_process_group(tmp_path, failure):
     import torch
     import torch.distributed as dist
 
-    from uniserve_worker.foundation.errors import WorkerError, WorkerErrorCode
+    from uniserve_worker.errors import WorkerError, WorkerErrorCode
     from uniserve_worker.worker import Worker
 
     dist.init_process_group(
@@ -154,57 +154,62 @@ def test_worker_preserves_a_caller_owned_process_group(tmp_path, failure):
         dist.destroy_process_group()
 
 
-def _owned_world(rank, directory):
+def _owned_world(rank, directory, failure):
     from dataclasses import replace
     from pathlib import Path
 
     import torch
     import torch.distributed as dist
 
-    from uniserve_worker.bootstrap.config import ModelLaunchConfig
-    from uniserve_worker.foundation.errors import WorkerError
+    from uniserve_worker.config.deployment import ModelLaunchConfig
+    from uniserve_worker.errors import WorkerError
     from uniserve_worker.worker import Worker
 
-    # Failure at either construction stage and a normal close must leave the
-    # process free to create another world.
-    for failure in ("model_loading", "execution_setup", None):
-        config = _stub_config(
-            Path(directory) / f"owned-world-{rank}",
-            rank=rank,
-            world_size=2,
-            init_method=f"file://{directory}/world-{failure}",
+    config = _stub_config(
+        Path(directory) / f"owned-world-{rank}",
+        rank=rank,
+        world_size=2,
+        init_method=f"file://{directory}/world-{failure}",
+    )
+    if failure == "model_loading":
+        config = replace(
+            config,
+            use_stub_model=False,
+            model=ModelLaunchConfig(directory, {}),
         )
-        if failure == "model_loading":
-            config = replace(
-                config,
-                use_stub_model=False,
-                model=ModelLaunchConfig(directory, {}),
-            )
-            with pytest.raises(
-                FileNotFoundError, match="modular_model_index.json"
-            ):
-                Worker.from_config(config)
-        elif failure == "execution_setup":
-            config = replace(
-                config,
-                data_plane=replace(config.data_plane, publication_backends=()),
-            )
-            with pytest.raises(
-                WorkerError, match="publication backends must be unique"
-            ):
-                Worker.from_config(config)
-        else:
-            with Worker.from_config(config):
-                value = torch.tensor([rank + 1])
-                dist.all_reduce(value)
-                assert value.item() == 3
-        assert not dist.is_initialized()
+        with pytest.raises(FileNotFoundError, match="modular_model_index.json"):
+            Worker.from_config(config)
+    elif failure == "execution_setup":
+        config = replace(
+            config,
+            data_plane=replace(config.data_plane, publication_backends=()),
+        )
+        with pytest.raises(
+            WorkerError, match="publication backends must be unique"
+        ):
+            Worker.from_config(config)
+    else:
+        with Worker.from_config(config):
+            value = torch.tensor([rank + 1])
+            dist.all_reduce(value)
+            assert value.item() == 3
+    if failure == "execution_setup":
+        import os
+
+        # Failed construction aborts this rank without synchronizing peers;
+        # the process must exit with its still-owned world retained.
+        assert dist.is_initialized()
+        os._exit(0)
+    assert not dist.is_initialized()
 
 
-def test_worker_releases_process_groups_created_by_its_factory(tmp_path):
+@pytest.mark.parametrize("failure", ("model_loading", "execution_setup", None))
+def test_worker_releases_process_groups_created_by_its_factory(
+    tmp_path, failure
+):
     import torch.multiprocessing as mp
 
-    mp.spawn(_owned_world, args=(str(tmp_path),), nprocs=2, join=True)
+    mp.spawn(_owned_world, args=(str(tmp_path), failure), nprocs=2, join=True)
 
 
 @pytest.mark.gpu
@@ -223,7 +228,7 @@ def test_partial_cuda_binding_failure_preserves_error_and_allows_reconstruction(
         token_call,
     )
     from tests.python.fixtures.execution_worker import execution_worker
-    from uniserve_worker.config import LaneConfig, WorkerConfig
+    from uniserve_worker.config.execution import LaneConfig, WorkerConfig
     from uniserve_worker.protocol.call import CALL_KINDS, CallStatus
 
     policy = WorkerConfig(

@@ -13,36 +13,23 @@ import torch
 from tests.python.fixtures.cache import mha_pool
 from tests.python.fixtures.transport import make_transport
 from uniserve.runtime import EventPool
-from uniserve_worker.execution.output import OutputBuffer, OutputPool
-from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.errors import WorkerError
+from uniserve_worker.execution.host import HostLane
 from uniserve_worker.protocol.batch import (
     BufferAllocation,
     LatentParams,
-    NewRequest,
 )
-from uniserve_worker.protocol.call import (
-    Bounds,
-    Call,
-    CallCoordinates,
-    ImageParams,
-    MediaCall,
-)
-from uniserve_worker.protocol.identity import (
-    BufferId,
-    CallId,
-    RequestKey,
-)
+from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.tensor import (
     DType,
     ShapeBound,
     StaticDim,
     TensorRef,
 )
-from uniserve_worker.runtime.buffer_pool import BufferPool
-from uniserve_worker.runtime.host_lane import HostLane
-from uniserve_worker.runtime.latent_pool import LatentPool
-from uniserve_worker.runtime.request import RequestPool
-from uniserve_worker.runtime.tensor_store import FeatureMetadata, TensorStore
+from uniserve_worker.storage.buffer_pool import BufferPool
+from uniserve_worker.storage.latent_pool import LatentPool, LatentUpdate
+from uniserve_worker.storage.output import OutputPool
+from uniserve_worker.storage.tensor_store import FeatureMetadata, TensorStore
 
 
 def test_abandoned_output_job_releases_capacity_and_terminates_dependent_work() -> (  # noqa: E501
@@ -742,43 +729,19 @@ def test_latent_import_preserves_page_order_and_committed_metadata() -> None:
 
 @pytest.fixture
 def latent_output():
-    """Prepare real call outputs.
-
-    The outputs are used by the public latent commit interface.
-    """
-    events = EventPool()
-    outputs = []
+    """Prepare public latent visibility updates without execution state."""
 
     def create(slot, pages, units, height, width):
-        requests = RequestPool(max_request_pool_size=slot)
         key = RequestKey(1, slot, 1)
-        call = Call(
-            request_key=key,
-            call_id=CallId(1, 0),
-            coordinates=CallCoordinates(),
-            kind=MediaCall.LATENT_PREPARATION,
-            bounds=Bounds(),
+        return LatentUpdate(
+            request_pool_idx=slot,
+            params=LatentParams(
+                key, CallId(1, 0), pages, units, height, width, 0, 0
+            ),
+            generation=1,
         )
-        requests.start(
-            NewRequest(
-                key,
-                request_pool_idx=slot,
-                image=ImageParams(height=height, width=width),
-            )
-        )
-        buffer = OutputBuffer(1, token_capacity=1, event_pool=events)
-        (output,) = requests.create_outputs((call,), (slot,), buffer)
-        output.latent_params = LatentParams(
-            key, call.call_id, pages, units, height, width, 0, 0
-        )
-        output.latent_generation = 1
-        outputs.append(output)
-        return output
 
-    yield create
-    for output in outputs:
-        output.abandon()
-    events.close()
+    return create
 
 
 @pytest.mark.parametrize("committed", (False, True))
@@ -859,9 +822,9 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
             width=176,
         )
         second = latent_output(1, pages, 11, 16, 176)
-        second.latent_expected_generation = 1
-        second.latent_generation = 2
-        second.latent_step = 1
+        second.expected_generation = 1
+        second.generation = 2
+        second.step = 1
         pool.validate_updates((second,))
         pool.apply_updates((second,))
         for value in borrowed:
@@ -917,10 +880,10 @@ def test_published_latent_bank_waits_for_every_reader_before_reuse(
             width=176,
         )
         third = latent_output(1, pages, 11, 16, 176)
-        third.latent_expected_generation = 2
-        third.latent_expected_step = 1
-        third.latent_generation = 3
-        third.latent_step = 2
+        third.expected_generation = 2
+        third.expected_step = 1
+        third.generation = 3
+        third.step = 2
         pool.validate_updates((third,))
         pool.apply_updates((third,))
         torch.testing.assert_close(
@@ -959,8 +922,8 @@ def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_o
     """
     from contextlib import suppress
 
-    from uniserve_worker.transfer import segment
-    from uniserve_worker.transfer.tickets import _open_shared_memory
+    from uniserve_worker.transport import segment
+    from uniserve_worker.transport.shared_storage import open_shared_storage
 
     events = EventPool()
     transport = make_transport(
@@ -995,7 +958,7 @@ def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_o
     pool.validate_updates((commit,))
     pool.apply_updates((commit,))
     # The consumer begins reading before the engine retires the publication.
-    storage = _open_shared_memory(
+    storage = open_shared_storage(
         locator.transport.name, segment.HEADER_BYTES + locator.nbytes
     )
     try:
@@ -1045,7 +1008,7 @@ def test_unacknowledged_latent_publication_retains_its_pages_without_poisoning_o
 
         # The consumer writes its word; the producer's next sweep returns the
         # segment and with it the pages.
-        storage = _open_shared_memory(
+        storage = open_shared_storage(
             locator.transport.name, segment.HEADER_BYTES + locator.nbytes
         )
         try:
@@ -1191,12 +1154,9 @@ def test_fp8_publication_preserves_values_before_a_later_block_scale_growth():
 
 def test_a_host_product_is_published_where_its_consumers_are() -> None:
     """Each host mechanism carries a product only to consumers it reaches."""
-    from uniserve_worker.transfer import segment
-    from uniserve_worker.transfer.tickets import (
-        _open_shared_memory,
-        make_transports,
-        publish_tensor,
-    )
+    from uniserve_worker.transport import make_transports, segment
+    from uniserve_worker.transport.publication import publish_tensor
+    from uniserve_worker.transport.shared_storage import open_shared_storage
 
     events = EventPool()
     # Slots 0 and 1 share this host; slot 2 is on another host.
@@ -1234,7 +1194,7 @@ def test_a_host_product_is_published_where_its_consumers_are() -> None:
                 # release alone.
                 for location in locations:
                     if location.backend == "shm":
-                        mapping = _open_shared_memory(
+                        mapping = open_shared_storage(
                             location.transport.name,
                             segment.HEADER_BYTES + location.nbytes,
                         )
