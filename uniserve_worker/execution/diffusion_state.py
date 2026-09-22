@@ -57,10 +57,7 @@ def resolve_prefix(
     negative_token_ids: tuple[int, ...],
     tokenizer: Any | None,
 ) -> tuple[tuple[int, ...], bool]:
-    """Resolve a branch prefix and flag an empty positive prompt as start-state.
-
-    conditioning.
-    """
+    """Resolve a branch prefix and detect empty positive-prompt conditioning."""
     if source is BranchSource.CONDITIONING and not image_prompt.strip():
         return (), True
     if source is BranchSource.NEGATIVE_OR_START and negative_token_ids:

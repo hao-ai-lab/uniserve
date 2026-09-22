@@ -18,10 +18,10 @@ mod worker;
 
 pub use crate::core::{EngineConfig, EngineCore, WorkerConfig, WorkerRank};
 pub use crate::executor::{
-    BatchResult, CommandOutcome, ComponentConfig, ComponentDistribution, ExecutionBatch, Executor,
-    ExecutorError, ExecutorInfo, ExecutorSubmitError, OpResult, ParallelConfig, RequestPlacement,
-    SequenceParallel, TransferBackend, TransferConfig, TransferConfigError, TransferEdge,
-    WorkerExecError, WorkerFailure, WorkerId, WorkerResult,
+    BatchResult, CallResult, CommandOutcome, ComponentConfig, ComponentDistribution,
+    ExecutionBatch, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, ParallelConfig,
+    RequestPlacement, SequenceParallel, TransferBackend, TransferConfig, TransferConfigError,
+    TransferEdge, WorkerExecError, WorkerFailure, WorkerId, WorkerResult,
 };
 pub use crate::handle::{
     Command, EVENT_BUFFER_CAPACITY, EngineHandle, EventRx, EventSendError, EventTx,
@@ -40,4 +40,4 @@ pub use crate::worker::{
     BatchSubmitError, FlashInferBackend, FlashInferBackendParseError, LaneConfig, WorkerExecutor,
     WorkerGroup, WorkerProcessArgs,
 };
-pub use uniserve_worker_ipc::AttentionBackend;
+pub use uniserve_worker_ipc::{AttentionBackend, DEFAULT_COMPONENT};

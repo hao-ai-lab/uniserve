@@ -612,10 +612,7 @@ def tensor_matches_product(tensor: TensorTransfer, product: TensorRef) -> bool:
 def _representation_matches_product(
     shape: tuple[int, ...], physical_dtype: str, nbytes: int, product: TensorRef
 ) -> bool:
-    """Match physical storage to the immutable declared value without.
-
-    converting it.
-    """
+    """Match physical storage to its declaration without conversion."""
     elements = math.prod(shape)
     shape_matches = product.shape_bound.contains_shape(shape)
     dtype, element_bytes = device_product_storage(product.dtype)

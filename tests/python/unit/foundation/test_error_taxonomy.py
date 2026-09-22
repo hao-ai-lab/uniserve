@@ -59,7 +59,8 @@ def test_oom_detection_walks_class_hierarchy_for_subclasses():
     class OutOfMemoryError(RuntimeError):
         pass
 
-    class DeviceAllocFailure(OutOfMemoryError):  # noqa: N818  # deliberate taxonomy name
+    # The private test type deliberately follows the error taxonomy.
+    class DeviceAllocFailure(OutOfMemoryError):  # noqa: N818
         pass
 
     err = classify(DeviceAllocFailure("alloc denied"))
@@ -121,7 +122,7 @@ def test_to_mapping_emits_canonical_error_context():
         fatal=False,
         req_id=42,
         call_id=CallId(7, 0),
-        op_kind="decode_und",
+        call_kind="decode_und",
         phase="run",
         route="language",
         calls=((5, 42, 3, CallId(7, 0)),),

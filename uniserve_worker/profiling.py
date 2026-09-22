@@ -403,7 +403,7 @@ def record_failure(
         error.code,
         error.req_id,
         error.call_id,
-        error.op_kind,
+        error.call_kind,
     )
 
 

@@ -1,6 +1,6 @@
 //! Physical worker fan-out, completion agreement, and process recovery.
 
-use crate::executor::{OpResult, WorkerResult};
+use crate::executor::{CallResult, WorkerResult};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -223,13 +223,13 @@ struct RankResult {
 /// Returns the request and call identifiers carried by a worker call.
 fn call_identity(
     request: uniserve_worker_ipc::RequestKey,
-    op: uniserve_worker_ipc::CallId,
+    call_id: uniserve_worker_ipc::CallId,
 ) -> CallIdentity {
     (
         request.engine_id,
         request.request_id.0,
         request.request_epoch,
-        op,
+        call_id,
     )
 }
 
@@ -567,7 +567,7 @@ impl WorkerGroup {
                             })?;
                             anyhow::ensure!(
                                 !*completed,
-                                "rank {rank} returned an call more than once for batch {batch_id}"
+                                "rank {rank} returned a call more than once for batch {batch_id}"
                             );
                             *completed = true;
                         }
@@ -743,7 +743,7 @@ impl WorkerGroup {
         for identity in &call_ids {
             anyhow::ensure!(
                 remaining.remove(identity),
-                "joined batch {batch_id} repeated an call"
+                "joined batch {batch_id} repeated a call"
             );
         }
         let done = remaining.is_empty() && pending.ranks.values().all(|result| result.complete);
@@ -845,8 +845,8 @@ impl WorkerGroup {
             let retired = batch
                 .calls
                 .iter()
-                .filter(|op| pending.contains(&call_identity(op.request_key, op.call_id)))
-                .map(|op| (batch.batch_id, op.request_key, op.call_id))
+                .filter(|call| pending.contains(&call_identity(call.request_key, call.call_id)))
+                .map(|call| (batch.batch_id, call.request_key, call.call_id))
                 .collect::<Vec<_>>();
             let requests = retired
                 .iter()
@@ -1280,7 +1280,7 @@ fn merge_rank_report(
     let batch_id = batch.batch_id;
     if participant_report.batch_id != batch_id {
         anyhow::bail!(
-            "rank {rank} completion report batch_id mismatch while joining pending_batch {batch_id}: got {}",
+            "rank {rank} completion report batch ID mismatch while joining pending batch {batch_id}: got {}",
             participant_report.batch_id
         );
     }
@@ -1341,7 +1341,7 @@ fn validate_and_order_rank_report(
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         report.batch_id == batch.batch_id,
-        "rank {rank} returned pending_batch {} for pending pending_batch {}",
+        "rank {rank} returned pending batch {} for pending batch {}",
         report.batch_id,
         batch.batch_id
     );
@@ -1362,7 +1362,7 @@ fn validate_and_order_rank_report(
             })
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "rank {rank} omitted an call for pending_batch {} collective {}",
+                    "rank {rank} omitted a call for pending batch {} collective {}",
                     batch.batch_id,
                     batch.collective_seq
                 )
@@ -1403,7 +1403,7 @@ fn validate_and_order_rank_report(
     }
     anyhow::ensure!(
         ordered.len() == report_count,
-        "rank {rank} returned an unplanned call for pending_batch {}",
+        "rank {rank} returned an unplanned call for pending batch {}",
         batch.batch_id
     );
     report.results = ordered;
@@ -1413,8 +1413,8 @@ fn validate_and_order_rank_report(
 /// Merge one participant into the output owner's result. Accepted progress and
 /// allocation generations agree; KV publications contribute immutable rank locations.
 fn merge_completion_record(
-    canonical: &mut OpResult,
-    rank_completion: &OpResult,
+    canonical: &mut CallResult,
+    rank_completion: &CallResult,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         canonical.output.request_key == rank_completion.output.request_key

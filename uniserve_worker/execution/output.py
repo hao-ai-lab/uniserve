@@ -835,14 +835,15 @@ class OutputPool:
         self.event_pool.reap()
 
 
-class _InvalidSamplingDistribution(RuntimeError):  # noqa: N818  # deliberate taxonomy name
+# The private exception deliberately follows the error taxonomy.
+class _InvalidSamplingDistribution(RuntimeError):  # noqa: N818
     """Marks a sampling row whose filtered probability mass is unusable."""
 
     pass
 
 
 class _PredicatedCall(RuntimeError):  # noqa: N818  # deliberate taxonomy name
-    """Marks an call suppressed by its resolved device predicate."""
+    """Marks a call suppressed by its resolved device predicate."""
 
     pass
 

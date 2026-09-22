@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
             "cpu",
             1,
             2,
-            uniserve_engine::WorkerConfig::single_component("model", 1),
+            uniserve_engine::WorkerConfig::single_component(uniserve_engine::DEFAULT_COMPONENT, 1),
         )
         .ranks,
         queue_depth: 2,
@@ -94,7 +94,7 @@ fn main() -> anyhow::Result<()> {
             ok = false;
         }
     }
-    println!("peak ops in a batch: {}", sched.peak_ops_in_batch);
+    println!("peak calls in a batch: {}", sched.peak_calls_in_batch);
     println!(
         "\nTWO-PROCESS IPC SMOKE: {}",
         if ok { "PASS" } else { "FAIL" }

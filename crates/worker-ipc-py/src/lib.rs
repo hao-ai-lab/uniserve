@@ -36,7 +36,7 @@ struct PyServer {
     inner: Mutex<ServerState>,
 }
 
-/// The endpoint may be borrowed by an call; both fields are empty after close.
+/// The endpoint may be borrowed by a call; both fields are empty after close.
 struct ServerState {
     endpoint: Option<RankServer>,
     /// Wake source used by CPU, transfer, and device completion callbacks.
@@ -446,7 +446,7 @@ fn pythonize_request(py: Python<'_>, request: &WorkerRequest) -> PyResult<Py<PyA
 }
 
 impl PyServer {
-    /// Takes exclusive endpoint ownership for an call that releases the GIL.
+    /// Takes exclusive endpoint ownership for a call that releases the GIL.
     fn take_endpoint(&self) -> PyResult<RankServer> {
         let mut guard = self
             .inner

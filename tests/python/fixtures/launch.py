@@ -31,7 +31,7 @@ DEFAULTS: dict[str, Any] = {
     "local_rank": 0,
     "world_size": 1,
     "components": {"model": {"ranks": [0]}},
-    "supported_ops": None,
+    "supported_calls": None,
     "transfer_backends": "local",
     "publish_backends": "local",
     "distributed_init_method": None,

@@ -94,7 +94,7 @@ impl ExecutionBatch {
     ) -> Vec<(Call, RequestPlacement)> {
         let (retired, active): (Vec<_>, Vec<_>) = std::mem::take(&mut self.requests)
             .into_iter()
-            .partition(|(op, _)| requests.contains(&op.request_key));
+            .partition(|(call, _)| requests.contains(&call.request_key));
         self.requests = active;
         self.commands.retain_mut(|command| {
             if !requests.contains(&command.request_key()) {
@@ -105,7 +105,7 @@ impl ExecutionBatch {
         let inputs = self
             .requests
             .iter()
-            .flat_map(|(op, _)| op.tensor_inputs().chain(op.predicate.iter()))
+            .flat_map(|(call, _)| call.tensor_inputs().chain(call.predicate.iter()))
             .collect::<std::collections::HashSet<_>>();
         self.input_transfers
             .retain(|payload| inputs.contains(&payload.product));
@@ -137,7 +137,7 @@ impl ExecutionBatch {
             anyhow::ensure!(!call.component.is_empty(), "call requires a component");
             anyhow::ensure!(
                 identities.insert(call.call_id),
-                "logical batch repeats an call identity"
+                "logical batch repeats a call identity"
             );
             placement.forward.validate(1)?;
             for table in &placement.block_tables {
@@ -180,7 +180,7 @@ impl ExecutionBatch {
             );
             anyhow::ensure!(
                 requests.contains(&admission.request_key),
-                "logical batch starts a request without an call"
+                "logical batch starts a request without a call"
             );
         }
 
@@ -315,7 +315,7 @@ impl ExecutorInfo {
         let routed = |variant: CallKind| {
             self.workers
                 .iter()
-                .find(|(_, info)| info.supported_ops.contains(&variant))
+                .find(|(_, info)| info.supported_calls.contains(&variant))
                 .map(|(_, info)| info)
         };
         let mut kv_indices = [
@@ -327,7 +327,7 @@ impl ExecutorInfo {
         .filter_map(|variant| {
             self.workers
                 .iter()
-                .position(|(_, info)| info.supported_ops.contains(&variant))
+                .position(|(_, info)| info.supported_calls.contains(&variant))
         })
         .collect::<Vec<_>>();
         kv_indices.sort_unstable();
@@ -348,7 +348,7 @@ impl ExecutorInfo {
         anyhow::ensure!(
             self.workers.iter().all(|(_, info)| {
                 !info
-                    .supported_ops
+                    .supported_calls
                     .contains(&CallKind::Media(MediaCall::Denoising))
                     || info.num_inference_steps == merged.num_inference_steps
             }),
@@ -400,7 +400,7 @@ impl ExecutorInfo {
         }
 
         // Aggregate global limits conservatively across all physical pools.
-        merged.supported_ops = CallKind::ALL
+        merged.supported_calls = CallKind::ALL
             .into_iter()
             .filter(|variant| routed(*variant).is_some())
             .collect();
@@ -410,10 +410,10 @@ impl ExecutorInfo {
             .map(|(_, info)| info.queue_depth.max(1))
             .try_fold(0u32, |total, depth| total.checked_add(depth))
             .context("worker capacity exceeds the engine window")?;
-        merged.max_batch_ops = self
+        merged.max_batch_calls = self
             .workers
             .iter()
-            .map(|(_, info)| info.max_batch_ops)
+            .map(|(_, info)| info.max_batch_calls)
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
@@ -438,7 +438,7 @@ impl ExecutorInfo {
                     self.workers
                         .iter()
                         .filter(|(_, info)| {
-                            info.supported_ops.contains(&CallKind::Media(call))
+                            info.supported_calls.contains(&CallKind::Media(call))
                                 && info
                                     .components
                                     .iter()
@@ -460,10 +460,10 @@ impl ExecutorInfo {
                 .min()
                 .unwrap_or(0)
         };
-        merged.max_unresolved_ops = self
+        merged.max_unresolved_calls = self
             .workers
             .iter()
-            .map(|(_, info)| info.max_unresolved_ops)
+            .map(|(_, info)| info.max_unresolved_calls)
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
@@ -498,7 +498,7 @@ impl ExecutorInfo {
 
 /// One call result returned from an executor-owned batch.
 #[derive(Debug, Clone)]
-pub struct OpResult {
+pub struct CallResult {
     /// Validated completion values; media storage is carried by `media` below.
     pub output: uniserve_worker_ipc::RequestOutput,
     /// Claimed immutable output storage, or its request-local acquisition error.
@@ -509,7 +509,7 @@ pub struct OpResult {
 #[derive(Debug)]
 pub struct WorkerResult {
     pub batch_id: u64,
-    pub results: Vec<OpResult>,
+    pub results: Vec<CallResult>,
     /// Tensor publications remain owned by the executor's transfer consumers.
     pub products: Vec<TensorPublication>,
     pub registration: uniserve_worker_ipc::RegistrationAck,
@@ -536,7 +536,7 @@ impl WorkerResult {
                             .map(Arc::new)
                     })
                     .transpose();
-                OpResult { output, media }
+                CallResult { output, media }
             })
             .collect();
         Self {
@@ -575,7 +575,7 @@ pub struct BatchResult {
     /// Logical batch identity assigned at submission.
     pub batch_id: u64,
     /// Call completions this join reports as ready.
-    pub results: Vec<OpResult>,
+    pub results: Vec<CallResult>,
     /// Control commands acknowledged by all target pools.
     pub command_results: Vec<CommandResult>,
     /// Whether this join completes the batch.
@@ -1314,7 +1314,7 @@ mod tests {
             .iter()
             .map(|(call, component)| (*call, (*component).to_owned()))
             .collect();
-        info.supported_ops = routes
+        info.supported_calls = routes
             .iter()
             .map(|(call, _)| CallKind::Media(*call))
             .collect();

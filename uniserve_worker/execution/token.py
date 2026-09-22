@@ -832,10 +832,7 @@ def token_task(
     request_indexed_decode: bool = False,
     request_tables: BlockTables | None,
 ) -> ForwardRow:
-    """Build one staged autoregressive forward row from request runtime and.
-
-    token coordinates.
-    """
+    """Build an autoregressive row from runtime and token coordinates."""
     if request_indexed_decode:
         if (
             call.kind is not ForwardMode.DECODE

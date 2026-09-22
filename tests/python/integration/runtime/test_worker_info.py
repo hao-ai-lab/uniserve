@@ -29,7 +29,7 @@ def test_worker_info_reports_schedulable_work_and_bounds(
 
     assert info["device"] == "cpu"
     assert tuple(info["transfer_backends"]) == backends
-    assert set(info["supported_ops"]) == {
+    assert set(info["supported_calls"]) == {
         "prefill",
         "decode",
         "verify",
@@ -45,8 +45,8 @@ def test_worker_info_reports_schedulable_work_and_bounds(
     assert info["kv_cache"]["num_layers"] > 0
     assert info["kv_cache"]["num_kv_heads"] > 0
     assert info["kv_cache"]["head_dim"] > 0
-    assert info["max_batch_ops"] > 0
-    assert info["max_unresolved_ops"] > 0
+    assert info["max_batch_calls"] > 0
+    assert info["max_unresolved_calls"] > 0
     assert info["request_slots"] > 0
     assert info["model_name"]
     assert len(info["configuration_id"]) == 64
@@ -124,7 +124,7 @@ def test_worker_info_reports_limits_safe_for_all_bound_lanes(
         Model(), config, image_processor=image_processor()
     ).info
 
-    assert info.max_batch_ops == (2 if with_lane_limits else 4)
+    assert info.max_batch_calls == (2 if with_lane_limits else 4)
     assert info.max_batch_tokens == (128 if with_lane_limits else 256)
 
 
@@ -143,12 +143,12 @@ def test_worker_identity_and_capabilities_reflect_enabled_calls() -> None:
             worker_config=config,
             sampling_group=None,
             tokenizer=None,
-            allowed_work_variants=allowed,
+            allowed_calls=allowed,
             queue_depth=1,
             completion_payload_bytes=65536,
         ) as worker:
             info = worker.info.to_mapping()
-            assert set(info["supported_ops"]) == {
+            assert set(info["supported_calls"]) == {
                 code.value for code in allowed
             }
             assert worker.supports_computation(ForwardMode.PREFILL)

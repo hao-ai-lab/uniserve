@@ -10,7 +10,7 @@ import torch
 
 from uniserve.distributed.mesh import Communicator, DeviceMesh
 from uniserve.model import EntryPoint
-from uniserve.runtime import CUDAStream
+from uniserve.runtime import CUDAStream, ExecutionContext
 
 from ..bootstrap.config import ComponentConfig
 from ..protocol.call import CallKind
@@ -19,7 +19,6 @@ from ..protocol.tensor import OutputInfo
 if TYPE_CHECKING:
     from .batch import ExecutionOutput
     from .input_buffers import InputBuffers
-from uniserve.runtime import ExecutionContext
 
 TensorOutput: TypeAlias = torch.Tensor | tuple[torch.Tensor, ...]
 
@@ -27,10 +26,7 @@ TensorOutput: TypeAlias = torch.Tensor | tuple[torch.Tensor, ...]
 def capture_required(
     missing: bool, groups: tuple[Communicator, ...], device: torch.device
 ) -> bool:
-    """Coordinate first-use work over the actual numerical communication.
-
-    groups.
-    """
+    """Coordinate first-use work over the numerical communication groups."""
     if not groups:
         return missing
     decision = torch.tensor(int(missing), dtype=torch.int32, device=device)

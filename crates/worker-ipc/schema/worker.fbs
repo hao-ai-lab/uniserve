@@ -149,9 +149,9 @@ table WorkerInfo {
   world_size:uint = 1;
   configuration_id:string;
   components:[ComponentInfo];
-  supported_ops:[CallKind];
+  supported_calls:[CallKind];
   queue_depth:uint;
-  max_batch_ops:uint;
+  max_batch_calls:uint;
   max_batch_tokens:uint;
   request_slots:uint;
   kv_cache:KVCacheInfo;
@@ -160,7 +160,7 @@ table WorkerInfo {
   buffer_pool_bytes:ulong;
   encoder_cache_entries:uint;
   encoder_entry_bytes:ulong;
-  max_unresolved_ops:uint = 1;
+  max_unresolved_calls:uint = 1;
   media_components:[MediaComponent];
   num_inference_steps:uint;
   host_lane_capacity:uint = 1;

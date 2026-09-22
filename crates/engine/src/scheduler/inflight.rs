@@ -19,11 +19,10 @@ pub(super) enum InflightInput {
     },
 }
 
-/// Submitted call and timing state awaiting completion.
-pub(super) struct InflightOp {
+/// Submitted call awaiting completion.
+pub(super) struct InflightCall {
     pub(super) call: Call,
     pub(super) input: InflightInput,
-    pub(super) started: Instant,
 }
 
 /// Completion held until earlier request calls are applied.
@@ -83,7 +82,7 @@ impl Scheduler {
             .iter()
             .filter(|(holder, _)| **holder != id)
             .flat_map(|(_, calls)| calls)
-            .any(|op| op.call.code == CallKind::Media(MediaCall::Denoising))
+            .any(|call| call.call.code == CallKind::Media(MediaCall::Denoising))
     }
 
     /// Stateful calls retain request order. Pure media branches complete
@@ -140,7 +139,7 @@ impl Scheduler {
         &mut self,
         request_key: RequestKey,
         call_id: CallId,
-    ) -> Option<InflightOp> {
+    ) -> Option<InflightCall> {
         let id = request_key.request_id;
         let queue = self.pending_calls.get_mut(&id)?;
         let index = queue.iter().position(|inflight| {
@@ -172,19 +171,19 @@ impl Scheduler {
         &mut self,
         batch_id: u64,
         request: RequestKey,
-        op: CallId,
-    ) -> Option<InflightOp> {
+        call_id: CallId,
+    ) -> Option<InflightCall> {
         if !self
             .pending_batches
             .get_mut(&batch_id)?
             .calls
-            .remove(&(request, op))
+            .remove(&(request, call_id))
         {
             return None;
         }
         let queue = self.pending_calls.get_mut(&request.request_id)?;
         let position = queue.iter().position(|inflight| {
-            inflight.call.request_key == request && inflight.call.call_id == op
+            inflight.call.request_key == request && inflight.call.call_id == call_id
         })?;
         let inflight = queue.remove(position)?;
         if queue.is_empty() {

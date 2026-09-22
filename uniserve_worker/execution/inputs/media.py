@@ -91,10 +91,7 @@ class MediaBuilder:
         constants: Mapping[str, torch.Tensor],
         workspace: Mapping[str, torch.Tensor],
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
-        """Fill CPU transfer sources and return destination/source pairs to.
-
-        stage.
-        """
+        """Fill CPU sources and return destination/source pairs for staging."""
         names = self.denoiser.modalities
         # The denoiser's numerical calls batch over leading size 1.
         noise = {name: tensors[f"{name}_noise"].unsqueeze(0) for name in names}

@@ -8,9 +8,9 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 use uniserve_engine::{
-    DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulingPolicy, TransferConfig,
-    WorkerConfig, WorkerProcessArgs,
+    DEFAULT_COMPONENT, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
+    SchedulingPolicy, TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
 
 /// How the HTTP server obtains its listening socket.
@@ -40,7 +40,7 @@ pub enum HttpListenerMode {
 /// engine execution; Python owns model forward execution.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EngineSettings {
-    /// Maximum ops assembled into one forward batch.
+    /// Maximum calls assembled into one forward batch.
     pub max_batch: usize,
     /// Maximum number of tokens scheduled in one engine step.
     pub max_num_batched_tokens: usize,
@@ -88,7 +88,7 @@ impl Default for EngineSettings {
                 "cuda",
                 1,
                 2,
-                WorkerConfig::single_component("model", 1),
+                WorkerConfig::single_component(DEFAULT_COMPONENT, 1),
             )],
             transfer: TransferConfig::default(),
             worker_process: WorkerProcessArgs {

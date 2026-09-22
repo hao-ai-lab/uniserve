@@ -173,7 +173,7 @@ def build_worker_layout(
     completion_payload_bytes: int = 1 << 20,
     endpoint: WorkerEndpoint | None = None,
     capacity_group: Communicator | None = None,
-    allowed_work_variants: frozenset[CallKind] | None = None,
+    allowed_calls: frozenset[CallKind] | None = None,
     transfer_backends: tuple[str, ...] = ("local",),
     components: tuple[tuple[str, ComponentConfig], ...] = (),
     attention_identity: str | None = None,
@@ -195,13 +195,13 @@ def build_worker_layout(
     if completion_payload_bytes <= 0:
         raise ValueError("completion payload capacity must be positive")
 
-    supported_ops = supported_calls(model, (name for name, _ in components))
-    if allowed_work_variants is not None:
-        supported_ops = supported_ops & allowed_work_variants
+    supported = supported_calls(model, (name for name, _ in components))
+    if allowed_calls is not None:
+        supported = supported & allowed_calls
 
-    if not supported_ops:
+    if not supported:
         raise unsupported_setup(
-            "worker model implements none of the requested work variants"
+            "worker model implements none of the requested call kinds"
         )
 
     model_name = (
@@ -246,7 +246,7 @@ def build_worker_layout(
     # A shared admission limit must be safe on every eligible lane. Keep it
     # in the layout so runtime allocation and the IPC handshake read the
     # same value.
-    max_calls = layout.info.max_batch_ops
+    max_calls = layout.info.max_batch_calls
     max_tokens = layout.info.max_batch_tokens
 
     for lane in worker_config.lanes:
@@ -257,20 +257,18 @@ def build_worker_layout(
     held = tuple(name for name, _ in components)
     info = replace(
         layout.info,
-        supported_ops=tuple(
-            code for code in CALL_KINDS if code in supported_ops
-        ),
+        supported_calls=tuple(code for code in CALL_KINDS if code in supported),
         # Advertised routing and advertised work describe the same placement,
-        # including a deployment narrowed to a subset of its work variants: a
+        # including a deployment narrowed to a subset of its call kinds: a
         # call this worker will not accept is a call it does not route.
         media_components={
             call: component
             for call, component in media_components(model, held).items()
-            if call in supported_ops
+            if call in supported
         },
         transfer_backends=transfer_backends,
         fabric_handles=_exports_fabric_handles(worker_config.device),
-        max_batch_ops=max_calls,
+        max_batch_calls=max_calls,
         max_batch_tokens=max_tokens,
         encoder_cache_entries=layout.encoder_cache_entries,
         encoder_entry_bytes=max(
@@ -490,7 +488,7 @@ def _token_worker_layout(
                 token_capacity=blocks * capacity.block_size,
             )
 
-    supported_ops = tuple(
+    supported = tuple(
         code for code in CALL_KINDS if code in supported_calls(model)
     )
     info = WorkerInfo(
@@ -499,9 +497,9 @@ def _token_worker_layout(
         endpoint=endpoint,
         device=str(worker_config.device),
         world_size=int(worker_config.world_size),
-        supported_ops=supported_ops,
+        supported_calls=supported,
         queue_depth=int(queue_depth),
-        max_batch_ops=int(worker_config.max_batch_calls),
+        max_batch_calls=int(worker_config.max_batch_calls),
         max_batch_tokens=int(worker_config.max_batch_tokens),
         request_slots=int(worker_config.max_request_pool_size),
         kv_cache=(
@@ -512,7 +510,7 @@ def _token_worker_layout(
         latent_page_units=latent_page_units,
         latent_pages=num_latent_pages,
         buffer_pool_bytes=buffer_pool_bytes,
-        max_unresolved_ops=unresolved_window,
+        max_unresolved_calls=unresolved_window,
         media_components=dict(media_components(model)),
         num_inference_steps=0,
         host_lane_capacity=1,
@@ -575,11 +573,11 @@ def _request_tensor_worker_layout(
         endpoint=endpoint,
         device=str(worker_config.device),
         world_size=int(worker_config.world_size),
-        supported_ops=tuple(
+        supported_calls=tuple(
             code for code in CALL_KINDS if code in supported_calls(model)
         ),
         queue_depth=depth,
-        max_batch_ops=max_calls,
+        max_batch_calls=max_calls,
         max_batch_tokens=max_calls,
         request_slots=slots,
         kv_cache=None,
@@ -587,7 +585,7 @@ def _request_tensor_worker_layout(
         latent_pages=0,
         buffer_pool_bytes=slots
         * product_storage_bytes(resolve_outputs(model, worker_config)),
-        max_unresolved_ops=unresolved_window,
+        max_unresolved_calls=unresolved_window,
         media_components=dict(media_components(model)),
         num_inference_steps=media_builder(model, worker_config).num_steps,
         host_lane_capacity=1,

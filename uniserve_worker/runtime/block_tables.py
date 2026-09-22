@@ -278,10 +278,7 @@ class BlockTables:
         return self._host_alloced_lens.get(int(request_pool_idx), 0)
 
     def set_verified(self, slots: torch.Tensor, lengths: torch.Tensor) -> None:
-        """Update verified cache lengths for selected request slots without.
-
-        changing page tables.
-        """
+        """Update verified cache lengths without changing page tables."""
         slots = slots.to(device=self.page_tables.device, dtype=torch.int64)
         lengths = lengths.to(device=self.page_tables.device, dtype=torch.int32)
         if slots.ndim != 1 or lengths.shape != slots.shape:

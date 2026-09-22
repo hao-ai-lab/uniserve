@@ -293,7 +293,7 @@ impl CallKind {
     }
 }
 
-/// Hard resource maxima the scheduler reserves before an call runs.
+/// Hard resource maxima the scheduler reserves before a call runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Bounds {
     /// Maximum tokens the call may process or produce.
@@ -398,6 +398,9 @@ impl CallCoordinates {
     }
 }
 
+/// Component used when a deployment does not partition a model by capability.
+pub const DEFAULT_COMPONENT: &str = "model";
+
 /// One immutable computation with its identity, data dependencies, and output limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Call {
@@ -409,7 +412,7 @@ pub struct Call {
     pub coordinates: CallCoordinates,
     /// Component bound within the selected Worker.
     pub component: String,
-    /// CallKind performed by this call.
+    /// Kind performed by this call.
     pub code: CallKind,
     /// Scheduler-declared limits for the computation and its outputs.
     pub bounds: Bounds,
@@ -799,7 +802,7 @@ pub struct RequestOutput {
     pub error_code: Option<ErrorCode>,
     /// Worker timing measurements for the call.
     pub timing_counters: TimingCounters,
-    /// CallKind that produced this result; must match the submitted call.
+    /// Kind that produced this result; must match the submitted call.
     pub code: CallKind,
     /// Model position for the next input, including image-feedback position advances.
     pub position: u32,
@@ -1764,7 +1767,7 @@ impl BatchOutput {
             );
             ensure_valid!(
                 identities.insert(completion.call_id),
-                "completion report repeats an call"
+                "completion report repeats a call"
             );
         }
         for payload in &self.products {

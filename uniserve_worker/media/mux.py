@@ -154,7 +154,7 @@ class MediaEncoder:
             profile_name=(
                 f"uniserve.host.encode request={_key_label(request_key)} "
                 f"step={call_id.batch_id} "
-                f"op={call_id.request_index} "
+                f"call={call_id.request_index} "
                 f"kind=video unit={unit_index} rank={self.rank}"
             ),
         )
@@ -217,7 +217,7 @@ class MediaMux:
             profile_name=(
                 f"uniserve.host.encode request={_key_label(request_key)} "
                 f"step={call_id.batch_id} "
-                f"op={call_id.request_index} "
+                f"call={call_id.request_index} "
                 f"kind=audio rank={self.rank}"
             ),
             session=key,
@@ -256,7 +256,7 @@ class MediaMux:
             profile_name=(
                 f"uniserve.host.mux request={_key_label(request_key)} "
                 f"step={call_id.batch_id} "
-                f"op={call_id.request_index} "
+                f"call={call_id.request_index} "
                 f"kind=units rank={self.rank}"
             ),
             session=key,
@@ -303,7 +303,7 @@ class MediaMux:
             profile_name=(
                 f"uniserve.host.mux request={_key_label(request_key)} "
                 f"step={call_id.batch_id} "
-                f"op={call_id.request_index} "
+                f"call={call_id.request_index} "
                 f"kind=artifact rank={self.rank}"
             ),
             session=key,

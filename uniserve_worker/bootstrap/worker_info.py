@@ -262,16 +262,16 @@ class WorkerInfo:
     model_name: str
     endpoint: WorkerEndpoint
     world_size: int
-    supported_ops: tuple[CallKind, ...]
+    supported_calls: tuple[CallKind, ...]
     queue_depth: int
-    max_batch_ops: int
+    max_batch_calls: int
     max_batch_tokens: int
     request_slots: int
     kv_cache: KVCacheInfo | None
     latent_page_units: int
     latent_pages: int
     buffer_pool_bytes: int
-    max_unresolved_ops: int
+    max_unresolved_calls: int
     host_lane_capacity: int
     encoder_cache_entries: int = 0
     encoder_entry_bytes: int = 0
@@ -337,10 +337,10 @@ class WorkerInfo:
 
         for name in (
             "queue_depth",
-            "max_batch_ops",
+            "max_batch_calls",
             "max_batch_tokens",
             "request_slots",
-            "max_unresolved_ops",
+            "max_unresolved_calls",
             "host_lane_capacity",
         ):
             if getattr(self, name) < 1:
@@ -354,7 +354,7 @@ class WorkerInfo:
         requires_kv = any(
             variant
             in {ForwardMode.PREFILL, ForwardMode.DECODE, ForwardMode.VERIFY}
-            for variant in self.supported_ops
+            for variant in self.supported_calls
         )
         if requires_kv and self.kv_cache is None:
             raise invalid_descriptor(
@@ -373,10 +373,10 @@ class WorkerInfo:
                     f"worker info.{name} must not be negative"
                 )
 
-        if not self.supported_ops:
-            raise invalid_descriptor("worker info must support a work variant")
-        if len(set(self.supported_ops)) != len(self.supported_ops):
-            raise invalid_descriptor("worker info repeats a work variant")
+        if not self.supported_calls:
+            raise invalid_descriptor("worker info must support a call kind")
+        if len(set(self.supported_calls)) != len(self.supported_calls):
+            raise invalid_descriptor("worker info repeats a call kind")
 
         if self.media_components:
             # A worker reports the component serving each media call it
@@ -385,7 +385,7 @@ class WorkerInfo:
             # completeness and its diffusion step count are the engine's
             # checks over every worker.
             if any(
-                not component or call not in self.supported_ops
+                not component or call not in self.supported_calls
                 for call, component in self.media_components.items()
             ):
                 raise invalid_descriptor(
@@ -453,15 +453,18 @@ class WorkerInfo:
             ),
             fabric_handles=bool(data.get("fabric_handles", False)),
             world_size=_uint(data.get("world_size"), f"{where}.world_size"),
-            supported_ops=tuple(
-                computation(item, f"{where}.supported_ops[{index}]")
+            supported_calls=tuple(
+                computation(item, f"{where}.supported_calls[{index}]")
                 for index, item in enumerate(
-                    _seq(data.get("supported_ops"), f"{where}.supported_ops")
+                    _seq(
+                        data.get("supported_calls"),
+                        f"{where}.supported_calls",
+                    )
                 )
             ),
             queue_depth=_uint(data.get("queue_depth"), f"{where}.queue_depth"),
-            max_batch_ops=_uint(
-                data.get("max_batch_ops"), f"{where}.max_batch_ops"
+            max_batch_calls=_uint(
+                data.get("max_batch_calls"), f"{where}.max_batch_calls"
             ),
             max_batch_tokens=_uint(
                 data.get("max_batch_tokens"), f"{where}.max_batch_tokens"
@@ -492,8 +495,9 @@ class WorkerInfo:
             encoder_entry_bytes=_uint(
                 data.get("encoder_entry_bytes"), f"{where}.encoder_entry_bytes"
             ),
-            max_unresolved_ops=_uint(
-                data.get("max_unresolved_ops"), f"{where}.max_unresolved_ops"
+            max_unresolved_calls=_uint(
+                data.get("max_unresolved_calls"),
+                f"{where}.max_unresolved_calls",
             ),
             host_lane_capacity=_uint(
                 data.get("host_lane_capacity"), f"{where}.host_lane_capacity"
@@ -519,9 +523,9 @@ class WorkerInfo:
             "components": [
                 component.to_mapping() for component in self.components
             ],
-            "supported_ops": [value.value for value in self.supported_ops],
+            "supported_calls": [value.value for value in self.supported_calls],
             "queue_depth": self.queue_depth,
-            "max_batch_ops": self.max_batch_ops,
+            "max_batch_calls": self.max_batch_calls,
             "max_batch_tokens": self.max_batch_tokens,
             "request_slots": self.request_slots,
             "kv_cache": None
@@ -532,7 +536,7 @@ class WorkerInfo:
             "buffer_pool_bytes": self.buffer_pool_bytes,
             "encoder_cache_entries": self.encoder_cache_entries,
             "encoder_entry_bytes": self.encoder_entry_bytes,
-            "max_unresolved_ops": self.max_unresolved_ops,
+            "max_unresolved_calls": self.max_unresolved_calls,
             "host_lane_capacity": self.host_lane_capacity,
         }
 

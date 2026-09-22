@@ -184,11 +184,11 @@ pub struct WorkerInfo {
     #[serde(default)]
     pub components: Vec<ComponentInfo>,
     /// Call families accepted by the worker.
-    pub supported_ops: Vec<CallKind>,
+    pub supported_calls: Vec<CallKind>,
     /// Maximum unresolved physical runs.
     pub queue_depth: u32,
     /// Maximum calls in one run.
-    pub max_batch_ops: u32,
+    pub max_batch_calls: u32,
     /// Maximum text tokens represented in one run.
     pub max_batch_tokens: u32,
     /// Number of resident request slots.
@@ -206,7 +206,7 @@ pub struct WorkerInfo {
     /// Maximum bytes in one encoder feature product, independent of pool size.
     pub encoder_entry_bytes: u64,
     /// Maximum unresolved calls per request lineage.
-    pub max_unresolved_ops: u32,
+    pub max_unresolved_calls: u32,
     /// Concurrent host-lane tasks this rank's bounded host executor admits.
     #[serde(default)]
     pub host_lane_capacity: u32,
@@ -307,17 +307,17 @@ impl WorkerInfo {
         }
         // Capability and scheduling limits must describe a usable worker.
         ensure_valid!(
-            !self.supported_ops.is_empty(),
-            "worker info declare no work variants"
+            !self.supported_calls.is_empty(),
+            "worker info declares no call kinds"
         );
         ensure_valid!(
-            self.supported_ops
+            self.supported_calls
                 .iter()
                 .copied()
                 .collect::<HashSet<_>>()
                 .len()
-                == self.supported_ops.len(),
-            "worker info repeat a work variant"
+                == self.supported_calls.len(),
+            "worker info repeats a call kind"
         );
         // A worker names the component serving each media call it implements. Every
         // named call must be one it advertises and a component it holds. The
@@ -326,20 +326,20 @@ impl WorkerInfo {
         // step count are the executor's checks over every worker.
         ensure_valid!(
             self.media_components.iter().all(|(call, component)| {
-                !component.is_empty() && self.supported_ops.contains(&CallKind::Media(*call))
+                !component.is_empty() && self.supported_calls.contains(&CallKind::Media(*call))
             }),
             "a media call names no component this worker serves"
         );
         ensure_valid!(
-            self.max_batch_ops > 0
+            self.max_batch_calls > 0
                 && self.max_batch_tokens > 0
                 && self.request_slots > 0
-                && self.max_unresolved_ops > 0,
+                && self.max_unresolved_calls > 0,
             "worker info declare a zero scheduling bound"
         );
         ensure_valid!(self.queue_depth > 0, "worker queue depth must be positive");
         // Advertised call families require their corresponding pools.
-        let requires_kv = self.supported_ops.iter().any(|variant| {
+        let requires_kv = self.supported_calls.iter().any(|variant| {
             matches!(
                 variant,
                 CallKind::Forward(ForwardMode::Prefill)
@@ -402,12 +402,12 @@ impl Default for WorkerInfo {
             configuration_id: String::new(),
             checkpoint_identity: "0".repeat(64),
             components: Vec::new(),
-            supported_ops: vec![
+            supported_calls: vec![
                 CallKind::Forward(ForwardMode::Prefill),
                 CallKind::Forward(ForwardMode::Decode),
             ],
             queue_depth: 1,
-            max_batch_ops: 1,
+            max_batch_calls: 1,
             max_batch_tokens: 8192,
             request_slots: 128,
             kv_cache: Some(KvCacheInfo {
@@ -432,7 +432,7 @@ impl Default for WorkerInfo {
             buffer_pool_bytes: 0,
             encoder_cache_entries: 0,
             encoder_entry_bytes: 0,
-            max_unresolved_ops: 1,
+            max_unresolved_calls: 1,
             host_lane_capacity: 1,
         }
     }

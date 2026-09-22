@@ -435,12 +435,11 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
                 )
                 calls.append(
                     Call(
-                        RequestKey(1, index, 0),
-                        CallId(1, index),
-                        None,
-                        CallCoordinates(),
-                        mode,
-                        Bounds(),
+                        request_key=RequestKey(1, index, 0),
+                        call_id=CallId(1, index),
+                        coordinates=CallCoordinates(),
+                        kind=mode,
+                        bounds=Bounds(),
                     )
                 )
             result = runner.run_forward_group(
@@ -493,7 +492,7 @@ def test_loaded_worker_warmup_retires_its_request_resources(tmp_path):
         worker_config=config,
         sampling_group=Communicator(device=torch.device("cuda:0")),
         tokenizer=None,
-        allowed_work_variants=supported_calls(model),
+        allowed_calls=supported_calls(model),
         queue_depth=2,
         completion_payload_bytes=1 << 16,
     ) as worker:

@@ -80,7 +80,7 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
     sim.set_results_on_wait(true);
 
     let info = sim.mut_info_for_test();
-    info.supported_ops = MediaCall::VIDEO
+    info.supported_calls = MediaCall::VIDEO
         .iter()
         .map(|call| CallKind::Media(*call))
         .collect();

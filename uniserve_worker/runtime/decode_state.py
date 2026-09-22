@@ -124,10 +124,7 @@ class DecodeState:
         continuation_width: int,
         logits_dtype: torch.dtype,
     ) -> dict[str, BufferConfig]:
-        """Describe continuation storage; verified lengths belong to.
-
-        the page-table owner.
-        """
+        """Describe continuation storage; its owner tracks verified lengths."""
         if min(request_pool_size, vocab_size, continuation_width) < 1:
             raise ValueError("runtime-state dimensions must be positive")
         if not logits_dtype.is_floating_point:

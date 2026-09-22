@@ -106,7 +106,7 @@ class WorkerError(Exception):
     fatal: bool = False
     req_id: int | None = None
     call_id: CallId | None = None
-    op_kind: str | None = None
+    call_kind: str | None = None
     phase: str | None = None
     route: str | None = None
     calls: tuple[tuple[int, int, int, CallId], ...] = ()
@@ -126,7 +126,7 @@ class WorkerError(Exception):
         """
         # Only the fields modeled on the Rust WorkerResponse cross the IPC
         # boundary.
-        # Richer context (req_id, call_id, op_kind, details) stays local
+        # Richer context (req_id, call_id, call_kind, details) stays local
         # for logging and metrics.
         return {
             "kind": "error",
@@ -256,9 +256,9 @@ def unsupported_call(kind: str, req_id: int | None = None) -> WorkerError:
     """
     return _make(
         WorkerErrorCode.UNSUPPORTED_CALL,
-        f"op kind {kind!r} is not supported by this worker",
+        f"call kind {kind!r} is not supported by this worker",
         req_id=req_id,
-        op_kind=kind,
+        call_kind=kind,
     )
 
 
