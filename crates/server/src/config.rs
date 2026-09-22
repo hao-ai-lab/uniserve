@@ -207,16 +207,16 @@ impl EngineSettings {
     /// transport (64 MiB).
     pub const DEFAULT_RESP_SLOT_CAP: usize = 64 << 20;
 
-    /// Worker IPC slot capacity for a media deployment (64 MiB).
+    /// Worker IPC slot capacity for a media deployment (72 MiB).
     ///
     /// A host product stays in a shared-memory segment on its host; across
     /// hosts its bytes ride the rank channel, in the producing rank's result
     /// and in the consuming rank's batch, so the cap admits the largest such
-    /// product a rank publishes at once: a decode round's encoded media unit
-    /// rows at their bound, four rows of a quarter of a 22-frame raster each,
-    /// plus a PCM shard. The rings grow to what a message needs, so the cap
-    /// costs nothing until a message uses it.
-    pub const MEDIA_IPC_SLOT_CAP: usize = 64 << 20;
+    /// product a rank publishes at once. A native FastH3 decode unit contains
+    /// 22 RGB frames at 1344x768 (68,124,672 bytes) plus its protocol envelope,
+    /// which is larger than 64 MiB. The rings grow to what a message needs, so
+    /// the cap costs nothing until a message uses it.
+    pub const MEDIA_IPC_SLOT_CAP: usize = 72 << 20;
 
     /// Rejects numeric engine settings that are structurally required to be
     /// positive (they index, divide, or bound scheduling). This catches a `0`
