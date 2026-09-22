@@ -137,3 +137,68 @@ def test_a_unit_that_exceeds_its_reserved_row_fails_by_name():
     )
     with pytest.raises(Exception, match="exceeds the"):
         frame_encoded_unit(payload, torch.zeros(16, dtype=torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "backends",
+    [
+        ("channel", "channel"),
+        ("shm", "channel"),
+        ("shm", "shm"),
+        ("local", "channel"),
+        ("local", "local"),
+    ],
+)
+def test_encoded_units_cross_hosts_without_transferring_reserved_padding(
+    backends,
+):
+    import torch
+
+    from uniserve.runtime import EventPool
+    from uniserve_worker.execution.host_media import read_encoded_units
+    from uniserve_worker.protocol.transfer import TensorTransfer
+    from uniserve_worker.transport.channel import ChannelTransport
+    from uniserve_worker.transport.local import LocalTransport
+    from uniserve_worker.transport.pool import TransferCapacity
+    from uniserve_worker.transport.shm import ShmTransport
+
+    config = _config()
+    units = (
+        encode_video_unit(config, np.zeros((4, 16, 32, 3), dtype=np.uint8)),
+        encode_video_unit(config, np.full((2, 16, 32, 3), 255, dtype=np.uint8)),
+    )
+    capacity = encoded_unit_bytes(4, 16, 32)
+    storage = torch.empty((2, capacity), dtype=torch.uint8)
+    transports = {
+        name: kind(
+            capacity=TransferCapacity(1024 * 1024, 8), event_pool=EventPool()
+        )
+        for name, kind in (
+            ("shm", ShmTransport),
+            ("channel", ChannelTransport),
+            ("local", LocalTransport),
+        )
+    }
+    locations = []
+    try:
+        for index, (payload, backend) in enumerate(
+            zip(units, backends, strict=True)
+        ):
+            framed = frame_encoded_unit(payload, storage[index])
+            locations.append(
+                transports[backend].publish(
+                    framed.unsqueeze(0), offset=(index, 0), consumers=(0,)
+                )
+            )
+        tensor = TensorTransfer(
+            shape=tuple(storage.shape), locations=tuple(locations)
+        )
+        assert sum(location.nbytes for location in locations) == sum(
+            len(unit) + 8 for unit in units
+        )
+        assert read_encoded_units(tensor, transports=transports) == units
+    finally:
+        for location in locations:
+            transports[location.backend].release(location)
+        for transport in transports.values():
+            transport.close()

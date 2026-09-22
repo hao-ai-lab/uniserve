@@ -410,6 +410,16 @@ def prepare_inputs(
                     "cross-call transfer entry has an unknown kind"
                 )
 
+            # Encoded rows publish initialized prefixes within their reserved
+            # capacity. The mux reads those host locations directly; importing
+            # the full logical tensor would require uninitialized padding.
+            if any(
+                call.kind is MediaCall.MUXING and entry.product in call.inputs
+                for call in batch.calls
+            ):
+                state.borrowed_inputs.add(entry.product.buffer_id)
+                continue
+
             parameters = {
                 params.buffer: params for params in batch.buffer_allocations
             }

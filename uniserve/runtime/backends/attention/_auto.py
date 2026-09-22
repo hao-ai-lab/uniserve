@@ -154,6 +154,7 @@ class Backend(_Backend):
             "torch": import_module(f"{__package__}.torch").Backend()
         }
         if device.type != "cuda":
+            self.name = f"auto:{device.type}:torch"
             return
 
         # Probe each native library's entry points; uninstalled or incomplete

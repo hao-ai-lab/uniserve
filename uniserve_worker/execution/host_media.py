@@ -28,7 +28,12 @@ from uniserve_worker.media.mux import (
 )
 from uniserve_worker.protocol.call import Call, CallStatus, MediaCall
 from uniserve_worker.protocol.output import FinishFlags
-from uniserve_worker.protocol.transfer import PosixShmTransfer
+from uniserve_worker.protocol.transfer import (
+    ChannelTransfer,
+    LocalTransfer,
+    PosixShmTransfer,
+    TensorTransfer,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -131,6 +136,78 @@ def _borrow(
         f"media unit {row} is not published over shared storage on this host: "
         + _locations(publication)
     )
+
+
+def read_encoded_units(
+    tensor: TensorTransfer, *, transports: Mapping[str, Transport]
+) -> tuple[bytes, ...]:
+    """Read initialized encoded rows, retaining shared storage through the copy.
+
+    Logical row capacity bounds encoding; physical locations carry only the
+    framed bytes. Shared storage reaches this host and channel bytes reach
+    other hosts. Never import the uninitialized remainder of a logical row.
+    """
+    import torch
+
+    from uniserve_worker.transport.shared_storage import open_shared_storage
+
+    if len(tensor.shape) != 2 or tensor.dtype != "uint8":
+        raise invalid_descriptor("encoded units require byte rows")
+    units: dict[int, bytes] = {}
+    shm = transports.get("shm")
+    for location in tensor.locations:
+        handle = location.transport
+        if isinstance(handle, PosixShmTransfer):
+            if shm is None or location.source.node != shm.source.node:
+                continue
+        elif isinstance(handle, LocalTransfer):
+            local = transports.get("local")
+            if (
+                local is None
+                or location.source.address_space != local.source.address_space
+            ):
+                continue
+        elif not isinstance(handle, ChannelTransfer):
+            continue
+        if location.offset[1] != 0:
+            raise invalid_descriptor(
+                "encoded unit location lacks its length prefix"
+            )
+        first = location.offset[0]
+        indices = range(first, first + location.shape[0])
+        if all(index in units for index in indices):
+            continue
+        if isinstance(handle, LocalTransfer):
+            ticket = local.fetch(location, device=torch.device("cpu"))
+            try:
+                rows = ticket.result()
+                for index, row in zip(indices, rows.unbind(0), strict=True):
+                    units[index] = read_encoded_unit(row)
+            finally:
+                ticket.close()
+            continue
+        if isinstance(handle, PosixShmTransfer):
+            borrow = shm.borrow(location)
+            try:
+                with open_shared_storage(
+                    borrow.segment, borrow.offset + borrow.nbytes
+                ) as mapping:
+                    raw = bytearray(
+                        mapping[borrow.offset : borrow.offset + borrow.nbytes]
+                    )
+            finally:
+                borrow.release()
+        else:
+            raw = bytearray(handle.payload)
+        rows = torch.frombuffer(raw, dtype=torch.uint8).reshape(location.shape)
+        for index, row in zip(indices, rows.unbind(0), strict=True):
+            units[index] = read_encoded_unit(row)
+    if len(units) != tensor.shape[0]:
+        raise invalid_descriptor(
+            f"artifact assembly requires every encoded media unit: received "
+            f"{sorted(units)} for {tensor.shape[0]} rows"
+        )
+    return tuple(units[index] for index in range(tensor.shape[0]))
 
 
 def _stage_tensor(value: torch.Tensor) -> HostBorrow:
@@ -286,10 +363,16 @@ def execute(
                 _validate_completion_products,
             )
 
-            for row, result in zip(rows.unbind(0), results, strict=True):
+            regions = []
+            for index, (row, result) in enumerate(
+                zip(rows.unbind(0), results, strict=True)
+            ):
                 if not isinstance(result, bytes):
                     raise RuntimeError("media unit encode produced no bytes")
-                frame_encoded_unit(result, row)
+                framed = frame_encoded_unit(result, row)
+                regions.append(
+                    (slice(index, index + 1), slice(0, framed.numel()))
+                )
             products = (
                 transfer.publish_deferred_product(
                     call.outputs[0],
@@ -298,6 +381,7 @@ def execute(
                     tensor_store=tensor_store,
                     publication_transports=publication_transports,
                     consumers=call.consumer_slots,
+                    regions=regions,
                 ),
             )
             _validate_completion_products(call, products)
@@ -349,7 +433,20 @@ def execute(
         # none: every unit and the audio track are in, and it assembles the
         # artifact.
         units: list[bytes] = []
-        for product in call.inputs:
+        for index, product in enumerate(call.inputs):
+            if product.buffer_id in state.borrowed_inputs:
+                publication = _input_publication(call, state, index)
+                units.extend(
+                    read_encoded_units(
+                        publication.value.tensor,
+                        transports=publication_transports,
+                    )
+                )
+                continue
+
+            # Wholly resident products arrive by identity, without wire
+            # locations. The producer already committed their reserved rows
+            # to this rank's tensor store; retain the read through consumption.
             read = tensor_store.consume(
                 product,
                 consumer_call_id=call.call_id,
@@ -360,8 +457,9 @@ def execute(
                 raise invalid_descriptor(
                     "artifact assembly requires every encoded media unit"
                 )
-            rows = read.tensor.to("cpu")
-            units.extend(read_encoded_unit(row) for row in rows.unbind(0))
+            units.extend(
+                read_encoded_unit(row) for row in read.tensor.unbind(0)
+            )
         if units:
             tasks = (
                 media_mux.append_units(

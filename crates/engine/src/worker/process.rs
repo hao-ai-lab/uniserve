@@ -848,10 +848,10 @@ impl RankProcess {
             if let Some(frame) = self.client.try_recv_response(pending)? {
                 return Ok(frame);
             }
-            anyhow::ensure!(
-                started.elapsed() < Duration::from_secs(300),
-                "worker response timed out during {context}"
-            );
+            // Loading checkpoints and preparing numerical shapes have no
+            // model-independent completion deadline. The caller owns the
+            // launch deadline; rank death and cancellation remain observable
+            // throughout preparation.
             if last_worker_check.elapsed() >= WORKER_CHECK_INTERVAL {
                 self.check_worker(context)?;
                 last_worker_check = Instant::now();

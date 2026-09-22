@@ -55,8 +55,10 @@ def encoded_unit_bytes(frames: int, height: int, width: int) -> int:
     return _LENGTH_BYTES + encoded_video_bytes(frames, height, width)
 
 
-def frame_encoded_unit(payload: bytes, destination: torch.Tensor) -> None:
-    """Write one encoded media unit and its length into a product row."""
+def frame_encoded_unit(
+    payload: bytes, destination: torch.Tensor
+) -> torch.Tensor:
+    """Write a framed unit and return its initialized prefix for publication."""
     import torch
 
     capacity = int(destination.numel()) - _LENGTH_BYTES
@@ -73,6 +75,7 @@ def frame_encoded_unit(payload: bytes, destination: torch.Tensor) -> None:
     destination[_LENGTH_BYTES : _LENGTH_BYTES + len(payload)].copy_(
         torch.from_numpy(body)
     )
+    return destination[: _LENGTH_BYTES + len(payload)]
 
 
 def read_encoded_unit(row: torch.Tensor) -> bytes:

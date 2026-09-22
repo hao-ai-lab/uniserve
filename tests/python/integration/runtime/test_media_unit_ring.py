@@ -111,16 +111,23 @@ def _serial() -> list[torch.Tensor]:
     ]
 
 
-def _ring(rank: int, expected_bytes: bytes) -> None:
+def _ring(rank: int, expected_bytes: bytes, device: torch.device) -> None:
     import pickle
+    from contextlib import ExitStack
 
     import torch.distributed as dist
 
     from uniserve.distributed import Communicator
+    from uniserve.runtime import ExecutionContext
+    from uniserve.runtime.execution import close_stream_collectives
 
     expected = pickle.loads(expected_bytes)
-    model = _postprocessor()
+    model = _postprocessor().to(device)
     constants, workspace, state = _resources()
+    constants, workspace, state = (
+        {name: value.to(device) for name, value in values.items()}
+        for values in (constants, workspace, state)
+    )
     frames = _windows()
     total = frames[-1].stop
     ranks = tuple(range(dist.get_world_size()))
@@ -128,48 +135,74 @@ def _ring(rank: int, expected_bytes: bytes) -> None:
         ranks=ranks,
         rank=rank,
         name="units",
-        device=torch.device("cpu"),
+        device=device,
         _group=dist.group.WORLD,
     )
 
-    cursor = 0
-    while cursor < UNITS:
-        count = min(len(ranks), UNITS - cursor)
-        if rank < count:
-            unit = cursor + rank
-            produced = model(
-                (_output(unit, total),),
-                frames=(frames[unit],),
-                num_frames=(total,),
-                state=state,
-                constants=constants,
-                workspace=workspace,
-                unit_count=count,
-            )[0].tensor
-            assert torch.equal(produced, expected[unit]), (
-                f"media unit {unit} on rank {rank} differs from the "
-                "whole-track reconstruction"
+    with ExitStack() as scope:
+        if device.type == "cuda":
+            stream = torch.cuda.Stream(device=device)
+            stream.wait_stream(torch.cuda.current_stream(device))
+            scope.callback(close_stream_collectives, stream)
+            context = ExecutionContext(
+                model, stream=stream, groups=(model.units,)
             )
-        cursor += count
+            scope.callback(context.close)
+            context.prepare(total)
+            scope.enter_context(context.activate())
+        cursor = 0
+        while cursor < UNITS:
+            count = min(len(ranks), UNITS - cursor)
+            if rank < count:
+                unit = cursor + rank
+                output = _output(unit, total)
+                output = TensorOutput(output.tensor.to(device), output.layout)
+                produced = model(
+                    (output,),
+                    frames=(frames[unit],),
+                    num_frames=(total,),
+                    state=state,
+                    constants=constants,
+                    workspace=workspace,
+                    unit_count=count,
+                )[0].tensor
+                assert torch.equal(produced.cpu(), expected[unit]), (
+                    f"media unit {unit} on rank {rank} differs from the "
+                    "whole-track reconstruction"
+                )
+            cursor += count
 
 
-def _worker(rank: int, directory: str, expected_bytes: bytes) -> None:
+def _worker(
+    rank: int, directory: str, expected_bytes: bytes, accelerator: str
+) -> None:
     import torch.distributed as dist
 
+    device = (
+        torch.device(accelerator, rank)
+        if accelerator == "cuda"
+        else torch.device("cpu")
+    )
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     dist.init_process_group(
-        "gloo",
+        "nccl" if device.type == "cuda" else "gloo",
         init_method=f"file://{directory}/ring",
         rank=rank,
         world_size=4,
     )
     try:
-        _ring(rank, expected_bytes)
+        _ring(rank, expected_bytes, device)
     finally:
         dist.destroy_process_group()
 
 
+@pytest.mark.parametrize(
+    "accelerator", ("cpu", pytest.param("cuda", marks=pytest.mark.gpu))
+)
 def test_media_units_across_a_ring_match_the_whole_track_reconstruction(
     tmp_path,
+    accelerator,
 ):
     import pickle
 
@@ -177,7 +210,7 @@ def test_media_units_across_a_ring_match_the_whole_track_reconstruction(
 
     mp.spawn(
         _worker,
-        args=(str(tmp_path), pickle.dumps(_serial())),
+        args=(str(tmp_path), pickle.dumps(_serial()), accelerator),
         nprocs=4,
         join=True,
     )

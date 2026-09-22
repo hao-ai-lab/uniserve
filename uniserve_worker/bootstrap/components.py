@@ -395,6 +395,15 @@ def bind_components(
                 for group in communicators(call.module)
                 if stage == "all" or "pp" not in group.name.split(".")
             }
+            # Temporal components have a rank-local numerical mesh, but their
+            # reconstruction still exchanges overlaps with adjacent ranks.
+            # Bind that ring to both the model and its prepared call scope.
+            if binding.units is not None and isinstance(
+                call.module.__dict__.get("units"), Communicator
+            ):
+                call.module.units = binding.units
+                if binding.units.size > 1:
+                    groups[binding.units._require()] = binding.units
             for axes in call.entry_point.communication_axes(mesh):
                 group = mesh.get_group(axes)
                 if group.size > 1:
@@ -405,9 +414,3 @@ def bind_components(
         binding.call_kinds = tuple(
             MUXER_CALL_KINDS if name == MUXER_COMPONENT else call_kinds(calls)
         )
-        # A module that reconstructs media units borrows the ring of ranks
-        # holding consecutive ones, the way a parallel module borrows its mesh.
-        if binding.units is not None:
-            for call in calls:
-                if isinstance(call.module.__dict__.get("units"), Communicator):
-                    call.module.units = binding.units

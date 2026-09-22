@@ -56,12 +56,30 @@ class GraphStorage:
         """Reject residency above the byte bound after preparation/capture."""
         if not self._budgets:
             return
+        for device, used in self.resident_bytes().items():
+            if used > self._budgets[device]:
+                raise CUDAGraphError(
+                    f"graph residency on {device} exceeds its byte budget "
+                    f"({used}>{self._budgets[device]})"
+                )
+
+    def set_budget(self, device, amount):
+        """Bind the graph share of an owner's remaining device-storage grant."""
+        if amount < 0:
+            raise ValueError("graph storage budgets must be nonnegative")
+        self._budgets[canonical_device(device)] = int(amount)
+        self.check()
+
+    def resident_bytes(self):
+        """Return reserved pool bytes, including reusable capture workspace."""
         sizes = dict.fromkeys(self._budgets, 0)
         ids = {
             (device.index, tuple(pool.id)): device
             for pools in self._pools.values()
             for device, pool in pools.items()
         }
+        if not ids:
+            return sizes
         for segment in torch.cuda.memory_snapshot():
             device = ids.get(
                 (
@@ -71,12 +89,7 @@ class GraphStorage:
             )
             if device is not None:
                 sizes[device] += segment["total_size"]
-        for device, used in sizes.items():
-            if used > self._budgets[device]:
-                raise CUDAGraphError(
-                    f"graph residency on {device} exceeds its byte budget "
-                    f"({used}>{self._budgets[device]})"
-                )
+        return sizes
 
     def release(self, owner):
         """Release a pool only after its graphs and borrowed views retire."""
