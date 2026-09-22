@@ -14,6 +14,22 @@ _SamplingKernel = Callable[
 ]
 
 
+def top_k_candidates(
+    logits: torch.Tensor, top_k: int, top_p: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Retain top-k candidates through the first nucleus threshold crossing.
+
+    General and compiled sampling use the same candidate ordering, including
+    ties at the top-k and nucleus boundaries. Returned IDs address the input
+    vocabulary; dropped candidates have negative-infinite logits.
+    """
+    values, indexes = torch.topk(logits, top_k, dim=-1, sorted=True)
+    cumulative = torch.softmax(values, dim=-1).cumsum(dim=-1)
+    over = cumulative > top_p.unsqueeze(1)
+    drop = torch.cat((torch.zeros_like(over[:, :1]), over[:, :-1]), dim=1)
+    return torch.where(drop, float("-inf"), values), indexes
+
+
 def _sample_top_k_tensor(
     logits: torch.Tensor,
     draws: torch.Tensor,
@@ -27,28 +43,19 @@ def _sample_top_k_tensor(
     With temperature and probability filters.
     """
     work = logits.float()
-    # Zero temperature preserves finite logits for filtering; it later selects
-    # the first sorted candidate deterministically.
+    # Zero temperature preserves finite logits for filtering; selection below
+    # resolves maximum-logit ties by vocabulary ID, as full-vocabulary argmax.
     divisors = torch.where(
         temperature > 0.0,
         temperature,
         torch.ones_like(temperature),
     )
     work = work / divisors.unsqueeze(1)
-    candidates, token_indexes = torch.topk(
-        work,
-        top_k,
-        dim=-1,
-        sorted=True,
-    )
+    candidates, token_indexes = top_k_candidates(work, top_k, top_p)
 
     # Nucleus filtering retains the candidate that first crosses top-p, while
     # min-p is measured relative to the maximum candidate probability in log
     # space.
-    cumulative = torch.softmax(candidates, dim=-1).cumsum(dim=-1)
-    over = cumulative > top_p.unsqueeze(1)
-    drop = torch.cat((torch.zeros_like(over[:, :1]), over[:, :-1]), dim=1)
-    candidates = torch.where(drop, float("-inf"), candidates)
     min_threshold = candidates[:, 0] + torch.log(min_p)
     candidates = torch.where(
         (min_p.unsqueeze(1) <= 0.0)
@@ -68,12 +75,20 @@ def _sample_top_k_tensor(
         .clamp_max(top_k - 1)
     )
     sampled = token_order.gather(1, sampled_order.unsqueeze(1))[:, 0]
-    selected = torch.where(
-        temperature > 0.0,
-        sampled,
-        torch.zeros_like(sampled),
+    greedy = (
+        torch.where(
+            candidates == candidates.max(dim=-1, keepdim=True).values,
+            token_indexes,
+            logits.shape[1],
+        )
+        .min(dim=-1)
+        .values
     )
-    tokens = token_indexes.gather(1, selected.unsqueeze(1))[:, 0]
+    tokens = torch.where(
+        temperature > 0.0,
+        token_indexes.gather(1, sampled.unsqueeze(1))[:, 0],
+        greedy,
+    )
 
     # Rows with NaN or +inf candidates, or with no finite candidate at all,
     # have no well-defined distribution; the caller rejects their tokens.
