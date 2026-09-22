@@ -45,8 +45,12 @@ from uniserve_worker.protocol.output import BatchOutput
 pytestmark = pytest.mark.integration
 
 
-def test_logprob_reporting_does_not_change_sample_selection() -> None:
-    worker = execution_worker()
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu))
+)
+def test_logprob_reporting_does_not_change_sample_selection(device, request):
+    worker = execution_worker(device=device)
+    request.addfinalizer(worker.close)
     sampling = SamplingParams(temperature=0.8, top_k=4, top_p=0.9, seed=71)
     first = ar_params(11, block_ids=(2,), sampling=sampling)
     second = ar_params(
@@ -95,6 +99,8 @@ def test_logprob_reporting_does_not_change_sample_selection() -> None:
         result.completions[0].committed_tokens
         == result.completions[1].committed_tokens
     )
+    assert result.completions[1].sampled_logprob is not None
+    assert len(result.completions[1].top_logprobs) == 2
 
 
 @pytest.mark.parametrize(
