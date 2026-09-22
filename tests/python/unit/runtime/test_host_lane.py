@@ -60,6 +60,33 @@ def test_close_cancels_unsubmitted_dependency_and_drains_submitted_work() -> (
     assert pool.reserved == 0
 
 
+def test_abort_returns_before_running_work_and_cancels_queued_work() -> None:
+    pool = HostLane(max_inflight=2, workers=1)
+    entered, finish, queued_ran = Event(), Event(), Event()
+
+    def work() -> int:
+        entered.set()
+        assert finish.wait(5)
+        return 17
+
+    running = pool.reserve().submit(work)
+    try:
+        assert entered.wait(5)
+        queued = pool.reserve().submit(queued_ran.set)
+        pool.abort()
+        assert not running.done()
+        with pytest.raises(WorkerError, match="closed"):
+            pool.reserve()
+        finish.set()
+        assert running.result(timeout=5) == 17
+        with pytest.raises(CancelledError):
+            queued.result(timeout=5)
+        assert not queued_ran.is_set()
+    finally:
+        finish.set()
+        pool.close()
+
+
 def test_ready_does_not_submit_and_failure_releases_capacity() -> None:
     pool = HostLane(max_inflight=1, workers=1)
     called = Event()

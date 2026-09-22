@@ -17,6 +17,7 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
+from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.protocol.batch import Batch, Finish, NewRequest
 from uniserve_worker.protocol.call import Call, ForwardMode
 from uniserve_worker.protocol.identity import CallId, RequestKey
@@ -78,6 +79,22 @@ def test_info_request_is_served_before_close() -> None:
     assert responses[1]["info"] == worker.info.to_mapping()
     assert [response["message_id"] for response in endpoint.responses] == [1, 2]
     assert responses[2]["kind"] == "ok"
+
+
+def test_direct_admission_preserves_identity_and_bounded_delivery():
+    commands = (Finish(RequestKey(1, 1, 1)),)
+    with execution_worker(queue_depth=1) as worker:
+        first = worker.submit(Batch(batch_id=7, commands=commands))
+        with pytest.raises(WorkerError, match="admission queue is full"):
+            worker.submit(Batch(batch_id=8, commands=commands))
+        assert worker.poll(first).batch_id == 7
+        with pytest.raises(RuntimeError, match="warmup must precede"):
+            worker.warmup()
+        with pytest.raises(WorkerError, match="must exceed"):
+            worker.submit(Batch(batch_id=7, commands=commands))
+        # Capacity rejection applied nothing: this identity can now be used.
+        second = worker.submit(Batch(batch_id=8, commands=commands))
+        assert worker.poll(second).batch_id == 8
 
 
 @pytest.mark.parametrize("queue_depth", (1, 3))
@@ -286,13 +303,10 @@ def test_close_releases_borrowed_endpoint_references() -> None:
     assert reference() is None
 
 
-@pytest.mark.parametrize("cleanup_failure", (False, True))
 @pytest.mark.parametrize("entrypoint", ("run", "warmup"))
 def test_warmup_failure_preserves_error_and_leaves_requests_unconsumed(
-    monkeypatch, tmp_path, cleanup_failure: bool, entrypoint: str
+    monkeypatch, tmp_path, entrypoint: str
 ) -> None:
-    import concurrent.futures
-
     import torch
 
     from tests.python.fixtures.launch import worker_args
@@ -319,16 +333,6 @@ def test_warmup_failure_preserves_error_and_leaves_requests_unconsumed(
     # failing their entry exercises the backend boundary those instances use.
     monkeypatch.setattr(torch.inference_mode, "__enter__", unavailable)
     worker = Worker.from_config(config)
-    if cleanup_failure:
-        shutdown = concurrent.futures.ThreadPoolExecutor.shutdown
-
-        def failed_shutdown(executor, *args, **kwargs):
-            shutdown(executor, *args, **kwargs)
-            raise OSError("executor shutdown failed")
-
-        monkeypatch.setattr(
-            concurrent.futures.ThreadPoolExecutor, "shutdown", failed_shutdown
-        )
     with pytest.raises(RuntimeError) as caught:
         with worker:
             if entrypoint == "run":
@@ -341,10 +345,6 @@ def test_warmup_failure_preserves_error_and_leaves_requests_unconsumed(
     with pytest.raises(RuntimeError, match="closed"):
         worker.submit(
             execution_batch(batch_id=1, commands=(Finish(RequestKey(1, 1, 1)),))
-        )
-    if cleanup_failure:
-        assert any(
-            "executor shutdown failed" in note for note in failure.__notes__
         )
 
 

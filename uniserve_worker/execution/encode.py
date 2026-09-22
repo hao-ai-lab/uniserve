@@ -52,7 +52,7 @@ from .image_input import (
     prepare_image,
     prepare_tensor_image,
 )
-from .rows import ForwardRow
+from .rows import DiffusionRow, TokenRow, VisionRow
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -456,9 +456,9 @@ def encode_source(
 def encode_row(
     mode: MediaCall,
     prepared: PreparedImage,
-) -> ForwardRow:
+) -> VisionRow:
     """Build a vision- or latent-encoder row from prepared image tensors."""
-    return ForwardRow(
+    return VisionRow(
         forward_mode=mode,
         encode_pixels=prepared.pixels,
         encode_grid=prepared.grid,
@@ -479,7 +479,7 @@ def vision_state_row(
     logits: bool,
     request_tables: BlockTables | None,
     model_runner: ModelRunner,
-) -> ForwardRow:
+) -> TokenRow:
     """Publish vision features and construct the request runtime that.
 
     references their token span.
@@ -534,7 +534,7 @@ def vision_state_row(
         close_image=close_image,
         model_runner=model_runner,
     )
-    return ForwardRow(
+    return TokenRow(
         forward_mode=ForwardMode.PREFILL,
         token_ids=token_ids,
         token_embeddings=token_embeddings,
@@ -635,7 +635,7 @@ def latent_state_row(
     state: BatchState,
     request_tables: BlockTables | None,
     model_runner: ModelRunner,
-) -> ForwardRow:
+) -> DiffusionRow:
     """Publish image latents and build the diffusion-conditioning runtime."""
     builder = model_runner.image_builder
     if builder is None or builder.framing != 2:
@@ -663,7 +663,7 @@ def latent_state_row(
         state.pending_output(completion_group, call.request_key.request_id),
         tables=request_tables,
     )
-    return ForwardRow(
+    return DiffusionRow(
         forward_mode=MediaCall.DENOISING,
         positions=positions,
         timestep=latent.new_zeros(1),

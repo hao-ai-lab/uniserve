@@ -30,7 +30,7 @@ from . import calls, encode
 from . import sample as sampling
 from .batch_state import BatchState
 from .output import capture_logprobs
-from .rows import ForwardRow
+from .rows import TokenRow
 from .sample import broadcast_selection
 from .sampling import (
     SamplerOutput,
@@ -58,7 +58,7 @@ def prepare_forward(
     request_tables: BlockTables | None,
     model_runner: ModelRunner,
     decode_state: DecodeState | None,
-) -> ForwardRow:
+) -> TokenRow:
     """Pack autoregressive extension, decode.
 
     or verification work into model-forward rows.
@@ -166,7 +166,7 @@ def prepare_forward(
 def prepare_sampling(
     call: Call,
     completion_group: int,
-    task: ForwardRow,
+    task: TokenRow,
     output: torch.Tensor,
     *,
     state: BatchState,
@@ -271,7 +271,7 @@ def prepare_sampling(
 def publish_sample(
     call: Call,
     completion_group: int,
-    task: ForwardRow,
+    task: TokenRow,
     logits: torch.Tensor,
     sample_work: SamplingMetadata | None,
     sampled: SamplerRow,
@@ -415,7 +415,7 @@ def _prepare_visual(
     tensor_store: TensorStore,
     request_tables: BlockTables | None,
     model_runner: ModelRunner,
-) -> ForwardRow:
+) -> TokenRow:
     """Resolve image features and interleave them with prompt tokens for model.
 
     execution.
@@ -479,7 +479,7 @@ def _prepare_visual(
 def _prepare_visual_sampling(
     call: Call,
     completion_group: int,
-    task: ForwardRow,
+    task: TokenRow,
     output: torch.Tensor,
     *,
     state: BatchState,
@@ -568,7 +568,7 @@ def _finish_visual(
 def graph_decode_samples(
     calls: tuple[Call, ...],
     requests: tuple[PendingOutput, ...],
-    tasks: tuple[ForwardRow, ...],
+    tasks: tuple[TokenRow, ...],
     output: SamplerOutput | None,
     *,
     sampling_group: Communicator | None,
@@ -757,7 +757,7 @@ def token_outcome(
     *,
     state: BatchState,
     request: PendingOutput | None = None,
-    task: ForwardRow | None = None,
+    task: TokenRow | None = None,
     tokens: int,
     logical_position: int | None = None,
     rng_counter: int | None = None,
@@ -831,7 +831,7 @@ def token_task(
     seq_len: int | None = None,
     request_indexed_decode: bool = False,
     request_tables: BlockTables | None,
-) -> ForwardRow:
+) -> TokenRow:
     """Build an autoregressive row from runtime and token coordinates."""
     if request_indexed_decode:
         if (
@@ -874,7 +874,7 @@ def token_task(
         raise invalid_descriptor(
             "token row visibility disagrees with call metadata"
         )
-    return ForwardRow(
+    return TokenRow(
         forward_mode=cast(ForwardMode, call.kind),
         token_ids=token_values,
         positions=position_values,
@@ -896,7 +896,7 @@ def token_task(
 
 
 def commit_kv(
-    task: ForwardRow,
+    task: TokenRow,
     tokens: int,
     request: PendingOutput,
     *,

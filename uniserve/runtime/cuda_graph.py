@@ -178,14 +178,20 @@ class CUDAGraph(Generic[ResultT]):
             ) from error
         return self._output
 
-    def close(self) -> None:
-        """Release the graph and its pool references.
+    def close(self, *, aborted: bool = False) -> None:
+        """Release the graph after its final readers have completed.
 
-        Output views become invalid.
+        Output views become invalid. Aborted close retains native resources
+        without waiting; the owning process must exit before reclaiming them.
         """
         if self._closed:
             return
         self._closed = True
+        if aborted:
+            from .resources import retain_until_exit
+
+            retain_until_exit(self)
+            return
         try:
             if self._graph is not None:
                 self._graph.reset()
@@ -207,7 +213,7 @@ class CUDAGraph(Generic[ResultT]):
 
     def __exit__(self, exc_type, exc, traceback):
         try:
-            self.close()
+            self.close(aborted=exc is not None)
         except BaseException as error:
             if exc is None:
                 raise

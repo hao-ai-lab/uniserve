@@ -17,7 +17,7 @@ from .attention import from_blocks
 from .batch import ExecutionOutput, InputBatch
 from .component_binding import ComponentBinding
 from .input_buffers import InputBuffers
-from .rows import ForwardRow
+from .rows import TokenRow
 
 if TYPE_CHECKING:
     from .graph_inputs import PrefillShape
@@ -58,7 +58,7 @@ def stage_text(
     mode = ForwardMode.DECODE if decode else ForwardMode.PREFILL
     batch = buffers.stage(
         tuple(
-            ForwardRow(
+            TokenRow(
                 forward_mode=mode,
                 token_ids=torch.tensor(value, dtype=torch.int64),
                 positions=position,

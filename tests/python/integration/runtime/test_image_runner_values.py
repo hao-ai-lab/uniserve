@@ -160,7 +160,6 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
             max_tokens=64,
             latent_capacity_units=16,
             decode_context_blocks=2,
-            variants=(),
             max_inflight=1,
         )
         runner.capture(tokenizer=None, latents=latents)
@@ -324,7 +323,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
     from uniserve.model import EmbeddingReplacement, TextInput
     from uniserve.nn.attention import SequenceLengths, VarlenInput
     from uniserve_worker.bootstrap.components import supported_calls
-    from uniserve_worker.execution.rows import ForwardRow
+    from uniserve_worker.execution.rows import TokenRow
     from uniserve_worker.execution.sampling import TokenSelection
     from uniserve_worker.worker import Worker
 
@@ -421,7 +420,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                         expected,
                         token_indices=torch.tensor([2], device="cuda:0"),
                     ).gather()
-            row = ForwardRow(
+            row = TokenRow(
                 forward_mode=ForwardMode.PREFILL,
                 token_ids=tokens,
                 positions=positions,
@@ -459,7 +458,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 model.text(inputs),
                 token_indices=torch.tensor([2], device="cuda:0"),
             ).gather()
-        row = ForwardRow(
+        row = TokenRow(
             forward_mode=ForwardMode.PREFILL,
             token_ids=tokens,
             positions=positions,
@@ -514,7 +513,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 ).gather()
                 actual = worker.runner.run_forward_group(
                     (
-                        ForwardRow(
+                        TokenRow(
                             forward_mode=ForwardMode.DECODE,
                             token_ids=next_token,
                             positions=next_position[0],

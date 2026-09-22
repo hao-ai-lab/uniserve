@@ -15,7 +15,7 @@ from uniserve.nn.attention import (
 )
 from uniserve_worker.foundation.errors import invalid_descriptor
 
-from .rows import ForwardRow
+from .rows import AttentionRow
 
 if TYPE_CHECKING:
     from ..runtime.block_tables import BlockTables
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 
 def cache_pages(
-    tasks: tuple[ForwardRow, ...],
+    tasks: tuple[AttentionRow, ...],
     *,
     tables: BlockTables | None,
     cache: CacheManager | None,

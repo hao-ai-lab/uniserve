@@ -24,25 +24,65 @@ from uniserve_worker.runtime.staging_buffers import StagingBuffers
 from .attention import cache_pages, columns
 from .batch import InputBatch
 from .inputs.image import DecodeInput, ImageBuilder
-from .rows import ForwardRow
+from .rows import DecodeRow, DiffusionRow, InputRow, TokenRow, VisionRow
 
 
 @dataclass(frozen=True, slots=True)
-class InputBufferConfig:
-    """Storage limits for one lane's token, prefix and embedding columns."""
+class RowBufferConfig:
+    """Request-slot capacity of one homogeneous staged call."""
 
     max_rows: int
+
+    def __post_init__(self):
+        if self.max_rows < 1:
+            raise ValueError("input-buffer row capacity must be positive")
+
+    def buffers(self):
+        return {
+            "request_pool_indices": BufferConfig((self.max_rows,), torch.int64)
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AttentionBufferConfig(RowBufferConfig):
+    """Sequence and page-table capacities shared by attention computations."""
+
     max_tokens: int
-    max_text_tokens: int
     max_blocks_per_row: int
+
+    def __post_init__(self):
+        RowBufferConfig.__post_init__(self)
+        if min(self.max_tokens, self.max_blocks_per_row) < 1:
+            raise ValueError(
+                "attention token and block bounds must be positive"
+            )
+
+    def buffers(self):
+        rows, tokens = self.max_rows, self.max_tokens
+        return {
+            **RowBufferConfig.buffers(self),
+            "positions": BufferConfig((3, tokens), torch.int64),
+            "block_tables": BufferConfig(
+                (rows, self.max_blocks_per_row), torch.int32
+            ),
+            "cache_lengths": BufferConfig((rows,), torch.int32),
+            "query_lengths": BufferConfig((rows,), torch.int32),
+            "cumulative_query_lengths": BufferConfig((rows + 1,), torch.int32),
+            "cumulative_prefix_lengths": BufferConfig((rows + 1,), torch.int32),
+            "write_indices": BufferConfig((tokens,), torch.int64),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TokenBufferConfig(AttentionBufferConfig):
+    """Token and optional embedding storage for a language model call."""
+
+    max_text_tokens: int
     hidden_size: int
     embedding_dtype: torch.dtype = torch.bfloat16
 
     def __post_init__(self):
-        if min(self.max_rows, self.max_tokens, self.max_blocks_per_row) < 1:
-            raise ValueError(
-                "input-buffer row, token and block bounds must be positive"
-            )
+        AttentionBufferConfig.__post_init__(self)
         if (
             self.hidden_size < 0
             or not 1 <= self.max_text_tokens <= self.max_tokens
@@ -58,96 +98,204 @@ class InputBufferConfig:
             raise ValueError("input embeddings require a logical compute dtype")
 
     def buffers(self):
-        rows, tokens, text = (
-            self.max_rows,
-            self.max_tokens,
-            self.max_text_tokens,
-        )
         fields = {
-            "input_ids": BufferConfig((text,), torch.int64),
-            "positions": BufferConfig((3, tokens), torch.int64),
-            "embedding_mask": BufferConfig((text,), torch.bool),
-            "request_pool_indices": BufferConfig((rows,), torch.int64),
-            "decode_force_finish": BufferConfig((rows,), torch.bool),
-            "block_tables": BufferConfig(
-                (rows, self.max_blocks_per_row), torch.int32
-            ),
-            "cache_lengths": BufferConfig((rows,), torch.int32),
-            "query_lengths": BufferConfig((rows,), torch.int32),
-            "cumulative_query_lengths": BufferConfig((rows + 1,), torch.int32),
-            "cumulative_prefix_lengths": BufferConfig((rows + 1,), torch.int32),
-            "write_indices": BufferConfig((tokens,), torch.int64),
-            "timesteps": BufferConfig((rows,), torch.float32),
+            **AttentionBufferConfig.buffers(self),
+            "input_ids": BufferConfig((self.max_text_tokens,), torch.int64),
+            "embedding_mask": BufferConfig((self.max_text_tokens,), torch.bool),
+            "decode_force_finish": BufferConfig((self.max_rows,), torch.bool),
         }
-
         if self.hidden_size:
             fields["input_embeddings"] = BufferConfig(
-                (text, self.hidden_size), self.embedding_dtype
+                (self.max_text_tokens, self.hidden_size), self.embedding_dtype
             )
         return fields
 
 
+@dataclass(frozen=True, slots=True)
+class DiffusionBufferConfig(AttentionBufferConfig):
+    """Attention columns and one solver time per image sequence."""
+
+    def buffers(self):
+        return {
+            **AttentionBufferConfig.buffers(self),
+            "timesteps": BufferConfig((self.max_rows,), torch.float32),
+        }
+
+
 class InputBuffers:
-    """Own lane staging.
+    """Own request-slot staging and borrow already placed numerical views."""
 
-    models receive only its borrowed typed numerical inputs.
-    """
+    row_type: type[InputRow]
 
-    def __init__(
-        self,
-        *,
-        config: InputBufferConfig,
-        device,
-        max_inflight=1,
-        image_builder: ImageBuilder | None = None,
-    ):
+    def __init__(self, *, config: RowBufferConfig, device, max_inflight=1):
         self.config = config
         self.device = torch.device(device)
-        self.image_builder = image_builder
-        self.max_rows, self.max_tokens = config.max_rows, config.max_tokens
-        self.max_text_tokens, self.max_blocks_per_row = (
-            config.max_text_tokens,
-            config.max_blocks_per_row,
-        )
-        self.hidden_size = config.hidden_size
-
-        self._backing = TensorBuffers.allocate(
-            config.buffers(), device=self.device
-        )
-        for name, tensor in self._backing.view(config.buffers()).items():
+        self.max_rows = config.max_rows
+        fields = config.buffers()
+        self._backing = TensorBuffers.allocate(fields, device=self.device)
+        for name, tensor in self._backing.view(fields).items():
             tensor.zero_()
             setattr(self, name, tensor)
-
-        # Unused slots keep sentinel values; staged calls overwrite the prefix
-        # they use.
-        self.input_ids.fill_(1)
-        self.write_indices.fill_(-1)
-        self.input_embeddings = getattr(self, "input_embeddings", None)
-
         self._request_host = StagingBuffers(
             self.max_rows, dtype=torch.int64, depth=max_inflight, device=device
-        )
-        self._finish_host = StagingBuffers(
-            self.max_rows, dtype=torch.bool, depth=max_inflight, device=device
         )
 
     def close(self):
         self._request_host.close()
-        self._finish_host.close()
         self._backing.close()
 
-    def _requests(self, rows):
-        """Copy request pool indices and any force-finish flags into device.
-
-        staging.
-        """
-        count = len(rows)
+    def stage(self, rows, *, forward_mode, **numerical):
+        """Stage one numerical call and retain its output request slots."""
+        if not 0 < len(rows) <= self.max_rows:
+            raise ValueError("row count exceeds input-buffer capacity")
+        if any(not isinstance(row, self.row_type) for row in rows):
+            raise TypeError(
+                f"this staging requires {self.row_type.__name__} inputs"
+            )
+        if any(
+            row.forward_mode != forward_mode
+            and not (
+                isinstance(row.forward_mode, ForwardMode)
+                and isinstance(forward_mode, ForwardMode)
+            )
+            for row in rows
+        ):
+            raise ValueError("one input call requires homogeneous computations")
         slot, host = self._request_host.acquire()
         fill_cpu_ints(host, tuple(row.request_pool_idx for row in rows))
-        requests = self.request_pool_indices[:count]
-        requests.copy_(host[:count], non_blocking=True)
+        requests = self.request_pool_indices[: len(rows)]
+        requests.copy_(host[: len(rows)], non_blocking=True)
         self._request_host.record_copy(slot)
+        inputs, selections, finish = self._stage(rows, **numerical)
+        return InputBatch(forward_mode, inputs, requests, selections, finish)
 
+    def _device_view(self, value):
+        if value is None or value.device != self.device:
+            raise ValueError(f"input tensor must already be on {self.device}")
+        return value
+
+
+class AttentionBuffers(InputBuffers):
+    """Copy attention metadata and positions into fixed-address columns."""
+
+    def __init__(self, *, config: AttentionBufferConfig, **options):
+        super().__init__(config=config, **options)
+        self.max_tokens = config.max_tokens
+        self.max_blocks_per_row = config.max_blocks_per_row
+        self.write_indices.fill_(-1)
+
+    def stage_attention(self, attention):
+        """Copy paged or segmented attention columns into the lane's fixed.
+
+        buffers.
+        """
+        if not isinstance(attention, (PagedInput, SegmentedInput)):
+            raise TypeError(
+                "worker token staging requires paged or prefix/current "
+                "attention"
+            )
+
+        count = attention.queries.batch_size
+        queries = SequenceLengths(
+            host=attention.queries.host,
+            values=self._vector(self.query_lengths, attention.queries.values),
+            offsets=self._vector(
+                self.cumulative_query_lengths, attention.queries.offsets
+            ),
+        )
+        prefixes = SequenceLengths(
+            host=attention.prefixes.host,
+            values=self._vector(self.cache_lengths, attention.prefixes.values),
+            offsets=self._vector(
+                self.cumulative_prefix_lengths, attention.prefixes.offsets
+            ),
+        )
+
+        source = attention.block_table.indices
+        if source.shape[1] > self.max_blocks_per_row:
+            raise ValueError("block tables exceed input-buffer capacity")
+
+        table = self.block_tables[:count, : source.shape[1]]
+        table.copy_(source, non_blocking=True)
+        blocks = BlockTable(table, attention.block_table.block_size)
+
+        writes = (
+            None
+            if attention.write_indices is None
+            else self._vector(self.write_indices, attention.write_indices)
+        )
+
+        if isinstance(attention, PagedInput):
+            return PagedInput(
+                queries, prefixes, blocks, writes, attention.causal
+            )
+
+        if not attention.fully_visible_current:
+            raise ValueError(
+                "image staging requires fully visible current sequences"
+            )
+
+        return SegmentedInput(
+            queries,
+            prefixes,
+            blocks,
+            writes,
+            queries.values[:, None].expand(-1, queries.maximum),
+            True,
+        )
+
+    def _positions(self, source, offset, count):
+        if source.ndim == 1:
+            source = source.unsqueeze(0)
+        if (
+            source.ndim != 2
+            or source.shape[0] not in (1, 3)
+            or source.shape[1] != count
+        ):
+            raise ValueError(
+                "positions must have one or three axes over the token span"
+            )
+        self.positions[: source.shape[0], offset : offset + count].copy_(
+            source, non_blocking=True
+        )
+
+    def _vector(self, target, source):
+        if source.numel() > target.numel():
+            raise ValueError("numerical column exceeds input-buffer capacity")
+        result = target[: source.numel()]
+        result.copy_(source.reshape(-1), non_blocking=True)
+        return result
+
+
+class TokenBuffers(AttentionBuffers):
+    """Stage text and resident decode continuations on their execution lane."""
+
+    row_type = TokenRow
+
+    def __init__(
+        self, *, config: TokenBufferConfig, image_builder=None, **options
+    ):
+        super().__init__(config=config, **options)
+        self.max_text_tokens = config.max_text_tokens
+        self.hidden_size = config.hidden_size
+        self.image_builder = image_builder
+        self.input_ids.fill_(1)
+        self.input_embeddings = getattr(self, "input_embeddings", None)
+        self._finish_host = StagingBuffers(
+            self.max_rows,
+            dtype=torch.bool,
+            depth=options.get("max_inflight", 1),
+            device=self.device,
+        )
+
+    def close(self):
+        self._finish_host.close()
+        super().close()
+
+    def _stage(
+        self, rows, *, attention=None, cache=None, tables=None, states=None
+    ):
+        count = len(rows)
         finish = None
         if all(
             row.decode_predicate is not None and row.decode_predicate_tagged
@@ -158,36 +306,6 @@ class InputBuffers:
             fill_cpu_bools(host, tuple(row.decode_force_finish for row in rows))
             finish.copy_(host[:count], non_blocking=True)
             self._finish_host.record_copy(slot)
-
-        return requests, finish
-
-    def stage(
-        self,
-        rows: tuple[ForwardRow, ...],
-        *,
-        forward_mode,
-        attention=None,
-        cache=None,
-        tables=None,
-        states=None,
-    ):
-        """Stage one homogeneous call into the lane's fixed buffers and bind.
-
-        its typed inputs.
-        """
-        if not 0 < len(rows) <= self.max_rows:
-            raise ValueError("forward row count exceeds input-buffer capacity")
-        if any(
-            row.forward_mode != forward_mode
-            and not (
-                isinstance(row.forward_mode, ForwardMode)
-                and isinstance(forward_mode, ForwardMode)
-            )
-            for row in rows
-        ):
-            raise ValueError("one input call requires homogeneous call kinds")
-
-        requests, finish = self._requests(rows)
 
         indexed = any(row.request_indexed_decode for row in rows)
         if indexed:
@@ -216,13 +334,7 @@ class InputBuffers:
             ):
                 _, width = cache_pages(rows, cache=cache, tables=tables)
                 inputs = self._indexed(rows, width, cache, tables, states)
-                return InputBatch(
-                    forward_mode,
-                    inputs,
-                    requests,
-                    tuple(row.selection for row in rows),
-                    finish,
-                )
+                return inputs, tuple(row.selection for row in rows), finish
 
             # Without a compatible resident CUDA cache, materialize one token
             # and position per row and continue through the ordinary path.
@@ -242,49 +354,13 @@ class InputBuffers:
                 for row in rows
             )
 
-        selections = ()
-        if (
-            isinstance(forward_mode, ForwardMode)
-            or forward_mode is MediaCall.DENOISING
-        ):
-            attention = (
-                columns(rows, cache=cache, tables=tables)
-                if attention is None
-                else attention
-            )
-            staged = self.stage_attention(attention)
-
-            if isinstance(forward_mode, ForwardMode):
-                inputs = self._text(rows, staged)
-                selections = tuple(row.selection for row in rows)
-            else:
-                inputs = self._images(rows, staged)
-        elif forward_mode in {
-            MediaCall.VISION_ENCODING,
-            MediaCall.LATENT_ENCODING,
-        }:
-            inputs = VisionInput(
-                tuple(self._device_view(row.encode_pixels) for row in rows),
-                tuple(
-                    None
-                    if row.encode_grid is None
-                    else self._device_view(row.encode_grid)
-                    for row in rows
-                ),
-                tuple(row.encode_grid_shape for row in rows),
-            )
-        elif forward_mode is MediaCall.IMAGE_DECODING:
-            inputs = DecodeInput(
-                tuple(self._device_view(row.latent) for row in rows),
-                tuple(
-                    image.Config(row.image_height, row.image_width)
-                    for row in rows
-                ),
-            )
-        else:
-            raise ValueError(f"unsupported staged computation {forward_mode}")
-
-        return InputBatch(forward_mode, inputs, requests, selections, finish)
+        attention = (
+            columns(rows, cache=cache, tables=tables)
+            if attention is None
+            else attention
+        )
+        inputs = self._text(rows, self.stage_attention(attention))
+        return inputs, tuple(row.selection for row in rows), finish
 
     def _text(self, rows, attention):
         """Stage token IDs.
@@ -376,108 +452,6 @@ class InputBuffers:
             else None,
         )
 
-    def _images(self, rows, attention):
-        """Stage denoising positions and timesteps.
-
-        then bind the image inputs.
-        """
-        if self.image_builder is None:
-            raise ValueError("image denoising requires its bound input builder")
-
-        sizes = tuple(
-            image.Config(row.image_height, row.image_width) for row in rows
-        )
-        lengths = tuple(
-            self.image_builder.sequence_length(size) for size in sizes
-        )
-        if sum(lengths) > self.max_tokens:
-            raise ValueError("image sequences exceed input-buffer capacity")
-
-        positions, offset = [], 0
-        for index, (row, size, length) in enumerate(
-            zip(rows, sizes, lengths, strict=True)
-        ):
-            if row.timestep is None or row.positions is None:
-                raise ValueError(
-                    "image denoising requires positions and a timestep"
-                )
-
-            self._positions(row.positions, offset, length)
-            positions.append(self.positions[:, offset : offset + length])
-            self.timesteps[index].copy_(row.timestep.reshape(()))
-            offset += length
-
-        return self.image_builder.bind(
-            samples=tuple(self._device_view(row.latent) for row in rows),
-            sizes=sizes,
-            timesteps=tuple(
-                self.timesteps[index : index + 1] for index in range(len(rows))
-            ),
-            positions=tuple(positions),
-            attention=attention,
-            step_index=0,
-        )
-
-    def stage_attention(self, attention):
-        """Copy paged or segmented attention columns into the lane's fixed.
-
-        buffers.
-        """
-        if not isinstance(attention, (PagedInput, SegmentedInput)):
-            raise TypeError(
-                "worker token staging requires paged or prefix/current "
-                "attention"
-            )
-
-        count = attention.queries.batch_size
-        queries = SequenceLengths(
-            host=attention.queries.host,
-            values=self._vector(self.query_lengths, attention.queries.values),
-            offsets=self._vector(
-                self.cumulative_query_lengths, attention.queries.offsets
-            ),
-        )
-        prefixes = SequenceLengths(
-            host=attention.prefixes.host,
-            values=self._vector(self.cache_lengths, attention.prefixes.values),
-            offsets=self._vector(
-                self.cumulative_prefix_lengths, attention.prefixes.offsets
-            ),
-        )
-
-        source = attention.block_table.indices
-        if source.shape[1] > self.max_blocks_per_row:
-            raise ValueError("block tables exceed input-buffer capacity")
-
-        table = self.block_tables[:count, : source.shape[1]]
-        table.copy_(source, non_blocking=True)
-        blocks = BlockTable(table, attention.block_table.block_size)
-
-        writes = (
-            None
-            if attention.write_indices is None
-            else self._vector(self.write_indices, attention.write_indices)
-        )
-
-        if isinstance(attention, PagedInput):
-            return PagedInput(
-                queries, prefixes, blocks, writes, attention.causal
-            )
-
-        if not attention.fully_visible_current:
-            raise ValueError(
-                "image staging requires fully visible current sequences"
-            )
-
-        return SegmentedInput(
-            queries,
-            prefixes,
-            blocks,
-            writes,
-            queries.values[:, None].expand(-1, queries.maximum),
-            True,
-        )
-
     def _indexed(self, rows, width, cache, tables, states):
         """Gather resident decode rows on device directly into paged staging."""
         count = len(rows)
@@ -531,29 +505,133 @@ class InputBuffers:
 
         return TextInput(self.input_ids[:count], positions, attention)
 
-    def _positions(self, source, offset, count):
-        if source.ndim == 1:
-            source = source.unsqueeze(0)
-        if (
-            source.ndim != 2
-            or source.shape[0] not in (1, 3)
-            or source.shape[1] != count
+
+class DiffusionBuffers(AttentionBuffers):
+    """Stage spatial attention and solver times without text storage."""
+
+    row_type = DiffusionRow
+
+    def __init__(self, *, image_builder: ImageBuilder, **options):
+        super().__init__(**options)
+        self.image_builder = image_builder
+
+    def _stage(
+        self, rows, *, attention=None, cache=None, tables=None, states=None
+    ):
+        attention = (
+            columns(rows, cache=cache, tables=tables)
+            if attention is None
+            else attention
+        )
+        return self._images(rows, self.stage_attention(attention)), (), None
+
+    def _images(self, rows, attention):
+        """Stage denoising positions and timesteps.
+
+        then bind the image inputs.
+        """
+        if self.image_builder is None:
+            raise ValueError("image denoising requires its bound input builder")
+
+        sizes = tuple(
+            image.Config(row.image_height, row.image_width) for row in rows
+        )
+        lengths = tuple(
+            self.image_builder.sequence_length(size) for size in sizes
+        )
+        if sum(lengths) > self.max_tokens:
+            raise ValueError("image sequences exceed input-buffer capacity")
+
+        positions, offset = [], 0
+        for index, (row, size, length) in enumerate(
+            zip(rows, sizes, lengths, strict=True)
         ):
-            raise ValueError(
-                "positions must have one or three axes over the token span"
-            )
-        self.positions[: source.shape[0], offset : offset + count].copy_(
-            source, non_blocking=True
+            if row.timestep is None or row.positions is None:
+                raise ValueError(
+                    "image denoising requires positions and a timestep"
+                )
+
+            self._positions(row.positions, offset, length)
+            positions.append(self.positions[:, offset : offset + length])
+            self.timesteps[index].copy_(row.timestep.reshape(()))
+            offset += length
+
+        return self.image_builder.bind(
+            samples=tuple(self._device_view(row.latent) for row in rows),
+            sizes=sizes,
+            timesteps=tuple(
+                self.timesteps[index : index + 1] for index in range(len(rows))
+            ),
+            positions=tuple(positions),
+            attention=attention,
+            step_index=0,
         )
 
-    def _vector(self, target, source):
-        if source.numel() > target.numel():
-            raise ValueError("numerical column exceeds input-buffer capacity")
-        result = target[: source.numel()]
-        result.copy_(source.reshape(-1), non_blocking=True)
-        return result
 
-    def _device_view(self, value):
-        if value is None or value.device != self.device:
-            raise ValueError(f"input tensor must already be on {self.device}")
-        return value
+class VisionBuffers(InputBuffers):
+    """Borrow prepared image views; codecs need no token or KV backing."""
+
+    row_type = VisionRow
+
+    def _stage(self, rows, **numerical):
+        return (
+            VisionInput(
+                tuple(self._device_view(row.encode_pixels) for row in rows),
+                tuple(
+                    None
+                    if row.encode_grid is None
+                    else self._device_view(row.encode_grid)
+                    for row in rows
+                ),
+                tuple(row.encode_grid_shape for row in rows),
+            ),
+            (),
+            None,
+        )
+
+
+class DecodeBuffers(InputBuffers):
+    """Borrow image latents together with their requested output extents."""
+
+    row_type = DecodeRow
+
+    def _stage(self, rows, **numerical):
+        return (
+            DecodeInput(
+                tuple(self._device_view(row.latent) for row in rows),
+                tuple(
+                    image.Config(row.image_height, row.image_width)
+                    for row in rows
+                ),
+            ),
+            (),
+            None,
+        )
+
+
+def staging_config(kind, limits: TokenBufferConfig):
+    """Select only the backing consumed by this numerical capability."""
+    if isinstance(kind, ForwardMode):
+        return TokenBuffers, limits
+    if kind is MediaCall.DENOISING:
+        return DiffusionBuffers, DiffusionBufferConfig(
+            limits.max_rows, limits.max_tokens, limits.max_blocks_per_row
+        )
+    if kind in {MediaCall.VISION_ENCODING, MediaCall.LATENT_ENCODING}:
+        return VisionBuffers, RowBufferConfig(limits.max_rows)
+    if kind is MediaCall.IMAGE_DECODING:
+        return DecodeBuffers, RowBufferConfig(limits.max_rows)
+    raise ValueError(f"unsupported staged computation {kind}")
+
+
+def staged_kinds(*, diffusion: bool):
+    """Numerical capabilities served by fixed row staging."""
+    kinds = {
+        *ForwardMode,
+        MediaCall.VISION_ENCODING,
+        MediaCall.LATENT_ENCODING,
+        MediaCall.IMAGE_DECODING,
+    }
+    if diffusion:
+        kinds.add(MediaCall.DENOISING)
+    return frozenset(kinds)

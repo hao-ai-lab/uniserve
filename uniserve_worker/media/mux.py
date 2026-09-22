@@ -27,6 +27,7 @@ from .codec_process import (
     MuxFinalize,
     SessionKey,
     SharedSlice,
+    encoded_video_bytes,
     require_media_codecs,
 )
 
@@ -47,22 +48,11 @@ __all__ = [
 # A framed media unit carries its own length because the product row that holds
 # it is sized for the largest unit a request can produce.
 _LENGTH_BYTES = 8
-# Container structure and the codec's parameter sets cost about a kilobyte and a
-# half regardless of raster, so a row is never smaller than this.
-_CONTAINER_FLOOR = 1 << 16
 
 
 def encoded_unit_bytes(frames: int, height: int, width: int) -> int:
-    """Bytes a framed encoded media unit occupies, including its length.
-
-    The bound is a quarter of the planar raster the encoder consumes, which is
-    about seven times the largest unit measured on real output at the serving
-    encoder's settings. A small unit is dominated by the container and its
-    parameter sets rather than by its raster, so the bound does not fall below
-    the floor those cost. A unit that exceeds the bound fails by name.
-    """
-    raster = int(frames) * int(height) * int(width)
-    return _LENGTH_BYTES + max(raster * 3 // 8, _CONTAINER_FLOOR)
+    """Storage bound for a serving codec unit, including its length prefix."""
+    return _LENGTH_BYTES + encoded_video_bytes(frames, height, width)
 
 
 def frame_encoded_unit(payload: bytes, destination: torch.Tensor) -> None:

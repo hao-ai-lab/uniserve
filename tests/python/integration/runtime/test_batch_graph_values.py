@@ -13,8 +13,8 @@ from uniserve_worker.bootstrap.cache import cache_info
 from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.graph_inputs import BatchGraph, pad_text
 from uniserve_worker.execution.input_buffers import (
-    InputBufferConfig,
-    InputBuffers,
+    TokenBufferConfig,
+    TokenBuffers,
 )
 from uniserve_worker.execution.sampling import TokenSelection
 from uniserve_worker.execution.startup import stage_text
@@ -78,8 +78,15 @@ def test_text_graph_replay_uses_live_lengths_tokens_and_cache_blocks(
     # Captured table views use two columns of wider caller-owned backing.
     # Input borrowing must preserve strides instead of relying on a clone
     # having made those views contiguous.
-    buffers = InputBuffers(
-        config=InputBufferConfig(4, 64, 64, 4, 128), device="cuda:0"
+    buffers = TokenBuffers(
+        config=TokenBufferConfig(
+            max_rows=4,
+            max_tokens=64,
+            max_text_tokens=64,
+            max_blocks_per_row=4,
+            hidden_size=128,
+        ),
+        device="cuda:0",
     )
     stream = torch.cuda.Stream(device="cuda:0")
     stream.wait_stream(torch.cuda.current_stream())
@@ -243,8 +250,15 @@ def test_noncausal_prefill_graph_preserves_live_prefixes_and_sequence_outputs(
     manager = CacheManager(
         cache, info=cache_info(model, worker, num_blocks=8), request_pool_size=4
     )
-    buffers = InputBuffers(
-        config=InputBufferConfig(4, 64, 64, 4, 128), device="cuda:0"
+    buffers = TokenBuffers(
+        config=TokenBufferConfig(
+            max_rows=4,
+            max_tokens=64,
+            max_text_tokens=64,
+            max_blocks_per_row=4,
+            hidden_size=128,
+        ),
+        device="cuda:0",
     )
     stream = torch.cuda.Stream(device="cuda:0")
     stream.wait_stream(torch.cuda.current_stream())
@@ -352,7 +366,7 @@ def test_noncausal_prefill_graph_preserves_live_prefixes_and_sequence_outputs(
 def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
     from uniserve_worker.bootstrap.capacity import input_buffer_config
     from uniserve_worker.execution.model_runner import ModelRunner
-    from uniserve_worker.execution.rows import ForwardRow
+    from uniserve_worker.execution.rows import TokenRow
     from uniserve_worker.execution.sampling import TokenSelection
     from uniserve_worker.protocol.call import (
         Bounds,
@@ -402,7 +416,6 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
             max_tokens=32,
             latent_capacity_units=0,
             decode_context_blocks=2,
-            variants=(),
             max_inflight=1,
         )
         runner.capture(tokenizer=None, latents=None)
@@ -419,7 +432,7 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
                     else sequence[-1:]
                 )
                 rows.append(
-                    ForwardRow(
+                    TokenRow(
                         forward_mode=mode,
                         token_ids=torch.tensor(tokens),
                         positions=torch.arange(prefix, prefix + len(tokens)),
