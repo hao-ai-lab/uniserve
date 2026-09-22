@@ -1,0 +1,144 @@
+[
+  {
+    "id": "flow-0",
+    "ranks": [
+      { "node": "localhost", "device": "cuda:0" },
+      { "node": "localhost", "device": "cuda:1" }
+    ],
+    "components": {
+      "denoiser": {
+        "ranks": [0, 1],
+        "parallel_config": {
+          "sequence_parallel": { "kind": "ulysses", "ulysses_degree": 2 }
+        }
+      },
+      "text_encoder": {
+        "ranks": [0, 1],
+        "parallel_config": { "tensor_parallel_size": 2 }
+      },
+      "video_decoder": {
+        "ranks": [0, 1],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 1
+      },
+      "audio_decoder": {
+        "ranks": [0, 1],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 1
+      }
+    },
+    "queue_depth": 6
+  },
+  {
+    "id": "flow-1",
+    "ranks": [
+      { "node": "localhost", "device": "cuda:2" },
+      { "node": "localhost", "device": "cuda:3" }
+    ],
+    "components": {
+      "denoiser": {
+        "ranks": [0, 1],
+        "parallel_config": {
+          "sequence_parallel": { "kind": "ulysses", "ulysses_degree": 2 }
+        }
+      },
+      "text_encoder": {
+        "ranks": [0, 1],
+        "parallel_config": { "tensor_parallel_size": 2 }
+      },
+      "video_decoder": {
+        "ranks": [0, 1],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 1
+      },
+      "audio_decoder": {
+        "ranks": [0, 1],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 1
+      }
+    },
+    "queue_depth": 6
+  },
+  {
+    "id": "flow-2",
+    "ranks": [
+      { "node": "localhost", "device": "cuda:4" },
+      { "node": "localhost", "device": "cuda:5" }
+    ],
+    "components": {
+      "denoiser": {
+        "ranks": [0, 1],
+        "parallel_config": {
+          "sequence_parallel": { "kind": "ulysses", "ulysses_degree": 2 }
+        }
+      },
+      "text_encoder": {
+        "ranks": [0, 1],
+        "parallel_config": { "tensor_parallel_size": 2 }
+      },
+      "video_decoder": {
+        "ranks": [0, 1],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 1
+      },
+      "audio_decoder": {
+        "ranks": [0, 1],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 1
+      }
+    },
+    "queue_depth": 6
+  },
+  {
+    "id": "flow-3",
+    "ranks": [
+      { "node": "localhost", "device": "cuda:6" },
+      { "node": "localhost", "device": "cuda:7" }
+    ],
+    "components": {
+      "denoiser": {
+        "ranks": [0, 1],
+        "parallel_config": {
+          "sequence_parallel": { "kind": "ulysses", "ulysses_degree": 2 }
+        }
+      },
+      "text_encoder": {
+        "ranks": [0, 1],
+        "parallel_config": { "tensor_parallel_size": 2 }
+      },
+      "video_decoder": {
+        "ranks": [0, 1],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 1
+      },
+      "audio_decoder": {
+        "ranks": [0, 1],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 1
+      }
+    },
+    "queue_depth": 6
+  },
+  {
+    "id": "host",
+    "ranks": [{ "node": "localhost", "device": "cpu" }],
+    "components": {
+      "video_encoder": {
+        "ranks": [0],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 8
+      },
+      "muxer": { "ranks": [0], "parallel_config": {} }
+    },
+    "queue_depth": 24
+  }
+]
