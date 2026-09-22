@@ -17,7 +17,6 @@ from uniserve.model import TextSize
 from uniserve.nn import ColumnParallelLinear
 from uniserve.nn.attention import AttentionParallelConfig, Ulysses
 from uniserve.runtime import CUDAGraph, ExecutionContext, partition_streams
-from uniserve.runtime.execution import close_stream_collectives
 from uniserve.runtime.process_groups import initialize_process_groups
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
@@ -192,55 +191,58 @@ def test_stream_collectives_preserve_values_and_rank_order_under_capture(
 
 @torch.inference_mode()
 def _run_release_after_failure(rank: int, rendezvous: str):
-    """Release a bound communicator on one rank while its peer keeps it.
+    """Abort with an outstanding collective whose peer never enters it."""
+    import os
 
-    Rank 0 stands in for a rank that has failed and is unwinding; rank 1 stands
-    in for a peer that is still serving and will never join a collective
-    retirement.
-    """
     device = torch.device("cuda", rank)
-    with initialize_process_groups(
+    environment = initialize_process_groups(
         rank=rank,
         local_rank=rank,
         world_size=2,
         device=device,
         backend="nccl",
         init_method=rendezvous,
-    ) as environment:
-        mesh = environment.bind(
-            DeviceMesh(ranks=(0, 1), shape=(2,), axes=("tokens",), rank=rank),
-            device=device,
+    )
+    mesh = environment.bind(
+        DeviceMesh(ranks=(0, 1), shape=(2,), axes=("tokens",), rank=rank),
+        device=device,
+    )
+    module = _Collectives(mesh)
+    green = partition_streams(device, (64,))[0]
+    context = ExecutionContext(module, stream=green.stream)
+    context.prepare(TextSize(4, 1))
+    values = torch.arange(8, dtype=torch.float32, device=device).view(2, 4)
+    with context.activate():
+        module(values)
+    green.stream.synchronize()
+    dist.barrier()
+
+    if rank == 0:
+        with context.activate():
+            pending = module.group.all_reduce(
+                values, out=torch.empty_like(values)
+            )
+        finished = torch.cuda.Event()
+        finished.record(green.stream)
+        assert not finished.query(), (
+            "collective unexpectedly completed without its peer"
         )
-        module = _Collectives(mesh)
-        green = partition_streams(device, (64,))[0]
-        try:
-            with ExecutionContext(module, stream=green.stream) as context:
-                context.prepare(TextSize(4, 1))
-                module(
-                    torch.arange(8, dtype=torch.float32, device=device).view(
-                        2, 4
-                    )
-                )
-            green.stream.synchronize()
-
-            # Both ranks hold a bound communicator before either moves on.
-            dist.barrier()
-
-            if rank == 0:
-                started = time.monotonic()
-                close_stream_collectives(green.stream, aborted=True)
-                elapsed = time.monotonic() - started
-                assert elapsed < PEER_HOLD_SECONDS / 3, (
-                    "releasing after a failure waited for a peer that is "
-                    f"still holding its communicator: {elapsed:.1f}s"
-                )
-            else:
-                # Outlive rank 0's release, so that release cannot be
-                # completed by this rank going away.
-                time.sleep(PEER_HOLD_SECONDS)
-                close_stream_collectives(green.stream, aborted=True)
-        finally:
-            green.close()
+        started = time.monotonic()
+        context.close(aborted=True)
+        green.close(aborted=True)
+        environment.close(aborted=True)
+        elapsed = time.monotonic() - started
+        assert elapsed < PEER_HOLD_SECONDS / 3, (
+            f"aborted release waited for its peer: {elapsed:.1f}s"
+        )
+        # The failed process owns the outstanding tensor until OS teardown.
+        assert pending.numel() == values.numel()
+    else:
+        time.sleep(PEER_HOLD_SECONDS)
+        context.close(aborted=True)
+        green.close(aborted=True)
+        environment.close(aborted=True)
+    os._exit(0)
 
 
 def test_release_after_failure_does_not_wait_for_a_serving_peer(

@@ -8,10 +8,10 @@ import torch
 
 from uniserve.nn.attention import PagedInput
 from uniserve_worker.execution.input_buffers import (
-    InputBufferConfig,
-    InputBuffers,
+    TokenBufferConfig,
+    TokenBuffers,
 )
-from uniserve_worker.execution.rows import ForwardRow
+from uniserve_worker.execution.rows import TokenRow
 from uniserve_worker.execution.sampling import TokenSelection
 from uniserve_worker.protocol.call import ForwardMode
 from uniserve_worker.runtime.decode_state import DecodeState
@@ -28,7 +28,7 @@ def test_token_positions_preserve_row_order_across_source_devices(
     # remain ordinary numerical rows, regardless of where their values
     # originate.
     rows = tuple(
-        ForwardRow(
+        TokenRow(
             forward_mode=ForwardMode.PREFILL,
             token_ids=torch.tensor([token], dtype=torch.long, device=device),
             positions=torch.tensor(
@@ -49,8 +49,14 @@ def test_token_positions_preserve_row_order_across_source_devices(
         causal=True,
         device="cpu",
     )
-    buffers = InputBuffers(
-        config=InputBufferConfig(2, 2, 2, 1, 0),
+    buffers = TokenBuffers(
+        config=TokenBufferConfig(
+            max_rows=2,
+            max_tokens=2,
+            max_text_tokens=2,
+            max_blocks_per_row=1,
+            hidden_size=0,
+        ),
         device="cuda:0",
     )
     try:
@@ -83,14 +89,14 @@ def test_mixed_forward_reads_current_continuation_in_row_order(
         continuation_width=1,
         device="cuda:0",
     )
-    prefix = ForwardRow(
+    prefix = TokenRow(
         forward_mode=ForwardMode.PREFILL,
         token_ids=torch.tensor([5, 7]),
         positions=torch.tensor([17, 18]),
         selection=TokenSelection.LAST_LOGITS,
         request_pool_idx=1,
     )
-    continuation = ForwardRow(
+    continuation = TokenRow(
         forward_mode=ForwardMode.DECODE,
         selection=TokenSelection.LAST_LOGITS,
         request_pool_idx=2,
@@ -108,8 +114,15 @@ def test_mixed_forward_reads_current_continuation_in_row_order(
         causal=True,
         device="cpu",
     )
-    buffers = InputBuffers(
-        config=InputBufferConfig(2, 3, 3, 1, 0), device="cuda:0"
+    buffers = TokenBuffers(
+        config=TokenBufferConfig(
+            max_rows=2,
+            max_tokens=3,
+            max_text_tokens=3,
+            max_blocks_per_row=1,
+            hidden_size=0,
+        ),
+        device="cuda:0",
     )
     enabled = torch.ones(1, dtype=torch.bool, device="cuda:0")
     try:
@@ -171,8 +184,15 @@ def test_indexed_decode_stages_live_tokens_cache_addresses_and_finish_controls()
         continuation_width=1,
         device="cuda:0",
     )
-    buffers = InputBuffers(
-        config=InputBufferConfig(2, 2, 2, 2, 0), device="cuda:0"
+    buffers = TokenBuffers(
+        config=TokenBufferConfig(
+            max_rows=2,
+            max_tokens=2,
+            max_text_tokens=2,
+            max_blocks_per_row=2,
+            hidden_size=0,
+        ),
+        device="cuda:0",
     )
     slots = torch.tensor([1, 2], device="cuda:0")
     enabled = torch.ones(2, dtype=torch.bool, device="cuda:0")
@@ -195,7 +215,7 @@ def test_indexed_decode_stages_live_tokens_cache_addresses_and_finish_controls()
                     sampling_position=23 + iteration,
                 )
             rows = tuple(
-                ForwardRow(
+                TokenRow(
                     forward_mode=ForwardMode.DECODE,
                     request_pool_idx=slot,
                     seq_len=lengths[slot - 1],

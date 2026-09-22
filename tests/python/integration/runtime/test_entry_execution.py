@@ -297,7 +297,7 @@ def test_text_encoder_call_publishes_consumable_conditioning(
 
             started = finalized_report(
                 worker,
-                worker.submit(Batch(batch_id=2, commands=run.commands)),
+                worker.submit(Batch(batch_id=0, commands=run.commands)),
             )
             assert not started.completions
             run = replace(run, commands=())
@@ -427,7 +427,9 @@ def test_worker_reports_text_bounds_and_executes_dense_attention_without_kv():
     )
     with execution_worker(
         model,
-        execution=WorkerConfig(max_sequence_tokens=16, graph_policy="off"),
+        execution=WorkerConfig(
+            max_sequence_tokens=16, graph_policy="off", model_dtype="float32"
+        ),
         components=components,
         bindings=_encoder_bindings(model, components),
     ) as worker:

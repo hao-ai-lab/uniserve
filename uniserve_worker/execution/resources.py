@@ -145,7 +145,13 @@ def output_layouts(
         return {}
     if isinstance(component, VideoDecoder):
         builder = media_builder(model, config)
+        if frames is None and builder is None:
+            # A standalone numerical decoder has no serving timeline bound.
+            # Its caller supplies the exact frame range with the invocation.
+            return {}
         count = builder.maximum.num_frames if frames is None else frames
+        if capability(model, VideoPostprocessor) is None:
+            return component.output_layout(count)
         return {"video": decoded_units_layout(model, count)}
 
     builder = media_builder(model, config)

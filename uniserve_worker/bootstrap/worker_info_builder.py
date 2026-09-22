@@ -22,7 +22,11 @@ from uniserve_worker.protocol.call import CALL_KINDS, CallKind
 
 from ..config import graph_memory_budget_bytes, graph_padding_block_count
 from ..execution.component_binding import ComponentBinding
-from ..execution.input_buffers import InputBufferConfig
+from ..execution.input_buffers import (
+    TokenBufferConfig,
+    staged_kinds,
+    staging_config,
+)
 from ..execution.resources import media_state_buffers
 from ..foundation.errors import unsupported_setup
 from ..protocol.transfer import WorkerEndpoint
@@ -45,7 +49,13 @@ from .capacity import (
     request_tensor_window,
     vision_tokens,
 )
-from .components import codec_workers, media_components, supported_calls
+from .components import (
+    call_kinds,
+    codec_workers,
+    describe_components,
+    media_components,
+    supported_calls,
+)
 from .config import ComponentConfig
 from .inputs import capability, image_builder, media_builder
 from .worker_info import ComponentInfo, WorkerInfo
@@ -59,26 +69,13 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class WorkerLayout:
-    """Worker-local model dimensions paired with the public capacity report."""
+    """Resolved worker allocations and their public capacity report."""
 
     info: WorkerInfo
     arena: ArenaCapacity
-    input_config: InputBufferConfig | None
+    input_config: TokenBufferConfig | None
     fixed_device_bytes: tuple[tuple[str, int], ...]
     physical_buffer_pool_bytes: int
-    latent_width: int
-    latent_dtype: str
-    latent_downsample: int
-    max_vae_grid_tokens: int
-    max_vit_grid_tokens: int
-    max_latent_feature_bytes: int
-    max_vision_feature_bytes: int
-    commit_marker_tokens: int
-    gen_rope_advance: int
-    max_cfg_branches: int
-    encoder_cache_entries: int
-    incremental_kv_publication: bool
-    model_dtype: str
 
 
 def _exports_fabric_handles(device: object) -> bool:
@@ -240,6 +237,7 @@ def build_worker_layout(
             completion_payload_bytes=completion_payload_bytes,
             endpoint=endpoint,
             capacity_group=capacity_group,
+            bindings=bindings,
             checkpoint_identity=checkpoint_identity,
         )
 
@@ -270,12 +268,6 @@ def build_worker_layout(
         fabric_handles=_exports_fabric_handles(worker_config.device),
         max_batch_calls=max_calls,
         max_batch_tokens=max_tokens,
-        encoder_cache_entries=layout.encoder_cache_entries,
-        encoder_entry_bytes=max(
-            layout.max_latent_feature_bytes, layout.max_vision_feature_bytes
-        )
-        if layout.encoder_cache_entries
-        else 0,
         components=tuple(
             ComponentInfo(name, entry, outputs.get(name, ()))
             for name, entry in components
@@ -302,6 +294,7 @@ def _token_worker_layout(
     completion_payload_bytes: int,
     endpoint: WorkerEndpoint,
     capacity_group: Communicator | None,
+    bindings: Mapping[str, ComponentBinding] | None,
     checkpoint_identity: str,
 ) -> WorkerLayout:
     """Size token inputs, paged KV, and latent storage before admission."""
@@ -426,13 +419,62 @@ def _token_worker_layout(
 
     if text is not None:
         assert cache is not None and input_config is not None
-        input_bytes = sum(
-            field.nbytes for field in input_config.buffers().values()
-        )
-        for device in devices:
-            fixed_bytes[device] += input_bytes * max(
-                1, len(worker_config.lanes)
-            )
+        from ..config import DEFAULT_PREFILL_GRAPH_ROW_BUCKETS
+        from ..execution.graph_inputs import select_prefill_captures
+        from ..protocol.call import ForwardMode, MediaCall
+
+        staged = staged_kinds(diffusion=flow is not None)
+        for name, calls in describe_components(model).items():
+            placement = None if bindings is None else bindings.get(name)
+            if bindings is not None and (
+                placement is None or not placement.owns
+            ):
+                continue
+            for call in calls:
+                kinds = call_kinds((call,)) & staged
+                target = (
+                    worker_config.generation_device or worker_config.device
+                    if kinds
+                    & {MediaCall.LATENT_ENCODING, MediaCall.IMAGE_DECODING}
+                    else worker_config.device
+                    if placement is None
+                    else str(placement.device)
+                )
+                for lane in worker_config.lanes or (None,):
+                    selected = (
+                        kinds
+                        if lane is None
+                        else kinds.intersection(lane.call_kinds)
+                    )
+                    if not selected:
+                        continue
+                    fields = input_config
+                    if ForwardMode.PREFILL in selected:
+                        captures = select_prefill_captures(
+                            worker_config.prefill_graph_token_sizes,
+                            DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
+                            max_rows=min(
+                                worker_config.max_batch_calls,
+                                worker_config.max_request_pool_size,
+                            ),
+                            max_tokens=input_config.max_tokens,
+                            visual=flow is not None,
+                        )
+                        fields = (
+                            replace(
+                                fields,
+                                max_rows=max(
+                                    fields.max_rows,
+                                    *(shape.row_bucket for shape in captures),
+                                ),
+                            )
+                            if captures
+                            else fields
+                        )
+                    _, allocation = staging_config(next(iter(selected)), fields)
+                    fixed_bytes[target] = fixed_bytes.get(target, 0) + sum(
+                        field.nbytes for field in allocation.buffers().values()
+                    )
 
         schemas = (
             BlockTables.buffers(
@@ -514,6 +556,12 @@ def _token_worker_layout(
         media_components=dict(media_components(model)),
         num_inference_steps=0,
         host_lane_capacity=1,
+        encoder_cache_entries=encoder_cache_entries,
+        encoder_entry_bytes=max(
+            max_latent_feature_bytes, max_vision_feature_bytes
+        )
+        if encoder_cache_entries
+        else 0,
     )
     arena = model_arena_capacity(
         model,
@@ -531,21 +579,6 @@ def _token_worker_layout(
         input_config=input_config,
         fixed_device_bytes=tuple(fixed_bytes.items()),
         physical_buffer_pool_bytes=buffer_pool_bytes,
-        latent_width=latent_width,
-        latent_dtype=worker_config.model_dtype if flow is not None else "",
-        latent_downsample=flow.denoiser.downsample if flow is not None else 1,
-        max_vae_grid_tokens=flow.max_tokens + flow.framing
-        if flow is not None
-        else 0,
-        max_vit_grid_tokens=max_vit_grid_tokens,
-        max_latent_feature_bytes=max_latent_feature_bytes,
-        max_vision_feature_bytes=max_vision_feature_bytes,
-        commit_marker_tokens=0 if flow is None else flow.framing,
-        gen_rope_advance=2 if flow is None else flow.rope_advance,
-        max_cfg_branches=1 if flow is None else 3,
-        encoder_cache_entries=encoder_cache_entries,
-        incremental_kv_publication=owns_kv,
-        model_dtype=worker_config.model_dtype,
     )
 
 
@@ -632,19 +665,6 @@ def _request_tensor_worker_layout(
             bindings=bindings or {},
             media_components=media_components(model),
         ),
-        latent_width=1,
-        latent_dtype="float32",
-        latent_downsample=1,
-        max_vae_grid_tokens=0,
-        max_vit_grid_tokens=0,
-        max_latent_feature_bytes=0,
-        max_vision_feature_bytes=0,
-        commit_marker_tokens=0,
-        gen_rope_advance=1,
-        max_cfg_branches=1,
-        encoder_cache_entries=0,
-        incremental_kv_publication=False,
-        model_dtype="bfloat16",
     )
 
 

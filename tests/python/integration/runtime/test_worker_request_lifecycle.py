@@ -186,7 +186,7 @@ def test_retained_encoder_product_outlives_its_producer_request(
         )
         visual = visual_state_call(
             replacement.request_key,
-            call_id=CallId(1, 0),
+            call_id=CallId(3, 0),
             predecessor=root_parent(replacement),
             feature=product,
             sample_continuation=True,
@@ -210,7 +210,9 @@ def test_retained_encoder_product_outlives_its_producer_request(
             consumed = prepared
         else:
             consumed = finalized_report(consumer, consumer.submit(batch))
-        assert consumed.completions[0].status is CallStatus.OK
+        assert consumed.completions[0].status is CallStatus.OK, (
+            consumed.completions[0]
+        )
         assert consumed.completions[0].kv_visible_len == 2
         assert consumed.completions[0].committed_tokens == (
             expected_successor(1007),
@@ -340,7 +342,7 @@ def test_command_acknowledgement_waits_for_readers_without_delaying_other_result
 def test_cancelled_admission_cannot_publish_over_a_reused_request_slot() -> (
     None
 ):
-    worker = execution_worker()
+    worker = execution_worker(queue_depth=2)
     admission = ar_params(89, block_ids=(0,))
     call = token_call(
         admission.request_key,
@@ -437,11 +439,13 @@ def test_close_rejects_descendants_without_affecting_another_request() -> None:
     close = Finish(
         request_key=closed_admission.request_key,
     )
-    worker.submit(execution_batch(batch_id=3, commands=(close,)))
+    finalized_report(
+        worker, worker.submit(execution_batch(batch_id=3, commands=(close,)))
+    )
 
     closed_decode = token_call(
         closed_admission.request_key,
-        call_id=CallId(2, 0),
+        call_id=CallId(4, 0),
         predecessor=closed_observation.call_id,
         mode=ForwardMode.DECODE,
         tokens=(report.completions[0].committed_tokens[0],),
@@ -460,7 +464,7 @@ def test_close_rejects_descendants_without_affecting_another_request() -> None:
 
     active_decode = token_call(
         active_admission.request_key,
-        call_id=CallId(2, 0),
+        call_id=CallId(5, 0),
         predecessor=active_observation.call_id,
         mode=ForwardMode.DECODE,
         tokens=(report.completions[1].committed_tokens[0],),
@@ -489,7 +493,7 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),
     )
-    worker.submit(
+    retired_batch = worker.submit(
         execution_batch(
             batch_id=1,
             admissions=(retired,),
@@ -497,6 +501,7 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
         )
     )
     worker.drop_request(retired.request_key.request_id)
+    finalized_report(worker, retired_batch)
 
     replacement_template = ar_params(84, block_ids=(1,))
     replacement = NewRequest(
@@ -603,7 +608,7 @@ def test_finish_of_uninstalled_admission_allows_slot_reuse() -> None:
     replacement = ar_params(86, block_ids=(0,))
     call = token_call(
         replacement.request_key,
-        call_id=CallId(1, 0),
+        call_id=CallId(3, 0),
         predecessor=root_parent(replacement),
         mode=ForwardMode.PREFILL,
         tokens=(3, 4),

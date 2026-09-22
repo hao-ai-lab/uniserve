@@ -28,7 +28,7 @@ from uniserve.tensors import BufferConfig
 
 from ..config import WorkerConfig
 from ..execution.component_binding import ComponentBinding
-from ..execution.input_buffers import InputBufferConfig
+from ..execution.input_buffers import TokenBufferConfig
 from ..execution.resources import media_state_buffers
 from ..foundation.errors import unsupported_setup
 from ..protocol.call import MediaCall
@@ -57,7 +57,7 @@ def input_buffer_config(
     config: WorkerConfig,
     *,
     processor: ImageProcessor | None = None,
-) -> InputBufferConfig:
+) -> TokenBufferConfig:
     """Size staging for the admitted text span.
 
     Staging also covers one atomic image or CFG call.
@@ -115,7 +115,7 @@ def input_buffer_config(
             )
         )
 
-    return InputBufferConfig(
+    return TokenBufferConfig(
         max_rows=max_rows * branches,
         # Text and diffusion use separate homogeneous calls on this lane.
         max_tokens=max(text_tokens, flow_tokens),

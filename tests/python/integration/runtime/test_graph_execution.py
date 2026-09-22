@@ -53,20 +53,31 @@ def test_initial_inputs_are_ready_for_consumption_after_preparation(
 
 
 @pytest.mark.parametrize("graphs", [False, True])
-@pytest.mark.parametrize("branch_device", ["cuda:0", "cuda:1"])
+@pytest.mark.parametrize("execution", ["cuda:0", "cuda:1", "green"])
 @torch.inference_mode()
 def test_denoising_reprepared_constants_and_slot_sizes_advance_one_step(
-    graphs, branch_device
+    graphs, execution
 ):
+    from uniserve.runtime import partition_streams
+
     device = torch.device("cuda:0")
+    branch_device = "cuda:0" if execution == "green" else execution
     model = LinearDenoiser().to(device)
     model.projection.to(branch_device)
     schedules = model.make_schedules(2, shift=1.0, device=device)
-    stream = torch.cuda.Stream(device=device) if graphs else None
+    partition = (
+        partition_streams(device, (64,))[0] if execution == "green" else None
+    )
+    stream = (
+        partition.stream
+        if partition is not None
+        else torch.cuda.Stream(device=device)
+    )
     runner = DenoisingRunner(
         model,
         device=device,
         stream=stream,
+        capture=graphs,
         groups=(),
         capacity=2,
         additional_devices=(torch.device(branch_device),)
@@ -115,6 +126,8 @@ def test_denoising_reprepared_constants_and_slot_sizes_advance_one_step(
     finally:
         torch.cuda.current_stream(device).synchronize()
         runner.close()
+        if partition is not None:
+            partition.close()
 
 
 @torch.inference_mode()
