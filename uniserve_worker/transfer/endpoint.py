@@ -36,13 +36,13 @@ def locator_digest(locator: Locator) -> bytes:
     return hashlib.sha256(encoded).digest()
 
 
-def publication_key(locator: Locator) -> bytes:
-    """Return the fixed-width key that identifies a publication."""
+def publication_key(locator: Locator) -> tuple[str, str]:
+    """Identify a publication within its transport's native namespace."""
     handle = locator.transport
     if isinstance(handle, CudaVmmTransfer):
-        return handle.publication_id.encode("ascii")
+        return "cuda_vmm", handle.publication_id
     if isinstance(handle, PosixShmTransfer):
-        return hashlib.sha256(handle.name.encode("utf-8")).digest()
+        return "shm", handle.name
     raise invalid_descriptor("process publication requires a shared transport")
 
 
@@ -91,7 +91,7 @@ class Publications(Generic[Source]):
         self._reclaim = reclaim
         self._drain = drain
         self._settled = settled
-        self._publications: dict[bytes, _Publication[Source]] = {}
+        self._publications: dict[tuple[str, str], _Publication[Source]] = {}
         self._lock = threading.Lock()
         self._closing = False
         self._closed = False

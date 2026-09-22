@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, fields, is_dataclass, replace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -14,18 +14,15 @@ from uniserve.nn.attention import (
     SegmentedInput,
     SequenceLengths,
 )
-from uniserve.runtime import CUDAGraph, ExecutionContext, PrefixCache
+from uniserve.runtime import PrefixCache
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.sampling import greedy
 from uniserve.tensors import adjacent_view
 from uniserve_worker.protocol.call import ForwardMode
 
 from .batch import ExecutionOutput, InputBatch
+from .graphs import Graph
 from .sampling import TOKEN_CONTINUATION_BIT, SamplerOutput, TokenSelection
-
-
-class GraphMiss(RuntimeError):  # noqa: N818  # deliberate taxonomy name
-    """The requested numerical shape is outside the installed graph catalog."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,157 +108,13 @@ def select_prefill_captures(
     return tuple(buckets)
 
 
-def tensor_leaves(value):
-    """Walk immutable numerical records without reading any tensor contents."""
-    if isinstance(value, torch.Tensor):
-        yield value
-    elif is_dataclass(value) and not isinstance(value, type):
-        for field in fields(value):
-            yield from tensor_leaves(getattr(value, field.name))
-    elif isinstance(value, Mapping):
-        for item in value.values():
-            yield from tensor_leaves(item)
-    elif isinstance(value, (tuple, list)):
-        for item in value:
-            yield from tensor_leaves(item)
-
-
-def map_tensors(value, transform):
-    """Apply transform to every tensor leaf, preserving the record structure."""
-    if isinstance(value, torch.Tensor):
-        return transform(value)
-    if is_dataclass(value) and not isinstance(value, type):
-        return replace(
-            value,
-            **{
-                field.name: map_tensors(getattr(value, field.name), transform)
-                for field in fields(value)
-            },
-        )
-    if isinstance(value, Mapping):
-        return {
-            key: map_tensors(item, transform) for key, item in value.items()
-        }
-    if isinstance(value, tuple):
-        return tuple(map_tensors(item, transform) for item in value)
-    if isinstance(value, list):
-        return [map_tensors(item, transform) for item in value]
-    return value
-
-
-def clone_inputs(value):
-    """Own tensor copies while preserving broadcast views and repeated.
-
-    references.
-    """
-    copies = {}
-
-    def clone(tensor):
-        if id(tensor) not in copies:
-            # A visibility column expanded across tokens must stay a broadcast
-            # view, rather than allocating a quadratic mask for each graph.
-            slices = tuple(
-                slice(0, 1) if stride == 0 else slice(None)
-                for stride in tensor.stride()
-            )
-            copy = tensor[slices].clone(memory_format=torch.preserve_format)
-            copies[id(tensor)] = copy.expand(tensor.shape)
-        return copies[id(tensor)]
-
-    return map_tensors(value, clone)
-
-
-def copy_inputs(target, source):
-    """Copy every tensor leaf of source into the matching leaf of target."""
-    _copy_tensors(tuple(tensor_leaves(target)), tuple(tensor_leaves(source)))
-
-
-def _copy_tensors(targets, sources):
-    if len(targets) != len(sources):
-        raise GraphMiss("numerical graph input structure changed")
-    copied = set()
-    for destination, value in zip(targets, sources, strict=True):
-        if (
-            destination.shape != value.shape
-            or destination.dtype != value.dtype
-            or destination.device != value.device
-        ):
-            raise GraphMiss(
-                "numerical graph tensor shape or representation changed"
-            )
-        if (
-            destination.data_ptr() == value.data_ptr()
-            or id(destination) in copied
-        ):
-            continue
-        if 0 in destination.stride():
-            # Broadcast backing has only one writable element along each
-            # expanded dimension; ordinary strided tensors need no slicing.
-            slices = tuple(
-                slice(0, 1) if stride == 0 else slice(None)
-                for stride in destination.stride()
-            )
-            destination[slices].copy_(value[slices])
-        else:
-            destination.copy_(value)
-        copied.add(id(destination))
-
-
-def bind_inputs(static, live):
-    """Bind attention's live metadata to the executable's numerical addresses.
-
-    Attention records contain tensor columns, sequence records, a block table
-    and immutable host scalars/tuples. Host tuples need no element traversal;
-    they are supplied anew even when the captured tensor addresses are reused.
-    """
-    changes = {}
-    for item in fields(live):
-        value = getattr(live, item.name)
-        captured = getattr(static, item.name)
-        if isinstance(value, torch.Tensor):
-            changes[item.name] = captured
-        elif is_dataclass(value):
-            changes[item.name] = bind_inputs(captured, value)
-    return replace(live, **changes)
-
-
-def input_signature(value):
-    """Describe exact static values and tensor layouts.
-
-    excluding tensor contents.
-    """
-    if isinstance(value, torch.Tensor):
-        return (
-            value.device,
-            value.dtype,
-            tuple(value.shape),
-            tuple(value.stride()),
-        )
-    if isinstance(value, (PagedInput, SegmentedInput)):
-        # Prefix lengths are mutable numerical inputs. Native paged providers
-        # launch to table capacity and consume the device lengths on replay.
-        return (
-            type(value),
-            tuple(
-                (field.name, input_signature(getattr(value, field.name)))
-                for field in fields(value)
-                if field.name != "prefixes"
-            ),
-            input_signature(value.prefixes.values),
-            input_signature(value.prefixes.offsets),
-        )
-    if is_dataclass(value) and not isinstance(value, type):
-        return type(value), tuple(
-            (field.name, input_signature(getattr(value, field.name)))
-            for field in fields(value)
-        )
-    if isinstance(value, Mapping):
-        return tuple(
-            (key, input_signature(item)) for key, item in value.items()
-        )
-    if isinstance(value, (tuple, list)):
-        return tuple(input_signature(item) for item in value)
-    return value
+def bind_attention(static, live):
+    """Pair captured addresses with the current host sequence metadata."""
+    return replace(
+        static,
+        queries=replace(static.queries, host=live.queries.host),
+        prefixes=replace(static.prefixes, host=live.prefixes.host),
+    )
 
 
 def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
@@ -301,9 +154,7 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
     shapes = tuple(
         shape
         for shape in prefill_shapes
-        if shape.causal == causal
-        and shape.selection is selection
-        and shape.row_bucket > batch.row_count
+        if shape.row_bucket > batch.row_count
         and shape.token_bucket >= inputs.input_ids.numel()
     )
     if not shapes:
@@ -321,14 +172,14 @@ def _fixed_view(tensor, shape):
     """
     strides = tensor.stride()
     if len(shape) != tensor.ndim or any(value < 0 for value in shape):
-        raise GraphMiss("graph view rank changed")
+        raise ValueError("graph view rank changed")
     last = tensor.storage_offset() + sum(
         (extent - 1) * stride
         for extent, stride in zip(shape, strides)
         if extent
     )
     if last >= tensor.untyped_storage().nbytes() // tensor.element_size():
-        raise GraphMiss("graph bucket exceeds lane input storage")
+        raise ValueError("graph bucket exceeds lane input storage")
     return tensor.as_strided(
         shape, strides, storage_offset=tensor.storage_offset()
     )
@@ -344,11 +195,11 @@ def pad_text(batch, rows, tokens, width, decode):
     inputs, live_rows = batch.inputs, batch.row_count
     attention, live_tokens = inputs.attention, inputs.input_ids.numel()
     if rows < live_rows or tokens < live_tokens:
-        raise GraphMiss("graph shape is smaller than its live inputs")
+        raise ValueError("graph shape is smaller than its live inputs")
 
     padding, extra = tokens - live_tokens, rows - live_rows
     if padding and not extra:
-        raise GraphMiss("token padding requires an additional sequence")
+        raise ValueError("token padding requires an additional sequence")
     if not padding and not extra:
         # The staged lengths and offsets already describe the whole bucket.
         # Only page-table capacity can differ from the captured view.
@@ -444,7 +295,7 @@ def widen_prefix(batch, width):
     if not isinstance(attention, (PagedInput, SegmentedInput)):
         return batch
     if attention.block_table.indices.shape[1] > width:
-        raise GraphMiss("prefix table exceeds its configured graph width")
+        raise ValueError("prefix table exceeds its configured graph width")
     table = _fixed_view(attention.block_table.indices, (batch.row_count, width))
     return replace(
         batch,
@@ -494,98 +345,61 @@ def restore_writes(batch, cache: PrefixCache | None):
     return restore
 
 
-@dataclass
-class BatchGraph:
-    """Retain an executable borrowing caller-bound numerical input storage.
+def capture_batch(
+    context, batch, call, *, pools=None, cache=None, predicates=None
+):
+    """Capture numerical batch output and greedy decoding on common backing."""
+    with context.activate():
+        attention = getattr(batch.inputs, "attention", None)
+        if attention is not None:
+            context.bind_attention(attention)
+        restore = restore_writes(batch, cache)
 
-    The caller serializes staging, replay and input reuse on the execution
-    stream. Separate execution entries require independent mutable backing.
-    Tensor references retain the supplied storage until the graph is drained.
-    """
+    def compute(static):
+        output = call(static)
+        return output, greedy_decode(static, output, predicates)
 
-    graph: CUDAGraph
-    inputs: InputBatch
-    _tensors: tuple[torch.Tensor, ...] = field(init=False, repr=False)
-    _hidden_output: bool = field(init=False, repr=False)
+    return Graph.capture(context, batch, compute, pools=pools, restore=restore)
 
-    def __post_init__(self):
-        # Captured input structure and backing stay fixed for the graph's
-        # lifetime. Only live tensors and attention metadata change on replay.
-        self._tensors = tuple(tensor_leaves(self.inputs))
-        self._hidden_output = isinstance(self.inputs.inputs, TextInput) and all(
-            selection is TokenSelection.HIDDEN
-            for selection in self.inputs.token_selections
-        )
 
-    @classmethod
-    def capture(
-        cls,
-        context: ExecutionContext,
-        batch: InputBatch,
-        call,
-        *,
-        pools=None,
-        cache=None,
-        predicates=None,
-    ):
-        with context.activate():
-            static = batch
-            attention = getattr(static.inputs, "attention", None)
-            if attention is not None:
-                context.bind_attention(attention)
-            restore = restore_writes(static, cache)
-
-            def compute():
-                output = call(static)
-                return output, greedy_decode(static, output, predicates)
-
-            try:
-                compute()
-            finally:
-                restore()
-        graph = CUDAGraph(context=context, pools=pools)
-        try:
-            graph.capture(compute, restore=restore)
-        except BaseException:
-            graph.close()
-            raise
-        return cls(graph, static)
-
-    def replay(self, batch, *, rows=None, borrow=False):
-        context = self.graph.context
-        with context.activate():
-            _copy_tensors(self._tensors, tuple(tensor_leaves(batch)))
-            attention = getattr(batch.inputs, "attention", None)
-            if attention is not None:
-                context.bind_attention(
-                    bind_inputs(self.inputs.inputs.attention, attention)
-                )
-
-            output, greedy = self.graph.replay()
-            count = batch.row_count if rows is None else rows
-            values = output.values
-            if self._hidden_output:
-                # Capture fixes tensor addresses, not the live sequence cuts.
-                # Uniform hidden results share one contiguous,
-                # pipeline-published tensor; split its views again using this
-                # invocation's lengths.
-                view = adjacent_view(values)
-                if view is None:
-                    raise GraphMiss(
-                        "hidden graph results must share contiguous output "
-                        "storage"
-                    )
-                values = view.reshape(-1, values[0].shape[-1]).split(
-                    attention.queries.host
-                )
-            result = replace(
-                output,
-                values=values[:count],
-                vocabularies=output.vocabularies[:count],
-                layouts=output.layouts[:count],
-                greedy=trim_greedy(greedy, count),
+def replay_batch(graph: Graph, batch, *, rows=None, borrow=False):
+    """Replay staged inputs and retain the live output rows."""
+    context = graph.executable.context
+    with context.activate():
+        graph.inputs.copy(batch)
+        attention = getattr(batch.inputs, "attention", None)
+        if attention is not None:
+            context.bind_attention(
+                bind_attention(graph.inputs.value.inputs.attention, attention)
             )
-            return result if borrow else result.clone()
+
+        output, greedy = graph.executable.replay()
+        count = batch.row_count if rows is None else rows
+        values = output.values
+        if isinstance(batch.inputs, TextInput) and all(
+            selection is TokenSelection.HIDDEN
+            for selection in batch.token_selections
+        ):
+            # Capture fixes tensor addresses, not the live sequence cuts.
+            # Uniform hidden results share one contiguous,
+            # pipeline-published tensor; split its views again using this
+            # invocation's lengths.
+            view = adjacent_view(values)
+            if view is None:
+                raise ValueError(
+                    "hidden graph results must share contiguous output storage"
+                )
+            values = view.reshape(-1, values[0].shape[-1]).split(
+                attention.queries.host
+            )
+        result = replace(
+            output,
+            values=values[:count],
+            vocabularies=output.vocabularies[:count],
+            layouts=output.layouts[:count],
+            greedy=trim_greedy(greedy, count),
+        )
+        return result if borrow else result.clone()
 
 
 def greedy_decode(
@@ -615,7 +429,7 @@ def greedy_decode(
     rows = tuple(value.reshape(-1) for value in output.values)
     logits = adjacent_view(rows)
     if logits is None:
-        raise GraphMiss("decode logits are not one contiguous graph output")
+        raise ValueError("decode logits are not one contiguous graph output")
     logits = logits.reshape(batch.row_count, -1)
     partitions = output.vocabularies
     if any(partition != partitions[0] for partition in partitions):

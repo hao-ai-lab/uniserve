@@ -51,7 +51,6 @@ if TYPE_CHECKING:
 
 def prepare_forward(
     call: Call,
-    completion_group: int,
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -63,9 +62,7 @@ def prepare_forward(
 
     or verification work into model-forward rows.
     """
-    request = state.pending_output(
-        completion_group, call.request_key.request_id
-    )
+    request = state.pending_output(call.request_key.request_id)
     if request.request.sampling is None:
         raise invalid_descriptor("sequence call has no admitted sampling state")
 
@@ -75,7 +72,6 @@ def prepare_forward(
     ):
         return _prepare_visual(
             call,
-            completion_group,
             request,
             tensor_store=tensor_store,
             request_tables=request_tables,
@@ -165,7 +161,6 @@ def prepare_forward(
 
 def prepare_sampling(
     call: Call,
-    completion_group: int,
     task: TokenRow,
     output: torch.Tensor,
     *,
@@ -180,16 +175,13 @@ def prepare_sampling(
 
     or direct outcomes.
     """
-    request = state.pending_output(
-        completion_group, call.request_key.request_id
-    )
+    request = state.pending_output(call.request_key.request_id)
     start = int(calls.require_progress(request).logical_position)
     mode = call.kind
 
     if call.vision_input is not None or call.latent_feature_input is not None:
         return _prepare_visual_sampling(
             call,
-            completion_group,
             task,
             output,
             request_pool_index=request_pool_index,
@@ -212,7 +204,6 @@ def prepare_sampling(
         if call.token_output is None:
             return token_outcome(
                 call,
-                completion_group,
                 tokens=0,
                 committed_tokens=(),
                 request_tables=request_tables,
@@ -223,7 +214,6 @@ def prepare_sampling(
             call,
             logits[-1],
             request,
-            completion_group,
             positions=(start + count,),
             request_pool_index=request_pool_index,
             decode_state=decode_state,
@@ -242,7 +232,6 @@ def prepare_sampling(
             call,
             logits[-1],
             request,
-            completion_group,
             positions=(start + 1,),
             request_pool_index=request_pool_index,
             decode_state=decode_state,
@@ -258,7 +247,6 @@ def prepare_sampling(
             call,
             logits,
             request,
-            completion_group,
             positions=tuple(range(start + 1, start + len(draft) + 2)),
             draft_token_ids=draft,
             request_pool_index=request_pool_index,
@@ -270,7 +258,6 @@ def prepare_sampling(
 
 def publish_sample(
     call: Call,
-    completion_group: int,
     task: TokenRow,
     logits: torch.Tensor,
     sample_work: SamplingMetadata | None,
@@ -285,9 +272,7 @@ def publish_sample(
 
     and request runtime transitions.
     """
-    request = state.pending_output(
-        completion_group, call.request_key.request_id
-    )
+    request = state.pending_output(call.request_key.request_id)
     start = int(calls.require_progress(request).logical_position)
     mode = call.kind
     if sample_work is None and mode is not ForwardMode.DECODE:
@@ -315,7 +300,6 @@ def publish_sample(
         )
         return _finish_visual(
             call,
-            completion_group,
             image_builder=image_builder,
             request_tables=request_tables,
             state=state,
@@ -333,7 +317,6 @@ def publish_sample(
                     start,
                     cast(torch.Tensor, task.token_ids),
                     logits,
-                    completion_group,
                     decode_state=decode_state,
                     state=state,
                 )
@@ -353,7 +336,6 @@ def publish_sample(
         )
         return token_outcome(
             call,
-            completion_group,
             request=request,
             task=task if mode is ForwardMode.DECODE else None,
             tokens=count,
@@ -399,7 +381,6 @@ def publish_sample(
         request.initialized_kv = initialized
         return token_outcome(
             call,
-            completion_group,
             tokens=0,
             request_tables=request_tables,
             state=state,
@@ -408,7 +389,6 @@ def publish_sample(
 
 def _prepare_visual(
     call: Call,
-    completion_group: int,
     request: PendingOutput,
     *,
     state: BatchState,
@@ -449,7 +429,6 @@ def _prepare_visual(
             metadata.height,
             metadata.width,
             position,
-            completion_group,
             close_image=close_image,
             logits=sample_token,
             request_tables=request_tables,
@@ -463,7 +442,6 @@ def _prepare_visual(
             metadata.height,
             metadata.width,
             position,
-            completion_group,
             request_tables=request_tables,
             model_runner=model_runner,
             state=state,
@@ -478,7 +456,6 @@ def _prepare_visual(
 
 def _prepare_visual_sampling(
     call: Call,
-    completion_group: int,
     task: TokenRow,
     output: torch.Tensor,
     *,
@@ -492,9 +469,7 @@ def _prepare_visual_sampling(
 
     reference.
     """
-    request = state.pending_output(
-        completion_group, call.request_key.request_id
-    )
+    request = state.pending_output(call.request_key.request_id)
 
     value = output if call.vision_input is not None else None
     commit_kv(
@@ -512,7 +487,6 @@ def _prepare_visual_sampling(
             call,
             value[-1],
             request,
-            completion_group,
             positions=(
                 int(calls.require_progress(request).logical_position)
                 + max(
@@ -526,7 +500,6 @@ def _prepare_visual_sampling(
         return sample
     return _finish_visual(
         call,
-        completion_group,
         image_builder=image_builder,
         request_tables=request_tables,
         state=state,
@@ -535,7 +508,6 @@ def _prepare_visual_sampling(
 
 def _finish_visual(
     call: Call,
-    completion_group: int,
     *,
     state: BatchState,
     image_builder: ImageBuilder | None,
@@ -545,9 +517,7 @@ def _finish_visual(
 
     state.
     """
-    request = state.pending_output(
-        completion_group, call.request_key.request_id
-    )
+    request = state.pending_output(call.request_key.request_id)
     position = int(calls.require_progress(request).logical_position)
     if call.completion_output is not None:
         flow = image_builder
@@ -561,7 +531,7 @@ def _finish_visual(
             calls.require_progress(request), logical_position=position + 1
         )
     return encode.state_outcome(
-        call, completion_group, request_tables=request_tables, state=state
+        call, request_tables=request_tables, state=state
     )
 
 
@@ -682,7 +652,6 @@ def prompt_logprob_details(
     start: int,
     tokens: torch.Tensor,
     logits: torch.Tensor,
-    completion_group: int,
     *,
     state: BatchState,
     decode_state: DecodeState | None,
@@ -747,13 +716,12 @@ def prompt_logprob_details(
         targets,
         (prompt_parameters,) * int(targets.numel()),
     )
-    captured = capture_logprobs(details, state.group_buffers[completion_group])
+    captured = capture_logprobs(details, state.output_buffer)
     return tuple(captured[index] for index in range(int(targets.numel())))
 
 
 def token_outcome(
     call: Call,
-    completion_group: int,
     *,
     state: BatchState,
     request: PendingOutput | None = None,
@@ -769,9 +737,7 @@ def token_outcome(
     completion.
     """
     if request is None:
-        request = state.pending_output(
-            completion_group, call.request_key.request_id
-        )
+        request = state.pending_output(call.request_key.request_id)
 
     cache = calls.cache_coordinates(request, tables=request_tables)
     initialized = cache[2]
@@ -969,10 +935,7 @@ def publish_runtime_sample(
     decode_increment: bool = False,
     decode_state: DecodeState | None,
 ) -> None:
-    """Bind one call's selection for the group's later device state.
-
-    update.
-    """
+    """Bind one call's selection for the batch's device state update."""
     if decode_state is None:
         return
     request.sampled = sample
@@ -985,7 +948,6 @@ def publish_runtime_sample(
 def publish_token_products(
     calls: tuple[Call, ...],
     samples: tuple[SamplerRow, ...],
-    completion_group: int,
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -1002,9 +964,7 @@ def publish_token_products(
         writes: list[TensorRecord] = []
         selected: list[SamplerRow] = []
         for call, sample in zip(calls, samples, strict=True):
-            request = state.pending_output(
-                completion_group, call.request_key.request_id
-            )
+            request = state.pending_output(call.request_key.request_id)
             write = (
                 request.transition_write if transitions else request.token_write
             )
@@ -1034,7 +994,6 @@ def build_sampling_metadata(
     call: Call,
     logits: torch.Tensor,
     request: PendingOutput,
-    completion_group: int,
     *,
     state: BatchState,
     positions: tuple[int, ...],

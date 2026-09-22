@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from functools import partial
-from itertools import combinations
 from types import MappingProxyType, TracebackType
 from typing import Any, Self
 
@@ -58,13 +57,19 @@ class ProcessGroups:
         )
 
     def bind(
-        self, mesh: DeviceMesh, *, device: torch.device | str
+        self,
+        mesh: DeviceMesh,
+        *,
+        device: torch.device | str,
+        axes: Iterable[tuple[str, ...]] | None = None,
     ) -> DeviceMesh:
         """Bind topology fibers in the same order on every process.
 
         Nonmembers participate in group creation and retain only the topology.
         Equivalent fibers of this binding share one backend handle; each mesh
         binding owns its own ordering domain for independent model components.
+        ``axes`` names the required fibers. By default only individual axes
+        are bound; models supply their numerical communication requirements.
         """
         if mesh.rank != self.rank or any(
             rank >= self.world_size for rank in mesh.ranks
@@ -74,35 +79,37 @@ class ProcessGroups:
         device = torch.device(device)
         handles = {}
         groups = {}
-        for width in range(len(mesh.axes) + 1):
-            for axes in combinations(mesh.axes, width):
-                for members in mesh.members(axes):
-                    ordered = tuple(sorted(members))
-                    if len(members) > 1 and ordered not in handles:
-                        if not dist.is_initialized():
-                            raise RuntimeError(
-                                "multi-rank mesh binding requires an "
-                                "initialized process world"
-                            )
-                        handle = dist.new_group(
-                            ranks=list(ordered),
-                            backend=self.backend,
-                            pg_options=_group_options(self.backend),
-                            device_id=device
-                            if self.backend == "nccl"
-                            else None,
+        selections = (
+            tuple((axis,) for axis in mesh.axes)
+            if axes is None
+            else tuple(axes)
+        )
+        for selection in sorted(set(selections)):
+            for members in mesh.members(selection):
+                ordered = tuple(sorted(members))
+                if len(members) > 1 and ordered not in handles:
+                    if not dist.is_initialized():
+                        raise RuntimeError(
+                            "multi-rank mesh binding requires an "
+                            "initialized process world"
                         )
-                        handles[ordered] = handle
-                        if self.rank in members:
-                            self._groups.append(handle)
+                    handle = dist.new_group(
+                        ranks=list(ordered),
+                        backend=self.backend,
+                        pg_options=_group_options(self.backend),
+                        device_id=device if self.backend == "nccl" else None,
+                    )
+                    handles[ordered] = handle
                     if self.rank in members:
-                        groups[axes] = Communicator(
-                            members,
-                            members.index(self.rank),
-                            ".".join(axes) or "local",
-                            device,
-                            handles.get(ordered),
-                        )
+                        self._groups.append(handle)
+                if self.rank in members:
+                    groups[selection] = Communicator(
+                        members,
+                        members.index(self.rank),
+                        ".".join(selection) or "local",
+                        device,
+                        handles.get(ordered),
+                    )
 
         result = DeviceMesh(
             ranks=mesh.ranks, shape=mesh.shape, axes=mesh.axes, rank=mesh.rank

@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from functools import lru_cache
-from typing import TypeAlias, cast
+from typing import TypeAlias
 
 from ..foundation.errors import invalid_descriptor
 from . import identity
@@ -249,9 +247,6 @@ class TensorRef:
         cls, value: object, where: str = "tensor_ref"
     ) -> TensorRef:
         """Parse and validate a typed logical product and its storage bounds."""
-        reference = _fast_tensor_ref(value)
-        if reference is not None:
-            return reference
         data = _map(value, where)
         return cls(
             request_key=identity.RequestKey.from_mapping(
@@ -280,130 +275,3 @@ class TensorRef:
             "dtype": self.dtype.value,
             "shape_bound": self.shape_bound.to_mapping(),
         }
-
-
-@lru_cache(maxsize=1024)
-def _interned_shape_bound(
-    encoded_dims: tuple[tuple[bool, int], ...],
-) -> ShapeBound:
-    """Reuse an immutable shape bound for an already encoded dimension tuple."""
-    # Dimensions arrive pre-validated by _fast_shape_bound, so construction
-    # bypasses __post_init__ to keep interning a pure allocation.
-    shape = object.__new__(ShapeBound)
-    object.__setattr__(
-        shape,
-        "dims",
-        tuple(
-            DeviceDim(extent) if device_actual else StaticDim(extent)
-            for device_actual, extent in encoded_dims
-        ),
-    )
-    return shape
-
-
-def _fast_shape_bound(value: object) -> ShapeBound | None:
-    """Decode a trusted compact shape-bound mapping.
-
-    Bypasses generic schema dispatch.
-    """
-    if type(value) is not dict:
-        return None
-    raw_dims = value.get("dims", ())
-    kind = type(raw_dims)
-    if kind is not list and kind is not tuple:
-        return None
-
-    # Each dim is encoded as (is_device_dim, extent) for the interning
-    # cache key.
-    dims: list[tuple[bool, int]] = []
-    device_dims = 0
-    for item in raw_dims:
-        if type(item) is not dict:
-            return None
-        tag = item.get("kind")
-        payload = item.get("value")
-        if tag == "static" and type(tag) is str:
-            if not (type(payload) is int and payload >= 0):
-                return None
-            dims.append((False, payload))
-        elif tag == "device" and type(tag) is str:
-            if type(payload) is not dict:
-                return None
-            bound = payload.get("max")
-            if not (type(bound) is int and bound >= 0):
-                return None
-            dims.append((True, bound))
-            device_dims += 1
-        else:
-            return None
-
-    if device_dims > 1:
-        # Delegate the invalid shape to the validating decoder.
-        return None
-    return _interned_shape_bound(tuple(dims))
-
-
-def _fast_tensor_ref(value: object) -> TensorRef | None:
-    """Decode a trusted compact product reference.
-
-    Also decodes its optional tensor bound.
-    """
-    if type(value) is not dict:
-        return None
-
-    request_key = identity._fast_request_key(value.get("request_key"))
-    if request_key is None:
-        return None
-
-    producer_call_id = value.get("producer_call_id")
-    output_index = value.get("output_index")
-    generation = value.get("generation")
-    if not (
-        isinstance(producer_call_id, identity.CallId)
-        and type(output_index) is int
-        and output_index >= 0
-        and type(generation) is int
-        and generation > 0
-    ):
-        return None
-
-    raw_dtype = value.get("dtype")
-    if type(raw_dtype) is not str:
-        return None
-    dtype = _DTYPE_BY_VALUE.get(raw_dtype)
-    if dtype is None:
-        return None
-
-    shape_bound = _fast_shape_bound(value.get("shape_bound"))
-    if shape_bound is None:
-        return None
-
-    # Every field validated above, so construction skips __post_init__.
-    reference = object.__new__(TensorRef)
-    set_field = object.__setattr__
-    set_field(reference, "request_key", request_key)
-    set_field(reference, "producer_call_id", producer_call_id)
-    set_field(reference, "output_index", output_index)
-    set_field(reference, "generation", generation)
-    set_field(reference, "dtype", dtype)
-    set_field(reference, "shape_bound", shape_bound)
-    set_field(reference, "_buffer_id", None)
-    return reference
-
-
-def _fast_tensor_refs(value: object) -> tuple[TensorRef, ...] | None:
-    """Decode a trusted sequence of compact product references."""
-    kind = type(value)
-    if kind is not list and kind is not tuple:
-        return None
-    items = cast(list[object] | tuple[object, ...], value)
-    references: list[TensorRef] = []
-    for item in items:
-        reference = _fast_tensor_ref(item)
-        if reference is None:
-            return None
-        references.append(reference)
-    return tuple(references)
-
-
-_DTYPE_BY_VALUE: Mapping[str, DType] = DType._value2member_map_  # type: ignore[assignment]

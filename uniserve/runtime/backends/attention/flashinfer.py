@@ -736,6 +736,8 @@ class _FlashInfer(_Operator):
 
 
 class Backend(_Backend):
+    name = "flashinfer"
+
     operator_class = _FlashInfer
 
     def __init__(self, config: Config = Config()):

@@ -14,6 +14,7 @@ from threading import RLock
 
 import torch
 
+from uniserve.cache import block_spans
 from uniserve.quantization import QuantizedTensor
 from uniserve.runtime import PrefixCache
 from uniserve_worker.bootstrap.worker_info import KVCacheInfo
@@ -23,7 +24,7 @@ from ..protocol.identity import BufferId, CallId, RequestKey
 from ..protocol.transfer import KvTransfer, Locator, TensorTransfer
 from ..transfer.exports import ExportLocations, release_exports
 from ..transfer.tickets import Transport, publish_tensor
-from .block_tables import BlockTables, page_spans
+from .block_tables import BlockTables
 from .cache_imports import CacheImport, CacheImports
 
 __all__ = ["CacheManager"]
@@ -181,7 +182,7 @@ class CacheManager:
             return
         pages = self.validate_pages(page_ids, group=group)
         ranges = tuple(
-            page_spans(pages, 0, length, page_size=self.info.block_size)
+            block_spans(pages, 0, length, block_size=self.info.block_size)
         )
 
         with self._execution_lock:
@@ -245,8 +246,8 @@ class CacheManager:
         self.require_writable(page_ids, group=group, start=start, length=length)
         if self._execution_dependencies(
             tuple(
-                page_spans(
-                    page_ids, start, length, page_size=self.info.block_size
+                block_spans(
+                    page_ids, start, length, block_size=self.info.block_size
                 )
             )
         ):
@@ -273,8 +274,8 @@ class CacheManager:
         pages = self.validate_pages(page_ids, group=group)
         ranges = {
             page: (offset, count)
-            for page, offset, count in page_spans(
-                pages, start, length, page_size=self.info.block_size
+            for page, offset, count in block_spans(
+                pages, start, length, block_size=self.info.block_size
             )
         }
         if not ranges or buffer in self._sources:
@@ -368,7 +369,7 @@ class CacheManager:
         self._reap_sources()
         pages = self.validate_pages(page_ids, group=group)
         ranges = tuple(
-            page_spans(pages, start, length, page_size=self.info.block_size)
+            block_spans(pages, start, length, block_size=self.info.block_size)
         )
         return (
             self._execution_dependencies(ranges)
@@ -397,7 +398,7 @@ class CacheManager:
         self._reap_sources()
         pages = self.validate_pages(page_ids, group=group)
         ranges = tuple(
-            page_spans(pages, start, length, page_size=self.info.block_size)
+            block_spans(pages, start, length, block_size=self.info.block_size)
         )
         if any(
             self._ranges_overlap(source.ranges, ranges)
@@ -574,48 +575,6 @@ class CacheManager:
         for name in self.layers:
             self.cache.zero_blocks(name, pages)
 
-    def initialize_import(self, write: CacheImport) -> None:
-        """Initialize the new pages covered by this active import.
-
-        reservation.
-        """
-        if not self.imports.owns(write):
-            raise invalid_descriptor(
-                "KV initialization has no destination reservation"
-            )
-        if write.initialized_pages:
-            for name in self.layers:
-                self.cache.zero_blocks(name, write.initialized_pages)
-
-    def mark_import_scales(self, write: CacheImport) -> None:
-        """Commit copied scale initialization for a still-owned import.
-
-        destination.
-        """
-        if not self.imports.owns(write):
-            raise invalid_descriptor(
-                "KV scale import has no destination reservation"
-            )
-        publication = write.publication
-        pages = tuple(
-            page
-            for page, _, _ in page_spans(
-                write.pages,
-                publication.base_extent,
-                publication.published_extent - publication.base_extent,
-                self.info.block_size,
-            )
-        )
-        for name in self.layers:
-            self.cache.mark_initialized(name, pages, fields=("key", "value"))
-
-    def destination_base(
-        self, request_key: RequestKey, destination: str
-    ) -> BufferId | None:
-        """Resolve the newest publication sent to one destination."""
-        value = self._destination_bases.get((request_key, str(destination)))
-        return None if value is None else value[0]
-
     def publish(
         self,
         *,
@@ -623,7 +582,6 @@ class CacheManager:
         group_id: int,
         visible_length: int,
         destination: str,
-        expected_base: BufferId | None,
         buffer: BufferId,
         transports: Mapping[str, Transport],
         consumers: Sequence[int] = (),
@@ -633,18 +591,7 @@ class CacheManager:
         `consumers` are the acknowledgment slots of the ranks that install it.
         """
         installed = self._destination_bases.get((buffer.owner, destination))
-        if installed is None:
-            if expected_base is not None:
-                raise invalid_descriptor(
-                    "KV publication expected base is not installed"
-                )
-            base_extent = 0
-        else:
-            installed_buffer, base_extent = installed
-            if installed_buffer != expected_base:
-                raise invalid_descriptor(
-                    "KV publication expected base does not match destination"
-                )
+        base, base_extent = (None, 0) if installed is None else installed
 
         pages = self.block_tables.pages(request_pool_idx, group_id)
         visible = int(visible_length)
@@ -671,7 +618,7 @@ class CacheManager:
         try:
             if suffix:
                 assert source is not None
-                spans = page_spans(
+                spans = block_spans(
                     pages, base_extent, suffix, self.info.block_size
                 )
                 fields = ("key", "value")
@@ -778,7 +725,7 @@ class CacheManager:
             tensors=tuple(tensors),
             source=buffer,
             destination=destination,
-            base=expected_base,
+            base=base,
             base_extent=base_extent,
             published_extent=visible,
             group_id=int(group_id),
@@ -836,19 +783,13 @@ class CacheManager:
         self.block_tables.pages(request_pool_idx, group_id)
         return publication
 
-    def _validate_install(
-        self, source: BufferId, publication: KvTransfer, *, group_id: int
-    ) -> None:
+    def _validate_install(self, publication: KvTransfer) -> None:
         """Check semantic lineage and the raw representation before destination.
 
         access.
         """
-        if source != publication.source:
-            raise invalid_descriptor(
-                "KV installation source identity is invalid"
-            )
         installed = self._installed_bases.get(
-            (source.owner, publication.destination)
+            (publication.source.owner, publication.destination)
         )
         if publication.base is None:
             if installed is not None or publication.base_extent != 0:
@@ -856,10 +797,6 @@ class CacheManager:
         elif installed != (publication.base, publication.base_extent):
             raise invalid_descriptor(
                 "KV installation base does not match destination"
-            )
-        if int(group_id) != publication.group_id:
-            raise invalid_descriptor(
-                "KV installation group disagrees with publication"
             )
         if publication.tensors:
             suffix = publication.published_extent - publication.base_extent
@@ -876,18 +813,17 @@ class CacheManager:
 
     def prepare_install(
         self,
-        source: BufferId,
         publication: KvTransfer,
         *,
         request_pool_idx: int,
-        group_id: int,
         page_ids: tuple[int, ...],
         allocated_length: int,
         initialized_pages: tuple[int, ...],
         transports: Mapping[str, Transport],
     ) -> CacheImport:
         """Reserve scheduler pages and start their bounded physical import."""
-        self._validate_install(source, publication, group_id=group_id)
+        self._validate_install(publication)
+        group_id = publication.group_id
         pages = self.validate_pages(page_ids, group=group_id)
         initialized = self.validate_pages(initialized_pages, group=group_id)
         if (
@@ -916,10 +852,8 @@ class CacheManager:
                 )
 
         return self.imports.reserve(
-            source,
             publication,
             request_pool_idx=request_pool_idx,
-            group=group_id,
             pages=pages,
             initialized_pages=initialized,
             transports=transports,
@@ -928,10 +862,6 @@ class CacheManager:
     def install(
         self,
         *,
-        request_pool_idx: int,
-        group_id: int,
-        request_key: RequestKey,
-        source: BufferId,
         installed_buffer: BufferId,
         write: CacheImport,
     ) -> KvTransfer:
@@ -940,16 +870,14 @@ class CacheManager:
         version.
         """
         publication = write.publication
-        if (
-            installed_buffer.owner != source.owner
-            or source.owner != request_key
-            or write.buffer != source
-            or write.request_pool_idx != request_pool_idx
-            or write.group_id != group_id
-        ):
+        if installed_buffer.owner != publication.source.owner:
             raise invalid_descriptor("installed KV buffer identity is invalid")
 
-        self._validate_install(source, publication, group_id=group_id)
+        self._validate_install(publication)
+        request_pool_idx, group_id = (
+            write.request_pool_idx,
+            publication.group_id,
+        )
         if (
             self.block_tables.pages(request_pool_idx, group_id) != write.pages
             or self.block_tables.allocated_length(request_pool_idx)
@@ -1047,17 +975,16 @@ class CacheManager:
                 publication.published_extent,
             )
 
-    def commit_publications(
+    def apply_publications(
         self,
         publications: Sequence[tuple[BufferId, KvTransfer]],
         installations: Sequence[tuple[BufferId, BufferId, KvTransfer]],
     ) -> None:
-        """Publish validated KV versions by updating only affected directory.
+        """Apply a preflighted update without repeating fallible validation.
 
-        entries.
+        The caller must call validate_publications before committing any owner
+        and must not mutate this directory between preflight and application.
         """
-        self.validate_publications(publications, installations)
-
         for buffer, publication in publications:
             self._publications[buffer] = publication
             self._destination_bases[(buffer.owner, publication.destination)] = (

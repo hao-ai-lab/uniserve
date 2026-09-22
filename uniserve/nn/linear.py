@@ -205,6 +205,7 @@ class ColumnParallelLinear(Linear):
         dtype: torch.dtype | None = None,
     ):
         self.group = Communicator() if group is None else group
+        self.communication_groups = (self.group,)
         if out_features % self.group.size:
             raise ValueError(
                 "column output channels must divide the tensor-parallel group"
@@ -260,6 +261,7 @@ class RowParallelLinear(Linear):
         dtype: torch.dtype | None = None,
     ):
         self.group = Communicator() if group is None else group
+        self.communication_groups = (self.group,)
         if in_features % self.group.size:
             raise ValueError(
                 "row input channels must divide the tensor-parallel group"
@@ -580,6 +582,7 @@ class VocabParallelEmbedding(nn.Module):
         self.embedding_dim = embedding_dim
         self.padding_idx = padding_idx
         self.group = Communicator() if group is None else group
+        self.communication_groups = (self.group,)
         self.vocab = _vocabulary(num_embeddings, self.group)
         width = self.vocab.local_slice.stop - self.vocab.local_slice.start
         self.weight = nn.Parameter(

@@ -2,7 +2,6 @@
 
 use crate::executor::{CallResult, WorkerResult};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
-use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -11,7 +10,6 @@ use super::registration::RankRegistry;
 use super::{BatchSubmitError, PendingRank, RankProcess};
 use crate::executor::{WorkerExecError, WorkerFailure};
 use anyhow::Context;
-use sha2::{Digest as _, Sha256};
 use uniserve_worker_ipc::{Batch, BatchCommand, RequestKey, WorkerInfo};
 
 use crate::worker::WorkerProcessArgs;
@@ -233,27 +231,6 @@ fn call_identity(
     )
 }
 
-/// Combine rank-local resolved identities into one ordered process-world identity.
-fn process_world_configuration_id(workers: &[RankProcess]) -> String {
-    if workers.len() == 1 {
-        return workers[0].info().configuration_id.clone();
-    }
-
-    let mut digest = Sha256::new();
-    digest.update(b"uniserve-process-world-configuration-v1\0");
-    for worker in workers {
-        let info = worker.info();
-        digest.update(info.endpoint.rank.to_le_bytes());
-        digest.update((info.configuration_id.len() as u64).to_le_bytes());
-        digest.update(info.configuration_id.as_bytes());
-    }
-    let mut identity = String::with_capacity(64);
-    for byte in digest.finalize() {
-        write!(&mut identity, "{byte:02x}").expect("writing to a String is infallible");
-    }
-    identity
-}
-
 /// Refuses a placement whose muxer is not on the head's host.
 ///
 /// The artifact a muxer publishes is a POSIX shared-memory object the head
@@ -384,7 +361,10 @@ impl WorkerGroup {
             u32::try_from(n).context("process world size exceeds the IPC representation")?;
         let mut info = workers[0].info().clone();
         let mut canonical = info.clone();
-        canonical.configuration_id.clear();
+        canonical.model_dtype.clear();
+        canonical.attention_backend.clear();
+        canonical.weight_formats.clear();
+        canonical.activation_formats.clear();
         // A rank's product storage follows the components it holds, which an
         // asymmetric placement makes rank-specific: a rank that imports a
         // component's product reserves the whole logical allocation for it,
@@ -437,11 +417,12 @@ impl WorkerGroup {
                 local.num_layers = reference.num_layers;
                 local.bytes_per_token = reference.bytes_per_token;
             }
-            // The resolved identity includes rank-local parameter and buffer
-            // layouts. Component params may therefore give each physical
-            // rank a distinct identity while all scheduling/resource bounds
-            // still have to agree.
-            normalized.configuration_id.clear();
+            // Placement may give ranks different numerical storage; restart
+            // compatibility below compares each rank with its own predecessor.
+            normalized.model_dtype.clear();
+            normalized.attention_backend.clear();
+            normalized.weight_formats.clear();
+            normalized.activation_formats.clear();
             anyhow::ensure!(
                 normalized == canonical,
                 "physical rank {rank} worker info disagree with rank 0"
@@ -502,7 +483,6 @@ impl WorkerGroup {
                 .max()
                 .unwrap_or(cache.bytes_per_token);
         }
-        info.configuration_id = process_world_configuration_id(&workers);
         for worker in &mut workers {
             worker.check_worker("WorkerGroup readiness")?;
             worker.set_startup_cancel(None);
@@ -658,10 +638,6 @@ impl WorkerGroup {
             for (rank, (before, after)) in expected.iter().zip(&workers).enumerate() {
                 validate_replacement_info(before, after.info(), rank)?;
             }
-            anyhow::ensure!(
-                process_world_configuration_id(&workers) == self.info.configuration_id,
-                "replacement process-world configuration changed"
-            );
             for worker in &mut workers {
                 worker.check_worker("WorkerGroup readiness")?;
                 worker.set_startup_cancel(None);
@@ -1471,11 +1447,8 @@ fn validate_replacement_info(
         "replacement rank {rank} did not establish a new endpoint incarnation"
     );
     normalized_expected.endpoint = actual.endpoint.clone();
-    normalized_expected.configuration_id.clear();
-    let mut normalized_actual = actual.clone();
-    normalized_actual.configuration_id.clear();
     anyhow::ensure!(
-        normalized_expected == normalized_actual,
+        normalized_expected == *actual,
         "replacement rank {rank} worker info changed"
     );
     Ok(())

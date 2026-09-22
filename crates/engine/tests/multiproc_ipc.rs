@@ -1038,6 +1038,54 @@ fn multiprocess_topology_handles_rank_failure_and_capacity_limits() -> anyhow::R
 }
 
 #[test]
+fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for change in [
+        serde_json::json!({"model_dtype": "float64"}),
+        serde_json::json!({"attention_backend": "flashinfer"}),
+        serde_json::json!({"weight_formats": ["fp8"]}),
+        serde_json::json!({"activation_formats": ["nvfp4"]}),
+        serde_json::json!({"max_batch_tokens": 128}),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let wrapper = directory.path().join("python");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!{}\nfrom pathlib import Path\nfrom tests.python.fixtures.replacement_worker import run\nrun(Path({}))\n",
+                worker_python().display(),
+                serde_json::to_string(&directory.path())?,
+            ),
+        )?;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+        let mut args = rank_group_args(1 << 20, 8 << 20);
+        args.python = wrapper;
+        let mut worker = WorkerGroup::spawn(args)?;
+        std::fs::write(
+            directory.path().join("replacement.json"),
+            serde_json::to_vec(&change)?,
+        )?;
+        let pid =
+            std::fs::read_to_string(directory.path().join("0.pid"))?.parse::<libc::pid_t>()?;
+        anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
+        let failure = worker
+            .poll_batch(Duration::from_secs(30))
+            .expect_err("rank loss must report replacement rejection");
+        assert!(
+            format!("{failure:#}").contains("worker info changed"),
+            "unexpected failure for {change}: {failure:#}",
+        );
+        assert!(
+            !worker.is_ready(),
+            "incompatible replacement accepted: {change}"
+        );
+        worker.close()?;
+    }
+    Ok(())
+}
+
+#[test]
 fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::ERROR)

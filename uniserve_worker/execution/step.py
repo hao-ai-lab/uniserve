@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING
 
 from uniserve_worker.execution import calls
 from uniserve_worker.execution.batch_state import BatchState
-from uniserve_worker.execution.commit import _commit_group, _discard_group
-from uniserve_worker.execution.prepare import _open_group
+from uniserve_worker.execution.commit import commit_batch, discard_batch
+from uniserve_worker.execution.prepare import reserve_outputs
 from uniserve_worker.foundation.errors import (
     WorkerError,
     WorkerErrorCode,
@@ -29,7 +29,7 @@ from uniserve_worker.protocol.output import (
 )
 from uniserve_worker.protocol.tensor import DType
 
-from .schedule import execute_completion
+from .schedule import dispatch_batch
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -117,11 +117,9 @@ def execute_batch(
         state.launched = True
         return
 
-    completion = BatchState.COMPLETION
     try:
-        _open_group(
+        reserve_outputs(
             batch,
-            completion,
             predicate_values,
             kv_cache=kv_cache,
             host_tasks=host_tasks,
@@ -138,10 +136,9 @@ def execute_batch(
             state=state,
         )
     except BaseException as error:
-        classified = _classify_group_failure(
-            completion,
+        classified = _classify_failure(
             error,
-            phase="completion group registration",
+            phase="batch registration",
             state=state,
         )
         if propagate_errors or classified.fatal:
@@ -149,7 +146,6 @@ def execute_batch(
 
         _error_outputs(
             state,
-            completion,
             classified,
             started,
             registration_visible=False,
@@ -159,8 +155,7 @@ def execute_batch(
         return
 
     try:
-        outcomes, execution_error = execute_completion(
-            completion,
+        outcomes = dispatch_batch(
             kv_cache=kv_cache,
             tensor_store=tensor_store,
             worker_info=worker_info,
@@ -182,14 +177,12 @@ def execute_batch(
 
     if outcomes is None:
         assert execution_error is not None
-        classified = _classify_group_failure(
-            completion,
+        classified = _classify_failure(
             execution_error,
-            phase="completion group execution",
+            phase="batch execution",
             state=state,
         )
-        _discard_group(
-            completion,
+        discard_batch(
             classified,
             kv_cache=kv_cache,
             tensor_store=tensor_store,
@@ -204,22 +197,20 @@ def execute_batch(
 
         _error_outputs(
             state,
-            completion,
             classified,
-            state.group_started_ns[completion],
-            registration_visible=state.group_registered[completion],
+            state.started_ns,
+            registration_visible=state.registered,
             forward_stats=_forward_stats(
-                state.group_forward_stats[completion],
-                state.group_component_us[completion],
+                state.forward_stats,
+                state.component_us,
             ),
             request_pool=request_pool,
         )
         return
 
     try:
-        _commit_group(
+        commit_batch(
             batch.batch_id,
-            completion,
             outcomes,
             started,
             state=state,
@@ -232,21 +223,18 @@ def execute_batch(
             config=config,
         )
     except BaseException as error:
-        if state.group_published[completion]:
-            classified = _published_group_failure(
-                completion,
+        if state.published:
+            classified = _publication_failure(
                 error,
                 state=state,
             )
         else:
-            classified = _classify_group_failure(
-                completion,
+            classified = _classify_failure(
                 error,
-                phase="completion group commit",
+                phase="batch commit",
                 state=state,
             )
-            _discard_group(
-                completion,
+            discard_batch(
                 classified,
                 kv_cache=kv_cache,
                 tensor_store=tensor_store,
@@ -261,26 +249,24 @@ def execute_batch(
 
         _error_outputs(
             state,
-            completion,
             classified,
-            state.group_started_ns[completion],
-            registration_visible=state.group_registered[completion],
+            state.started_ns,
+            registration_visible=state.registered,
             forward_stats=_forward_stats(
-                state.group_forward_stats[completion],
-                state.group_component_us[completion],
+                state.forward_stats,
+                state.component_us,
             ),
             request_pool=request_pool,
         )
 
 
-def _classify_group_failure(
-    completion_group: int,
+def _classify_failure(
     error: BaseException,
     *,
     phase: str,
     state: BatchState,
 ) -> WorkerError:
-    """Classify a pre-publication completion group failure with complete.
+    """Classify a pre-publication batch failure with complete.
 
     call and route context.
     """
@@ -307,12 +293,11 @@ def _classify_group_failure(
         call_kind=None if sole is None else sole.kind.value,
         route=str(0),
     )
-    _log_group_failure(completion_group, classified, cause=error)
+    _log_failure(classified, cause=error)
     return classified
 
 
-def _published_group_failure(
-    completion_group: int,
+def _publication_failure(
     error: BaseException,
     *,
     state: BatchState,
@@ -332,33 +317,28 @@ def _published_group_failure(
     )
     classified = WorkerError(
         code=WorkerErrorCode.INVARIANT_VIOLATION,
-        message=(
-            f"completion_group publication failed after visibility "
-            f"began: {error}"
-        ),
+        message=(f"batch publication failed after visibility began: {error}"),
         fatal=True,
-        phase="completion group publication",
+        phase="batch publication",
         route=str(0),
         calls=scheduled,
     )
-    _log_group_failure(completion_group, classified, cause=error)
+    _log_failure(classified, cause=error)
     return classified
 
 
-def _log_group_failure(
-    completion_group: int,
+def _log_failure(
     error: WorkerError,
     *,
     cause: BaseException | None = None,
 ) -> None:
-    """Log a completion-group failure, adding a diagnostic traceback."""
+    """Log a batch failure, adding a diagnostic traceback."""
     capture_trace = should_capture_trace(error.code)
     log = logger.error if capture_trace else logger.warning
     log(
-        "completion group failed: %s [code=%s group_id=%s route=%s calls=%s]",
+        "batch failed: %s [code=%s route=%s calls=%s]",
         error.message,
         error.code,
-        completion_group,
         0,
         error.calls,
         exc_info=(type(cause), cause, cause.__traceback__)
@@ -377,7 +357,6 @@ def _log_group_failure(
 
 def _error_outputs(
     state: BatchState,
-    completion_group: int,
     error: WorkerError,
     started: int,
     *,
@@ -428,7 +407,6 @@ def _error_outputs(
         records.append(placeholder)
 
     state.record_outputs(
-        completion_group,
         tuple(records),
         visible=registration_visible,
         execution_us=(time.perf_counter_ns() - started) // 1000,

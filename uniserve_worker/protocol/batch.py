@@ -36,12 +36,12 @@ def native_batch(
         tuple[int, ...],
         tuple[bool, ...],
     ],
-    latent_params: Sequence[object],
-    decode_ranges: Sequence[object],
-    buffer_allocations: Sequence[object],
+    latent_params: tuple[LatentParams, ...],
+    decode_ranges: tuple[DecodeRange, ...],
+    buffer_allocations: tuple[BufferAllocation, ...],
     commands: tuple[BatchCommand, ...],
-    input_products: Sequence[object],
-    kv_inputs: Sequence[object],
+    input_products: tuple[TensorPublication, ...],
+    kv_inputs: tuple[transfer.KvTransfer, ...],
 ) -> Batch:
     """Assemble a validated batch from transport-constructed members.
 
@@ -63,49 +63,13 @@ def native_batch(
     set_field(batch, "query_lens", forward_inputs[3])
     set_field(batch, "write_kv", forward_inputs[4])
 
-    set_field(
-        batch,
-        "latent_params",
-        tuple(
-            LatentParams.from_mapping(item, f"batch.latent_params[{index}]")
-            for index, item in enumerate(latent_params)
-        ),
-    )
-    set_field(
-        batch,
-        "decode_ranges",
-        tuple(
-            DecodeRange.from_mapping(item, f"batch.decode_ranges[{index}]")
-            for index, item in enumerate(decode_ranges)
-        ),
-    )
-    set_field(
-        batch,
-        "buffer_allocations",
-        tuple(
-            BufferAllocation.from_mapping(
-                item, f"batch.buffer_allocations[{index}]"
-            )
-            for index, item in enumerate(buffer_allocations)
-        ),
-    )
+    set_field(batch, "latent_params", latent_params)
+    set_field(batch, "decode_ranges", decode_ranges)
+    set_field(batch, "buffer_allocations", buffer_allocations)
     set_field(batch, "commands", commands)
 
-    set_field(
-        batch,
-        "input_products",
-        tuple(
-            TensorPublication.from_mapping(
-                item, f"batch.input_products[{index}]"
-            )
-            for index, item in enumerate(input_products)
-        ),
-    )
-    set_field(
-        batch,
-        "kv_inputs",
-        tuple(transfer.KvTransfer.from_mapping(value) for value in kv_inputs),
-    )
+    set_field(batch, "input_products", input_products)
+    set_field(batch, "kv_inputs", kv_inputs)
     return batch
 
 
@@ -190,16 +154,10 @@ def command_from_mapping(
     if kind == "start":
         return Start.from_mapping(data, f"{where}.value")
 
-    # Free carries no request_key; finish falls back to the validating parser
-    # when the fast decode does not recognize the value.
-    request_key = identity._fast_request_key(data.get("request_key"))
-    if kind != "free" and request_key is None:
+    if kind == "finish":
         request_key = identity.RequestKey.from_mapping(
             data.get("request_key"), f"{where}.value.request_key"
         )
-
-    if kind == "finish":
-        assert request_key is not None
         command: BatchCommand = Finish(
             request_key=request_key,
             retained_buffers=tuple(
@@ -499,17 +457,10 @@ class BlockTable:
         data = _map(value, where)
 
         def uint_field(name: str) -> int:
-            """Decode a nonnegative integer field via the fast scalar path."""
-            raw = data.get(name)
-            return (
-                raw
-                if type(raw) is int and raw >= 0
-                else _uint(raw, f"{where}.{name}")
-            )
+            """Decode a nonnegative integer field."""
+            return _uint(data.get(name), f"{where}.{name}")
 
-        page_ids = call._fast_uints(data.get("page_ids", ()))
-        if page_ids is None:
-            page_ids = _uints(data.get("page_ids", ()), f"{where}.page_ids")
+        page_ids = _uints(data.get("page_ids", ()), f"{where}.page_ids")
         fields = (
             uint_field("request_pool_idx"),
             uint_field("group_id"),
@@ -565,17 +516,10 @@ class CachePageAllocation:
         data = _map(value, where)
 
         def uint_field(name: str) -> int:
-            """Decode a nonnegative integer field via the fast scalar path."""
-            raw = data.get(name)
-            return (
-                raw
-                if type(raw) is int and raw >= 0
-                else _uint(raw, f"{where}.{name}")
-            )
+            """Decode a nonnegative integer field."""
+            return _uint(data.get(name), f"{where}.{name}")
 
-        page_ids = call._fast_uints(data.get("page_ids", ()))
-        if page_ids is None:
-            page_ids = _uints(data.get("page_ids", ()), f"{where}.page_ids")
+        page_ids = _uints(data.get("page_ids", ()), f"{where}.page_ids")
         fields = (
             uint_field("request_pool_idx"),
             uint_field("group_id"),

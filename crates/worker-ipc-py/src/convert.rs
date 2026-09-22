@@ -1,4 +1,4 @@
-//! Typed conversion between worker IPC frames and Python mappings.
+//! Conversion between validated worker IPC frames and Python records.
 //!
 //! The conversion path crosses the FFI boundary once in each direction per
 //! batch. Mapping keys and enum strings are interned, lists are preallocated,
@@ -13,7 +13,7 @@ use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 use pyo3::exceptions::PyValueError;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString, PyTuple};
 use uniserve_core::{ImageParams, SamplingParams, TokenLogprob};
 use uniserve_worker_ipc::{
     ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable,
@@ -22,8 +22,7 @@ use uniserve_worker_ipc::{
     FeatureKind, FinishFlags, ForwardStats, KvTransfer, LatentParams, Locator, MediaOutput,
     NewRequest, RegistrationAck, RequestKey, RequestKind, RequestOutput, ShapeBound,
     TensorPublication, TensorRef, TensorTransfer, TimingCounters, TransferHandle,
-    TransferTransport, UmmRequestParams, WorkerEndpoint, WorkerRequest, WorkerResponse,
-    WorkerResponseError,
+    TransferTransport, WorkerEndpoint, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
 #[cfg(test)]
@@ -46,15 +45,9 @@ pub(crate) fn execute_request_to_py<'py>(
     Ok(dict)
 }
 
-/// Cached handles to the worker's call types and enum members.
-///
-/// The serve loop constructs one `Batch` object per submission; every hot
-/// record (calls, KV allocations, admission/close/release commands) is built
-/// by calling the call dataclass constructors positionally, so the worker
-/// never re-decodes those records from IPC maps. Rare members (admissions,
-/// input products and allocations) still cross as IPC maps and are decoded by
-/// `native_batch` on the Python side.
-struct NativeRequestTypes {
+/// Cached constructors and enum members for transport-validated records.
+struct RequestTypes {
+    records: HashMap<&'static str, Py<PyAny>>,
     call: Py<PyAny>,
     computation_id: Py<PyAny>,
     request_key: Py<PyAny>,
@@ -81,7 +74,7 @@ struct NativeRequestTypes {
 }
 
 /// Process-wide cache of worker Python constructors and enum members.
-static NATIVE_REQUEST_TYPES: std::sync::OnceLock<NativeRequestTypes> = std::sync::OnceLock::new();
+static REQUEST_TYPES: std::sync::OnceLock<RequestTypes> = std::sync::OnceLock::new();
 
 /// Resolves named Python enum members into a fixed-size indexed cache.
 fn enum_members<const N: usize>(
@@ -99,7 +92,7 @@ fn enum_members<const N: usize>(
         .unwrap_or_else(|_| unreachable!("member count matches the declared array")))
 }
 
-impl NativeRequestTypes {
+impl RequestTypes {
     /// Imports worker model types and caches every constructor and enum member.
     fn build(py: Python<'_>) -> PyResult<Self> {
         // Resolve classes once so per-request conversion uses direct constructor
@@ -114,7 +107,42 @@ impl NativeRequestTypes {
             Ok(module.getattr(name)?.unbind())
         };
 
+        let mut records = HashMap::new();
+        let module = py.import("uniserve_worker.protocol.batch")?;
+        records.insert("LatentParams", class(&module, "LatentParams")?);
+        records.insert("DecodeRange", class(&module, "DecodeRange")?);
+        records.insert("BufferAllocation", class(&module, "BufferAllocation")?);
+        records.insert("NewRequest", class(&module, "NewRequest")?);
+        records.insert("GenerationParams", class(&module, "GenerationParams")?);
+        records.insert("DiffusionParams", class(&module, "DiffusionParams")?);
+        records.insert("TensorPublication", class(&module, "TensorPublication")?);
+        let module = py.import("uniserve_worker.protocol.call")?;
+        records.insert("ImageParams", class(&module, "ImageParams")?);
+        let module = py.import("uniserve.sampling")?;
+        records.insert("SamplingParams", class(&module, "SamplingParams")?);
+        let module = py.import("uniserve_worker.protocol.transfer")?;
+        records.insert("WorkerEndpoint", class(&module, "WorkerEndpoint")?);
+        records.insert("Locator", class(&module, "Locator")?);
+        records.insert("LocalTransfer", class(&module, "LocalTransfer")?);
+        records.insert("PosixShmTransfer", class(&module, "PosixShmTransfer")?);
+        records.insert("CudaVmmTransfer", class(&module, "CudaVmmTransfer")?);
+        records.insert("ChannelTransfer", class(&module, "ChannelTransfer")?);
+        records.insert(
+            "EncoderTransferValue",
+            class(&module, "EncoderTransferValue")?,
+        );
+        records.insert(
+            "DeviceProductTransferValue",
+            class(&module, "DeviceProductTransferValue")?,
+        );
+        records.insert(
+            "LatentTransferValue",
+            class(&module, "LatentTransferValue")?,
+        );
+        records.insert("TensorTransfer", class(&module, "TensorTransfer")?);
+        records.insert("KvTransfer", class(&module, "KvTransfer")?);
         Ok(Self {
+            records,
             call: class(&call, "Call")?,
             computation_id: class(&identity, "CallId")?,
             request_key: class(&identity, "RequestKey")?,
@@ -162,11 +190,11 @@ impl NativeRequestTypes {
 
     /// Returns the process-wide type cache, initializing it under the GIL.
     fn get(py: Python<'_>) -> PyResult<&'static Self> {
-        if let Some(types) = NATIVE_REQUEST_TYPES.get() {
+        if let Some(types) = REQUEST_TYPES.get() {
             return Ok(types);
         }
         let built = Self::build(py)?;
-        Ok(NATIVE_REQUEST_TYPES.get_or_init(|| built))
+        Ok(REQUEST_TYPES.get_or_init(|| built))
     }
 
     /// Returns the Python enum member for a physical run kind.
@@ -194,22 +222,32 @@ impl NativeRequestTypes {
     }
 }
 
-/// Per-batch construction context: typed leaves shared across the batch's
-/// records are built once and reused by identity.
-struct NativeRequestConversion<'py> {
+/// Construct an explicit record from keyword arguments without reparsing a map.
+fn construct<'py>(
     py: Python<'py>,
-    types: &'static NativeRequestTypes,
+    name: &str,
+    fields: &Bound<'py, PyDict>,
+) -> PyResult<Bound<'py, PyAny>> {
+    RequestTypes::get(py)?.records[name]
+        .bind(py)
+        .call((), Some(fields))
+}
+
+/// Per-batch construction context: repeated typed leaves are built once.
+struct RequestConversion<'py> {
+    py: Python<'py>,
+    types: &'static RequestTypes,
     request_keys: HashMap<RequestKey, Py<PyAny>>,
     computation_ids: HashMap<CallId, Py<PyAny>>,
     shape_bounds: HashMap<ShapeBound, Py<PyAny>>,
 }
 
-impl<'py> NativeRequestConversion<'py> {
+impl<'py> RequestConversion<'py> {
     /// Starts a batch conversion with shared Python types and empty value caches.
     fn new(py: Python<'py>) -> PyResult<Self> {
         Ok(Self {
             py,
-            types: NativeRequestTypes::get(py)?,
+            types: RequestTypes::get(py)?,
             request_keys: HashMap::new(),
             computation_ids: HashMap::new(),
             shape_bounds: HashMap::new(),
@@ -482,14 +520,8 @@ impl<'py> NativeRequestConversion<'py> {
         // controls use their cached typed constructors directly.
         match command {
             BatchCommand::Start { request } => {
-                let request =
-                    admission_to_py(self.py, request, &mut RequestConversion::new(self.py))?;
-                let value = PyDict::new(self.py);
-                value.set_item(intern!(self.py, "request"), request)?;
-                self.types
-                    .start
-                    .bind(self.py)
-                    .call_method1("from_mapping", (value,))
+                let request = admission_to_py(self.py, request, self)?;
+                self.types.start.bind(self.py).call1((request,))
             }
 
             BatchCommand::Finish {
@@ -514,12 +546,10 @@ impl<'py> NativeRequestConversion<'py> {
     }
 }
 
-/// Constructs one Python run, using typed hot-path objects and mapped rare records.
+/// Constructs a fully typed Python batch from the validated wire record.
 fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>> {
-    let mut context = RequestConversion::new(py);
-    let mut native = NativeRequestConversion::new(py)?;
+    let mut native = RequestConversion::new(py)?;
 
-    // Materialize the execution-critical records as Python model instances.
     let calls = run
         .calls
         .iter()
@@ -541,12 +571,11 @@ fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>>
         .map(|command| native.command(command))
         .collect::<PyResult<Vec<_>>>()?;
 
-    // Rare payloads retain their schema-shaped mapping representation.
-    let input_products = dict_list(py, &run.input_products, |payload| {
-        tensor_publication_to_py(py, payload, &mut context)
+    let input_products = record_tuple(py, &run.input_products, |payload| {
+        tensor_publication_to_py(py, payload, &mut native)
     })?;
 
-    // `native_batch` assembles both representations without reparsing typed leaves.
+    // Python only assembles records; wire constraints were checked by Rust.
     let arguments = pyo3::types::PyTuple::new(
         py,
         [
@@ -564,21 +593,21 @@ fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>>
             )
                 .into_pyobject(py)?
                 .into_any(),
-            dict_list(py, &run.latent_params, |params| {
-                latent_params_to_py(py, params, &mut context)
+            record_tuple(py, &run.latent_params, |params| {
+                latent_params_to_py(py, params, &mut native)
             })?
             .into_any(),
-            dict_list(py, &run.decode_ranges, |params| {
-                decode_range_to_py(py, params, &mut context)
+            record_tuple(py, &run.decode_ranges, |params| {
+                decode_range_to_py(py, params, &mut native)
             })?
             .into_any(),
-            dict_list(py, &run.buffer_allocations, |params| {
-                buffer_allocation_to_py(py, params, &mut context)
+            record_tuple(py, &run.buffer_allocations, |params| {
+                buffer_allocation_to_py(py, params, &mut native)
             })?
             .into_any(),
             pyo3::types::PyTuple::new(py, commands)?.into_any(),
             input_products.into_any(),
-            dict_list(py, &run.kv_inputs, |transfer| {
+            record_tuple(py, &run.kv_inputs, |transfer| {
                 kv_transfer_to_py(py, transfer)
             })?
             .into_any(),
@@ -587,12 +616,12 @@ fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>>
     native.types.native_batch.bind(py).call1(arguments)
 }
 
-/// Converts a latent-page params into its Python mapping shape.
+/// Converts a latent-page params into its Python record.
 fn latent_params_to_py<'py>(
     py: Python<'py>,
     params: &LatentParams,
     context: &mut RequestConversion<'py>,
-) -> PyResult<Bound<'py, PyDict>> {
+) -> PyResult<Bound<'py, PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item(
         intern!(py, "request_key"),
@@ -600,23 +629,26 @@ fn latent_params_to_py<'py>(
     )?;
     dict.set_item(
         intern!(py, "call_id"),
-        computation_id_to_py(py, params.call_id)?,
+        context.computation_id(params.call_id)?,
     )?;
-    dict.set_item(intern!(py, "page_table"), u32_list(py, &params.page_table)?)?;
+    dict.set_item(
+        intern!(py, "page_table"),
+        u32_tuple(py, &params.page_table)?,
+    )?;
     dict.set_item(intern!(py, "latent_units"), params.latent_units)?;
     dict.set_item(intern!(py, "height"), params.height)?;
     dict.set_item(intern!(py, "width"), params.width)?;
     dict.set_item(intern!(py, "start_step"), params.start_step)?;
     dict.set_item(intern!(py, "step_count"), params.step_count)?;
-    Ok(dict)
+    construct(py, "LatentParams", &dict)
 }
 
-/// Converts a diffusion decoder params into its Python mapping shape.
+/// Converts a diffusion decoder params into its Python record.
 fn decode_range_to_py<'py>(
     py: Python<'py>,
     params: &DecodeRange,
     context: &mut RequestConversion<'py>,
-) -> PyResult<Bound<'py, PyDict>> {
+) -> PyResult<Bound<'py, PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item(
         intern!(py, "request_key"),
@@ -624,95 +656,45 @@ fn decode_range_to_py<'py>(
     )?;
     dict.set_item(
         intern!(py, "call_id"),
-        computation_id_to_py(py, params.call_id)?,
+        context.computation_id(params.call_id)?,
     )?;
     dict.set_item(intern!(py, "cursor"), params.cursor)?;
     dict.set_item(intern!(py, "max_units"), params.max_units)?;
-    Ok(dict)
+    construct(py, "DecodeRange", &dict)
 }
 
-/// Converts a persistent-buffer byte span into its nested Python mapping.
+/// Converts a persistent-buffer byte span into its Python allocation record.
 fn buffer_allocation_to_py<'py>(
     py: Python<'py>,
     params: &BufferAllocation,
     context: &mut RequestConversion<'py>,
-) -> PyResult<Bound<'py, PyDict>> {
+) -> PyResult<Bound<'py, PyAny>> {
     let dict = PyDict::new(py);
-    let id = params.buffer;
-    let buffer = PyDict::new(py);
-    buffer.set_item(intern!(py, "owner"), context.request_key(id.owner)?)?;
-    buffer.set_item(
-        intern!(py, "producer_call_id"),
-        computation_id_to_py(py, id.producer_call_id)?,
-    )?;
-    buffer.set_item(intern!(py, "output_index"), id.output_index)?;
-    buffer.set_item(intern!(py, "generation"), id.generation)?;
-    dict.set_item(intern!(py, "buffer"), buffer)?;
+    dict.set_item("buffer", context.buffer_id(params.buffer)?)?;
     dict.set_item(intern!(py, "offset"), params.offset)?;
     dict.set_item(intern!(py, "bytes"), params.bytes)?;
-    Ok(dict)
+    construct(py, "BufferAllocation", &dict)
 }
 
-/// Converts a Rust slice into a Python list of mapped dictionaries.
-fn dict_list<'py, T, F>(
+/// Converts a Rust slice into a tuple of Python records.
+fn record_tuple<'py, T, F>(
     py: Python<'py>,
     items: &[T],
     mut convert: F,
-) -> PyResult<Bound<'py, PyList>>
+) -> PyResult<Bound<'py, PyTuple>>
 where
-    F: FnMut(&T) -> PyResult<Bound<'py, PyDict>>,
+    F: FnMut(&T) -> PyResult<Bound<'py, PyAny>>,
 {
     let converted = items
         .iter()
         .map(&mut convert)
         .collect::<PyResult<Vec<_>>>()?;
-    PyList::new(py, converted)
+    PyTuple::new(py, converted)
 }
 
-/// Per-batch cache for schema-shaped dictionary leaves shared by mapped records.
-struct RequestConversion<'py> {
-    py: Python<'py>,
-    request_keys: HashMap<RequestKey, Bound<'py, PyDict>>,
-    shape_bounds: HashMap<ShapeBound, Bound<'py, PyDict>>,
-}
-
-impl<'py> RequestConversion<'py> {
-    /// Starts a mapped-record conversion with empty identity caches.
-    fn new(py: Python<'py>) -> Self {
-        Self {
-            py,
-            request_keys: HashMap::new(),
-            shape_bounds: HashMap::new(),
-        }
-    }
-
-    /// Returns a canonical request-identity mapping for this batch.
-    fn request_key(&mut self, key: RequestKey) -> PyResult<Bound<'py, PyDict>> {
-        if let Some(value) = self.request_keys.get(&key) {
-            return Ok(value.clone());
-        }
-        let dict = PyDict::new(self.py);
-        dict.set_item(intern!(self.py, "engine_id"), key.engine_id)?;
-        dict.set_item(intern!(self.py, "request_id"), key.request_id.0)?;
-        dict.set_item(intern!(self.py, "request_epoch"), key.request_epoch)?;
-        self.request_keys.insert(key, dict.clone());
-        Ok(dict)
-    }
-
-    /// Returns a canonical shape-bound mapping for this batch.
-    fn shape_bound(&mut self, shape: &ShapeBound) -> PyResult<Bound<'py, PyDict>> {
-        if let Some(value) = self.shape_bounds.get(shape) {
-            return Ok(value.clone());
-        }
-        let dict = shape_bound_to_py(self.py, shape)?;
-        self.shape_bounds.insert(shape.clone(), dict.clone());
-        Ok(dict)
-    }
-}
-
-/// Copies `u32` values into a Python list without an intermediate mapping.
-fn u32_list<'py>(py: Python<'py>, values: &[u32]) -> PyResult<Bound<'py, PyList>> {
-    PyList::new(py, values.iter().copied())
+/// Copies `u32` values into a Python tuple.
+fn u32_tuple<'py>(py: Python<'py>, values: &[u32]) -> PyResult<Bound<'py, PyTuple>> {
+    PyTuple::new(py, values.iter().copied())
 }
 
 /// Converts a request admission and its selected parameter family.
@@ -720,11 +702,11 @@ fn admission_to_py<'py>(
     py: Python<'py>,
     admission: &NewRequest,
     context: &mut RequestConversion<'py>,
-) -> PyResult<Bound<'py, PyDict>> {
+) -> PyResult<Bound<'py, PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item(
         intern!(py, "prompt_token_ids"),
-        u32_list(py, &admission.prompt_token_ids)?,
+        u32_tuple(py, &admission.prompt_token_ids)?,
     )?;
     dict.set_item(
         intern!(py, "request_key"),
@@ -732,7 +714,7 @@ fn admission_to_py<'py>(
     )?;
     dict.set_item(intern!(py, "request_pool_idx"), admission.request_pool_idx)?;
     dict.set_item(
-        intern!(py, "ar"),
+        intern!(py, "generation"),
         admission
             .ar
             .as_ref()
@@ -740,11 +722,11 @@ fn admission_to_py<'py>(
             .transpose()?,
     )?;
     dict.set_item(
-        intern!(py, "umm"),
+        intern!(py, "image"),
         admission
             .umm
             .as_ref()
-            .map(|branch| umm_params_to_py(py, branch))
+            .map(|branch| image_to_py(py, &branch.image))
             .transpose()?,
     )?;
     dict.set_item(
@@ -755,40 +737,30 @@ fn admission_to_py<'py>(
             .map(|diffusion| diffusion_params_to_py(py, diffusion))
             .transpose()?,
     )?;
-    Ok(dict)
+    construct(py, "NewRequest", &dict)
 }
 
-/// Converts autoregressive admission parameters into a Python mapping.
-fn ar_params_to_py<'py>(py: Python<'py>, ar: &ArRequestParams) -> PyResult<Bound<'py, PyDict>> {
+/// Converts autoregressive admission parameters into a Python record.
+fn ar_params_to_py<'py>(py: Python<'py>, ar: &ArRequestParams) -> PyResult<Bound<'py, PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "sampling"), sampling_to_py(py, &ar.sampling)?)?;
     dict.set_item(
         intern!(py, "negative_token_ids"),
-        u32_list(py, &ar.negative_token_ids)?,
+        u32_tuple(py, &ar.negative_token_ids)?,
     )?;
     dict.set_item(
         intern!(py, "finish_token_ids"),
-        u32_list(py, &ar.finish_token_ids)?,
+        u32_tuple(py, &ar.finish_token_ids)?,
     )?;
     dict.set_item(intern!(py, "initial_position"), ar.initial_position)?;
-    Ok(dict)
-}
-
-/// Converts unified-multimodal admission parameters into a Python mapping.
-fn umm_params_to_py<'py>(
-    py: Python<'py>,
-    branch: &UmmRequestParams,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "image"), image_to_py(py, &branch.image)?)?;
-    Ok(dict)
+    construct(py, "GenerationParams", &dict)
 }
 
 /// Converts diffusion admission parameters and resolved media geometry.
 fn diffusion_params_to_py<'py>(
     py: Python<'py>,
     diffusion: &DiffusionSamplingParams,
-) -> PyResult<Bound<'py, PyDict>> {
+) -> PyResult<Bound<'py, PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "num_frames"), diffusion.num_frames)?;
     dict.set_item(intern!(py, "video_units"), diffusion.video_units)?;
@@ -797,11 +769,11 @@ fn diffusion_params_to_py<'py>(
         diffusion.num_inference_steps,
     )?;
     dict.set_item(intern!(py, "seed"), diffusion.seed)?;
-    Ok(dict)
+    construct(py, "DiffusionParams", &dict)
 }
 
-/// Converts sampling controls into the worker's Python mapping schema.
-fn sampling_to_py<'py>(py: Python<'py>, sampling: &SamplingParams) -> PyResult<Bound<'py, PyDict>> {
+/// Converts sampling controls into the worker's typed parameters.
+fn sampling_to_py<'py>(py: Python<'py>, sampling: &SamplingParams) -> PyResult<Bound<'py, PyAny>> {
     // Scalar controls are inserted directly under interned protocol keys.
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "temperature"), sampling.temperature)?;
@@ -820,7 +792,7 @@ fn sampling_to_py<'py>(py: Python<'py>, sampling: &SamplingParams) -> PyResult<B
     // Preserve the tuple shape expected for each token-bias pair.
     dict.set_item(
         intern!(py, "logit_bias"),
-        PyList::new(
+        PyTuple::new(
             py,
             sampling
                 .logit_bias
@@ -838,34 +810,34 @@ fn sampling_to_py<'py>(py: Python<'py>, sampling: &SamplingParams) -> PyResult<B
     dict.set_item(intern!(py, "n_prompt_logprobs"), sampling.n_prompt_logprobs)?;
     dict.set_item(
         intern!(py, "logprob_token_ids"),
-        u32_list(py, &sampling.logprob_token_ids)?,
+        u32_tuple(py, &sampling.logprob_token_ids)?,
     )?;
 
     // Materialize nested token collections only after the scalar fields.
     let bad_words = sampling
         .bad_words_ids
         .iter()
-        .map(|tokens| u32_list(py, tokens))
+        .map(|tokens| u32_tuple(py, tokens))
         .collect::<PyResult<Vec<_>>>()?;
-    dict.set_item(intern!(py, "bad_words_ids"), PyList::new(py, bad_words)?)?;
+    dict.set_item(intern!(py, "bad_words_ids"), PyTuple::new(py, bad_words)?)?;
     dict.set_item(
         intern!(py, "allowed_token_ids"),
         sampling
             .allowed_token_ids
             .as_deref()
-            .map(|tokens| u32_list(py, tokens))
+            .map(|tokens| u32_tuple(py, tokens))
             .transpose()?,
     )?;
     dict.set_item(intern!(py, "typical_p"), sampling.typical_p)?;
     dict.set_item(
         intern!(py, "forced_token_ids"),
-        u32_list(py, &sampling.forced_token_ids)?,
+        u32_tuple(py, &sampling.forced_token_ids)?,
     )?;
-    Ok(dict)
+    construct(py, "SamplingParams", &dict)
 }
 
-/// Converts image-generation controls into the worker's Python mapping schema.
-fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py, PyDict>> {
+/// Converts image-generation controls into the worker's typed parameters.
+fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py, PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "steps"), image.steps)?;
     dict.set_item(intern!(py, "cfg_text_scale"), image.cfg_text_scale)?;
@@ -888,84 +860,32 @@ fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py,
     dict.set_item(intern!(py, "max_images"), image.max_images)?;
     dict.set_item(
         intern!(py, "image_prompts"),
-        PyList::new(py, image.image_prompts.iter().map(|prompt| prompt.as_str()))?,
+        PyTuple::new(py, image.image_prompts.iter().map(|prompt| prompt.as_str()))?,
     )?;
     dict.set_item(intern!(py, "retain_images"), image.retain_images)?;
-    Ok(dict)
+    construct(py, "ImageParams", &dict)
 }
 
-/// Converts a product identity, storage contract, and bounds into a mapping.
-fn tensor_ref_to_py<'py>(
-    py: Python<'py>,
-    product: &TensorRef,
-    context: &mut RequestConversion<'py>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item(
-        intern!(py, "request_key"),
-        context.request_key(product.request_key)?,
-    )?;
-    dict.set_item(
-        intern!(py, "producer_call_id"),
-        computation_id_to_py(py, product.producer_call_id)?,
-    )?;
-    dict.set_item(intern!(py, "output_index"), product.output_index)?;
-    dict.set_item(intern!(py, "generation"), product.generation)?;
-    dict.set_item(intern!(py, "dtype"), dtype_py(py, product.dtype))?;
-    dict.set_item(
-        intern!(py, "shape_bound"),
-        context.shape_bound(&product.shape_bound)?,
-    )?;
-    Ok(dict)
-}
-
-/// Converts static and device-bounded dimensions into their tagged mappings.
-fn shape_bound_to_py<'py>(py: Python<'py>, shape: &ShapeBound) -> PyResult<Bound<'py, PyDict>> {
-    let dims = shape
-        .dims
-        .iter()
-        .map(|dim| {
-            let entry = PyDict::new(py);
-            match dim {
-                DimBound::Static(extent) => {
-                    entry.set_item(intern!(py, "kind"), intern!(py, "static"))?;
-                    entry.set_item(intern!(py, "value"), *extent)?;
-                }
-                DimBound::Device { max } => {
-                    entry.set_item(intern!(py, "kind"), intern!(py, "device"))?;
-                    let value = PyDict::new(py);
-                    value.set_item(intern!(py, "max"), *max)?;
-                    entry.set_item(intern!(py, "value"), value)?;
-                }
-            }
-            Ok(entry)
-        })
-        .collect::<PyResult<Vec<_>>>()?;
-    let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "dims"), PyList::new(py, dims)?)?;
-    Ok(dict)
-}
-
-/// Converts a tensor publication into its Python mapping.
+/// Converts a tensor publication into its Python record.
 fn tensor_publication_to_py<'py>(
     py: Python<'py>,
     payload: &TensorPublication,
     context: &mut RequestConversion<'py>,
-) -> PyResult<Bound<'py, PyDict>> {
+) -> PyResult<Bound<'py, PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item(
         intern!(py, "product"),
-        tensor_ref_to_py(py, &payload.product, context)?,
+        context.tensor_ref(&payload.product)?,
     )?;
     dict.set_item(
         intern!(py, "value"),
         transfer_handle_to_py(py, &payload.value)?,
     )?;
-    Ok(dict)
+    construct(py, "TensorPublication", &dict)
 }
 
-/// Converts tensor metadata and transport coordinates into a Python mapping.
-fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<Bound<'py, PyDict>> {
+/// Converts tensor metadata and transport coordinates into a Python record.
+fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<Bound<'py, PyAny>> {
     // Tensor metadata is common to every transport family.
     let dict = PyDict::new(py);
     let source = PyDict::new(py);
@@ -974,24 +894,25 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
     source.set_item("node", &locator.source.node)?;
     source.set_item("address_space", &locator.source.address_space)?;
     source.set_item("incarnation", &locator.source.incarnation)?;
-    dict.set_item("source", source)?;
+    dict.set_item("source", construct(py, "WorkerEndpoint", &source)?)?;
     dict.set_item(intern!(py, "nbytes"), locator.nbytes)?;
     dict.set_item(intern!(py, "dtype"), locator.dtype.as_str())?;
-    dict.set_item(intern!(py, "shape"), PyList::new(py, &locator.shape)?)?;
+    dict.set_item(intern!(py, "shape"), PyTuple::new(py, &locator.shape)?)?;
     dict.set_item(intern!(py, "device"), locator.device.as_str())?;
-    dict.set_item(intern!(py, "offset"), PyList::new(py, &locator.offset)?)?;
+    dict.set_item(intern!(py, "offset"), PyTuple::new(py, &locator.offset)?)?;
 
     // The transport tag determines the remaining coordinate fields.
-    match &locator.transport {
+    let handle = PyDict::new(py);
+    let name = match &locator.transport {
         TransferTransport::Local { endpoint, key } => {
-            dict.set_item(intern!(py, "transport"), "local")?;
-            dict.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
-            dict.set_item(intern!(py, "key"), key)?;
+            handle.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
+            handle.set_item(intern!(py, "key"), key)?;
+            "LocalTransfer"
         }
         TransferTransport::PosixShm { endpoint, name } => {
-            dict.set_item(intern!(py, "transport"), "posix_shm")?;
-            dict.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
-            dict.set_item(intern!(py, "name"), name.as_str())?;
+            handle.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
+            handle.set_item(intern!(py, "name"), name.as_str())?;
+            "PosixShmTransfer"
         }
         TransferTransport::CudaVmm {
             endpoint,
@@ -1005,74 +926,59 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
             allocation_handle,
             acknowledgment_offset,
         } => {
-            dict.set_item(intern!(py, "transport"), "cuda_vmm")?;
-            dict.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
-            dict.set_item(intern!(py, "publication_id"), publication_id.as_str())?;
-            dict.set_item(intern!(py, "storage_size_bytes"), storage_size_bytes)?;
-            dict.set_item(intern!(py, "storage_offsets_bytes"), storage_offsets_bytes)?;
-            dict.set_item(intern!(py, "span_lengths"), span_lengths)?;
-            dict.set_item(intern!(py, "span_counts"), span_counts)?;
-            dict.set_item(
-                intern!(py, "tensor_stride"),
-                PyList::new(py, tensor_stride)?,
+            handle.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
+            handle.set_item(intern!(py, "publication_id"), publication_id.as_str())?;
+            handle.set_item(intern!(py, "storage_size_bytes"), storage_size_bytes)?;
+            handle.set_item(
+                intern!(py, "storage_offsets_bytes"),
+                PyTuple::new(py, storage_offsets_bytes)?,
             )?;
-            dict.set_item(
+            handle.set_item(intern!(py, "span_lengths"), PyTuple::new(py, span_lengths)?)?;
+            handle.set_item(intern!(py, "span_counts"), PyTuple::new(py, span_counts)?)?;
+            handle.set_item(
+                intern!(py, "tensor_stride"),
+                PyTuple::new(py, tensor_stride)?,
+            )?;
+            handle.set_item(
                 intern!(py, "ready_event_handle"),
                 PyBytes::new(py, ready_event_handle),
             )?;
-            dict.set_item(
+            handle.set_item(
                 intern!(py, "allocation_handle"),
                 PyBytes::new(py, allocation_handle),
             )?;
-            dict.set_item(intern!(py, "acknowledgment_offset"), acknowledgment_offset)?;
+            handle.set_item(intern!(py, "acknowledgment_offset"), acknowledgment_offset)?;
+            "CudaVmmTransfer"
         }
         TransferTransport::Channel { endpoint, payload } => {
-            dict.set_item(intern!(py, "transport"), "channel")?;
-            dict.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
-            dict.set_item(intern!(py, "payload"), PyBytes::new(py, payload))?;
+            handle.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
+            handle.set_item(intern!(py, "payload"), PyBytes::new(py, payload))?;
+            "ChannelTransfer"
         }
-    }
+    };
+    dict.set_item("transport", construct(py, name, &handle)?)?;
 
-    Ok(dict)
+    construct(py, "Locator", &dict)
 }
 
 /// Encodes the persistent buffer that identifies a KV publication.
-fn buffer_id_mapping_to_py<'py>(
-    py: Python<'py>,
-    buffer: &BufferId,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    let owner = PyDict::new(py);
-    owner.set_item("engine_id", buffer.owner.engine_id)?;
-    owner.set_item("request_id", buffer.owner.request_id.0)?;
-    owner.set_item("request_epoch", buffer.owner.request_epoch)?;
-    dict.set_item("owner", owner)?;
-    dict.set_item(
-        "producer_call_id",
-        computation_id_to_py(py, buffer.producer_call_id)?,
-    )?;
-    dict.set_item("output_index", buffer.output_index)?;
-    dict.set_item("generation", buffer.generation)?;
-    Ok(dict)
+fn buffer_id_to_py<'py>(py: Python<'py>, buffer: &BufferId) -> PyResult<Bound<'py, PyAny>> {
+    RequestConversion::new(py)?.buffer_id(*buffer)
 }
 
-/// Converts a product-family transfer handle into its tagged Python mapping.
+/// Converts a product-family transfer handle into its typed Python record.
 fn transfer_handle_to_py<'py>(
     py: Python<'py>,
     handle: &TransferHandle,
-) -> PyResult<Bound<'py, PyDict>> {
-    // Preserve the tagged-union shape expected by the worker: the outer mapping
-    // carries the family tag and the inner mapping carries family metadata.
-    let dict = PyDict::new(py);
+) -> PyResult<Bound<'py, PyAny>> {
     let value = PyDict::new(py);
-    match handle {
+    let name = match handle {
         TransferHandle::Encoder {
             height,
             width,
             payload_kind,
             tensor,
         } => {
-            dict.set_item(intern!(py, "kind"), "encoder")?;
             value.set_item(intern!(py, "height"), height)?;
             value.set_item(intern!(py, "width"), width)?;
             value.set_item(
@@ -1080,6 +986,7 @@ fn transfer_handle_to_py<'py>(
                 feature_kind_py(py, *payload_kind),
             )?;
             value.set_item(intern!(py, "tensor"), tensor_transfer_to_py(py, tensor)?)?;
+            "EncoderTransferValue"
         }
         TransferHandle::DeviceProduct {
             height,
@@ -1087,11 +994,11 @@ fn transfer_handle_to_py<'py>(
             value_range,
             tensor,
         } => {
-            dict.set_item(intern!(py, "kind"), "device_product")?;
             value.set_item(intern!(py, "height"), height)?;
             value.set_item(intern!(py, "width"), width)?;
             value.set_item(intern!(py, "value_range"), value_range.as_str())?;
             value.set_item(intern!(py, "tensor"), tensor_transfer_to_py(py, tensor)?)?;
+            "DeviceProductTransferValue"
         }
         TransferHandle::Latent {
             height,
@@ -1100,17 +1007,15 @@ fn transfer_handle_to_py<'py>(
             step,
             tensor,
         } => {
-            dict.set_item(intern!(py, "kind"), "latent")?;
             value.set_item(intern!(py, "height"), height)?;
             value.set_item(intern!(py, "width"), width)?;
             value.set_item(intern!(py, "latent_units"), latent_units)?;
             value.set_item(intern!(py, "step"), step)?;
             value.set_item(intern!(py, "tensor"), tensor_transfer_to_py(py, tensor)?)?;
+            "LatentTransferValue"
         }
-    }
-
-    dict.set_item(intern!(py, "value"), value)?;
-    Ok(dict)
+    };
+    construct(py, name, &value)
 }
 
 /// Returns the interned Python spelling for a request kind.
@@ -1127,21 +1032,6 @@ fn feature_kind_py<'py>(py: Python<'py>, kind: FeatureKind) -> &'py Bound<'py, P
     match kind {
         FeatureKind::Vision => intern!(py, "vision_feature"),
         FeatureKind::Latent => intern!(py, "latent_feature"),
-    }
-}
-
-/// Returns the interned Python spelling for a product storage class.
-
-/// Returns the interned Python spelling for an element type.
-fn dtype_py<'py>(py: Python<'py>, dtype: DType) -> &'py Bound<'py, PyString> {
-    match dtype {
-        DType::U8 => intern!(py, "u8"),
-        DType::I32 => intern!(py, "i32"),
-        DType::I64 => intern!(py, "i64"),
-        DType::F16 => intern!(py, "f16"),
-        DType::BF16 => intern!(py, "bf16"),
-        DType::F32 => intern!(py, "f32"),
-        DType::I16 => intern!(py, "i16"),
     }
 }
 
@@ -1656,13 +1546,6 @@ fn computation_id_from_py(value: &Bound<'_, PyAny>) -> Option<CallId> {
         u64_of(&get(dict, intern!(py, "batch_id"))?)?,
         u32_of(&get(dict, intern!(py, "request_index"))?)?,
     ))
-}
-
-fn computation_id_to_py(py: Python<'_>, id: CallId) -> PyResult<Bound<'_, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "batch_id"), id.batch_id)?;
-    dict.set_item(intern!(py, "request_index"), id.request_index)?;
-    Ok(dict)
 }
 
 /// Decodes a request identity from its Python mapping.
@@ -2383,16 +2266,16 @@ mod tests {
 fn tensor_transfer_to_py<'py>(
     py: Python<'py>,
     tensor: &TensorTransfer,
-) -> PyResult<Bound<'py, PyDict>> {
+) -> PyResult<Bound<'py, PyAny>> {
     let dict = PyDict::new(py);
-    dict.set_item("shape", PyList::new(py, &tensor.shape)?)?;
+    dict.set_item("shape", PyTuple::new(py, &tensor.shape)?)?;
     let locations = tensor
         .locations
         .iter()
         .map(|location| transfer_locator_to_py(py, location))
         .collect::<PyResult<Vec<_>>>()?;
-    dict.set_item("locations", PyList::new(py, locations)?)?;
-    Ok(dict)
+    dict.set_item("locations", PyTuple::new(py, locations)?)?;
+    construct(py, "TensorTransfer", &dict)
 }
 
 fn tensor_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<TensorTransfer> {
@@ -2413,7 +2296,7 @@ fn tensor_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<TensorTransfer> {
     Some(tensor)
 }
 
-fn kv_transfer_to_py<'py>(py: Python<'py>, transfer: &KvTransfer) -> PyResult<Bound<'py, PyDict>> {
+fn kv_transfer_to_py<'py>(py: Python<'py>, transfer: &KvTransfer) -> PyResult<Bound<'py, PyAny>> {
     let KvTransfer {
         tensors,
         source,
@@ -2432,13 +2315,13 @@ fn kv_transfer_to_py<'py>(py: Python<'py>, transfer: &KvTransfer) -> PyResult<Bo
         .iter()
         .map(|tensor| tensor_transfer_to_py(py, tensor))
         .collect::<PyResult<Vec<_>>>()?;
-    value.set_item(intern!(py, "tensors"), PyList::new(py, tensors)?)?;
-    value.set_item(intern!(py, "source"), buffer_id_mapping_to_py(py, source)?)?;
+    value.set_item(intern!(py, "tensors"), PyTuple::new(py, tensors)?)?;
+    value.set_item(intern!(py, "source"), buffer_id_to_py(py, source)?)?;
     value.set_item(intern!(py, "destination"), destination.as_str())?;
     value.set_item(
         intern!(py, "base"),
         base.as_ref()
-            .map(|buffer| buffer_id_mapping_to_py(py, buffer))
+            .map(|buffer| buffer_id_to_py(py, buffer))
             .transpose()?,
     )?;
     value.set_item(intern!(py, "base_extent"), base_extent)?;
@@ -2446,7 +2329,7 @@ fn kv_transfer_to_py<'py>(py: Python<'py>, transfer: &KvTransfer) -> PyResult<Bo
     value.set_item(intern!(py, "group_id"), group_id)?;
     value.set_item(intern!(py, "compute_dtype"), compute_dtype.as_str())?;
     value.set_item(intern!(py, "page_size"), page_size)?;
-    Ok(value)
+    construct(py, "KvTransfer", &value)
 }
 
 fn kv_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<KvTransfer> {

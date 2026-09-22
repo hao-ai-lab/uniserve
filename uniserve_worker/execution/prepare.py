@@ -20,7 +20,7 @@ import torch
 from uniserve.media import image as media_image
 from uniserve_worker.execution import calls as calls
 from uniserve_worker.execution.batch_state import BatchState
-from uniserve_worker.execution.commit import _discard_group
+from uniserve_worker.execution.commit import discard_batch
 from uniserve_worker.execution.host_media import (
     BORROWED_INPUT_CALLS,
     encoded_unit_positions,
@@ -629,10 +629,8 @@ def prepare_inputs(
                 for page in allocation.page_ids
             )
             write = publications.prepare_install(
-                kv_transfer.source,
                 kv_transfer,
                 request_pool_idx=slot,
-                group_id=kv_transfer.group_id,
                 page_ids=pages,
                 allocated_length=allocated,
                 initialized_pages=initialized,
@@ -768,9 +766,8 @@ def capture_predicates(state: BatchState, tensor_store: TensorStore) -> None:
     state.predicates_sealed = True
 
 
-def _open_group(
+def reserve_outputs(
     batch: Batch,
-    completion_group: int,
     predicate_values: Mapping[CallIdentity, bool],
     *,
     state: BatchState,
@@ -786,8 +783,8 @@ def _open_group(
     model_runner: ModelRunner,
     transfer_backends: Mapping[str, Transport],
     config: WorkerConfig,
-) -> int:
-    """Stage one completion group's speculative state, resources, inputs.
+) -> None:
+    """Stage one batch's speculative state, resources, inputs.
 
     and completion storage.
     """
@@ -817,11 +814,10 @@ def _open_group(
             # Request slots are initialized on the control stream. Independent
             # components publish their own producer/consumer fences.
             stream.wait_stream(torch.cuda.current_stream(stream.device))
-            state.group_streams[completion_group] = stream
+            state.stream = stream
 
-    with state.group_scope(completion_group):
-        # Restrict input payloads to identities declared by this completion
-        # group.
+    with state.scope():
+        # Restrict input payloads to identities declared by this batch.
         started = time.perf_counter_ns()
         declared_inputs = {
             reference.buffer_id
@@ -845,7 +841,7 @@ def _open_group(
         completion: OutputBuffer | None = None
         try:
             # Candidate drafts and completion slots form a speculative ownership
-            # unit: either all later completion group resources bind
+            # unit: either all later batch resources bind
             # successfully or both are discarded.
             request_pool_indices = tuple(
                 int(
@@ -878,14 +874,13 @@ def _open_group(
         for request in candidates:
             if calls.call_identity(request.call) in predicated:
                 request.status = CallStatus.PREDICATED
-        state.bind_outputs(completion_group, candidates, completion, started)
+        state.bind_outputs(candidates, completion, started)
 
         try:
             # Bind physical state in dependency order before decoding
             # transferred inputs.
             _reserve_host_tasks(
                 active_calls,
-                completion_group,
                 host_tasks=host_tasks,
                 worker_info=worker_info,
                 config=config,
@@ -908,21 +903,18 @@ def _open_group(
                 else:
                     _bind_cache_tables(
                         active_calls,
-                        completion_group,
                         kv_cache=kv_cache,
                         request_tables=request_tables,
                         state=state,
                     )
                 _bind_latent_inputs(
                     active_calls,
-                    completion_group,
                     latent_pool=latent_pool,
                     model_runner=model_runner,
                     state=state,
                 )
             _reserve_outputs(
                 scheduled,
-                completion_group,
                 tensor_store=tensor_store,
                 model_runner=model_runner,
                 state=state,
@@ -946,7 +938,6 @@ def _open_group(
                     for payload in input_products
                     if payload.product in active_inputs
                 ),
-                completion_group,
                 kv_cache=kv_cache,
                 tensor_store=tensor_store,
                 latent_pool=latent_pool,
@@ -955,25 +946,20 @@ def _open_group(
             )
             _consume_predicates(
                 active_calls,
-                completion_group,
                 tensor_store=tensor_store,
                 model_runner=model_runner,
                 state=state,
             )
             _publish_predicated_outputs(
                 scheduled,
-                completion_group,
                 tensor_store=tensor_store,
                 state=state,
             )
-            state.group_registered[completion_group] = True
-            record_component(
-                state.group_component_us[completion_group], "open_lane", started
-            )
-            return completion_group
+            state.registered = True
+            record_component(state.component_us, "open_lane", started)
+            return None
         except BaseException:
-            _discard_group(
-                completion_group,
+            discard_batch(
                 kv_cache=kv_cache,
                 tensor_store=tensor_store,
                 latent_pool=latent_pool,
@@ -985,7 +971,7 @@ def _open_group(
 
 
 def _completion_words(scheduled: tuple[Call, ...]) -> int:
-    """Compute completion-word capacity for one completion group."""
+    """Compute completion-word capacity for one batch."""
     # Completion storage is addressed in 4-byte words; payload byte budgets
     # round up to whole words.
     return max(
@@ -1000,7 +986,6 @@ def _completion_words(scheduled: tuple[Call, ...]) -> int:
 
 def _reserve_host_tasks(
     scheduled: tuple[Call, ...],
-    completion_group: int,
     *,
     state: BatchState,
     host_tasks: HostLane,
@@ -1040,9 +1025,7 @@ def _reserve_host_tasks(
         ):
             continue
 
-        pending = state.pending_output(
-            completion_group, call.request_key.request_id
-        )
+        pending = state.pending_output(call.request_key.request_id)
         if pending.completion_tasks:
             raise invalid_descriptor(
                 "materialization repeats its CPU task identity"
@@ -1077,7 +1060,7 @@ def validate_batch(
     config: WorkerConfig,
     predecessors: Mapping[CallId, CallId | None],
 ) -> None:
-    """Validate batch identity, completion group resources, routing.
+    """Validate batch identity, batch resources, routing.
 
     and call support before staging.
     """
@@ -1143,7 +1126,6 @@ def validate_batch(
 
 def _reserve_outputs(
     scheduled: tuple[Call, ...],
-    completion_group: int,
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -1164,9 +1146,7 @@ def _reserve_outputs(
 
     for call in scheduled:
         device = model_runner.call_devices(call)[2]
-        request = state.pending_output(
-            completion_group, call.request_key.request_id
-        )
+        request = state.pending_output(call.request_key.request_id)
         predicated = request.status is CallStatus.PREDICATED
 
         if not predicated:
@@ -1227,7 +1207,7 @@ def _reserve_outputs(
 
     request_slots = {
         request.request.request_key: int(request.request.request_pool_idx)
-        for request in state.pending_outputs(completion_group)
+        for request in state.pending_outputs()
     }
     allocations = {
         params.buffer: params for params in state.batch.buffer_allocations
@@ -1244,7 +1224,7 @@ def _reserve_outputs(
     for binding in bound_groups:
         for write in binding:
             request = state.pending_output(
-                completion_group, write.reference.request_key.request_id
+                write.reference.request_key.request_id
             )
             request.writes.append(write)
 
@@ -1252,9 +1232,7 @@ def _reserve_outputs(
         tuple(encoder_bindings), buffer_allocations=allocations
     )
     for write in features:
-        request = state.pending_output(
-            completion_group, write.reference.request_key.request_id
-        )
+        request = state.pending_output(write.reference.request_key.request_id)
         request.writes.append(write)
 
     # Classify each bound write against its producer's declared output roles.
@@ -1269,9 +1247,7 @@ def _reserve_outputs(
                 "device output binding has no computation in the execution "
                 "batch"
             )
-        request = state.pending_output(
-            completion_group, producer.request_key.request_id
-        )
+        request = state.pending_output(producer.request_key.request_id)
         if write.reference == producer.token_output:
             request.token_write = write
         elif write.reference == producer.transition_output:
@@ -1287,7 +1263,6 @@ def _reserve_outputs(
 
 def _consume_predicates(
     scheduled: tuple[Call, ...],
-    completion_group: int,
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -1332,16 +1307,13 @@ def _consume_predicates(
             # I64 predicates are relay tags carrying a predecessor's decision;
             # U8 predicates are plain completion booleans.
             tagged = predicate.dtype is DType.I64
-            request = state.pending_output(
-                completion_group, call.request_key.request_id
-            )
+            request = state.pending_output(call.request_key.request_id)
             request.device_reads.append(read)
             request.predicate = (read.tensor, tagged)
 
 
 def _publish_predicated_outputs(
     scheduled: tuple[Call, ...],
-    completion_group: int,
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -1351,9 +1323,7 @@ def _publish_predicated_outputs(
     calls.
     """
     for call in scheduled:
-        request = state.pending_output(
-            completion_group, call.request_key.request_id
-        )
+        request = state.pending_output(call.request_key.request_id)
         if request.status is CallStatus.PREDICATED:
             for write in (request.completion_write, request.transition_write):
                 if write is not None:
@@ -1362,7 +1332,6 @@ def _publish_predicated_outputs(
 
 def _bind_latent_inputs(
     scheduled: tuple[Call, ...],
-    completion_group: int,
     *,
     state: BatchState,
     latent_pool: LatentPool | None,
@@ -1385,7 +1354,7 @@ def _bind_latent_inputs(
     requests = {
         calls.call_identity(call): (
             call,
-            state.pending_output(completion_group, call.request_key.request_id),
+            state.pending_output(call.request_key.request_id),
         )
         for call in scheduled
     }
@@ -1398,7 +1367,7 @@ def _bind_latent_inputs(
             selected = requests.get(identity)
             if selected is None:
                 raise invalid_descriptor(
-                    "latent params names a call outside its completion group"
+                    "latent params names a call outside its batch"
                 )
             call, request = selected
             if params.page_table or params.latent_units:
@@ -1439,7 +1408,7 @@ def _bind_latent_inputs(
         selected = requests.get(identity)
         if selected is None:
             raise invalid_descriptor(
-                "latent params names a call outside its completion group"
+                "latent params names a call outside its batch"
             )
         call, request = selected
         slot = int(request.request.request_pool_idx)
@@ -1528,14 +1497,13 @@ def _bind_latent_inputs(
     )
 
     for (identity, params, slot), value in zip(rows, staged, strict=True):
-        request = state.pending_output(completion_group, identity[0].request_id)
+        request = state.pending_output(identity[0].request_id)
         request.input_latent_params = params
         request.latent_staging = value
 
 
 def _bind_cache_tables(
     scheduled: tuple[Call, ...],
-    completion_group: int,
     *,
     state: BatchState,
     kv_cache: CacheManager | None,
@@ -1551,11 +1519,11 @@ def _bind_cache_tables(
     inputs = state.batch
     identities = {calls.call_identity(call) for call in scheduled}
 
-    # Tables are needed for every slot this group reads or writes: its own
+    # Tables are needed for every slot this batch reads or writes: its own
     # requests plus any alternative-prefix rows of its forward calls.
     slots = {
         state.pending_output(
-            completion_group, call.request_key.request_id
+            call.request_key.request_id
         ).request.request_pool_idx
         for call in scheduled
     }
@@ -1606,7 +1574,7 @@ def _bind_cache_tables(
         initialized = {
             page
             for write in state.cache_imports.values()
-            if (write.request_pool_idx, write.group_id)
+            if (write.request_pool_idx, write.publication.group_id)
             == (allocation.request_pool_idx, allocation.group_id)
             for page in write.initialized_pages
         }
@@ -1615,7 +1583,7 @@ def _bind_cache_tables(
             tuple(page for page in pages if page not in initialized),
         )
 
-    # Indices refer to the original completion group columns, including when
+    # Indices refer to the original batch columns, including when
     # inactive call kinds were filtered from the cache-registration view.
     rows_by_call: dict[CallIdentity, list[int]] = defaultdict(list)
     for row, index in enumerate(inputs.forward_call_indices):
@@ -1623,14 +1591,10 @@ def _bind_cache_tables(
         rows_by_call[identity].append(row)
 
     for call in scheduled:
-        request = state.pending_output(
-            completion_group, call.request_key.request_id
-        )
+        request = state.pending_output(call.request_key.request_id)
         main_slot = int(request.request.request_pool_idx)
         call_rows = rows_by_call.get(calls.call_identity(call), [])
-        state.group_forward_indices[completion_group][
-            calls.call_identity(call)
-        ] = tuple(call_rows)
+        state.forward_indices[calls.call_identity(call)] = tuple(call_rows)
 
         main_descriptor = next(
             (
@@ -1681,19 +1645,14 @@ def _bind_cache_tables(
                     if inputs.write_kv[descriptor]
                     else inputs.query_lens[descriptor]
                 ),
-                completion=state.group_buffers[
-                    completion_group
-                ].completion_future(),
+                completion=state.output_buffer.completion_future(),
             )
 
-    record_component(
-        state.group_component_us[completion_group], "bc_tables", started
-    )
+    record_component(state.component_us, "bc_tables", started)
 
 
 def _stage_input_products(
     input_products: Sequence[TensorPublication],
-    completion_group: int,
     *,
     state: BatchState,
     kv_cache: CacheManager | None,
@@ -1705,7 +1664,7 @@ def _stage_input_products(
 
     stores.
     """
-    # KV imports consumed by this group must be complete and conflict-free
+    # KV imports consumed by this batch must be complete and conflict-free
     # before any transferred product is published.
     cache_inputs = {call.kv_input for call in state.batch.calls}
     for buffer, write in state.cache_imports.items():
@@ -1745,12 +1704,10 @@ def _stage_input_products(
             )
             if len(consumers) != 1:
                 raise invalid_descriptor(
-                    "latent transfer must have one completion group consumer"
+                    "latent transfer must have one batch consumer"
                 )
 
-            row = state.pending_output(
-                completion_group, consumers[0].request_key.request_id
-            )
+            row = state.pending_output(consumers[0].request_key.request_id)
             params = row.input_latent_params
             staging = row.latent_staging
             if params is None or staging is None:
@@ -1767,9 +1724,7 @@ def _stage_input_products(
                     "latent transfer disagrees with its scheduler params"
                 )
 
-            request = state.pending_output(
-                completion_group, product.request_key.request_id
-            )
+            request = state.pending_output(product.request_key.request_id)
             if int(calls.require_progress(request).flow_step) != 0:
                 raise invalid_descriptor(
                     "latent transfer destination already owns a trajectory"
@@ -1811,7 +1766,7 @@ def _stage_input_products(
         )
         if not consumers:
             raise invalid_descriptor(
-                "transferred product has no completion group consumer"
+                "transferred product has no batch consumer"
             )
 
         devices = {model_runner.call_devices(call)[0] for call in consumers}

@@ -8,7 +8,7 @@ from importlib import import_module
 
 from torch import nn
 
-from uniserve.distributed import Communicator, DeviceMesh
+from uniserve.distributed import Communicator, DeviceMesh, communicators
 from uniserve.model import (
     AudioDecoder,
     CausalLM,
@@ -297,9 +297,14 @@ def validate_components(
     components: Mapping[str, ComponentConfig],
     *,
     entries: Mapping[str, ComponentEntry] | None = None,
+    declarations: dict[str, tuple[Call, ...]] | None = None,
 ) -> dict[str, tuple[Call, ...]]:
     """Validate physical placement before loading weights or creating groups."""
-    declared = describe_components(model, entries=entries)
+    declared = (
+        describe_components(model, entries=entries)
+        if declarations is None
+        else declarations
+    )
     unknown = components.keys() - declared.keys()
     if unknown:
         raise unsupported_setup(f"unknown components {sorted(unknown)}")
@@ -356,6 +361,7 @@ def bind_components(
     bindings: Mapping[str, ComponentBinding],
     *,
     entries: Mapping[str, ComponentEntry] | None = None,
+    declarations: dict[str, tuple[Call, ...]] | None = None,
 ) -> None:
     """Borrow methods and communicator views for each local component.
 
@@ -365,6 +371,7 @@ def bind_components(
         model,
         {name: binding.config for name, binding in bindings.items()},
         entries=entries,
+        declarations=declarations,
     )
     for name, binding in bindings.items():
         binding.calls = ()
@@ -381,22 +388,15 @@ def bind_components(
             if stage == "last" and pipeline.rank != pipeline.size - 1:
                 continue
 
-            groups = {}
-            for role in call.entry_point.groups:
-                axes = (
-                    tuple(
-                        axis
-                        for axis in mesh.axes
-                        if axis.startswith("cp")
-                        or (role == "sp" and axis == "ulysses")
-                    )
-                    if role in {"cp", "sp"}
-                    else (role,)
-                )
+            groups = {
+                group._require(): group
+                for group in communicators(call.module)
+                if stage == "all" or "pp" not in group.name.split(".")
+            }
+            for axes in call.entry_point.communication_axes(mesh):
                 group = mesh.get_group(axes)
-                # Roles resolving to the same rank set share one group.
                 if group.size > 1:
-                    groups[group.ranks] = group
+                    groups[group._require()] = group
             calls.append(replace(call, groups=tuple(groups.values())))
 
         binding.calls = tuple(calls)

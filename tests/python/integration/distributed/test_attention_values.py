@@ -159,6 +159,7 @@ def _context(rank, rendezvous, gpu):
                     ranks=(3, 1, 0, 2), shape=shape, axes=axes, rank=rank
                 ),
                 device=device,
+                axes=(*((axis,) for axis in axes), axes),
             )
             tokens = mesh.get_group(axes)
             layer = Attention(8, 2, 64, cache_name="attention")

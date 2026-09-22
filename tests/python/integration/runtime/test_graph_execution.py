@@ -113,11 +113,16 @@ def test_denoising_reprepared_constants_and_slot_sizes_advance_one_step(
 
             runner.warmup(inputs(0), schedules, state={}, input_key=key)
             torch.testing.assert_close(sample, reference, rtol=0, atol=0)
+            trajectory = runner.bind_inputs(
+                key,
+                tuple(inputs(step) for step in (0, 1)),
+                schedules,
+                state={"image": sample},
+                slot=slot,
+            )
             for step in (0, 1):
                 reference.add_(0.5 * (reference * 0.25 + size.offset))
-                actual, _ = runner.step(
-                    inputs(step), schedules, state={}, slot=slot, input_key=key
-                )
+                actual, _ = runner.step(trajectory, step)
                 torch.testing.assert_close(
                     actual["image"][0], reference, rtol=1e-6, atol=1e-6
                 )
@@ -128,72 +133,6 @@ def test_denoising_reprepared_constants_and_slot_sizes_advance_one_step(
         runner.close()
         if partition is not None:
             partition.close()
-
-
-@torch.inference_mode()
-def test_one_captured_ladder_serves_a_slot_that_owns_host_state():
-    """A slot's own host storage does not give that slot its own ladder.
-
-    Preparation draws each request slot's noise into storage that slot owns
-    and no bank holds, and hands the same mapping to the step. A ladder
-    captured while one slot is resident must still replay for the next slot:
-    if the slot's own addresses reached the capture, every slot would pay a
-    capture of its own and a deployment's graphs would scale with residency.
-    """
-    device = torch.device("cuda:0")
-    model = LinearDenoiser().to(device)
-    steps = 2
-    schedules = model.make_schedules(steps, shift=1.0, device=device)
-    size = Size(32, 2.0)
-    runner = DenoisingRunner(
-        model,
-        device=device,
-        stream=torch.cuda.Stream(device=device),
-        groups=(),
-        capacity=2,
-        shapes=2,
-    )
-    bank = torch.zeros((2, 64), device=device)
-    runner.bind_bank({"image": bank})
-    # One draw per slot, in the slot's own host storage, as preparation makes
-    # it: outside every bank and at a different address for every slot.
-    draws = {
-        slot: torch.zeros(32, dtype=torch.float32).pin_memory()
-        for slot in (1, 2)
-    }
-    try:
-        runner.prepare_inputs(size, size)
-        samples = {slot: bank[slot - 1, :32] for slot in (1, 2)}
-        for sample in samples.values():
-            sample.fill_(7.0)
-
-        def call(runner_method, slot, step):
-            return runner_method(
-                DenoiserInput(
-                    {
-                        "image": (
-                            LatentInput(
-                                samples[slot],
-                                schedules["image"].timesteps[step],
-                            ),
-                        )
-                    },
-                    (size,),
-                    step,
-                ),
-                schedules,
-                state={"image_noise": draws[slot]},
-                slot=slot,
-                input_key=size,
-            )
-
-        for step in range(steps):
-            call(runner.capture, 1, step)
-        paths = [call(runner.step, 2, step)[1] for step in range(steps)]
-        assert paths == ["graph_replay"] * steps
-    finally:
-        torch.cuda.current_stream(device).synchronize()
-        runner.close()
 
 
 @torch.inference_mode()
@@ -212,29 +151,40 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
     size = Size(32, 2.0)
     slots = (1, 2)
 
+    draws = {
+        slot: torch.zeros(32, dtype=torch.float32).pin_memory()
+        for slot in slots
+    }
+
+    def bind(runner, samples, slot):
+        return runner.bind_inputs(
+            size,
+            tuple(
+                DenoiserInput(
+                    {
+                        "image": (
+                            LatentInput(
+                                samples[slot],
+                                schedules["image"].timesteps[step],
+                            ),
+                        )
+                    },
+                    (size,),
+                    step,
+                )
+                for step in range(steps)
+            ),
+            schedules,
+            state={"image": samples[slot], "image_noise": draws[slot]},
+            slot=slot,
+        )
+
     def ladder(runner, samples):
-        """Advance every slot one full ladder and report its step paths."""
         values, paths = {}, []
         for slot in slots:
+            trajectory = bind(runner, samples, slot)
             for step in range(steps):
-                result, path = runner.step(
-                    DenoiserInput(
-                        {
-                            "image": (
-                                LatentInput(
-                                    samples[slot],
-                                    schedules["image"].timesteps[step],
-                                ),
-                            )
-                        },
-                        (size,),
-                        step,
-                    ),
-                    schedules,
-                    state={},
-                    slot=slot,
-                    input_key=size,
-                )
+                result, path = runner.step(trajectory, step)
                 paths.append(path)
             values[slot] = result["image"][0].clone()
         return values, paths
@@ -269,25 +219,9 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
             sample.fill_(7.0)
         for slot in slots:
             resting = samples[slot].clone()
+            trajectory = bind(runner, samples, slot)
             for step in range(steps):
-                runner.capture(
-                    DenoiserInput(
-                        {
-                            "image": (
-                                LatentInput(
-                                    samples[slot],
-                                    schedules["image"].timesteps[step],
-                                ),
-                            )
-                        },
-                        (size,),
-                        step,
-                    ),
-                    schedules,
-                    state={},
-                    slot=slot,
-                    input_key=size,
-                )
+                runner.capture(trajectory, step)
             # Capture must leave the slot's samples where it found them.
             torch.testing.assert_close(samples[slot], resting, rtol=0, atol=0)
 

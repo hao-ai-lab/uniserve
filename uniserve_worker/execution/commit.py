@@ -46,9 +46,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _commit_group(
+def commit_batch(
     batch_id: int,
-    completion_group: int,
     outcomes: tuple[PendingOutput, ...],
     started: int,
     *,
@@ -61,26 +60,19 @@ def _commit_group(
     decode_state: DecodeState | None,
     config: WorkerConfig,
 ) -> None:
-    """Atomically publish validated completion group resources.
-
-    execution progress, and output records.
-    """
-    with state.group_scope(completion_group):
+    """Publish validated resources, execution progress and batch outputs."""
+    with state.scope():
         commit_started = time.perf_counter_ns()
         calls = state.batch.calls
 
         # All device reads must finish and every staged resource must validate
         # before completion storage becomes immutable or any publication becomes
         # visible.
-        _finish_device_reads(
-            completion_group, tensor_store=tensor_store, state=state
-        )
-        _publish_predicates(
-            completion_group, tensor_store=tensor_store, state=state
-        )
+        _finish_device_reads(tensor_store=tensor_store, state=state)
+        _publish_predicates(tensor_store=tensor_store, state=state)
         writes = tuple(
             write
-            for request in state.pending_outputs(completion_group)
+            for request in state.pending_outputs()
             for write in request.writes
         )
         tensor_store.validate_writes(writes)
@@ -89,7 +81,7 @@ def _commit_group(
                 raise RuntimeError("latent publication has no physical pool")
         else:
             latent_pool.validate_updates(outcomes)
-        state.group_buffers[completion_group].seal()
+        state.output_buffer.seal()
 
         # Prepare the execution result without mutating resident state.
         records: list[PendingOutput] = []
@@ -97,7 +89,7 @@ def _commit_group(
         for row, (call, request, outcome) in enumerate(
             zip(
                 calls,
-                state.pending_outputs(completion_group),
+                state.pending_outputs(),
                 outcomes,
                 strict=True,
             )
@@ -148,7 +140,7 @@ def _commit_group(
             records.append(pending)
 
         record_component(
-            state.group_component_us[completion_group],
+            state.component_us,
             "commit_lane",
             commit_started,
         )
@@ -156,23 +148,21 @@ def _commit_group(
         # Prepare cross-resource commit records first so no publication is
         # visible until every participating owner has accepted its state
         # transition.
-        execution_us = (
-            time.perf_counter_ns() - state.group_started_ns[completion_group]
-        ) // 1000
+        execution_us = (time.perf_counter_ns() - state.started_ns) // 1000
         stats = _forward_stats(
-            state.group_forward_stats[completion_group],
-            state.group_component_us[completion_group],
+            state.forward_stats,
+            state.component_us,
         )
 
         cache_publications = kv_cache
         publications = tuple(
             request.cache_publication
-            for request in state.pending_outputs(completion_group)
+            for request in state.pending_outputs()
             if request.cache_publication is not None
         )
         installations = tuple(
             request.cache_installation
-            for request in state.pending_outputs(completion_group)
+            for request in state.pending_outputs()
             if request.cache_installation is not None
         )
         if cache_publications is None:
@@ -187,17 +177,17 @@ def _commit_group(
 
         tensor_exports = {
             buffer: locations
-            for request in state.pending_outputs(completion_group)
+            for request in state.pending_outputs()
             for buffer, locations in request.tensor_exports.items()
         }
         cache_exports = {
             buffer: locations
-            for request in state.pending_outputs(completion_group)
+            for request in state.pending_outputs()
             for buffer, locations in request.cache_exports.items()
         }
         latent_exports = {
             buffer: locations
-            for request in state.pending_outputs(completion_group)
+            for request in state.pending_outputs()
             for buffer, locations in request.latent_exports.items()
         }
 
@@ -215,16 +205,16 @@ def _commit_group(
             else:
                 validate_exports(owner.exports, exports)
 
-        # From this point the completion group cannot be discarded: apply
+        # From this point the batch cannot be discarded: apply
         # resource commits, then reserve the request publication that gates
         # successor readiness.
-        state.group_published[completion_group] = True
+        state.published = True
         tensor_store.commit_writes(writes)
 
         if latent_pool is not None:
             latent_pool.apply_updates(outcomes)
         if cache_publications is not None:
-            cache_publications.commit_publications(publications, installations)
+            cache_publications.apply_publications(publications, installations)
 
         tensor_store.exports.update(tensor_exports)
         if kv_cache is not None:
@@ -232,16 +222,13 @@ def _commit_group(
         if latent_pool is not None:
             latent_pool.exports.update(latent_exports)
 
-        _commit_runtime_states(
-            completion_group, decode_state=decode_state, state=state
-        )
+        _commit_runtime_states(decode_state=decode_state, state=state)
 
-        for request in state.pending_outputs(completion_group):
+        for request in state.pending_outputs():
             request.release_execution_references()
 
         request_pool.add_pending(records)
         state.record_outputs(
-            completion_group,
             tuple(records),
             products=tuple(report_products),
             visible=True,
@@ -251,7 +238,6 @@ def _commit_group(
 
 
 def _commit_runtime_states(
-    completion_group: int,
     *,
     state: BatchState,
     decode_state: DecodeState | None,
@@ -260,7 +246,7 @@ def _commit_runtime_states(
 
     results.
     """
-    requests = state.pending_outputs(completion_group)
+    requests = state.pending_outputs()
     states = decode_state
     if states is None:
         if any(
@@ -336,8 +322,7 @@ def _commit_runtime_states(
             )
 
 
-def _discard_group(
-    completion_group: int,
+def discard_batch(
     error: BaseException | None = None,
     *,
     state: BatchState,
@@ -347,23 +332,19 @@ def _discard_group(
     media_mux: MediaMux | None,
     transfer_backends: Mapping[str, Transport],
 ) -> None:
-    """Release all provisional completion group resources that have not crossed.
+    """Release all provisional batch resources that have not crossed.
 
     publication visibility.
     """
-    with state.group_scope(completion_group):
-        if state.group_published[completion_group]:
-            raise RuntimeError(
-                "published completion group state cannot be discarded"
-            )
-        _finish_device_reads(
-            completion_group, tensor_store=tensor_store, state=state
-        )
+    with state.scope():
+        if state.published:
+            raise RuntimeError("published batch state cannot be discarded")
+        _finish_device_reads(tensor_store=tensor_store, state=state)
 
         # Cancellation uses the same producer fence as successful CPU work.
-        state.group_buffers[completion_group].seal()
+        state.output_buffer.seal()
 
-        for pending in state.pending_outputs(completion_group):
+        for pending in state.pending_outputs():
             pending.abandon()
 
         if media_mux is not None:
@@ -371,12 +352,12 @@ def _discard_group(
                 if call.kind is MediaCall.LATENT_PREPARATION:
                     media_mux.drop(int(call.request_key.request_id))
 
-        state.group_buffers[completion_group].abandon()
+        state.output_buffer.abandon()
 
         tensor_store.abandon_writes(
             tuple(
                 write
-                for request in state.pending_outputs(completion_group)
+                for request in state.pending_outputs()
                 for write in request.writes
             )
         )
@@ -390,7 +371,7 @@ def _discard_group(
 
         imported_slots = tuple(
             int(request.request.request_pool_idx)
-            for request in state.pending_outputs(completion_group)
+            for request in state.pending_outputs()
             if request.latent_imported
         )
         if latent_pool is not None and imported_slots:
@@ -408,13 +389,13 @@ def _discard_group(
         _release_locators(
             tuple(
                 locator
-                for request in state.pending_outputs(completion_group)
+                for request in state.pending_outputs()
                 for locator in request.exported_locators
             ),
             transfer_backends=transfer_backends,
         )
 
-        for request in state.pending_outputs(completion_group):
+        for request in state.pending_outputs():
             request.release_execution_references()
 
 
@@ -434,7 +415,7 @@ def _validate_completion_products(
 
 
 def _publish_predicates(
-    completion_group: int, *, state: BatchState, tensor_store: TensorStore
+    *, state: BatchState, tensor_store: TensorStore
 ) -> None:
     """Publish predicate outputs after their producing calls have.
 
@@ -442,7 +423,7 @@ def _publish_predicates(
     """
     writes = tuple(
         request.completion_write
-        for request in state.pending_outputs(completion_group)
+        for request in state.pending_outputs()
         if request.status is not CallStatus.PREDICATED
         and request.completion_write is not None
         and not request.completion_write.producer_recorded
@@ -465,12 +446,12 @@ def _publish_predicates(
 
 
 def _finish_device_reads(
-    completion_group: int, *, state: BatchState, tensor_store: TensorStore
+    *, state: BatchState, tensor_store: TensorStore
 ) -> None:
     """Complete actual consumer reads using that call's producer fence."""
     reads = tuple(
         read
-        for request in state.pending_outputs(completion_group)
+        for request in state.pending_outputs()
         for read in request.device_reads
     )
     if reads:
@@ -478,7 +459,7 @@ def _finish_device_reads(
         # ordered by the consuming call's output, never by source identity.
         after_writes = tuple(
             request.producer_write
-            for request in state.pending_outputs(completion_group)
+            for request in state.pending_outputs()
             for _read in request.device_reads
             if request.producer_write is not None
         )
@@ -491,12 +472,12 @@ def _finish_device_reads(
 
     feature_reads = tuple(
         read
-        for request in state.pending_outputs(completion_group)
+        for request in state.pending_outputs()
         for read in request.feature_reads
     )
     if feature_reads:
         tensor_store.complete_reads(feature_reads)
 
-    for request in state.pending_outputs(completion_group):
+    for request in state.pending_outputs():
         request.device_reads.clear()
         request.feature_reads.clear()

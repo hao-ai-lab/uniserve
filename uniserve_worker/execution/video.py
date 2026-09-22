@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from ..runtime.request import RequestPool
     from ..runtime.tensor_store import TensorStore
     from ..transfer.tickets import Transport
+    from .denoising_runner import DenoisingRunner
     from .model_runner import ModelRunner
 
 
@@ -146,14 +147,14 @@ def prepare_call(runner: ModelRunner, trajectory: VideoState, call, storage):
         runner.prepare_module(call.component, size.num_frames, method="forward")
         return trajectory.tensors["video_overlap"], runner.prepare_module(
             call.component, size.num_frames, method="decode"
-        )
+        ).context
 
     if kind is MediaCall.AUDIO_DECODING:
         decoder = runner.component(kind)
         frames = decoder.latent_frames(audio_samples(runner, size.num_frames))
         return {}, runner.prepare_module(
             call.component, frames, method="decode"
-        )
+        ).context
 
     return {}, None
 
@@ -297,14 +298,18 @@ def capture_denoising(
             for name in builder.denoiser.modalities:
                 views[name].zero_()
 
+        trajectory = denoising.bind_inputs(
+            size,
+            tuple(
+                builder.bind(size, views, schedules, index)
+                for index in range(builder.num_steps)
+            ),
+            schedules,
+            state=views,
+            slot=1,
+        )
         for index in range(builder.num_steps):
-            denoising.capture(
-                builder.bind(size, views, schedules, index),
-                schedules,
-                state=views,
-                slot=1,
-                input_key=size,
-            )
+            denoising.capture(trajectory, index)
 
 
 @torch.inference_mode()
@@ -523,7 +528,6 @@ def validate_batch(
 
 def execute(
     call: Call,
-    completion_group: int,
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -539,9 +543,7 @@ def execute(
     """
     if model_runner.video_postprocessor is None:
         raise invalid_descriptor("video execution requires a video model")
-    request = state.pending_output(
-        completion_group, call.request_key.request_id
-    )
+    request = state.pending_output(call.request_key.request_id)
     media = request.request.admission.diffusion
     if media is None:
         raise invalid_descriptor("video call has no admitted media dimensions")
@@ -624,7 +626,7 @@ def execute(
                     raise RuntimeError(
                         "module output has no execution statistics"
                     )
-                state.group_forward_stats[completion_group].append(result.stats)
+                state.forward_stats.append(result.stats)
                 if len(result.values) != 1:
                     raise invalid_descriptor(
                         "conditioning computation must return one Tensor"
@@ -647,18 +649,26 @@ def execute(
                 "video denoising requires one selected numerical step"
             )
 
-        result = model_runner.run_denoising(
-            model_runner.media_builder.bind(
-                numerical_shape, slot, trajectory.schedules, start_step
-            ),
-            trajectory.schedules,
-            state=slot,
-            slot=request.request.request_pool_idx,
-            input_key=numerical_shape,
-        )
+        if trajectory.denoising is None:
+            builder = model_runner.media_builder
+            trajectory.denoising = cast(
+                "DenoisingRunner", model_runner.denoising
+            ).bind_inputs(
+                numerical_shape,
+                tuple(
+                    builder.bind(
+                        numerical_shape, slot, trajectory.schedules, index
+                    )
+                    for index in range(builder.num_steps)
+                ),
+                trajectory.schedules,
+                state=slot,
+                slot=request.request.request_pool_idx,
+            )
+        result = model_runner.run_denoising(trajectory.denoising, start_step)
         if result.stats is None:
             raise RuntimeError("module output has no execution statistics")
-        state.group_forward_stats[completion_group].append(result.stats)
+        state.forward_stats.append(result.stats)
         request.progress = replace(
             calls.require_progress(request),
             flow_step=start_step + step_count,
@@ -674,7 +684,6 @@ def execute(
             products = transfer.publish_tensors(
                 call,
                 result.values,
-                completion_group,
                 tensor_store=tensor_store,
                 publication_transports=publication_transports,
                 state=state,
@@ -736,7 +745,7 @@ def execute(
             )
             if decoded.stats is None:
                 raise RuntimeError("module output has no execution statistics")
-            state.group_forward_stats[completion_group].append(decoded.stats)
+            state.forward_stats.append(decoded.stats)
             if len(decoded.values) != 1 or decoded.values[0].shape[0] != 1:
                 raise invalid_descriptor(
                     "video decoding reconstructs exactly one media unit"
@@ -769,7 +778,7 @@ def execute(
                 state=slot,
                 unit_count=count,
             )
-            state.group_forward_stats[completion_group].append(processed.stats)
+            state.forward_stats.append(processed.stats)
             # Concatenation borrows one flat byte span; the product row is
             # the unit's frames at the output raster, and a unit shorter than
             # the longest fills its row's leading frames.
@@ -802,7 +811,7 @@ def execute(
             )
             if result.stats is None:
                 raise RuntimeError("module output has no execution statistics")
-            state.group_forward_stats[completion_group].append(result.stats)
+            state.forward_stats.append(result.stats)
             if len(result.values) != 1:
                 raise invalid_descriptor(
                     "media decoder must return one numerical tensor"
@@ -814,7 +823,6 @@ def execute(
         products = transfer.publish_tensors(
             call,
             values,
-            completion_group,
             tensor_store=tensor_store,
             publication_transports=publication_transports,
             state=state,

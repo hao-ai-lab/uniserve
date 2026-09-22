@@ -147,7 +147,10 @@ table WorkerInfo {
   // startup rather than failing on its first publication.
   fabric_handles:bool = false;
   world_size:uint = 1;
-  configuration_id:string;
+  model_dtype:string;
+  attention_backend:string;
+  weight_formats:[string];
+  activation_formats:[string];
   components:[ComponentInfo];
   supported_calls:[CallKind];
   queue_depth:uint;

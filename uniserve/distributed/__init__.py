@@ -8,12 +8,14 @@ __all__ = [
     "Communicator",
     "DeviceMesh",
     "parallelize_",
+    "communication_axes",
+    "communicators",
 ]
 
 
 def __getattr__(name):
-    if name == "parallelize_":
-        from .parallelize import parallelize_
+    if name in {"parallelize_", "communication_axes", "communicators"}:
+        from . import parallelize
 
-        return parallelize_
+        return getattr(parallelize, name)
     raise AttributeError(name)

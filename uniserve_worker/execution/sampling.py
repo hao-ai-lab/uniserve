@@ -188,7 +188,7 @@ def sample_columns(
 
     retaining contiguous batch spans.
 
-    A completion group may select reordered rows or combine independent sampling
+    A batch may select reordered rows or combine independent sampling
     batches. Only those discontinuities require concatenation; no
     storage-address inspection or per-row tensor construction is needed for a
     contiguous span.

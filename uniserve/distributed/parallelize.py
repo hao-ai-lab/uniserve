@@ -30,6 +30,98 @@ from .distribution import Distribution
 from .mesh import DeviceMesh
 
 
+def communication_axes(
+    module: nn.Module,
+    mesh: DeviceMesh,
+    *,
+    attention: AttentionParallelConfig = AttentionParallelConfig(),
+) -> tuple[tuple[str, ...], ...]:
+    """Declare the fibers used by numerical partitioning and quantization.
+
+    This query reads an unpartitioned model, including a meta model. Runtime
+    owners create these groups on every rank before loading local parameters.
+    It does not create resources or depend on a rank's resident pipeline stage.
+    """
+    return tuple(
+        sorted(
+            {
+                axes
+                for requirements in _communication_axes(
+                    module, mesh, attention
+                ).values()
+                for axes in requirements
+            }
+        )
+    )
+
+
+def _communication_axes(module, mesh, attention):
+    from uniserve.model import Denoiser, Encoder, TransformerDecoder
+
+    requirements = {}
+
+    def visit(child, config, projected=False):
+        required = set()
+
+        def add(*axes):
+            selected = tuple(axis for axis in mesh.axes if axis in axes)
+            if mesh.size(selected) > 1:
+                required.add(selected)
+
+        if child is not module and isinstance(child, Encoder):
+            config = AttentionParallelConfig()
+        head = None if config.heads is None else config.heads.axis
+        context = None if config.context is None else config.context.gather_axis
+        tokens = tuple(axis for axis in mesh.axes if axis in (head, context))
+        if isinstance(child, (Denoiser, TransformerDecoder)):
+            add("pp")
+            add(*tokens)
+        if isinstance(child, (Attention, VsaAttention)):
+            add(head)
+            add(context)
+        if isinstance(child, (Linear, VocabParallelEmbedding)):
+            # Quantization reduces statistics across each sharded dimension.
+            for axis in tokens:
+                add(axis)
+            if isinstance(
+                child,
+                (
+                    ColumnParallelLinear,
+                    RowParallelLinear,
+                    VocabParallelEmbedding,
+                ),
+            ):
+                add("tp")
+            if isinstance(child, ColumnParallelLinear):
+                add(head) if projected else add(*tokens)
+        branches = (
+            isinstance(child, MergedColumnParallelLinear)
+            and child.branch_width is not None
+        )
+        if branches:
+            add("tp", head)
+        for nested in child.children():
+            visit(nested, config, projected or branches)
+        requirements[child] = tuple(sorted(required))
+
+    visit(module, attention)
+    return requirements
+
+
+def communicators(module: nn.Module) -> tuple:
+    """Read declared borrowed groups, deduplicated by physical instance.
+
+    Numerical bindings and custom modules expose ``communication_groups``.
+    No other module attributes participate in communication discovery.
+    """
+    groups = {}
+    for child in module.modules():
+        for group in getattr(child, "communication_groups", ()):
+            if group.size > 1:
+                groups[group._require()] = group
+    return tuple(groups.values())
+
+
 def _replicated_heads(mesh: DeviceMesh, heads: int) -> Distribution:
     """Factor TP into distinct KV heads and adjacent copies of each head."""
     index = mesh.axes.index("tp")
@@ -159,6 +251,11 @@ def parallelize_(
     # modules that remain reachable from the root.
     retained = {id(child) for child in module.modules()}
     modules = [child for child in modules if id(child) in retained]
+    requirements = _communication_axes(module, mesh, attention)
+    for child in modules:
+        child.communication_groups = tuple(
+            mesh.get_group(axes) for axes in requirements[child]
+        )
     for child in modules:
         if (
             isinstance(child, CausalLM)

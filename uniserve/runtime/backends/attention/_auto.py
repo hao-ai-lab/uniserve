@@ -203,6 +203,11 @@ class Backend(_Backend):
                 f"{__package__}.flash_attn_4"
             ).Backend()
 
+        # Replacement compatibility includes the resolved provider policy.
+        self.name = f"auto:sm{self._architecture}:" + ",".join(
+            sorted(self._factories)
+        )
+
     def _providers(self, dtype, head_dim, cache):
         # Native kernels require half precision and unquantized cache state.
         if dtype not in {torch.float16, torch.bfloat16} or (

@@ -170,6 +170,8 @@ class _FlashOperator(_Operator):
 
 
 class Backend(_Backend):
+    name = "flash_attn"
+
     operator_class = _FlashOperator
 
     def workspace_buffers(

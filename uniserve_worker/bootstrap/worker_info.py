@@ -275,7 +275,10 @@ class WorkerInfo:
     host_lane_capacity: int
     encoder_cache_entries: int = 0
     encoder_entry_bytes: int = 0
-    configuration_id: str = ""
+    model_dtype: str = ""
+    attention_backend: str = ""
+    weight_formats: tuple[str, ...] = ()
+    activation_formats: tuple[str, ...] = ()
     # Identity of the loaded checkpoint files, distinct from the resolved
     # execution configuration. The engine requires it from every rank that
     # serves a checkpoint; a model built in-process without one reports none.
@@ -429,7 +432,25 @@ class WorkerInfo:
                 data.get("num_inference_steps", 0),
                 f"{where}.num_inference_steps",
             ),
-            configuration_id=str(data.get("configuration_id", "")),
+            model_dtype=_str(
+                data.get("model_dtype", ""), f"{where}.model_dtype"
+            ),
+            attention_backend=_str(
+                data.get("attention_backend", ""), f"{where}.attention_backend"
+            ),
+            activation_formats=tuple(
+                _str(value, f"{where}.activation_formats")
+                for value in _seq(
+                    data.get("activation_formats", ()),
+                    f"{where}.activation_formats",
+                )
+            ),
+            weight_formats=tuple(
+                _str(value, f"{where}.weight_formats")
+                for value in _seq(
+                    data.get("weight_formats", ()), f"{where}.weight_formats"
+                )
+            ),
             checkpoint_identity=_str(
                 data.get("checkpoint_identity", ""),
                 f"{where}.checkpoint_identity",
@@ -518,7 +539,10 @@ class WorkerInfo:
             "transfer_backends": list(self.transfer_backends),
             "fabric_handles": self.fabric_handles,
             "world_size": self.world_size,
-            "configuration_id": self.configuration_id,
+            "model_dtype": self.model_dtype,
+            "attention_backend": self.attention_backend,
+            "weight_formats": list(self.weight_formats),
+            "activation_formats": list(self.activation_formats),
             "checkpoint_identity": self.checkpoint_identity,
             "components": [
                 component.to_mapping() for component in self.components

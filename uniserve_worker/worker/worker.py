@@ -17,7 +17,7 @@ from torch import nn
 
 from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
-from uniserve.model import DEFAULT_COMPONENT, CausalLM, VideoPostprocessor
+from uniserve.model import CausalLM, VideoPostprocessor
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.profiling import profile_range
 from uniserve.quantization import Quantizer
@@ -183,7 +183,7 @@ class Worker:
         returned worker owns those resources until its context exits or the
         caller closes it.
         """
-        source = prepare_worker_model(config)
+        source, description, declarations = prepare_worker_model(config)
 
         # Mathematical constraints are checked before physical groups exist.
         try:
@@ -203,20 +203,32 @@ class Worker:
         try:
             try:
                 bindings = initialize_components(
-                    distributed, dict(config.components)
+                    distributed,
+                    dict(config.components),
+                    declarations=declarations,
                 )
             except ValueError as error:
                 raise unsupported_setup(str(error)) from error
 
-            loaded = load_worker_model(config, bindings, source=source)
+            loaded = load_worker_model(
+                config,
+                bindings,
+                source=source,
+                description=description,
+                declarations=declarations,
+            )
 
             # Sampling uses the language model's TP group, independently of
             # other components' parallel layouts. Backend selection belongs
             # to the runner.
-            model_mesh = (
-                bindings[DEFAULT_COMPONENT].mesh
-                if DEFAULT_COMPONENT in bindings
-                else None
+            model_mesh = next(
+                (
+                    bindings[name].mesh
+                    for name, calls in declarations.items()
+                    if name in bindings
+                    and any(isinstance(call.module, CausalLM) for call in calls)
+                ),
+                None,
             )
             sampling_group = (
                 None if model_mesh is None else model_mesh.get_group("tp")
@@ -229,6 +241,7 @@ class Worker:
                 loaded.model,
                 bindings=bindings,
                 sampling_group=sampling_group,
+                entry_points=loaded.entry_points,
                 worker_config=loaded.config,
                 tokenizer=loaded.tokenizer,
                 image_processor=loaded.image_processor,
@@ -279,6 +292,7 @@ class Worker:
         process_groups: ProcessGroups | None = None,
         bindings: Mapping[str, ComponentBinding] | None = None,
         checkpoint_identity: str = "",
+        entry_points=None,
     ) -> None:
         """Allocate execution resources for an already-loaded model.
 
@@ -343,6 +357,7 @@ class Worker:
                 worker_config,
                 bindings=bindings,
                 attention=attention,
+                entry_points=entry_points,
                 image_processor=image_processor,
                 flow_prompt=flow_prompt,
                 max_inflight=queue_depth,
@@ -350,8 +365,7 @@ class Worker:
             self.runner = runner
             startup.callback(runner.close)
 
-            attention = runner.attention
-            self.attention = attention
+            self.attention = runner.attention
 
             # Measure the remaining grant after the runner binds persistent
             # model inputs and workspaces. Sizing earlier would treat
@@ -387,10 +401,7 @@ class Worker:
                 transfer_backends=transfer_backends,
                 components=components,
                 checkpoint_identity=checkpoint_identity,
-                attention_identity=(
-                    f"{type(attention).__module__}."
-                    f"{type(attention).__qualname__}"
-                ),
+                attention_backend=runner.attention.name,
                 # The scheduler's page indices are shared across all
                 # resident layer and head regions, including stages with
                 # different memory grants.

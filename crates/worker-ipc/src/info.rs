@@ -172,9 +172,17 @@ pub struct WorkerInfo {
     pub fabric_handles: bool,
     /// Number of physical members in this Worker.
     pub world_size: u32,
-    /// Stable identity of the expanded component configuration.
+    /// Resolved compute dtype and attention selection, compared per rank on restart.
     #[serde(default)]
-    pub configuration_id: String,
+    pub model_dtype: String,
+    #[serde(default)]
+    pub attention_backend: String,
+    /// Numerical weight storage formats present on this rank.
+    #[serde(default)]
+    pub weight_formats: Vec<String>,
+    /// Resolved activation quantization formats on this physical rank.
+    #[serde(default)]
+    pub activation_formats: Vec<String>,
     /// Identity of the loaded checkpoint files: the lowercase hex SHA-256 the
     /// checkpoint identity rule defines over the checkpoint directory. The
     /// weightless stub model reports none; every other worker must.
@@ -399,7 +407,10 @@ impl Default for WorkerInfo {
             world_size: 1,
             device: "cpu".into(),
             transfer_backends: vec!["local".into()],
-            configuration_id: String::new(),
+            model_dtype: String::new(),
+            attention_backend: String::new(),
+            weight_formats: Vec::new(),
+            activation_formats: Vec::new(),
             checkpoint_identity: "0".repeat(64),
             components: Vec::new(),
             supported_calls: vec![

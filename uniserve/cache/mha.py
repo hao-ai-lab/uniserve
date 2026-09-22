@@ -14,29 +14,7 @@ from uniserve.tensors import BufferConfig
 
 from ._fp8 import rescale_
 from .state import State as PrefixState
-from .state import StateConfig, _blocks
-
-
-def _spans(
-    blocks: tuple[int, ...], start: int, length: int, block_size: int
-) -> tuple[tuple[int, int, int], ...]:
-    """Split a token interval into ``(block, offset, count)`` segments."""
-    if (
-        type(start) is not int
-        or type(length) is not int
-        or start < 0
-        or length < 0
-        or start + length > len(blocks) * block_size
-    ):
-        raise ValueError("token interval exceeds its block table")
-    spans = []
-    while length:
-        logical, offset = divmod(start, block_size)
-        count = min(length, block_size - offset)
-        spans.append((blocks[logical], offset, count))
-        start += count
-        length -= count
-    return tuple(spans)
+from .state import StateConfig, _blocks, block_spans, decode_region
 
 
 @dataclass(frozen=True)
@@ -229,7 +207,7 @@ class State(PrefixState):
         Over the interval.
         """
         _blocks(block_ids, self.key.shape[0])
-        spans = _spans(block_ids, start, length, self.block_size)
+        spans = block_spans(block_ids, start, length, self.block_size)
 
         outputs = []
         for name in ("key", "value"):
@@ -328,7 +306,7 @@ class State(PrefixState):
             )
 
         _blocks(block_ids, self.key.shape[0])
-        spans = _spans(block_ids, start, key.shape[0], self.block_size)
+        spans = block_spans(block_ids, start, key.shape[0], self.block_size)
         written = 0
         for block, offset, count in spans:
             interval = (
@@ -478,7 +456,7 @@ class State(PrefixState):
     ) -> Mapping[str, tuple[torch.Tensor, ...]]:
         """Borrow one encoded storage view per physical field and span."""
         _blocks(block_ids, self.key.shape[0])
-        spans = _spans(block_ids, start, length, self.block_size)
+        spans = block_spans(block_ids, start, length, self.block_size)
         result = {}
         for name, tensor in self._storage().items():
             result[name] = tuple(
@@ -523,48 +501,8 @@ class State(PrefixState):
         if not all(shape):
             return
 
-        if isinstance(source, QuantizedTensor):
-            if source.quantizer.format != "fp8":
-                raise ValueError(
-                    "MHA transfer requires dense or FP8 source storage"
-                )
-            fields = source.buffers()
-
-            values = (
-                workspace["values"]
-                .flatten()[: fields["values"][source_slice].numel()]
-                .view(shape)
-            )
-            if values.dtype != torch.float32 or values.device != target.device:
-                raise ValueError(
-                    "conversion workspace must provide FP32 values on the "
-                    "target device"
-                )
-            values.copy_(fields["values"][source_slice])
-            scale = (
-                fields["scale"]
-                if source.quantizer.axis is None
-                else fields["scale"][source_slice[0]]
-            )
-            values.mul_(scale.to(target.device))
-
-            # Encoded sources round through their logical dtype before the
-            # destination encoding is applied.
-            if source.dtype != torch.float32:
-                rounded = (
-                    workspace["rounded"].flatten()[: values.numel()].view(shape)
-                )
-                if (
-                    rounded.dtype != source.dtype
-                    or rounded.device != target.device
-                ):
-                    raise ValueError(
-                        "rounding workspace must match the source's logical "
-                        "dtype"
-                    )
-                rounded.copy_(values)
-                values.copy_(rounded)
-        else:
-            values = source[source_slice]
+        values = decode_region(
+            source, source_slice, device=target.device, workspace=workspace
+        )
 
         self._write(field, block, target_slice, values)

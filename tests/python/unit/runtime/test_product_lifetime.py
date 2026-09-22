@@ -1147,7 +1147,6 @@ def test_fp8_publication_preserves_values_before_a_later_block_scale_growth():
             group_id=0,
             visible_length=1,
             destination="consumer",
-            expected_base=None,
             buffer=source,
             transports={"local": transport},
         )
@@ -1156,7 +1155,8 @@ def test_fp8_publication_preserves_values_before_a_later_block_scale_growth():
             for field in publication.tensors
             for location in field.locations
         )
-        pool.commit_publications(((source, publication),), ())
+        pool.validate_publications(((source, publication),), ())
+        pool.apply_publications(((source, publication),), ())
         # The import can begin after another invocation appends to the same
         # physical block. Its BufferId still denotes the earlier exact value.
         suffix = torch.full_like(prefix, 896)

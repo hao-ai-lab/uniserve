@@ -8,7 +8,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from threading import Lock
-from typing import ClassVar, cast
+from typing import cast
 
 import torch
 
@@ -40,21 +40,15 @@ from uniserve_worker.transfer.tickets import TransferTicket
 
 @dataclass(slots=True)
 class BatchState:
-    """Retain original input, physical dependencies, outputs.
-
-    and delivery position.
+    """Retain inputs, physical dependencies, outputs and delivery position.
 
     Worker submits inputs, launches computation, and materializes results. This
     object has no callback that can execute its batch or advance the worker.
 
-    A batch is one homogeneous group: every call it carries has the same kind
-    and component, so the batch completes as a whole. Execution stages still
-    address that completion by the identity ``COMPLETION``; it is the only
-    key the per-completion bookkeeping below ever holds.
+    Every call has the same kind and component, so execution, publication,
+    and failure belong to the batch as a whole. Physical retirement remains
+    distinct from making its outputs visible.
     """
-
-    #: The identity of the batch's single completion.
-    COMPLETION: ClassVar[int] = 1
 
     batch: Batch
     propagate_errors: bool = False
@@ -99,28 +93,23 @@ class BatchState:
     # still be outstanding after this, so it is distinct from ``complete``.
     materialized: bool = False
 
-    # Execution and publication bookkeeping, keyed by ``COMPLETION``.
-    group_buffers: dict[int, OutputBuffer] = field(default_factory=dict)
-    group_streams: dict[int, torch.cuda.Stream] = field(default_factory=dict)
-    group_started_ns: dict[int, int] = field(default_factory=dict)
-    group_forward_stats: dict[int, list[ForwardStats]] = field(
+    buffer: OutputBuffer | None = None
+    stream: torch.cuda.Stream | None = None
+    started_ns: int = 0
+    forward_stats: list[ForwardStats] = field(default_factory=list)
+    component_us: dict[str, int] = field(default_factory=dict)
+    forward_indices: dict[CallIdentity, tuple[int, ...]] = field(
         default_factory=dict
     )
-    group_component_us: dict[int, dict[str, int]] = field(default_factory=dict)
-    group_forward_indices: dict[int, dict[CallIdentity, tuple[int, ...]]] = (
-        field(default_factory=dict)
-    )
-    group_registered: dict[int, bool] = field(default_factory=dict)
-    group_published: dict[int, bool] = field(default_factory=dict)
+    registered: bool = False
+    published: bool = False
     # Output index of each request's call. Looking up one request must not
     # scan the other calls of the batch.
     request_indexes: dict[int, int] = field(default_factory=dict)
-    group_products: dict[int, tuple[TensorPublication, ...]] = field(
-        default_factory=dict
-    )
-    group_stats: dict[int, ForwardStats] = field(default_factory=dict)
-    group_execution_us: dict[int, int] = field(default_factory=dict)
-    visible_groups: set[int] = field(default_factory=set)
+    products: tuple[TensorPublication, ...] = ()
+    stats: ForwardStats | None = None
+    execution_us: int | None = None
+    visible: bool = False
 
     # Resource retirement decided during execution, applied by the owner.
     retirement_requests: frozenset[RequestKey] = frozenset()
@@ -145,25 +134,25 @@ class BatchState:
         """Return the call this call follows, or None for independent work."""
         return self.predecessors.get(call.call_id)
 
-    def group_scope(self, group: int):
-        """Keep numerical access and its retirement fences on the selected.
-
-        stream.
-        """
-        stream = self.group_streams.get(group)
+    def scope(self):
+        """Keep numerical access and retirement fences on the batch stream."""
+        stream = self.stream
         return nullcontext() if stream is None else torch.cuda.stream(stream)
+
+    @property
+    def output_buffer(self) -> OutputBuffer:
+        """Borrow completion storage during execution, before publication."""
+        if self.buffer is None:
+            raise RuntimeError("batch has no reserved output buffer")
+        return self.buffer
 
     def bind_outputs(
         self,
-        group: int,
         outputs: tuple[PendingOutput, ...],
         buffer: OutputBuffer,
         started_ns: int,
     ) -> None:
-        """Bind reserved outputs to original call indexes before resource.
-
-        preparation.
-        """
+        """Bind reserved outputs to call indexes before preparing resources."""
         for index, (call, output) in enumerate(
             zip(self.batch.calls, outputs, strict=True)
         ):
@@ -178,30 +167,21 @@ class BatchState:
                 )
             self.outputs[index] = output
 
-        self.group_buffers[group] = buffer
-        self.group_started_ns[group] = started_ns
-        self.group_forward_stats[group] = []
-        self.group_component_us[group] = {}
-        self.group_forward_indices[group] = {}
-        self.group_registered[group] = False
-        self.group_published[group] = False
+        self.buffer = buffer
+        self.started_ns = started_ns
 
-    def pending_outputs(self, group: int) -> tuple[PendingOutput, ...]:
+    def pending_outputs(self) -> tuple[PendingOutput, ...]:
         """Borrow the currently executing outputs of the batch's completion."""
         values = tuple(self.outputs)
         if any(not isinstance(value, PendingOutput) for value in values):
-            raise RuntimeError(
-                "completion group has no reserved pending outputs"
-            )
+            raise RuntimeError("batch has no reserved pending outputs")
         return cast(tuple[PendingOutput, ...], values)
 
-    def pending_output(self, group: int, request_id: int) -> PendingOutput:
+    def pending_output(self, request_id: int) -> PendingOutput:
         """Borrow the reserved pending output of one request of the batch."""
         index = self.request_indexes.get(int(request_id))
         if index is None:
-            raise invalid_descriptor(
-                f"completion group has no request {request_id}"
-            )
+            raise invalid_descriptor(f"batch has no request {request_id}")
         value = self.outputs[index]
         if not isinstance(value, PendingOutput):
             raise RuntimeError("request has no reserved pending output")
@@ -395,7 +375,6 @@ class BatchState:
 
     def record_outputs(
         self,
-        group: int,
         outputs: tuple[PendingOutput | RequestOutput, ...],
         *,
         products: tuple[TensorPublication, ...] = (),
@@ -407,8 +386,8 @@ class BatchState:
 
         boundary.
         """
-        if group in self.group_stats:
-            raise RuntimeError("completion group was published more than once")
+        if self.stats is not None:
+            raise RuntimeError("batch was published more than once")
 
         for index, (call, output) in enumerate(
             zip(self.batch.calls, outputs, strict=True)
@@ -437,20 +416,16 @@ class BatchState:
             not in identities
             for value in products
         ):
-            raise invalid_descriptor(
-                "product does not belong to its completion group"
-            )
+            raise invalid_descriptor("product does not belong to its batch")
 
-        self.group_products[group] = products
-        self.group_stats[group] = stats
-        self.group_execution_us[group] = execution_us
-        self.group_buffers.pop(group, None)
-        self.group_forward_indices.pop(group, None)
-        self.group_forward_stats.pop(group, None)
-        self.group_component_us.pop(group, None)
-
-        if visible:
-            self.visible_groups.add(group)
+        self.products = products
+        self.stats = stats
+        self.execution_us = execution_us
+        self.buffer = None
+        self.forward_indices.clear()
+        self.forward_stats.clear()
+        self.component_us.clear()
+        self.visible = visible
 
     def ready(self) -> bool:
         """Query whether the batch's single result can be delivered."""
@@ -488,29 +463,20 @@ class BatchState:
 
         # A batch without calls carries only lifecycle commands and records
         # no completion, so it reports no execution statistics.
-        completion = self.COMPLETION
-        recorded = completion in self.group_stats
         return BatchOutput(
             batch_id=self.batch_id,
             completions=tuple(values),
             products=tuple(
                 value
-                for value in self.group_products.get(completion, ())
+                for value in self.products
                 if (value.product.request_key, value.product.producer_call_id)
                 in successful
             ),
             registration=RegistrationAck(
-                visible=not self.batch.calls
-                or completion in self.visible_groups
+                visible=not self.batch.calls or self.visible
             ),
-            worker_exec_us=(
-                self.group_execution_us[completion] if recorded else None
-            ),
-            forward_stats=(
-                ForwardStats.combine((self.group_stats[completion],))
-                if recorded
-                else None
-            ),
+            worker_exec_us=self.execution_us,
+            forward_stats=self.stats,
         )
 
     def take_error(self) -> WorkerError:

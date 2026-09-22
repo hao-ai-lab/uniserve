@@ -13,14 +13,15 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve.quantization import QuantizedTensor
+from uniserve.cache import block_spans
+from uniserve.cache.state import decode_region
+from uniserve.quantization import QuantizedTensor, Quantizer
 
 from ..foundation.errors import invalid_descriptor, resource_error
 from ..protocol.identity import BufferId, RequestKey
 from ..protocol.transfer import KvTransfer, TensorTransfer
 from ..transfer.layout import fetch_tensor
 from ..transfer.tickets import TransferTicket, Transport
-from .block_tables import page_spans
 from .host_lane import HostLane
 
 if TYPE_CHECKING:
@@ -59,9 +60,7 @@ class CacheImport:
     access.
     """
 
-    buffer: BufferId
     request_pool_idx: int
-    group_id: int
     pages: tuple[int, ...]
     initialized_pages: tuple[int, ...]
     publication: KvTransfer
@@ -169,11 +168,9 @@ class CacheImports:
 
     def reserve(
         self,
-        buffer: BufferId,
         publication: KvTransfer,
         *,
         request_pool_idx: int,
-        group: int,
         pages: tuple[int, ...],
         initialized_pages: tuple[int, ...],
         transports: Mapping[str, Transport],
@@ -185,11 +182,11 @@ class CacheImports:
         suffix = publication.published_extent - publication.base_extent
         ranges = {
             page: (offset, count)
-            for page, offset, count in page_spans(
+            for page, offset, count in block_spans(
                 pages,
                 publication.base_extent,
                 suffix,
-                page_size=self.pool.info.block_size,
+                block_size=self.pool.info.block_size,
             )
         }
         ranges.update(
@@ -197,7 +194,7 @@ class CacheImports:
         )
         for page, (offset, count) in ranges.items():
             self.pool.require_reusable(
-                (page,), group=group, start=offset, length=count
+                (page,), group=publication.group_id, start=offset, length=count
             )
 
         reservation = (
@@ -206,15 +203,14 @@ class CacheImports:
             else None
         )
         write = CacheImport(
-            buffer,
             request_pool_idx,
-            group,
             pages,
             initialized_pages,
             publication,
             ranges,
         )
 
+        buffer = publication.source
         try:
             with self._condition:
                 if self._closed or buffer in self._writes:
@@ -240,7 +236,7 @@ class CacheImports:
 
     def owns(self, write: CacheImport) -> bool:
         with self._condition:
-            return self._writes.get(write.buffer) is write
+            return self._writes.get(write.publication.source) is write
 
     def adopt(self, write: CacheImport) -> None:
         """Hand a completed import to resident cache ownership."""
@@ -283,8 +279,8 @@ class CacheImports:
         with self._condition:
             for write in tuple(self._writes.values()):
                 if (
-                    write.buffer.owner in requests
-                    and write.buffer not in retained
+                    write.publication.source.owner in requests
+                    and write.publication.source not in retained
                 ):
                     self.abandon(write)
 
@@ -360,7 +356,7 @@ class CacheImports:
             write._workspace = None
             self._condition.notify_all()
         if write.released and not write.retirement.done():
-            self._writes.pop(write.buffer, None)
+            self._writes.pop(write.publication.source, None)
             write.retirement.set_result(None)
             if self._wake is not None:
                 self._wake()
@@ -412,7 +408,12 @@ class CacheImports:
                 else nullcontext()
             )
             with context:
-                self.pool.initialize_import(write)
+                self._require_active(write)
+                if write.initialized_pages:
+                    for name in self.pool.layers:
+                        self.pool.cache.zero_blocks(
+                            name, write.initialized_pages
+                        )
                 if workspace.stream is not None:
                     # Backend copy streams must not race initialization of the
                     # reserved pages. This host wait belongs to the bounded
@@ -471,7 +472,7 @@ class CacheImports:
     ) -> None:
         publication = write.publication
         suffix = publication.published_extent - publication.base_extent
-        spans = page_spans(
+        spans = block_spans(
             write.pages,
             publication.base_extent,
             suffix,
@@ -536,7 +537,12 @@ class CacheImports:
             self._consume(tuple(tickets), workspace)
             for ticket in tickets:
                 ticket.close()
-        self.pool.mark_import_scales(write)
+        self._require_active(write)
+        pages = tuple(page for page, _, _ in spans)
+        for name in self.pool.layers:
+            self.pool.cache.mark_initialized(
+                name, pages, fields=("key", "value")
+            )
 
     def _copy_converted(
         self,
@@ -557,8 +563,8 @@ class CacheImports:
         itemsize = workspace.raw.view(dtype).element_size()
         logical = 0
 
-        for page, offset, count in page_spans(
-            write.pages, start, suffix, page_size=self.pool.info.block_size
+        for page, offset, count in block_spans(
+            write.pages, start, suffix, block_size=self.pool.info.block_size
         ):
             elements = (
                 count
@@ -640,9 +646,16 @@ class CacheImports:
                 values = source
                 if quantized:
                     values = workspace.values[:count]
-                    values.copy_(source)
-                    # Dequantize in FP32. Source scale pages and head groups do
-                    # not align with the span boundaries, so walk both.
+                    # Intersect source scale pages and head groups here; the
+                    # numerical cache library owns decoding and rounding.
+                    compute_dtype = getattr(torch, publication.compute_dtype)
+                    rounded = (
+                        workspace.raw[field_index, elements * 4 :].view(
+                            compute_dtype
+                        )
+                        if compute_dtype not in {torch.float32, torch.float64}
+                        else workspace.raw[field_index, :0].view(compute_dtype)
+                    )
                     position, scale_index, token_offset = 0, 0, source_offset
                     while position < count:
                         length = min(
@@ -657,37 +670,44 @@ class CacheImports:
                                 % publication.scale_head_size,
                                 self.pool.info.num_kv_heads - head,
                             )
-                            scale = workspace.scales[
-                                scale_index, field_index, :, group
-                            ].reshape(1, self.pool.info.num_layers, 1, 1)
-                            values[
-                                position : position + length,
-                                :,
-                                head : head + heads,
-                            ].mul_(scale)
+                            for layer in range(self.pool.info.num_layers):
+                                page_region = (
+                                    slice(position, position + length),
+                                    layer,
+                                    slice(head, head + heads),
+                                )
+                                encoded = source[page_region]
+                                numerical = Quantizer("fp8").from_tensors(
+                                    {
+                                        "values": encoded,
+                                        "scale": workspace.scales[
+                                            scale_index,
+                                            field_index,
+                                            layer,
+                                            group,
+                                        ].reshape(()),
+                                    },
+                                    shape=tuple(encoded.shape),
+                                    dtype=compute_dtype,
+                                )
+                                decode_region(
+                                    numerical,
+                                    tuple(
+                                        slice(0, size) for size in encoded.shape
+                                    ),
+                                    device=values.device,
+                                    workspace={
+                                        "values": values[page_region],
+                                        # The raw FP8 input occupies the first
+                                        # eighth; rounding is disjoint.
+                                        "rounded": rounded,
+                                    },
+                                )
                             head += heads
                             group += 1
                         position += length
                         scale_index += 1
                         token_offset = 0
-
-                    compute_dtype = getattr(torch, publication.compute_dtype)
-                    if compute_dtype != torch.float32:
-                        # An encoded source first rounds through its original
-                        # compute representation, before destination encoding.
-                        rounded = (
-                            workspace.raw[
-                                field_index,
-                                : elements
-                                * torch.empty(
-                                    (), dtype=compute_dtype
-                                ).element_size(),
-                            ]
-                            .view(compute_dtype)
-                            .reshape_as(values)
-                        )
-                        rounded.copy_(values)
-                        values.copy_(rounded)
 
                 # Store the converted tokens into the destination page by layer.
                 for layer, name in enumerate(self.pool.layers):

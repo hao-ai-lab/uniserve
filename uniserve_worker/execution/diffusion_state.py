@@ -12,6 +12,7 @@ from uniserve.media.image import Config
 from uniserve.processing import BranchSource, FlowPrompt
 
 from ..foundation.errors import invalid_descriptor
+from .denoising_runner import Trajectory
 
 
 @dataclass(slots=True)
@@ -46,6 +47,7 @@ class VideoState:
     size: Any
     schedules: dict[str, Schedule]
     tensors: dict[str, dict[str, torch.Tensor]] = field(default_factory=dict)
+    denoising: Trajectory | None = None
 
 
 def resolve_prefix(

@@ -1113,7 +1113,9 @@ fn worker_info_round_trips() {
         let count = config.world_size().unwrap();
         let info = WorkerInfo {
             world_size: count as u32,
-            configuration_id: "a".repeat(64),
+            model_dtype: "bfloat16".into(),
+            attention_backend: "torch".into(),
+            weight_formats: vec!["dense".into()],
             kv_cache: Some(KvCacheInfo {
                 num_layers: 9,
                 total_layers: 28,
