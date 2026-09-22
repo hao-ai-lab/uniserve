@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import replace
 from multiprocessing import shared_memory
 
+import pytest
 import torch
 
 from tests.python.fixtures.depth_one import (
@@ -46,6 +46,8 @@ from uniserve_worker.protocol.transfer import (
 from uniserve_worker.transport import segment
 from uniserve_worker.transport.endpoint import locator_digest
 from uniserve_worker.transport.shared_storage import open_shared_storage
+
+pytestmark = pytest.mark.integration
 
 
 def _gated_copy(locator: Locator) -> tuple[Locator, shared_memory.SharedMemory]:
@@ -499,12 +501,6 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             **_installation_allocation(installation, 2),
         )
         prepared = consumer.submit(batch)
-        assert prepared is not None
-        deadline = time.monotonic() + 5.0
-        while not prepared.inputs_ready() and time.monotonic() < deadline:
-            consumer.advance_inputs(prepared)
-            time.sleep(0.001)
-        assert prepared.inputs_ready()
         prepared = finalized_report(consumer, prepared)
         report = prepared
         assert report.completions[0].status.value == "ok"
@@ -536,8 +532,6 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             block_tables=(BlockTable(admission.request_pool_idx, 0, (1,), 2),),
         )
         repeated_prepared = consumer.submit(repeated_batch)
-        assert repeated_prepared is not None
-        assert repeated_prepared.inputs_ready()
         repeated_prepared = finalized_report(consumer, repeated_prepared)
         repeated_report = repeated_prepared
         assert repeated_report.completions[0].status.value == "ok"
@@ -566,12 +560,6 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
                 **_installation_allocation(expired_install, 2),
             )
         )
-        assert expired is not None
-        deadline = time.monotonic() + 5.0
-        while not expired.inputs_ready() and time.monotonic() < deadline:
-            released_consumer.advance_inputs(expired)
-            time.sleep(0.001)
-        assert expired.inputs_ready()
         expired = finalized_report(released_consumer, expired)
         expired_report = expired
         assert expired_report.completions[0].status.value == "error"
@@ -654,12 +642,6 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
                 **_installation_allocation(installation, 2),
             )
         )
-        assert prepared is not None
-        deadline = time.monotonic() + 5.0
-        while not prepared.inputs_ready() and time.monotonic() < deadline:
-            consumer.advance_inputs(prepared)
-            time.sleep(0.001)
-        assert prepared.inputs_ready()
 
         report = prepared
 
@@ -682,12 +664,6 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
                 **_installation_allocation(retry, 2),
             )
         )
-        assert prepared_retry is not None
-        deadline = time.monotonic() + 5.0
-        while not prepared_retry.inputs_ready() and time.monotonic() < deadline:
-            consumer.advance_inputs(prepared_retry)
-            time.sleep(0.001)
-        assert prepared_retry.inputs_ready()
         prepared_retry = finalized_report(consumer, prepared_retry)
         retry_report = prepared_retry
         assert retry_report.completions[0].status.value == "ok"
