@@ -420,25 +420,19 @@ class NcclCommunicator:
         self._release_stream()
 
     def abort(self) -> None:
-        """Release the communicator without waiting for its peers.
+        """Invalidate local use and retain native resources until process exit.
 
-        A rank that is unwinding from a failure cannot complete a collective
-        destruction, because the ranks it would wait for may be serving, may
-        have failed elsewhere, or may never call it. An abort completes on this
-        rank alone and fails whatever the communicator had in flight. Nothing
-        here waits on the device either: the work an abort interrupts is
-        exactly the work that may already be stuck.
+        NCCL abort can wait on other communicators or captured graph users.
+        Failed execution cannot prove those users have retired, so the owning
+        process must exit without entering native communicator teardown.
         """
         from .resources import retain_until_exit
 
-        # Abort does not prove that every local access has ended. Registered
-        # tensors and transfer streams remain owned until process exit.
-        retain_until_exit(self)
         if self._comm.value:
-            # Abort invalidates the communicator and its window registrations.
-            # Their backing stays retained; no deregistration uses this handle.
-            communicator, self._comm = self._comm.value, c_void_p()
-            self._nccl.comm_abort(communicator)
+            # Retain the handle, registered tensors and streams together. No
+            # failed access is acknowledged as completed or safe to reuse.
+            retain_until_exit((self, self._comm))
+            self._comm = c_void_p()
 
     def _release_stream(self) -> None:
         """Destroy the communication stream this communicator owns."""

@@ -397,6 +397,10 @@ def test_text_entry_stages_successive_bounded_inputs(device):
         ),
     )
     try:
+        # Startup creates reusable staging tensors under inference mode;
+        # serving callers need not enter that scope themselves.
+        with torch.inference_mode():
+            runner.run_encoder("text", runner.prepare_text_tokens((2, 4, 6)))
         outputs = []
         prompts = ((3, 8, 1), (31,), (0, 5, 19, 7), (1, 2))
         for prompt in prompts:

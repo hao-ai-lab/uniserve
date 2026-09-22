@@ -466,13 +466,16 @@ def publish_deferred_product(
     tensor_store: TensorStore,
     publication_transports: Mapping[str, Transport],
     consumers: Sequence[int],
+    regions: Sequence[tuple[slice, ...]] | None = None,
 ) -> TensorPublication:
     """Publish a product whose write host work filled after its call committed.
 
     The committed call released its execution references, so the caller
     hands over the write it retained. The product is published as host
     bytes, registered for retirement, and committed here; the caller reports
-    the publication with the completion the work belongs to.
+    the publication with the completion the work belongs to. If only regions
+    are initialized, publish those views at their logical offsets. Consumers
+    must read these regions rather than the uninitialized reserved capacity.
     """
     if not publication_transports:
         raise unsupported_setup(
@@ -498,14 +501,38 @@ def publish_deferred_product(
             "product transfer changes its declared representation"
         )
     value = tensor_store.publish_write(write, value, metadata=None)
-    locations = publish_tensor(
-        publication_transports,
-        value,
-        retain=partial(tensor_store.retain_publication, write),
-        offset=None if region is None else _slices.offset(region),
-        consumers=consumers,
-        host=True,
+    views = (
+        regions
+        if regions is not None
+        else (tuple(slice(0, n) for n in value.shape),)
     )
+    origin = (0,) * value.ndim if region is None else _slices.offset(region)
+    locations = []
+    try:
+        for view in views:
+            if not _slices.within(view, value.shape):
+                raise invalid_descriptor(
+                    "publication exceeds its product region"
+                )
+            locations.extend(
+                publish_tensor(
+                    publication_transports,
+                    value[view],
+                    retain=partial(tensor_store.retain_publication, write),
+                    offset=tuple(
+                        a + b
+                        for a, b in zip(
+                            origin, _slices.offset(view), strict=True
+                        )
+                    ),
+                    consumers=consumers,
+                    host=True,
+                )
+            )
+    except BaseException:
+        for location in locations:
+            publication_transports[location.backend].release(location)
+        raise
     tensor_store.exports[product.buffer_id] = tuple(
         (publication_transports[location.backend], location)
         for location in locations
@@ -517,7 +544,7 @@ def publish_deferred_product(
             height=0,
             width=0,
             value_range="",
-            tensor=TensorTransfer(shape=shape, locations=locations),
+            tensor=TensorTransfer(shape=shape, locations=tuple(locations)),
         ),
     )
 

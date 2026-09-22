@@ -126,9 +126,12 @@ def test_worker_info_reports_limits_safe_for_all_bound_lanes(
     assert info.max_batch_tokens == (128 if with_lane_limits else 256)
 
 
-def test_worker_capabilities_reflect_enabled_calls() -> None:
+@pytest.mark.parametrize("attention_backend", ("torch", "auto"))
+def test_worker_capabilities_reflect_enabled_calls(attention_backend) -> None:
     config = replace(
-        stub_worker_config(16, max_batch_tokens=256), graph_policy="off"
+        stub_worker_config(16, max_batch_tokens=256),
+        graph_policy="off",
+        attention_backend=attention_backend,
     )
     for allowed in (
         frozenset({ForwardMode.PREFILL}),

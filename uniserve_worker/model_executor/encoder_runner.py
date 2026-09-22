@@ -23,6 +23,7 @@ class EncoderRunner(ModelRunner):
         self._tokens: torch.Tensor | None = None
         self._host: HostBuffers | None = None
 
+    @torch.inference_mode()
     def prepare_tokens(self, tokens, *, capacity):
         """Copy a flat token sequence while retaining its host source fence."""
         if not 1 <= len(tokens) <= capacity:

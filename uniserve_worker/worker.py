@@ -112,6 +112,13 @@ class Worker:
 
         The scope's error is neither suppressed nor replaced.
         """
+        if exc_value is not None:
+            # Native cleanup can itself stall after a device failure. Record
+            # the initiating error before entering teardown so it is not lost.
+            logger.error(
+                "worker execution failed before resource cleanup",
+                exc_info=(exc_type, exc_value, traceback),
+            )
         try:
             # A scope leaving on an error releases without its peers: they are
             # not leaving with it, and every collective step would wait for
@@ -694,6 +701,36 @@ class Worker:
             )
 
         if self.runner.numerical:
+            # KV sizing reserves a graph allowance before allocating pages.
+            # Media workers instead have fixed request banks: their graph
+            # share is the grant left after those banks and all lazy products,
+            # not the token worker's fraction of total device memory.
+            devices = tuple(
+                dict.fromkeys(
+                    (
+                        self.worker_config.device,
+                        self.worker_config.generation_device
+                        or self.worker_config.device,
+                    )
+                )
+            )
+            storage = self.runner.graph_storage
+            resident = storage.resident_bytes()
+            products = self._layout.arena.device_product_bytes // len(devices)
+            for device in devices:
+                target = canonical_device(device)
+                if target.type != "cuda":
+                    continue
+                available, _free = device_storage_budget(
+                    target, self.worker_config.kv_storage_fraction
+                )
+                pending = max(
+                    0, products - self.tensor_store.resident_bytes(target)
+                )
+                storage.set_budget(
+                    target,
+                    resident.get(target, 0) + max(0, available - pending),
+                )
             self.runner.warmup(self.requests.storage.tensor_slots)
             self.runner.capture(
                 tokenizer=self.tokenizer, latents=self.latent_pool

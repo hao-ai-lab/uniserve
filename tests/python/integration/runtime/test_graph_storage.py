@@ -23,6 +23,12 @@ def test_independent_graph_owners_share_a_byte_limit_and_retire_capacity():
             second = torch.empty_like(first)
         with pytest.raises(CUDAGraphError, match="exceeds its byte budget"):
             storage.check()
+        # A worker can assign unused storage after its fixed pools are sized.
+        # The new grant still covers every owner, including existing backing.
+        storage.set_budget(device, 4 << 20)
+        storage.check()
+        with pytest.raises(CUDAGraphError, match="exceeds its byte budget"):
+            storage.set_budget(device, 2 << 20)
         del second
         storage.release(owners[1])
         storage.check()
