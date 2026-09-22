@@ -9,6 +9,7 @@ from torch import nn
 
 from uniserve.distributed import Communicator
 from uniserve.model import (
+    DEFAULT_COMPONENT,
     CausalLM,
     ComponentEntry,
     EntryPoint,
@@ -200,7 +201,7 @@ def entry_points(config: Config):
     """Declare the numerical methods serving ranks may invoke on this model."""
     return MappingProxyType(
         {
-            "model": ComponentEntry(
+            DEFAULT_COMPONENT: ComponentEntry(
                 "",
                 (
                     EntryPoint("forward"),

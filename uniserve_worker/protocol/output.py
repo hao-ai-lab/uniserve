@@ -185,7 +185,7 @@ class MediaOutput:
 
 @dataclass(frozen=True, slots=True)
 class RequestOutput:
-    """An call completion with accepted progress and tokens.
+    """A call completion with accepted progress and tokens.
 
     Also carries products and timing.
     """

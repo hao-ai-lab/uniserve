@@ -17,7 +17,7 @@ from torch import nn
 
 from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
-from uniserve.model import CausalLM, VideoPostprocessor
+from uniserve.model import DEFAULT_COMPONENT, CausalLM, VideoPostprocessor
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.profiling import profile_range
 from uniserve.quantization import Quantizer
@@ -212,7 +212,11 @@ class Worker:
             # Sampling uses the language model's TP group, independently of
             # other components' parallel layouts. Backend selection belongs
             # to the runner.
-            model_mesh = bindings["model"].mesh if "model" in bindings else None
+            model_mesh = (
+                bindings[DEFAULT_COMPONENT].mesh
+                if DEFAULT_COMPONENT in bindings
+                else None
+            )
             sampling_group = (
                 None if model_mesh is None else model_mesh.get_group("tp")
             )
@@ -228,7 +232,7 @@ class Worker:
                 tokenizer=loaded.tokenizer,
                 image_processor=loaded.image_processor,
                 flow_prompt=loaded.flow_prompt,
-                allowed_work_variants=config.supported_ops,
+                allowed_calls=config.supported_calls,
                 transfer_backends=config.data_plane.backends,
                 publication_backends=config.data_plane.publication_backends,
                 worker_id=config.worker_id,
@@ -258,7 +262,7 @@ class Worker:
         worker_config: WorkerConfig,
         sampling_group: Communicator | None,
         tokenizer: Any | None,
-        allowed_work_variants: frozenset[CallKind],
+        allowed_calls: frozenset[CallKind],
         queue_depth: int,
         completion_payload_bytes: int,
         acknowledgment_slot: int = 0,
@@ -377,11 +381,14 @@ class Worker:
                 bindings=bindings,
                 queue_depth=int(queue_depth),
                 completion_payload_bytes=int(completion_payload_bytes),
-                allowed_work_variants=allowed_work_variants,
+                allowed_calls=allowed_calls,
                 transfer_backends=transfer_backends,
                 components=components,
                 checkpoint_identity=checkpoint_identity,
-                attention_identity=f"{type(attention).__module__}.{type(attention).__qualname__}",
+                attention_identity=(
+                    f"{type(attention).__module__}."
+                    f"{type(attention).__qualname__}"
+                ),
                 # The scheduler's page indices are shared across all
                 # resident layer and head regions, including stages with
                 # different memory grants.
@@ -474,7 +481,7 @@ class Worker:
                     ),
                     info=kv_cache,
                     group_ranges=tuple(group_ranges) if group_ranges else None,
-                    import_capacity=int(info.max_unresolved_ops),
+                    import_capacity=int(info.max_unresolved_calls),
                     request_pool_size=int(info.request_slots),
                     max_blocks_per_request=max_blocks_per_row,
                     staging_depth=int(queue_depth),
@@ -566,8 +573,8 @@ class Worker:
             startup.callback(self.device_events.close)
 
             self.output_pool = OutputPool(
-                capacity=int(queue_depth) * int(info.max_batch_ops),
-                max_words=int(info.max_batch_ops)
+                capacity=int(queue_depth) * int(info.max_batch_calls),
+                max_words=int(info.max_batch_calls)
                 * (4 + (int(completion_payload_bytes) + 3) // 4),
                 event_pool=self.device_events,
             )
@@ -592,7 +599,7 @@ class Worker:
                 ),
                 devices=owner_devices,
                 request_capacity=int(info.request_slots),
-                relay_depth=int(info.max_unresolved_ops) + 1,
+                relay_depth=int(info.max_unresolved_calls) + 1,
                 buffer_pool=self.buffer_pool,
                 event_pool=self.device_events,
             )
@@ -651,14 +658,14 @@ class Worker:
                     kv_cache=self.kv_cache,
                     latent_pool=self.latent_pool,
                     decode_predicates=self.decode_state.predicates,
-                    max_calls=int(info.max_batch_ops),
+                    max_calls=int(info.max_batch_calls),
                     request_slots=int(info.request_slots),
                     max_tokens=int(info.max_batch_tokens),
                     latent_capacity_units=int(info.latent_capacity_units),
                     decode_context_blocks=decode_context_blocks(
                         model, worker_config, self.kv_cache
                     ),
-                    variants=frozenset(info.supported_ops),
+                    variants=frozenset(info.supported_calls),
                     max_inflight=int(queue_depth),
                 )
 
@@ -1108,7 +1115,7 @@ class Worker:
             if unsupported:
                 names = sorted({value.value for value in unsupported})
                 raise invalid_descriptor(
-                    "execution batch contains work variants unsupported by "
+                    "execution batch contains call kinds unsupported by "
                     f"this worker: {names!r}"
                 )
 
@@ -1164,7 +1171,7 @@ class Worker:
         if not batch.materialized:
             outputs = tuple(batch.outputs)
             if any(value is None for value in outputs):
-                raise RuntimeError("launched batch is missing an call output")
+                raise RuntimeError("launched batch is missing a call output")
             if all(
                 not isinstance(value, PendingOutput) or value.ready()
                 for value in outputs
@@ -1521,7 +1528,7 @@ class Worker:
 
     def supports_computation(self, kind: CallKind) -> bool:
         """Return whether this worker can execute this computation."""
-        return kind in self.info.supported_ops
+        return kind in self.info.supported_calls
 
     def _prepare_execution(self, state: BatchState) -> None:
         """Validate the batch and apply its commands.

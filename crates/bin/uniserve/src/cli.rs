@@ -13,7 +13,7 @@ use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use uniserve_core::{KvCacheDtype, ModelDtype};
 use uniserve_engine::{
-    AttentionBackend, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
+    AttentionBackend, DEFAULT_COMPONENT, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
     FlashInferBackend, LaneConfig, TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
@@ -168,10 +168,10 @@ pub(crate) struct SharedRuntimeArgs {
     /// Explicit Python worker launch/runtime arguments.
     #[command(flatten)]
     pub worker_process: WorkerProcessOptions,
-    /// How many op-batches the scheduler keeps in flight against the worker.
+    /// How many call batches the scheduler keeps in flight against the worker.
     #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
     pub queue_depth: Option<usize>,
-    /// Maximum number of ops assembled into one forward batch.
+    /// Maximum number of calls assembled into one forward batch.
     #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
     pub max_batch: Option<usize>,
     /// Maximum transformer-token work admitted in one scheduling step.
@@ -327,7 +327,7 @@ impl SharedRuntimeArgs {
                     &self.device,
                     self.worker_ranks,
                     queue_depth,
-                    WorkerConfig::single_component("model", self.worker_ranks),
+                    WorkerConfig::single_component(DEFAULT_COMPONENT, self.worker_ranks),
                 )]
             }),
             transfer: self.transfer.clone().unwrap_or_default(),

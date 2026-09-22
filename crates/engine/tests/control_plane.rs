@@ -74,11 +74,11 @@ fn generation_capabilities_require_complete_paths_and_distinct_encoders() {
     ];
     for (calls, expected) in cases {
         let mut sim = SimEngine::new();
-        sim.mut_info_for_test().supported_ops = vec![
+        sim.mut_info_for_test().supported_calls = vec![
             CallKind::Forward(ForwardMode::Prefill),
             CallKind::Forward(ForwardMode::Decode),
         ];
-        sim.mut_info_for_test().supported_ops.extend(calls);
+        sim.mut_info_for_test().supported_calls.extend(calls);
         let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
         assert_eq!(
             scheduler.generation_limits().features,
@@ -301,7 +301,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
     sim.mut_info_for_test().latent_page_units = 64;
     sim.mut_info_for_test().latent_pages = 65;
     sim.mut_info_for_test().buffer_pool_bytes = 16 << 20;
-    sim.mut_info_for_test().max_batch_ops = 1024;
+    sim.mut_info_for_test().max_batch_calls = 1024;
     let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -440,7 +440,7 @@ fn image_events_cover_declared_denoise_steps() {
 #[test]
 fn scheduler_clamps_max_batch_to_worker_info() {
     let mut sim = SimEngine::new();
-    sim.mut_info_for_test().max_batch_ops = 3;
+    sim.mut_info_for_test().max_batch_calls = 3;
     let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
 
     assert_eq!(sched.config().max_batch, 3);

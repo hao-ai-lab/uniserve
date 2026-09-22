@@ -527,7 +527,7 @@ impl WorkerExecutor {
                     .batch
                     .requests
                     .iter()
-                    .flat_map(|(op, _)| op.input_buffers())
+                    .flat_map(|(call, _)| call.input_buffers())
                     .collect::<HashSet<_>>();
                 submission
                     .dependencies
@@ -1256,7 +1256,7 @@ impl Executor for WorkerExecutor {
                     self.workers[call_worker]
                         .1
                         .info()
-                        .supported_ops
+                        .supported_calls
                         .contains(&variant),
                     "target worker does not support call {variant:?}"
                 );
@@ -1422,14 +1422,14 @@ impl Executor for WorkerExecutor {
             }
 
             let mut expected_workers = 0;
-            for (worker_index, (((ops, commands), input_products), dependencies)) in worker_ops
+            for (worker_index, (((calls, commands), input_products), dependencies)) in worker_ops
                 .into_iter()
                 .zip(worker_commands)
                 .zip(worker_inputs)
                 .zip(worker_dependencies)
                 .enumerate()
             {
-                if ops.is_empty() && commands.is_empty() {
+                if calls.is_empty() && commands.is_empty() {
                     anyhow::ensure!(
                         dependencies.is_empty(),
                         "product dependency has no consuming worker submission"
@@ -1441,7 +1441,7 @@ impl Executor for WorkerExecutor {
                 // Rank indices and collective order are derived at physical submission.
                 self.worker_submissions[worker_index].push_back(WorkerSubmission::build(
                     batch_id,
-                    ops,
+                    calls,
                     commands,
                     input_products,
                     std::mem::take(&mut worker_kv_inputs[worker_index]),

@@ -8,7 +8,7 @@ fn resolve_generation_limits(
     mut limits: uniserve_core::GenerationLimits,
     info: &WorkerInfo,
 ) -> uniserve_core::GenerationLimits {
-    let supports = |kind| info.supported_ops.contains(&kind);
+    let supports = |kind| info.supported_calls.contains(&kind);
     let mut available = uniserve_core::GenerationFeatures::empty();
     if supports(CallKind::Forward(ForwardMode::Prefill))
         && supports(CallKind::Forward(ForwardMode::Decode))
@@ -90,14 +90,14 @@ impl Scheduler {
 
         // Capability families are mutually ordered from diffusion-only through
         // unified multimodal support to autoregressive-only execution.
-        let work = &info.supported_ops;
-        let family = if work.contains(&CallKind::Media(MediaCall::LatentPreparation))
-            && !work.contains(&CallKind::Forward(ForwardMode::Decode))
+        let calls = &info.supported_calls;
+        let family = if calls.contains(&CallKind::Media(MediaCall::LatentPreparation))
+            && !calls.contains(&CallKind::Forward(ForwardMode::Decode))
         {
             RuntimeFamily::Diffusion
-        } else if work.contains(&CallKind::Media(MediaCall::Denoising))
-            || (work.contains(&CallKind::Media(MediaCall::VisionEncoding))
-                || work.contains(&CallKind::Media(MediaCall::LatentEncoding)))
+        } else if calls.contains(&CallKind::Media(MediaCall::Denoising))
+            || (calls.contains(&CallKind::Media(MediaCall::VisionEncoding))
+                || calls.contains(&CallKind::Media(MediaCall::LatentEncoding)))
         {
             RuntimeFamily::Umm
         } else {
@@ -164,7 +164,7 @@ impl Scheduler {
             .iter()
             .filter(|(_, worker)| {
                 worker
-                    .supported_ops
+                    .supported_calls
                     .iter()
                     .any(|kind| matches!(kind, CallKind::Media(_)))
             })
@@ -180,10 +180,10 @@ impl Scheduler {
             .collect();
 
         // Queue and batch limits cannot exceed the physical executor envelope.
-        let max_batch_ops = info.max_batch_ops as usize;
+        let max_batch_calls = info.max_batch_calls as usize;
         let max_batch_tokens = info.max_batch_tokens as usize;
         let transfer_capacity = (info.queue_depth as usize)
-            .saturating_mul(max_batch_ops)
+            .saturating_mul(max_batch_calls)
             .clamp(1, MAX_INFLIGHT_TRANSFERS);
 
         config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
@@ -192,7 +192,7 @@ impl Scheduler {
         let flow_slot_reserve = usize::from(
             info.uses_kv()
                 && info
-                    .supported_ops
+                    .supported_calls
                     .contains(&CallKind::Media(MediaCall::Denoising)),
         );
         let request_pool_capacity = info.request_slots as usize;
@@ -205,8 +205,8 @@ impl Scheduler {
             .clamp(1, MAX_NUM_SEQS)
             .min(main_request_capacity);
         config.max_num_batched_tokens = config.max_num_batched_tokens.max(1).min(max_batch_tokens);
-        if max_batch_ops > 0 {
-            config.max_batch = config.max_batch.min(max_batch_ops.max(1));
+        if max_batch_calls > 0 {
+            config.max_batch = config.max_batch.min(max_batch_calls.max(1));
         }
 
         // Memory and scheduler statistics share the resolved worker capacities.
@@ -220,41 +220,6 @@ impl Scheduler {
         // Environment switches select scheduling behavior without changing the
         // model capabilities.
         let denoise_step_burst = denoise_step_burst_from_env();
-
-        let mut trace_sink = crate::scheduler::bench_trace::RuntimeTraceSink::from_env();
-        if let Some(sink) = trace_sink.as_mut() {
-            sink.record(&json!({
-                "event": "run_started",
-                "at_s": now(),
-                "pid": std::process::id(),
-                "scheduler": {
-                    "policy": config.policy,
-                    "max_batch": config.max_batch,
-                    "max_num_batched_tokens": config.max_num_batched_tokens,
-                    "max_num_seqs": config.max_num_seqs,
-                    "long_prefill_threshold": config.long_prefill_threshold,
-                    "mixed_prefill_tokens": config.mixed_prefill_tokens,
-                    "denoise_step_burst": denoise_step_burst,
-                },
-                "info": {
-                    "block_size": info.kv_block_size(),
-                    "num_blocks": info.kv_num_blocks(),
-                    "supported_ops": &info.supported_ops,
-                    "max_batch_ops": info.max_batch_ops,
-                    "max_batch_tokens": info.max_batch_tokens,
-                    "request_slots": info.request_slots,
-                    "queue_depth": info.queue_depth,
-                    "latent_page_units": info.latent_page_units,
-                    "latent_pages": info.latent_pages,
-                    "latent_dtype": &latent_dtype,
-                    "latent_downsample": generation_limits.latent_downsample,
-                    "max_vae_grid_tokens": generation_limits.max_vae_grid_tokens,
-                    "max_vit_grid_tokens": generation_limits.max_vit_grid_tokens,
-                    "commit_marker_tokens": generation_limits.commit_marker_tokens,
-                    "max_cfg_branches": generation_limits.max_cfg_branches,
-                },
-            }));
-        }
 
         // Runtime state remains single-owner; executors receive immutable batch
         // inputs assembled from these queues and request records.
@@ -305,8 +270,7 @@ impl Scheduler {
             prefer_media: true,
             config,
             fatal: false,
-            trace_sink,
-            peak_ops_in_batch: 0,
+            peak_calls_in_batch: 0,
             stats,
         }
     }
@@ -350,7 +314,7 @@ impl Scheduler {
             self.info.uses_kv()
                 && self
                     .info
-                    .supported_ops
+                    .supported_calls
                     .contains(&CallKind::Media(MediaCall::Denoising)),
         );
         let capacity = self

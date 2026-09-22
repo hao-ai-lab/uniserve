@@ -92,7 +92,7 @@ fn main() -> anyhow::Result<()> {
             "cpu",
             1,
             2,
-            uniserve_engine::WorkerConfig::single_component("model", 1),
+            uniserve_engine::WorkerConfig::single_component(uniserve_engine::DEFAULT_COMPONENT, 1),
         )
         .ranks,
         queue_depth: 2,

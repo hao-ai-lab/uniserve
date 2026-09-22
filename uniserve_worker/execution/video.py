@@ -471,7 +471,7 @@ def mux_config(runner: ModelRunner, media) -> AvMuxConfig:
 
 
 def trajectory_params(call: Call, *, state: BatchState):
-    """Return the unique latent trajectory params assigned to an call."""
+    """Return the unique latent trajectory params assigned to a call."""
     selected = tuple(
         params
         for params in state.batch.latent_params
@@ -486,7 +486,7 @@ def trajectory_params(call: Call, *, state: BatchState):
 
 
 def decode_range(call: Call, *, state: BatchState) -> DecodeRange:
-    """Return the unique reconstruction params assigned to an call."""
+    """Return the unique reconstruction params assigned to a call."""
     selected = tuple(
         params
         for params in state.batch.decode_ranges

@@ -46,7 +46,7 @@ def execution_runtime(
     flow_step: int | None = None,
     computed_len: int | None = None,
 ) -> RequestProgress:
-    """Project the coordinates a call's numerical consumers run at.
+    """Project the coordinates used by a call's numerical consumers.
 
     The call states them; the cache tuple overrides the KV extents when the
     block tables resolved a different accepted prefix.
@@ -95,10 +95,7 @@ def cache_coordinates(
 
 
 def call_identity(call: Call) -> CallIdentity:
-    """Form the completion group-local identity from request generation and.
-
-    call id.
-    """
+    """Form the completion-group-local identity from generation and call ID."""
     return call.request_key, call.call_id
 
 

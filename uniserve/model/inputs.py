@@ -14,6 +14,9 @@ from uniserve.nn.routing import RouteSpan
 
 SizeT = TypeVar("SizeT")
 
+# The entry name used when a deployment serves one undivided model.
+DEFAULT_COMPONENT = "model"
+
 
 @dataclass(frozen=True, slots=True)
 class EntryPoint:

@@ -158,7 +158,7 @@ def test_h3_worker_advertises_bounded_media_products():
     assert info.num_inference_steps == 4
     assert info.request_slots == 2
     assert info.kv_cache is None
-    assert info.max_batch_ops == 2
+    assert info.max_batch_calls == 2
 
 
 def test_sensenova_reader_resolves_aliases_and_numerical_layer_modes(tmp_path):

@@ -89,9 +89,7 @@ def prepare_batch(
     request_tables: BlockTables | None,
     request_pool: RequestPool,
 ) -> None:
-    """Materialize KV publications and record storage write dependencies for.
-
-    the batch.
+    """Materialize KV publications and record the batch's write dependencies.
 
     Runs after admission and release controls have been applied. KV install
     calls receive a cache publication for their source, and every latent,
@@ -894,7 +892,9 @@ def _open_group(
                 state=state,
             )
             if active_calls:
-                identities = {calls.call_identity(op) for op in active_calls}
+                identities = {
+                    calls.call_identity(call) for call in active_calls
+                }
                 has_forward = any(
                     calls.call_identity(batch.calls[index]) in identities
                     for index in batch.forward_call_indices
@@ -985,10 +985,7 @@ def _open_group(
 
 
 def _completion_words(scheduled: tuple[Call, ...]) -> int:
-    """Compute fixed completion-word capacity for all calls in a.
-
-    completion group.
-    """
+    """Compute completion-word capacity for one completion group."""
     # Completion storage is addressed in 4-byte words; payload byte budgets
     # round up to whole words.
     return max(
@@ -1123,7 +1120,7 @@ def validate_batch(
 
     for call in batch.calls:
         variant = call.kind
-        if variant not in worker_info.supported_ops:
+        if variant not in worker_info.supported_calls:
             raise unsupported_call(variant.value, call.request_key.request_id)
 
     if any(
@@ -1375,7 +1372,7 @@ def _bind_latent_inputs(
 
     views.
     """
-    identities = {calls.call_identity(op) for op in scheduled}
+    identities = {calls.call_identity(call) for call in scheduled}
     parameters = tuple(
         params
         for params in state.batch.latent_params
@@ -1401,7 +1398,7 @@ def _bind_latent_inputs(
             selected = requests.get(identity)
             if selected is None:
                 raise invalid_descriptor(
-                    "latent params names an call outside its completion group"
+                    "latent params names a call outside its completion group"
                 )
             call, request = selected
             if params.page_table or params.latent_units:
@@ -1442,7 +1439,7 @@ def _bind_latent_inputs(
         selected = requests.get(identity)
         if selected is None:
             raise invalid_descriptor(
-                "latent params names an call outside its completion group"
+                "latent params names a call outside its completion group"
             )
         call, request = selected
         slot = int(request.request.request_pool_idx)
@@ -1552,7 +1549,7 @@ def _bind_cache_tables(
 
     started = time.perf_counter_ns()
     inputs = state.batch
-    identities = {calls.call_identity(op) for op in scheduled}
+    identities = {calls.call_identity(call) for call in scheduled}
 
     # Tables are needed for every slot this group reads or writes: its own
     # requests plus any alternative-prefix rows of its forward calls.

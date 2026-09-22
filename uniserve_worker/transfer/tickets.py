@@ -2018,7 +2018,7 @@ class CudaVmmTransport(Transport):
     open file of the producing process and carries no meaning elsewhere, so a
     consumer asks this rank for it over the grant socket in
     `descriptor_grants`. Such a device cannot place an edge across hosts in
-    any case, so that connection costs nothing the fabric case has.
+    any case, so that connection has none of the costs of the fabric case.
     """
 
     name = "cuda_vmm"

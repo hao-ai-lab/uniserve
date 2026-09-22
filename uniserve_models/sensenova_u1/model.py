@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from uniserve.model import (
+    DEFAULT_COMPONENT,
     CausalLM,
     ComponentEntry,
     EntryPoint,
@@ -58,7 +59,7 @@ class Model(nn.Module):
 def entry_points(config: Config):
     return MappingProxyType(
         {
-            "model": ComponentEntry(
+            DEFAULT_COMPONENT: ComponentEntry(
                 "",
                 (
                     EntryPoint("text.forward", groups=("tp", "sp", "pp")),

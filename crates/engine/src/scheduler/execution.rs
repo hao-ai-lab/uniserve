@@ -10,12 +10,11 @@ use uniserve_worker_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode}
 impl Scheduler {
     /// Enumerates loaded components that can execute the requested call.
     ///
-    /// Which component serves a media call is the model's to state, not the
+    /// Which component serves a media call is the model's state, not the
     /// engine's: a worker resolves it from the capabilities its components
     /// implement and reports it as `media_components`. That report is the
-    /// only authority here, so the engine holds no component vocabulary of its
-    /// own and cannot drift from the names a model actually binds. A worker
-    /// that reports no media routing serves one undivided model.
+    /// only authority here. Calls without an explicit media route use the
+    /// protocol's default component for an undivided model.
     pub(super) fn worker_candidates(
         &self,
         kind: CallKind,
@@ -25,8 +24,8 @@ impl Scheduler {
                 .info
                 .media_components
                 .get(&media_call)
-                .map_or("model", String::as_str),
-            _ => "model",
+                .map_or(DEFAULT_COMPONENT, String::as_str),
+            _ => DEFAULT_COMPONENT,
         };
         self.component_candidates(kind, component)
     }
@@ -41,7 +40,7 @@ impl Scheduler {
             .workers
             .iter()
             .filter_map(move |(id, info)| {
-                if !info.supported_ops.contains(&kind) {
+                if !info.supported_calls.contains(&kind) {
                     return None;
                 }
                 let bound_component = if info
@@ -54,9 +53,9 @@ impl Scheduler {
                     || info
                         .components
                         .iter()
-                        .any(|binding| binding.name == "model")
+                        .any(|binding| binding.name == DEFAULT_COMPONENT)
                 {
-                    "model"
+                    DEFAULT_COMPONENT
                 } else {
                     return None;
                 };
@@ -134,7 +133,7 @@ impl Scheduler {
 
     /// Binds planned work to its configured component and records request residency.
     pub(super) fn select_worker(&mut self, call: &Call) -> (crate::WorkerId, String) {
-        let (id, bound_component) = if call.component == "model" {
+        let (id, bound_component) = if call.component == DEFAULT_COMPONENT {
             self.worker_target(call.request_key, call.code)
         } else {
             self.component_target(call.request_key, call.code, &call.component)
@@ -184,7 +183,6 @@ impl Scheduler {
                 self.pending_submissions.push_back(batch);
                 continue;
             }
-            let batch_id = batch.id;
             match self.executor.submit(batch) {
                 Ok(()) => progressed = true,
                 Err(ExecutorSubmitError::WouldBlock(batch)) => {
@@ -192,12 +190,6 @@ impl Scheduler {
                     self.pending_submissions.push_back(batch);
                 }
                 Err(ExecutorSubmitError::Failed(error)) => {
-                    self.trace_record(json!({
-                        "event": "batch_submit_failed",
-                        "at_s": now(),
-                        "batch_id": batch_id,
-                        "error": format!("{error}"),
-                    }));
                     // Failure reconciliation owns the pending identities until
                     // every affected computation has been retired.
                     self.on_executor_error(error);
@@ -540,9 +532,10 @@ impl Scheduler {
             !self
                 .pending_calls
                 .get(&state.request.request_id)
-                .is_some_and(|ops| {
-                    ops.iter()
-                        .any(|op| op.call.call_id == product.producer_call_id)
+                .is_some_and(|calls| {
+                    calls
+                        .iter()
+                        .any(|call| call.call.call_id == product.producer_call_id)
                 })
         };
         if !state.text_encoding_scheduled {
@@ -747,11 +740,11 @@ impl Scheduler {
     fn lane_occupancy(&self) -> LaneLedger {
         let mut ledger = LaneLedger::default();
         for (id, queue) in &self.pending_calls {
-            for op in queue {
-                let CallKind::Media(media_call) = op.call.code else {
+            for inflight in queue {
+                let CallKind::Media(media_call) = inflight.call.code else {
                     continue;
                 };
-                let units = match &op.input {
+                let units = match &inflight.input {
                     InflightInput::Media {
                         decode: Some(range),
                         ..
@@ -759,7 +752,7 @@ impl Scheduler {
                     _ => 1,
                 };
                 ledger.occupy(
-                    &self.lane_demand(op.call.request_key, media_call, units),
+                    &self.lane_demand(inflight.call.request_key, media_call, units),
                     *id,
                 );
             }
@@ -916,8 +909,12 @@ impl Scheduler {
             let predicate = if stateful {
                 self.pending_calls
                     .get(&id)
-                    .and_then(|ops| ops.iter().find(|op| op.call.call_id == state.predecessor))
-                    .and_then(|op| op.call.completion_output.as_ref())
+                    .and_then(|calls| {
+                        calls
+                            .iter()
+                            .find(|call| call.call.call_id == state.predecessor)
+                    })
+                    .and_then(|call| call.call.completion_output.as_ref())
                     .cloned()
             } else {
                 None
@@ -1150,7 +1147,6 @@ impl Scheduler {
                     latent: placement.latent.clone(),
                     decode: placement.decode.clone(),
                 },
-                submit_at,
                 0,
             );
             call_batches
@@ -1187,36 +1183,6 @@ impl Scheduler {
                 .expect("media_call batch exists");
             let batch_commands = starts.remove(&media_call).unwrap_or_default();
             let batch = ExecutionBatch::new(batch_id, calls, batch_commands, Vec::new());
-            if self.trace_enabled() {
-                self.trace_record(json!({
-                    "event": "batch_submitted",
-                    "at_s": now(),
-                    "batch_id": batch.id,
-                    "call": media_call.as_str(),
-                    "batch_size": batch.requests.len(),
-                    "request_ids": batch
-                        .requests
-                        .iter()
-                        .map(|(call, _)| call.request_key.request_id.0)
-                        .collect::<Vec<_>>(),
-                    "workers": batch
-                        .requests
-                        .iter()
-                        .map(|(_, placement)| placement.worker.0.as_str())
-                        .collect::<Vec<_>>(),
-                    "admitted_request_ids": batch
-                        .admissions()
-                        .map(|request| request.request_key.request_id.0)
-                        .collect::<Vec<_>>(),
-                    "units": batch
-                        .requests
-                        .iter()
-                        .map(|(_, placement)| {
-                            placement.decode.as_ref().map_or(0, |range| range.max_units)
-                        })
-                        .collect::<Vec<_>>(),
-                }));
-            }
             self.register_pending_batch(&batch, submit_at);
             batches.push(batch);
         }
@@ -1310,7 +1276,7 @@ impl Scheduler {
                 .get(&id)
                 .into_iter()
                 .flatten()
-                .any(|op| op.call.code == CallKind::Media(MediaCall::Denoising))
+                .any(|call| call.call.code == CallKind::Media(MediaCall::Denoising))
     }
 
     /// Counts prompt tokens accepted or present in pending forward inputs.
@@ -1639,7 +1605,7 @@ impl Scheduler {
 
         // Bound speculation by worker capacity and exclude lineages whose
         // terminal or relay state makes the projection unsafe.
-        if queue.len() >= self.info.max_unresolved_ops as usize
+        if queue.len() >= self.info.max_unresolved_calls as usize
             || state.terminal_intent.is_terminal()
             || self.pending_finishes.contains_key(&id)
             || !Self::device_token_relay_eligible(state)
@@ -1679,9 +1645,9 @@ impl Scheduler {
 
             if !matches!(state.phase, Phase::Prefill | Phase::DecodeUnd)
                 || (state.phase == Phase::Prefill && state.starts_gen_after_context())
-                || queue.iter().any(|op| {
+                || queue.iter().any(|call| {
                     !matches!(
-                        op.call.code,
+                        call.call.code,
                         CallKind::Forward(ForwardMode::Prefill)
                             | CallKind::Forward(ForwardMode::Decode)
                     )
@@ -1801,7 +1767,7 @@ impl Scheduler {
             && self.running.get(&id).is_some_and(|state| {
                 !state.speculative_chain_invalidated
                     && state.output.decoder_boundaries.len()
-                        < self.info.max_unresolved_ops.max(1) as usize
+                        < self.info.max_unresolved_calls.max(1) as usize
                     && self.peek_next_call_variant(id).is_none_or(|kind| {
                         self.worker_target(
                             RequestKey::new(self.engine_id, id, state.request_epoch),
@@ -1853,13 +1819,7 @@ impl Scheduler {
     }
 
     /// Retains submitted inputs and charges their domain and transfer credits.
-    pub(super) fn register_inflight(
-        &mut self,
-        call: Call,
-        input: InflightInput,
-        started: Instant,
-        queue_us: u64,
-    ) {
+    pub(super) fn register_inflight(&mut self, call: Call, input: InflightInput, queue_us: u64) {
         let request_id = call.request_key.request_id;
         let domain = self.stats.domains.get(call.code);
         let active = domain.active_credits.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1869,11 +1829,7 @@ impl Scheduler {
         self.pending_calls
             .entry(request_id)
             .or_default()
-            .push_back(InflightOp {
-                call,
-                input,
-                started,
-            });
+            .push_back(InflightCall { call, input });
     }
 
     /// Records the domain backpressure.
@@ -1963,12 +1919,6 @@ impl Scheduler {
             .get(&id)
             .is_some_and(|pending| pending.contains_key(&call_id));
         if !known || duplicate {
-            self.trace_record(json!({
-                "event": "unknown_result_call_id",
-                "at_s": now(),
-                "request_id": id.0,
-                "call_id": call_id,
-            }));
             if let Some(state) = self.media_state_mut(id) {
                 state.terminal_intent =
                     TerminalIntent::Failure("worker returned an unknown media call".to_string());
@@ -1980,12 +1930,6 @@ impl Scheduler {
         let media = match media {
             Ok(media) => media,
             Err(message) => {
-                self.trace_record(json!({
-                    "event": "media_mapping_failed",
-                    "request_id": record.request_key.request_id.0,
-                    "call_id": record.call_id,
-                    "detail": &message,
-                }));
                 let event = EngineCoreOutput::ArtifactUnavailable { message };
                 if let Some(state) = self.media_state(id) {
                     let _ = state.event_tx.send(event);
@@ -2156,21 +2100,6 @@ impl Scheduler {
             return;
         };
         self.running_order.retain(|candidate| *candidate != id);
-        let finished_at = now();
-        self.trace_record(json!({
-            "event": "request_finished",
-            "at_s": finished_at,
-            "request_id": id.0,
-            "queue": "media",
-            "queued_at": state.queued_at,
-            "admitted_at": state.admitted_at,
-            "total_us": ((finished_at - state.queued_at) * 1e6) as u64,
-            "outcome": match &event {
-                DiffusionTerminal::Completed(_) => "completed",
-                DiffusionTerminal::Failed(_) => "failed",
-                DiffusionTerminal::Finished(_) => "finished",
-            },
-        }));
         match event {
             DiffusionTerminal::Completed(artifact) => {
                 let _ = state.event_tx.send(EngineCoreOutput::Artifact(artifact));
@@ -2218,15 +2147,15 @@ impl Scheduler {
         );
     }
 
-    /// Resolves the front in-flight op for `id` by the worker's echoed `call_id`.
+    /// Resolves the front in-flight call for `id` by the worker's echoed `call_id`.
     pub(super) fn pop_inflight(
         &mut self,
         request_key: RequestKey,
         call_id: CallId,
-    ) -> Option<(Call, InflightInput, Instant)> {
+    ) -> Option<(Call, InflightInput)> {
         let inflight = self.pop_pending_call(request_key, call_id)?;
         self.reclaim_domain_credit(inflight.call.code, false);
-        Some((inflight.call, inflight.input, inflight.started))
+        Some((inflight.call, inflight.input))
     }
 
     /// Revoke completed buffer identities while retaining allocations until release acknowledgement.
@@ -2278,7 +2207,7 @@ impl Scheduler {
         let result_batch_id = report.batch_id;
         // Aggregate timings by the stable public metric groups. Multiple concrete
         // calls in one group count as one returned run, as do multiple requests.
-        let mut returned_groups: [Option<(usize, TimingCounters)>; 3] = [None; 3];
+        let mut returned_groups: [Option<TimingCounters>; 3] = [None; 3];
         let mut invalid_result = false;
 
         // A completion can mutate state only while its logical batch remains owned
@@ -2326,12 +2255,11 @@ impl Scheduler {
                 continue;
             };
             let component = returned_groups[super::stats::ExecutionDomainStats::index(computation)]
-                .get_or_insert((0, TimingCounters::default()));
-            component.0 += 1;
-            component.1.queued_us = component.1.queued_us.max(record.timing_counters.queued_us);
-            component.1.device_us = component.1.device_us.max(record.timing_counters.device_us);
-            component.1.copy_us = component.1.copy_us.max(record.timing_counters.copy_us);
-            component.1.host_us = component.1.host_us.max(record.timing_counters.host_us);
+                .get_or_insert(TimingCounters::default());
+            component.queued_us = component.queued_us.max(record.timing_counters.queued_us);
+            component.device_us = component.device_us.max(record.timing_counters.device_us);
+            component.copy_us = component.copy_us.max(record.timing_counters.copy_us);
+            component.host_us = component.host_us.max(record.timing_counters.host_us);
         }
 
         let calls_complete = self
@@ -2351,9 +2279,6 @@ impl Scheduler {
         // Publish domain and batch accounting before individual request state is
         // advanced, so every accepted completion contributes exactly once.
         let forward_stats = report.forward_stats;
-        let completion_count = report.results.len();
-        let trace_enabled = self.trace_enabled();
-        let mut domain_trace = trace_enabled.then(Vec::new);
         for result in &report.results {
             let record = &result.output;
             if let Some(computation) = self
@@ -2370,21 +2295,11 @@ impl Scheduler {
             }
         }
         for (index, returned) in returned_groups.into_iter().enumerate() {
-            let Some((call_count, timing)) = returned else {
+            let Some(timing) = returned else {
                 continue;
             };
-            let (label, stats) = self.stats.domains.groups()[index];
+            let (_, stats) = self.stats.domains.groups()[index];
             Self::record_domain_batch(stats, timing);
-            if let Some(trace) = domain_trace.as_mut() {
-                trace.push(json!({
-                    "result_group": index as u32 + 1,
-                    "domain": label,
-                    "calls": call_count,
-                    "queue_us": timing.queued_us,
-                    "device_us": timing.device_us,
-                    "completion_us": timing.copy_us.saturating_add(timing.host_us),
-                }));
-            }
         }
 
         let pending = self
@@ -2443,12 +2358,6 @@ impl Scheduler {
                 .fetch_add(1, Ordering::Relaxed);
         }
 
-        let forward_stats_trace = trace_enabled.then(|| {
-            forward_stats
-                .iter()
-                .map(worker_forward_stats_trace)
-                .collect::<Vec<_>>()
-        });
         for stats in &forward_stats {
             self.record_worker_forward_stats(Some(stats));
         }
@@ -2458,9 +2367,6 @@ impl Scheduler {
         for result in report.results {
             self.stage_completion(result.output, result.media);
         }
-
-        let mut resolved_ops = trace_enabled.then(|| Vec::with_capacity(completion_count));
-        let mut progress_ops = trace_enabled.then(|| Vec::with_capacity(completion_count));
 
         loop {
             let completions = self.take_ready_completions();
@@ -2477,14 +2383,7 @@ impl Scheduler {
                 } = completion;
                 let id = record.request_key.request_id;
                 let call_id = record.call_id;
-                let Some((call, input, started)) = self.pop_inflight(record.request_key, call_id)
-                else {
-                    self.trace_record(json!({
-                        "event": "unknown_result_call_id",
-                        "at_s": now(),
-                        "request_id": id.0,
-                        "call_id": call_id,
-                    }));
+                let Some((call, input)) = self.pop_inflight(record.request_key, call_id) else {
                     if let Some(state) = self.media_state_mut(id) {
                         state.terminal_intent = TerminalIntent::Failure(
                             "worker returned an out-of-order media call".to_string(),
@@ -2496,25 +2395,11 @@ impl Scheduler {
                 };
 
                 let call_variant = call.code;
-                let roundtrip_us = started.elapsed().as_micros() as u64;
 
                 // Media calls update their independent call progress immediately;
                 // generation calls continue through semantic validation.
                 let (image_kv, start_step) = match input {
                     InflightInput::Media { latent, decode } => {
-                        if let Some(ops) = resolved_ops.as_mut() {
-                            ops.push(json!({
-                                "request_id": id.0,
-                                "call_id": call_id,
-                                "kind": call_variant.as_str(),
-                                "status": record.status,
-                                "roundtrip_us": roundtrip_us,
-                                "worker_queued_us": record.timing_counters.queued_us,
-                                "device_us": record.timing_counters.device_us,
-                                "copy_us": record.timing_counters.copy_us,
-                                "host_us": record.timing_counters.host_us,
-                            }));
-                        }
                         self.process_diffusion_result(call, latent, decode, record, media);
                         continue;
                     }
@@ -2551,38 +2436,6 @@ impl Scheduler {
                     continue;
                 }
 
-                let sampled_token_ids_len = record.committed_tokens.len();
-                let sampled_token_ids_last = record.committed_tokens.last().copied();
-                if let Some(resolved_ops) = resolved_ops.as_mut() {
-                    let image = media
-                        .as_ref()
-                        .and_then(|value| std::str::from_utf8(value.as_bytes()).ok());
-                    let image_hw = image
-                        .and_then(|png| validate_png_artifact(png, None))
-                        .map(|metadata| (metadata.height, metadata.width));
-                    resolved_ops.push(json!({
-                        "request_id": id.0,
-                        "call_id": call_id,
-                        "call_type": call_variant.as_str(),
-                        "computation": call.code,
-                        "call": call_trace(&call),
-                        "roundtrip_us": roundtrip_us,
-                        "worker_queue_us": record.timing_counters.queued_us,
-                        "device_us": record.timing_counters.device_us,
-                        "completion_copy_us": record.timing_counters.copy_us,
-                        "completion_ready_to_observed_us": record.timing_counters.host_us,
-                        "sampled_token": sampled_token_ids_last.is_some(),
-                        "sampled_token_ids_len": sampled_token_ids_len,
-                        "sampled_token_ids_last": sampled_token_ids_last,
-                        "flow_done": record.finish_flags.eos || record.finish_flags.length || record.finish_flags.stop,
-                        "steps_completed": record.num_completed_steps,
-                        "image_done": image.is_some(),
-                        "image_hw": image_hw,
-                        "kv_tokens": record.kv_visible_len,
-                        "product_handle": record.product_generations.first().copied(),
-                    }));
-                }
-
                 let Some(state) = self
                     .running
                     .get(&id)
@@ -2592,22 +2445,16 @@ impl Scheduler {
                     // outputs still being produced when cancellation arrived.
                     continue;
                 };
-                if let Err(error) = generation::validate_generation_result(
+                if generation::validate_generation_result(
                     &call,
                     image_kv,
                     start_step,
                     state,
                     &record,
                     media.as_deref(),
-                ) {
-                    self.trace_record(json!({
-                        "event": "transition_validation_failed",
-                        "at_s": now(),
-                        "request_id": id.0,
-                        "call_id": call_id,
-                        "call_type": call_variant.as_str(),
-                        "error": error.detail(),
-                    }));
+                )
+                .is_err()
+                {
                     if self.running.contains_key(&id) {
                         self.finish_after_inflight(id, FinishReason::Error, None);
                     }
@@ -2665,15 +2512,7 @@ impl Scheduler {
                 } else {
                     None
                 };
-                if let Some(Err(error)) = progress_result {
-                    self.trace_record(json!({
-                        "event": "generation_result_invalid",
-                        "at_s": now(),
-                        "request_id": id.0,
-                        "call_id": call_id,
-                        "call_type": call_variant.as_str(),
-                        "error": error.to_string(),
-                    }));
+                if let Some(Err(_)) = progress_result {
                     if self.running.contains_key(&id) {
                         self.finish_after_inflight(id, FinishReason::Error, None);
                     }
@@ -2806,44 +2645,7 @@ impl Scheduler {
                     }
                 }
                 self.finish_pending_if_idle(id);
-                if let (Some(st), Some(progress_ops)) =
-                    (self.running.get(&id), progress_ops.as_mut())
-                {
-                    progress_ops.push(json!({
-                        "request_id": id.0,
-                        "phase": st.phase,
-                        "generated_tokens": st.num_generated_tokens,
-                        "images_done": st.num_generated_images,
-                        "image_id": st.image_id,
-                        "steps_done": st.num_completed_denoise_steps,
-                        "pos": st.logical_position,
-                        "kvlen": st.kv_visible_len,
-                        "next_token": st.next_token,
-                        "text_since_image": st.text_tokens_since_image,
-                        "gen_branch_pending": st.image_reservation_pending,
-                        "context_round_closing": st.round_closing,
-                    }));
-                }
             }
-        }
-
-        if let (Some(resolved_ops), Some(progress_ops)) = (resolved_ops, progress_ops) {
-            self.trace_record(json!({
-                "event": "batch_resolved",
-                "at_s": now(),
-                "batch_id": result_batch_id,
-                "worker_exec_us": worker_us,
-                "host_roundtrip_us": batch_roundtrip_us,
-                "batch_complete": batch_complete,
-                "domains": domain_trace,
-                "forward_stats": forward_stats_trace,
-                "batch_size": resolved_ops.len(),
-                "ops": resolved_ops,
-                "progress": progress_ops,
-                "running": self.running.len(),
-                "pending": self.waiting_order.len(),
-                "in_flight": self.pending_batches.len(),
-            }));
         }
     }
 
@@ -3005,14 +2807,14 @@ impl Scheduler {
         loop {
             let before = (requests.len(), buffers.len());
             for batch in &self.pending_submissions {
-                for (op, placement) in &batch.requests {
+                for (call, placement) in &batch.requests {
                     if (!loss.endpoints.is_empty() && placement.worker == loss.worker_id)
-                        || op.input_buffers().any(|buffer| buffers.contains(&buffer))
+                        || call.input_buffers().any(|buffer| buffers.contains(&buffer))
                     {
-                        requests.insert(op.request_key);
+                        requests.insert(call.request_key);
                     }
-                    if requests.contains(&op.request_key) {
-                        buffers.extend(op.output_buffers());
+                    if requests.contains(&call.request_key) {
+                        buffers.extend(call.output_buffers());
                     }
                 }
             }
@@ -3029,7 +2831,7 @@ impl Scheduler {
                 batch
                     .retire_requests(&requests)
                     .into_iter()
-                    .map(|(op, _)| (batch.id, op.request_key, op.call_id)),
+                    .map(|(call, _)| (batch.id, call.request_key, call.call_id)),
             );
             if let Some(pending) = self.pending_batches.get_mut(&batch.id) {
                 pending.commands = batch
@@ -3041,13 +2843,13 @@ impl Scheduler {
             }
             pending.push_back(batch);
         }
-        for (batch_id, request, op) in retired {
-            let Some(inflight) = self.retire_call(batch_id, request, op) else {
+        for (batch_id, request, call_id) in retired {
+            let Some(inflight) = self.retire_call(batch_id, request, call_id) else {
                 self.fatal = true;
                 tracing::error!(
                     batch_id,
                     ?request,
-                    ?op,
+                    ?call_id,
                     "Worker failure named an unknown pending call"
                 );
                 return;
@@ -3118,7 +2920,7 @@ impl Scheduler {
                 else {
                     break;
                 };
-                let Some((call, _, _)) = self.pop_inflight(request, call_id) else {
+                let Some((call, _)) = self.pop_inflight(request, call_id) else {
                     unreachable!("ready completion owns its call");
                 };
                 drop(completion);
