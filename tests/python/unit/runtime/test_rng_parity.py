@@ -14,7 +14,11 @@ import json
 import struct
 from pathlib import Path
 
+import pytest
+
 from uniserve.nn.rng import philox4x32_10, sampling_key, sampling_uniform
+
+pytestmark = pytest.mark.unit
 
 _FIXTURE = (
     Path(__file__).resolve().parents[2]

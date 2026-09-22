@@ -45,6 +45,8 @@ def _worker_config(*, token_capacity: int | None):
     )
 
 
+# Layout planning queries the device properties of its CUDA grant.
+@pytest.mark.gpu
 def test_explicit_kv_capacity_provisions_one_physical_page_pool():
     info = build_worker_layout(
         _model(), _worker_config(token_capacity=131072)
@@ -89,6 +91,8 @@ def test_automatic_cuda_kv_capacity_requires_a_host_grant():
         )
 
 
+# Layout planning queries the device properties of its CUDA grant.
+@pytest.mark.gpu
 def test_automatic_capacity_charges_request_and_input_storage() -> None:
     model = _model()
     config = replace(
@@ -112,6 +116,8 @@ def test_automatic_capacity_charges_request_and_input_storage() -> None:
     assert larger_input.kv_cache.num_blocks < small.kv_cache.num_blocks
 
 
+# Layout planning queries the device properties of its CUDA grant.
+@pytest.mark.gpu
 def test_explicit_pages_cannot_displace_resident_encoder_storage() -> None:
     model = _model()
     config = replace(

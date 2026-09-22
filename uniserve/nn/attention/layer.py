@@ -10,8 +10,9 @@ import torch
 from torch import nn
 
 from uniserve.distributed import Communicator
-from uniserve.distributed._tokens import _HeadExchange, _TokenShard
+from uniserve.distributed.tokens import HeadExchange, TokenShard
 from uniserve.nn import _binding, functional
+from uniserve.nn.functional._tensors import result
 
 from .inputs import AttentionInput, DenseInput, PagedInput, SegmentedInput
 
@@ -52,11 +53,11 @@ class Attention(nn.Module):
         ):
             raise ValueError("cache names must identify a numerical layer path")
         self.cache_name = cache_name
-        self._local_heads = num_heads
-        self._local_kv_heads = num_kv_heads
-        self._head_indices = tuple(range(num_kv_heads))
-        self._exchange = _HeadExchange(Communicator())
-        self._context = None
+        self.local_heads = num_heads
+        self.local_kv_heads = num_kv_heads
+        self.head_indices = tuple(range(num_kv_heads))
+        self.exchange = HeadExchange(Communicator())
+        self.context_parallel = None
 
     def forward(
         self,
@@ -82,9 +83,9 @@ class Attention(nn.Module):
                 "attention output must match the local query representation"
             )
 
-        group = self._exchange.group
+        group = self.exchange.group
         operator = _binding.attention.get().get(id(self))
-        if self._context is not None:
+        if self.context_parallel is not None:
             if operator is None:
                 raise RuntimeError(
                     "context attention requires an active ExecutionContext"
@@ -105,36 +106,36 @@ class Attention(nn.Module):
                     "ExecutionContext"
                 )
             batch = operator.sequence_inputs(batch)
-        partition = _TokenShard(batch.queries.num_tokens, group)
+        partition = TokenShard(batch.queries.num_tokens, group)
         if partition.num_tokens == 0:
             return torch.empty_like(q) if out is None else out
 
         # Token shard -> this rank's head shard, over the padded common layout.
         storage = _binding.attention_storage.get().get(id(self))
         query, key, value = (
-            self._exchange.heads(
+            self.exchange.heads(
                 partition.pad(tensor), storage=storage, role=role
             )[: partition.num_tokens]
             for role, tensor in zip(
                 ("query", "key", "value"), (q, k, v), strict=True
             )
         )
-        result = self._compute(operator, query, key, value, batch, None)
+        attended = self._compute(operator, query, key, value, batch, None)
 
         # Head shard -> token shard. The exchange spans the padded physical
         # token count, so a short compute result is zero-filled first.
         physical_tokens = partition.capacity * group.size
-        if result.shape[0] != physical_tokens:
-            padded = result.new_zeros((physical_tokens, *result.shape[1:]))
-            padded[: partition.num_tokens].copy_(result)
-            result = padded
-        result = self._exchange.tokens(result, storage=storage)[
+        if attended.shape[0] != physical_tokens:
+            padded = attended.new_zeros((physical_tokens, *attended.shape[1:]))
+            padded[: partition.num_tokens].copy_(attended)
+            attended = padded
+        attended = self.exchange.tokens(attended, storage=storage)[
             : partition.count
         ]
-        return functional._result(result, out)
+        return result(attended, out)
 
     def _compute(self, operator, q, k, v, batch, out):
-        if q.shape[1] != self._local_heads or k.shape[-1] != self.head_dim:
+        if q.shape[1] != self.local_heads or k.shape[-1] != self.head_dim:
             raise ValueError(
                 "attention projections do not match the bound head partition"
             )
@@ -168,17 +169,17 @@ class Attention(nn.Module):
                 "cache writes require an active ExecutionContext"
             )
 
-        if self._context is not None:
+        if self.context_parallel is not None:
             operator.update_cache(k, v, indices=indices)
             return
 
-        if self._exchange.group.size > 1:
-            partition = _TokenShard(indices.numel(), self._exchange.group)
+        if self.exchange.group.size > 1:
+            partition = TokenShard(indices.numel(), self.exchange.group)
             if partition.num_tokens == 0:
                 return
             storage = _binding.attention_storage.get().get(id(self))
             k, v = (
-                self._exchange.heads(
+                self.exchange.heads(
                     partition.pad(tensor), storage=storage, role=role
                 )[: partition.num_tokens]
                 for role, tensor in (("key", k), ("value", v))

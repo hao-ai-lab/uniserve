@@ -4,45 +4,6 @@ from math import prod
 
 import torch
 
-from .triton import triton_available
-
-try:
-    import triton
-    import triton.language as tl
-except ImportError:  # CPU-only library installations use ordinary tensor fills.
-    triton = None
-    tl = None
-
-
-if triton is not None:
-
-    @triton.jit
-    def _fill_kernel(
-        tensors,
-        widths: tl.constexpr,
-        values: tl.constexpr,
-        tiles: tl.constexpr,
-        start,
-        block: tl.constexpr,
-    ):
-        # Grid axis 0 walks the per-field 1024-element tiles of one block,
-        # concatenated across fields; axis 1 indexes blocks along the leading
-        # axis, offset by ``start``. Each tensor is [block, *widths[field]].
-        tile = tl.program_id(0)
-        page = start + tl.program_id(1)
-        first: tl.constexpr = 0
-        for field in tl.static_range(len(widths)):
-            if tile >= first and tile < first + tiles[field]:
-                offsets = (tile - first) * block + tl.arange(0, block)
-                tl.store(
-                    tensors[field]
-                    + page.to(tl.int64) * widths[field]
-                    + offsets,
-                    values[field],
-                    offsets < widths[field],
-                )
-            first += tiles[field]
-
 
 class BlockFill:
     """Borrow physical fields with one fill value and a leading block axis each.
@@ -58,31 +19,10 @@ class BlockFill:
     ):
         self.tensors, self.values = tensors, values
         self.widths = tuple(prod(tensor.shape[1:]) for tensor in tensors)
-        self.tiles = tuple((width + 1023) // 1024 for width in self.widths)
 
-        self._cuda = (
-            triton is not None
-            and bool(tensors)
-            and triton_available(tensors[0].device)
-            and all(
-                tensor.device == tensors[0].device
-                and tensor.is_contiguous()
-                and tensor.dtype
-                in {
-                    torch.bool,
-                    torch.uint8,
-                    torch.int8,
-                    torch.int16,
-                    torch.int32,
-                    torch.int64,
-                    torch.float16,
-                    torch.bfloat16,
-                    torch.float32,
-                    torch.float64,
-                }
-                for tensor in tensors
-            )
-        )
+        from uniserve_kernels import cache
+
+        self._cuda = cache.can_fill_blocks(tensors)
 
     def __call__(self, start: int, stop: int) -> None:
         """Fill a block interval on every field.
@@ -91,17 +31,13 @@ class BlockFill:
         field.
         """
         if self._cuda:
-            # A public cache call follows its backing device even when
-            # the calling thread currently has another CUDA device selected.
-            with torch.cuda.device(self.tensors[0].device):
-                _fill_kernel[(sum(self.tiles), stop - start)](
-                    self.tensors,
-                    self.widths,
-                    self.values,
-                    self.tiles,
-                    start,
-                    1024,
-                )
+            from uniserve_kernels import cache
+
+            # A public cache call follows its backing device even when the
+            # calling thread currently has another CUDA device selected.
+            cache.fill_blocks(
+                self.tensors, self.values, self.widths, start, stop
+            )
         else:
             for tensor, value in zip(self.tensors, self.values, strict=True):
                 tensor[start:stop].fill_(value)

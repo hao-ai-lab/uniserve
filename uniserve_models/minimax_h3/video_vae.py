@@ -12,22 +12,23 @@ from torch import nn
 from uniserve.media import image
 from uniserve.nn import functional
 from uniserve.nn.attention import Attention, DenseInput
-from uniserve.nn.linear import Linear, QKVParallelLinear, RowParallelLinear
-from uniserve.nn.mlp import GatedMLP
-from uniserve.nn.rope import RotaryEmbedding
-from uniserve.nn.vae import LatentDecoder, SpatialDecoder
-from uniserve.ops.patch import unpatchify_video_tokens
-from uniserve.ops.residual import (
+from uniserve.nn.functional import (
+    qk_bias_rms_norm_rope_,
     scaled_residual_,
     scaled_residual_layer_norm,
     scaled_residual_layer_norm_absmax,
     scaled_residual_rms_norm_,
     scaled_residual_rms_norm_absmax_,
+    swiglu,
+    swiglu_absmax,
+    unpatchify_video_tokens,
     weighted_rms_norm,
     weighted_rms_norm_absmax,
 )
-from uniserve.ops.rope import qk_rms_norm_partial_rope_
-from uniserve.ops.silu import swiglu, swiglu_absmax
+from uniserve.nn.linear import Linear, QKVParallelLinear, RowParallelLinear
+from uniserve.nn.mlp import GatedMLP
+from uniserve.nn.rope import RotaryEmbedding
+from uniserve.nn.vae import LatentDecoder, SpatialDecoder
 from uniserve.quantization import QuantizedTensor
 
 
@@ -366,7 +367,7 @@ class TransformerLayer(nn.Module):
             projections[name].reshape(batch, sequence, -1, dim)
             for name in ("q", "k", "v")
         )
-        qk_rms_norm_partial_rope_(
+        qk_bias_rms_norm_rope_(
             query,
             key,
             cos,
@@ -506,11 +507,10 @@ class Transformer(nn.Module):
             dtype=torch.float32,
             sequence_length=max(frames, height, width),
         )
-        # Repeat each rotary frequency for its rotate-half pair, then cast the
-        # tables to the activation dtype: [B, heads, tokens, rope_width].
+        # Compact factors in the activation dtype, one per rotate-half pair:
+        # [B, tokens, rope_width / 2], broadcast over heads.
         cos, sin = (
-            value.flatten(2, 3).repeat(1, 1, 2).unsqueeze(2).to(compute_dtype)
-            for value in (cos, sin)
+            value.flatten(2, 3).to(compute_dtype) for value in (cos, sin)
         )
 
         first = self.layers[0]

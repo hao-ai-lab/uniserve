@@ -8,7 +8,7 @@ from torch import nn
 
 from uniserve.nn.functional import apply_rotary
 from uniserve.nn.rope import RotaryEmbedding
-from uniserve.nn.vision.patching import build_abs_positions_from_grid_hw
+from uniserve.nn.vision.position import build_abs_positions_from_grid_hw
 
 
 @dataclass(frozen=True)

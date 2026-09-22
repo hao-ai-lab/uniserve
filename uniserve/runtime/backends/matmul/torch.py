@@ -5,8 +5,8 @@ import torch.nn.functional as F
 
 from uniserve.quantization import QuantizedTensor
 
-from . import Backend as _Backend
-from . import Operator as _Operator
+from .base import Backend as _Backend
+from .base import Operator as _Operator
 
 
 class _TorchOperator(_Operator):

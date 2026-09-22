@@ -6,6 +6,8 @@ import pytest
 
 from uniserve_worker._uniserve_ipc import atomic_load_u32, atomic_store_u32
 
+pytestmark = pytest.mark.unit
+
 
 def test_atomic_access_checks_the_actual_view_address_and_extent():
     storage = bytearray(16)

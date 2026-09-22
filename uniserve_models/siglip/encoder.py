@@ -15,7 +15,7 @@ from uniserve.nn.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from uniserve.nn.vision.patching import build_abs_positions_from_grid_hw
+from uniserve.nn.vision.position import build_abs_positions_from_grid_hw
 
 from .config import Config, TransformerConfig
 

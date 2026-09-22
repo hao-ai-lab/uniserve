@@ -26,6 +26,7 @@ from uniserve.nn.attention import (
 )
 from uniserve.runtime import (
     CUDAGraph,
+    CUDAStream,
     ExecutionContext,
     TensorBuffers,
     initialize_process_groups,
@@ -178,9 +179,12 @@ def _run(rank, rendezvous, directory, source):
             ),
         ).model
         size = DenoiserSize(22, 63)
-        stream = torch.cuda.Stream(device=device)
-        stream.wait_stream(torch.cuda.current_stream(device))
-        with ExecutionContext(model, stream=stream, vsa="cute") as execution:
+        stream = CUDAStream.external(torch.cuda.Stream(device=device))
+        stream.wait(torch.cuda.current_stream(device))
+        with (
+            stream,
+            ExecutionContext(model, stream=stream, vsa="cute") as execution,
+        ):
             execution.prepare(size)
             requirements = model.state_buffers(size)
             with (
@@ -388,10 +392,11 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
         factory = MediaBuilder(model, max_frames=22, max_text_tokens=65)
         size = factory.size(22, 63)
         matrices = {name: value.to(device) for name, value in source.items()}
+        stream = CUDAStream.external(torch.cuda.Stream(device=device))
         runner = TrajectoryRunner(
             model,
             device=device,
-            stream=torch.cuda.Stream(device=device),
+            stream=stream,
             groups=(),
             capacity=2,
         )
@@ -477,3 +482,4 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
         finally:
             runner.close()
             pool.close()
+            stream.close()

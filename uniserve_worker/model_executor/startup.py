@@ -238,7 +238,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
     prefix_entry = runner._forward_calls[(entry.name, ForwardMode.PREFILL)]
     stream = entry.context.stream
     if stream is not None:
-        stream.wait_stream(torch.cuda.current_stream(entry.device))
+        stream.wait(torch.cuda.current_stream(entry.device))
 
     with entry.context.activate():
         for shape in sorted(
@@ -331,13 +331,13 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                         else None
                     )
                     if prefix_stream is not None:
-                        prefix_stream.wait_stream(current_stream)
+                        prefix_stream.wait(current_stream)
                     prefix_entry.eager_batch(
                         batch,
                         prefix_entry.batch_forward,
                     )
                     if prefix_stream is not None:
-                        current_stream.wait_stream(prefix_stream)
+                        current_stream.wait_stream(prefix_stream.stream)
 
                 attention = from_blocks(
                     pages=tuple(pages),
@@ -379,4 +379,4 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                     entry.eager_batch(batch, forward)
 
     if stream is not None:
-        torch.cuda.current_stream(entry.device).wait_stream(stream)
+        torch.cuda.current_stream(entry.device).wait_stream(stream.stream)

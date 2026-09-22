@@ -2,9 +2,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+
+import torch
 
 _failed_resources: list[object] = []
+
+
+def streams_idle(streams: Iterable[torch.cuda.Stream]) -> bool:
+    """Report, without waiting, whether every stream finished its work.
+
+    An owner leaving on an exception releases normally only when no access
+    it submitted can still be running. A device fault reported by the query
+    leaves that unproven, so it counts as unfinished work.
+    """
+    try:
+        return all(stream.query() for stream in streams)
+    except RuntimeError:
+        return False
 
 
 def retain_until_exit(owner: object) -> None:

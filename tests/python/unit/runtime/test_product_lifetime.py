@@ -31,6 +31,8 @@ from uniserve_worker.storage.latent_pool import LatentPool, LatentUpdate
 from uniserve_worker.storage.output import OutputPool
 from uniserve_worker.storage.tensor_store import FeatureMetadata, TensorStore
 
+pytestmark = pytest.mark.unit
+
 
 def test_abandoned_output_job_releases_capacity_and_terminates_dependent_work() -> (  # noqa: E501
     None

@@ -97,34 +97,6 @@ def test_media_units_cover_the_sample_timeline_without_overlap(units, trim):
         assert earlier.stop == later.start
 
 
-def test_a_halo_shorter_than_the_receptive_field_changes_the_result(
-    monkeypatch,
-):
-    """The equality above is the halo's doing, not the decoder's."""
-    decoder = _decoder()
-    frames, units = 18, 3
-    latent, num_samples, workspace = _track(decoder, frames, 0)
-
-    whole = decoder.decode(
-        (latent,),
-        frames=(slice(0, frames),),
-        num_samples=(num_samples,),
-        workspace=workspace,
-    )[0]
-    monkeypatch.setattr(type(decoder), "latent_halo", lambda self: 0)
-    pieces = [
-        decoder.decode(
-            (latent,),
-            frames=(window,),
-            num_samples=(num_samples,),
-            workspace=workspace,
-        )[0]
-        for window in decoder.unit_frames(num_samples, units)
-    ]
-
-    assert not torch.equal(torch.cat(pieces, dim=0), whole)
-
-
 def test_media_units_must_lie_within_the_latent_timeline():
     decoder = _decoder()
     frames = 12

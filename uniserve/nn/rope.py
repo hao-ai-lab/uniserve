@@ -274,13 +274,20 @@ class RotaryEmbedding(nn.Module):
             frequencies = self.inv_freq.to(device=positions.device)
             scale = self._frequency_scale
 
-        from uniserve.ops.rope_kernels import try_triton_rotary_factors
+        from uniserve_kernels import rope
 
-        factors = try_triton_rotary_factors(
-            positions, frequencies, scale * self.attention_scale, dtype=dtype
-        )
-        if factors is not None:
-            return factors
+        if rope.can_run_rotary_factors(positions, frequencies, dtype):
+            shape = (*positions.shape, frequencies.numel())
+            cosine = torch.empty(shape, device=positions.device, dtype=dtype)
+            sine = torch.empty_like(cosine)
+            rope.rotary_factors(
+                positions,
+                frequencies,
+                scale * self.attention_scale,
+                cosine,
+                sine,
+            )
+            return cosine, sine
 
         device_type = (
             positions.device.type if positions.device.type != "mps" else "cpu"
@@ -307,7 +314,7 @@ class RotaryEmbedding(nn.Module):
 
     def prepare_constants(self, max_position: int, *, out):
         """Fill caller-owned factors for one complete sequence-length domain."""
-        from .functional import _result
+        from .functional._tensors import result as _result
 
         expected = self.constant_buffers(max_position)
         if set(out) != set(expected):

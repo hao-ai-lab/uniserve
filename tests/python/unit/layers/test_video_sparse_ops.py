@@ -2,8 +2,7 @@
 
 import pytest
 import torch
-
-from uniserve.ops import video_sparse as ops
+from uniserve_kernels.attention import vsa_tiles as ops
 
 pytestmark = [pytest.mark.unit, pytest.mark.gpu]
 

@@ -38,25 +38,6 @@ def rescale_(
 
 
 def _rescale(values, old, new, initialized, *, dtype):
-    import triton
-    import triton.language as tl
+    from uniserve_kernels import cache
 
-    from ._fp8_kernel import rescale_blocks
-
-    width = values[0].numel() if values.shape[0] else 0
-    if not width:
-        return
-    rescale_blocks[(values.shape[0],)](
-        values,
-        old,
-        new,
-        initialized,
-        width,
-        triton.next_power_of_2(min(width, 1024)),
-        {
-            torch.float16: tl.float16,
-            torch.bfloat16: tl.bfloat16,
-            torch.float32: tl.float32,
-        }[dtype],
-        num_warps=4,
-    )
+    cache.rescale_fp8_blocks(values, old, new, initialized, dtype)

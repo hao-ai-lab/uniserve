@@ -23,7 +23,8 @@ def test_encoder_runner_preserves_homogeneous_sample_order() -> None:
 
     with ExecutionContext(model) as context:
         runner = EncoderRunner(model, context=context)
-        output = runner.encode(inputs, size=3)
+        runner.warmup(3)
+        output = runner.encode(inputs)
 
     assert output is not None
     for actual, expected in zip(output, inputs, strict=True):
@@ -43,7 +44,7 @@ def test_image_runner_decodes_canonical_patch_rows() -> None:
     torch.testing.assert_close(pixels, expected)
 
 
-def test_runner_rejects_mismatched_context_and_calls_after_close() -> None:
+def test_runner_rejects_mismatched_and_closed_contexts() -> None:
     model = nn.Identity()
     other = nn.Identity()
     with ExecutionContext(other) as context:
@@ -52,6 +53,5 @@ def test_runner_rejects_mismatched_context_and_calls_after_close() -> None:
 
     with ExecutionContext(model) as context:
         runner = ModelRunner(model, context=context)
-        runner.close()
-        with pytest.raises(RuntimeError, match="runner is closed"):
-            runner.warmup(1)
+    with pytest.raises(RuntimeError, match="execution context is closed"):
+        runner.warmup(1)

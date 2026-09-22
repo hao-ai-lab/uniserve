@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from functools import partial
 from importlib import import_module
 
 import torch
 
 from uniserve.nn.attention.vsa.inputs import BlockInput, Pattern
 
+from ._rows import _Rows
+
 
 class Operator:
-    """One call site's plans and borrowed scratch.
+    """One call site's plans, borrowed scratch and per-scale row producers.
 
-    Block IDs remain live inputs.
+    Block IDs remain live inputs. A concrete operator supplies ``kernel``, the
+    block-64 numerical call ``kernel(q, k, v, out, indices, counts,
+    valid_sizes, scale=...)`` that evaluates complete calls, and may supply a
+    different ``row_kernel`` for row production.
     """
+
+    kernel: Callable[..., object]
 
     def __init__(self, pattern, *, num_heads, head_dim, dtype, workspace):
         if min(num_heads, head_dim) < 1 or len(pattern.row_counts) not in (
@@ -31,6 +40,13 @@ class Operator:
             dtype,
         )
         self.workspace, self._closed = workspace, False
+        # Row producers own the query maps they plan, one per softmax scale.
+        self._rows: dict[float, _Rows] = {}
+
+    @property
+    def row_kernel(self) -> Callable[..., object]:
+        """Return the numerical call used for row production."""
+        return self.kernel
 
     def bind(self, batch: BlockInput) -> None:
         """Check a live batch against the prepared pattern before use."""
@@ -81,12 +97,67 @@ class Operator:
             )
 
     def __call__(self, q, k, v, batch, *, scale, out):
-        """Evaluate one attention call; implemented by each concrete backend."""
-        raise NotImplementedError
+        """Evaluate one attention call into ``out``."""
+        self._validate(q, k, v, batch, out)
+        self.kernel(
+            q,
+            k,
+            v,
+            out,
+            batch.block_indices,
+            batch.block_counts,
+            batch.valid_sizes,
+            scale=scale,
+        )
+        return out
+
+    def rows(
+        self,
+        q,
+        k,
+        v,
+        batch,
+        *,
+        gate,
+        compressed,
+        out,
+        owners,
+        chunk_tokens,
+        packed,
+        scale,
+    ):
+        """Return a producer of owner row intervals over one fine attention.
+
+        The first produced interval launches ``row_kernel`` over the complete
+        packed query domain; every interval then composes its own rows into
+        its transport destinations. ``out`` stays borrowed until the last
+        interval has been composed.
+        """
+        self.bind(batch)
+        producer = self._rows.get(scale)
+        if producer is None:
+            producer = self._rows[scale] = _Rows(
+                partial(self.row_kernel, scale=scale)
+            )
+        return producer.prepare(
+            q,
+            k,
+            v,
+            mask_block_indices=batch.block_indices,
+            mask_block_count=batch.block_counts,
+            valid_sizes=batch.valid_sizes,
+            gate=gate,
+            compressed=compressed,
+            attention_output=out,
+            owners=owners,
+            chunk_rows=chunk_tokens,
+            packed=packed,
+        )
 
     def close(self):
-        """Release the borrowed workspace; the operator cannot be reused."""
+        """Release plans and borrowed workspace; the operator is not reused."""
         self._closed = True
+        self._rows.clear()
         self.workspace = {}
 
 

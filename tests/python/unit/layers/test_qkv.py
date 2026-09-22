@@ -9,7 +9,7 @@ from torch import nn
 
 from uniserve.nn import QKVParallelLinear, RMSNorm
 from uniserve.nn.attention import RotaryQKVProjection
-from uniserve.runtime import CUDAGraph, ExecutionContext
+from uniserve.runtime import CUDAGraph, CUDAStream, ExecutionContext
 
 
 class Projection(nn.Module):
@@ -95,9 +95,14 @@ def test_rotary_projection_preserves_qkv_values_and_replay(rows, flow_device):
             torch.testing.assert_close(actual, reference.to(device))
 
     with ExitStack() as scope, torch.inference_mode():
-        stream = None if device == "cpu" else torch.cuda.Stream(device=device)
+        stream = (
+            None
+            if device == "cpu"
+            else CUDAStream.external(torch.cuda.Stream(device=device))
+        )
         if stream is not None:
-            stream.wait_stream(torch.cuda.current_stream(device))
+            scope.callback(stream.close)
+            stream.wait(torch.cuda.current_stream(device))
         context = scope.enter_context(ExecutionContext(module, stream=stream))
         context.prepare(None)
         verify(module(inputs, cos, sin), expected(hidden))

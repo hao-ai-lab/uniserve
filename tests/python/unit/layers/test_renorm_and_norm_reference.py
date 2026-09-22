@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve import ops
 from uniserve.diffusion import AdditiveGuidance, Branch, Renorm, make_schedule
 from uniserve.nn import functional
 from uniserve.nn.norm import RMSNorm
@@ -182,13 +181,15 @@ def test_rmsnorm_matches_fp32_reference_on_cuda():
     x = torch.randn(16, hidden, device="cuda", dtype=torch.float32).contiguous()
 
     with torch.no_grad():
-        actual = ops.rms_norm(x, weight, 1e-6)
+        actual = functional.rms_norm(x, weight, 1e-6)
     expected = _rms_reference(x, weight, 1e-6)
 
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_rmsnorm_preserves_normalization_and_residual_values(device, dtype):
     if device == "cuda" and not torch.cuda.is_available():

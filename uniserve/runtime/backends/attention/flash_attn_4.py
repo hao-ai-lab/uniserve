@@ -5,6 +5,7 @@ from __future__ import annotations
 from functools import partial
 
 import torch
+from uniserve_kernels.attention.merge import merge_attention_states
 
 from uniserve.nn.attention.inputs import (
     DenseInput,
@@ -18,14 +19,34 @@ from uniserve.tensors import BufferConfig
 
 from . import Backend as _Backend
 from . import Operator as _Operator
-from ._merge import merge_attention_states
 from ._sequences import causal_runs
+
+
+def available() -> bool:
+    """Report whether the FlashAttention-4 CuTe runtime can be imported."""
+    try:
+        _flash_attn_forward()
+    except ImportError:
+        return False
+    return True
+
+
+def _flash_attn_forward():
+    """Return FlashAttention-4's forward entry, raising if it is absent."""
+    try:
+        from flash_attn.cute.interface import _flash_attn_fwd
+    except Exception as error:
+        raise ImportError(
+            "FlashAttention-4 is unavailable; install uniserve-kernels with "
+            "its flash_attn extra"
+        ) from error
+    return _flash_attn_fwd
 
 
 def _visible_options(
     batch, keys, *, query_capacity, key_capacity, segmented=False
 ):
-    from uniserve_kernel.flash_attn_jagged import hybrid_multimodal_mask
+    from uniserve_kernels.attention.visible_end import visible_end_mask
 
     visible = batch.visible_current_end if segmented else batch.visible_end
     complete = batch.fully_visible_current if segmented else batch.fully_visible
@@ -38,7 +59,7 @@ def _visible_options(
     visible.__leading_dim__ = 1
     visible.__assumed_align__ = 4
 
-    result = {"aux_tensors": [visible], "mask_mod": hybrid_multimodal_mask}
+    result = {"aux_tensors": [visible], "mask_mod": visible_end_mask}
     architecture = torch.cuda.get_device_capability(visible.device)[0]
     if (
         not segmented
@@ -48,7 +69,7 @@ def _visible_options(
     ):
         # Native block-sparse traversal consumes contiguous K/V. Paged K/V
         # retains the identical elementwise visibility mask above.
-        from uniserve_kernel.flash_attn_jagged.prefix_bounds import (
+        from uniserve_kernels.attention.prefix_bounds import (
             prefix_block_sparsity,
         )
 
@@ -93,12 +114,7 @@ class _FlashAttentionOperator(_Operator):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        from uniserve_kernel.flash_attn_jagged import (
-            flash_attn_fwd,
-            require_available,
-        )
-
-        require_available()
+        flash_attn_fwd = _flash_attn_forward()
         if self.dtype not in {torch.float16, torch.bfloat16}:
             raise ValueError(
                 "FlashAttention-4 requires FP16 or BF16 computation"

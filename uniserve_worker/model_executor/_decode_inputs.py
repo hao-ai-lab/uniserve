@@ -9,8 +9,7 @@ the scheduler changes the set of live request slots.
 from __future__ import annotations
 
 import torch
-
-from uniserve.runtime.triton import triton_available
+from uniserve_kernels.triton import launchable
 
 try:
     import triton
@@ -198,7 +197,7 @@ def gather_request_decode_inputs(
         raise ValueError(
             "request-indexed decode staging requires one CUDA device"
         )
-    if triton is None or not triton_available(device):
+    if triton is None or not launchable(device):
         raise RuntimeError("request-indexed decode staging requires Triton")
 
     # ``request_pool_indices`` defines scalar output capacity; ``rows`` selects

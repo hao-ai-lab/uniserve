@@ -1,24 +1,29 @@
 """Stream-bound NCCL collectives for local tensor parallelism.
 
-Execution binds each process group's communicator to the stream that will
-enqueue its collectives, so captured graphs replay without host dispatch.
+Each computation stream owns the communicators that enqueue its collectives,
+so captured graphs replay without host dispatch. The stream's
+:class:`StreamCommunication` also owns every window registered on those
+communicators and the storage behind it; execution contexts borrow them.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Hashable, Iterable, Mapping
+from contextlib import contextmanager
 from ctypes import addressof, c_void_p
+from types import MappingProxyType
+from typing import Protocol
 
 import torch
 import torch.distributed as dist
 
-from uniserve.distributed.mesh import Communicator
 from uniserve.runtime.cuda import (
     create_sibling_stream,
     cuda_value,
     destroy_stream,
     driver,
 )
+from uniserve.runtime.resources import close_resources
 
 
 class _CollectiveWork:
@@ -119,6 +124,11 @@ class NcclCommunicator:
                     )
                 self._comm = c_void_p()
             raise
+
+    @property
+    def transfer_stream(self) -> torch.cuda.Stream | None:
+        """Return the owned stream that carries streamed publications."""
+        return self._transfer
 
     def _arguments(
         self,
@@ -442,31 +452,219 @@ class NcclCommunicator:
             self._transfer = self._pending = None
 
 
-def allocate_stream_collectives(
-    groups: Iterable[Communicator], stream: torch.cuda.Stream
-) -> dict[str, NcclCommunicator]:
-    """Allocate communication resources for one stream.
+def _capturing(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
 
-    Allocate independent communication resources for one computation stream.
+
+class GatherPool:
+    """Lend transport buffers until their readers are enqueued.
+
+    Iterators may nest while upstream projections still have unread payloads.
+    Each active borrower receives distinct backing; completed borrowers reuse
+    storage on the owner's serialized stream. Captured graphs keep addressing
+    every buffer, so buffers live as long as the pool. With a communicator,
+    each buffer is registered as one of its windows when it is created.
     """
-    bindings = {}
-    try:
-        for communicator in groups:
-            if communicator.size == 1:
-                continue
-            group = communicator._require()
-            if (
-                dist.get_backend(group) == "nccl"
-                and group.group_name not in bindings
-            ):
-                bindings[group.group_name] = NcclCommunicator(group, stream)
-    except BaseException as error:
-        for binding in reversed(tuple(bindings.values())):
-            try:
-                binding.close()
-            except BaseException as cleanup_error:
-                error.add_note(
-                    f"collective binding cleanup failed: {cleanup_error!r}"
+
+    def __init__(self, group, communicator: NcclCommunicator | None):
+        self.group = group
+        self.communicator = communicator
+        self.buffers: list[torch.Tensor] = []
+        self.borrowed: set[int] = set()
+        self.symmetric = dist.get_backend(group._require()) == "nccl"
+
+    @contextmanager
+    def borrow(self, size, device, *, capacity=None):
+        if device != self.group.device:
+            raise ValueError(
+                "projection exchange must use its communicator's device"
+            )
+        if capacity is not None and size > capacity:
+            raise ValueError("projection exchange exceeds the bound workspace")
+        amount = size if capacity is None else capacity
+
+        buffer = next(
+            (
+                value
+                for value in self.buffers
+                if id(value) not in self.borrowed and value.numel() >= amount
+            ),
+            None,
+        )
+        if buffer is None:
+            if _capturing(device):
+                raise RuntimeError(
+                    "prepare projection exchange backing before capture"
                 )
-        raise
-    return bindings
+            if self.symmetric:
+                from ._peer_storage import allocate_collective_buffer
+
+                buffer = allocate_collective_buffer(
+                    (amount,), dtype=torch.uint8, device=device
+                )
+            else:
+                buffer = torch.empty(amount, dtype=torch.uint8, device=device)
+            if self.communicator is not None:
+                self.communicator.register_buffers(buffer)
+            self.buffers.append(buffer)
+
+        self.borrowed.add(id(buffer))
+        try:
+            yield buffer
+        finally:
+            self.borrowed.remove(id(buffer))
+
+
+class _Allocation(Protocol):
+    """Backing storage that its owner retires exactly once."""
+
+    def close(self) -> None: ...
+
+
+class StreamCommunication:
+    """Own the communicators, windows and window storage of one stream.
+
+    Every execution context running on the stream borrows these resources.
+    Binding a communicator, registering a window and retiring either are
+    collective over the group, so they live as long as the stream rather than
+    any one context: ranks may prepare different numbers of contexts, in
+    different orders, but each rank binds a stream's groups in one order and
+    closes the stream on a path all members reach.
+    """
+
+    def __init__(self, stream: torch.cuda.Stream) -> None:
+        self.stream = stream
+        self._communicators: dict[str, NcclCommunicator] = {}
+        self._gather_pools: dict[object, GatherPool] = {}
+        self._windows: dict[
+            Hashable, tuple[object, tuple[_Allocation, ...]]
+        ] = {}
+        self._closed = False
+
+    @property
+    def communicators(self) -> Mapping[str, NcclCommunicator]:
+        """Borrow the bound communicators by process-group name.
+
+        The view is live: groups bound later appear in scopes already entered.
+        """
+        return MappingProxyType(self._communicators)
+
+    def _open(self) -> None:
+        if self._closed:
+            raise RuntimeError("stream communication is closed")
+
+    def bind(self, groups: Iterable) -> None:
+        """Create communicators for multi-rank NCCL groups not yet bound.
+
+        Creation is collective over each group: every member binds the same
+        groups on its corresponding stream in the same order. Groups already
+        bound are borrowed again without communication.
+        """
+        self._open()
+        created: dict[str, NcclCommunicator] = {}
+        try:
+            for communicator in groups:
+                if communicator.size == 1:
+                    continue
+                group = communicator._require()
+                name = group.group_name
+                if (
+                    dist.get_backend(group) == "nccl"
+                    and name not in self._communicators
+                    and name not in created
+                ):
+                    created[name] = NcclCommunicator(group, self.stream)
+        except BaseException as error:
+            for binding in reversed(tuple(created.values())):
+                try:
+                    binding.close()
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        f"collective binding cleanup failed: {cleanup_error!r}"
+                    )
+            raise
+        self._communicators.update(created)
+
+    def gather_pool(self, group) -> GatherPool:
+        """Borrow the stream's transport pool for one gather group."""
+        self._open()
+        pool = self._gather_pools.get(group)
+        if pool is None:
+            pool = GatherPool(
+                group, self._communicators.get(group._require().group_name)
+            )
+            self._gather_pools[group] = pool
+        return pool
+
+    def windows(
+        self,
+        key: Hashable,
+        group,
+        allocate: Callable[
+            [], tuple[object, tuple[_Allocation, ...], tuple[torch.Tensor, ...]]
+        ],
+    ) -> object:
+        """Borrow storage whose tensors are registered on ``group``'s windows.
+
+        ``allocate`` returns the borrowed value, the allocations that own its
+        backing, and the tensors to register. It runs once per ``key``; later
+        contexts borrow the same registered storage, so re-preparation neither
+        registers new windows nor retains retired backing.
+        """
+        self._open()
+        if key not in self._windows:
+            if _capturing(self.stream.device):
+                raise RuntimeError(
+                    "prepare registered communication storage before capture"
+                )
+            communicator = self._communicators.get(group._require().group_name)
+            if communicator is None:
+                raise RuntimeError(
+                    "bind a group's communicator before registering windows"
+                )
+            value, allocations, tensors = allocate()
+            try:
+                communicator.register_buffers(*tensors)
+            except BaseException:
+                close_resources(
+                    *(allocation.close for allocation in allocations)
+                )
+                raise
+            self._windows[key] = value, allocations
+        return self._windows[key][0]
+
+    def close(self, *, aborted: bool = False) -> None:
+        """Retire communicators, then the storage their windows registered.
+
+        Normal retirement is collective over every bound group; call it on a
+        path all members reach after every context and graph on the stream
+        has retired. ``aborted`` retains every native resource until process
+        exit without waiting for peers or the device.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if aborted:
+            from .resources import retain_until_exit
+
+            retain_until_exit(self)
+            for communicator in self._communicators.values():
+                communicator.abort()
+            return
+
+        try:
+            close_resources(
+                *(
+                    communicator.close
+                    for communicator in self._communicators.values()
+                ),
+                *(
+                    allocation.close
+                    for _, allocations in self._windows.values()
+                    for allocation in allocations
+                ),
+            )
+        finally:
+            self._communicators.clear()
+            self._gather_pools.clear()
+            self._windows.clear()

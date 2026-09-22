@@ -119,7 +119,7 @@ def _run_collectives(rank: int, rendezvous: str):
         greens = partition_streams(device, (64, 88))
         try:
             for green in greens:
-                with ExecutionContext(module, stream=green.stream) as context:
+                with ExecutionContext(module, stream=green) as context:
                     # Replacing a preparation must retire its registrations and
                     # plans. The same numerical module remains callable with a
                     # different row capacity after every graph reader retires.
@@ -200,6 +200,78 @@ def test_stream_collectives_preserve_values_and_rank_order_under_capture(
 
 
 @torch.inference_mode()
+def _run_shared_stream(rank: int, rendezvous: str):
+    """Contexts on one stream borrow the communicators the stream retires."""
+    device = torch.device("cuda", rank)
+    with initialize_process_groups(
+        rank=rank,
+        local_rank=rank,
+        world_size=2,
+        device=device,
+        backend="nccl",
+        init_method=rendezvous,
+    ) as environment:
+        mesh = environment.bind(
+            DeviceMesh(ranks=(0, 1), shape=(2,), axes=("tokens",), rank=rank),
+            device=device,
+        )
+        group = mesh.get_group("tokens")
+        module = _Collectives(mesh)
+        base = torch.arange(8, dtype=torch.float32, device=device).view(2, 4)
+        value = base + rank * 10
+        expected = base * 2 + 10
+
+        def reduced(context):
+            with context.activate():
+                return group.all_reduce(value, out=torch.empty_like(value))
+
+        green = partition_streams(device, (64,))[0]
+        with green:
+            first = ExecutionContext(module, stream=green)
+            first.prepare(TextSize(4, 1))
+            # A second context and its graph share the first context's
+            # communicators while both contexts remain open.
+            with ExecutionContext(module, stream=green) as second:
+                second.prepare(TextSize(8, 1))
+                with CUDAGraph(context=second) as graph:
+                    graph.capture(lambda: reduced(second))
+                    replayed = graph.replay()
+                    green.stream.synchronize()
+                    torch.testing.assert_close(replayed, expected)
+                eager = reduced(first)
+                green.stream.synchronize()
+                torch.testing.assert_close(eager, expected)
+            first.close()
+
+            # Ranks may prepare different numbers of contexts. Preparing binds
+            # no communicator the stream already owns, so it needs no peer.
+            if rank == 0:
+                with ExecutionContext(module, stream=green) as extra:
+                    extra.prepare(TextSize(2, 1))
+
+            # The stream, not a retired context, owns the communicators.
+            with ExecutionContext(module, stream=green) as last:
+                last.prepare(TextSize(4, 1))
+                eager = reduced(last)
+                green.stream.synchronize()
+                torch.testing.assert_close(eager, expected)
+
+        with pytest.raises(RuntimeError, match="stream communication"):
+            ExecutionContext(module, stream=green).prepare(TextSize(4, 1))
+
+
+def test_contexts_share_the_communicators_their_stream_retires(
+    tmp_path: Path,
+):
+    mp.spawn(
+        _run_shared_stream,
+        ((tmp_path / "shared").as_uri(),),
+        nprocs=2,
+        join=True,
+    )
+
+
+@torch.inference_mode()
 def _run_release_after_failure(rank: int, rendezvous: str):
     """Abort with an outstanding collective whose peer never enters it."""
     import os
@@ -219,7 +291,7 @@ def _run_release_after_failure(rank: int, rendezvous: str):
     )
     module = _Collectives(mesh)
     green = partition_streams(device, (64,))[0]
-    context = ExecutionContext(module, stream=green.stream)
+    context = ExecutionContext(module, stream=green)
     context.prepare(TextSize(4, 1))
     values = torch.arange(8, dtype=torch.float32, device=device).view(2, 4)
     with context.activate():
@@ -228,18 +300,23 @@ def _run_release_after_failure(rank: int, rendezvous: str):
     dist.barrier()
 
     if rank == 0:
-        with context.activate():
-            pending = module.group.all_reduce(
-                values, out=torch.empty_like(values)
-            )
-        finished = torch.cuda.Event()
-        finished.record(green.stream)
-        assert not finished.query(), (
-            "collective unexpectedly completed without its peer"
-        )
         started = time.monotonic()
-        context.close(aborted=True)
-        green.close(aborted=True)
+        try:
+            # Leaving on an error with a collective its peer never enters
+            # cannot prove the access ended, so every owner retains its
+            # resources instead of waiting.
+            with green, context:
+                pending = module.group.all_reduce(
+                    values, out=torch.empty_like(values)
+                )
+                finished = torch.cuda.Event()
+                finished.record(green.stream)
+                assert not finished.query(), (
+                    "collective unexpectedly completed without its peer"
+                )
+                raise RuntimeError("rank failed after submitting work")
+        except RuntimeError as error:
+            assert "rank failed" in str(error)
         environment.close(aborted=True)
         elapsed = time.monotonic() - started
         assert elapsed < PEER_HOLD_SECONDS / 3, (

@@ -118,8 +118,7 @@ def _ring(rank: int, expected_bytes: bytes, device: torch.device) -> None:
     import torch.distributed as dist
 
     from uniserve.distributed import Communicator
-    from uniserve.runtime import ExecutionContext
-    from uniserve.runtime.execution import close_stream_collectives
+    from uniserve.runtime import CUDAStream, ExecutionContext
 
     expected = pickle.loads(expected_bytes)
     model = _postprocessor().to(device)
@@ -141,9 +140,10 @@ def _ring(rank: int, expected_bytes: bytes, device: torch.device) -> None:
 
     with ExitStack() as scope:
         if device.type == "cuda":
-            stream = torch.cuda.Stream(device=device)
-            stream.wait_stream(torch.cuda.current_stream(device))
-            scope.callback(close_stream_collectives, stream)
+            stream = CUDAStream.external(torch.cuda.Stream(device=device))
+            stream.wait(torch.cuda.current_stream(device))
+            # The stream retires its communicators after the context.
+            scope.callback(stream.close)
             context = ExecutionContext(
                 model, stream=stream, groups=(model.units,)
             )

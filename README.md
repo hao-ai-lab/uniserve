@@ -27,9 +27,9 @@ uv pip install -e .
 
 The installation builds the `uniserve` binary and the native worker IPC extension.
 
-The three Python packages are installed together. The [Python library guide](docs/python-library.md) shows checkpoint resolution, typed model configuration, explicit loading and direct tensor calls. Its runnable examples produce text logits and reconstruct H3 video through the public computation interfaces.
+The three Python packages (`uniserve`, `uniserve_models` and `uniserve_worker`) are installed together with their `uniserve-kernels` dependency, which holds UniServe's own device kernels. The [Python library guide](docs/python-library.md) shows checkpoint resolution, typed model configuration, explicit loading and direct tensor calls. Its runnable examples produce text logits and reconstruct H3 video through the public computation interfaces.
 
-The `gpu` extra includes FlashAttention-4 and the native `uniserve-kernel` package for CUDA IPC and peer-storage mappings. Install the source workspace with `uv sync --extra gpu`; building these mappings requires a CUDA toolkit compatible with PyTorch, a C++ compiler, and Ninja.
+The `gpu` extra adds FlashAttention-4 and the native `uniserve-kernels` extensions for sparse video attention, CUDA IPC and peer-storage mappings. Install the source workspace with `uv sync --extra gpu`; building these extensions requires a CUDA toolkit compatible with PyTorch, a C++ compiler, and Ninja.
 
 ## Start a server
 
@@ -158,8 +158,11 @@ just lint
 just test-rust
 just test-python-fast
 just test-python-integration
+just test-python-cuda
 just test-python-e2e
 ```
+
+The fast and integration suites run without a CUDA device; tests that need one carry the `gpu` marker, which `test-python-cuda` selects at the unit and integration layers.
 
 Real-device end-to-end validation uses the configured model environment variables:
 
