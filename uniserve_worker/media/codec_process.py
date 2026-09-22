@@ -55,6 +55,35 @@ __all__ = [
 # unbounded pool does; one thread takes four to five times as long.
 _ENCODER_THREADS = 8
 
+
+def encoded_video_bytes(frames: int, height: int, width: int) -> int:
+    """Bound the MP4 bytes of the serving libx264/yuv420p/ultrafast encoder.
+
+    This preset uses baseline CAVLC. A padded 16x16 macroblock has at most
+    27 residual blocks (including the separate DC blocks), each with up to
+    16 coefficients. Baseline level codes occupy at most 28 bits; x264
+    re-encodes CAVLC overflows at a higher QP. Per-block token, zero and run
+    codes need at most 16 + 9 + 15*11 bits. A further 1536 bits covers all
+    macroblock headers and 16 pairs of motion-vector differences. NAL escaping
+    adds at most one byte per two source bytes.
+
+    Eight slice headers per frame need at most 1024 bytes each. MP4 sample
+    tables need at most 64 bytes per packet; parameter sets, encoder SEI and
+    fixed container boxes fit in 64 KiB. These are syntax bounds, independent
+    of image entropy or the achieved compression ratio. See x264's
+    encoder/cavlc.c and encoder/encoder.c and FFmpeg's libavformat/movenc.c.
+    """
+    if min(frames, height, width) < 1:
+        raise ValueError("encoded video dimensions must be positive")
+    blocks = ((height + 15) // 16) * ((width + 15) // 16)
+    residual_bits = 27 * (16 + 16 * 28 + 9 + 15 * 11)
+    macroblock_bytes = (residual_bits + 1536 + 7) // 8
+    escaped_bytes = (3 * macroblock_bytes + 1) // 2
+    return (1 << 16) + frames * (
+        blocks * escaped_bytes + _ENCODER_THREADS * 1024 + 64
+    )
+
+
 # A mux session is identified by the request it assembles: the engine id, the
 # request id and the request epoch, which is what a RequestKey carries.
 SessionKey = tuple[int, int, int]
@@ -568,6 +597,11 @@ class CodecProcess:
         if kind == "error":
             raise value
         return value
+
+    def abort(self) -> None:
+        """Stop the codec without acquiring its in-flight job lock."""
+        if self._process.poll() is None:
+            self._process.kill()
 
     def close(self) -> None:
         """End the process, forcibly if it does not exit on request."""

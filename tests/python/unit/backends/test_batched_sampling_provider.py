@@ -10,43 +10,6 @@ from uniserve.sampling import sample_top_k
 pytestmark = pytest.mark.unit
 
 
-def _reference(
-    logits: torch.Tensor,
-    draws: torch.Tensor,
-    parameters: torch.Tensor,
-    top_k: int,
-) -> torch.Tensor:
-    work = logits.float().clone()
-    work /= torch.where(parameters[:, :1] > 0, parameters[:, :1], 1)
-    candidate_values, candidate_ids = torch.topk(
-        work, top_k, dim=-1, sorted=True
-    )
-    for row in range(work.shape[0]):
-        min_p = float(parameters[row, 2])
-        if min_p > 0:
-            candidate_values[
-                row,
-                candidate_values[row]
-                < candidate_values[row, 0] + torch.log(parameters[row, 2]),
-            ] = float("-inf")
-        cumulative = torch.softmax(candidate_values[row], dim=-1).cumsum(dim=-1)
-        drop = cumulative > parameters[row, 1]
-        drop[1:] = drop[:-1].clone()
-        drop[0] = False
-        candidate_values[row, drop] = float("-inf")
-    candidate_probabilities = torch.softmax(candidate_values, dim=-1)
-    token_order = torch.argsort(candidate_ids, dim=-1)
-    cumulative = candidate_probabilities.gather(1, token_order).cumsum(dim=-1)
-    sampled_order = (
-        (cumulative < draws.unsqueeze(1)).sum(dim=-1).clamp_max(top_k - 1)
-    )
-    sampled = token_order.gather(1, sampled_order.unsqueeze(1))[:, 0]
-    selected = torch.where(
-        parameters[:, 0] > 0, sampled, torch.zeros_like(sampled)
-    )
-    return candidate_ids.gather(1, selected.unsqueeze(1))[:, 0]
-
-
 def _inputs(device: torch.device) -> tuple[torch.Tensor, ...]:
     logits = torch.tensor(
         [
@@ -68,7 +31,7 @@ def _inputs(device: torch.device) -> tuple[torch.Tensor, ...]:
     return logits, draws, parameters
 
 
-def test_top_k_provider_matches_the_full_expression() -> None:
+def test_top_k_provider_preserves_filtered_categorical_and_greedy_selection():
     inputs = _inputs(torch.device("cpu"))
 
     logits, draws, parameters = inputs
@@ -80,14 +43,16 @@ def test_top_k_provider_matches_the_full_expression() -> None:
     )
 
     assert valid.tolist() == [True, True]
-    assert torch.equal(tokens, _reference(*inputs, 4))
+    # Row 0 retains IDs 1, 3, 5 with probabilities about .234, .635, .131.
+    # Draw .25 selects ID 3; row 1 selects its maximum at zero temperature.
+    assert tokens.tolist() == [3, 5]
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_top_k_provider_is_capture_eligible_and_matches_eager_tokens() -> None:
     inputs = _inputs(torch.device("cuda"))
-    expected = _reference(*inputs, 4)
+    expected = torch.tensor([3, 5], device="cuda")
     logits, draws, parameters = inputs
     sample_top_k(logits, draws, parameters, 4)
     torch.cuda.synchronize()

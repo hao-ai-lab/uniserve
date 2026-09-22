@@ -27,7 +27,7 @@ from . import calls
 from .batch_state import BatchState
 from .diffusion_state import ImageState, resolve_prefix
 from .output import PendingOutput
-from .rows import ForwardRow
+from .rows import DiffusionRow, TokenRow
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -325,7 +325,7 @@ def prepare_step(
     tuple[Branch, ...],
     torch.Tensor,
     torch.Tensor,
-    tuple[tuple[Branch, ForwardRow], ...],
+    tuple[tuple[Branch, TokenRow], ...],
 ]:
     """Gather current latent pages and construct one guided diffusion-step.
 
@@ -619,13 +619,13 @@ def initial_latent(
 def prefix_row(
     tokens: tuple[int, ...],
     entry: tuple[int, int, int, int],
-) -> ForwardRow:
+) -> TokenRow:
     """Build the model-forward row that materializes one diffusion conditioning.
 
     prefix.
     """
     positions = torch.arange(entry[2], entry[2] + len(tokens), dtype=torch.long)
-    return ForwardRow(
+    return TokenRow(
         forward_mode=ForwardMode.PREFILL,
         token_ids=torch.tensor(tokens, dtype=torch.long),
         positions=positions,
@@ -665,7 +665,7 @@ def flow_rows(
                 size, temporal, device=device
             )
         rows.append(
-            ForwardRow(
+            DiffusionRow(
                 forward_mode=MediaCall.DENOISING,
                 positions=trajectory.positions[temporal],
                 timestep=timestep.reshape(1),
@@ -857,7 +857,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                     write=(False,) * len(prefixes),
                 )
                 rows = tuple(
-                    ForwardRow(
+                    DiffusionRow(
                         forward_mode=MediaCall.DENOISING,
                         positions=builder.positions(
                             size, len(prefix), device=entry.device

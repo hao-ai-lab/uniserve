@@ -31,7 +31,7 @@ from .validation import (
 
 
 class ForwardMode(StrEnum):
-    """The numerical mode of an autoregressive or mixed model forward."""
+    """The numerical mode of one homogeneous autoregressive call."""
 
     PREFILL = "prefill"
     DECODE = "decode"

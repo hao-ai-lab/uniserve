@@ -11,7 +11,7 @@ from uniserve_worker.bootstrap.cache import cache_info
 from uniserve_worker.bootstrap.capacity import input_buffer_config
 from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.model_runner import ModelRunner
-from uniserve_worker.execution.rows import ForwardRow
+from uniserve_worker.execution.rows import DecodeRow, VisionRow
 from uniserve_worker.protocol.call import (
     Bounds,
     Call,
@@ -71,7 +71,6 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
             max_tokens=64,
             latent_capacity_units=16,
             decode_context_blocks=2,
-            variants=(),
             max_inflight=1,
         )
         runner.complete_startup()
@@ -91,7 +90,7 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
                 expected = model.latent_encoder.encode(pixels)
                 torch.manual_seed(129)
                 rows = tuple(
-                    ForwardRow(MediaCall.LATENT_ENCODING, encode_pixels=value)
+                    VisionRow(MediaCall.LATENT_ENCODING, encode_pixels=value)
                     for value in pixels
                 )
                 encoded = _run(runner, manager, rows)
@@ -100,7 +99,7 @@ def test_batched_codec_queries_are_independent_of_text_token_capacity(tmp_path):
                 tuple(expected.unbind(0)), sizes=(size,) * count
             )
             rows = tuple(
-                ForwardRow(
+                DecodeRow(
                     MediaCall.IMAGE_DECODING,
                     latent=value,
                     image_height=size.height,

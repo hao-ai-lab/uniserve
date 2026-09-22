@@ -72,6 +72,7 @@ from ..foundation.errors import (
     WorkerErrorCode,
     classify,
     invalid_descriptor,
+    resource_error,
     unsupported_setup,
 )
 from ..media.mux import MediaMux
@@ -247,7 +248,7 @@ class Worker:
             )
         except BaseException as error:
             try:
-                distributed.close()
+                distributed.close(aborted=True)
             except BaseException as cleanup_error:
                 error.add_note(
                     f"Resource cleanup also failed: {cleanup_error!r}"
@@ -344,6 +345,7 @@ class Worker:
                 attention=attention,
                 image_processor=image_processor,
                 flow_prompt=flow_prompt,
+                max_inflight=queue_depth,
             )
             self.runner = runner
             startup.callback(runner.close)
@@ -525,12 +527,10 @@ class Worker:
             # Generation state has its own page pool and may live on
             # another device.
             flow = image_builder(model)
-            latent_dtype = getattr(
-                torch, str(layout.latent_dtype).removeprefix("torch."), None
-            )
+            latent_dtype = getattr(torch, worker_config.model_dtype, None)
             if flow is not None and not isinstance(latent_dtype, torch.dtype):
                 raise unsupported_setup(
-                    f"unsupported latent dtype {layout.latent_dtype!r}"
+                    f"unsupported latent dtype {worker_config.model_dtype!r}"
                 )
 
             if flow is None:
@@ -541,7 +541,10 @@ class Worker:
                     request_pool_size=int(info.request_slots),
                     num_pages=int(info.latent_pages),
                     page_units=int(info.latent_page_units),
-                    latent_width=int(layout.latent_width),
+                    latent_width=(
+                        flow.denoiser.latent_channels
+                        * flow.denoiser.patch_size**2
+                    ),
                     dtype=latent_dtype,
                     device=worker_config.generation_device
                     or worker_config.device,
@@ -591,12 +594,8 @@ class Worker:
             self.tensor_store = TensorStore(
                 capacity=arena.tensor_store,
                 byte_capacity=arena.device_product_bytes,
-                entry_capacity=int(layout.encoder_cache_entries),
-                max_entry_bytes=max(
-                    1,
-                    int(layout.max_latent_feature_bytes),
-                    int(layout.max_vision_feature_bytes),
-                ),
+                entry_capacity=int(info.encoder_cache_entries),
+                max_entry_bytes=max(1, int(info.encoder_entry_bytes)),
                 devices=owner_devices,
                 request_capacity=int(info.request_slots),
                 relay_depth=int(info.max_unresolved_calls) + 1,
@@ -665,7 +664,6 @@ class Worker:
                     decode_context_blocks=decode_context_blocks(
                         model, worker_config, self.kv_cache
                     ),
-                    variants=frozenset(info.supported_calls),
                     max_inflight=int(queue_depth),
                 )
 
@@ -683,7 +681,14 @@ class Worker:
 
         except BaseException as error:
             try:
-                startup.close()
+                from uniserve.runtime.resources import retain_until_exit
+
+                self._closed = True
+                retain_until_exit((self, startup.pop_all()))
+                if "host_tasks" in self.__dict__:
+                    self.host_tasks.abort()
+                if "runner" in self.__dict__:
+                    self.runner.close(aborted=True)
             except BaseException as cleanup_error:
                 error.add_note(
                     f"Resource cleanup also failed: {cleanup_error!r}"
@@ -746,7 +751,6 @@ class Worker:
         # rank start the next batch while a peer is still in this one, so one
         # rank can reach a denoiser's capture_required all-reduce that its
         # peers have not. Such a rank therefore holds one batch in flight.
-        self._launched_submissions = 0
         self._collective_component = any(
             group.size > 1
             for binding in self.runner.bindings.values()
@@ -964,25 +968,7 @@ class Worker:
                         else Batch.from_mapping(raw_batch)
                     )
 
-                if batch.batch_id <= self._last_batch_id:
-                    raise invalid_descriptor(
-                        f"batch id {batch.batch_id} must exceed previously "
-                        f"submitted id {self._last_batch_id}"
-                    )
-                self._last_batch_id = batch.batch_id
-
-                # Product release is independent of request-state transitions.
-                # An earlier numerical batch may need this retired allocation,
-                # so revocation cannot wait behind that batch's execution FIFO.
-                # Existing readers retain storage; the command's ordinary
-                # terminal acknowledgement still waits for their completion.
-                freed = tuple(
-                    command.buffer
-                    for command in batch.commands
-                    if isinstance(command, Free)
-                )
-                if freed:
-                    self.release_buffers(freed)
+                self._admit_batch(batch)
 
                 requests = messages.batch_requests(batch)
 
@@ -1010,8 +996,6 @@ class Worker:
         if pending.released:
             return
         pending.released = True
-        if pending.kind is RequestKind.SUBMIT:
-            self._launched_submissions -= 1
         self._pending_requests.pop(pending.sequence, None)
 
     def _launch_one_ready_request(self) -> bool:
@@ -1029,8 +1013,7 @@ class Worker:
         head = self._ready_requests[0]
         if head.kind is RequestKind.SUBMIT and (
             len(self.inflight) >= self.queue_depth
-            or (self._collective_component and self._launched_submissions)
-            or self._awaits_local_product(head)
+            or not self._can_start_batch(head.batch)
         ):
             return False
 
@@ -1038,7 +1021,6 @@ class Worker:
 
         try:
             if pending.kind is RequestKind.SUBMIT:
-                self._launched_submissions += 1
                 self._launch_execute(pending)
             else:
                 self._launch_admin(pending)
@@ -1065,7 +1047,18 @@ class Worker:
             )
         )
 
-    def _awaits_local_product(self, pending: ServiceRequest) -> bool:
+    def _can_start_batch(self, batch: Batch) -> bool:
+        """Preserve launch order and collective participation across callers."""
+        for previous in self.inflight.values():
+            if previous.batch_id >= batch.batch_id:
+                break
+            if self._collective_component or not (
+                previous.launched or previous.complete
+            ):
+                return False
+        return not self._awaits_local_product(batch)
+
+    def _awaits_local_product(self, batch: Batch) -> bool:
         """Whether an in-flight batch has yet to write a product this reads.
 
         Preparation resolves a product this rank produced from its own store,
@@ -1075,9 +1068,6 @@ class Worker:
         rank overlaps preparation with execution, and only the batches that
         read an unwritten product wait.
         """
-        batch = pending.batch
-        if batch is None:
-            return False
         for call in batch.calls:
             references = call.tensor_inputs()
             if call.predicate is not None:
@@ -1107,20 +1097,6 @@ class Worker:
         Directly launches the batch when the inputs are ready.
         """
         try:
-            unsupported = tuple(
-                call.kind
-                for call in batch.batch.calls
-                if not self.supports_computation(call.kind)
-            )
-            if unsupported:
-                names = sorted({value.value for value in unsupported})
-                raise invalid_descriptor(
-                    "execution batch contains call kinds unsupported by "
-                    f"this worker: {names!r}"
-                )
-
-            self._prepare_execution(batch)
-
             if self._advance_execution(batch):
                 if not batch.complete:
                     self._executing_batches.append(batch)
@@ -1139,6 +1115,10 @@ class Worker:
         if batch.complete or batch.launched:
             return True
         try:
+            if not batch.inputs_submitted:
+                if not self._can_start_batch(batch.batch):
+                    return False
+                self._prepare_execution(batch)
             self.advance_inputs(batch)
             if not batch.inputs_ready():
                 return False
@@ -1390,17 +1370,17 @@ class Worker:
         Retains the batch's asynchronous state. Call advance to progress
         pending inputs, CPU work, and retirement, then poll to consume the
         batch's result. A batch identity remains owned until its result is
-        consumed or the Worker closes.
+        consumed or the Worker closes. IDs strictly increase, including after
+        completion. A full admission queue raises ResourceError; consume a
+        result before retrying. Accepted batches launch in submission order.
         """
         self._require_open()
-        if batch.batch_id in self.inflight:
-            raise invalid_descriptor("batch ID already has an in-flight batch")
+        self._admit_batch(batch)
 
         state = BatchState(batch, propagate_errors=propagate_errors)
         self.inflight[state.batch_id] = state
 
         try:
-            self._prepare_execution(state)
             self._advance_execution(state)
             self._advance_batch(state)
         except BaseException:
@@ -1414,6 +1394,30 @@ class Worker:
             self._close_batch(state)
             raise error
         return state
+
+    def _admit_batch(self, batch: Batch) -> None:
+        """Claim identity and capacity, then revoke freed products."""
+        if batch.batch_id <= self._last_batch_id:
+            raise invalid_descriptor(
+                f"batch id {batch.batch_id} must exceed previously "
+                f"submitted id {self._last_batch_id}"
+            )
+        queued = sum(
+            pending.kind is RequestKind.SUBMIT
+            for pending in self._ready_requests
+        )
+        if len(self.inflight) + queued >= self.queue_depth:
+            raise resource_error("worker admission queue is full")
+        self._last_batch_id = batch.batch_id
+        # Revocation cannot wait behind an earlier allocation-dependent call.
+        # Existing readers keep their leases until their actual last access.
+        freed = tuple(
+            command.buffer
+            for command in batch.commands
+            if isinstance(command, Free)
+        )
+        if freed:
+            self.release_buffers(freed)
 
     def advance(self) -> None:
         """Progress pending batch state on the caller thread.
@@ -1536,6 +1540,16 @@ class Worker:
         Also prepares the batch's physical inputs.
         """
         batch = state.batch
+        unsupported = {
+            call.kind.value
+            for call in batch.calls
+            if not self.supports_computation(call.kind)
+        }
+        if unsupported:
+            raise invalid_descriptor(
+                "execution batch contains call kinds unsupported by "
+                f"this worker: {sorted(unsupported)!r}"
+            )
         # A request's first call on this rank arrives with the command that
         # establishes its lineage, so the lineage is installed before naming
         # what each call follows. The calls of a request this rank has yet to
@@ -1820,6 +1834,10 @@ class Worker:
         self._require_open()
         if self._warmed_up:
             return
+        if self._last_batch_id >= 0:
+            raise RuntimeError(
+                "warmup must precede the first serving submission"
+            )
 
         if self.runner.numerical:
             self.runner.warmup(self.requests.tensor_slots)
@@ -1837,6 +1855,7 @@ class Worker:
         if self.requests.request_ids():
             raise RuntimeError("startup completed with resident requests")
         self._last_collective_seq = -1
+        self._last_batch_id = -1
         check_startup_memory(
             self.worker_config,
             self._layout.arena.device_product_bytes,
@@ -1989,9 +2008,26 @@ class Worker:
 
         self._closed = True
 
-        actions: list[Callable[[], object]] = []
-        if not aborted:
-            actions.append(self.runner.synchronize)
+        if aborted:
+            from uniserve.runtime.resources import retain_until_exit
+
+            # Transfers, outputs and graphs can borrow the same backing. Keep
+            # the complete tree; no failed access is acknowledged as retired.
+            retain_until_exit(self)
+            close_resources(
+                partial(self.set_completion_wake, None, None),
+                self.host_tasks.abort,
+                partial(self.runner.close, aborted=True),
+                *(
+                    (partial(self.process_groups.close, aborted=True),)
+                    if self.process_groups is not None
+                    else ()
+                ),
+            )
+            self.ipc_endpoint = None
+            return
+
+        actions: list[Callable[[], object]] = [self.runner.synchronize]
         if self.profiler is not None:
             actions.append(self.profiler.close)
         actions.append(self._release_service_runs)
@@ -2082,7 +2118,6 @@ class Worker:
 
             self._pending_requests.clear()
             self._ready_requests.clear()
-            self._launched_submissions = 0
             self._executing_batches.clear()
 
             while not self._preparation_ready.empty():

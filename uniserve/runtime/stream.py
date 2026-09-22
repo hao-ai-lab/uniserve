@@ -151,15 +151,21 @@ class CUDAStream:
                 _destroy_stream(raw)
             raise
 
-    def close(self) -> None:
-        """Drain submitted accesses.
+    def close(self, *, aborted: bool = False) -> None:
+        """Drain accesses and release native streams and contexts.
 
-        Drain submitted accesses before releasing native streams and
-        contexts.
+        Aborted close retains those resources without waiting; the owning
+        process must exit before reclaiming them.
         """
         if self._closed:
             return
         self._closed = True
+
+        if aborted:
+            from .resources import retain_until_exit
+
+            retain_until_exit(self)
+            return
 
         actions = [self.stream.synchronize]
         if self.raw_stream is not None:

@@ -16,7 +16,7 @@ from uniserve_worker.execution import calls
 from uniserve_worker.execution.batch_state import BatchState
 from uniserve_worker.execution.image_input import PreparedImage
 from uniserve_worker.execution.output import PendingOutput
-from uniserve_worker.execution.rows import ForwardRow
+from uniserve_worker.execution.rows import DecodeRow, InputRow
 from uniserve_worker.execution.sample import broadcast_selection
 from uniserve_worker.execution.sample import sample as _sample_task_batch
 from uniserve_worker.foundation.errors import classify, invalid_descriptor
@@ -54,7 +54,7 @@ ForwardValue = tuple[
 ]
 SampleCandidate = tuple[
     int,
-    ForwardRow,
+    InputRow,
     torch.Tensor,
     SamplingMetadata | None,
     SamplerRow | None,
@@ -63,7 +63,7 @@ SampleCandidate = tuple[
 
 def forward_values(
     model_runner: ModelRunner,
-    inputs: tuple[tuple[ForwardRow, Call, int], ...],
+    inputs: tuple[tuple[InputRow, Call, int], ...],
     *,
     state: BatchState,
     errors: dict[int, BaseException],
@@ -317,7 +317,7 @@ def prepare_diffusion_step(
     step_inputs: dict[
         int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]
     ] = {}
-    prefixes: list[tuple[int, Branch, ForwardRow]] = []
+    prefixes: list[tuple[int, Branch, InputRow]] = []
 
     for index, trajectory in trajectories.items():
         call, completion_group = scheduled[index]
@@ -429,11 +429,11 @@ def prepare_forward_rows(
     request_tables: BlockTables | None,
     model_runner: ModelRunner,
     decode_state: DecodeState | None,
-) -> tuple[list[tuple[int, ForwardRow]], dict[int, PreparedImage]]:
+) -> tuple[list[tuple[int, InputRow]], dict[int, PreparedImage]]:
     """Build homogeneous numerical rows for the current dependency frontier."""
     from . import encode, flow, token
 
-    forward: list[tuple[int, ForwardRow]] = []
+    forward: list[tuple[int, InputRow]] = []
     images: dict[int, PreparedImage] = {}
 
     for index in numerical:
@@ -538,7 +538,7 @@ def prepare_forward_rows(
                 forward.append(
                     (
                         index,
-                        ForwardRow(
+                        DecodeRow(
                             forward_mode=MediaCall.IMAGE_DECODING,
                             latent=latent,
                             image_height=int(params.height),
@@ -560,7 +560,7 @@ def prepare_forward_rows(
 
 
 def publish_forward_values(
-    forward: list[tuple[int, ForwardRow]],
+    forward: list[tuple[int, InputRow]],
     values: tuple[ForwardValue | None, ...],
     images: Mapping[int, PreparedImage],
     trajectories: Mapping[int, ImageState],

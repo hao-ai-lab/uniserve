@@ -588,21 +588,6 @@ class BatchGraph:
             return result if borrow else result.clone()
 
 
-def private_pool_bytes(device, pools):
-    """Sum memory-pool segment bytes the given pools hold on this device."""
-    if device.type != "cuda" or not pools:
-        return 0
-    index = (
-        torch.cuda.current_device() if device.index is None else device.index
-    )
-    return sum(
-        int(segment.get("total_size", 0))
-        for segment in torch.cuda.memory_snapshot()
-        if segment.get("device") == index
-        and segment.get("segment_pool_id") in pools
-    )
-
-
 def greedy_decode(
     batch: InputBatch,
     output: ExecutionOutput,

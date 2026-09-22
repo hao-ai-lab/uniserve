@@ -37,6 +37,59 @@ def _await_ticket(ticket):
     return ticket.result()
 
 
+def test_exhausted_vmm_pool_delivers_host_fallback_and_restores_quota():
+    from uniserve_kernel.peer_memory import allocation_granularity
+
+    from uniserve_worker.transfer.tickets import make_transports, publish_tensor
+
+    device = torch.device("cuda:0")
+    page = allocation_granularity(device)
+    events = EventPool()
+    transports = make_transports(
+        ("cuda_vmm", "shm"),
+        byte_capacity=page,
+        ticket_capacity=2,
+        event_pool=events,
+        host_slots=(0,),
+    )
+    consumer = make_transports(
+        ("shm",),
+        byte_capacity=page,
+        ticket_capacity=2,
+        event_pool=events,
+        acknowledgment_slot=0,
+    )["shm"]
+    # One physical page fits the payload but cannot also hold the VMM chunk's
+    # acknowledgment header. Its logical byte lease must survive fallback.
+    source = torch.arange(page // 4, dtype=torch.float32, device=device)
+    try:
+        for _ in range(2):
+            retirements = []
+            locations = publish_tensor(
+                transports,
+                source,
+                retain=retirements.append,
+                consumers=(0,),
+            )
+            (location,) = locations
+            ticket = consumer.fetch(location, device=torch.device("cpu"))
+            observed = _await_ticket(ticket)
+            torch.testing.assert_close(observed, source.cpu(), rtol=0, atol=0)
+            retired = threading.Event()
+            ticket.add_retirement_callback(retired.set)
+            ticket.close()
+            assert retired.wait(5)
+            transports[location.backend].release(location)
+            transports[location.backend].reap()
+            for retirement in retirements:
+                retirement.result(timeout=5)
+    finally:
+        consumer.close()
+        for transport in transports.values():
+            transport.close()
+        events.close()
+
+
 @pytest.mark.parametrize("backend", ("local", "shm", "cuda_vmm"))
 def test_transfer_writes_only_the_reserved_destination(backend: str) -> None:
     device = torch.device("cuda:0")
@@ -791,7 +844,7 @@ def test_shm_producer_failure_fails_its_pending_read_and_preserves_independent_r
 
 
 @pytest.mark.parametrize("owner", ("encoder", "device", "latent"))
-def test_cancelled_shard_reads_retain_destination_and_capacity_until_physical_retirement(  # noqa: E501
+def test_cancelled_pending_shards_release_destination_after_read_retirement(
     owner: str,
 ) -> None:
     context = mp.get_context("spawn")
@@ -924,34 +977,18 @@ def test_cancelled_shard_reads_retain_destination_and_capacity_until_physical_re
         assert ticket.ready()
         with pytest.raises(WorkerError, match="cancelled"):
             ticket.result()
-        assert not ticket.retired()
-        assert not retired.is_set()
-        with pytest.raises(WorkerError):
-            reserve(replacement, replacement_allocation)
-        if isinstance(store, LatentPool):
-            assert not store.retirement_ready((product.request_key,))
-            with pytest.raises(WorkerError, match="owned"):
-                store.reserve_import(
-                    replace(replacement, request_key=RequestKey(2, 1, 1)),
-                    request_pool_idx=2,
-                    page_table=(4, 2, 1, 3),
-                    latent_units=256,
-                )
-
-        healthy = producer.publish(torch.tensor([7.0]))
-        with pytest.raises(WorkerError, match="capacity"):
-            consumer.fetch(healthy, device=torch.device("cpu"))
+        # No DMA started while the producer was pending. Cancellation ends
+        # the real read and releases the reservation without waiting for it.
+        assert retired.wait(5), "cancelled physical read did not retire"
         parent.send("exit")
         process.join(30)
         assert process.exitcode == 0
-        assert retired.wait(5), (
-            "cancelled physical read did not retire after source loss"
-        )
         assert ticket.retired()
         if isinstance(store, LatentPool):
             assert store.retirement_ready((product.request_key,))
         reused = reserve(replacement, replacement_allocation)
         abandon(reused)
+        healthy = producer.publish(torch.tensor([7.0]))
         actual = _await_ticket(
             consumer.fetch(healthy, device=torch.device("cpu"))
         )
