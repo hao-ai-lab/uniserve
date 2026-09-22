@@ -365,25 +365,3 @@ class BlockTables:
                 del self._host_tables[identity]
         for slot in selected:
             self._host_alloced_lens.pop(slot, None)
-
-
-def page_spans(page_ids, start: int, length: int, page_size: int):
-    """Map a logical token interval to scheduler-owned page/offset/count spans.
-
-    Each returned span is (page id, token offset within the page, token count).
-    """
-    if (
-        page_size < 1
-        or start < 0
-        or length < 0
-        or start + length > len(page_ids) * page_size
-    ):
-        raise ValueError("KV token interval exceeds its block table")
-    spans = []
-    while length:
-        logical, offset = divmod(start, page_size)
-        count = min(length, page_size - offset)
-        spans.append((page_ids[logical], offset, count))
-        start += count
-        length -= count
-    return tuple(spans)

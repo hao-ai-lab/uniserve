@@ -181,7 +181,6 @@ def _stage_tensor(value: torch.Tensor) -> HostBorrow:
 
 def execute(
     call: Call,
-    completion_group: int,
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -194,9 +193,7 @@ def execute(
     from . import transfer
     from .video import mux_config
 
-    request = state.pending_output(
-        completion_group, call.request_key.request_id
-    )
+    request = state.pending_output(call.request_key.request_id)
     media = request.request.admission.diffusion
     if media is None:
         raise invalid_descriptor("host media call has no admitted media")
@@ -290,7 +287,7 @@ def execute(
         # rank's positions of the round, filled and published once every
         # encode has completed.
         write, rows = transfer.reserved_unit_rows(
-            call, completion_group, state=state, count=len(positions)
+            call, state=state, count=len(positions)
         )
         tensor_store.defer_write(write)
 
@@ -312,13 +309,10 @@ def execute(
                 ),
             )
             _validate_completion_products(call, products)
-            # The group's products were recorded when the call was committed,
+            # Products were recorded when the call was committed,
             # before its encodes ran; these join them for the batch's result.
             request.products = products
-            state.group_products[completion_group] = (
-                *state.group_products.get(completion_group, ()),
-                *products,
-            )
+            state.products = (*state.products, *products)
 
         finish = publish
 

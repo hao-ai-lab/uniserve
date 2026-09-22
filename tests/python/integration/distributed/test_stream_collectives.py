@@ -28,10 +28,12 @@ PEER_HOLD_SECONDS = 30.0
 
 
 class _Collectives(nn.Module):
-    def __init__(self, mesh):
+    def __init__(self, mesh, independent=None):
         super().__init__()
         group = mesh.get_group("tokens")
         self.group = group
+        self.independent = group if independent is None else independent
+        self.communication_groups = (group, self.independent)
         self.register_buffer("reference", torch.empty(0, device=group.device))
         self.projection = ColumnParallelLinear(
             4, 4, bias=False, device=group.device
@@ -87,6 +89,7 @@ class _Collectives(nn.Module):
             ),
             projected,
             total,
+            self.independent.all_reduce(value * 3),
         )
 
 
@@ -106,7 +109,13 @@ def _run_collectives(rank: int, rendezvous: str):
             device=device,
         )
         group = mesh.get_group("tokens")
-        module = _Collectives(mesh)
+        # Identical topology can belong to independent physical ordering
+        # domains. Both must remain usable in the same captured computation.
+        independent = environment.bind(
+            DeviceMesh(ranks=(1, 0), shape=(2,), axes=("tokens",), rank=rank),
+            device=device,
+        ).get_group("tokens")
+        module = _Collectives(mesh, independent)
         greens = partition_streams(device, (64, 88))
         try:
             for green in greens:
@@ -165,6 +174,7 @@ def _run_collectives(rank: int, rendezvous: str):
                                     base + (1 - rank) * 10,
                                     torch.cat(peers),
                                     base * 2 + 10,
+                                    base * 6 + 30,
                                 )
                                 for result, reference in zip(
                                     actual, expected, strict=True

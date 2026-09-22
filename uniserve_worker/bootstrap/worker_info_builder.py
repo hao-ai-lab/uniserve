@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 
 import torch
 from torch import nn
@@ -14,6 +12,7 @@ from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
 from uniserve.media import image
 from uniserve.model import CausalLM, PatchEncoder, VideoPostprocessor
+from uniserve.nn import Linear
 from uniserve.processing import ImageProcessor
 from uniserve.quantization import QuantizedTensor
 from uniserve.tensors import BufferConfig
@@ -63,7 +62,6 @@ from .worker_info import ComponentInfo, WorkerInfo
 __all__ = [
     "WorkerLayout",
     "build_worker_layout",
-    "configuration_identity",
 ]
 
 
@@ -94,72 +92,6 @@ def _exports_fabric_handles(device: object) -> bool:
     return exports_fabric_handles(resolved.index or 0)
 
 
-def configuration_identity(
-    model: nn.Module,
-    worker_config: WorkerConfig,
-    layout: WorkerLayout,
-    components: tuple[tuple[str, ComponentConfig], ...],
-    attention_identity: str | None,
-) -> str:
-    """Identify resolved params, numerical storage, operators, and shape bounds.
-
-    This describes resolved execution dimensions and numerical policy, not
-    a hash of weight contents. Graph and arena objects retain their own
-    lifetimes and cannot be reused by a differently initialized worker.
-    """
-    numerical = {
-        name: asdict(value.quantizer)
-        for name, value in model.named_parameters()
-        if isinstance(value, QuantizedTensor)
-    }
-
-    layout_description = asdict(layout)
-    layout_description["info"].pop("endpoint")
-    layout_description["info"].pop("configuration_id")
-    layout_description["info"].pop("checkpoint_identity")
-    if layout.input_config is not None:
-        layout_description["input_config"]["embedding_dtype"] = str(
-            layout.input_config.embedding_dtype
-        )
-
-    # The observed grant changes with transient allocations and other
-    # processes. Resolved capacities live in layout; free bytes are not an
-    # execution identity.
-    execution_config = asdict(worker_config)
-    execution_config.pop("pool_memory_bytes")
-
-    encoded = json.dumps(
-        {
-            "worker_config": execution_config,
-            "layout": layout_description,
-            "components": {
-                name: component.to_dict() for name, component in components
-            },
-            "entry_outputs": {
-                name: [output.to_mapping() for output in outputs]
-                for name, outputs in resolve_outputs(
-                    model, worker_config
-                ).items()
-            },
-            "attention": attention_identity,
-            "model": f"{type(model).__module__}.{type(model).__qualname__}",
-            "numerical": numerical,
-            "parameters": [
-                (name, tuple(value.shape), str(value.dtype))
-                for name, value in model.named_parameters()
-            ],
-            "buffers": [
-                (name, tuple(value.shape), str(value.dtype))
-                for name, value in model.named_buffers()
-            ],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-    return hashlib.sha256(encoded.encode()).hexdigest()
-
-
 def build_worker_layout(
     model: nn.Module,
     worker_config: WorkerConfig,
@@ -173,7 +105,7 @@ def build_worker_layout(
     allowed_calls: frozenset[CallKind] | None = None,
     transfer_backends: tuple[str, ...] = ("local",),
     components: tuple[tuple[str, ComponentConfig], ...] = (),
-    attention_identity: str | None = None,
+    attention_backend: str = "",
     bindings: Mapping[str, ComponentBinding] | None = None,
     state_buffers: Mapping[str, BufferConfig] | None = None,
     checkpoint_identity: str = "",
@@ -255,6 +187,33 @@ def build_worker_layout(
     held = tuple(name for name, _ in components)
     info = replace(
         layout.info,
+        model_dtype=worker_config.model_dtype,
+        attention_backend=attention_backend
+        or worker_config.attention_backend
+        or "auto",
+        # Loading owns quantization selection. Report actual storage formats,
+        # independently of parameter names and module structure.
+        weight_formats=tuple(
+            sorted(
+                {
+                    value.quantizer.format
+                    if isinstance(value, QuantizedTensor)
+                    else "dense"
+                    for value in model.parameters()
+                }
+            )
+        ),
+        activation_formats=tuple(
+            sorted(
+                {
+                    child.input_quantizer.format
+                    if child.input_quantizer is not None
+                    else "dense"
+                    for child in model.modules()
+                    if isinstance(child, Linear)
+                }
+            )
+        ),
         supported_calls=tuple(code for code in CALL_KINDS if code in supported),
         # Advertised routing and advertised work describe the same placement,
         # including a deployment narrowed to a subset of its call kinds: a
@@ -273,15 +232,7 @@ def build_worker_layout(
             for name, entry in components
         ),
     )
-    layout = replace(layout, info=info)
-
-    # Hash the final advertised limits and component bindings, excluding the
-    # process incarnation and the identity field itself.
-    identity = configuration_identity(
-        model, worker_config, layout, components, attention_identity
-    )
-
-    return replace(layout, info=replace(info, configuration_id=identity))
+    return replace(layout, info=info)
 
 
 def _token_worker_layout(

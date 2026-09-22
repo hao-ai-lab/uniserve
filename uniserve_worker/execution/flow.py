@@ -81,7 +81,6 @@ def require_inputs(runner):
 
 def prepare_latent(
     call: Call,
-    completion_group: int,
     *,
     state: BatchState,
     kv_cache: CacheManager | None,
@@ -108,7 +107,7 @@ def prepare_latent(
             "media preparation requires one exact conditioning input and "
             "latent output"
         )
-    request = state.pending_output(completion_group, request_id)
+    request = state.pending_output(request_id)
     cache = calls.cache_coordinates(request, tables=request_tables)
     publications = kv_cache
     if publications is None:
@@ -160,7 +159,7 @@ def prepare_latent(
 
     # Noise is generated directly into request-owned staging, then installed in
     # the pool before its generation becomes visible to downstream calls.
-    row = state.pending_output(completion_group, call.request_key.request_id)
+    row = state.pending_output(call.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
     if params is None or staging is None:
@@ -190,8 +189,8 @@ def prepare_latent(
         latent_units=int(params.latent_units),
     )
 
-    # Publication is deferred with the completion group commit so a failed
-    # completion group cannot expose a partially initialized trajectory.
+    # Publication is deferred with the batch commit so a failed
+    # batch cannot expose a partially initialized trajectory.
     request.latent_params = params
     request.latent_expected_generation = 0
     request.latent_expected_step = 0
@@ -203,7 +202,6 @@ def prepare_latent(
         output,
         row,
         step=0,
-        completion_group=completion_group,
         worker_info=worker_info,
         latent_pool=latent_pool,
         publication_transports=publication_transports,
@@ -221,7 +219,6 @@ def prepare_latent(
 
 def initialize(
     call: Call,
-    completion_group: int,
     *,
     state: BatchState,
     kv_cache: CacheManager | None,
@@ -243,7 +240,7 @@ def initialize(
             "flow call requires exact conditioning and one latent "
             "input/output generation"
         )
-    request = state.pending_output(completion_group, request_id)
+    request = state.pending_output(request_id)
     cache = calls.cache_coordinates(request, tables=request_tables)
     publications = kv_cache
     if publications is None:
@@ -279,7 +276,7 @@ def initialize(
     ):
         raise invalid_descriptor("flow latent generations are invalid")
 
-    row = state.pending_output(completion_group, call.request_key.request_id)
+    row = state.pending_output(call.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
     if params is None or staging is None:
@@ -312,7 +309,6 @@ def initialize(
 
 def prepare_step(
     call: Call,
-    completion_group: int,
     trajectory: ImageState,
     step_index: int,
     *,
@@ -331,15 +327,13 @@ def prepare_step(
 
     batch.
     """
-    request = state.pending_output(
-        completion_group, call.request_key.request_id
-    )
+    request = state.pending_output(call.request_key.request_id)
     image = request.request.image
     if image is None:
         raise invalid_descriptor("flow step requires admitted image parameters")
 
     builder = require_inputs(model_runner)
-    row = state.pending_output(completion_group, call.request_key.request_id)
+    row = state.pending_output(call.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
     if params is None or staging is None:
@@ -359,9 +353,7 @@ def prepare_step(
     prefix_rows = []
     prefix_branches = []
     entries = trajectory.entries
-    descriptors = state.group_forward_indices[completion_group].get(
-        calls.call_identity(call), ()
-    )
+    descriptors = state.forward_indices.get(calls.call_identity(call), ())
     if len(descriptors) < len(branches):
         raise invalid_descriptor(
             "media denoise has incomplete forward-row metadata"
@@ -455,7 +447,6 @@ def prepare_step(
 
 def finish(
     call: Call,
-    completion_group: int,
     trajectory: ImageState,
     *,
     state: BatchState,
@@ -469,10 +460,8 @@ def finish(
 
     and prepare publication.
     """
-    request = state.pending_output(
-        completion_group, call.request_key.request_id
-    )
-    row = state.pending_output(completion_group, call.request_key.request_id)
+    request = state.pending_output(call.request_key.request_id)
+    row = state.pending_output(call.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
     if params is None or staging is None:
@@ -511,7 +500,6 @@ def finish(
         latent_output,
         row,
         step=final_step,
-        completion_group=completion_group,
         worker_info=worker_info,
         latent_pool=latent_pool,
         publication_transports=publication_transports,
@@ -554,7 +542,6 @@ def publish_latent_transfer(
     *,
     state: BatchState,
     step: int,
-    completion_group: int,
     worker_info: WorkerInfo,
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
@@ -586,7 +573,6 @@ def publish_latent_transfer(
             source,
             row,
             step=step,
-            completion_group=completion_group,
             latent_pool=latent_pool,
             publication_transports=publication_transports,
             state=state,

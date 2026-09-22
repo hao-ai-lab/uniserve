@@ -9,6 +9,7 @@ from typing import Generic, Literal, TypeVar
 
 import torch
 
+from uniserve.distributed import DeviceMesh
 from uniserve.nn.attention import AttentionInput, DenseInput
 from uniserve.nn.routing import RouteSpan
 
@@ -29,6 +30,21 @@ class EntryPoint:
     method: str
     stage: Literal["all", "first", "last"] = "all"
     groups: tuple[str, ...] = ()
+
+    def communication_axes(
+        self, mesh: DeviceMesh
+    ) -> tuple[tuple[str, ...], ...]:
+        """Resolve participation roles to the mesh's ordered axes."""
+        return tuple(
+            tuple(
+                axis
+                for axis in mesh.axes
+                if axis.startswith("cp") or (role == "sp" and axis == "ulysses")
+            )
+            if role in {"cp", "sp"}
+            else (role,)
+            for role in self.groups
+        )
 
     def __post_init__(self):
         if not self.method or self.stage not in {"all", "first", "last"}:

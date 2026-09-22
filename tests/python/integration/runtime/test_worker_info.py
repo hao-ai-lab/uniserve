@@ -49,7 +49,6 @@ def test_worker_info_reports_schedulable_work_and_bounds(
     assert info["max_unresolved_calls"] > 0
     assert info["request_slots"] > 0
     assert info["model_name"]
-    assert len(info["configuration_id"]) == 64
 
 
 def test_loaded_worker_identity_distinguishes_incarnations_in_one_process() -> (
@@ -85,7 +84,6 @@ def test_loaded_worker_identity_distinguishes_incarnations_in_one_process() -> (
         == second["endpoint"]["address_space"]
     )
     assert first["endpoint"]["incarnation"] != second["endpoint"]["incarnation"]
-    assert first["configuration_id"] == second["configuration_id"]
 
 
 @pytest.mark.parametrize("with_lane_limits", (False, True))
@@ -128,8 +126,7 @@ def test_worker_info_reports_limits_safe_for_all_bound_lanes(
     assert info.max_batch_tokens == (128 if with_lane_limits else 256)
 
 
-def test_worker_identity_and_capabilities_reflect_enabled_calls() -> None:
-    identities = []
+def test_worker_capabilities_reflect_enabled_calls() -> None:
     config = replace(
         stub_worker_config(16, max_batch_tokens=256), graph_policy="off"
     )
@@ -155,8 +152,3 @@ def test_worker_identity_and_capabilities_reflect_enabled_calls() -> None:
             assert worker.supports_computation(ForwardMode.DECODE) == (
                 ForwardMode.DECODE in allowed
             )
-            identities.append(info["configuration_id"])
-
-    # Same model and geometry, but different executable work: callers must not
-    # mistake these workers for the same resolved configuration.
-    assert identities[0] != identities[1]

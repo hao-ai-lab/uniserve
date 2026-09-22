@@ -212,6 +212,8 @@ class Backend:
     declarations.
     """
 
+    name: str
+
     operator_class: type[Operator]
 
     def workspace_buffers(

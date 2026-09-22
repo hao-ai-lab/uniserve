@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from functools import lru_cache
 
 from ..foundation.errors import invalid_descriptor
 from .validation import _map, _nonnegative, _uint
@@ -104,9 +103,6 @@ class RequestKey:
 
         Also parses the admission epoch.
         """
-        key = _fast_request_key(value)
-        if key is not None:
-            return key
         data = _map(value, where)
         return cls(
             engine_id=_uint(data.get("engine_id"), f"{where}.engine_id"),
@@ -184,40 +180,3 @@ class BufferId:
             "output_index": self.output_index,
             "generation": self.generation,
         }
-
-
-@lru_cache(maxsize=8192)
-def _interned_request_key(
-    engine_id: int, request_id: int, request_epoch: int
-) -> RequestKey:
-    """Reuse an immutable request key for identical coordinates.
-
-    The coordinates are the engine, request, and epoch values.
-    """
-    # Callers have already validated the coordinates, so __post_init__ is
-    # skipped to keep interning a pure allocation on the hot decode path.
-    key = object.__new__(RequestKey)
-    object.__setattr__(key, "engine_id", engine_id)
-    object.__setattr__(key, "request_id", request_id)
-    object.__setattr__(key, "request_epoch", request_epoch)
-    object.__setattr__(key, "_hash_value", None)
-    return key
-
-
-def _fast_request_key(value: object) -> RequestKey | None:
-    """Decode a trusted compact request-key mapping."""
-    if type(value) is not dict:
-        return None
-    engine_id = value.get("engine_id")
-    request_id = value.get("request_id")
-    request_epoch = value.get("request_epoch")
-    if (
-        type(engine_id) is int
-        and engine_id >= 0
-        and type(request_id) is int
-        and request_id >= 0
-        and type(request_epoch) is int
-        and request_epoch >= 0
-    ):
-        return _interned_request_key(engine_id, request_id, request_epoch)
-    return None

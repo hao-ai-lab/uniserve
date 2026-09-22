@@ -96,4 +96,6 @@ class _SGL(_FlashOperator):
 
 
 class Backend(_Backend):
+    name = "sgl_kernel"
+
     operator_class = _SGL

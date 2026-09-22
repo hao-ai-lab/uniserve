@@ -13,7 +13,13 @@ import torch
 from torch import nn
 
 from uniserve.loading import weights
-from uniserve.model import CausalLM, Denoiser, ImageDecoder, VideoDecoder
+from uniserve.model import (
+    CausalLM,
+    ComponentEntry,
+    Denoiser,
+    ImageDecoder,
+    VideoDecoder,
+)
 from uniserve.nn.attention import (
     AttentionParallelConfig,
     ContextParallelConfig,
@@ -29,12 +35,9 @@ from uniserve.quantization import QuantizationConfig, Quantizer
 from uniserve_models import loading as models
 
 from ..config import WorkerConfig
-from ..execution.component_binding import ComponentBinding
+from ..execution.component_binding import Call, ComponentBinding
 from ..foundation.errors import unsupported_setup
-from ..runtime.results import resolve_outputs
 from .components import (
-    bind_components,
-    describe_components,
     is_host_component,
     validate_components,
 )
@@ -54,6 +57,7 @@ class WorkerModel:
     flow_prompt: FlowPrompt | None = None
     # Identity of the loaded checkpoint; empty for a model without one.
     checkpoint_identity: str = ""
+    entry_points: Mapping[str, ComponentEntry] | None = None
 
 
 def verify_checkpoint_identity(
@@ -75,7 +79,9 @@ def verify_checkpoint_identity(
     )
 
 
-def prepare_worker_model(config: WorkerProcessArgs) -> models.Config | None:
+def prepare_worker_model(
+    config: WorkerProcessArgs,
+) -> tuple[models.Config | None, nn.Module, dict[str, tuple[Call, ...]]]:
     """Resolve the resident checkpoint closure.
 
     The closure is resolved before creating process groups, and its checkpoint
@@ -83,7 +89,12 @@ def prepare_worker_model(config: WorkerProcessArgs) -> models.Config | None:
     is read.
     """
     if config.use_stub_model:
-        return None
+        from uniserve_models.stub import Model
+
+        with torch.device("meta"):
+            description = Model()
+        declarations = validate_components(description, dict(config.components))
+        return None, description, declarations
 
     launch = config.model
     if launch is None:
@@ -119,11 +130,15 @@ def prepare_worker_model(config: WorkerProcessArgs) -> models.Config | None:
         host=socket.gethostname(),
     )
 
-    return replace(
-        source,
-        weights=_weight_config(
-            source, launch.quantization_config, config.execution
+    return (
+        replace(
+            source,
+            weights=_weight_config(
+                source, launch.quantization_config, config.execution
+            ),
         ),
+        model,
+        declared,
     )
 
 
@@ -233,6 +248,8 @@ def load_worker_model(
     bindings: Mapping[str, ComponentBinding],
     *,
     source: models.Config | None,
+    description: nn.Module,
+    declarations: Mapping[str, tuple[Call, ...]],
 ) -> WorkerModel:
     """Materialize selected modules and attach borrowed capability methods."""
     if config.use_stub_model:
@@ -243,7 +260,6 @@ def load_worker_model(
             _devices(model, config.execution.generation_device) or {}
         ).items():
             model.get_submodule(path).to(device)
-        bind_components(model, bindings)
         return WorkerModel(
             model,
             replace(
@@ -258,10 +274,6 @@ def load_worker_model(
             "validated model worker is missing model configuration"
         )
 
-    with torch.device("meta"):
-        description = source.model_class(source.model)
-    declarations = describe_components(description, entries=source.entry_points)
-
     if all(
         is_host_component(name) or not declarations.get(name)
         for name in bindings
@@ -269,13 +281,9 @@ def load_worker_model(
         # A host rank holds only host components: it needs the model's
         # declared media geometry, rates and unit division, which the
         # weight-less description carries, and no numerical state.
-        bind_components(description, bindings, entries=source.entry_points)
         worker_config = loaded_worker_config(
             description, config.execution, config.ipc.queue_depth
         )
-        outputs = resolve_outputs(description, worker_config)
-        for name, binding in bindings.items():
-            binding.outputs = outputs.get(name, ())
         logger.info(
             "described numerical model %s for host work",
             type(description).__qualname__,
@@ -287,6 +295,7 @@ def load_worker_model(
             source.image_processor,
             source.flow_prompt,
             source.checkpoint_identity,
+            source.entry_points,
         )
 
     meshes, attention = {}, {}
@@ -316,7 +325,6 @@ def load_worker_model(
         devices=_devices(description, config.execution.generation_device),
     )
     model = loaded.model
-    bind_components(model, bindings, entries=source.entry_points)
 
     worker_config = loaded_worker_config(
         model, config.execution, config.ipc.queue_depth
@@ -324,10 +332,6 @@ def load_worker_model(
     override = config.model.quantization_config.get("kv_cache_dtype")
     if override is not None:
         worker_config = replace(worker_config, kv_cache_dtype=override)
-
-    outputs = resolve_outputs(model, worker_config)
-    for name, binding in bindings.items():
-        binding.outputs = outputs.get(name, ())
 
     logger.info("loaded numerical model %s", type(model).__qualname__)
     return WorkerModel(
@@ -337,6 +341,7 @@ def load_worker_model(
         source.image_processor,
         source.flow_prompt,
         source.checkpoint_identity,
+        source.entry_points,
     )
 
 

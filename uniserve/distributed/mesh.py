@@ -228,7 +228,7 @@ class Communicator:
     rank: int = 0
     name: str = "local"
     device: torch.device = torch.device("cpu")
-    _group: Any = field(default=None, repr=False, compare=False)
+    _group: Any = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not self.ranks or len(set(self.ranks)) != len(self.ranks):
@@ -789,7 +789,7 @@ class DeviceMesh:
         # The same axis set selected in a different order shares one backend
         # group; only the logical member ordering of the descriptor changes.
         for axes, group in self._groups.items():
-            if set(axes) == set(selected):
+            if set(axes) == set(selected) or set(group.ranks) == set(members):
                 return Communicator(
                     members,
                     members.index(self.rank),

@@ -243,7 +243,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                 causal=(False,) * len(branches),
                 write=(False,) * len(branches),
             )
-            from uniserve_worker.execution.graph_inputs import map_tensors
+            from uniserve_worker.execution.graphs import map_tensors
 
             attention = map_tensors(attention, lambda value: value.to("cuda:0"))
             inputs = factory.bind(

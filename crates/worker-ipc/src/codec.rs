@@ -895,7 +895,16 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             .map(str::to_owned)
             .collect(),
         world_size: info.world_size(),
-        configuration_id: info.configuration_id().unwrap_or_default().to_owned(),
+        model_dtype: info.model_dtype().unwrap_or_default().to_owned(),
+        attention_backend: info.attention_backend().unwrap_or_default().to_owned(),
+        weight_formats: info
+            .weight_formats()
+            .map(|values| values.iter().map(str::to_owned).collect())
+            .unwrap_or_default(),
+        activation_formats: info
+            .activation_formats()
+            .map(|values| values.iter().map(str::to_owned).collect())
+            .unwrap_or_default(),
         checkpoint_identity: info.checkpoint_identity().unwrap_or_default().to_owned(),
         components: info
             .components()
@@ -1887,7 +1896,10 @@ fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
         transfer_backends: Some(info.transfer_backends.clone()),
         fabric_handles: info.fabric_handles,
         world_size: info.world_size,
-        configuration_id: Some(info.configuration_id.clone()),
+        model_dtype: Some(info.model_dtype.clone()),
+        attention_backend: Some(info.attention_backend.clone()),
+        weight_formats: Some(info.weight_formats.clone()),
+        activation_formats: Some(info.activation_formats.clone()),
         checkpoint_identity: Some(info.checkpoint_identity.clone()),
         components: Some(
             info.components

@@ -16,7 +16,7 @@ from torch.nn import functional as F
 
 from uniserve import loading
 from uniserve.diffusion import DenoisingStep, normal_noise
-from uniserve.distributed import DeviceMesh
+from uniserve.distributed import DeviceMesh, communication_axes
 from uniserve.loading import checkpoint, weights
 from uniserve.model import LatentInput
 from uniserve.nn.attention import (
@@ -143,9 +143,15 @@ def _run(rank, rendezvous, directory, source):
         if name.startswith(("proj_", "audio_proj_", "norm_out.linear"))
     }
     for shape, axes, attention in cases:
+        topology = DeviceMesh(
+            ranks=(3, 1, 0, 2), shape=shape, axes=axes, rank=rank
+        )
+        with torch.device("meta"):
+            description = Denoiser(_config(), diffusion=DiffusionConfig())
         mesh = groups.bind(
-            DeviceMesh(ranks=(3, 1, 0, 2), shape=shape, axes=axes, rank=rank),
+            topology,
             device=device,
+            axes=communication_axes(description, topology, attention=attention),
         )
         model = loading.load_model(
             partial(Denoiser, diffusion=DiffusionConfig()),
@@ -423,8 +429,17 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                         torch.testing.assert_close(
                             state[name], initial[name], rtol=0, atol=0
                         )
+                    trajectory = runner.bind_inputs(
+                        size,
+                        tuple(
+                            factory.bind(size, views, schedules, index)
+                            for index in range(4)
+                        ),
+                        schedules,
+                        state=views,
+                        slot=1,
+                    )
                     for index in range(4):
-                        inputs = factory.bind(size, views, schedules, index)
                         expected = {}
                         for name, value in state.items():
                             prediction = _prediction(value, matrices, name)
@@ -443,11 +458,8 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                                 + (1.0 - ratio).double() * clean
                             ).float()
                         result, _ = runner.step(
-                            inputs,
-                            schedules,
-                            state=state,
-                            slot=1,
-                            input_key=size,
+                            trajectory,
+                            index,
                         )
                         for name in model.modalities:
                             torch.testing.assert_close(

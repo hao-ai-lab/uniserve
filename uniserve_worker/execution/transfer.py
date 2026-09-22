@@ -49,7 +49,6 @@ if TYPE_CHECKING:
 
 def execute(
     call: Call,
-    completion_group: int,
     *,
     state: BatchState,
     kv_cache: CacheManager | None,
@@ -81,15 +80,13 @@ def execute(
             raise invalid_descriptor(
                 "KV publication requires a cache output identity"
             )
-        request = state.pending_output(completion_group, request_id)
+        request = state.pending_output(request_id)
         cache = calls.cache_coordinates(request, tables=request_tables)
-        expected_base = publications.destination_base(call.request_key, "gen")
         snapshot = publications.publish(
             request_pool_idx=request.request.request_pool_idx,
             group_id=cache[1],
             visible_length=cache[2],
             destination="gen",
-            expected_base=expected_base,
             buffer=output,
             transports=transports,
             consumers=call.consumer_slots,
@@ -106,7 +103,7 @@ def execute(
             for location in tensor.locations
         )
 
-        outcome = encode.non_state_outcome(call, completion_group, state=state)
+        outcome = encode.non_state_outcome(call, state=state)
         outcome.kv_output = snapshot
     elif mode is TransferMode.KV_INSTALL:
         publications = kv_cache
@@ -118,24 +115,19 @@ def execute(
             raise invalid_descriptor(
                 "KV installation requires source and output identities"
             )
-        request = state.pending_output(completion_group, request_id)
-        cache = calls.cache_coordinates(request, tables=request_tables)
+        request = state.pending_output(request_id)
         write = state.cache_imports.get(source)
         if write is None:
             raise invalid_descriptor(
                 "KV installation has no reserved physical input"
             )
         installed = publications.install(
-            request_pool_idx=request.request.request_pool_idx,
-            group_id=cache[1],
-            request_key=call.request_key,
-            source=source,
             installed_buffer=output,
             write=write,
         )
         request.cache_installation = (source, output, installed)
 
-        outcome = encode.non_state_outcome(call, completion_group, state=state)
+        outcome = encode.non_state_outcome(call, state=state)
         if outcome.progress is not None:
             outcome.progress = replace(
                 outcome.progress,
@@ -158,7 +150,6 @@ def execute(
                 call,
                 inputs[0],
                 outputs[0],
-                completion_group,
                 latent_pool=latent_pool,
                 publication_transports=publication_transports,
                 state=state,
@@ -166,7 +157,6 @@ def execute(
         else:
             value, metadata = fetch_product(
                 call,
-                completion_group,
                 tensor_store=tensor_store,
                 model_runner=model_runner,
                 state=state,
@@ -175,14 +165,12 @@ def execute(
                 outputs[0],
                 value,
                 metadata,
-                completion_group,
                 tensor_store=tensor_store,
                 publication_transports=publication_transports,
                 state=state,
             )
         outcome = encode.non_state_outcome(
             call,
-            completion_group,
             products=(tensor_publication,),
             state=state,
         )
@@ -193,7 +181,6 @@ def _publish_current_latent(
     call: Call,
     reference: TensorRef,
     product: TensorRef,
-    completion_group: int,
     *,
     state: BatchState,
     latent_pool: LatentPool,
@@ -205,7 +192,7 @@ def _publish_current_latent(
             "product transfer changes the physical product kind"
         )
 
-    row = state.pending_output(completion_group, call.request_key.request_id)
+    row = state.pending_output(call.request_key.request_id)
     params = row.input_latent_params
     staging = row.latent_staging
     if params is None or staging is None:
@@ -227,7 +214,6 @@ def _publish_current_latent(
         source,
         row,
         step=params.start_step,
-        completion_group=completion_group,
         latent_pool=latent_pool,
         publication_transports=publication_transports,
         state=state,
@@ -241,7 +227,6 @@ def publish_latent_source(
     *,
     state: BatchState,
     step: int,
-    completion_group: int,
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
 ) -> TensorPublication:
@@ -253,9 +238,7 @@ def publish_latent_source(
     if params is None:
         raise invalid_descriptor("latent publication has no staged parameters")
 
-    request = state.pending_output(
-        completion_group, product.request_key.request_id
-    )
+    request = state.pending_output(product.request_key.request_id)
     transports = publication_transports
     if not transports:
         raise unsupported_setup(
@@ -299,7 +282,6 @@ def publish_latent_source(
 def publish_tensors(
     call: Call,
     values: tuple[torch.Tensor, ...],
-    completion_group: int,
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -316,16 +298,13 @@ def publish_tensors(
         raise invalid_descriptor(
             "numerical results disagree with declared Tensor outputs"
         )
-    request = state.pending_output(
-        completion_group, call.request_key.request_id
-    )
+    request = state.pending_output(call.request_key.request_id)
     owned = {write.reference for write in request.writes if not write.feature}
     return tuple(
         publish_product(
             output,
             value,
             None,
-            completion_group,
             tensor_store=tensor_store,
             publication_transports=publication_transports,
             state=state,
@@ -341,7 +320,6 @@ def publish_product(
     product: TensorRef,
     value: torch.Tensor,
     source_metadata: ImageMetadata | FeatureMetadata | None,
-    completion_group: int,
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -362,9 +340,7 @@ def publish_product(
             "product publication requires a configured transport"
         )
 
-    request = state.pending_output(
-        completion_group, product.request_key.request_id
-    )
+    request = state.pending_output(product.request_key.request_id)
     encoder_write = next(
         (
             write
@@ -376,7 +352,7 @@ def publish_product(
     device_write = (
         None
         if encoder_write is not None
-        else bound_device_write(completion_group, product, state=state)
+        else bound_device_write(product, state=state)
     )
 
     height = 0 if source_metadata is None else source_metadata.height
@@ -552,7 +528,6 @@ def publish_deferred_product(
 
 def fetch_product(
     call: Call,
-    completion_group: int,
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -562,9 +537,7 @@ def fetch_product(
 
     call.
     """
-    request = state.pending_output(
-        completion_group, call.request_key.request_id
-    )
+    request = state.pending_output(call.request_key.request_id)
     for reference in (call.vision_input, call.latent_feature_input):
         if reference is None:
             continue
@@ -639,7 +612,6 @@ def _release_locators(
 
 def reserved_unit_rows(
     call: Call,
-    completion_group: int,
     *,
     state: BatchState,
     count: int,
@@ -657,7 +629,7 @@ def reserved_unit_rows(
         raise invalid_descriptor(
             "encoded media units require exactly one declared product"
         )
-    write = bound_device_write(completion_group, outputs[0], state=state)
+    write = bound_device_write(outputs[0], state=state)
     rows = write.tensor
     if rows.ndim != 2 or rows.shape[0] != count:
         raise invalid_descriptor(

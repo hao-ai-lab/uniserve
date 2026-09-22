@@ -315,6 +315,8 @@ class _FlashAttentionOperator(_Operator):
 
 
 class Backend(_Backend):
+    name = "flash_attn_4"
+
     operator_class = _FlashAttentionOperator
 
     def workspace_buffers(

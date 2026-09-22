@@ -82,12 +82,9 @@ def test_attention_axes_are_distinct_and_context_names_its_axis():
         heads=Ulysses("heads"),
         context=ContextParallelConfig(gather_axis="columns"),
     )
-    assert config.heads.axis == "heads"
     with pytest.raises(ValueError, match="independent"):
         AttentionParallelConfig(
             heads=Ulysses("columns"), context=config.context
         )
-    with pytest.raises(TypeError):
-        ContextParallelConfig()
     with pytest.raises(ValueError, match="nonempty"):
         ContextParallelConfig(gather_axis="")

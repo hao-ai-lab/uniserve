@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from functools import lru_cache
-from typing import TypeAlias, cast
+from typing import TypeAlias
 
 from uniserve import sampling
 from uniserve.model import DEFAULT_COMPONENT
@@ -407,9 +405,6 @@ class Bounds:
     @classmethod
     def from_mapping(cls, value: object, where: str = "bounds") -> Bounds:
         """Parse scheduler-enforced resource ceilings for one call."""
-        bounds = _fast_bounds(value)
-        if bounds is not None:
-            return bounds
         data = _map(value, where)
         return cls(
             max_tokens=_uint(data.get("max_tokens"), f"{where}.max_tokens"),
@@ -454,9 +449,6 @@ class Rng:
     @classmethod
     def from_mapping(cls, value: object, where: str = "rng") -> Rng:
         """Parse deterministic random seed, semantic offset, and draw layout."""
-        rng = _fast_rng(value)
-        if rng is not None:
-            return rng
         data = _map(value, where)
         return cls(
             seed=_uint(data.get("seed"), f"{where}.seed"),
@@ -501,9 +493,6 @@ class CallCoordinates:
         cls, value: object, where: str = "coordinates"
     ) -> CallCoordinates:
         """Parse the coordinates a call states."""
-        coordinates = _fast_coordinates(value)
-        if coordinates is not None:
-            return coordinates
         data = _map(value, where)
         coordinates = cls(
             logical_position=_uint(
@@ -825,17 +814,12 @@ class Call:
 
         Also validates its execution dependencies.
         """
-        # Field decoding follows declaration order with a no-allocation fast
-        # path per field. Irregular values use the validating field decoders so
-        # diagnostics identify the first invalid declaration.
         data = _map(value, where)
         get = data.get
 
-        request_key = identity._fast_request_key(get("request_key"))
-        if request_key is None:
-            request_key = identity.RequestKey.from_mapping(
-                get("request_key"), f"{where}.request_key"
-            )
+        request_key = identity.RequestKey.from_mapping(
+            get("request_key"), f"{where}.request_key"
+        )
         call_id = identity.CallId.from_mapping(
             get("call_id"), f"{where}.call_id"
         )
@@ -844,43 +828,33 @@ class Call:
         )
         component = _str(get("component"), f"{where}.component")
         work = computation(get("code"), f"{where}.code")
-        bounds = _fast_bounds(get("bounds"))
-        if bounds is None:
-            bounds = Bounds.from_mapping(get("bounds"), f"{where}.bounds")
+        bounds = Bounds.from_mapping(get("bounds"), f"{where}.bounds")
 
-        inputs = tensor._fast_tensor_refs(get("inputs", ()))
-        if inputs is None:
-            inputs = tuple(
-                tensor.TensorRef.from_mapping(item, f"{where}.inputs[{index}]")
-                for index, item in enumerate(
-                    _seq(get("inputs", ()), f"{where}.inputs")
-                )
+        inputs = tuple(
+            tensor.TensorRef.from_mapping(item, f"{where}.inputs[{index}]")
+            for index, item in enumerate(
+                _seq(get("inputs", ()), f"{where}.inputs")
             )
-        outputs = tensor._fast_tensor_refs(get("outputs", ()))
-        if outputs is None:
-            outputs = tuple(
-                tensor.TensorRef.from_mapping(item, f"{where}.outputs[{index}]")
-                for index, item in enumerate(
-                    _seq(get("outputs", ()), f"{where}.outputs")
-                )
+        )
+        outputs = tuple(
+            tensor.TensorRef.from_mapping(item, f"{where}.outputs[{index}]")
+            for index, item in enumerate(
+                _seq(get("outputs", ()), f"{where}.outputs")
             )
+        )
 
         predicate_raw = get("predicate")
         if predicate_raw is None:
             predicate = None
         else:
-            predicate = tensor._fast_tensor_ref(predicate_raw)
-            if predicate is None:
-                predicate = tensor.TensorRef.from_mapping(
-                    predicate_raw, f"{where}.predicate"
-                )
+            predicate = tensor.TensorRef.from_mapping(
+                predicate_raw, f"{where}.predicate"
+            )
         rng_raw = get("rng")
         if rng_raw is None:
             rng = None
         else:
-            rng = _fast_rng(rng_raw)
-            if rng is None:
-                rng = Rng.from_mapping(rng_raw, f"{where}.rng")
+            rng = Rng.from_mapping(rng_raw, f"{where}.rng")
 
         call = cls(
             request_key=request_key,
@@ -1124,136 +1098,3 @@ class SamplingState:
             "transition_token_ids": list(self.transition_token_ids),
             "force_finish": self.force_finish,
         }
-
-
-# Each `_fast_*` helper recognizes the exact built-in IPC shape without
-# allocating error-location strings. A non-matching value returns ``None`` so
-# the caller applies the canonical validated constructor and its precise error.
-
-_DRAW_LAYOUT_BY_VALUE: Mapping[str, DrawLayout] = DrawLayout._value2member_map_  # type: ignore[assignment]
-
-
-# Each returns the decoded record for a well-formed IPC value and ``None``
-# otherwise; the caller uses validating decoders in declaration order so the
-# first invalid field receives a precise diagnostic.
-# Construction bypasses ``__init__``/``__post_init__`` only where the fast
-# path itself enforces everything those validators check.
-
-
-@lru_cache(maxsize=256)
-def _interned_bounds(
-    max_tokens: int,
-    max_kv_pages: int,
-    max_latent_bytes: int,
-    max_completion_bytes: int,
-    max_transfer_bytes: int,
-) -> Bounds:
-    """Reuse immutable execution bounds for an identical capacity tuple."""
-    bounds = object.__new__(Bounds)
-    set_field = object.__setattr__
-    set_field(bounds, "max_tokens", max_tokens)
-    set_field(bounds, "max_kv_pages", max_kv_pages)
-    set_field(bounds, "max_latent_bytes", max_latent_bytes)
-    set_field(bounds, "max_completion_bytes", max_completion_bytes)
-    set_field(bounds, "max_transfer_bytes", max_transfer_bytes)
-    return bounds
-
-
-def _fast_bounds(value: object) -> Bounds | None:
-    """Decode trusted optional execution bounds.
-
-    Reads from the compact wire representation.
-    """
-    if type(value) is not dict:
-        return None
-    max_tokens = value.get("max_tokens")
-    max_kv_pages = value.get("max_kv_pages")
-    max_latent_bytes = value.get("max_latent_bytes")
-    max_completion_bytes = value.get("max_completion_bytes")
-    max_transfer_bytes = value.get("max_transfer_bytes")
-    if (
-        type(max_tokens) is int
-        and max_tokens >= 0
-        and type(max_kv_pages) is int
-        and max_kv_pages >= 0
-        and type(max_latent_bytes) is int
-        and max_latent_bytes >= 0
-        and type(max_completion_bytes) is int
-        and max_completion_bytes >= 0
-        and type(max_transfer_bytes) is int
-        and max_transfer_bytes >= 0
-    ):
-        return _interned_bounds(
-            max_tokens,
-            max_kv_pages,
-            max_latent_bytes,
-            max_completion_bytes,
-            max_transfer_bytes,
-        )
-    return None
-
-
-def _fast_coordinates(value: object) -> CallCoordinates | None:
-    """Decode trusted call coordinates from the compact wire representation."""
-    if type(value) is not dict:
-        return None
-    logical_position = value.get("logical_position")
-    kv_visible_len = value.get("kv_visible_len")
-    kv_computed_len = value.get("kv_computed_len")
-    flow_step = value.get("flow_step")
-    if not (
-        type(logical_position) is int
-        and logical_position >= 0
-        and type(kv_visible_len) is int
-        and type(kv_computed_len) is int
-        and 0 <= kv_visible_len <= kv_computed_len
-        and type(flow_step) is int
-        and flow_step >= 0
-    ):
-        return None
-    coordinates = object.__new__(CallCoordinates)
-    object.__setattr__(coordinates, "logical_position", logical_position)
-    object.__setattr__(coordinates, "kv_visible_len", kv_visible_len)
-    object.__setattr__(coordinates, "kv_computed_len", kv_computed_len)
-    object.__setattr__(coordinates, "flow_step", flow_step)
-    return coordinates
-
-
-def _fast_rng(value: object) -> Rng | None:
-    """Decode trusted optional RNG coordinates.
-
-    Reads from the compact wire representation.
-    """
-    if type(value) is not dict:
-        return None
-    seed = value.get("seed")
-    semantic_index_base = value.get("semantic_index_base")
-    raw_layout = value.get("draw_layout")
-    if not (
-        type(seed) is int
-        and seed >= 0
-        and type(semantic_index_base) is int
-        and semantic_index_base >= 0
-        and type(raw_layout) is str
-    ):
-        return None
-    draw_layout = _DRAW_LAYOUT_BY_VALUE.get(raw_layout)
-    if draw_layout is None:
-        return None
-    rng = object.__new__(Rng)
-    object.__setattr__(rng, "seed", seed)
-    object.__setattr__(rng, "semantic_index_base", semantic_index_base)
-    object.__setattr__(rng, "draw_layout", draw_layout)
-    return rng
-
-
-def _fast_uints(value: object) -> tuple[int, ...] | None:
-    """Decode a trusted integer sequence while enforcing non-negative values."""
-    kind = type(value)
-    if kind is not list and kind is not tuple:
-        return None
-    items = cast(list[object] | tuple[object, ...], value)
-    for item in items:
-        if not (type(item) is int and item >= 0):
-            return None
-    return cast(tuple[int, ...], tuple(items))

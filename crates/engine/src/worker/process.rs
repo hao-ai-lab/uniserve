@@ -745,8 +745,8 @@ impl RankProcess {
             "worker resolved component configuration disagrees with configuration"
         );
         anyhow::ensure!(
-            info.configuration_id.len() == 64,
-            "worker omitted resolved configuration identity"
+            !info.model_dtype.is_empty() && !info.attention_backend.is_empty(),
+            "worker omitted resolved numerical settings"
         );
         self.check_worker("Worker startup")?;
         self.info = info;

@@ -19,7 +19,7 @@ from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.execution.rows import DecodeRow, InputRow
 from uniserve_worker.execution.sample import broadcast_selection
 from uniserve_worker.execution.sample import sample as _sample_task_batch
-from uniserve_worker.foundation.errors import classify, invalid_descriptor
+from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.call import (
     Call,
@@ -63,27 +63,21 @@ SampleCandidate = tuple[
 
 def forward_values(
     model_runner: ModelRunner,
-    inputs: tuple[tuple[InputRow, Call, int], ...],
+    inputs: tuple[tuple[InputRow, Call], ...],
     *,
     state: BatchState,
-    errors: dict[int, BaseException],
     retain_sampling: bool = False,
     cache: CacheManager | None,
     tables: BlockTables | None,
     states: DecodeState | None,
     sampling_group: Communicator | None,
 ) -> tuple[ForwardValue | None, ...]:
-    """Bind numerical outputs to their completion owners and attribute group.
-
-    statistics.
-    """
-    for row, _call, completion_group in inputs:
-        state.group_buffers[completion_group].register_device(
-            model_runner.call_devices(_call)[1]
-        )
+    """Bind numerical outputs to calls and attribute execution statistics."""
+    for row, _call in inputs:
+        state.output_buffer.register_device(model_runner.call_devices(_call)[1])
 
     outputs = model_runner.forward(
-        tuple((row, call) for row, call, _scope in inputs),
+        inputs,
         cache=cache,
         tables=tables,
         states=states,
@@ -93,62 +87,52 @@ def forward_values(
 
     for indexes, output in outputs:
         if isinstance(output, BaseException):
-            for index in indexes:
-                errors[inputs[index][2]] = output
-            continue
+            raise output
 
-        try:
-            if output.stats is None or output.request_pool_indices is None:
-                raise RuntimeError(
-                    "numerical forward lost statistics or request slot views"
-                )
-            stats = output.stats
-            request_pool_indices = output.request_pool_indices
-
-            selected = graph_decode_samples(
-                tuple(inputs[index][1] for index in indexes),
-                tuple(
-                    state.pending_output(
-                        inputs[index][2],
-                        inputs[index][1].request_key.request_id,
-                    )
-                    for index in indexes
-                ),
-                tuple(inputs[index][0] for index in indexes),
-                output.greedy.clone()
-                if retain_sampling and output.greedy is not None
-                else output.greedy,
-                sampling_group=sampling_group,
-                request_pool_indices=output.request_pool_indices,
+        if output.stats is None or output.request_pool_indices is None:
+            raise RuntimeError(
+                "numerical forward lost statistics or request slot views"
             )
-            if selected is None:
-                output = output.materialize()
+        stats = output.stats
+        request_pool_indices = output.request_pool_indices
 
-            # One forward output group maps back to its input rows; bind each
-            # row's value, request slot view, graph sample, and output layout.
-            state.group_forward_stats[inputs[indexes[0]][2]].append(stats)
-            for local, (index, value) in enumerate(
-                zip(indexes, output.values, strict=True)
-            ):
-                values[index] = (
-                    value,
-                    request_pool_indices[local : local + 1],
-                    None if selected is None else selected[local],
-                    output.layouts[local],
+        selected = graph_decode_samples(
+            tuple(inputs[index][1] for index in indexes),
+            tuple(
+                state.pending_output(
+                    inputs[index][1].request_key.request_id,
                 )
-        except BaseException as error:
-            if classify(error).fatal:
-                raise
-            for index in indexes:
-                errors[inputs[index][2]] = error
+                for index in indexes
+            ),
+            tuple(inputs[index][0] for index in indexes),
+            output.greedy.clone()
+            if retain_sampling and output.greedy is not None
+            else output.greedy,
+            sampling_group=sampling_group,
+            request_pool_indices=output.request_pool_indices,
+        )
+        if selected is None:
+            output = output.materialize()
+
+        # One forward output group maps back to its input rows; bind each
+        # row's value, request slot view, graph sample, and output layout.
+        state.forward_stats.append(stats)
+        for local, (index, value) in enumerate(
+            zip(indexes, output.values, strict=True)
+        ):
+            values[index] = (
+                value,
+                request_pool_indices[local : local + 1],
+                None if selected is None else selected[local],
+                output.layouts[local],
+            )
     return tuple(values)
 
 
-def _publish_sample_groups(
-    samples: Mapping[int, list[SampleCandidate]],
-    scheduled: tuple[tuple[Call, int], ...],
+def _publish_samples(
+    candidates: list[SampleCandidate],
+    scheduled: tuple[Call, ...],
     outcomes: dict[int, PendingOutput],
-    errors: dict[int, BaseException],
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -163,89 +147,78 @@ def _publish_sample_groups(
     """
     from . import token
 
-    for group_id, candidates in samples.items():
-        if group_id in errors:
-            continue
+    if not candidates:
+        return
 
-        completion_group = scheduled[candidates[0][0]][1]
-        try:
-            # Rows already sampled inside a graph replay carry a selection;
-            # sample only the rows that still need one, preserving order.
-            sample_started = time.perf_counter_ns()
-            sampling_inputs = tuple(
-                work
-                for _index, _task, _logits, work, _selected in candidates
-                if work is not None
+    # Rows already sampled inside a graph replay carry a selection;
+    # sample only the rows that still need one, preserving order.
+    sample_started = time.perf_counter_ns()
+    sampling_inputs = tuple(
+        work
+        for _index, _task, _logits, work, _selected in candidates
+        if work is not None
+    )
+    sampled_values = iter(
+        _sample_task_batch(
+            sampling_inputs,
+            selection_broadcast=partial(broadcast_selection, sampling_group),
+        )
+    )
+    sampled = tuple(
+        selected if selected is not None else next(sampled_values)
+        for _index, _task, _logits, _work, selected in candidates
+    )
+    capture_samples(
+        sampled,
+        tuple(
+            state.pending_output(
+                scheduled[index].request_key.request_id,
             )
-            sampled_values = iter(
-                _sample_task_batch(
-                    sampling_inputs,
-                    selection_broadcast=partial(
-                        broadcast_selection, sampling_group
-                    ),
-                )
-            )
-            sampled = tuple(
-                selected if selected is not None else next(sampled_values)
-                for _index, _task, _logits, _work, selected in candidates
-            )
-            capture_samples(
-                sampled,
-                tuple(
-                    state.pending_output(
-                        completion_group,
-                        scheduled[index][0].request_key.request_id,
-                    )
-                    for index, _task, _logits, _work, _selected in candidates
-                ),
-                state.group_buffers[completion_group],
-            )
-            record_component(
-                state.group_component_us[group_id],
-                "text_sample",
-                sample_started,
-            )
+            for index, _task, _logits, _work, _selected in candidates
+        ),
+        state.output_buffer,
+    )
+    record_component(
+        state.component_us,
+        "text_sample",
+        sample_started,
+    )
 
-            finalize_started = time.perf_counter_ns()
-            token.publish_token_products(
-                tuple(
-                    scheduled[index][0]
-                    for index, _task, _logits, _work, _selected in candidates
-                ),
-                sampled,
-                completion_group,
-                tensor_store=tensor_store,
-                state=state,
-            )
-            for (index, task, logits, work, _captured), selected in zip(
-                candidates, sampled, strict=True
-            ):
-                outcomes[index] = token.publish_sample(
-                    scheduled[index][0],
-                    completion_group,
-                    task,
-                    logits,
-                    work,
-                    selected,
-                    image_builder=model_runner.image_builder,
-                    request_tables=request_tables,
-                    decode_state=decode_state,
-                    state=state,
-                )
-            record_component(
-                state.group_component_us[group_id],
-                "text_finalize",
-                finalize_started,
-            )
-        except BaseException as error:
-            errors[group_id] = error
+    finalize_started = time.perf_counter_ns()
+    token.publish_token_products(
+        tuple(
+            scheduled[index]
+            for index, _task, _logits, _work, _selected in candidates
+        ),
+        sampled,
+        tensor_store=tensor_store,
+        state=state,
+    )
+    for (index, task, logits, work, _captured), selected in zip(
+        candidates, sampled, strict=True
+    ):
+        outcomes[index] = token.publish_sample(
+            scheduled[index],
+            task,
+            logits,
+            work,
+            selected,
+            image_builder=model_runner.image_builder,
+            request_tables=request_tables,
+            decode_state=decode_state,
+            state=state,
+        )
+    record_component(
+        state.component_us,
+        "text_finalize",
+        finalize_started,
+    )
 
 
 def initialize_trajectories(
     numerical: tuple[int, ...],
-    scheduled: tuple[tuple[Call, int], ...],
+    scheduled: tuple[Call, ...],
     outcomes: dict[int, PendingOutput],
-    errors: dict[int, BaseException],
     *,
     state: BatchState,
     kv_cache: CacheManager | None,
@@ -258,33 +231,23 @@ def initialize_trajectories(
 
     trajectories: dict[int, ImageState] = {}
     for index in numerical:
-        call, completion_group = scheduled[index]
-        if (
-            call.kind is not MediaCall.DENOISING
-            or index in outcomes
-            or completion_group in errors
-        ):
+        call = scheduled[index]
+        if call.kind is not MediaCall.DENOISING or index in outcomes:
             continue
 
-        try:
-            trajectories[index] = flow.initialize(
-                call,
-                completion_group,
-                kv_cache=kv_cache,
-                latent_pool=latent_pool,
-                request_tables=request_tables,
-                model_runner=model_runner,
-                state=state,
-            )
-        except BaseException as error:
-            errors[completion_group] = error
+        trajectories[index] = flow.initialize(
+            call,
+            kv_cache=kv_cache,
+            latent_pool=latent_pool,
+            request_tables=request_tables,
+            model_runner=model_runner,
+            state=state,
+        )
 
     step_count = 1
     for index in trajectories:
-        call, completion_group = scheduled[index]
-        request = state.pending_output(
-            completion_group, call.request_key.request_id
-        )
+        call = scheduled[index]
+        request = state.pending_output(call.request_key.request_id)
         params = request.input_latent_params
         if params is None:
             raise invalid_descriptor(
@@ -298,9 +261,8 @@ def initialize_trajectories(
 def prepare_diffusion_step(
     offset: int,
     trajectories: dict[int, ImageState],
-    scheduled: tuple[tuple[Call, int], ...],
+    scheduled: tuple[Call, ...],
     outcomes: dict[int, PendingOutput],
-    errors: dict[int, BaseException],
     *,
     state: BatchState,
     kv_cache: CacheManager | None,
@@ -320,13 +282,11 @@ def prepare_diffusion_step(
     prefixes: list[tuple[int, Branch, InputRow]] = []
 
     for index, trajectory in trajectories.items():
-        call, completion_group = scheduled[index]
-        if index in outcomes or completion_group in errors:
+        call = scheduled[index]
+        if index in outcomes:
             continue
 
-        row = state.pending_output(
-            completion_group, call.request_key.request_id
-        )
+        row = state.pending_output(call.request_key.request_id)
         params = row.input_latent_params
         staging = row.latent_staging
         if params is None or staging is None:
@@ -336,29 +296,21 @@ def prepare_diffusion_step(
         if offset >= int(params.step_count):
             continue
 
-        try:
-            guide, timestep, next_timestep, prefix_rows = flow.prepare_step(
-                call,
-                completion_group,
-                trajectory,
-                int(params.start_step) + offset,
-                request_tables=request_tables,
-                model_runner=model_runner,
-                latent_pool=latent_pool,
-                tokenizer=tokenizer,
-                state=state,
-            )
-            step_inputs[index] = guide, timestep, next_timestep
-            prefixes.extend(
-                (index, branch, task) for branch, task in prefix_rows
-            )
-        except BaseException as error:
-            errors[completion_group] = error
+        guide, timestep, next_timestep, prefix_rows = flow.prepare_step(
+            call,
+            trajectory,
+            int(params.start_step) + offset,
+            request_tables=request_tables,
+            model_runner=model_runner,
+            latent_pool=latent_pool,
+            tokenizer=tokenizer,
+            state=state,
+        )
+        step_inputs[index] = guide, timestep, next_timestep
+        prefixes.extend((index, branch, task) for branch, task in prefix_rows)
 
     active_prefixes = tuple(
-        item
-        for item in prefixes
-        if item[0] not in outcomes and scheduled[item[0]][1] not in errors
+        item for item in prefixes if item[0] not in outcomes
     )
     if not active_prefixes:
         return step_inputs
@@ -366,48 +318,37 @@ def prepare_diffusion_step(
     values = forward_values(
         model_runner,
         tuple(
-            (task, scheduled[index][0], scheduled[index][1])
-            for index, _branch, task in active_prefixes
+            (task, scheduled[index]) for index, _branch, task in active_prefixes
         ),
         cache=kv_cache,
         tables=request_tables,
         states=decode_state,
         sampling_group=sampling_group,
         state=state,
-        errors=errors,
     )
     for (index, branch, task), numerical_result in zip(
         active_prefixes, values, strict=True
     ):
-        call, completion_group = scheduled[index]
-        if (
-            index in outcomes
-            or completion_group in errors
-            or numerical_result is None
-        ):
+        call = scheduled[index]
+        if index in outcomes or numerical_result is None:
             continue
 
         value, _sampling_index, _selection, _layout = numerical_result
-        try:
-            token.commit_kv(
-                task,
-                task.query_tokens,
-                state.pending_output(
-                    completion_group, call.request_key.request_id
-                ),
-                publish_runtime=False,
-                request_tables=request_tables,
-                decode_state=decode_state,
-            )
-            entry = trajectories[index].entries[branch]
-            trajectories[index].entries[branch] = (
-                entry[0],
-                entry[1],
-                entry[2] + task.query_tokens,
-                entry[3],
-            )
-        except BaseException as error:
-            errors[completion_group] = error
+        token.commit_kv(
+            task,
+            task.query_tokens,
+            state.pending_output(call.request_key.request_id),
+            publish_runtime=False,
+            request_tables=request_tables,
+            decode_state=decode_state,
+        )
+        entry = trajectories[index].entries[branch]
+        trajectories[index].entries[branch] = (
+            entry[0],
+            entry[1],
+            entry[2] + task.query_tokens,
+            entry[3],
+        )
 
     return step_inputs
 
@@ -419,9 +360,8 @@ def prepare_forward_rows(
         int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]
     ],
     trajectories: Mapping[int, ImageState],
-    scheduled: tuple[tuple[Call, int], ...],
+    scheduled: tuple[Call, ...],
     outcomes: dict[int, PendingOutput],
-    errors: dict[int, BaseException],
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -437,124 +377,105 @@ def prepare_forward_rows(
     images: dict[int, PreparedImage] = {}
 
     for index in numerical:
-        call, completion_group = scheduled[index]
-        if (
-            index in outcomes
-            or completion_group in errors
-            or (offset > 0 and index not in step_inputs)
-        ):
+        call = scheduled[index]
+        if index in outcomes or (offset > 0 and index not in step_inputs):
             continue
 
-        try:
-            if index in trajectories:
-                if index not in step_inputs:
-                    continue
-                guide, timestep, _next_timestep = step_inputs[index]
-                row = state.pending_output(
-                    completion_group, call.request_key.request_id
+        if index in trajectories:
+            if index not in step_inputs:
+                continue
+            guide, timestep, _next_timestep = step_inputs[index]
+            row = state.pending_output(call.request_key.request_id)
+            params = row.input_latent_params
+            staging = row.latent_staging
+            if params is None or staging is None:
+                raise invalid_descriptor(
+                    "trajectory call has no staged latent inputs"
                 )
-                params = row.input_latent_params
-                staging = row.latent_staging
-                if params is None or staging is None:
-                    raise invalid_descriptor(
-                        "trajectory call has no staged latent inputs"
-                    )
 
-                rows = flow.flow_rows(
-                    flow.require_inputs(model_runner),
-                    trajectories[index],
-                    staging.value[: int(params.latent_units)],
-                    guide,
-                    timestep,
-                    conditioning_position=int(
-                        calls.require_progress(row).logical_position
+            rows = flow.flow_rows(
+                flow.require_inputs(model_runner),
+                trajectories[index],
+                staging.value[: int(params.latent_units)],
+                guide,
+                timestep,
+                conditioning_position=int(
+                    calls.require_progress(row).logical_position
+                ),
+                device=model_runner.call_devices(call)[1],
+            )
+            forward.extend((index, task) for task in rows)
+        elif isinstance(call.kind, ForwardMode):
+            build_started = time.perf_counter_ns()
+            task = token.prepare_forward(
+                call,
+                tensor_store=tensor_store,
+                request_tables=request_tables,
+                model_runner=model_runner,
+                decode_state=decode_state,
+                state=state,
+            )
+            record_component(
+                state.component_us,
+                "text_build_batch",
+                build_started,
+            )
+            forward.append((index, task))
+        elif call.kind in {
+            MediaCall.VISION_ENCODING,
+            MediaCall.LATENT_ENCODING,
+        }:
+            prepared = encode.prepare_features(
+                call,
+                tensor_store=tensor_store,
+                model_runner=model_runner,
+                state=state,
+            )
+            images[index] = prepared
+            forward.append(
+                (
+                    index,
+                    encode.encode_row(cast(MediaCall, call.kind), prepared),
+                )
+            )
+        elif call.latent_input is None:
+            outcomes[index] = encode.diffusion_finalize_frames(
+                call,
+                tensor_store=tensor_store,
+                model_runner=model_runner,
+                state=state,
+            )
+        else:
+            if latent_pool is None:
+                raise RuntimeError("image decoding requires a latent pool")
+            latent = encode.materialization_latent(
+                call,
+                latent_pool=latent_pool,
+                model_runner=model_runner,
+                state=state,
+            )
+            row = state.pending_output(call.request_key.request_id)
+            params = row.input_latent_params
+            staging = row.latent_staging
+            if params is None or staging is None:
+                raise invalid_descriptor(
+                    "trajectory call has no staged latent inputs"
+                )
+
+            forward.append(
+                (
+                    index,
+                    DecodeRow(
+                        forward_mode=MediaCall.IMAGE_DECODING,
+                        latent=latent,
+                        image_height=int(params.height),
+                        image_width=int(params.width),
                     ),
-                    device=model_runner.call_devices(call)[1],
                 )
-                forward.extend((index, task) for task in rows)
-            elif isinstance(call.kind, ForwardMode):
-                build_started = time.perf_counter_ns()
-                task = token.prepare_forward(
-                    call,
-                    completion_group,
-                    tensor_store=tensor_store,
-                    request_tables=request_tables,
-                    model_runner=model_runner,
-                    decode_state=decode_state,
-                    state=state,
-                )
-                record_component(
-                    state.group_component_us[completion_group],
-                    "text_build_batch",
-                    build_started,
-                )
-                forward.append((index, task))
-            elif call.kind in {
-                MediaCall.VISION_ENCODING,
-                MediaCall.LATENT_ENCODING,
-            }:
-                prepared = encode.prepare_features(
-                    call,
-                    completion_group,
-                    tensor_store=tensor_store,
-                    model_runner=model_runner,
-                    state=state,
-                )
-                images[index] = prepared
-                forward.append(
-                    (
-                        index,
-                        encode.encode_row(cast(MediaCall, call.kind), prepared),
-                    )
-                )
-            elif call.latent_input is None:
-                outcomes[index] = encode.diffusion_finalize_frames(
-                    call,
-                    completion_group,
-                    tensor_store=tensor_store,
-                    model_runner=model_runner,
-                    state=state,
-                )
-            else:
-                if latent_pool is None:
-                    raise RuntimeError("image decoding requires a latent pool")
-                latent = encode.materialization_latent(
-                    call,
-                    completion_group,
-                    latent_pool=latent_pool,
-                    model_runner=model_runner,
-                    state=state,
-                )
-                row = state.pending_output(
-                    completion_group, call.request_key.request_id
-                )
-                params = row.input_latent_params
-                staging = row.latent_staging
-                if params is None or staging is None:
-                    raise invalid_descriptor(
-                        "trajectory call has no staged latent inputs"
-                    )
-
-                forward.append(
-                    (
-                        index,
-                        DecodeRow(
-                            forward_mode=MediaCall.IMAGE_DECODING,
-                            latent=latent,
-                            image_height=int(params.height),
-                            image_width=int(params.width),
-                        ),
-                    )
-                )
-        except BaseException as error:
-            errors[completion_group] = error
+            )
 
     return (
-        [
-            item
-            for item in forward
-            if item[0] not in outcomes and scheduled[item[0]][1] not in errors
-        ],
+        [item for item in forward if item[0] not in outcomes],
         images,
     )
 
@@ -564,9 +485,8 @@ def publish_forward_values(
     values: tuple[ForwardValue | None, ...],
     images: Mapping[int, PreparedImage],
     trajectories: Mapping[int, ImageState],
-    scheduled: tuple[tuple[Call, int], ...],
+    scheduled: tuple[Call, ...],
     outcomes: dict[int, PendingOutput],
-    errors: dict[int, BaseException],
     *,
     state: BatchState,
     tensor_store: TensorStore,
@@ -582,89 +502,72 @@ def publish_forward_values(
     from . import encode, token
 
     predictions: dict[int, list[torch.Tensor]] = defaultdict(list)
-    samples: dict[int, list[SampleCandidate]] = defaultdict(list)
+    samples: list[SampleCandidate] = []
 
     for (index, task), numerical_result in zip(forward, values, strict=True):
-        call, completion_group = scheduled[index]
-        if (
-            index in outcomes
-            or completion_group in errors
-            or numerical_result is None
-        ):
+        call = scheduled[index]
+        if index in outcomes or numerical_result is None:
             continue
 
         value, sampling_index, graph_sample, layout = numerical_result
-        try:
-            if index in trajectories:
-                predictions[index].append(value)
-            elif isinstance(call.kind, ForwardMode):
-                if graph_sample is not None:
-                    request = state.pending_output(
-                        completion_group, call.request_key.request_id
-                    )
-                    token.commit_kv(
-                        task,
-                        1,
-                        request,
-                        publish_runtime=False,
-                        request_tables=request_tables,
-                        decode_state=decode_state,
-                    )
-                    samples[completion_group].append(
-                        (index, task, value, None, graph_sample)
-                    )
-                else:
-                    selection = token.prepare_sampling(
-                        call,
-                        completion_group,
-                        task,
-                        value,
-                        request_pool_index=sampling_index,
-                        tensor_store=tensor_store,
-                        image_builder=model_runner.image_builder,
-                        request_tables=request_tables,
-                        decode_state=decode_state,
-                        state=state,
-                    )
-                    if isinstance(selection, PendingOutput):
-                        outcomes[index] = selection
-                    else:
-                        samples[completion_group].append(
-                            (index, task, value, selection, None)
-                        )
-            elif index in images:
-                outcomes[index] = encode.publish_features(
-                    call,
-                    completion_group,
-                    images[index],
-                    value,
-                    tensor_store=tensor_store,
-                    worker_info=worker_info,
-                    publication_transports=publication_transports,
-                    config=config,
-                    state=state,
+        if index in trajectories:
+            predictions[index].append(value)
+        elif isinstance(call.kind, ForwardMode):
+            if graph_sample is not None:
+                request = state.pending_output(call.request_key.request_id)
+                token.commit_kv(
+                    task,
+                    1,
+                    request,
+                    publish_runtime=False,
+                    request_tables=request_tables,
+                    decode_state=decode_state,
                 )
+                samples.append((index, task, value, None, graph_sample))
             else:
-                if layout is None or layout.value_range is None:
-                    raise ValueError(
-                        "image decoder must declare its numerical range"
-                    )
-                outcomes[index] = encode.publish_image(
+                selection = token.prepare_sampling(
                     call,
-                    completion_group,
-                    value.detach(),
-                    layout.value_range,
+                    task,
+                    value,
+                    request_pool_index=sampling_index,
                     tensor_store=tensor_store,
+                    image_builder=model_runner.image_builder,
+                    request_tables=request_tables,
+                    decode_state=decode_state,
                     state=state,
                 )
-        except BaseException as error:
-            errors[completion_group] = error
+                if isinstance(selection, PendingOutput):
+                    outcomes[index] = selection
+                else:
+                    samples.append((index, task, value, selection, None))
+        elif index in images:
+            outcomes[index] = encode.publish_features(
+                call,
+                images[index],
+                value,
+                tensor_store=tensor_store,
+                worker_info=worker_info,
+                publication_transports=publication_transports,
+                config=config,
+                state=state,
+            )
+        else:
+            if layout is None or layout.value_range is None:
+                raise ValueError(
+                    "image decoder must declare its numerical range"
+                )
+            outcomes[index] = encode.publish_image(
+                call,
+                value.detach(),
+                layout.value_range,
+                tensor_store=tensor_store,
+                state=state,
+            )
 
-    _publish_sample_groups(
+    _publish_samples(
         samples,
         scheduled,
         outcomes,
-        errors,
         state=state,
         tensor_store=tensor_store,
         model_runner=model_runner,
@@ -682,9 +585,8 @@ def integrate_predictions(
     ],
     trajectories: Mapping[int, ImageState],
     offset: int,
-    scheduled: tuple[tuple[Call, int], ...],
+    scheduled: tuple[Call, ...],
     outcomes: dict[int, PendingOutput],
-    errors: dict[int, BaseException],
     *,
     state: BatchState,
     worker_info: WorkerInfo,
@@ -701,44 +603,38 @@ def integrate_predictions(
     from . import flow
 
     for index, values in predictions.items():
-        call, completion_group = scheduled[index]
-        if index in outcomes or completion_group in errors:
+        call = scheduled[index]
+        if index in outcomes:
             continue
 
-        try:
-            guide, timestep, next_timestep = step_inputs[index]
-            row = state.pending_output(
-                completion_group, call.request_key.request_id
+        guide, timestep, next_timestep = step_inputs[index]
+        row = state.pending_output(call.request_key.request_id)
+        params = row.input_latent_params
+        staging = row.latent_staging
+        if params is None or staging is None:
+            raise invalid_descriptor(
+                "trajectory call has no staged latent inputs"
             )
-            params = row.input_latent_params
-            staging = row.latent_staging
-            if params is None or staging is None:
-                raise invalid_descriptor(
-                    "trajectory call has no staged latent inputs"
-                )
 
-            # The solver updates only the model-visible portion of this
-            # call's staging, preserving page padding.
-            flow.integrate(
-                flow.require_inputs(model_runner),
+        # The solver updates only the model-visible portion of this
+        # call's staging, preserving page padding.
+        flow.integrate(
+            flow.require_inputs(model_runner),
+            trajectories[index],
+            staging.value[: int(params.latent_units)],
+            tuple(values),
+            int(params.start_step) + offset,
+            timestep,
+            next_timestep,
+        )
+        if offset + 1 == int(params.step_count):
+            outcomes[index] = flow.finish(
+                call,
                 trajectories[index],
-                staging.value[: int(params.latent_units)],
-                tuple(values),
-                int(params.start_step) + offset,
-                timestep,
-                next_timestep,
+                worker_info=worker_info,
+                latent_pool=latent_pool,
+                publication_transports=publication_transports,
+                request_tables=request_tables,
+                config=config,
+                state=state,
             )
-            if offset + 1 == int(params.step_count):
-                outcomes[index] = flow.finish(
-                    call,
-                    completion_group,
-                    trajectories[index],
-                    worker_info=worker_info,
-                    latent_pool=latent_pool,
-                    publication_transports=publication_transports,
-                    request_tables=request_tables,
-                    config=config,
-                    state=state,
-                )
-        except BaseException as error:
-            errors[completion_group] = error

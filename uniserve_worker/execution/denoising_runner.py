@@ -1,72 +1,37 @@
-"""Own prepared denoising calls.
-
-graph residency and numerical resource lifetime.
-"""
+"""Bind denoising trajectories once and own their prepared graph residency."""
 
 from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Hashable, Mapping
-from dataclasses import fields, is_dataclass, replace
-from typing import Generic, TypeVar
+from dataclasses import dataclass, field
+from typing import Generic, TypeVar, cast
 
 import torch
 
 from uniserve.diffusion import DenoisingStep, Schedule
 from uniserve.distributed import Communicator
 from uniserve.model import Denoiser, DenoiserInput
-from uniserve.runtime import CUDAGraph, ExecutionContext, PrefixCache
+from uniserve.runtime import ExecutionContext, PrefixCache
 
 from .component_binding import capture_required
-from .graph_inputs import clone_inputs, copy_inputs, input_signature
 from .graph_memory import GraphMemory
+from .graphs import (
+    Execution,
+    Graph,
+    GraphBucket,
+    Inputs,
+    clone_inputs,
+    input_signature,
+    map_tensors,
+)
 
 InputT = TypeVar("InputT", bound=DenoiserInput)
 SizeT = TypeVar("SizeT")
 
 
-def _numerical_signature(value: object) -> Hashable:
-    """Identify static values and tensor backing independently of tensor.
-
-    contents.
-
-    Immutable numerical records may be rebuilt between calls. Their values and
-    borrowed tensor addresses determine graph reuse; mutable device contents do
-    not, so this function never reads tensors back to the host.
-    """
-    if isinstance(value, torch.Tensor):
-        return (
-            value.device,
-            value.dtype,
-            tuple(value.shape),
-            tuple(value.stride()),
-            value.data_ptr(),
-        )
-    if isinstance(value, Mapping):
-        return tuple(
-            (key, _numerical_signature(item)) for key, item in value.items()
-        )
-    if isinstance(value, (tuple, list)):
-        return tuple(_numerical_signature(item) for item in value)
-    if is_dataclass(value) and not isinstance(value, type):
-        return type(value), tuple(
-            (field.name, _numerical_signature(getattr(value, field.name)))
-            for field in fields(value)
-        )
-    if isinstance(value, Hashable):
-        return value
-    raise TypeError(
-        f"unsupported numerical graph value: {type(value).__name__}"
-    )
-
-
 def restore_samples(inputs: DenoiserInput):
-    """Snapshot solver samples while keeping disposable prediction storage.
-
-    separate.
-    """
-    # Keying by identity snapshots each backing tensor once, even when several
-    # latent views alias the same storage.
+    """Snapshot mutable solver samples without retaining prediction scratch."""
     samples = {
         id(value.tensor): value.tensor
         for values in inputs.latents.values()
@@ -81,14 +46,42 @@ def restore_samples(inputs: DenoiserInput):
     return restore
 
 
-class DenoisingRunner(Generic[InputT, SizeT]):
-    """Execute one denoiser capability over caller-supplied typed inputs.
+@dataclass(frozen=True)
+class Trajectory:
+    """One request's fixed numerical calls and named spans of its slot storage.
 
-    Prepared contexts own plans, constants, communication resources and scratch.
-    Graphs borrow those contexts and request-slot samples, but own their
-    schedule and timestep inputs. New requests can supply new schedule tensors
-    without replacing a slot's captured sample addresses. Retirement releases
-    graphs before their contexts or sample backing can be reused.
+    Tensor contents remain live. Changing static parameters or tensor layouts
+    requires a new binding; each solver step already has its own typed input.
+    """
+
+    input_key: Hashable
+    inputs: tuple[DenoiserInput, ...]
+    schedules: Mapping[str, Schedule]
+    state: Mapping[str, torch.Tensor]
+    slot: int
+    signature: Hashable
+    # Tensor identity maps to an explicitly named field, never to a bank search.
+    fields: Mapping[int, str]
+    spans: Mapping[str, tuple[int, tuple[int, ...]]]
+    temporal: tuple[tuple[torch.Tensor, ...], ...]
+
+
+@dataclass
+class DenoisingBucket(GraphBucket):
+    """Shared solver stages and graph variants for one numerical trajectory."""
+
+    state: Mapping[str, torch.Tensor] = field(default_factory=dict)
+    gathers: tuple = ()
+    scatters: tuple = ()
+
+
+class DenoisingRunner(Generic[InputT, SizeT]):
+    """Own prepared contexts and their denoising graph buckets.
+
+    A bound trajectory states its input correspondence once. Replays select a
+    step and a slot, update live temporal values and gather/scatter that slot.
+    Prepared sizes and graph buckets each have the configured ``shapes`` limit;
+    evicting a bucket leaves its context usable for eager work or recapture.
     """
 
     def __init__(
@@ -105,50 +98,22 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         cache: PrefixCache | None = None,
         attention="auto",
         matmul="auto",
-        additional_devices: tuple[torch.device, ...] = (),
+        additional_devices=(),
     ):
-        if capacity < 1:
+        if capacity < 1 or shapes < 1:
             raise ValueError(
-                "denoising requires a positive resident request capacity"
+                "denoising requires positive slot and size capacities"
             )
-        if shapes < 1:
-            raise ValueError(
-                "denoising requires a positive resident size capacity"
-            )
-
-        self.model, self.device = model, device
-        self.stream, self.groups, self.capacity = (
-            stream,
-            groups,
-            capacity,
-        )
-        self.shapes = shapes
+        self.model, self.device, self.stream = model, device, stream
+        self.groups, self.capacity, self.shapes = groups, capacity, shapes
         self._captures = capture and stream is not None
-        self.cache, self.attention, self.matmul = cache, attention, matmul
-
-        # Captured graphs draw their workspace from per-device memory pools.
-        self.graph_memory = graph_memory or GraphMemory()
-        self._devices = (device, *additional_devices) if self.captures else ()
-        self._pools = {}
-
-        self.graphs: dict[
-            tuple[Hashable, Hashable, Hashable], tuple[CUDAGraph, tuple]
-        ] = {}
-        self.prepared_inputs: OrderedDict[Hashable, ExecutionContext] = (
-            OrderedDict()
+        self.graph_memory = (
+            graph_memory if graph_memory is not None else GraphMemory()
         )
-        # One entry per resident ladder: one numerical signature, mapped to
-        # the prepared size it borrows. A ladder serves every request slot,
-        # because its graph reads and writes slot storage through the slot
-        # index below rather than through a slot's addresses. Least recently
-        # used ladders retire first.
-        self._resident: OrderedDict[Hashable, Hashable] = OrderedDict()
-        # Request slot storage: one bank per field with a leading slot axis,
-        # bound by the owner of the request slots. Graph-owned stage tensors
-        # per prepared size hold the slot a replay gathers, and the slot index
-        # is the one device word a replay reads to find its rows.
+        self._devices = (device, *additional_devices) if self.captures else ()
+        self.cache, self.attention, self.matmul = cache, attention, matmul
+        self.prepared: OrderedDict[Hashable, Execution] = OrderedDict()
         self._bank: dict[str, torch.Tensor] = {}
-        self._stages: dict[Hashable, dict[Hashable, torch.Tensor]] = {}
         self._slot_index = (
             torch.zeros(1, dtype=torch.int64, device=device)
             if self.captures
@@ -158,60 +123,47 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         self._closed = False
 
     @property
-    def captures(self) -> bool:
-        """Whether this runner replays captured graphs.
-
-        The execution stream belongs to the resource grant whether or not
-        this runner captures graphs.
-        """
+    def captures(self):
+        """Graph policy is independent of the granted execution stream."""
         return self._captures
 
-    def prepare_inputs(
-        self, key: Hashable, size: SizeT
-    ) -> ExecutionContext[SizeT]:
-        """Prepare one exact numerical size.
-
-        retaining it through dependent graphs.
-        """
+    def prepare_inputs(self, key: Hashable, size: SizeT) -> ExecutionContext:
+        """Prepare and retain one exact size through its dependent graphs."""
         if self._closed:
             raise RuntimeError("denoising runner is closed")
-
-        if key not in self.prepared_inputs:
-            if len(self.prepared_inputs) >= self.shapes:
-                self.release_inputs(next(iter(self.prepared_inputs)))
-
+        if key not in self.prepared:
+            if len(self.prepared) >= self.shapes:
+                self.release_inputs(next(iter(self.prepared)))
             context = ExecutionContext(
                 self.model,
                 cache=self.cache,
                 attention=self.attention,
                 matmul=self.matmul,
                 stream=self.stream,
+                groups=self.groups,
             )
-            self._pools[key] = self.graph_memory.reserve(
-                (self, key), self._devices
+            entry = Execution(
+                context, memory=self.graph_memory, devices=self._devices
             )
             try:
-                if context.stream is not None:
-                    context.stream.wait_stream(
+                if self.stream is not None:
+                    self.stream.wait_stream(
                         torch.cuda.current_stream(self.device)
                     )
-                with self.graph_memory.allocate((self, key)):
+                with self.graph_memory.allocate(entry):
                     context.prepare(size)
                 self.graph_memory.check()
             except BaseException:
-                context.close()
-                self._pools.pop(key, None)
-                self.graph_memory.release((self, key))
+                entry.close()
                 raise
-            self.prepared_inputs[key] = context
-
-        self.prepared_inputs.move_to_end(key)
-        return self.prepared_inputs[key]
+            self.prepared[key] = entry
+        self.prepared.move_to_end(key)
+        return self.prepared[key].context
 
     def _call(self, inputs, schedules, state, key):
         if self._closed:
             raise RuntimeError("denoising runner is closed")
-        context = self.prepared_inputs[key]
+        context = self.prepared[key].context
         return context, DenoisingStep(
             self.model,
             inputs,
@@ -222,353 +174,252 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         )
 
     @torch.inference_mode()
-    def warmup(
-        self,
-        inputs: InputT,
-        schedules: Mapping[str, Schedule],
-        *,
-        state: Mapping[str, torch.Tensor],
-        input_key: Hashable,
-    ) -> None:
-        """Prepare the actual call's kernel specializations without advancing.
-
-        its samples.
-        """
+    def warmup(self, inputs, schedules, *, state, input_key):
+        """Prepare kernel specializations without advancing the samples."""
         context, call = self._call(inputs, schedules, state, input_key)
         if context.stream is not None:
             context.stream.wait_stream(torch.cuda.current_stream(self.device))
-
         with context.activate():
             restore = restore_samples(inputs)
             try:
                 call()
             finally:
                 restore()
-
         if self.device.type == "cuda":
             (
                 context.stream or torch.cuda.current_stream(self.device)
             ).synchronize()
 
-    def bind_bank(self, bank: Mapping[str, torch.Tensor]) -> None:
-        """Name the request-slot storage indexed by captured graphs.
-
-        Each value is one field's bank with a leading axis of `capacity` slot
-        rows; a request's tensors are prefixes of its row. A graph gathers the
-        rows the slot index names into its stage, runs the step there, and
-        scatters the samples back, so one captured ladder serves every slot.
-        """
+    def bind_bank(self, bank: Mapping[str, torch.Tensor]):
+        """Borrow named request fields with a leading slot axis."""
+        if self.prepared:
+            raise RuntimeError(
+                "bind request storage before preparing execution"
+            )
         for name, value in bank.items():
-            if value.ndim < 1 or value.shape[0] != self.capacity:
-                raise ValueError(
-                    f"slot bank {name!r} must hold {self.capacity} slot rows"
-                )
-            if not value.is_contiguous():
-                raise ValueError(f"slot bank {name!r} must be contiguous")
-        self._bank = dict(bank)
-
-    def _locate(
-        self, tensor: torch.Tensor
-    ) -> tuple[str, int | None, torch.Tensor | None] | None:
-        """Find the bank field and slot row containing a tensor span.
-
-        A slot tensor is one contiguous span of its row: a size's leading
-        prefix, or a sequence-parallel rank's shard inside it. Returns the
-        field, the slot row and every row's matching span as a 2-D view, or
-        None for a tensor outside every bank.
-        """
-        pointer = tensor.untyped_storage().data_ptr()
-        for name, bank in self._bank.items():
-            if bank.untyped_storage().data_ptr() != pointer:
-                continue
-            if tensor.numel() == 0:
-                # A rank whose shard of this field is empty holds no span of
-                # any row: there is nothing to gather and nothing names a slot.
-                return name, None, None
-            rows = bank.view(bank.shape[0], -1)
-            row_bytes = rows.shape[1] * bank.element_size()
-            offset = tensor.data_ptr() - bank.data_ptr()
-            row, within = divmod(offset, row_bytes)
-            start = within // bank.element_size()
             if (
-                within % bank.element_size()
-                or not tensor.is_contiguous()
-                or not 0 <= row < rows.shape[0]
-                or start + tensor.numel() > rows.shape[1]
+                value.ndim < 1
+                or value.shape[0] != self.capacity
+                or not value.is_contiguous()
             ):
                 raise ValueError(
-                    f"slot tensor is not a contiguous span of a {name!r} row: "
-                    f"tensor {tuple(tensor.shape)} {tensor.dtype} on "
-                    f"{tensor.device} at {tensor.data_ptr():#x} with storage "
-                    f"{pointer:#x}, bank {tuple(bank.shape)} at "
-                    f"{bank.data_ptr():#x} with storage "
-                    f"{bank.untyped_storage().data_ptr():#x}"
+                    f"bank {name!r} requires {self.capacity} "
+                    "contiguous slot rows"
                 )
-            return name, row, rows[:, start : start + tensor.numel()]
-        return None
+        self._bank = dict(bank)
 
-    def _stage(
-        self, input_key: Hashable, name: str, template: torch.Tensor
-    ) -> torch.Tensor:
-        """Return the graph-owned stage for one span of a field at one size.
+    def bind_inputs(self, input_key, inputs, schedules, *, state, slot):
+        """Bind the complete typed solver trajectory to named request storage.
 
-        A field is staged once per span shape: a rank's latent shard and the
-        state's view of the whole row are different spans of the same field,
-        and each keeps its own stage so a ladder's addresses stay fixed.
+        State field names come from RequestPool/MediaBuilder. For each known
+        field, record its row offset once and validate that the supplied view
+        lies in the requested slot. Models receive only the numerical views.
         """
-        stages = self._stages.setdefault(input_key, {})
-        key = (name, tuple(template.shape), template.dtype)
-        stage = stages.get(key)
-        if stage is None:
-            with self.graph_memory.allocate((self, input_key)):
-                stage = torch.empty_like(template)
-            stages[key] = stage
-        return stage
-
-    def _slot_value(self, slot: int) -> torch.Tensor:
-        """Return the pinned host word naming one slot's bank row."""
-        value = self._slot_values.get(slot)
-        if value is None:
-            if not 1 <= slot <= self.capacity:
-                raise ValueError(f"request slot {slot} is outside the bank")
-            value = torch.tensor([slot - 1], dtype=torch.int64).pin_memory()
-            self._slot_values[slot] = value
-        return value
-
-    def _stage_inputs(self, inputs, state, input_key):
-        """Rebind a call's slot tensors to the stage its graph runs on.
-
-        Returns the rebound inputs and state, the slot row the inputs name,
-        the gathers a replay performs before the step and the scatters it
-        performs after: pairs of a bank's rows and the stage that holds one.
-        """
-        slots: dict[int, list[str]] = {}
-        gathers = []
-        scatters = []
-
-        def staged(tensor, *, writeback):
-            located = self._locate(tensor)
-            if located is None:
-                raise ValueError(
-                    "denoising graph capture requires request slot storage "
-                    "bound as a bank"
-                )
-            name, slot, span = located
-            stage = self._stage(input_key, name, tensor)
-            if span is None:
-                return stage
-            slots.setdefault(slot, []).append(name)
-            pair = (span, stage.view(1, -1))
-            gathers.append(pair)
-            if writeback:
-                scatters.append(pair)
-            return stage
-
-        def rebind(value):
-            """Replace every bank-resident tensor in a field by its stage."""
-            if isinstance(value, torch.Tensor):
-                if self._locate(value) is None:
-                    return value
-                return staged(value, writeback=False)
-            if isinstance(value, tuple):
-                return tuple(rebind(item) for item in value)
-            if isinstance(value, Mapping):
-                return {name: rebind(item) for name, item in value.items()}
-            return value
-
-        latents = {
-            name: tuple(
-                replace(value, tensor=staged(value.tensor, writeback=True))
-                for value in values
-            )
-            for name, values in inputs.latents.items()
-        }
-        # Conditioning and any other slot-resident input is gathered but not
-        # written back; the latents are the state a step advances.
-        others = {
-            field.name: rebind(getattr(inputs, field.name))
-            for field in fields(inputs)
-            if field.name not in {"latents", "step_index", "sizes"}
-        }
-        bound = replace(inputs, latents=latents, **others)
-        # State names the same slot storage the latents do; a graph reads the
-        # stage that holds it, never a slot's own addresses. A field outside
-        # every bank is the slot's own storage, which preparation draws and
-        # reads before any step runs; binding it here would put one slot's
-        # addresses in the captured ladder and give every slot a ladder of its
-        # own, so the step binds the banked state alone.
-        bound_state = {
-            name: staged(tensor, writeback=False)
-            for name, tensor in state.items()
-            if self._locate(tensor) is not None
-        }
-        if len(slots) != 1:
+        if not 1 <= slot <= self.capacity or not inputs:
             raise ValueError(
-                "a denoising call binds the storage of exactly one slot, not "
-                f"{slots}"
+                "a trajectory requires a valid slot and solver steps"
             )
-        return bound, bound_state, next(iter(slots)) + 1, gathers, scatters
+        inputs = tuple(inputs)
+        if any(value.step_index != index for index, value in enumerate(inputs)):
+            raise ValueError(
+                "trajectory inputs must enumerate solver steps in order"
+            )
+        spans, names = {}, {}
+        if self.captures:
+            for name, tensor in state.items():
+                bank = self._bank.get(name)
+                if bank is None:
+                    continue
+                row = bank[slot - 1]
+                start = tensor.storage_offset() - row.storage_offset()
+                if (
+                    tensor.dtype != bank.dtype
+                    or tensor.device != bank.device
+                    or tensor.untyped_storage().data_ptr()
+                    != bank.untyped_storage().data_ptr()
+                    or not tensor.is_contiguous()
+                    or start < 0
+                    or start + tensor.numel() > row.numel()
+                ):
+                    raise ValueError(
+                        f"state field {name!r} is outside its named slot"
+                    )
+                spans[name] = start, tuple(tensor.shape)
+                names[id(tensor)] = name
+            if any(
+                id(value.tensor) not in names
+                for inputs_at_step in inputs
+                for values in inputs_at_step.latents.values()
+                for value in values
+            ):
+                raise ValueError(
+                    "every latent must name a supplied bank state field"
+                )
+        signature = (
+            input_signature((inputs, schedules)),
+            tuple(sorted(spans.items())),
+        )
+        temporal = tuple(
+            tuple(
+                value
+                for _, value in Inputs(step).tensors
+                if id(value) not in names
+            )
+            for step in inputs
+        )
+        return Trajectory(
+            input_key,
+            inputs,
+            schedules,
+            state,
+            slot,
+            signature,
+            names,
+            spans,
+            temporal,
+        )
 
-    def _resident_ladder(
-        self,
-        inputs: InputT,
-        schedules: Mapping[str, Schedule],
-        *,
-        state: Mapping[str, torch.Tensor],
-        slot: Hashable,
-        input_key: Hashable,
-    ):
-        """Return the graph one call replays, capturing it when it is missing.
+    def _bucket(self, trajectory):
+        entry = self.prepared[trajectory.input_key]
+        bucket = entry.buckets.get(trajectory.signature)
+        if bucket is None:
+            # Context capacity and captured trajectory capacity are independent.
+            # Entries own their stages and graphs; evict the oldest bucket.
+            residents = [
+                (bucket.last_used, owner, key)
+                for owner in self.prepared.values()
+                for key, bucket in owner.buckets.items()
+            ]
+            if len(residents) >= self.shapes:
+                _, owner, key = min(residents, key=lambda value: value[0])
+                owner.close_bucket(key)
+            stages, gathers, scatters = {}, [], []
+            mutable = {
+                trajectory.fields[id(value.tensor)]
+                for step in trajectory.inputs
+                for values in step.latents.values()
+                for value in values
+            }
+            for name, (start, shape) in trajectory.spans.items():
+                with self.graph_memory.allocate(entry):
+                    stage = torch.empty_like(trajectory.state[name])
+                stages[name] = stage
+                if stage.numel():
+                    rows = self._bank[name].view(self.capacity, -1)
+                    pair = (
+                        rows[:, start : start + stage.numel()],
+                        stage.view(1, -1),
+                    )
+                    gathers.append(pair)
+                    if name in mutable:
+                        scatters.append(pair)
+            bucket = DenoisingBucket(
+                state=stages,
+                gathers=tuple(gathers),
+                scatters=tuple(scatters),
+            )
+            entry.buckets[trajectory.signature] = bucket
+        bucket.touch()
+        return entry, bucket
 
-        Yields the graph, its graph-owned temporal storage, the caller's
-        temporal values, the prepared context and whether this call captured.
-        Capture never advances the caller's samples.
-        """
+    def _slot_value(self, slot):
+        if slot not in self._slot_values:
+            self._slot_values[slot] = torch.tensor(
+                [slot - 1], dtype=torch.int64
+            ).pin_memory()
+        return self._slot_values[slot]
+
+    def _graph(self, trajectory, index):
         if self._closed:
             raise RuntimeError("denoising runner is closed")
-
-        context = self.prepared_inputs[input_key]
-        bound, bound_state, bound_slot, gathers, scatters = self._stage_inputs(
-            inputs, state, input_key
-        )
-        if slot != bound_slot:
-            raise ValueError(
-                f"denoising call names slot {slot} but binds slot {bound_slot}"
-            )
-
-        # The signature is taken over the stage the graph runs on, so it holds
-        # for every slot. Schedules are rebuilt per trajectory, so their
-        # values are copied into graph-owned storage on every invocation
-        # instead of making addresses part of reuse.
-        signature = (
-            _numerical_signature(
-                (
-                    tuple(
-                        (field.name, getattr(bound, field.name))
-                        for field in fields(bound)
-                        if field.name not in {"latents", "step_index"}
-                    ),
-                    tuple(
-                        (name, tuple(value.tensor for value in values))
-                        for name, values in bound.latents.items()
-                    ),
-                    bound_state,
-                    context.constants,
-                    context.workspace,
-                )
-            ),
-            input_signature(schedules),
-        )
-        timesteps = {
-            name: tuple(value.timestep for value in values)
-            for name, values in inputs.latents.items()
-        }
-        temporal = schedules, timesteps
-        variant = inputs.step_index, input_signature(timesteps)
-        key = (signature, variant)
-
-        missing = capture_required(
-            key not in self.graphs, self.groups, self.device
-        )
+        entry, bucket = self._bucket(trajectory)
+        context = entry.context
+        slot_index = cast(torch.Tensor, self._slot_index)
+        graph = bucket.graphs.get(index)
+        missing = capture_required(graph is None, self.groups, self.device)
         if missing:
-            self._admit(signature, input_key)
-            self._discard_graph(key)
-            self.warmup(inputs, schedules, state=state, input_key=input_key)
-
-            graph = CUDAGraph(context=context, pools=self._pools[input_key])
+            if graph is not None:
+                graph.close()
+            live = trajectory.inputs[index]
+            self.warmup(
+                live,
+                trajectory.schedules,
+                state=trajectory.state,
+                input_key=trajectory.input_key,
+            )
             try:
                 with context.activate():
-                    # Bind graph-owned schedule and timestep copies so replay
-                    # only needs their values refreshed, never new addresses.
-                    with self.graph_memory.allocate((self, input_key)):
-                        staged = clone_inputs(temporal)
-                    stepped = replace(
-                        bound,
-                        latents={
-                            name: tuple(
-                                replace(value, timestep=timestep)
-                                for value, timestep in zip(
-                                    values, staged[1][name], strict=True
-                                )
-                            )
-                            for name, values in bound.latents.items()
-                        },
+                    # Bank tensors are gathered in the graph. Other numerical
+                    # tensors, including timesteps, have graph-owned copies.
+                    sources = trajectory.temporal[index]
+                    with self.graph_memory.allocate(entry):
+                        temporal = clone_inputs((trajectory.schedules, sources))
+                    replacements = {
+                        id(value): staged
+                        for value, staged in zip(
+                            sources, temporal[1], strict=True
+                        )
+                    }
+                    stepped = map_tensors(
+                        live,
+                        lambda value: (
+                            bucket.state[trajectory.fields[id(value)]]
+                            if id(value) in trajectory.fields
+                            else replacements[id(value)]
+                        ),
                     )
-                    step = DenoisingStep(
+                    call = DenoisingStep(
                         self.model,
                         stepped,
-                        staged[0],
-                        bound_state,
+                        temporal[0],
+                        bucket.state,
                         context.constants,
                         context.workspace,
                     )
-                    slot_index = self._slot_index
-                    assert slot_index is not None
-                    slot_index.copy_(self._slot_value(slot), non_blocking=True)
+                    slot_index.copy_(
+                        self._slot_value(trajectory.slot), non_blocking=True
+                    )
 
-                    def call():
-                        # The slot index names the rows: gather them into the
-                        # stage, run the step there, and scatter the samples
-                        # back, all inside the graph.
-                        for rows, stage in gathers:
+                    def compute(_):
+                        for rows, stage in bucket.gathers:
                             torch.index_select(rows, 0, slot_index, out=stage)
-                        samples = step()
-                        for rows, stage in scatters:
+                        samples = call()
+                        for rows, stage in bucket.scatters:
                             rows.index_copy_(0, slot_index, stage)
                         return samples
 
-                    restore = restore_samples(inputs)
-                graph.capture(call, restore=restore)
-                self.graph_memory.check()
+                    graph = Graph.capture(
+                        context,
+                        temporal,
+                        compute,
+                        pools=entry.pools,
+                        restore=restore_samples(live),
+                    )
+                    bucket.graphs[index] = graph
+                    self.graph_memory.check()
             except BaseException:
-                graph.close()
-                self.release_inputs(input_key)
+                self.release_inputs(trajectory.input_key)
                 raise
-            self.graphs[key] = graph, staged
-
-        self._resident.move_to_end(signature)
-        graph, staged = self.graphs[key]
-        return graph, staged, temporal, context, missing
+        return graph, context, missing
 
     @torch.inference_mode()
-    def capture(
-        self,
-        inputs: InputT,
-        schedules: Mapping[str, Schedule],
-        *,
-        state: Mapping[str, torch.Tensor],
-        slot: Hashable,
-        input_key: Hashable,
-    ) -> None:
-        """Make one ladder step's graph resident.
-
-        Warmup calls this for every step of the production ladder at every
-        declared size so no request pays capture on its own path; the graph
-        serves every request slot. The caller's samples are unchanged when
-        this returns.
-        """
+    def capture(self, trajectory: Trajectory, index: int):
+        """Capture one bound step without advancing the request's samples."""
         if not self.captures:
             raise RuntimeError("denoising graph capture requires a stream")
-        self._resident_ladder(
-            inputs, schedules, state=state, slot=slot, input_key=input_key
-        )
+        self._graph(trajectory, index)
 
     @torch.inference_mode()
-    def step(
-        self,
-        inputs: InputT,
-        schedules: Mapping[str, Schedule],
-        *,
-        state: Mapping[str, torch.Tensor],
-        slot: Hashable,
-        input_key: Hashable,
-    ) -> tuple[Mapping[str, tuple[torch.Tensor, ...]], str]:
-        """Run one numerical update.
-
-        the worker separately commits request progress.
-        """
+    def step(self, trajectory: Trajectory, index: int):
+        """Advance a bound step; the worker commits request progress."""
+        live = trajectory.inputs[index]
         if not self.captures:
-            context, call = self._call(inputs, schedules, state, input_key)
+            context, call = self._call(
+                live,
+                trajectory.schedules,
+                trajectory.state,
+                trajectory.input_key,
+            )
             current = (
                 torch.cuda.current_stream(self.device)
                 if context.stream is not None
@@ -582,77 +433,36 @@ class DenoisingRunner(Generic[InputT, SizeT]):
             finally:
                 if context.stream is not None:
                     current.wait_stream(context.stream)
-
-        graph, staged, temporal, context, captured = self._resident_ladder(
-            inputs, schedules, state=state, slot=slot, input_key=input_key
-        )
+        graph, context, captured = self._graph(trajectory, index)
         current = torch.cuda.current_stream(self.device)
         context.stream.wait_stream(current)
-
         with context.activate():
-            copy_inputs(staged, temporal)
-            assert self._slot_index is not None
-            self._slot_index.copy_(self._slot_value(slot), non_blocking=True)
-            graph.replay()
+            # The trajectory's non-bank tensors have known positions. Keep
+            # their correspondence per binding, including new schedule objects.
+            temporal = trajectory.schedules, trajectory.temporal[index]
+            cast(torch.Tensor, self._slot_index).copy_(
+                self._slot_value(trajectory.slot), non_blocking=True
+            )
+            graph.replay(temporal)
         current.wait_stream(context.stream)
-        # The samples live in the slot's rows, where the graph scattered them.
-        samples = {
+        return {
             name: tuple(value.tensor for value in values)
-            for name, values in inputs.latents.items()
-        }
-        return samples, "graph_capture" if captured else "graph_replay"
+            for name, values in live.latents.items()
+        }, "graph_capture" if captured else "graph_replay"
 
-    def _admit(self, signature: Hashable, input_key: Hashable) -> None:
-        """Reserve residency for one ladder at one numerical signature.
-
-        Residency spans every prepared size, so a ladder captured at startup
-        survives until its prepared size retires.
-        """
-        if signature not in self._resident and len(self._resident) >= (
-            self.shapes
-        ):
-            self._release_ladder(next(iter(self._resident)))
-        self._resident[signature] = input_key
-
-    def _release_ladder(self, signature: Hashable) -> None:
-        """Retire every captured step of one ladder."""
-        for key in tuple(self.graphs):
-            if key[0] == signature:
-                self._discard_graph(key)
-        self._resident.pop(signature, None)
-
-    def _discard_graph(self, key):
-        resident = self.graphs.pop(key, None)
-        if resident is not None:
-            graph, _staged = resident
-            # Automatic residency eviction may follow an asynchronous replay.
-            # Finish this producer before resetting its captured allocations.
-            (
-                graph.context.stream or torch.cuda.current_stream(self.device)
-            ).synchronize()
-            graph.close()
-
-    def release_inputs(self, key: Hashable) -> None:
-        """Retire dependent calls before releasing their execution context."""
-        for ladder, resident_key in tuple(self._resident.items()):
-            if resident_key == key:
-                self._release_ladder(ladder)
-        self._stages.pop(key, None)
-
-        context = self.prepared_inputs.pop(key, None)
-        if context is not None:
+    def release_inputs(self, key):
+        """Retire one prepared size and every graph that borrows it."""
+        entry = self.prepared.pop(key, None)
+        if entry is not None:
             if self.device.type == "cuda":
                 (
-                    context.stream or torch.cuda.current_stream(self.device)
+                    self.stream or torch.cuda.current_stream(self.device)
                 ).synchronize()
-            context.close()
-        self._pools.pop(key, None)
-        self.graph_memory.release((self, key))
+            entry.close()
 
-    def close(self, *, aborted: bool = False) -> None:
+    def close(self, *, aborted: bool = False):
         if self._closed:
             return
-
         if aborted:
             from uniserve.runtime.execution import close_stream_collectives
             from uniserve.runtime.resources import retain_until_exit
@@ -662,12 +472,10 @@ class DenoisingRunner(Generic[InputT, SizeT]):
             if self.stream is not None:
                 close_stream_collectives(self.stream, aborted=True)
             return
-
-        for key in tuple(self.prepared_inputs):
+        for key in tuple(self.prepared):
             self.release_inputs(key)
-        # Pinned copies remember their destination stream until the host
-        # allocation is released. Retire them while that stream's CUDA context
-        # still exists, before the caller destroys its execution partition.
+        # Pinned copies retain their destination stream; release them before
+        # the caller destroys that stream's execution partition.
         self._slot_values.clear()
         self._slot_index = None
         self._bank.clear()

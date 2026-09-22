@@ -10,6 +10,7 @@ from typing import ClassVar, Literal
 
 import torch
 
+from uniserve import _slices
 from uniserve.quantization import QuantizedTensor, Quantizer
 from uniserve.tensors import BufferConfig
 
@@ -19,6 +20,52 @@ def _blocks(blocks: tuple[int, ...], count: int) -> None:
         type(block) is not int or not 0 <= block < count for block in blocks
     ):
         raise ValueError("state block indices must lie within the backing")
+
+
+def decode_region(
+    source: torch.Tensor,
+    region: tuple[slice, ...],
+    *,
+    device: torch.device,
+    workspace: Mapping[str, torch.Tensor],
+) -> torch.Tensor:
+    """Borrow dense values for a cache region, preserving source rounding.
+
+    Encoded FP8 is multiplied by its scale in FP32, then rounded through its
+    logical dtype. The caller owns values and rounding scratch until copying
+    the returned view completes. An exact-shape values view may be strided.
+    """
+    if not _slices.within(region, tuple(source.shape)):
+        raise ValueError("decode region exceeds source storage")
+    if not isinstance(source, QuantizedTensor):
+        return source[region]
+    if source.quantizer.format != "fp8":
+        raise ValueError("cache transfer requires dense or FP8 source storage")
+
+    fields = source.buffers()
+    shape = _slices.shape(region)
+    values = workspace["values"]
+    if tuple(values.shape) != shape:
+        values = values.flatten()[: fields["values"][region].numel()].view(
+            shape
+        )
+    if values.dtype != torch.float32 or values.device != device:
+        raise ValueError("conversion scratch must be FP32 on the target device")
+    values.copy_(fields["values"][region])
+    scale = fields["scale"]
+    if source.quantizer.axis is not None:
+        scale = scale[region[0]]
+    values.mul_(scale.to(device))
+
+    # FP32 -> FP64 -> FP32 is exact; only narrower logical representations
+    # introduce the source rounding that must precede destination encoding.
+    if source.dtype not in {torch.float32, torch.float64}:
+        rounded = workspace["rounded"].flatten()[: values.numel()].view(shape)
+        if rounded.dtype != source.dtype or rounded.device != device:
+            raise ValueError("rounding scratch must match the source dtype")
+        rounded.copy_(values)
+        values.copy_(rounded)
+    return values
 
 
 @dataclass(frozen=True)
@@ -271,3 +318,26 @@ class Config:
         ):
             raise TypeError("each layer must supply a StateConfig")
         object.__setattr__(self, "layers", MappingProxyType(dict(self.layers)))
+
+
+def block_spans(blocks, start: int, length: int, block_size: int):
+    """Map a logical token interval to physical page/offset/count spans.
+
+    Each returned span is (page id, token offset within the page, token count).
+    """
+    if (
+        any(type(value) is not int for value in (start, length, block_size))
+        or block_size < 1
+        or start < 0
+        or length < 0
+        or start + length > len(blocks) * block_size
+    ):
+        raise ValueError("KV token interval exceeds its block table")
+    spans = []
+    while length:
+        logical, offset = divmod(start, block_size)
+        count = min(length, block_size - offset)
+        spans.append((blocks[logical], offset, count))
+        start += count
+        length -= count
+    return tuple(spans)

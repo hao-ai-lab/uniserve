@@ -95,13 +95,12 @@ def cache_coordinates(
 
 
 def call_identity(call: Call) -> CallIdentity:
-    """Form the completion-group-local identity from generation and call ID."""
+    """Form the batch-local identity from generation and call ID."""
     return call.request_key, call.call_id
 
 
 def _predicated_outcome(
     call: Call,
-    completion_group: int,
     *,
     state: BatchState,
 ) -> PendingOutput:
@@ -109,9 +108,7 @@ def _predicated_outcome(
 
     generations.
     """
-    request = state.pending_output(
-        completion_group, call.request_key.request_id
-    )
+    request = state.pending_output(call.request_key.request_id)
     request.status = CallStatus.PREDICATED
     request.progress = execution_runtime(request, None)
     request.finish_flags = FinishFlags()

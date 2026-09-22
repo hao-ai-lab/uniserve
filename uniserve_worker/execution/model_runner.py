@@ -10,7 +10,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from functools import partial
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
@@ -28,11 +28,11 @@ from uniserve.model import (
     VideoDecoder,
     VideoPostprocessor,
 )
+from uniserve.nn.attention import PagedInput, SegmentedInput
 from uniserve.nn.vae import PatchAutoencoder
 from uniserve.processing import ImageProcessor
 from uniserve.profiling import profile_range
 from uniserve.runtime import (
-    CUDAGraph,
     CUDAStream,
     ExecutionContext,
     partition_streams,
@@ -77,24 +77,24 @@ from .batch import ExecutionOutput, InputBatch
 from .component_binding import ComponentBinding, capture_required
 from .denoising_runner import DenoisingRunner
 from .graph_inputs import (
-    BatchGraph,
     PrefillShape,
-    clone_inputs,
-    copy_inputs,
-    input_signature,
+    capture_batch,
     pad_text,
+    replay_batch,
     select_flow_captures,
     select_prefill_captures,
     text_shape,
     widen_prefix,
 )
 from .graph_memory import GraphMemory
+from .graphs import Execution, Graph, GraphBucket, clone_inputs, input_signature
 from .input_buffers import (
     DiffusionBuffers,
     TokenBuffers,
     staged_kinds,
     staging_config,
 )
+from .lane import Lane
 from .resources import media_state_buffers, output_layouts
 from .rows import DecodeRow, DiffusionRow, InputRow, TokenRow, VisionRow
 from .sampling import TokenSelection
@@ -155,6 +155,7 @@ class ModelRunner:
         worker_config: WorkerConfig,
         *,
         bindings=None,
+        entry_points=None,
         attention=None,
         image_processor=None,
         flow_prompt=None,
@@ -178,7 +179,7 @@ class ModelRunner:
         self.audio_decoder = capability(model, AudioDecoder)
         self.video_postprocessor = capability(model, VideoPostprocessor)
         self.outputs = resolve_outputs(model, worker_config)
-        self._declarations = describe_components(model)
+        self._declarations = describe_components(model, entries=entry_points)
 
         # Without supplied bindings, every declared component runs standalone
         # on this rank; only video decoders distribute over temporal units.
@@ -210,7 +211,7 @@ class ModelRunner:
                     name, config, group, mesh, device
                 )
         self.bindings = MappingProxyType(dict(bindings))
-        bind_components(model, self.bindings)
+        bind_components(model, self.bindings, declarations=self._declarations)
         # A host rank holds components with no numerical method: it warms
         # nothing up and captures nothing, and its model is a description.
         self.numerical = any(
@@ -224,9 +225,7 @@ class ModelRunner:
         self._forward_calls = {}
         self._module_calls = {}
         self._calls_by_kind = defaultdict(list)
-        self._module_contexts = OrderedDict()
-        self._module_pools = {}
-        self._module_graphs = {}
+        self._module_entries: OrderedDict[tuple, Execution] = OrderedDict()
         self._module_streams = {}
         self._text_calls = {}
 
@@ -234,8 +233,6 @@ class ModelRunner:
         self._preparation_stream = None
         self._text_staging = self._text_tokens = None
 
-        self.batch_graphs = {}
-        self.graph_pools = {}
         self.graph_memory = GraphMemory()
         self.decode_shapes, self.prefill_shapes = {}, {}
         self.prefill_row_sizes = ()
@@ -381,9 +378,9 @@ class ModelRunner:
         """
         binding, call = self._module_call(name, method)
         key = (name, call.path, call.entry_point.method, input_signature(size))
-        if key not in self._module_contexts:
+        if key not in self._module_entries:
             resident = tuple(
-                value for value in self._module_contexts if value[:3] == key[:3]
+                value for value in self._module_entries if value[:3] == key[:3]
             )
             if len(resident) >= self.worker_config.max_request_pool_size:
                 self._retire_module(resident[0])
@@ -396,11 +393,12 @@ class ModelRunner:
                 # A method declared for one pipeline stage runs on that stage
                 # alone, so its preparation opens no binding over a group the
                 # other stages never reach.
-                stage_local=call.entry_point.stage != "all",
+                groups=call.groups,
             )
-            pools = self.graph_memory.reserve(
-                id(context),
-                (binding.device,)
+            entry = Execution(
+                context,
+                memory=self.graph_memory,
+                devices=(binding.device,)
                 if stream is not None
                 and self.worker_config.graph_policy != "off"
                 and not isinstance(call.module, VideoPostprocessor)
@@ -411,19 +409,17 @@ class ModelRunner:
                     stream.wait_stream(
                         torch.cuda.current_stream(binding.device)
                     )
-                with self.graph_memory.allocate(id(context)):
+                with self.graph_memory.allocate(entry):
                     context.prepare(size)
                 self.graph_memory.check()
             except BaseException:
-                context.close()
-                self.graph_memory.release(id(context))
+                entry.close()
                 raise
 
-            self._module_contexts[key] = context
-            self._module_pools[id(context)] = pools
+            self._module_entries[key] = entry
 
-        self._module_contexts.move_to_end(key)
-        return self._module_contexts[key]
+        self._module_entries.move_to_end(key)
+        return self._module_entries[key]
 
     def module_stream(self, name, *, method=None):
         """Bind one numerical entry to a stream in its existing resource.
@@ -567,17 +563,10 @@ class ModelRunner:
 
         resources.
         """
-        context = self._module_contexts.pop(key)
-        if context.stream is not None:
-            context.stream.synchronize()
-
-        for graph_key in tuple(self._module_graphs):
-            if graph_key[0] == id(context):
-                self._module_graphs.pop(graph_key)[0].close()
-
-        context.close()
-        self._module_pools.pop(id(context), None)
-        self.graph_memory.release(id(context))
+        entry = self._module_entries.pop(key)
+        if entry.context.stream is not None:
+            entry.context.stream.synchronize()
+        entry.close()
 
     @property
     def encoder_kinds(self):
@@ -642,9 +631,10 @@ class ModelRunner:
             f"uniserve.model.module rank={self.worker_config.rank} work={name}"
         ):
             binding, call = self._module_call(name, method)
-            context = self.prepare_module(
+            prepared = self.prepare_module(
                 name, size, method=call.entry_point.method
             )
+            context = prepared.context
             started, path = time.perf_counter_ns(), "eager"
 
             stream = context.stream
@@ -662,8 +652,9 @@ class ModelRunner:
                 resources["workspace"] = context.workspace
 
             values = (args, kwargs)
-            key = (id(context), input_signature(values))
-            graph = self._module_graphs.get(key)
+            key = input_signature(values)
+            bucket = prepared.buckets.get(key)
+            graph = None if bucket is None else bucket.graphs[None]
             can_capture = (
                 stream is not None
                 and self.worker_config.graph_policy != "off"
@@ -676,48 +667,36 @@ class ModelRunner:
                             graph is None, call.groups, binding.device
                         )
                         if missing:
-                            if graph is not None:
-                                graph[0].close()
-                            # One eager warmup run on the static inputs precedes
-                            # capture.
-                            with self.graph_memory.allocate(id(context)):
+                            prepared.close_bucket(key)
+                            with self.graph_memory.allocate(prepared):
                                 static = clone_inputs(values)
-                            call.forward(*static[0], **static[1], **resources)
-                            executable = CUDAGraph(
-                                context=context,
-                                pools=self._module_pools[id(context)],
+                            graph = Graph.capture(
+                                context,
+                                static,
+                                lambda inputs: call.forward(
+                                    *inputs[0], **inputs[1], **resources
+                                ),
+                                pools=prepared.pools,
                             )
-                            try:
-                                executable.capture(
-                                    lambda: call.forward(
-                                        *static[0], **static[1], **resources
-                                    )
-                                )
-                                self.graph_memory.check()
-                            except BaseException:
-                                executable.close()
-                                raise
-                            graph = (executable, static)
-                            self._module_graphs[key] = graph
+                            prepared.buckets[key] = GraphBucket({None: graph})
+                            self.graph_memory.check()
                             path = "graph_capture"
                         else:
                             path = "graph_replay"
-                        copy_inputs(graph[1], values)
-                        result = graph[0].replay()
+                        result = cast(Graph, graph).replay(values)
                     else:
                         result = call.forward(*args, **kwargs, **resources)
                     output = self._result(result).clone()
-
             except CUDAGraphError:
-                # A rejected capture must not leave its context's private pool
-                # resident above the worker budget. Other numerical owners are
-                # independent and remain available.
-                for context_key, prepared in tuple(
-                    self._module_contexts.items()
-                ):
-                    if prepared is context:
-                        self._retire_module(context_key)
-                        break
+                # Rejected captures retire their own context and charged pools.
+                self._retire_module(
+                    (
+                        name,
+                        call.path,
+                        call.entry_point.method,
+                        input_signature(size),
+                    )
+                )
                 raise
 
             if stream is not None:
@@ -748,7 +727,7 @@ class ModelRunner:
                 )
         return ExecutionOutput(tuple(values), layouts=tuple(layouts))
 
-    def run_denoising(self, inputs, schedules, *, state, slot, input_key):
+    def run_denoising(self, trajectory, index):
         """Run one denoising step for a resident trajectory and time it."""
         if self.denoising is None:
             raise InputError("rank does not own denoising computation")
@@ -757,9 +736,7 @@ class ModelRunner:
             f"uniserve.model.denoise rank={self.worker_config.rank} "
             "work=denoiser"
         ):
-            values, path = self.denoising.step(
-                inputs, schedules, state=state, slot=slot, input_key=input_key
-            )
+            values, path = self.denoising.step(trajectory, index)
         return replace(
             self._result(values), stats=_observations("denoiser", started, path)
         )
@@ -869,7 +846,7 @@ class ModelRunner:
     ):
         """Bind staged input resources and graph budgets for every capability.
 
-        Creates one ComponentBinding per (entry, path, lane) covering a staged
+        Creates one Lane per (entry, path, lane) covering a staged
         computation kind, with its input buffers, execution context, decode /
         prefill capture shapes, and private CUDA graph memory pools. Callable
         exactly once.
@@ -878,7 +855,7 @@ class ModelRunner:
             DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
         )
 
-        if self.batch_graphs:
+        if self.entries:
             raise RuntimeError("input execution resources are already bound")
 
         self.kv_cache, self.decode_predicates = kv_cache, decode_predicates
@@ -999,20 +976,7 @@ class ModelRunner:
                     if prefill
                     else input_config
                 )
-                entry = ComponentBinding(
-                    name,
-                    placement.config,
-                    placement.process_group,
-                    placement.mesh,
-                    target,
-                    calls=(call,),
-                    call_kinds=tuple(kinds),
-                    cuda_stream=stream,
-                )
-                if config.graph_policy != "off" and target.type == "cuda":
-                    self.graph_pools[entry] = self.graph_memory.reserve(
-                        entry, (target, *self._capture_devices(target))
-                    )
+                inputs = context = entry = None
                 try:
                     if stream is not None:
                         stream.wait(torch.cuda.current_stream(target))
@@ -1024,7 +988,7 @@ class ModelRunner:
                         buffer_type, buffer_config = staging_config(
                             next(iter(kinds)), fields
                         )
-                        entry.input_buffers = buffer_type(
+                        inputs = buffer_type(
                             config=buffer_config,
                             device=target,
                             max_inflight=max_inflight,
@@ -1035,7 +999,7 @@ class ModelRunner:
                                 else {}
                             ),
                         )
-                        entry.context = ExecutionContext(
+                        context = ExecutionContext(
                             call.module,
                             cache=kv_cache.cache
                             if isinstance(
@@ -1044,7 +1008,7 @@ class ModelRunner:
                             else None,
                             attention=self.attention,
                             stream=None if stream is None else stream.stream,
-                            stage_local=call.entry_point.stage != "all",
+                            groups=call.groups,
                         )
                         # Text staging counts canonical tokens. Spatial codecs
                         # and vision towers expand those into different query
@@ -1057,12 +1021,22 @@ class ModelRunner:
                             )
                             else None
                         )
-                        with (
-                            self.graph_memory.allocate(entry)
-                            if entry in self.graph_pools
-                            else nullcontext()
-                        ):
-                            entry.context.prepare(size)
+                        entry = Lane(
+                            name,
+                            call,
+                            target,
+                            kinds,
+                            stream,
+                            context,
+                            inputs,
+                            memory=self.graph_memory,
+                            devices=(target, *self._capture_devices(target))
+                            if config.graph_policy != "off"
+                            and target.type == "cuda"
+                            else (),
+                        )
+                        with self.graph_memory.allocate(entry):
+                            context.prepare(size)
                         self.graph_memory.check()
                 except BaseException as error:
                     try:
@@ -1070,8 +1044,9 @@ class ModelRunner:
                             *(
                                 owner.close
                                 for owner in (
-                                    entry.context,
-                                    entry.input_buffers,
+                                    (entry,)
+                                    if entry is not None
+                                    else (context, inputs)
                                 )
                                 if owner is not None
                             )
@@ -1085,7 +1060,6 @@ class ModelRunner:
                 self.entries[
                     (name, path, None if lane is None else lane.lane_id)
                 ] = entry
-                self.batch_graphs[entry] = {}
                 self.decode_shapes[entry], self.prefill_shapes[entry] = (
                     decode,
                     prefill,
@@ -1104,7 +1078,7 @@ class ModelRunner:
 
         kind.
         """
-        call = entry.calls[0]
+        call = entry.call
         module, inputs = call.module, batch.inputs
 
         if isinstance(module, CausalLM):
@@ -1177,10 +1151,10 @@ class ModelRunner:
         Text batches are padded into a configured bucket keyed by shape and
         input signature; other capabilities replay only their exact signature.
         """
-        if not eligible or entry not in self.graph_pools:
+        if not eligible or not entry.pools:
             return None
 
-        text = isinstance(entry.calls[0].module, CausalLM)
+        text = isinstance(entry.call.module, CausalLM)
         decode = (
             text
             and batch.forward_mode is ForwardMode.DECODE
@@ -1224,7 +1198,25 @@ class ModelRunner:
             return key, padded, True
 
         execution = widen_prefix(batch, entry.input_buffers.max_blocks_per_row)
-        return ("exact", input_signature(execution)), execution, False
+        attention = getattr(execution.inputs, "attention", None)
+        keyed = execution
+        if isinstance(attention, (PagedInput, SegmentedInput)):
+            keyed = replace(
+                execution,
+                inputs=replace(
+                    execution.inputs,
+                    attention=replace(
+                        attention,
+                        prefixes=replace(
+                            attention.prefixes,
+                            host=None
+                            if attention.prefixes.host is None
+                            else (0,) * len(attention.prefixes.host),
+                        ),
+                    ),
+                ),
+            )
+        return ("exact", input_signature(keyed)), execution, False
 
     @torch.inference_mode()
     def eager_batch(self, entry, batch, forward):
@@ -1266,7 +1258,7 @@ class ModelRunner:
             return
 
         key, execution, padded = selected
-        if key in self.batch_graphs[entry]:
+        if key in entry.buckets:
             return
 
         invoke = (
@@ -1279,20 +1271,20 @@ class ModelRunner:
         # latents; own those inputs independently of their pool-slot lifetime.
         with self.graph_memory.allocate(entry):
             static = execution if padded else clone_inputs(execution)
-        graph = BatchGraph.capture(
+        graph = capture_batch(
             entry.context,
             static,
             invoke,
-            pools=self.graph_pools[entry],
+            pools=entry.pools,
             cache=self.kv_cache.cache,
             predicates=self.decode_predicates,
         )
         try:
             self.graph_memory.check()
         except BaseException:
-            graph.graph.close()
+            graph.close()
             raise
-        self.batch_graphs[entry][key] = graph
+        entry.buckets[key] = GraphBucket({None: graph})
 
     @torch.inference_mode()
     def run_batch(
@@ -1319,7 +1311,7 @@ class ModelRunner:
 
         key, execution, bucketed = selected
         captured = False
-        if key not in self.batch_graphs[entry]:
+        if key not in entry.buckets:
             # Only configured text buckets may capture at run time; an exact
             # signature without a resident graph simply runs eager.
             if not bucketed:
@@ -1330,14 +1322,32 @@ class ModelRunner:
                     ),
                 )
             if self._startup_complete:
+                # A physical bucket can serve additional numerical variants
+                # explicitly prepared through capture_batch. Unconfigured
+                # variants retain eager execution after startup is sealed.
+                configured = key[1][-1] or any(
+                    shape.causal == execution.inputs.attention.causal[0]
+                    and shape.selection is execution.token_selections[0]
+                    for shape in self.prefill_shapes[entry]
+                )
+                if not configured:
+                    return replace(
+                        self.eager_batch(entry, batch, forward),
+                        stats=ForwardStats(
+                            cuda_graph_runtime_mode_counts={"eager": 1}
+                        ),
+                    )
                 raise CUDAGraphError(
                     f"configured graph bucket is not resident: {key!r}"
                 )
             self.capture_batch(entry, batch, forward)
             captured = True
 
-        result = self.batch_graphs[entry][key].replay(
-            execution, rows=batch.row_count, borrow=borrow_output
+        result = replay_batch(
+            entry.buckets[key].graphs[None],
+            execution,
+            rows=batch.row_count,
+            borrow=borrow_output,
         )
         if batch.decode_force_finish is None:
             result = replace(result, greedy=None)
@@ -1407,7 +1417,7 @@ class ModelRunner:
         from .startup import prepare_decode, prepare_prefill
 
         for phase in ("prefill", "decode", "flow"):
-            for entry in self.batch_graphs:
+            for entry in self.entries.values():
                 forward = partial(self.batch_forward, entry)
                 if (
                     phase == "prefill"
@@ -1481,19 +1491,15 @@ class ModelRunner:
         call.
         """
         actions = [
-            graph.graph.close
-            for graphs in self.batch_graphs.values()
-            for graph in graphs.values()
+            entry.close_graphs
+            for entry in (
+                *self.entries.values(),
+                *self._module_entries.values(),
+            )
         ]
-        actions.extend(graph.close for graph, _ in self._module_graphs.values())
         if self.denoising is not None:
             actions.append(self.denoising.close)
-        try:
-            close_resources(*actions)
-        finally:
-            for graphs in self.batch_graphs.values():
-                graphs.clear()
-            self._module_graphs.clear()
+        close_resources(*actions)
 
     def close(self, *, aborted: bool = False):
         """Release every owned context, buffer, graph.
@@ -1528,11 +1534,9 @@ class ModelRunner:
 
         actions = [self.synchronize]
         actions.append(self.close_graphs)
-        actions.extend(
-            context.close for context in self._module_contexts.values()
-        )
-        for entry in self.batch_graphs:
-            actions.extend((entry.context.close, entry.input_buffers.close))
+        actions.extend(entry.close for entry in self._module_entries.values())
+        for entry in self.entries.values():
+            actions.append(entry.close)
         if self._text_staging is not None:
             actions.append(self._text_staging.close)
 
@@ -1559,10 +1563,7 @@ class ModelRunner:
             close_resources(*actions)
         finally:
             self.entries.clear()
-            self.batch_graphs.clear()
-            self.graph_pools.clear()
-            self._module_contexts.clear()
-            self._module_pools.clear()
+            self._module_entries.clear()
             self.graph_memory.close()
             self._module_streams.clear()
             self._lane_streams.clear()
@@ -1651,14 +1652,14 @@ class ModelRunner:
         yielding results at their original indexes.
 
         A failed model call identifies every participating row. The caller owns
-        completion groups and decides which dependent calls to suppress.
+        batches and decides which dependent calls to suppress.
         Fatal failures propagate immediately because later device work is
         unsafe.
         """
         # Rows sharing an entry, forward mode, device, and media shape form
         # one homogeneous numerical call.
         grouped: dict[tuple[object, ...], list[int]] = defaultdict(list)
-        bindings: dict[int, ComponentBinding] = {}
+        bindings: dict[int, Lane] = {}
         for index, (task, call) in enumerate(tasks):
             entry = self._forward_calls.get((call.component, task.forward_mode))
             if entry is None:

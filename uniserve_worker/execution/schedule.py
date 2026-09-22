@@ -44,8 +44,7 @@ if TYPE_CHECKING:
     from uniserve_worker.transfer.tickets import Transport
 
 
-def execute_completion(
-    completion_group: int,
+def dispatch_batch(
     *,
     state: BatchState,
     kv_cache: CacheManager | None,
@@ -62,48 +61,42 @@ def execute_completion(
     sampling_group: Communicator | None,
     tokenizer: PreTrainedTokenizerBase | None,
     config: WorkerConfig,
-) -> tuple[tuple[PendingOutput, ...] | None, BaseException | None]:
+) -> tuple[PendingOutput, ...]:
     """Execute the batch's active calls and align outcomes with its call order.
 
-    Returns the pending outputs in call order and no error, or no outputs and
-    the error that failed the completion.
+    A failure aborts the homogeneous batch; its owner discards all provisional
+    outputs before reporting the error.
     """
     batch_calls = state.batch.calls
     active = tuple(
         call
         for call in batch_calls
-        if state.pending_output(
-            completion_group, call.request_key.request_id
-        ).status
+        if state.pending_output(call.request_key.request_id).status
         is not CallStatus.PREDICATED
     )
-    with state.group_scope(completion_group):
+    with state.scope():
         for device in dict.fromkeys(
             device
             for call in active
             for device in model_runner.call_devices(call)
         ):
-            state.group_buffers[completion_group].begin_device(device)
+            state.output_buffer.begin_device(device)
 
     outcomes: list[PendingOutput | None] = [None] * len(batch_calls)
-    scheduled: list[tuple[Call, int]] = []
+    scheduled: list[Call] = []
     locations: list[int] = []
 
     for call_index, call in enumerate(batch_calls):
         if (
-            state.pending_output(
-                completion_group, call.request_key.request_id
-            ).status
+            state.pending_output(call.request_key.request_id).status
             is CallStatus.PREDICATED
         ):
-            outcomes[call_index] = _predicated_outcome(
-                call, completion_group, state=state
-            )
+            outcomes[call_index] = _predicated_outcome(call, state=state)
             continue
         locations.append(call_index)
-        scheduled.append((call, completion_group))
+        scheduled.append(call)
 
-    completed, errors = _execute_calls(
+    completed = _execute_calls(
         tuple(scheduled),
         kv_cache=kv_cache,
         tensor_store=tensor_store,
@@ -122,23 +115,17 @@ def execute_completion(
         state=state,
     )
 
-    if (error := errors.get(completion_group)) is not None:
-        return None, error
-
     for index, outcome in completed.items():
         outcomes[locations[index]] = outcome
     if any(outcome is None for outcome in outcomes):
-        raise RuntimeError(
-            "successful completion group did not resolve every call"
-        )
-    return tuple(cast(PendingOutput, outcome) for outcome in outcomes), None
+        raise RuntimeError("successful batch did not resolve every call")
+    return tuple(cast(PendingOutput, outcome) for outcome in outcomes)
 
 
 def _execute_ready_actions(
     frontier: tuple[int, ...],
-    scheduled: tuple[tuple[Call, int], ...],
+    scheduled: tuple[Call, ...],
     outcomes: dict[int, PendingOutput],
-    errors: dict[int, BaseException],
     *,
     state: BatchState,
     kv_cache: CacheManager | None,
@@ -158,79 +145,71 @@ def _execute_ready_actions(
     from .host_media import HOST_MEDIA_CALLS
 
     for index in frontier:
-        call, completion_group = scheduled[index]
-        if index in outcomes or completion_group in errors:
+        call = scheduled[index]
+        if index in outcomes:
             continue
 
-        try:
-            with state.group_scope(completion_group):
-                if isinstance(call.kind, TransferMode):
-                    result = transfer.execute(
-                        call,
-                        completion_group,
-                        kv_cache=kv_cache,
-                        tensor_store=tensor_store,
-                        latent_pool=latent_pool,
-                        publication_transports=publication_transports,
-                        request_tables=request_tables,
-                        model_runner=model_runner,
-                        state=state,
-                    )
-                elif (
-                    call.kind is MediaCall.LATENT_PREPARATION
-                    and latent_pool is not None
-                ):
-                    result = flow.prepare_latent(
-                        call,
-                        completion_group,
-                        kv_cache=kv_cache,
-                        worker_info=worker_info,
-                        latent_pool=latent_pool,
-                        publication_transports=publication_transports,
-                        request_tables=request_tables,
-                        model_runner=model_runner,
-                        config=config,
-                        state=state,
-                    )
-                elif call.kind is MediaCall.TEXT_ENCODING:
-                    result = encode.text(
-                        call,
-                        completion_group,
-                        tensor_store=tensor_store,
-                        publication_transports=publication_transports,
-                        model_runner=model_runner,
-                        state=state,
-                    )
-                elif call.kind in HOST_MEDIA_CALLS:
-                    result = host_media.execute(
-                        call,
-                        completion_group,
-                        tensor_store=tensor_store,
-                        media_mux=media_mux,
-                        publication_transports=publication_transports,
-                        transports=transports,
-                        model_runner=model_runner,
-                        state=state,
-                    )
-                elif model_runner.video_postprocessor is not None:
-                    result = video.execute(
-                        call,
-                        completion_group,
-                        tensor_store=tensor_store,
-                        publication_transports=publication_transports,
-                        request_pool=request_pool,
-                        model_runner=model_runner,
-                        state=state,
-                    )
-                else:
-                    raise invalid_descriptor(f"unsupported call {call.kind!r}")
-            outcomes[index] = result
-        except BaseException as error:
-            errors[completion_group] = error
+        with state.scope():
+            if isinstance(call.kind, TransferMode):
+                result = transfer.execute(
+                    call,
+                    kv_cache=kv_cache,
+                    tensor_store=tensor_store,
+                    latent_pool=latent_pool,
+                    publication_transports=publication_transports,
+                    request_tables=request_tables,
+                    model_runner=model_runner,
+                    state=state,
+                )
+            elif (
+                call.kind is MediaCall.LATENT_PREPARATION
+                and latent_pool is not None
+            ):
+                result = flow.prepare_latent(
+                    call,
+                    kv_cache=kv_cache,
+                    worker_info=worker_info,
+                    latent_pool=latent_pool,
+                    publication_transports=publication_transports,
+                    request_tables=request_tables,
+                    model_runner=model_runner,
+                    config=config,
+                    state=state,
+                )
+            elif call.kind is MediaCall.TEXT_ENCODING:
+                result = encode.text(
+                    call,
+                    tensor_store=tensor_store,
+                    publication_transports=publication_transports,
+                    model_runner=model_runner,
+                    state=state,
+                )
+            elif call.kind in HOST_MEDIA_CALLS:
+                result = host_media.execute(
+                    call,
+                    tensor_store=tensor_store,
+                    media_mux=media_mux,
+                    publication_transports=publication_transports,
+                    transports=transports,
+                    model_runner=model_runner,
+                    state=state,
+                )
+            elif model_runner.video_postprocessor is not None:
+                result = video.execute(
+                    call,
+                    tensor_store=tensor_store,
+                    publication_transports=publication_transports,
+                    request_pool=request_pool,
+                    model_runner=model_runner,
+                    state=state,
+                )
+            else:
+                raise invalid_descriptor(f"unsupported call {call.kind!r}")
+        outcomes[index] = result
 
 
 def _execute_calls(
-    scheduled: tuple[tuple[Call, int], ...],
+    scheduled: tuple[Call, ...],
     *,
     state: BatchState,
     kv_cache: CacheManager | None,
@@ -247,7 +226,7 @@ def _execute_calls(
     sampling_group: Communicator | None,
     tokenizer: PreTrainedTokenizerBase | None,
     config: WorkerConfig,
-) -> tuple[dict[int, PendingOutput], dict[int, BaseException]]:
+) -> dict[int, PendingOutput]:
     """Execute product dependency frontiers with direct numerical algorithms.
 
     Each index addresses an original call. Only completed products unlock
@@ -256,7 +235,7 @@ def _execute_calls(
     """
     producers = {
         buffer: index
-        for index, (call, _scope) in enumerate(scheduled)
+        for index, call in enumerate(scheduled)
         for buffer in (
             *(output.buffer_id for output in call.tensor_outputs()),
             *((call.kv_output,) if call.kv_output is not None else ()),
@@ -264,13 +243,12 @@ def _execute_calls(
     }
 
     outcomes: dict[int, PendingOutput] = {}
-    errors: dict[int, BaseException] = {}
 
     def live(index: int) -> bool:
-        return index not in outcomes and scheduled[index][1] not in errors
+        return index not in outcomes
 
     def ready(index: int) -> bool:
-        call = scheduled[index][0]
+        call = scheduled[index]
         return all(
             producer in outcomes
             for buffer in (
@@ -289,7 +267,7 @@ def _execute_calls(
         if not frontier:
             blocked = tuple(
                 calls.call_identity(call)
-                for index, (call, _scope) in enumerate(scheduled)
+                for index, call in enumerate(scheduled)
                 if live(index)
             )
             raise RuntimeError(
@@ -299,12 +277,12 @@ def _execute_calls(
         numerical = tuple(
             index
             for index in frontier
-            if isinstance(scheduled[index][0].kind, ForwardMode)
-            or scheduled[index][0].kind
+            if isinstance(scheduled[index].kind, ForwardMode)
+            or scheduled[index].kind
             in {MediaCall.VISION_ENCODING, MediaCall.LATENT_ENCODING}
             or (
                 latent_pool is not None
-                and scheduled[index][0].kind
+                and scheduled[index].kind
                 in {
                     MediaCall.DENOISING,
                     MediaCall.IMAGE_DECODING,
@@ -317,7 +295,6 @@ def _execute_calls(
                 frontier,
                 scheduled,
                 outcomes,
-                errors,
                 state=state,
                 kv_cache=kv_cache,
                 tensor_store=tensor_store,
@@ -338,7 +315,6 @@ def _execute_calls(
                 numerical,
                 scheduled,
                 outcomes,
-                errors,
                 state=state,
                 kv_cache=kv_cache,
                 latent_pool=latent_pool,
@@ -358,7 +334,6 @@ def _execute_calls(
                     trajectories,
                     scheduled,
                     outcomes,
-                    errors,
                     state=state,
                     kv_cache=kv_cache,
                     latent_pool=latent_pool,
@@ -378,7 +353,6 @@ def _execute_calls(
                 trajectories,
                 scheduled,
                 outcomes,
-                errors,
                 state=state,
                 tensor_store=tensor_store,
                 latent_pool=latent_pool,
@@ -390,16 +364,12 @@ def _execute_calls(
             values = (
                 forward_values(
                     model_runner,
-                    tuple(
-                        (task, scheduled[index][0], scheduled[index][1])
-                        for index, task in forward
-                    ),
+                    tuple((task, scheduled[index]) for index, task in forward),
                     cache=kv_cache,
                     tables=request_tables,
                     states=decode_state,
                     sampling_group=sampling_group,
                     state=state,
-                    errors=errors,
                     retain_sampling=offset + 1 < step_count,
                 )
                 if forward
@@ -413,7 +383,6 @@ def _execute_calls(
                 trajectories,
                 scheduled,
                 outcomes,
-                errors,
                 state=state,
                 tensor_store=tensor_store,
                 worker_info=worker_info,
@@ -434,7 +403,6 @@ def _execute_calls(
                     offset,
                     scheduled,
                     outcomes,
-                    errors,
                     state=state,
                     worker_info=worker_info,
                     latent_pool=latent_pool,
@@ -443,4 +411,4 @@ def _execute_calls(
                     model_runner=model_runner,
                     config=config,
                 )
-    return outcomes, errors
+    return outcomes

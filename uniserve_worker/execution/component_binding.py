@@ -1,26 +1,18 @@
-"""Resolved numerical module bindings and their resident input storage."""
+"""Resolved component placement and borrowed numerical calls."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import Any
 
 import torch
 
 from uniserve.distributed.mesh import Communicator, DeviceMesh
 from uniserve.model import EntryPoint
-from uniserve.runtime import CUDAStream, ExecutionContext
 
 from ..bootstrap.config import ComponentConfig
 from ..protocol.call import CallKind
-from ..protocol.tensor import OutputInfo
-
-if TYPE_CHECKING:
-    from .batch import ExecutionOutput
-    from .input_buffers import InputBuffers
-
-TensorOutput: TypeAlias = torch.Tensor | tuple[torch.Tensor, ...]
 
 
 def capture_required(
@@ -51,11 +43,11 @@ class Call:
 
 @dataclass(slots=True, eq=False)
 class ComponentBinding:
-    """A component's placement, local callable and resident execution addresses.
+    """A component's placement and borrowed numerical calls.
 
     All ranks retain placement for routing and product sizing. Only members
     have a mesh; their callable is attached after checkpoint materialization.
-    Physical stream bindings share the immutable configuration and mesh.
+    Lanes reference these calls without copying the component's topology.
     """
 
     name: str
@@ -66,15 +58,9 @@ class ComponentBinding:
     # The ranks this component's media units are distributed over, ordered by
     # unit. Only a distributed component has one, and only on its own members.
     units: Communicator | None = None
-    forward: Callable[..., TensorOutput | ExecutionOutput] | None = None
     groups: tuple[Communicator, ...] = ()
-    outputs: tuple[OutputInfo, ...] = ()
     call_kinds: tuple[CallKind, ...] = ()
-    component: str = ""
     calls: tuple[Call, ...] = ()
-    context: ExecutionContext | None = None
-    input_buffers: InputBuffers | None = None
-    cuda_stream: CUDAStream | None = None
 
     def __post_init__(self) -> None:
         if any(
@@ -96,17 +82,6 @@ class ComponentBinding:
             ):
                 raise ValueError(
                     f"component {self.name} mesh disagrees with configuration"
-                )
-
-        if self.mesh is not None:
-            if not self.groups:
-                # Deduplicate the mesh's per-axis groups by their member ranks.
-                self.groups = tuple(
-                    {
-                        group.ranks: group
-                        for axes in self.mesh._groups
-                        for group in (self.mesh.get_group(axes),)
-                    }.values()
                 )
 
     @property

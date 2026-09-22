@@ -73,8 +73,10 @@ def encoded_video_bytes(frames: int, height: int, width: int) -> int:
     of image entropy or the achieved compression ratio. See x264's
     encoder/cavlc.c and encoder/encoder.c and FFmpeg's libavformat/movenc.c.
     """
-    if min(frames, height, width) < 1:
-        raise ValueError("encoded video dimensions must be positive")
+    if any(
+        type(value) is not int or value < 1 for value in (frames, height, width)
+    ):
+        raise ValueError("encoded video dimensions must be positive integers")
     blocks = ((height + 15) // 16) * ((width + 15) // 16)
     residual_bits = 27 * (16 + 16 * 28 + 9 + 15 * 11)
     macroblock_bytes = (residual_bits + 1536 + 7) // 8

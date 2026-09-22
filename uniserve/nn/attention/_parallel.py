@@ -164,6 +164,7 @@ class ParallelAttention(torch.nn.Module):
 
         self.ulysses_group = mesh.get_group(heads)
         self.context_group = mesh.get_group(context_axes)
+        self.communication_groups = (self.ulysses_group, self.context_group)
 
         self.key_group = self.context_group
 

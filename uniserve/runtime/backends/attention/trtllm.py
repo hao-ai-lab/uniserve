@@ -157,6 +157,8 @@ class _TRTLLM(_Operator):
 
 
 class Backend(_Backend):
+    name = "trtllm"
+
     operator_class = _TRTLLM
 
     def __init__(self, *, workspace_size=512 * 1024 * 1024):
