@@ -29,13 +29,55 @@ _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 @dataclass(frozen=True, slots=True)
 class PreparedImage:
-    """Normalized pixels, patch coordinates, and original image dimensions."""
+    """Normalized pixels, patch coordinates, and model canvas dimensions."""
 
     pixels: torch.Tensor
     grid: torch.Tensor | None
     grid_shape: tuple[int, int] | None
     height: int
     width: int
+
+
+def _image_plan(processor, kind, height, width):
+    """Resolve canvas and tower dimensions independently of pixel storage."""
+    transform = (
+        processor.vit if kind is MediaCall.VISION_ENCODING else processor.vae
+    )
+    if transform is None:
+        raise invalid_descriptor(
+            f"model declares no {kind.value} image transform"
+        )
+    if isinstance(transform, PatchTransform):
+        return (
+            transform,
+            (height, width),
+            _patch_image_shape(transform, height, width),
+        )
+
+    canvas = (
+        (height, width)
+        if processor.vae is None
+        else _stride_image_shape(height, width, processor.vae.resize)
+    )
+    return transform, canvas, _stride_image_shape(*canvas, transform.resize)
+
+
+def _prepared_pixels(processor, transform, pixels, canvas, device):
+    """Pack the numerical tower input and attach its canvas coordinates."""
+    grid = grid_shape = None
+    if isinstance(transform, PatchTransform):
+        patch = int(transform.patch_size)
+        channels, height, width = pixels.shape
+        grid_shape = (height // patch, width // patch)
+        pixels = (
+            pixels.reshape(channels, grid_shape[0], patch, grid_shape[1], patch)
+            .permute(1, 3, 0, 2, 4)
+            .reshape(grid_shape[0] * grid_shape[1], channels * patch * patch)
+        )
+        grid = torch.tensor([grid_shape], dtype=torch.long, device=device)
+    return PreparedImage(
+        _stage(pixels, processor, device), grid, grid_shape, *canvas
+    )
 
 
 def prepare_image(
@@ -45,56 +87,23 @@ def prepare_image(
     *,
     device: torch.device,
 ) -> PreparedImage:
-    """Decode, resize, normalize.
-
-    and stage one encoded image for the selected model tower.
-    """
+    """Decode RGB bytes and apply the model's canvas and tower transforms."""
     image = _decode_rgb(encoded)
-    transform = (
-        processor.vit if kind is MediaCall.VISION_ENCODING else processor.vae
+    transform, canvas, tower = _image_plan(
+        processor, kind, image.height, image.width
     )
-    if transform is None:
-        raise invalid_descriptor(
-            f"model declares no {kind.value} image transform"
+    if not isinstance(transform, PatchTransform):
+        image = vision.resize(
+            image,
+            canvas,
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
         )
-
-    if isinstance(transform, PatchTransform):
-        height, width = image.height, image.width
-        resized = _resize_patch_image(image, transform)
-        normalized = _normalize(resized, transform.normalization)
-
-        # Unfold the [channels, height, width] image into row-major patches:
-        # [grid_height * grid_width, channels * patch * patch].
-        patch = int(transform.patch_size)
-        channels, resized_height, resized_width = normalized.shape
-        grid_height = resized_height // patch
-        grid_width = resized_width // patch
-        pixels = (
-            normalized.view(channels, grid_height, patch, grid_width, patch)
-            .permute(1, 3, 0, 2, 4)
-            .reshape(grid_height * grid_width, channels * patch * patch)
-        )
-        grid = torch.tensor([[grid_height, grid_width]], dtype=torch.long)
-
-        return PreparedImage(
-            _stage(pixels, processor, device),
-            grid.to(device=device, non_blocking=True),
-            (grid_height, grid_width),
-            height,
-            width,
-        )
-
-    # The tower consumes the VAE-bounded canvas resized to its own stride.
-    canvas = image
-    if processor.vae is not None:
-        canvas = _resize_stride(canvas, processor.vae.resize)
-    height, width = canvas.height, canvas.width
-
-    tower_image = _resize_stride(canvas, transform.resize)
-    pixels = _normalize(tower_image, transform.normalization)
-    return PreparedImage(
-        _stage(pixels, processor, device), None, None, height, width
+    image = vision.resize(
+        image, tower, interpolation=InterpolationMode.BICUBIC, antialias=True
     )
+    pixels = _normalize(image, transform.normalization)
+    return _prepared_pixels(processor, transform, pixels, canvas, device)
 
 
 def prepare_tensor_image(
@@ -105,7 +114,7 @@ def prepare_tensor_image(
     device: torch.device,
     signed_unit: bool,
 ) -> PreparedImage:
-    """Apply the declared image transform to an already decoded RGB tensor."""
+    """Apply the same canvas and tower policy to an already decoded RGB view."""
     value = image.detach().to(dtype=torch.float32)
     if value.ndim == 4:
         if int(value.shape[0]) != 1:
@@ -117,88 +126,17 @@ def prepare_tensor_image(
         raise invalid_descriptor(
             "generated image tensor must have shape [3, height, width]"
         )
-
     if signed_unit:
         value = (value + 1.0) * 0.5
     value = value.clamp(0.0, 1.0)
-    source_height, source_width = int(value.shape[1]), int(value.shape[2])
-
-    transform = (
-        processor.vit if kind is MediaCall.VISION_ENCODING else processor.vae
+    transform, canvas, tower = _image_plan(
+        processor, kind, int(value.shape[1]), int(value.shape[2])
     )
-    if transform is None:
-        raise invalid_descriptor(
-            f"model declares no {kind.value} image transform"
-        )
-
-    if isinstance(transform, PatchTransform):
-        resized_height, resized_width = _patch_image_shape(
-            transform,
-            source_height,
-            source_width,
-        )
-        value = _resize_tensor(value, resized_height, resized_width)
-        normalized = _normalize_tensor(value, transform.normalization)
-
-        # Unfold into row-major patches: [grid_height * grid_width, channels *
-        # patch * patch].
-        patch = int(transform.patch_size)
-        channels = int(normalized.shape[0])
-        grid_height = resized_height // patch
-        grid_width = resized_width // patch
-        pixels = (
-            normalized.view(channels, grid_height, patch, grid_width, patch)
-            .permute(1, 3, 0, 2, 4)
-            .reshape(grid_height * grid_width, channels * patch * patch)
-        )
-        grid = torch.tensor([[grid_height, grid_width]], dtype=torch.long)
-
-        return PreparedImage(
-            _stage(pixels, processor, device),
-            grid.to(device=device, non_blocking=True),
-            (grid_height, grid_width),
-            source_height,
-            source_width,
-        )
-
-    # Fit within the long-edge, short-edge, pixel-count, and stride bounds in
-    # order; each violated bound rescales and re-aligns the target.
-    resize = transform.resize
-    scale = min(int(resize.max_size) / max(source_width, source_height), 1.0)
-    scale = max(scale, int(resize.min_size) / min(source_width, source_height))
-    target_width, target_height = _stride_shape(
-        source_width,
-        source_height,
-        scale,
-        int(resize.stride),
-    )
-
-    if target_width * target_height > int(resize.max_pixels):
-        scale = int(resize.max_pixels) / (target_width * target_height)
-        target_width, target_height = _stride_shape(
-            target_width,
-            target_height,
-            scale,
-            int(resize.stride),
-        )
-    if max(target_width, target_height) > int(resize.max_size):
-        scale = int(resize.max_size) / max(target_width, target_height)
-        target_width, target_height = _stride_shape(
-            target_width,
-            target_height,
-            scale,
-            int(resize.stride),
-        )
-
-    value = _resize_tensor(value, target_height, target_width)
-    normalized = _normalize_tensor(value, transform.normalization)
-    return PreparedImage(
-        _stage(normalized, processor, device),
-        None,
-        None,
-        source_height,
-        source_width,
-    )
+    if not isinstance(transform, PatchTransform):
+        value = _resize_tensor(value, *canvas)
+    value = _resize_tensor(value, *tower)
+    pixels = _normalize_tensor(value, transform.normalization)
+    return _prepared_pixels(processor, transform, pixels, canvas, device)
 
 
 def _decode_rgb(encoded: str) -> Image.Image:
@@ -223,19 +161,6 @@ def _decode_rgb(encoded: str) -> Image.Image:
         rgb.paste(rgba, mask=rgba.getchannel("A"))
         return rgb
     return image.convert("RGB")
-
-
-def _resize_patch_image(
-    image: Image.Image, processor: PatchTransform
-) -> Image.Image:
-    """Resize an image to the processor's bounded patch grid."""
-    height, width = _patch_image_shape(processor, image.height, image.width)
-    return vision.resize(
-        image,
-        (height, width),
-        interpolation=InterpolationMode.BICUBIC,
-        antialias=True,
-    )
 
 
 def patch_grid_shape(
@@ -296,9 +221,10 @@ def _bounded_grid_shape(
     return result_height, result_width
 
 
-def _resize_stride(image: Image.Image, processor: StrideResize) -> Image.Image:
-    """Resize both image dimensions to the configured spatial stride."""
-    width, height = image.size
+def _stride_image_shape(
+    height: int, width: int, processor: StrideResize
+) -> tuple[int, int]:
+    """Resolve both image dimensions at the configured spatial stride."""
     scale = min(int(processor.max_size) / max(width, height), 1.0)
     scale = max(scale, int(processor.min_size) / min(width, height))
     new_width, new_height = _stride_shape(
@@ -314,12 +240,7 @@ def _resize_stride(image: Image.Image, processor: StrideResize) -> Image.Image:
         new_width, new_height = _stride_shape(
             new_width, new_height, scale, int(processor.stride)
         )
-    return vision.resize(
-        image,
-        (new_height, new_width),
-        interpolation=InterpolationMode.BICUBIC,
-        antialias=True,
-    )
+    return new_height, new_width
 
 
 def _stride_shape(
