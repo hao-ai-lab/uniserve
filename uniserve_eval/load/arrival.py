@@ -6,14 +6,11 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator, Callable, Coroutine
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import Any, TypeVar
 
 import numpy as np
 
 from ..types import Example
-
-if TYPE_CHECKING:
-    from ..nsys import NsysCapture
 
 T = TypeVar("T")
 Submit = Callable[[Example, float | None], Coroutine[Any, Any, T]]
@@ -70,7 +67,6 @@ async def run_load(
     max_concurrency: int | None,
     submit: Submit[T],
     warmup_requests: int = 1,
-    measurement: NsysCapture | None = None,
 ) -> LoadResult:
     """Run warmup, settle, and measured requests under a concurrency limit."""
     if not rows:
@@ -87,8 +83,7 @@ async def run_load(
         async with semaphore:
             return await submit(row, scheduled)
 
-    # Warmup exercises the same request path but remains outside both the
-    # profiler window and the reported duration.
+    # Warmup exercises the same request path outside the reported duration.
     warmup_outputs: list[T] = []
     if warmup_requests > 0:
         warmup_outputs = await asyncio.gather(
@@ -101,20 +96,13 @@ async def run_load(
 
     await asyncio.sleep(1.0)
 
-    if measurement is not None:
-        measurement.start()
     benchmark_start_time = time.perf_counter()
 
-    try:
-        tasks: list[asyncio.Task[T]] = []
-        async for row in get_request(rows, request_rate):
-            tasks.append(asyncio.create_task(limited(row, time.perf_counter())))
-        outputs = await asyncio.gather(*tasks)
-    finally:
-        # Profiler report draining is outside the request completion window.
-        benchmark_end_time = time.perf_counter()
-        if measurement is not None:
-            measurement.stop()
+    tasks: list[asyncio.Task[T]] = []
+    async for row in get_request(rows, request_rate):
+        tasks.append(asyncio.create_task(limited(row, time.perf_counter())))
+    outputs = await asyncio.gather(*tasks)
+    benchmark_end_time = time.perf_counter()
 
     # Duration covers scheduled arrival generation through completion of the
     # final measured request, matching the throughput denominator.

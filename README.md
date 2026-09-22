@@ -168,7 +168,7 @@ UNISERVE_RUN_GPU_E2E=1 \
 just test-python-gpu
 ```
 
-Serving evaluator points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).
+The serving evaluator runs HTTP workloads against serving models, measures performance, validates response correctness, and writes reproducible result bundles. Benchmark points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).
 
 ## Repository layout
 

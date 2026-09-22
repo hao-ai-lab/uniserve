@@ -12,7 +12,6 @@ import numpy as np
 from ..artifacts import ArtifactWriter
 from ..datasets import load_examples
 from ..load import GpuMemorySampler, WarmupFailure, run_load
-from ..nsys import NsysCapture
 from ..tasks import get_task
 from ..transport import send_request
 from ..types import (
@@ -32,7 +31,6 @@ async def run_point(
     *,
     launch: dict[str, Any] | None = None,
     timeout_s: float = 6 * 60 * 60.0,
-    measurement: NsysCapture | None = None,
 ) -> RunResult:
     """Run dataset loading, warmup, measured load, validation, and persistence."""  # noqa: E501
     output_path = Path(output_dir)
@@ -118,7 +116,6 @@ async def run_point(
                     max_concurrency=point.load.max_concurrency,
                     submit=submit,
                     warmup_requests=point.load.warmup_requests,
-                    measurement=measurement,
                 )
             except WarmupFailure as error:
                 warmup_records = cast(list[RequestRecord], list(error.outputs))
