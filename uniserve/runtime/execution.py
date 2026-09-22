@@ -1134,14 +1134,22 @@ class ExecutionContext(Generic[SizeT]):
             self.constants = self.workspace = MappingProxyType({})
             self._max_tokens = None
 
-    def close(self):
-        """Release all prepared resources.
+    def close(self, *, aborted=False):
+        """Release prepared resources and reject subsequent execution.
 
-        Release all prepared resources; the context cannot be used afterward.
+        Aborted close retains resources and aborts stream collectives without
+        waiting; the owning process must exit before reclaiming them.
         """
         if self._closed:
             return
         self._closed = True
+        if aborted:
+            from .resources import retain_until_exit
+
+            retain_until_exit(self)
+            if self.stream is not None:
+                close_stream_collectives(self.stream, aborted=True)
+            return
         try:
             self._release()
         finally:
@@ -1166,7 +1174,7 @@ class ExecutionContext(Generic[SizeT]):
         finally:
             self._entered = None
             try:
-                self.close()
+                self.close(aborted=exc is not None)
             except BaseException as error:
                 if exc is None:
                     raise

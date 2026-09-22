@@ -19,6 +19,7 @@ from uniserve.runtime import CUDAGraph, ExecutionContext, PrefixCache
 
 from .component_binding import capture_required
 from .graph_inputs import clone_inputs, copy_inputs, input_signature
+from .graph_memory import GraphMemory
 
 InputT = TypeVar("InputT", bound=DenoiserInput)
 SizeT = TypeVar("SizeT")
@@ -98,6 +99,8 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         stream: torch.cuda.Stream | None,
         groups: tuple[Communicator, ...],
         capacity: int,
+        capture: bool = True,
+        graph_memory: GraphMemory | None = None,
         shapes: int = 1,
         cache: PrefixCache | None = None,
         attention="auto",
@@ -120,14 +123,13 @@ class DenoisingRunner(Generic[InputT, SizeT]):
             capacity,
         )
         self.shapes = shapes
+        self._captures = capture and stream is not None
         self.cache, self.attention, self.matmul = cache, attention, matmul
 
         # Captured graphs draw their workspace from per-device memory pools.
-        self.device_pools = {}
-        if stream is not None:
-            for target in dict.fromkeys((device, *additional_devices)):
-                with torch.cuda.device(target):
-                    self.device_pools[target] = torch.cuda.MemPool()
+        self.graph_memory = graph_memory or GraphMemory()
+        self._devices = (device, *additional_devices) if self.captures else ()
+        self._pools = {}
 
         self.graphs: dict[
             tuple[Hashable, Hashable, Hashable], tuple[CUDAGraph, tuple]
@@ -149,7 +151,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         self._stages: dict[Hashable, dict[Hashable, torch.Tensor]] = {}
         self._slot_index = (
             torch.zeros(1, dtype=torch.int64, device=device)
-            if stream is not None
+            if self.captures
             else None
         )
         self._slot_values: dict[int, torch.Tensor] = {}
@@ -159,10 +161,10 @@ class DenoisingRunner(Generic[InputT, SizeT]):
     def captures(self) -> bool:
         """Whether this runner replays captured graphs.
 
-        A runner given a stream prepares its sizes on it and captures each
-        ladder step there; a runner without one evaluates every step eagerly.
+        The execution stream belongs to the resource grant whether or not
+        this runner captures graphs.
         """
-        return self.stream is not None
+        return self._captures
 
     def prepare_inputs(
         self, key: Hashable, size: SizeT
@@ -185,14 +187,21 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                 matmul=self.matmul,
                 stream=self.stream,
             )
+            self._pools[key] = self.graph_memory.reserve(
+                (self, key), self._devices
+            )
             try:
                 if context.stream is not None:
                     context.stream.wait_stream(
                         torch.cuda.current_stream(self.device)
                     )
-                context.prepare(size)
+                with self.graph_memory.allocate((self, key)):
+                    context.prepare(size)
+                self.graph_memory.check()
             except BaseException:
                 context.close()
+                self._pools.pop(key, None)
+                self.graph_memory.release((self, key))
                 raise
             self.prepared_inputs[key] = context
 
@@ -311,7 +320,8 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         key = (name, tuple(template.shape), template.dtype)
         stage = stages.get(key)
         if stage is None:
-            stage = torch.empty_like(template)
+            with self.graph_memory.allocate((self, input_key)):
+                stage = torch.empty_like(template)
             stages[key] = stage
         return stage
 
@@ -465,12 +475,13 @@ class DenoisingRunner(Generic[InputT, SizeT]):
             self._discard_graph(key)
             self.warmup(inputs, schedules, state=state, input_key=input_key)
 
-            graph = CUDAGraph(context=context, pools=self.device_pools)
+            graph = CUDAGraph(context=context, pools=self._pools[input_key])
             try:
                 with context.activate():
                     # Bind graph-owned schedule and timestep copies so replay
                     # only needs their values refreshed, never new addresses.
-                    staged = clone_inputs(temporal)
+                    with self.graph_memory.allocate((self, input_key)):
+                        staged = clone_inputs(temporal)
                     stepped = replace(
                         bound,
                         latents={
@@ -508,8 +519,10 @@ class DenoisingRunner(Generic[InputT, SizeT]):
 
                     restore = restore_samples(inputs)
                 graph.capture(call, restore=restore)
+                self.graph_memory.check()
             except BaseException:
                 graph.close()
+                self.release_inputs(input_key)
                 raise
             self.graphs[key] = graph, staged
 
@@ -534,7 +547,7 @@ class DenoisingRunner(Generic[InputT, SizeT]):
         serves every request slot. The caller's samples are unchanged when
         this returns.
         """
-        if self.stream is None:
+        if not self.captures:
             raise RuntimeError("denoising graph capture requires a stream")
         self._resident_ladder(
             inputs, schedules, state=state, slot=slot, input_key=input_key
@@ -554,10 +567,21 @@ class DenoisingRunner(Generic[InputT, SizeT]):
 
         the worker separately commits request progress.
         """
-        if self.stream is None:
+        if not self.captures:
             context, call = self._call(inputs, schedules, state, input_key)
-            with context.activate():
-                return call(), "eager"
+            current = (
+                torch.cuda.current_stream(self.device)
+                if context.stream is not None
+                else None
+            )
+            if context.stream is not None:
+                context.stream.wait_stream(current)
+            try:
+                with context.activate():
+                    return call(), "eager"
+            finally:
+                if context.stream is not None:
+                    current.wait_stream(context.stream)
 
         graph, staged, temporal, context, captured = self._resident_ladder(
             inputs, schedules, state=state, slot=slot, input_key=input_key
@@ -622,12 +646,29 @@ class DenoisingRunner(Generic[InputT, SizeT]):
                     context.stream or torch.cuda.current_stream(self.device)
                 ).synchronize()
             context.close()
+        self._pools.pop(key, None)
+        self.graph_memory.release((self, key))
 
-    def close(self) -> None:
+    def close(self, *, aborted: bool = False) -> None:
         if self._closed:
+            return
+
+        if aborted:
+            from uniserve.runtime.execution import close_stream_collectives
+            from uniserve.runtime.resources import retain_until_exit
+
+            self._closed = True
+            retain_until_exit(self)
+            if self.stream is not None:
+                close_stream_collectives(self.stream, aborted=True)
             return
 
         for key in tuple(self.prepared_inputs):
             self.release_inputs(key)
-        self.device_pools.clear()
+        # Pinned copies remember their destination stream until the host
+        # allocation is released. Retire them while that stream's CUDA context
+        # still exists, before the caller destroys its execution partition.
+        self._slot_values.clear()
+        self._slot_index = None
+        self._bank.clear()
         self._closed = True

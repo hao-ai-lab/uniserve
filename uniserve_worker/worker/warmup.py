@@ -540,10 +540,11 @@ def _build_warmup_batch(
             )
     height, width = image_size or _warmup_image_size(requests)
     # Latents occupy a grid of (height/downsample) x (width/downsample) units.
-    latent_units = max(
-        1,
-        (height // max(1, int(requests.worker._layout.latent_downsample)))
-        * (width // max(1, int(requests.worker._layout.latent_downsample))),
+    builder = requests.worker.runner.image_builder
+    latent_units = (
+        builder.denoiser.latent_shape("image", ImageConfig(height, width))[0]
+        if builder is not None
+        else 1
     )
     page_units = int(requests.worker.info.latent_page_units)
     latent_page_count = (
@@ -807,12 +808,11 @@ def _warmup_image_size(requests: _WarmupRequests) -> tuple[int, int]:
 
     The image's latent grid must fit the declared capacity.
     """
-    downsample = max(1, int(requests.worker._layout.latent_downsample))
+    builder = requests.worker.runner.image_builder
+    downsample = 1 if builder is None else builder.denoiser.downsample
     capacity = int(requests.worker.info.latent_capacity_units)
-    if int(requests.worker._layout.max_vae_grid_tokens) > 0:
-        capacity = min(
-            capacity, int(requests.worker._layout.max_vae_grid_tokens)
-        )
+    if builder is not None:
+        capacity = min(capacity, builder.max_tokens + builder.framing)
 
     side = max(1, math.isqrt(max(1, capacity)))
     return side * downsample, side * downsample

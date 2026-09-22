@@ -89,18 +89,43 @@ def test_assembly_requires_every_media_unit_of_the_request():
         session.append((encode_video_unit(config, blue),))
 
 
-def test_a_product_row_carries_one_encoded_unit_and_its_length():
+@pytest.mark.parametrize(
+    "frames,height,width", ((4, 16, 32), (8, 256, 256), (3, 34, 50))
+)
+def test_a_product_row_carries_one_encoded_unit_and_its_length(
+    frames, height, width
+):
+    from dataclasses import replace
+
     import torch
 
-    config = _config()
+    config = replace(
+        _config(),
+        frame_count=frames,
+        video_unit_frames=(frames,),
+        height=height,
+        width=width,
+    )
     payload = encode_video_unit(
-        config, np.zeros((4, 16, 32, 3), dtype=np.uint8)
+        config,
+        np.random.default_rng(0).integers(
+            0,
+            256,
+            (frames, height, width, 3),
+            dtype=np.uint8,
+        ),
     )
     row = torch.zeros(
-        encoded_unit_bytes(4, config.height, config.width), dtype=torch.uint8
+        encoded_unit_bytes(frames, height, width), dtype=torch.uint8
     )
     frame_encoded_unit(payload, row)
     assert read_encoded_unit(row) == payload
+    with av.open(io.BytesIO(read_encoded_unit(row))) as container:
+        decoded = tuple(container.decode(video=0))
+    assert len(decoded) == frames
+    assert all(
+        (frame.height, frame.width) == (height, width) for frame in decoded
+    )
 
 
 def test_a_unit_that_exceeds_its_reserved_row_fails_by_name():

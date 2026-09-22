@@ -429,15 +429,16 @@ class NcclCommunicator:
         here waits on the device either: the work an abort interrupts is
         exactly the work that may already be stuck.
         """
+        from .resources import retain_until_exit
+
+        # Abort does not prove that every local access has ended. Registered
+        # tensors and transfer streams remain owned until process exit.
+        retain_until_exit(self)
         if self._comm.value:
-            # The abort invalidates the communicator, and with it every window
-            # registered on it, so the windows are dropped rather than
-            # deregistered through a handle that no longer names anything.
-            self._windows.clear()
+            # Abort invalidates the communicator and its window registrations.
+            # Their backing stays retained; no deregistration uses this handle.
             communicator, self._comm = self._comm.value, c_void_p()
             self._nccl.comm_abort(communicator)
-
-        self._release_stream()
 
     def _release_stream(self) -> None:
         """Destroy the communication stream this communicator owns."""

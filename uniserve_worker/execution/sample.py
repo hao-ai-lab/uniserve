@@ -11,6 +11,7 @@ import torch
 from uniserve.distributed.mesh import Communicator
 from uniserve.runtime.triton import triton_available
 from uniserve.sampling import SamplingParams, sample_top_k
+from uniserve.sampling.top_k import top_k_candidates
 from uniserve.tensors import adjacent_view
 from uniserve_worker.foundation.errors import (
     invalid_descriptor,
@@ -35,6 +36,9 @@ def device_greedy_parameters(parameters: SamplingParams) -> bool:
     """
     return (
         float(parameters.temperature) <= 0.0
+        and parameters.top_k == 0
+        and parameters.top_p == 1.0
+        and parameters.typical_p == 1.0
         and not parameters.return_logprobs
         and int(parameters.n_logprobs) == 0
         and not parameters.logprob_token_ids
@@ -253,19 +257,13 @@ def _fused_top_k(task: SamplingMetadata, vocab: int) -> int:
         return 0
     parameters = task.parameters
     top_k = int(parameters.top_k)
-    wants_logprobs = (
-        parameters.return_logprobs
-        or int(parameters.n_logprobs) > 0
-        or bool(parameters.logprob_token_ids)
-    )
     uses_penalties = (
         parameters.repetition_penalty != 1.0
         or parameters.frequency_penalty != 0.0
         or parameters.presence_penalty != 0.0
     )
     if (
-        wants_logprobs
-        or uses_penalties
+        uses_penalties
         or task.allowed[0] is not None
         or task.suppress
         or parameters.logit_bias
@@ -321,6 +319,22 @@ def _sample_fused_top_k_group(
     transitions = _sampled_transition_values(tasks, tokens, valid, active)
     tagged_tokens = tagged_token_values(tokens, continuation_values)
     span = sampling_columns(valid, active, tokens, torch.zeros_like(tokens))
+    rows = tuple(task.parameters for task in tasks)
+    details = None
+    if any(_wants_logprobs(row) for row in rows):
+        # Observations do not select another numerical sampler: even draws at
+        # a floating-point CDF boundary must retain the same chosen token.
+        work, _ = _shape_sampling_logits_batch(
+            logits,
+            rows,
+            parameters,
+            tuple(value for task in tasks for value in task.allowed),
+            tuple(task.suppress for task in tasks),
+            tuple(value for task in tasks for value in task.penalty_counts),
+        )
+        details = logprob_details(
+            work, torch.arange(len(tasks), device=tokens.device), tokens, rows
+        )
     output = SamplerOutput(
         tokens=tokens,
         valid=valid,
@@ -329,6 +343,7 @@ def _sample_fused_top_k_group(
         continuation=continuation_values,
         tagged_tokens=tagged_tokens,
         completion=span,
+        logprobs=details,
     )
     return tuple(
         output.row(
@@ -381,9 +396,14 @@ def _sample_task_group(
     draws = torch.cat(
         tuple(cast(torch.Tensor, task.draws) for task in tasks), dim=0
     )
+    parameter_values = torch.cat(
+        tuple(cast(torch.Tensor, task.parameter_values) for task in tasks),
+        dim=0,
+    )
     work, valid = _shape_sampling_logits_batch(
         logits,
         parameters,
+        parameter_values,
         tuple(value for task in tasks for value in task.allowed),
         tuple(task.suppress for task in tasks for _ in task.allowed),
         tuple(value for task in tasks for value in task.penalty_counts),
@@ -391,11 +411,7 @@ def _sample_task_group(
 
     # Temperature-zero rows use deterministic argmax; remaining rows invert the
     # categorical CDF with their precomputed RNG draw.
-    temperatures = torch.tensor(
-        [float(value.temperature) for value in parameters],
-        dtype=work.dtype,
-        device=device,
-    )
+    temperatures = parameter_values[:, 0]
     probabilities = torch.softmax(work, dim=-1)
     cumulative = probabilities.cumsum(dim=-1)
     sampled_tokens = (
@@ -803,6 +819,7 @@ def select_device_values(
 def _shape_sampling_logits_batch(
     logits: torch.Tensor,
     parameters: Sequence[SamplingParams],
+    parameter_values: torch.Tensor,
     allowed_tokens: Sequence[tuple[int, ...] | None],
     suppressed_tokens: Sequence[tuple[int, ...]],
     penalty_counts: Sequence[torch.Tensor | None],
@@ -933,20 +950,7 @@ def _shape_sampling_logits_batch(
             accumulate=True,
         )
 
-    # Per-row (temperature, min_p, top_p) values drive the remaining shaping.
-    parameter_values = torch.tensor(
-        [
-            (
-                float(row.temperature),
-                float(row.min_p),
-                float(row.top_p),
-            )
-            for row in parameters
-        ],
-        dtype=work.dtype,
-        device=work.device,
-    )
-
+    # All sampling paths consume the same (temperature, top_p, min_p) columns.
     # A zero temperature divides by one; the caller selects those rows by
     # argmax.
     temperatures = parameter_values[:, 0]
@@ -969,29 +973,8 @@ def _shape_sampling_logits_batch(
             row_indexes, dtype=torch.long, device=work.device
         )
         subset = work.index_select(0, indexes)
-        values, token_indexes = torch.topk(
-            subset,
-            top_k,
-            dim=-1,
-            sorted=False,
-        )
-        ordered, order = torch.sort(values, dim=-1, descending=True)
-        token_indexes = token_indexes.gather(1, order)
-        top_p = parameter_values.index_select(0, indexes)[:, 2]
-        cumulative = torch.softmax(ordered, dim=-1).cumsum(dim=-1)
-        over = cumulative > top_p.unsqueeze(1)
-        drop = torch.cat(
-            (
-                torch.zeros(
-                    (len(row_indexes), 1),
-                    dtype=torch.bool,
-                    device=work.device,
-                ),
-                over[:, :-1],
-            ),
-            dim=1,
-        )
-        ordered.masked_fill_(drop, float("-inf"))
+        top_p = parameter_values.index_select(0, indexes)[:, 1]
+        ordered, token_indexes = top_k_candidates(subset, top_k, top_p)
         truncated = torch.full_like(subset, float("-inf"))
         truncated.scatter_(1, token_indexes, ordered)
         work.index_copy_(0, indexes, truncated)
@@ -1006,7 +989,7 @@ def _shape_sampling_logits_batch(
         indexes = torch.tensor(top_p_rows, dtype=torch.long, device=work.device)
         subset = work.index_select(0, indexes)
         ordered, token_indexes = torch.sort(subset, dim=-1, descending=True)
-        top_p = parameter_values.index_select(0, indexes)[:, 2]
+        top_p = parameter_values.index_select(0, indexes)[:, 1]
         cumulative = torch.softmax(ordered, dim=-1).cumsum(dim=-1)
         over = cumulative > top_p.unsqueeze(1)
         drop = torch.cat(
@@ -1033,7 +1016,7 @@ def _shape_sampling_logits_batch(
     if min_p_rows:
         indexes = torch.tensor(min_p_rows, dtype=torch.long, device=work.device)
         subset = work.index_select(0, indexes)
-        min_p = parameter_values.index_select(0, indexes)[:, 1]
+        min_p = parameter_values.index_select(0, indexes)[:, 2]
         min_threshold = subset.max(dim=-1).values + torch.log(min_p)
         subset.masked_fill_(subset < min_threshold.unsqueeze(1), float("-inf"))
         work.index_copy_(0, indexes, subset)
@@ -1086,6 +1069,14 @@ def _shape_sampling_logits_batch(
     return work, valid
 
 
+def _wants_logprobs(parameters: SamplingParams) -> bool:
+    return (
+        parameters.return_logprobs
+        or parameters.n_logprobs > 0
+        or bool(parameters.logprob_token_ids)
+    )
+
+
 def logprob_details(
     work: torch.Tensor,
     output_rows: torch.Tensor,
@@ -1098,11 +1089,7 @@ def logprob_details(
     """
     vocab = int(work.shape[1])
     requested_rows = tuple(
-        index
-        for index, row in enumerate(parameters)
-        if row.return_logprobs
-        or int(row.n_logprobs) > 0
-        or bool(row.logprob_token_ids)
+        index for index, row in enumerate(parameters) if _wants_logprobs(row)
     )
     if not requested_rows:
         return None

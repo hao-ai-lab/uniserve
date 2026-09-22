@@ -21,6 +21,7 @@ import uuid
 import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import cache
@@ -1270,6 +1271,43 @@ class HostBorrow:
         release()
 
 
+@contextmanager
+def _shared_read(locator: Locator, slot: int, *, check=None):
+    """Own a mapping and claim through its last read, including failure."""
+    handle = locator.transport
+    if not isinstance(handle, PosixShmTransfer):
+        raise invalid_descriptor("shared-memory read requires a SHM locator")
+    try:
+        shm = _open_shared_memory(
+            handle.name, segment.HEADER_BYTES + locator.nbytes
+        )
+    except FileNotFoundError:
+        raise invalid_descriptor(
+            "publication is retired, invalid, or belongs to another view"
+        ) from None
+
+    header = memoryview(shm)
+    claimed = False
+    try:
+        if segment.digest(header) != locator_digest(locator):
+            raise invalid_descriptor(
+                "publication is retired, invalid, or belongs to another view"
+            )
+        segment.claim(header, slot)
+        claimed = True
+        segment.await_ready(header, check=check)
+        yield shm
+    finally:
+        # Failed readiness and cancellation end this reader's access too. The
+        # producer separately retains its own writes until they have completed.
+        try:
+            if claimed:
+                segment.acknowledge(header, slot)
+        finally:
+            header.release()
+            shm.close()
+
+
 class ShmTransport(Transport):
     """Shared-memory publication whose segment carries its own readiness.
 
@@ -1565,41 +1603,15 @@ class ShmTransport(Transport):
         """
         import torch
 
-        handle = locator.transport
-        if not isinstance(handle, PosixShmTransfer):
-            raise invalid_descriptor(
-                "shared-memory read requires a shared-memory locator"
-            )
         try:
             ticket._require_active()
-            try:
-                shm = _open_shared_memory(
-                    handle.name, segment.HEADER_BYTES + locator.nbytes
-                )
-            except FileNotFoundError:
-                raise invalid_descriptor(
-                    "publication is retired, invalid, or belongs to another "
-                    "view"
-                ) from None
-            try:
-                header = memoryview(shm)
-                if segment.digest(header) != locator_digest(locator):
-                    raise invalid_descriptor(
-                        "publication is retired, invalid, or belongs to "
-                        "another view"
-                    )
-                # The claim precedes the first read and the acknowledgment
-                # follows the copy, both with release ordering, so the
-                # producer reclaims nothing this rank still reads and waits
-                # for no rank that never began.
-                segment.claim(header, self._acknowledgment_slot)
-                segment.await_ready(header, check=ticket._require_active)
+            with _shared_read(
+                locator,
+                self._acknowledgment_slot,
+                check=ticket._require_active,
+            ) as shm:
                 payload = segment.HEADER_BYTES
                 buf = bytearray(shm[payload : payload + locator.nbytes])
-                segment.acknowledge(header, self._acknowledgment_slot)
-            finally:
-                header.release()
-                shm.close()
         except BaseException as error:
             ticket._fail(error)
             raise
@@ -1668,41 +1680,16 @@ class ShmTransport(Transport):
                 "shared-memory transport requires the source node"
             )
         start, nbytes = _row_span(locator, region)
-        try:
-            shm = _open_shared_memory(
-                handle.name, segment.HEADER_BYTES + locator.nbytes
+        with ExitStack() as ownership:
+            ownership.enter_context(
+                _shared_read(locator, self._acknowledgment_slot)
             )
-        except FileNotFoundError:
-            raise invalid_descriptor(
-                "publication is retired, invalid, or belongs to another view"
-            ) from None
-        header = memoryview(shm)
-        try:
-            if segment.digest(header) != locator_digest(locator):
-                raise invalid_descriptor(
-                    "publication is retired, invalid, or belongs to another "
-                    "view"
-                )
-            # The claim precedes the reader's first use of the payload.
-            segment.claim(header, self._acknowledgment_slot)
-            segment.await_ready(header)
-        except BaseException:
-            header.release()
-            shm.close()
-            raise
-
-        def release() -> None:
-            # The word is written after the reader's use of the payload, with
-            # release ordering, so the producer reclaims nothing still read.
-            try:
-                segment.acknowledge(header, self._acknowledgment_slot)
-            finally:
-                header.release()
-                shm.close()
-
-        return HostBorrow(
-            handle.name, segment.HEADER_BYTES + start, nbytes, release
-        )
+            return HostBorrow(
+                handle.name,
+                segment.HEADER_BYTES + start,
+                nbytes,
+                ownership.pop_all().close,
+            )
 
     def release(
         self, locator: Locator
@@ -2245,6 +2232,9 @@ class CudaVmmTransport(Transport):
         publication = None
         descriptor = None
         copied_source = None
+        pool = chunk = grants = None
+        publication_id = ""
+        submitted = False
         try:
             # Storage that can be exported where it lies is published where
             # it lies, wherever it is read. That copies nothing, and it is
@@ -2256,8 +2246,6 @@ class CudaVmmTransport(Transport):
             # produces reaches another host too; what does not reach is the
             # fence, and that is settled below.
             exported = export_handle(first)
-            pool = None
-            chunk = None
             if exported is None:
                 # Otherwise the product is materialized in this device's pool,
                 # whose one handle a consumer imports once however many
@@ -2267,16 +2255,13 @@ class CudaVmmTransport(Transport):
                 # publish over the host mechanism; the pool reports the
                 # exhaustion once.
                 pool = self._pool(first.device)
-                try:
-                    chunk = pool.reserve(_nbytes(tensor))
-                except PoolExhaustedError:
-                    self._bytes.release(nbytes)
-                    raise
+                chunk = pool.reserve(_nbytes(tensor))
             if exported is not None:
                 descriptor, storage_size, storage_offset = exported
             else:
                 assert chunk is not None
                 shared = chunk.storage.view(first.dtype).view(shape)
+                submitted = True
                 for target, value in _copy_pairs(source, shared):
                     target.copy_(value, non_blocking=True)
                 copied_source = source
@@ -2390,7 +2375,8 @@ class CudaVmmTransport(Transport):
                 try:
                     # No usable producer fence exists on this failure path.
                     # Keep its allocation and quota if draining also fails.
-                    torch.cuda.current_stream(first.device).synchronize()
+                    if submitted or event is not None:
+                        torch.cuda.current_stream(first.device).synchronize()
                     if event is not None:
                         self._events.defer_release((event,), source)
                 except BaseException as error:
@@ -2401,6 +2387,15 @@ class CudaVmmTransport(Transport):
                         copied_source,
                     )
                     raise
+                if grants is not None:
+                    grants.release(publication_id)
+                if chunk is not None:
+                    pool.release(chunk)
+                elif (
+                    descriptor is not None
+                    and len(descriptor) == DESCRIPTOR_HANDLE_BYTES
+                ):
+                    os.close(int.from_bytes(descriptor, sys.byteorder))
                 self._bytes.release(nbytes)
             raise
 

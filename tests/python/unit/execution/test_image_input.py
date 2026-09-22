@@ -14,7 +14,10 @@ from uniserve.processing import (
     StrideResize,
     TowerTransform,
 )
-from uniserve_worker.execution.image_input import prepare_image
+from uniserve_worker.execution.image_input import (
+    prepare_image,
+    prepare_tensor_image,
+)
 from uniserve_worker.protocol.call import MediaCall
 
 
@@ -77,4 +80,40 @@ def test_encoded_pixels_match_channel_normalization(
     assert (result.height, result.width) == (24, 32)
     torch.testing.assert_close(
         result.pixels.cpu(), expected.to(getattr(torch, dtype)), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize(
+    "kind", (MediaCall.LATENT_ENCODING, MediaCall.VISION_ENCODING)
+)
+def test_image_sources_preserve_the_same_model_canvas(kind):
+    raw = np.full((16, 16, 3), 128, dtype=np.uint8)
+    encoded = io.BytesIO()
+    Image.fromarray(raw).save(encoded, format="PNG")
+    processor = ImageProcessor(
+        vae=TowerTransform(StrideResize(64, 32, 16, 4096)),
+        vit=TowerTransform(StrideResize(64, 48, 16, 4096)),
+        staging_dtype=torch.float32,
+    )
+    arguments = {"device": torch.device("cpu")}
+    uploaded = prepare_image(
+        processor,
+        kind,
+        base64.b64encode(encoded.getvalue()).decode(),
+        **arguments,
+    )
+    resident = prepare_tensor_image(
+        processor,
+        kind,
+        torch.from_numpy(raw).permute(2, 0, 1).float() / 255,
+        signed_unit=False,
+        **arguments,
+    )
+    assert (uploaded.height, uploaded.width) == (32, 32)
+    assert (resident.height, resident.width) == (32, 32)
+    expected_size = 32 if kind is MediaCall.LATENT_ENCODING else 48
+    assert (
+        uploaded.pixels.shape
+        == resident.pixels.shape
+        == (3, expected_size, expected_size)
     )

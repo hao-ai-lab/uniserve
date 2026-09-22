@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import faulthandler
 import logging
+import os
 import signal
 import sys
 
@@ -29,6 +30,14 @@ def main() -> None:
         run_worker(process_args)
     except KeyboardInterrupt:
         logger.info("worker interrupted; shutting down")
+        os._exit(130)
+    except BaseException:
+        # Failed CUDA accesses and transfer threads retain backing until the
+        # rank exits. Python's executor/finalizer shutdown would try to drain
+        # them and can wait forever for the failed peer.
+        logger.exception("worker failed")
+        sys.stderr.flush()
+        os._exit(1)
     finally:
         logger.info("worker shut down")
 

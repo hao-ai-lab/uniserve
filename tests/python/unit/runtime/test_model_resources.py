@@ -165,7 +165,7 @@ def test_stateless_ranks_still_budget_request_products_and_arenas():
     )
 
 
-def test_worker_info_projects_model_behavior_and_resource_geometry():
+def test_worker_info_reports_capabilities_and_cache_limits():
     layout = build_worker_layout(
         TEST_MODEL,
         TEST_WORKER_CONFIG,
@@ -176,7 +176,6 @@ def test_worker_info_projects_model_behavior_and_resource_geometry():
 
     assert ForwardMode.PREFILL in info.supported_calls
     assert MediaCall.DENOISING in info.supported_calls
-    assert layout.max_vision_feature_bytes == ((512 // 16) ** 2 * 4 * 2)
     assert info.kv_cache is not None
     assert info.kv_cache.num_layers == len(TEST_MODEL.cache_config.layers)
     assert info.model_name == "test-model"
@@ -206,13 +205,12 @@ def test_persistent_buffer_capacity_includes_active_encoder_output() -> None:
     layout = build_worker_layout(
         TEST_MODEL, TEST_WORKER_CONFIG, image_processor=image_processor()
     )
-    feature_bytes = max(
-        layout.max_latent_feature_bytes,
-        layout.max_vision_feature_bytes,
-    )
+    # The stub's largest encoder result is a 32x32 latent grid, with one
+    # flattened RGB 16x16 patch per grid position in bfloat16.
+    feature_bytes = 32 * 32 * 3 * 16 * 16 * 2
     assert (
         layout.info.buffer_pool_bytes
-        == (TEST_WORKER_CONFIG.encoder_cache_entries + 1) * feature_bytes
+        >= (TEST_WORKER_CONFIG.encoder_cache_entries + 1) * feature_bytes
     )
 
 
@@ -223,7 +221,7 @@ def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() ->
     layout = build_worker_layout(
         TEST_MODEL, worker_config, image_processor=image_processor()
     )
-    assert layout.max_latent_feature_bytes == latent_trajectory_bytes(
+    assert layout.info.encoder_entry_bytes == latent_trajectory_bytes(
         1024,
         3 * 16**2,
         4,

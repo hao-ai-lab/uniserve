@@ -72,7 +72,10 @@ class _Worker:
                         pass
                 continue
             try:
-                item._run(self)
+                if lane._aborted:
+                    item._cancel()
+                else:
+                    item._run(self)
             finally:
                 lane._dequeued(self, item)
 
@@ -103,6 +106,7 @@ class HostLane:
             raise ValueError("host lane workers must be within its capacity")
         self._lock = Lock()
         self._closed = False
+        self._aborted = False
         self._tasks: set[HostTask] = set()
         self._sessions: dict[SessionKey, _Worker] = {}
         self._completion_wake: Callable[[], None] | None = None
@@ -194,6 +198,20 @@ class HostLane:
     def _remove(self, task: HostTask) -> None:
         with self._lock:
             self._tasks.discard(task)
+
+    def abort(self) -> None:
+        """Stop admission and codec processes without waiting for device inputs.
+
+        A running thread may hold a CUDA-dependent read; its resources remain
+        owned by the failed worker until process exit.
+        """
+        with self._lock:
+            self._closed = self._aborted = True
+            self._completion_wake = None
+        for worker in self._workers:
+            if worker.codec is not None:
+                worker.codec.abort()
+            worker.queue.put(None)
 
     def close(self) -> None:
         """Reject admission, cancel unsubmitted tasks and drain host readers."""
