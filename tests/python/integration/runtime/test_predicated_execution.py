@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from tests.python.fixtures.depth_one import (
     ar_params,
     diffusion_prepare_call,
@@ -26,6 +28,8 @@ from uniserve_worker.protocol.call import (
 from uniserve_worker.protocol.identity import CallId
 from uniserve_worker.protocol.tensor import DType, ShapeBound, TensorRef
 
+pytestmark = pytest.mark.integration
+
 
 def _with_transition_predicate(
     call: Call,
@@ -48,6 +52,11 @@ def _with_transition_predicate(
 
 
 def _release_relay_outputs(worker, *calls: Call) -> None:
+    """Free the calls' relay outputs in a command-only batch.
+
+    The batch takes the identity after the latest call's batch, so a call
+    submitted afterwards must name a later batch.
+    """
     finalized_report(
         worker,
         worker.submit(
@@ -207,7 +216,7 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
     _release_relay_outputs(worker, predecessor, successor, descendant)
     later = token_call(
         admission.request_key,
-        call_id=CallId(4, 0),
+        call_id=CallId(5, 0),
         predecessor=selected,
         mode=ForwardMode.DECODE,
         tokens=(7,),
@@ -275,12 +284,15 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         call_id=CallId(2, 0),
         predecessor=initial_observation.call_id,
     )
-    worker.submit(
-        execution_batch(
-            batch_id=2,
-            calls=(publication,),
-            commands=(),
-        )
+    finalized_report(
+        worker,
+        worker.submit(
+            execution_batch(
+                batch_id=2,
+                calls=(publication,),
+                commands=(),
+            )
+        ),
     )
     predecessor = token_call(
         admission.request_key,
@@ -330,7 +342,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     _release_relay_outputs(worker, initial, predecessor, candidate)
     selected, _selected_latent = diffusion_prepare_call(
         admission.request_key,
-        call_id=CallId(5, 0),
+        call_id=CallId(6, 0),
         predecessor=parent_observation.call_id,
         conditioning=conditioning,
     )
@@ -338,7 +350,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         worker,
         worker.submit(
             execution_batch(
-                batch_id=5,
+                batch_id=6,
                 calls=(selected,),
                 commands=(),
             )
