@@ -217,6 +217,68 @@ impl Scheduler {
         Some(outputs)
     }
 
+    /// Chooses one physical owner for every component of a media lineage.
+    ///
+    /// The denoiser is selected first because it defines the expensive replica
+    /// residency. Components co-located with that worker follow it; shared
+    /// components such as a TP text encoder and the host codec worker retain
+    /// their own independently bounded request rows.
+    fn media_routes(&self) -> Option<HashMap<String, crate::WorkerId>> {
+        use uniserve_worker_ipc::MediaCall;
+
+        let mut required = self
+            .info
+            .media_components
+            .iter()
+            .map(|(call, component)| (*call, component.clone()))
+            .collect::<Vec<_>>();
+        required.sort_by_key(|(call, _)| match call {
+            MediaCall::Denoising => 0,
+            MediaCall::TextEncoding | MediaCall::LatentPreparation => 1,
+            MediaCall::VideoDecoding | MediaCall::AudioDecoding => 2,
+            MediaCall::VideoEncoding | MediaCall::AudioEncoding | MediaCall::Muxing => 3,
+            _ => 4,
+        });
+
+        let mut routes = HashMap::new();
+        let mut selected_workers = HashSet::new();
+        for (call, component) in required {
+            if routes.contains_key(&component) {
+                continue;
+            }
+            let candidates = self
+                .component_candidates(CallKind::Media(call), &component)
+                .filter(|(worker, _, _)| {
+                    self.executor.is_ready(worker)
+                        && (selected_workers.contains(*worker)
+                            || self
+                                .media_memory
+                                .get(*worker)
+                                .is_some_and(|memory| memory.requests.available() > 0))
+                })
+                .collect::<Vec<_>>();
+            let resident = candidates
+                .iter()
+                .copied()
+                .find(|(worker, _, _)| selected_workers.contains(*worker));
+            let chosen = resident.or_else(|| {
+                candidates.into_iter().min_by_key(|(worker, _, _)| {
+                    let active = self
+                        .worker_affinity
+                        .iter()
+                        .filter_map(|((request, _), owner)| (owner == *worker).then_some(*request))
+                        .collect::<HashSet<_>>()
+                        .len();
+                    let available = self.media_memory[*worker].requests.available();
+                    (active, usize::MAX - available)
+                })
+            })?;
+            selected_workers.insert(chosen.0.clone());
+            routes.insert(component.clone(), chosen.0.clone());
+        }
+        Some(routes)
+    }
+
     /// Validates and queues one terminal media-generation request.
     pub(super) fn enqueue_media(&mut self, submission: PendingMedia) {
         let request = &submission.request;
@@ -287,42 +349,72 @@ impl Scheduler {
             let request_epoch = self.next_request_epoch;
             let request_key = RequestKey::new(self.engine_id, id, request_epoch);
             let sampling = submission.request.sampling;
-            if self
-                .info
-                .media_components
-                .iter()
-                .any(|(media_call, component)| {
-                    !self
-                        .component_candidates(CallKind::Media(*media_call), component)
-                        .any(|(worker, _, _)| self.executor.is_ready(worker))
-                })
-            {
-                self.waiting_media.insert(id, submission);
-                self.waiting_media_order.push_front(id);
-                break;
-            }
-            let Ok(request_slot) = self.request_pool.allocate(request_key) else {
+            let Some(routes) = self.media_routes() else {
                 self.waiting_media.insert(id, submission);
                 self.waiting_media_order.push_front(id);
                 break;
             };
+            let route_workers = routes.values().cloned().collect::<HashSet<_>>();
+            let mut request_slots = HashMap::new();
+            let mut reserved = true;
+            for worker in &route_workers {
+                let allocation = self
+                    .media_memory
+                    .get_mut(worker)
+                    .expect("media route names a loaded worker")
+                    .requests
+                    .allocate(request_key);
+                match allocation {
+                    Ok(allocation) => {
+                        request_slots.insert(worker.clone(), allocation);
+                    }
+                    Err(_) => {
+                        reserved = false;
+                        break;
+                    }
+                }
+            }
+            if !reserved {
+                for (worker, allocation) in request_slots {
+                    self.free_media_request(&worker, allocation);
+                }
+                self.waiting_media.insert(id, submission);
+                self.waiting_media_order.push_front(id);
+                break;
+            }
             let outputs = self
                 .media_outputs(sampling, submission.request.prompt_token_ids.len() as u32)
                 .expect("queued media has valid output bounds");
             let mut tensors = HashMap::new();
-            let mut reserved = true;
+            reserved = true;
             for (component, index, dtype, shape_bound) in outputs {
                 let bytes = shape_bound
                     .max_elements()
                     .saturating_mul(dtype.element_bytes());
-                let Ok(allocation) = self.buffer_pool.allocate(request_key, bytes, 256) else {
-                    reserved = false;
+                let mut allocations = HashMap::new();
+                for worker in &route_workers {
+                    let allocation = self
+                        .media_memory
+                        .get_mut(worker)
+                        .expect("media route names a loaded worker")
+                        .buffers
+                        .allocate(request_key, bytes, 256);
+                    let Ok(allocation) = allocation else {
+                        for (allocated_worker, allocation) in std::mem::take(&mut allocations) {
+                            self.free_media_buffer(&allocated_worker, allocation);
+                        }
+                        reserved = false;
+                        break;
+                    };
+                    allocations.insert(worker.clone(), allocation);
+                }
+                if !reserved {
                     break;
-                };
+                }
                 tensors.insert(
                     (component, index),
                     MediaTensorAllocation {
-                        allocation,
+                        allocations,
                         dtype,
                         shape_bound,
                     },
@@ -330,18 +422,27 @@ impl Scheduler {
             }
             if !reserved {
                 for tensor in tensors.into_values() {
-                    self.free_allocation(tensor.allocation);
+                    for (worker, allocation) in tensor.allocations {
+                        self.free_media_buffer(&worker, allocation);
+                    }
                 }
-                self.free_allocation(request_slot);
+                for (worker, allocation) in request_slots {
+                    self.free_media_request(&worker, allocation);
+                }
                 self.waiting_media.insert(id, submission);
                 self.waiting_media_order.push_front(id);
                 break;
             }
             let allocations = MediaAllocations {
-                request_slot,
+                request_slots,
                 tensors,
             };
-            let request_pool_idx = allocations.request_slot();
+            let primary_component = self.info.media_components[&MediaCall::Denoising].as_str();
+            let request_pool_idx = allocations.request_slot(&routes[primary_component]);
+            for (component, worker) in &routes {
+                self.worker_affinity
+                    .insert((request_key, component.clone()), worker.clone());
+            }
             self.next_request_epoch = self.next_request_epoch.saturating_add(1);
             let admission = NewRequest::new_media(
                 request_key,
@@ -369,6 +470,7 @@ impl Scheduler {
                     request: submission.request,
                     event_tx: submission.event_tx,
                     allocations,
+                    buffer_bindings: HashMap::new(),
                     conditioning: None,
                     latents: Vec::new(),
                     decoded_units: BTreeMap::new(),

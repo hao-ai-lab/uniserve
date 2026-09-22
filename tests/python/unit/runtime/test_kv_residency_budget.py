@@ -26,6 +26,9 @@ def fixed_device_total(monkeypatch):
         lambda device: (TOTAL_BYTES, TOTAL_BYTES),
         raising=False,
     )
+    monkeypatch.setattr(
+        "torch.cuda.memory_reserved", lambda device: 0, raising=False
+    )
 
 
 def _model() -> Model:

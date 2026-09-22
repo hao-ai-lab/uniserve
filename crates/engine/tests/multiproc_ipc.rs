@@ -407,6 +407,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             ranks: args.ranks.clone(),
             components: args.components.clone(),
             queue_depth: args.queue_depth,
+            memory_fraction: None,
         }])?;
         args.transfer = transfer.clone();
         let mut executor = WorkerExecutor::try_new(
@@ -422,6 +423,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
                     call,
                     RequestPlacement {
                         worker: WorkerId("worker".into()),
+                        request_pool_idx: None,
                         block_tables: batch.block_tables,
                         new_cache_pages: batch.new_cache_pages,
                         forward: batch.forward,
@@ -656,6 +658,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         let call = batch.calls.remove(0);
         let placement = RequestPlacement {
             worker: WorkerId("worker".into()),
+            request_pool_idx: None,
             block_tables: batch.block_tables,
             new_cache_pages: batch.new_cache_pages,
             forward: batch.forward,
@@ -734,6 +737,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
                 call,
                 RequestPlacement {
                     worker: WorkerId("worker".into()),
+                    request_pool_idx: None,
                     block_tables: batch.block_tables,
                     new_cache_pages: batch.new_cache_pages,
                     forward: batch.forward,
@@ -1748,6 +1752,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
                 call,
                 RequestPlacement {
                     worker: WorkerId(worker.into()),
+                    request_pool_idx: None,
                     block_tables: batch.block_tables,
                     new_cache_pages: batch.new_cache_pages,
                     forward: batch.forward,
@@ -2077,17 +2082,25 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         rng: None,
     };
     let mut retained = Batch::new(15, vec![next], vec![retained]);
-    retained
-        .buffer_allocations
-        .push(uniserve_worker_ipc::BufferAllocation {
+    // The source product lives at offset zero on encoder-1. Its destination
+    // address on encoder-0 is independent and must not collide with the new
+    // output that this call writes at offset zero in encoder-0's address space.
+    retained.buffer_allocations.extend([
+        uniserve_worker_ipc::BufferAllocation {
             buffer: retained.calls[0]
                 .encoder_output
                 .as_ref()
                 .unwrap()
                 .buffer_id(),
+            offset: 0,
+            bytes: 8192,
+        },
+        uniserve_worker_ipc::BufferAllocation {
+            buffer: feature.buffer_id(),
             offset: 8192,
             bytes: 8192,
-        });
+        },
+    ]);
     executor.submit(bind(retained, "encoder-0"))?;
     let retained = poll_logical(&mut executor)?.context("retained product was not readable")?;
     assert_eq!(retained.results[0].output.status, CallStatus::Ok);

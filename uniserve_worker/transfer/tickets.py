@@ -81,6 +81,16 @@ class TransportKind(StrEnum):
 TRANSPORTS = tuple(kind.value for kind in TransportKind)
 
 
+@cache
+def _can_access_peer(device: str, peer: str) -> bool:
+    """Return the process-stable CUDA peer relation for two visible devices."""
+    import torch
+
+    return torch.cuda.can_device_access_peer(
+        torch.device(device), torch.device(peer)
+    )
+
+
 def _dtype_to_str(dtype: torch.dtype) -> str:
     """Encode a torch dtype as its unqualified transport name."""
     return str(dtype).removeprefix("torch.")
@@ -2455,6 +2465,7 @@ class CudaVmmTransport(Transport):
         # product's buffer only once the batch consuming it has completed.
         mapped = None
         event = None
+        import_device = device
         # A read in the producer's own address space needs no acknowledgment:
         # the publication's own owner reclaims it.
         acknowledgment = None
@@ -2482,12 +2493,12 @@ class CudaVmmTransport(Transport):
                     mapped = publication.tensor
                     event = publication.event
                 else:
-                    prototype = (
+                    destination_prototype = (
                         destination[0]
                         if isinstance(destination, tuple)
                         else destination
                     )
-                    itemsize = prototype.element_size()
+                    itemsize = destination_prototype.element_size()
                     if any(
                         offset % itemsize
                         for offset in handle.storage_offsets_bytes
@@ -2495,6 +2506,33 @@ class CudaVmmTransport(Transport):
                         raise invalid_descriptor(
                             "CUDA VMM span offset is not element aligned"
                         )
+                    # A VMM mapping can be granted only to a device that can
+                    # access the producing allocation. Some hosts expose all
+                    # GPUs to one process but grant peer access only inside
+                    # smaller peer islands. Map such an allocation on its
+                    # owning GPU, then let CUDA perform the cross-device copy
+                    # into the destination. CUDA stages through host memory
+                    # when no peer path exists. This decision follows the
+                    # discovered CUDA topology, not a device model or SKU.
+                    source_device = torch.device(locator.device)
+                    if (
+                        locator.source.node == self.source.node
+                        and source_device.type == "cuda"
+                        and source_device != device
+                        and not _can_access_peer(
+                            str(device), str(source_device)
+                        )
+                    ):
+                        import_device = source_device
+                    prototype = (
+                        destination_prototype
+                        if import_device == device
+                        else torch.empty(
+                            0,
+                            dtype=destination_prototype.dtype,
+                            device=import_device,
+                        )
+                    )
                     # One mapping owns every span; tensor views share its
                     # deleter.
                     # A fabric handle is importable as published. A descriptor
@@ -2550,13 +2588,32 @@ class CudaVmmTransport(Transport):
                     # and that fence reaches this rank only on its own host.
                     if handle.ready_event_handle:
                         event = torch.cuda.Event.from_ipc_handle(
-                            device, handle.ready_event_handle
+                            import_device, handle.ready_event_handle
                         )
                 if region is not None:
                     mapped = region_view(mapped, region)
-                self._reads.copy(
-                    ticket, mapped, destination, event, acknowledgment
-                )
+                if event is not None and import_device != device:
+                    # CUDA does not permit the destination device's stream to
+                    # wait on this imported source-device IPC event on every
+                    # topology. Drain the producer on its owning device before
+                    # submitting the host-staged cross-device copy.
+                    event.synchronize()
+                    event = None
+                if acknowledgment is not None and import_device != device:
+                    # The acknowledgment word belongs to the source-device
+                    # mapping. Claim it before the staged copy, then publish
+                    # completion only after the destination copy has drained.
+                    with torch.cuda.device(import_device):
+                        acknowledgment.copy_(_chunk_word(vmm_pool.CLAIMED))
+                        torch.cuda.current_stream(import_device).synchronize()
+                    self._reads.copy(ticket, mapped, destination, event, None)
+                    with torch.cuda.device(import_device):
+                        acknowledgment.copy_(_chunk_word(vmm_pool.ACKNOWLEDGED))
+                        torch.cuda.current_stream(import_device).synchronize()
+                else:
+                    self._reads.copy(
+                        ticket, mapped, destination, event, acknowledgment
+                    )
         except BaseException as error:
             # Failure visibility must not wait for the source's retirement
             # acknowledgement. Physical ownership remains with the backend.

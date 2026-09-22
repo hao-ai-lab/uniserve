@@ -97,6 +97,42 @@ def test_encoded_projection_chunks_preserve_the_source_scale_domain(quantizer):
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.gpu
+@torch.inference_mode()
+def test_calibrated_nvfp4_projection_chunks_match_complete_input():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (
+        10,
+        0,
+    ):
+        pytest.skip("NVFP4 projection requires an SM100-class CUDA device")
+
+    quantizer = Quantizer("nvfp4", calibrated_amax=8.0)
+    layer = ColumnParallelLinear(
+        32, 32, bias=False, device="cuda", dtype=torch.bfloat16
+    )
+    layer.weight = nn.Parameter(
+        quantizer.quantize(layer.weight), requires_grad=False
+    )
+    layer.input_quantizer = quantizer
+    source = torch.randn(257, 32, device="cuda", dtype=torch.bfloat16)
+    expected = layer(source)
+
+    result = torch.empty_like(expected)
+    for interval, value in layer.forward_chunks(
+        iter(
+            (
+                (slice(0, 129), source[:129]),
+                (slice(129, 257), source[129:]),
+            )
+        ),
+        token_slice=slice(0, 257),
+        num_tokens=257,
+    ):
+        result[interval].copy_(value)
+
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("axis", [None, 0])
 def test_encoded_input_preserves_scales_shape_and_bias(axis):
     quantizer = Quantizer("fp8", axis=axis)

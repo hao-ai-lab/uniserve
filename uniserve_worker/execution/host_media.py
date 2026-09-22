@@ -141,12 +141,13 @@ def _borrow(
     )
 
 
-def _stage_track(samples: torch.Tensor) -> HostBorrow:
-    """Copy the PCM timeline into a segment of this rank's own for the codec.
+def _stage_tensor(value: torch.Tensor) -> HostBorrow:
+    """Copy a tensor into a segment of this rank's own for a codec process.
 
-    The codec reads media bytes from a named shared-memory segment; the
-    imported timeline lives in this rank's memory, so it is written to a
-    segment the borrow's release unlinks once the encode has read it.
+    Codecs read media bytes from a named shared-memory segment. An input
+    imported from another host instead lives in this rank's tensor store, so
+    it is copied to a local segment whose borrow unlinks it after the codec has
+    read it.
     """
     import torch
 
@@ -155,10 +156,10 @@ def _stage_track(samples: torch.Tensor) -> HostBorrow:
     )
     from uniserve_worker.transfer.tickets import HostBorrow
 
-    raw = samples.detach().to("cpu").contiguous().view(torch.uint8).reshape(-1)
+    raw = value.detach().to("cpu").contiguous().view(torch.uint8).reshape(-1)
     nbytes = int(raw.numel())
     if nbytes < 1:
-        raise invalid_descriptor("audio encoding has an empty PCM timeline")
+        raise invalid_descriptor("codec input is empty")
     segment = allocate_shared_memory(nbytes)
     try:
         # The mapping is dropped before the borrow is released, so closing
@@ -223,6 +224,21 @@ def execute(
         cursor = int(decode_range(call, state=state).cursor)
         config = mux_config(model_runner, media)
         publication = _input_publication(call, state)
+        imported = call.inputs[0].buffer_id not in state.borrowed_inputs
+        imported_read = None
+        imported_units = None
+        if imported:
+            imported_read = tensor_store.consume(
+                call.inputs[0],
+                consumer_call_id=call.call_id,
+                device=model_runner.call_devices(call)[0],
+            )
+            request.device_reads.append(imported_read)
+            if imported_read.region is not None or imported_read.tensor is None:
+                raise invalid_descriptor(
+                    "video encoding requires the complete decoded unit round"
+                )
+            imported_units = imported_read.tensor
         encoder = MediaEncoder(rank=model_runner.worker_config.rank)
         scheduled: list[HostTask] = []
         borrows: list[HostBorrow] = []
@@ -233,7 +249,19 @@ def execute(
                 # The round's product is indexed from its own first unit;
                 # the unit's index in the track names its frame count.
                 unit = cursor + position
-                borrow = _borrow(publication, position, transports=transports)
+                if imported_units is None:
+                    borrow = _borrow(
+                        publication, position, transports=transports
+                    )
+                else:
+                    if position >= int(imported_units.shape[0]):
+                        raise invalid_descriptor(
+                            "video encoding position exceeds the imported "
+                            "decoded unit round"
+                        )
+                    borrow = _stage_tensor(
+                        imported_units[position : position + 1]
+                    )
                 borrows.append(borrow)
                 frames = config.video_unit_frames[unit]
                 expected = frames * config.height * config.width * 3
@@ -314,7 +342,7 @@ def execute(
             raise invalid_descriptor(
                 "audio encoding requires the complete PCM timeline"
             )
-        track = _stage_track(read.tensor)
+        track = _stage_tensor(read.tensor)
         try:
             tasks = (
                 media_mux.audio(

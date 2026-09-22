@@ -116,7 +116,8 @@ pub struct WorkerExecutor {
     admissions: HashMap<RequestKey, NewRequest>,
     admitted_workers: HashSet<(usize, RequestKey)>,
     buffer_routes: HashMap<BufferId, BufferRoute>,
-    buffer_allocations: HashMap<BufferId, BufferAllocation>,
+    /// Persistent buffer addresses are local to a physical Worker address space.
+    buffer_allocations: HashMap<(usize, BufferId), BufferAllocation>,
     buffer_workers: HashMap<BufferId, HashSet<usize>>,
     transfer_products: HashMap<BufferId, TensorPublication>,
     kv_transfers: HashMap<BufferId, KvTransfer>,
@@ -588,6 +589,8 @@ impl WorkerExecutor {
         }
         if lost {
             self.admitted_workers.retain(|(worker, _)| *worker != index);
+            self.buffer_allocations
+                .retain(|(worker, _), _| *worker != index);
             for workers in self.buffer_workers.values_mut() {
                 workers.remove(&index);
             }
@@ -638,7 +641,8 @@ impl WorkerExecutor {
         calls: &[(Call, RequestPlacement)],
     ) -> anyhow::Result<Vec<NewRequest>> {
         let mut admissions = Vec::new();
-        for (call, _) in calls {
+        let mut rows = HashMap::new();
+        for (call, placement) in calls {
             if self
                 .admitted_workers
                 .contains(&(worker_index, call.request_key))
@@ -651,7 +655,20 @@ impl WorkerExecutor {
                     call.request_key
                 )
             })?;
-            admissions.push(admission.clone());
+            let row = placement
+                .request_pool_idx
+                .unwrap_or(admission.request_pool_idx);
+            if let Some(existing) = rows.insert(call.request_key, row) {
+                anyhow::ensure!(
+                    existing == row,
+                    "worker {worker_index} received conflicting request rows for {:?}",
+                    call.request_key
+                );
+                continue;
+            }
+            let mut admission = admission.clone();
+            admission.request_pool_idx = row;
+            admissions.push(admission);
         }
         Ok(admissions)
     }
@@ -783,9 +800,17 @@ impl WorkerExecutor {
             {
                 continue;
             }
+            // A routed destination may reserve a different address from its
+            // producer. Shared-address layouts omit that override and keep the
+            // producer's allocation, which is the established single-pool path.
             let params = self
                 .buffer_allocations
-                .get(dependency)
+                .get(&(worker_index, *dependency))
+                .or_else(|| {
+                    let producer = self.buffer_routes.get(dependency)?;
+                    self.buffer_allocations
+                        .get(&(producer.worker_index, *dependency))
+                })
                 .copied()
                 .ok_or_else(|| {
                     anyhow::anyhow!(
@@ -1095,7 +1120,8 @@ impl WorkerExecutor {
                     }
                     BatchCommand::Free { buffer } => {
                         self.buffer_workers.remove(&buffer);
-                        self.buffer_allocations.remove(&buffer);
+                        self.buffer_allocations
+                            .retain(|(_, identity), _| *identity != buffer);
                         self.buffer_routes.retain(|identity, _| *identity != buffer);
                         self.kv_transfers.remove(&buffer);
                         self.transfer_products
@@ -1126,7 +1152,7 @@ impl WorkerExecutor {
         self.kv_transfers
             .retain(|buffer, _| buffer.owner != request || retained.contains(buffer));
         self.buffer_allocations
-            .retain(|buffer, _| buffer.owner != request || retained.contains(buffer));
+            .retain(|(_, buffer), _| buffer.owner != request || retained.contains(buffer));
         self.buffer_workers
             .retain(|buffer, _| buffer.owner != request || retained.contains(buffer));
     }
@@ -1262,24 +1288,26 @@ impl Executor for WorkerExecutor {
                         .or_default()
                         .insert(call_worker);
                 }
-                for output in call.buffer_outputs() {
-                    let params = placement
-                        .buffers
-                        .iter()
-                        .find(|params| params.buffer == output.buffer_id())
-                        .copied()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "persistent product {:?} has no scheduler params",
-                                output
-                            )
-                        })?;
-                    if let Some(existing) = self.buffer_allocations.insert(params.buffer, params) {
+                for params in &placement.buffers {
+                    if let Some(existing) = self
+                        .buffer_allocations
+                        .insert((call_worker, params.buffer), *params)
+                    {
                         anyhow::ensure!(
-                            existing == params,
-                            "buffer identity was assigned conflicting allocations"
+                            existing == *params,
+                            "buffer identity was assigned conflicting worker-local allocations"
                         );
                     }
+                }
+                for output in call.buffer_outputs() {
+                    anyhow::ensure!(
+                        placement
+                            .buffers
+                            .iter()
+                            .any(|params| params.buffer == output.buffer_id()),
+                        "persistent product {:?} has no scheduler params",
+                        output
+                    );
                 }
                 call_routes.insert(
                     (call.request_key, call.call_id),
@@ -1627,6 +1655,53 @@ mod placement_tests {
             model_components.get("audio_decoder"),
         );
         assert_eq!(slots, [transfer.acknowledgment_slot("host", 0)]);
+    }
+
+    #[test]
+    fn a_shared_producer_names_every_possible_replica_reader() {
+        use crate::executor::TransferConfig;
+        use crate::worker::instance::media_consumer_slots;
+
+        let text = BTreeMap::from([(
+            "text_encoder".to_owned(),
+            ComponentConfig::parallel(vec![0], Default::default()),
+        )]);
+        let denoiser = || {
+            BTreeMap::from([(
+                "denoiser".to_owned(),
+                ComponentConfig::parallel(vec![0], Default::default()),
+            )])
+        };
+        let peers = BTreeMap::from([
+            ("flow-0".to_owned(), denoiser()),
+            ("flow-1".to_owned(), denoiser()),
+            ("text".to_owned(), text.clone()),
+        ]);
+        let routing = BTreeMap::from([(MediaCall::LatentPreparation, "denoiser".to_owned())]);
+        let mut transfer = TransferConfig::default();
+        for worker in ["text", "flow-0", "flow-1"] {
+            transfer.worker_ranks.insert(worker.to_owned(), 1);
+        }
+
+        let slots = media_consumer_slots(
+            &[MediaCall::LatentPreparation],
+            &routing,
+            "text",
+            &text,
+            &peers,
+            &transfer,
+            &[0],
+            0,
+            text.get("text_encoder"),
+        );
+
+        assert_eq!(
+            slots,
+            [
+                transfer.acknowledgment_slot("flow-0", 0),
+                transfer.acknowledgment_slot("flow-1", 0),
+            ]
+        );
     }
 
     #[test]
