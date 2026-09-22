@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 
 from .config import DEFAULT_CONFIG, load_config, server_launch
-from .nsys import NsysCapture
 from .pipeline.run import run_point
 from .pipeline.setup import (
     applied_environment,
@@ -77,41 +76,23 @@ def run(args: argparse.Namespace) -> None:
             launch = prepare_launch(config, point, args.executable)
             point_dir = output_root / point.name
             log_path = output_root / "server-logs" / f"{point.name}.log"
-            capture = (
-                NsysCapture(
-                    point.name,
-                    output_root / "nsys" / point.name,
-                    cuda_trace=args.nsys_cuda_trace,
-                )
-                if args.nsys
-                else None
-            )
-            if capture is not None:
-                launch = capture.wrap_launch(launch)
             launch_record = describe_launch(launch)
-            if capture is not None:
-                launch_record["nsys"] = capture.describe()
             with applied_environment(launch.environment):
-                try:
-                    with ManagedServer(
-                        server,
-                        launch,
-                        log_path,
-                        timeout_s=args.launch_timeout_s,
-                    ):
-                        result = asyncio.run(
-                            run_point(
-                                server.base_url,
-                                point,
-                                point_dir,
-                                launch=launch_record,
-                                timeout_s=args.request_timeout_s,
-                                measurement=capture,
-                            )
+                with ManagedServer(
+                    server,
+                    launch,
+                    log_path,
+                    timeout_s=args.launch_timeout_s,
+                ):
+                    result = asyncio.run(
+                        run_point(
+                            server.base_url,
+                            point,
+                            point_dir,
+                            launch=launch_record,
+                            timeout_s=args.request_timeout_s,
                         )
-                finally:
-                    if capture is not None:
-                        capture.finalize()
+                    )
             status = "pass" if result.summary["validation"]["valid"] else "fail"
             print(
                 f"{point.name}: {status} ({result.summary['ok_count']}"
@@ -150,20 +131,6 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--output-root", type=Path)
     command.add_argument("--launch-timeout-s", type=float, default=1800)
     command.add_argument("--request-timeout-s", type=float, default=6 * 60 * 60)
-    command.add_argument(
-        "--nsys",
-        action="store_true",
-        help="capture the warmed measurement window with Nsight Systems",
-    )
-    command.add_argument(
-        "--nsys-cuda-trace",
-        choices=("cuda", "cuda-hw"),
-        default="cuda",
-        help=(
-            "select Nsight's software CUDA tracing or hardware tracing "
-            "on supported devices"
-        ),
-    )
     command.set_defaults(function=run)
     return parser
 
