@@ -13,7 +13,7 @@ import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
 from uniserve.diffusion import DenoisingStep, normal_noise
-from uniserve.distributed import DeviceMesh
+from uniserve.distributed import DeviceMesh, communication_axes
 from uniserve.model import LatentInput, TextSize
 from uniserve.nn.attention import (
     AttentionParallelConfig,
@@ -119,28 +119,42 @@ def _generate(
     )
     ranks, shape, axes, parallel = _LAYOUTS[kind]
     encoder_ranks = (0, 2, 1, 3)[:encoder_tp]
-    meshes = {
-        "denoiser": groups.bind(
-            DeviceMesh(ranks=ranks, shape=shape, axes=axes, rank=rank),
-            device=device,
-        ),
-        "text_encoder": groups.bind(
-            DeviceMesh(
-                ranks=encoder_ranks,
-                shape=(encoder_tp,),
-                axes=("tp",),
-                rank=rank,
-            ),
-            device=device,
+    topologies = {
+        "denoiser": DeviceMesh(ranks=ranks, shape=shape, axes=axes, rank=rank),
+        "text_encoder": DeviceMesh(
+            ranks=encoder_ranks,
+            shape=(encoder_tp,),
+            axes=("tp",),
+            rank=rank,
         ),
     }
-    config = models.read_config(checkpoint, modules=frozenset(meshes))
+    attention = {"denoiser": parallel}
+    config = models.read_config(checkpoint, modules=frozenset(topologies))
+
+    # Numerical partitions can communicate over multi-axis fibers, such as
+    # merged projections across tensor and head partitions. Every rank,
+    # including nonmembers, creates the fibers the meta description declares
+    # in the same order before loading its local parameters.
+    with torch.device("meta"):
+        description = config.model_class(config.model)
+    meshes = {
+        name: groups.bind(
+            topology,
+            device=device,
+            axes=communication_axes(
+                description.get_submodule(name),
+                topology,
+                attention=attention.get(name, AttentionParallelConfig()),
+            ),
+        )
+        for name, topology in topologies.items()
+    }
     model = models.load_model(
         config,
         device=device,
         precision=precision,
         meshes=meshes,
-        attention={"denoiser": parallel},
+        attention=attention,
     ).model
     world = groups.process_group
     for index, (frames, token_ids) in enumerate(requests):
