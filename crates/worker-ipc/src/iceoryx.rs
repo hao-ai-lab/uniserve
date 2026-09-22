@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::codec::{CodecError, decode_request, decode_response, encode_request, encode_response};
-use crate::{RequestKind, ResponseKind, WorkerRequest, WorkerResponse};
+use crate::{WorkerRequest, WorkerResponse};
 use iceoryx2::active_request::ActiveRequest;
 use iceoryx2::pending_response::PendingResponse;
 use iceoryx2::port::client::Client;
@@ -18,9 +18,7 @@ use iceoryx2_bb_elementary_traits::zero_copy_send::ZeroCopySend;
 
 mod events;
 use events::{ClientEvents, ServerEvents};
-pub use events::{
-    EVT_COMMAND, EVT_COMPLETION, EVT_DEATH, EVT_REQUEST, EVT_RESULT, WakeEvents, WakeSender,
-};
+pub use events::{EVT_COMPLETION, EVT_DEATH, EVT_REQUEST, EVT_RESULT, WakeEvents, WakeSender};
 
 /// Default namespace prefix for per-worker iceoryx2 services.
 pub const DEFAULT_SERVICE_PREFIX: &str = "uniserve/worker";
@@ -31,6 +29,9 @@ pub type IpcResult<T> = std::result::Result<T, IpcError>;
 /// Codec, transport, timeout, and protocol failures at the IPC boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum IpcError {
+    /// Submission was not accepted because the bounded send queue is full.
+    #[error("rank channel send queue is full")]
+    WouldBlock,
     /// Payload encoding, decoding, or semantic validation failed.
     #[error(transparent)]
     Codec(#[from] CodecError),
@@ -106,67 +107,71 @@ macro_rules! ipc_error {
 }
 
 /// IPC version this build emits on every [`Header`].
-pub const IPC_VERSION: u16 = 68;
+pub const IPC_VERSION: u16 = 69;
 
 /// Returns whether this build can decode a peer-advertised IPC `version`.
 pub fn is_supported_ipc_version(version: u16) -> bool {
     version == IPC_VERSION
 }
 
-/// Fixed-size IPC frame header sent zero-copy across the worker process
-/// boundary.
-///
-/// Fields are ordered largest-alignment-first so the `#[repr(C)]` layout is
-/// completely free of implicit padding. The header is shipped via
-/// [`ZeroCopySend`], so padding would copy uninitialized bytes across the
-/// process boundary and make logically equal headers bytewise unstable. The
-/// layout is exactly
-/// `2*u64 + 3*u32 + u16 + 2*u8 = 32` bytes with no holes.
+/// Frame correlation, size, and protocol version. Message semantics live in the payload.
+/// The explicit reserved word keeps this zero-copy C layout padding-free.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
-    /// Batch identity, or zero for frames that carry no batch.
-    pub batch_id: u64,
     /// Request-response correlation identity.
     pub message_id: u64,
     /// Encoded payload length in bytes.
     pub len: u32,
-    /// Reserved protocol word, emitted as zero.
-    pub reserved0: u32,
-    /// Reserved protocol word, emitted as zero.
-    pub reserved1: u32,
     /// Worker IPC protocol version.
     pub version: u16,
-    /// Request or response kind discriminator.
-    pub kind: u8,
-    /// Kind-specific protocol flags.
-    pub flags: u8,
+    /// Reserved word, always zero.
+    pub reserved: u16,
 }
 
 impl Default for Header {
-    /// Returns an empty header stamped with the emitted IPC version.
     fn default() -> Self {
         Self {
-            batch_id: 0,
             message_id: 0,
             len: 0,
-            reserved0: 0,
-            reserved1: 0,
             version: IPC_VERSION,
-            kind: 0,
-            flags: 0,
+            reserved: 0,
         }
     }
 }
 
 unsafe impl ZeroCopySend for Header {}
+const _: () = assert!(std::mem::size_of::<Header>() == 16);
 
-// This assertion binds the C representation to the sum of its field sizes so
-// zero-copy transmission cannot include implicit padding.
-const _: () = assert!(
-    std::mem::size_of::<Header>() == 2 * 8 + 3 * 4 + 2 + 2,
-    "Header must be padding-free for zero-copy transmission"
-);
+impl Header {
+    /// Checks framing before allocating or decoding a payload on either transport.
+    pub(crate) fn validate(&self, bound: usize) -> IpcResult<()> {
+        if !is_supported_ipc_version(self.version) {
+            ipc_bail!(
+                "unsupported IPC version {}: this build requires {}",
+                self.version,
+                IPC_VERSION
+            );
+        }
+        if self.reserved != 0 {
+            ipc_bail!("IPC reserved header word must be zero");
+        }
+        if self.len as usize > bound {
+            ipc_bail!(
+                "rank channel frame of {} bytes exceeds its {bound} byte bound",
+                self.len
+            );
+        }
+        Ok(())
+    }
+
+    /// Stamps the actual length and enforces the common send limit.
+    pub(crate) fn for_payload(mut self, len: usize, bound: usize) -> IpcResult<Self> {
+        self.len = payload_len_u32(len)?;
+        self.validate(bound)?;
+        Ok(self)
+    }
+}
 
 /// Received frame header and owned FlatBuffers payload.
 pub struct Frame {
@@ -179,11 +184,13 @@ pub struct Frame {
 impl Frame {
     /// Decodes this frame as a worker request.
     pub fn decode_request(&self) -> IpcResult<WorkerRequest> {
+        verify_header_len(self.header, self.payload.len())?;
         decode_request(&self.payload).map_err(Into::into)
     }
 
     /// Decodes this frame as a worker response.
     pub fn decode_response(&self) -> IpcResult<WorkerResponse> {
+        verify_header_len(self.header, self.payload.len())?;
         decode_response(&self.payload).map_err(Into::into)
     }
 }
@@ -226,6 +233,7 @@ pub struct ClientEndpoint {
     _node: Node<IxService>,
     /// Request-response port used to loan and send request frames.
     client: IxClient,
+    max_payload: usize,
     /// Deadline for establishing or awaiting worker connectivity.
     connect_timeout: Duration,
     /// Directional wake ports paired with the request-response service.
@@ -234,11 +242,7 @@ pub struct ClientEndpoint {
 
 impl ClientEndpoint {
     /// Connects a host endpoint to an existing worker service.
-    pub fn connect(
-        service: &str,
-        initial_max_slice_len: usize,
-        max_inflight: usize,
-    ) -> IpcResult<Self> {
+    pub fn connect(service: &str, max_payload: usize, max_inflight: usize) -> IpcResult<Self> {
         // Create the request-response service with bounded, non-overflowing
         // capacity so every pending handle names one retained request.
         let service_name = ServiceName::new(service).context("invalid iceoryx2 service name")?;
@@ -263,7 +267,7 @@ impl ClientEndpoint {
         // Power-of-two growth accommodates variable FlatBuffers frame sizes.
         let client = factory
             .client_builder()
-            .initial_max_slice_len(initial_max_slice_len.max(1))
+            .initial_max_slice_len(max_payload.clamp(1, 64 * 1024))
             .allocation_strategy(AllocationStrategy::PowerOfTwo)
             .create()
             .context("creating iceoryx2 client port")?;
@@ -273,12 +277,13 @@ impl ClientEndpoint {
         Ok(Self {
             _node: node,
             client,
+            max_payload,
             connect_timeout: Duration::from_secs(300),
             events,
         })
     }
 
-    /// Parks for {result, command, death} until a wake fires or `timeout`
+    /// Parks for {result, death} until a wake fires or `timeout`
     /// elapses. Returns which sources fired.
     pub fn wait_wake(&self, timeout: Duration) -> IpcResult<WakeEvents> {
         self.events.wait(timeout)
@@ -293,11 +298,6 @@ impl ClientEndpoint {
     /// Returns the borrowed descriptor used by an external poll loop.
     pub fn wake_file_descriptor(&self) -> i32 {
         self.events.file_descriptor()
-    }
-
-    /// Returns a cloneable wake source for queued host commands.
-    pub fn command_wake(&self) -> WakeSender {
-        self.events.command_wake()
     }
 
     /// Returns a cloneable wake source for worker-process exit.
@@ -339,6 +339,7 @@ impl ClientEndpoint {
 
     /// Attempts one non-blocking pre-encoded frame submission.
     pub fn send_raw_attempt(&self, header: Header, payload: &[u8]) -> IpcResult<Pending> {
+        let header = header.for_payload(payload.len(), self.max_payload)?;
         // Loan exact shared-memory capacity, initialize the header and payload,
         // then transfer ownership to the request-response service.
         let mut request = self
@@ -358,8 +359,9 @@ impl ClientEndpoint {
             return Ok(None);
         };
         let header = *response.user_header();
+        header.validate(self.max_payload)?;
+        verify_header_len(header, response.payload().len())?;
         let payload = response.payload().to_vec();
-        verify_header_len(header, payload.len())?;
         Ok(Some(Frame { header, payload }))
     }
 
@@ -389,6 +391,7 @@ pub struct ServerEndpoint {
     _node: Node<IxService>,
     /// Request-response port used to receive and answer request frames.
     server: IxServer,
+    max_payload: usize,
     /// Active requests retained until their matching `message_id` is answered.
     active: VecDeque<(u64, IxActive)>,
     /// Directional wake ports paired with the request-response service.
@@ -397,11 +400,7 @@ pub struct ServerEndpoint {
 
 impl ServerEndpoint {
     /// Creates the worker endpoint and its directional wake services.
-    pub fn bind(
-        service: &str,
-        initial_max_slice_len: usize,
-        max_inflight: usize,
-    ) -> IpcResult<Self> {
+    pub fn bind(service: &str, max_payload: usize, max_inflight: usize) -> IpcResult<Self> {
         // Mirror client capacity on a single-server, single-client service and
         // disable overflow so request ownership remains explicit.
         let service_name = ServiceName::new(service).context("invalid iceoryx2 service name")?;
@@ -426,7 +425,7 @@ impl ServerEndpoint {
         // Allocate response buffers with the same variable-size strategy.
         let server = factory
             .server_builder()
-            .initial_max_slice_len(initial_max_slice_len.max(1))
+            .initial_max_slice_len(max_payload.clamp(1, 64 * 1024))
             .allocation_strategy(AllocationStrategy::PowerOfTwo)
             .max_loaned_responses_per_request(1)
             .create()
@@ -437,6 +436,7 @@ impl ServerEndpoint {
         Ok(Self {
             _node: node,
             server,
+            max_payload,
             active: VecDeque::new(),
             events,
         })
@@ -454,8 +454,9 @@ impl ServerEndpoint {
         // Receiving from the ring consumes the work represented by wake hints.
         self.events.drain_worker_wakes()?;
         let header = *active.user_header();
+        header.validate(self.max_payload)?;
+        verify_header_len(header, active.payload().len())?;
         let payload = active.payload().to_vec();
-        verify_header_len(header, payload.len())?;
         // Retain transport ownership until a response with this message id arrives.
         self.active.push_back((header.message_id, active));
         Ok(Some(Frame { header, payload }))
@@ -492,6 +493,7 @@ impl ServerEndpoint {
 
     /// Publishes a pre-encoded response for the active request.
     pub fn respond_raw(&mut self, header: Header, payload: &[u8]) -> IpcResult<()> {
+        let header = header.for_payload(payload.len(), self.max_payload)?;
         // Resolve and remove the exact active transport request before loaning
         // its response buffer.
         let pos = self
@@ -527,49 +529,25 @@ impl ServerEndpoint {
     }
 }
 
-/// Builds the IPC header that accompanies `req`.
-///
-/// `message_id` is the authoritative request/response correlation key. The
-/// `batch_id` field is a diagnostic hint populated from the batch; the decoded
-/// payload is authoritative for the call identities it carries.
+/// Builds the request correlation header; send stamps the encoded length.
 pub fn header_for_request(req: &WorkerRequest) -> Header {
-    let mut h = Header {
-        kind: request_kind_code(req.kind()),
+    Header {
         message_id: req.message_id().unwrap_or_default(),
         ..Default::default()
-    };
-    if let Some(batch) = req.batch() {
-        h.batch_id = batch.batch_id;
     }
-    h
 }
 
-/// Builds the IPC header that accompanies `resp`.
-///
-/// `message_id` is the authoritative request/response correlation key. The
-/// `batch_id` field is a diagnostic hint populated from the result; the decoded
-/// payload is authoritative for the call identities it carries.
+/// Builds the response correlation header; send stamps the encoded length.
 pub fn header_for_response(resp: &WorkerResponse) -> Header {
-    let mut h = Header {
-        kind: response_kind_code(resp.kind()),
+    Header {
         message_id: resp.message_id().unwrap_or_default(),
         ..Default::default()
-    };
-    if let Some(report) = resp.report() {
-        h.batch_id = report.batch_id;
     }
-    h
 }
 
 /// Verifies protocol version and payload length before frame decoding.
 fn verify_header_len(header: Header, actual: usize) -> IpcResult<()> {
-    if !is_supported_ipc_version(header.version) {
-        ipc_bail!(
-            "unsupported IPC version {}: this build requires {}",
-            header.version,
-            IPC_VERSION
-        );
-    }
+    header.validate(u32::MAX as usize)?;
     if header.len as usize != actual {
         ipc_bail!(
             "IPC payload length mismatch: header={} actual={actual}",
@@ -579,32 +557,35 @@ fn verify_header_len(header: Header, actual: usize) -> IpcResult<()> {
     Ok(())
 }
 
-/// Maps a request kind to its diagnostic header byte.
-///
-/// The FlatBuffers payload remains authoritative for request dispatch.
-fn request_kind_code(kind: RequestKind) -> u8 {
-    match kind {
-        RequestKind::Info => 1,
-        RequestKind::Submit => 2,
-        RequestKind::Close => 3,
-    }
-}
-
-/// Maps a response kind to its diagnostic header byte.
-///
-/// The FlatBuffers payload remains authoritative for response dispatch.
-fn response_kind_code(kind: ResponseKind) -> u8 {
-    match kind {
-        ResponseKind::Info => 1,
-        ResponseKind::Result => 2,
-        ResponseKind::Ok => 3,
-        ResponseKind::Error => 4,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_memory_enforces_the_payload_bound_in_both_directions() {
+        let service = format!("payload-bound-{}", std::process::id());
+        let mut server = ServerEndpoint::bind(&service, 256, 2).unwrap();
+        let client = ClientEndpoint::connect(&service, 256, 2).unwrap();
+        assert!(client.send_raw(Header::default(), &[0; 257]).is_err());
+        let pending = client
+            .send_raw(
+                Header {
+                    message_id: 7,
+                    ..Header::default()
+                },
+                &[9; 256],
+            )
+            .unwrap();
+        let request = server.recv().unwrap();
+        assert_eq!(request.payload, vec![9; 256]);
+        assert!(server.respond_raw(request.header, &[0; 257]).is_err());
+        server.respond_raw(request.header, &[3; 256]).unwrap();
+        let response = client
+            .recv_response_timeout(&pending, Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.payload, vec![3; 256]);
+    }
 
     #[test]
     fn header_len_matches_encoded_request() {

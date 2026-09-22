@@ -39,11 +39,6 @@ impl Qwen3XmlToolParser {
         }
     }
 
-    /// Returns whether decoding must preserve tool-call markers.
-    pub const fn preserve_special_tokens(&self) -> bool {
-        false
-    }
-
     /// Parses one text chunk into an existing output accumulator.
     pub fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()> {
         self.inner.parse_into(chunk, output)

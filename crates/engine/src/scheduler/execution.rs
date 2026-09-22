@@ -99,7 +99,7 @@ impl Scheduler {
             return self.executor.has_capacity(id).then_some((id, component));
         }
 
-        // A new lineage goes to the least-resident ready replica. Queue
+        // A new request goes to the least-resident ready replica. Queue
         // capacity remains a hard admission condition; residency breaks ties
         // so a burst fans out instead of filling the first configured worker.
         candidates
@@ -247,13 +247,18 @@ impl Scheduler {
             .get_mut(&id)
             .and_then(|state| state.allocations_mut().latent.take());
         if let Some(allocation) = allocation {
-            self.free_allocation(allocation);
+            self.latent_pool.free(allocation);
         }
     }
     /// Advances scheduler and executor work, blocking only for an outstanding result.
     ///
     /// Returns whether the loop made progress or handled an executor outcome.
-    pub fn step(&mut self) -> bool {
+    pub fn step(&mut self, commands: &Receiver<Command>) -> bool {
+        if self.drain_commands(commands) {
+            self.abort_all_requests();
+            let _ = self.executor.close();
+            return false;
+        }
         let progressed = self.step_nonblocking();
         if progressed || self.pending_batches.is_empty() {
             return progressed;
@@ -1544,7 +1549,7 @@ impl Scheduler {
                             .and_then(|state| state.buffers.remove(buffer))
                     });
                 if let Some(allocation) = allocation {
-                    self.free_allocation(allocation);
+                    self.buffer_pool.free(allocation);
                 }
             } else if let BatchCommand::Finish { request_key, .. } = command {
                 let id = request_key.request_id;
@@ -1571,17 +1576,14 @@ impl Scheduler {
                     .retiring_requests
                     .remove(&id)
                     .expect("retiring request exists");
-                for allocation in retiring.buffers.into_values().chain(retiring.allocations) {
-                    self.free_allocation(allocation);
+                for buffer in retiring.buffers.into_values() {
+                    self.buffer_pool.free(buffer);
                 }
-                for (worker, allocation) in retiring.media_allocations {
-                    match allocation {
-                        Allocation::RequestSlot { .. } => {
-                            self.free_media_request(&worker, allocation)
-                        }
-                        Allocation::Buffer { .. } => self.free_media_buffer(&worker, allocation),
-                        _ => unreachable!("media retirement owns request rows and buffers"),
-                    }
+                for allocation in retiring.allocations {
+                    allocation.free(self);
+                }
+                if let Some(media) = retiring.media_allocations {
+                    media.free(self);
                 }
             }
         }
@@ -1603,7 +1605,7 @@ impl Scheduler {
             return false;
         };
 
-        // Bound speculation by worker capacity and exclude lineages whose
+        // Bound speculation by worker capacity and exclude requests whose
         // terminal or relay state makes the projection unsafe.
         if queue.len() >= self.info.max_unresolved_calls as usize
             || state.terminal_intent.is_terminal()
@@ -1787,10 +1789,10 @@ impl Scheduler {
         let Some(state) = self.running.get(&id) else {
             return false;
         };
-        if state.output.is_closed() {
+        if state.output.events.is_closed() {
             return false;
         }
-        let available = state.output.available_capacity();
+        let available = state.output.events.available_capacity();
         let reserved = self
             .pending_calls
             .get(&id)
@@ -1931,8 +1933,8 @@ impl Scheduler {
             Ok(media) => media,
             Err(message) => {
                 let event = EngineCoreOutput::ArtifactUnavailable { message };
-                if let Some(state) = self.media_state(id) {
-                    let _ = state.event_tx.send(event);
+                if let Some(state) = self.media_state_mut(id) {
+                    let _ = state.output.enqueue(event);
                 } else {
                     self.emit(id, event);
                 }
@@ -2047,7 +2049,7 @@ impl Scheduler {
                     CallKind::Media(MediaCall::Muxing) => "finalizing",
                     _ => unreachable!("media request completed a non-media computation"),
                 };
-                let _ = state.event_tx.send(EngineCoreOutput::MediaProgress {
+                let _ = state.output.enqueue(EngineCoreOutput::MediaProgress {
                     phase: phase.to_owned(),
                     completed_steps: state.num_completed_steps,
                 });
@@ -2077,7 +2079,7 @@ impl Scheduler {
                 Some(DiffusionTerminal::Failed(message.clone()))
             } else if let TerminalIntent::Finish(reason) = &state.terminal_intent {
                 Some(DiffusionTerminal::Finished(reason.clone()))
-            } else if state.event_tx.is_closed() {
+            } else if state.output.is_closed() {
                 Some(DiffusionTerminal::Finished(FinishReason::Cancelled))
             } else if state.muxed {
                 let event = state.artifact.clone().map_or_else(
@@ -2096,14 +2098,14 @@ impl Scheduler {
 
     /// Emits terminal media output and releases all request-owned resources.
     pub(super) fn finish_media(&mut self, id: RequestId, event: DiffusionTerminal) {
-        let Some(state) = self.take_media_state(id) else {
+        let Some(mut state) = self.take_media_state(id) else {
             return;
         };
         self.running_order.retain(|candidate| *candidate != id);
         match event {
             DiffusionTerminal::Completed(artifact) => {
-                let _ = state.event_tx.send(EngineCoreOutput::Artifact(artifact));
-                let _ = state.event_tx.send(EngineCoreOutput::Finished {
+                let _ = state.output.enqueue(EngineCoreOutput::Artifact(artifact));
+                let _ = state.output.enqueue(EngineCoreOutput::Finished {
                     reason: FinishReason::Completed,
                     stop_reason: None,
                     prompt_tokens: state.request.prompt_token_ids.len(),
@@ -2112,10 +2114,10 @@ impl Scheduler {
                 });
             }
             DiffusionTerminal::Failed(message) => {
-                let _ = state.event_tx.send(EngineCoreOutput::Error { message });
+                let _ = state.output.enqueue(EngineCoreOutput::Error { message });
             }
             DiffusionTerminal::Finished(reason) => {
-                let _ = state.event_tx.send(EngineCoreOutput::Finished {
+                let _ = state.output.enqueue(EngineCoreOutput::Finished {
                     reason,
                     stop_reason: None,
                     prompt_tokens: state.request.prompt_token_ids.len(),
@@ -2124,6 +2126,7 @@ impl Scheduler {
                 });
             }
         }
+        self.output.retire(id, state.output);
         match state.admission_state {
             WorkerRegistration::Unsubmitted => {
                 state.allocations.free(self);
@@ -2141,7 +2144,7 @@ impl Scheduler {
             RetiringRequest {
                 request_key,
                 allocations: Vec::new(),
-                media_allocations: state.allocations.into_allocations(),
+                media_allocations: Some(state.allocations),
                 buffers: HashMap::new(),
             },
         );
@@ -2171,7 +2174,7 @@ impl Scheduler {
             if let Some(allocation) = self.take_encoder_buffer(buffer) {
                 if let Some(previous) = self.pending_buffer_frees.insert(buffer, allocation) {
                     tracing::error!(?buffer, "buffer free identity was already pending");
-                    self.free_allocation(previous);
+                    self.buffer_pool.free(previous);
                     self.fatal = true;
                 }
             }

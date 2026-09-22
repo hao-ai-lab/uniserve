@@ -456,18 +456,7 @@ impl InputProcessor {
                 Some("prompt"),
             ));
         }
-        let ModelParameters::MiniMaxH3 {
-            max_video_seconds,
-            num_inference_steps,
-        } = &self.config.parameters
-        else {
-            return Err(crate::openai::serve_error_to_api(
-                ServeError::UnsupportedFeature {
-                    request_id: request_id.clone(),
-                    feature: "video_generation",
-                },
-            ));
-        };
+        let (_, sampling) = self.video_sampling(request_id, seconds, seed)?;
         // Tokenize and bound the prompt before deriving any media allocation.
         let prompt_token_ids = self
             .tokenizer
@@ -494,6 +483,35 @@ impl InputProcessor {
                 },
             ));
         }
+        Ok(uniserve_core::DiffusionRequest {
+            request_id: uniserve_core::RequestId(0),
+            prompt_token_ids,
+            priority: 0,
+            sampling,
+        })
+    }
+
+    /// Resolves the advertised duration default and the model's frame alignment.
+    pub fn video_sampling(
+        &self,
+        request_id: &crate::serving::ServeRequestId,
+        seconds: Option<f64>,
+        seed: u64,
+    ) -> std::result::Result<(f64, uniserve_core::DiffusionSamplingParams), crate::openai::ApiError>
+    {
+        let ModelParameters::MiniMaxH3 {
+            max_video_seconds,
+            num_inference_steps,
+        } = &self.config.parameters
+        else {
+            return Err(crate::openai::serve_error_to_api(
+                ServeError::UnsupportedFeature {
+                    request_id: request_id.clone(),
+                    feature: "video_generation",
+                },
+            ));
+        };
+        let seconds = seconds.unwrap_or(max_video_seconds.min(5.0));
         // Duration is a public floating-point input and must be finite before
         // conversion to the fixed-width frame protocol.
         if !seconds.is_finite() || seconds <= 0.0 || seconds > *max_video_seconds {
@@ -526,17 +544,15 @@ impl InputProcessor {
         // Each H3 video media unit consumes a temporal latent window and emits its
         // non-overlapping frame interval; the model owns overlap reconstruction.
         let video_units = (frame_count - 5) / 17;
-        Ok(uniserve_core::DiffusionRequest {
-            request_id: uniserve_core::RequestId(0),
-            prompt_token_ids,
-            priority: 0,
-            sampling: uniserve_core::DiffusionSamplingParams {
+        Ok((
+            seconds,
+            uniserve_core::DiffusionSamplingParams {
                 num_frames: frame_count,
                 video_units,
                 num_inference_steps: *num_inference_steps,
                 seed,
             },
-        })
+        ))
     }
 
     /// Builds the model identity stamped onto accepted events.
@@ -749,7 +765,7 @@ impl InputProcessor {
                 seed: image_gen
                     .as_ref()
                     .and_then(|image| image.seed)
-                    .or_else(|| sampling.seed.and_then(|seed| seed.try_into().ok())),
+                    .or_else(|| sampling.seed.map(|seed| seed as u64)),
                 ..SamplingParams::default()
             },
             image: ImageParams::default(),
@@ -965,14 +981,6 @@ impl InputProcessor {
     ) -> std::result::Result<(SamplingParams, u32, Vec<u32>), crate::serving::TokenizeError> {
         let defaults = &self.config.sampling_defaults;
 
-        let temperature = sampling.temperature.or(defaults.temperature).unwrap_or(1.0);
-        let top_p = sampling.top_p.or(defaults.top_p).unwrap_or(1.0);
-        let top_k = sampling.top_k.or(defaults.top_k).unwrap_or(0);
-        let min_p = sampling.min_p.or(defaults.min_p).unwrap_or(0.0);
-        let repetition_penalty = sampling
-            .repetition_penalty
-            .or(defaults.repetition_penalty)
-            .unwrap_or(1.0);
         let max_tokens = resolve_max_tokens(
             sampling.max_tokens,
             defaults.max_output_tokens,
@@ -980,8 +988,6 @@ impl InputProcessor {
             prompt_len,
         )?;
         let min_tokens = sampling.min_tokens.unwrap_or(0);
-        let frequency_penalty = sampling.frequency_penalty.unwrap_or(0.0);
-        let presence_penalty = sampling.presence_penalty.unwrap_or(0.0);
 
         let mut stop_token_ids = stop.stop_token_ids.clone();
         if !sampling.ignore_eos {
@@ -997,16 +1003,6 @@ impl InputProcessor {
             }
         }
 
-        for (field, value) in [
-            ("logprobs", stop.logprobs),
-            ("prompt_logprobs", stop.prompt_logprobs),
-        ] {
-            if let Some(value) = value
-                && value < -1
-            {
-                return Err(crate::serving::TokenizeError::InvalidLogprobCount { field, value });
-            }
-        }
         if min_tokens > max_tokens {
             return Err(crate::serving::TokenizeError::MinTokensExceedsMaximum {
                 min_tokens,
@@ -1014,46 +1010,15 @@ impl InputProcessor {
             });
         }
 
-        let bad_words_ids = tokenize_bad_words(&stop.bad_words, self.tokenizer.as_ref())?;
-
-        let mut canonical_logit_bias: Vec<(u32, f32)> = stop
-            .logit_bias
-            .as_ref()
-            .map(|biases| biases.iter().map(|(&token, &bias)| (token, bias)).collect())
-            .unwrap_or_default();
-        canonical_logit_bias.sort_by_key(|(token, _)| *token);
-
-        let core = SamplingParams {
-            temperature,
-            top_k,
-            top_p,
-            ignore_eos: sampling.ignore_eos,
-            seed: sampling.seed.map(|value| value as u64),
-            min_p,
-            repetition_penalty,
-            frequency_penalty,
-            presence_penalty,
-            logit_bias: canonical_logit_bias,
-            min_tokens: min_tokens as usize,
-            return_logprobs: stop.logprobs.is_some() || stop.logprob_token_ids.is_some(),
-            n_logprobs: match stop.logprobs {
-                Some(-1) => u32::MAX,
-                Some(value) => value as u32,
-                None => 0,
-            },
-            return_prompt_logprobs: stop.prompt_logprobs.is_some(),
-            n_prompt_logprobs: match stop.prompt_logprobs {
-                Some(-1) => u32::MAX,
-                Some(value) => value as u32,
-                None => 0,
-            },
-            logprob_token_ids: stop.logprob_token_ids.clone().unwrap_or_default(),
-            bad_words_ids: bad_words_ids.unwrap_or_default(),
-            allowed_token_ids: stop.allowed_token_ids.clone(),
-            typical_p: 1.0,
-            forced_token_ids: Vec::new(),
+        let mut core = SamplingParams {
+            temperature: defaults.temperature.unwrap_or(1.0),
+            top_k: defaults.top_k.unwrap_or(0),
+            top_p: defaults.top_p.unwrap_or(1.0),
+            min_p: defaults.min_p.unwrap_or(0.0),
+            repetition_penalty: defaults.repetition_penalty.unwrap_or(1.0),
+            ..SamplingParams::default()
         };
-        core.validate()?;
+        super::sampling::apply_sampling(&self.tokenizer, sampling, stop, &mut core)?;
 
         // Logprob feature gate.
         if (stop.logprobs.is_some() || stop.prompt_logprobs.is_some())
@@ -1066,32 +1031,6 @@ impl InputProcessor {
 
         Ok((core, max_tokens, stop_token_ids))
     }
-}
-
-/// Converts bad-word strings into token-ID sequences, encoding each word both
-/// with and without a leading space (prefix-space convention) and deduping.
-fn tokenize_bad_words(
-    bad_words: &[String],
-    tokenizer: &crate::profile::tokenizer::HuggingFaceTokenizer,
-) -> std::result::Result<Option<Vec<Vec<u32>>>, crate::profile::tokenizer::TokenizerError> {
-    if bad_words.is_empty() {
-        return Ok(None);
-    }
-    let mut all_token_ids = Vec::new();
-    for bad_word in bad_words {
-        let without_space = tokenizer.encode(bad_word, false)?;
-        let with_space = tokenizer.encode(&format!(" {}", bad_word.trim_start()), false)?;
-        let keep_with_space = !with_space.is_empty()
-            && (without_space.is_empty()
-                || (with_space[0] != without_space[0] && with_space.len() == without_space.len()));
-        if !without_space.is_empty() {
-            all_token_ids.push(without_space);
-        }
-        if keep_with_space {
-            all_token_ids.push(with_space);
-        }
-    }
-    Ok((!all_token_ids.is_empty()).then_some(all_token_ids))
 }
 
 /// Computes a deterministic identifier for a preprocessed request.

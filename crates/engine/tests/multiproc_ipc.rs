@@ -728,6 +728,21 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         vec![(WorkerId("worker".into()), WorkerGroup::spawn(args)?)],
         transfer,
     )?;
+    // Delay the command-only rank until the producer's completion is observed.
+    // Its later acknowledgment must retire the same batch exactly once.
+    let rank = std::fs::read_to_string("/proc/thread-self/children")?
+        .split_whitespace()
+        .find_map(|pid| {
+            let args = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+            args.split(|byte| *byte == 0)
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|pair| pair == [b"--rank".as_slice(), b"0".as_slice()])
+                .then(|| pid.parse::<i32>().ok())
+                .flatten()
+        })
+        .context("command-only rank was not found")?;
+    let mut delayed_rank = PausedProcess::new(rank)?;
     let bind = |mut batch: Batch, entry: &str| {
         let mut call = batch.calls.remove(0);
         call.component = entry.into();
@@ -883,10 +898,11 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut failed = false;
     let mut source_returned = false;
+    let mut source_done = false;
     let mut batch_done = false;
     let mut independent_returned = false;
     while std::time::Instant::now() < deadline
-        && !(failed && source_returned && batch_done && independent_returned)
+        && !(failed && source_returned && source_done && batch_done && independent_returned)
     {
         match executor.poll(Duration::from_millis(100)) {
             Err(error) => {
@@ -902,7 +918,9 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
                 failed = true;
             }
             Ok(Some(result)) => {
+                source_done |= result.done && result.batch_id == 1;
                 batch_done |= result.done && result.batch_id == 3;
+                let done = result.done;
                 for result in result.results {
                     match result.output.call_id {
                         CallId {
@@ -911,7 +929,9 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
                         } => {
                             assert_eq!(result.output.status, CallStatus::Error);
                             assert!(!source_returned);
+                            assert!(!done, "command-only rank has not acknowledged yet");
                             source_returned = true;
+                            delayed_rank.resume()?;
                         }
                         CallId {
                             batch_id: 3,
@@ -929,7 +949,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
             Ok(None) => {}
         }
     }
-    assert!(failed && source_returned && batch_done && independent_returned);
+    assert!(failed && source_returned && source_done && batch_done && independent_returned);
     executor.close()?;
     Ok(())
 }

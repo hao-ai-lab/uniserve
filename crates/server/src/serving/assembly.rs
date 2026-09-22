@@ -176,7 +176,7 @@ pub(super) async fn assemble_chat_event_stream(
 
     // Decode raw engine events first, then apply the model-selected structured
     // chat processor before exposing any public event.
-    let started = Instant::now();
+    let started = event_context.started;
     let emit_context = EmitContext {
         request_id: &request_id,
         event: &event_context,
@@ -202,6 +202,20 @@ pub(super) async fn assemble_chat_event_stream(
     let mut queue_us = None;
     let mut first_visible_output_us = None;
     while let Some(next) = output.next().await {
+        let next = match next {
+            Err(crate::serving::chat::Error::Text(crate::serving::text::Error::Rejected {
+                message,
+                ..
+            })) => {
+                y.yield_ok(RequestOutput::Rejected {
+                    request_id,
+                    message,
+                })
+                .await;
+                return Ok(());
+            }
+            next => next,
+        };
         let event = next.map_err(|error| ServeError::OutputProcessing {
             request_id: request_id.clone(),
             source: OutputProcessingError::Chat(error),
@@ -492,7 +506,7 @@ impl RawAssemblerState {
                 internal_token_count: 0,
                 finish_reason: FinishReason::with_stop_reason(
                     uniserve_core::FinishReason::Stop,
-                    Some(StopReason::Text(stop_string.clone())),
+                    Some(StopReason::String(stop_string.clone())),
                 ),
             });
 
@@ -574,7 +588,7 @@ pub(super) async fn assemble_event_stream(
         mut stream,
     } = assembly;
 
-    let started = Instant::now();
+    let started = event_context.started;
     let emit_context = EmitContext {
         request_id: &request_id,
         event: &event_context,
@@ -814,7 +828,6 @@ pub(super) async fn assemble_event_stream(
                 height,
                 width,
                 bytes,
-                sha256,
                 pixels_png_b64,
             } => {
                 state.ensure_output_ready(&request_id, "image-done event")?;
@@ -825,7 +838,6 @@ pub(super) async fn assemble_event_stream(
                     width: Some(width),
                     height: Some(height),
                     bytes: Some(bytes),
-                    sha256: Some(sha256),
                     pixels_png_b64: Some(pixels_png_b64),
                     elapsed_us: started.elapsed().as_micros() as u64,
                 });
@@ -854,7 +866,7 @@ pub(super) async fn assemble_event_stream(
                     output_token_count: completion_tokens,
                     internal_token_count: completion_tokens
                         .saturating_sub(state.emitted_output_tokens as usize),
-                    finish_reason: generation_text_finish_reason(reason, stop_reason),
+                    finish_reason: FinishReason::with_stop_reason(reason, stop_reason),
                 };
 
                 let done = emit_text_update(
@@ -927,23 +939,6 @@ pub(super) async fn assemble_event_stream(
     ))
 }
 
-/// Returns the text finish reason from a generation event.
-fn generation_text_finish_reason(
-    reason: uniserve_core::FinishReason,
-    stop_reason: Option<uniserve_core::StopReason>,
-) -> FinishReason {
-    if reason == uniserve_core::FinishReason::Stop {
-        return FinishReason::with_stop_reason(
-            reason,
-            stop_reason.map(|reason| match reason {
-                uniserve_core::StopReason::Token(id) => StopReason::TokenId(id),
-                uniserve_core::StopReason::String(value) => StopReason::Text(value),
-            }),
-        );
-    }
-    FinishReason::new(reason)
-}
-
 /// Returns structured finish details from a generation event.
 fn generation_finish_detail(reason: &uniserve_core::FinishReason) -> &'static str {
     match reason {
@@ -957,4 +952,116 @@ fn generation_finish_detail(reason: &uniserve_core::FinishReason) -> &'static st
         uniserve_core::FinishReason::Repetition => "repetition",
         uniserve_core::FinishReason::Error => "error",
     }
+}
+
+#[try_stream]
+/// Converts diffusion events through the common serving lifecycle and terminal semantics.
+pub(super) async fn assemble_media_event_stream(
+    request_id: ServeRequestId,
+    context: EventContext,
+    prompt_tokens: usize,
+    mut stream: EventRx,
+    mut y: TryYielder<RequestOutput, ServeError>,
+) -> Result<()> {
+    y.yield_ok(RequestOutput::Accepted {
+        request_id: request_id.clone(),
+        served_name: context.served_name.clone(),
+        description: context.description.clone(),
+        compile_duration_us: context.compile_duration_us,
+        prompt_token_count: prompt_tokens,
+        prompt_token_ids: Vec::new(),
+        prompt_logprobs: None,
+    })
+    .await;
+    let mut queue_us = None;
+    let mut first_visible_output_us = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            EngineCoreOutput::Scheduled {
+                queued_at,
+                scheduled_at,
+            } => {
+                queue_us = Some(((scheduled_at - queued_at).max(0.0) * 1_000_000.0) as u64);
+                context.metrics.scheduled.fetch_add(1, Ordering::Relaxed);
+                y.yield_ok(RequestOutput::Scheduled {
+                    request_id: request_id.clone(),
+                    queued_at: Some(queued_at),
+                    scheduled_at: Some(scheduled_at),
+                    cache: context.cache.clone(),
+                    resources: context.resources.clone(),
+                })
+                .await;
+            }
+            EngineCoreOutput::MediaProgress {
+                phase,
+                completed_steps,
+            } => {
+                y.yield_ok(RequestOutput::MediaProgress {
+                    phase,
+                    completed_steps,
+                })
+                .await
+            }
+            EngineCoreOutput::Artifact(artifact) => {
+                first_visible_output_us = Some(context.started.elapsed().as_micros() as u64);
+                y.yield_ok(RequestOutput::Artifact(artifact)).await;
+            }
+            EngineCoreOutput::Finished {
+                reason,
+                stop_reason,
+                ..
+            } => {
+                emit_terminal(
+                    &EmitContext {
+                        request_id: &request_id,
+                        event: &context,
+                        started: &context.started,
+                    },
+                    TerminalAccounting {
+                        queue_us,
+                        first_visible_output_us,
+                        image_count: 0,
+                        image_steps: 0,
+                    },
+                    None,
+                    crate::serving::text::Finished {
+                        prompt_token_count: prompt_tokens,
+                        output_token_count: 0,
+                        internal_token_count: 0,
+                        finish_reason: FinishReason::with_stop_reason(reason, stop_reason),
+                    },
+                    &mut y,
+                )
+                .await;
+                return Ok(());
+            }
+            EngineCoreOutput::Rejected { message } => {
+                y.yield_ok(RequestOutput::Rejected {
+                    request_id,
+                    message,
+                })
+                .await;
+                return Ok(());
+            }
+            EngineCoreOutput::Error { message }
+            | EngineCoreOutput::ArtifactUnavailable { message } => {
+                y.yield_ok(RequestOutput::Failed {
+                    request_id,
+                    message,
+                })
+                .await;
+                return Ok(());
+            }
+            _ => {
+                return Err(malformed_output(
+                    request_id,
+                    "diffusion received a non-media event",
+                ));
+            }
+        }
+    }
+    Err(malformed_output(
+        request_id,
+        "engine stream closed before a terminal event",
+    ))
 }

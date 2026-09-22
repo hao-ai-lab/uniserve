@@ -140,7 +140,6 @@ def assert_generated_image(image: dict[str, Any]) -> None:
     assert (image["width"], image["height"]) == IMAGE_SIZE
     assert png_size_from_b64(image["b64_json"]) == IMAGE_SIZE
     assert image["bytes"] > 0
-    assert len(image["sha256"]) == 64
 
 
 def visible_stream_delta(event: dict[str, Any]) -> dict[str, Any] | None:

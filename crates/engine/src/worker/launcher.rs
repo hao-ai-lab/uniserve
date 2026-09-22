@@ -26,8 +26,6 @@ use serde::{Deserialize, Serialize};
 struct Presentation {
     /// The host identity this launcher owns, as the placement names it.
     host: String,
-    /// A free port of that host for a rendezvous bound by a rank placed there.
-    rendezvous_port: u16,
 }
 
 /// What a launcher says when one of its ranks exits.
@@ -47,9 +45,14 @@ pub(crate) struct RankExit {
 enum Instruction<'a> {
     /// Start one rank from the descriptor the head derived for it.
     Spawn(RemoteLaunch<'a>),
+    Reserve {
+        worker_id: &'a str,
+    },
     /// Stop every rank of one worker group the launcher owns, before the
     /// group is relaunched.
-    Stop { worker_id: &'a str },
+    Stop {
+        worker_id: &'a str,
+    },
     /// Stop every rank the launcher owns.
     Terminate,
 }
@@ -82,8 +85,8 @@ pub(crate) struct RemoteLaunch<'a> {
 struct Launcher {
     stream: TcpStream,
     reader: BufReader<TcpStream>,
-    /// The port the launcher reserved on its host for a rendezvous.
-    rendezvous_port: u16,
+    /// Partial report retained across nonblocking reads.
+    pending: Vec<u8>,
 }
 
 /// The head's launcher registration address and the launchers that presented.
@@ -247,7 +250,7 @@ impl LauncherRegistry {
             Launcher {
                 stream,
                 reader,
-                rendezvous_port: presentation.rendezvous_port,
+                pending: Vec::new(),
             },
         ))
     }
@@ -258,20 +261,42 @@ impl LauncherRegistry {
     /// The first rank binds the collective store, so the store's address has
     /// to be one of that rank's own host: the address its launcher connected
     /// from, at the port the launcher reserved there.
-    pub(crate) fn rendezvous_on(&self, host: &str) -> anyhow::Result<String> {
+    pub(crate) fn rendezvous_on(&mut self, host: &str, worker_id: &str) -> anyhow::Result<String> {
         let launcher = self
             .hosts
-            .get(host)
+            .get_mut(host)
             .with_context(|| format!("no launcher presented host {host}"))?;
-        let address = launcher
+        let address = launcher.stream.peer_addr()?.ip();
+        writeln!(
+            launcher.stream,
+            "{}",
+            serde_json::to_string(&Instruction::Reserve { worker_id })?
+        )?;
+        launcher
             .stream
-            .peer_addr()
-            .with_context(|| format!("reading the address host {host} connected from"))?;
-        Ok(format!(
-            "tcp://{}:{}",
-            address.ip(),
-            launcher.rendezvous_port
-        ))
+            .set_read_timeout(Some(Duration::from_secs(10)))?;
+        let reservation = (|| {
+            loop {
+                let read = launcher.reader.read_until(b'\n', &mut launcher.pending)?;
+                anyhow::ensure!(read > 0, "launcher disconnected while reserving rendezvous");
+                let report: serde_json::Value = serde_json::from_slice(&launcher.pending)?;
+                launcher.pending.clear();
+                if let Some(port) = report.get("port").and_then(serde_json::Value::as_u64) {
+                    anyhow::ensure!(
+                        report["worker_id"] == worker_id && port > 0 && port <= u16::MAX as u64,
+                        "invalid rendezvous reservation"
+                    );
+                    return Ok(format!("tcp://{}", SocketAddr::new(address, port as u16)));
+                }
+                let exit: RankExit = serde_json::from_value(report)?;
+                self.exits
+                    .entry(exit.worker_id.clone())
+                    .or_default()
+                    .push((host.to_owned(), exit));
+            }
+        })();
+        launcher.stream.set_read_timeout(None)?;
+        reservation
     }
 
     /// Sends one rank's launch to the launcher that owns its host.
@@ -303,19 +328,18 @@ impl LauncherRegistry {
             if launcher.stream.set_nonblocking(true).is_err() {
                 continue;
             }
-            let mut line = String::new();
             while launcher
                 .reader
-                .read_line(&mut line)
+                .read_until(b'\n', &mut launcher.pending)
                 .is_ok_and(|read| read > 0)
             {
-                if let Ok(exit) = serde_json::from_str::<RankExit>(line.trim()) {
+                if let Ok(exit) = serde_json::from_slice::<RankExit>(&launcher.pending) {
                     self.exits
                         .entry(exit.worker_id.clone())
                         .or_default()
                         .push((host.clone(), exit));
                 }
-                line.clear();
+                launcher.pending.clear();
             }
             let _ = launcher.stream.set_nonblocking(false);
         }
@@ -436,7 +460,7 @@ mod tests {
         let launcher = std::thread::spawn(move || {
             let mut stream = TcpStream::connect(address).expect("the launcher connects");
             stream
-                .write_all(b"{\"host\":\"b\",\"rendezvous_port\":1}\n")
+                .write_all(b"{\"host\":\"b\"}\n")
                 .expect("the launcher presents");
             stream
                 .write_all(

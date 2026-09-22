@@ -1,17 +1,16 @@
 //! Middleware that tracks active requests and streaming response bodies.
 
-use std::pin::Pin;
 use std::sync::{Arc, Weak};
-use std::task::{Context, Poll};
 
 use axum::Json;
-use axum::body::{Body, Bytes, HttpBody};
+use axum::body::Body;
+
+use super::GuardedBody;
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::header::RETRY_AFTER;
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use http_body::{Frame, SizeHint};
 use serde_json::json;
 
 use crate::AppState;
@@ -82,7 +81,7 @@ pub(crate) async fn track_server_load(
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
-        Body::new(LoadTrackedBody {
+        Body::new(GuardedBody {
             inner: body,
             _guard: guard,
         }),
@@ -100,36 +99,5 @@ impl Drop for ServerLoadGuard {
         if let Some(state) = self.state.upgrade() {
             state.decrement_server_load();
         }
-    }
-}
-
-/// A wrapper around response bodies that tracks server load by holding a
-/// `ServerLoadGuard`, which will decrement the load when the body is fully
-/// consumed and dropped.
-struct LoadTrackedBody {
-    inner: Body,
-    _guard: ServerLoadGuard,
-}
-
-impl HttpBody for LoadTrackedBody {
-    type Data = Bytes;
-    type Error = axum::Error;
-
-    /// Polls the wrapped response body for its next frame.
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        Pin::new(&mut self.inner).poll_frame(cx)
-    }
-
-    /// Returns whether the wrapped response body has ended.
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    /// Returns the wrapped response body size estimate.
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
     }
 }

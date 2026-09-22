@@ -404,7 +404,7 @@ pub const DEFAULT_COMPONENT: &str = "model";
 /// One immutable computation with its identity, data dependencies, and output limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Call {
-    /// Request lineage that owns the call.
+    /// Request that owns the call.
     pub request_key: RequestKey,
     /// Logical batch and selection ordinal of the completed computation.
     pub call_id: CallId,
@@ -542,7 +542,7 @@ impl Call {
     }
     /// Validates family-specific products, bounds, predicates, and RNG state.
     pub fn validate(&self) -> ValidationResult<()> {
-        // Establish call identity, family, lineage, and declared capacity.
+        // Establish call identity, family, request, and declared capacity.
         ensure_valid!(self.call_id.batch_id > 0, "call id must be positive");
         ensure_valid!(
             !self.component.is_empty(),
@@ -673,21 +673,21 @@ impl Call {
             );
         }
 
-        // Only encoder features can be shared across request lineages.
+        // Only encoder features can be shared across requests.
         for input in self.tensor_inputs() {
             input.validate()?;
             ensure_valid!(
                 input.request_key == self.request_key
                     || Some(input) == self.vision_input.as_ref()
                     || Some(input) == self.latent_feature_input.as_ref(),
-                "request-local tensor belongs to another request lineage"
+                "request-local tensor belongs to another request"
             );
         }
         if let Some(predicate) = &self.predicate {
             predicate.validate()?;
             ensure_valid!(
                 predicate.request_key == self.request_key,
-                "computation predicate belongs to another request lineage"
+                "computation predicate belongs to another request"
             );
             ensure_valid!(
                 matches!(predicate.dtype, DType::U8 | DType::I64)
@@ -790,7 +790,7 @@ pub struct MediaOutput {
 /// copy event is query-ready and its pinned fields are validated on the host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestOutput {
-    /// Request lineage completed by the call.
+    /// Request completed by the call.
     pub request_key: RequestKey,
     /// Request-local call identifier.
     pub call_id: CallId,
@@ -885,7 +885,7 @@ impl RequestOutput {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum BatchCommand {
-    /// Establish one request lineage before its first call on a pool.
+    /// Establish one request before its first call on a pool.
     Start {
         /// Static request state installed by the worker.
         request: NewRequest,
@@ -904,7 +904,7 @@ pub enum BatchCommand {
 }
 
 impl BatchCommand {
-    /// Returns the request lineage targeted by this command.
+    /// Returns the request targeted by this command.
     pub fn request_key(&self) -> RequestKey {
         match self {
             Self::Start { request } => request.request_key,
@@ -965,28 +965,21 @@ pub struct ArRequestParams {
     pub initial_position: u32,
 }
 
-/// Unified-multimodal request parameters fixed for the worker request lifetime.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UmmRequestParams {
-    /// Image-generation or transformation parameters.
-    pub image: ImageParams,
-}
-
 pub use uniserve_core::DiffusionSamplingParams;
 
 /// Request-start framing. Carries the per-domain parameters a request
 /// needs before its calls run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewRequest {
-    /// Globally unique request lineage identity.
+    /// Globally unique request identity.
     pub request_key: RequestKey,
     /// Scheduler-assigned stable request-state row. Index zero is reserved for
     /// inactive graph padding and never identifies a live request.
     pub request_pool_idx: u32,
     /// Autoregressive request parameters, when applicable.
     pub ar: Option<ArRequestParams>,
-    /// Unified-multimodal request parameters, when applicable.
-    pub umm: Option<UmmRequestParams>,
+    /// Image request parameters, when applicable.
+    pub image: Option<ImageParams>,
     /// Diffusion request parameters, when applicable.
     pub diffusion: Option<DiffusionSamplingParams>,
     /// Tokenized conditioning supplied at diffusion admission.
@@ -999,18 +992,18 @@ impl NewRequest {
         request_key: RequestKey,
         request_pool_idx: u32,
         ar: Option<ArRequestParams>,
-        umm: Option<UmmRequestParams>,
+        image: Option<ImageParams>,
     ) -> ValidationResult<Self> {
         ensure_valid!(request_pool_idx > 0, "request-pool index must be positive");
         ensure_valid!(
-            ar.is_some() || umm.is_some(),
-            "request start must declare autoregressive or unified-multimodal parameters"
+            ar.is_some() || image.is_some(),
+            "request start must declare autoregressive or image parameters"
         );
         let admission = Self {
             request_key,
             request_pool_idx,
             ar,
-            umm,
+            image,
             diffusion: None,
             prompt_token_ids: Vec::new(),
         };
@@ -1029,7 +1022,7 @@ impl NewRequest {
             request_key,
             request_pool_idx,
             ar: None,
-            umm: None,
+            image: None,
             diffusion: Some(diffusion),
             prompt_token_ids,
         };
@@ -1044,7 +1037,7 @@ impl NewRequest {
             "request-pool index must be positive"
         );
         ensure_valid!(
-            self.ar.is_some() || self.umm.is_some() || self.diffusion.is_some(),
+            self.ar.is_some() || self.image.is_some() || self.diffusion.is_some(),
             "request start must declare one runtime-family parameter set"
         );
         if let Some(ar) = &self.ar {
@@ -1054,8 +1047,8 @@ impl NewRequest {
                 "autoregressive finish token ids are not canonical"
             );
         }
-        if let Some(branch) = &self.umm {
-            branch.image.validate()?;
+        if let Some(branch) = &self.image {
+            branch.validate()?;
         }
         if let Some(diffusion) = &self.diffusion {
             ensure_valid!(
@@ -1237,7 +1230,7 @@ impl ForwardBatch {
 /// Solver-step range and optional paged storage for one request trajectory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatentParams {
-    /// Request lineage that owns the trajectory.
+    /// Request that owns the trajectory.
     pub request_key: RequestKey,
     /// Call that addresses the trajectory.
     pub call_id: CallId,
@@ -1279,7 +1272,7 @@ impl LatentParams {
 /// Cursor and unit bounds for one diffusion decode call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecodeRange {
-    /// Request lineage that owns the media output.
+    /// Request that owns the media output.
     pub request_key: RequestKey,
     /// Decode call receiving the params.
     pub call_id: CallId,
@@ -1737,8 +1730,6 @@ pub struct BatchOutput {
     pub completions: Vec<RequestOutput>,
     /// Product values published by completed calls.
     pub products: Vec<TensorPublication>,
-    /// Visibility result for atomic product registration.
-    pub registration: RegistrationAck,
     /// Aggregate worker execution time in microseconds, when measured.
     pub worker_exec_us: Option<u64>,
     /// Model-forward statistics, when reported by the worker.

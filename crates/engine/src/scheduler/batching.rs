@@ -46,7 +46,7 @@ impl Scheduler {
     }
 
     /// Reserves persistent buffers, latent pages, and transfer capacity for one computation.
-    fn reserve_generation_resources(&mut self, call: &Call) -> Option<Vec<Allocation>> {
+    fn reserve_generation_resources(&mut self, call: &Call) -> Option<Vec<BufferSpan>> {
         let id = call.request_key.request_id;
         if call.code == CallKind::Media(MediaCall::Denoising) && !self.ensure_flow_prefix(id) {
             return None;
@@ -71,7 +71,7 @@ impl Scheduler {
                 Ok(allocation) => allocation,
                 Err(_) => {
                     for allocation in buffer_allocations {
-                        self.free_allocation(allocation);
+                        self.buffer_pool.free(allocation);
                     }
                     if let Some(product) = self.encoder_cache.evict_one() {
                         self.free_buffers([product.buffer_id()]);
@@ -93,16 +93,13 @@ impl Scheduler {
             let Some(state) = self.running.get_mut(&id) else {
                 return None;
             };
-            let request_key = RequestKey::new(self.engine_id, id, state.request_epoch);
             let allocations = state.allocations_mut();
             let result = if let Some(allocation) = allocations.latent.as_mut() {
                 self.latent_pool.grow(allocation, latent_units)
             } else {
-                self.latent_pool
-                    .allocate(request_key, latent_units)
-                    .map(|allocation| {
-                        allocations.latent = Some(allocation);
-                    })
+                self.latent_pool.allocate(latent_units).map(|allocation| {
+                    allocations.latent = Some(allocation);
+                })
             };
             if result.is_err() {
                 for allocation in buffer_allocations {
@@ -255,9 +252,7 @@ impl Scheduler {
                             finish_token_ids,
                             initial_position: st.num_computed_prompt_tokens,
                         }),
-                        st.req.generates_images().then(|| UmmRequestParams {
-                            image: st.req.image.clone(),
-                        }),
+                        st.req.generates_images().then(|| st.req.image.clone()),
                     )
                     .expect("validated request produces a valid admission");
                     // Admission is the first request-state dependency.
@@ -491,7 +486,7 @@ impl Scheduler {
     fn prepare_generation_call(
         &mut self,
         mut call: Call,
-        reserved_buffers: Vec<Allocation>,
+        reserved_buffers: Vec<BufferSpan>,
         admitted: bool,
         planned_us: u64,
         batch: &mut ExecutionBatch,
@@ -699,7 +694,7 @@ impl Scheduler {
             generation::register_call(&mut call, request_key, &mut self.next_product_generation)
         {
             for allocation in reserved_buffers {
-                self.free_allocation(allocation);
+                self.buffer_pool.free(allocation);
             }
             tracing::error!(
                 request_id = request_id.0,
@@ -719,7 +714,7 @@ impl Scheduler {
             .collect::<Vec<_>>();
         if persistent_outputs.len() != reserved_buffers.len() {
             for allocation in reserved_buffers {
-                self.free_allocation(allocation);
+                self.buffer_pool.free(allocation);
             }
             tracing::error!(
                 request_id = request_id.0,
@@ -732,16 +727,13 @@ impl Scheduler {
         let mut call_buffers = Vec::with_capacity(reserved_buffers.len());
         let Some(state) = self.running.get_mut(&request_id) else {
             for allocation in reserved_buffers {
-                self.free_allocation(allocation);
+                self.buffer_pool.free(allocation);
             }
             self.fatal = true;
             return None;
         };
         for (buffer, allocation) in persistent_outputs.into_iter().zip(reserved_buffers) {
-            let (offset, bytes) = match &allocation {
-                Allocation::Buffer { offset, bytes, .. } => (*offset, *bytes),
-                _ => unreachable!("persistent output allocation has a non-buffer params"),
-            };
+            let (offset, bytes) = (allocation.offset, allocation.bytes);
             let replaced = state.allocations_mut().buffers.insert(buffer, allocation);
             debug_assert!(replaced.is_none(), "buffer identity was reused");
             call_buffers.push(BufferAllocation {
@@ -829,10 +821,7 @@ impl Scheduler {
                 .allocations()
                 .latent
                 .as_ref()
-                .and_then(|allocation| match allocation {
-                    Allocation::Latent { pages, .. } => Some(pages.clone()),
-                    _ => None,
-                })
+                .map(|allocation| allocation.pages.clone())
                 .unwrap_or_default();
             let latent_units = self.worker_image_latent_units_for(state).max(1);
             let Some(start_step) = start_step else {
@@ -909,7 +898,6 @@ impl Scheduler {
 
         // Snapshot scheduler gauges at the batch boundary before ownership moves
         // into the executor.
-        self.peak_calls_in_batch = self.peak_calls_in_batch.max(batch.requests.len());
         self.stats
             .general
             .peak_calls
@@ -1071,7 +1059,7 @@ impl Scheduler {
                 if !self.ensure_request_capacity(id, end) {
                     return None;
                 }
-                let sampling_state = self.build_token_masks(id, 0);
+                let sampling_state = self.build_token_masks(id, 0, 0);
 
                 self.plan_computation(id, |_scheduler, request| {
                     generation::plan_prompt(request, cursor as u32, end as u32, sampling_state)
@@ -1087,7 +1075,7 @@ impl Scheduler {
                 } else {
                     0
                 };
-                let sampling_state = self.build_token_masks(id, projected);
+                let sampling_state = self.build_token_masks(id, projected, 0);
                 let st = self.running.get(&id)?;
                 // The prior committed token this decode continues from. It is
                 // attached as a host input only when no exact selected-point
@@ -1228,7 +1216,7 @@ impl Scheduler {
                     return None;
                 };
 
-                let sampling_state = self.build_token_masks(id, 0);
+                let sampling_state = self.build_token_masks(id, 0, usize::from(is_final_step));
                 self.plan_computation(id, |scheduler, request| {
                     generation::plan_image_extend(
                         &scheduler.generation_limits,
@@ -1372,7 +1360,7 @@ impl Scheduler {
             return None;
         }
 
-        let sampling_state = self.build_token_masks(id, 0);
+        let sampling_state = self.build_token_masks(id, 0, 0);
 
         self.plan_computation(id, |_scheduler, request| {
             generation::plan_prompt(request, cursor as u32, end as u32, sampling_state)
@@ -1417,6 +1405,7 @@ impl Scheduler {
         &self,
         id: RequestId,
         projected: usize,
+        completing_images: usize,
     ) -> Option<SamplingState> {
         let n_generated = self.running.get(&id).map_or(0, |state| {
             state.num_generated_tokens.saturating_add(projected)
@@ -1425,6 +1414,7 @@ impl Scheduler {
             state
                 .num_generated_images
                 .saturating_add(self.scheduled_feedback(id).map_or(0, |(_, images)| images))
+                .saturating_add(completing_images)
         });
         let state = self.running.get(&id)?;
         let sampling = &state.req.sampling;
@@ -1441,14 +1431,10 @@ impl Scheduler {
                 suppress.push(last);
             }
         }
-        // Image-budget enforcement: once a request has produced max_images, a
-        // direct branch-opening token is
-        // suppressed, so an eager or positively-biased model must return to
-        // text/EOS instead of emitting an un-actionable trigger into its
-        // own context forever. Suppression beats logit bias (bias skips
-        // -inf'd logits on the worker).
-        if state.req.generates_images()
-            && projected_images_done >= state.req.image.max_images as usize
+        // Disallow unavailable transitions before sampling. The sampled token,
+        // its scores, and any device-resident successor input must agree.
+        if (!state.req.generates_images()
+            || projected_images_done >= state.req.image.max_images as usize)
             && let Some(trigger) = state.req.image_generation.trigger.direct_token()
         {
             suppress.push(trigger);

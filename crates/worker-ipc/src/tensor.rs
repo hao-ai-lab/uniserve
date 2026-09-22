@@ -90,7 +90,7 @@ impl ShapeBound {
 /// producing computation. Actual geometry and locations are published separately.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TensorRef {
-    /// Request lineage that owns the value.
+    /// Request that owns the value.
     pub request_key: RequestKey,
     /// Call that declares the value.
     pub producer_call_id: CallId,
@@ -107,7 +107,7 @@ pub struct TensorRef {
 /// Stable identity for one cross-call buffer, independent of its physical representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BufferId {
-    /// Request lineage that owns the buffer.
+    /// Request that owns the buffer.
     pub owner: RequestKey,
     /// Call that first declares the buffer.
     pub producer_call_id: CallId,
@@ -151,14 +151,6 @@ impl TensorRef {
             .max_elements()
             .saturating_mul(self.dtype.element_bytes())
     }
-}
-
-/// Envelope metadata reporting whether an atomic registration became visible. It
-/// carries no semantic lineage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct RegistrationAck {
-    /// Whether the submitted registration is visible to subsequent calls.
-    pub visible: bool,
 }
 
 /// Transport used to publish a product between worker pools.
@@ -605,6 +597,7 @@ fn transfer_encoded_size(tensors: &[TensorTransfer]) -> usize {
                     endpoint,
                     publication_id,
                     ready_event_handle,
+                    allocation_handle,
                     tensor_stride,
                     span_lengths,
                     storage_offsets_bytes,
@@ -613,6 +606,7 @@ fn transfer_encoded_size(tensors: &[TensorTransfer]) -> usize {
                     .len()
                     .saturating_add(publication_id.len())
                     .saturating_add(ready_event_handle.len())
+                    .saturating_add(allocation_handle.len())
                     .saturating_add(8usize.saturating_mul(tensor_stride.len()))
                     .saturating_add(8usize.saturating_mul(storage_offsets_bytes.len()))
                     .saturating_add(12usize.saturating_mul(span_lengths.len()))
@@ -782,6 +776,7 @@ impl Locator {
                 span_counts,
                 tensor_stride,
                 ready_event_handle,
+                allocation_handle,
                 ..
             } => {
                 ensure_valid!(
@@ -814,10 +809,11 @@ impl Locator {
                         // publishing instead.
                         && (ready_event_handle.len() == 64
                             || ready_event_handle.is_empty())
+                        && matches!(allocation_handle.len(), 4 | 64)
                         && tensor_stride.iter().all(|stride| *stride >= 0),
                     "CUDA VMM transfer handle is incomplete"
                 );
-                let opaque_bytes = ready_event_handle.len();
+                let opaque_bytes = ready_event_handle.len() + allocation_handle.len();
 
                 ensure_valid!(
                     opaque_bytes <= MAX_TRANSFER_HANDLE_BYTES,

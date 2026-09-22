@@ -309,43 +309,6 @@ pub fn record_scheduler_stats(
         .batch_timing_count
         .get_or_create(&labels)
         .inc_by(stats.batch_count);
-
-    // Per-engine performance / MFU counters.
-    if let Some(perf_stats) = &stats.perf_stats
-        && (perf_stats.num_flops_per_gpu != 0
-            || perf_stats.num_read_bytes_per_gpu != 0
-            || perf_stats.num_write_bytes_per_gpu != 0)
-    {
-        metrics
-            .estimated_flops_per_gpu
-            .get_or_create(&labels)
-            .inc_by(perf_stats.num_flops_per_gpu);
-        metrics
-            .estimated_read_bytes_per_gpu
-            .get_or_create(&labels)
-            .inc_by(perf_stats.num_read_bytes_per_gpu);
-        metrics
-            .estimated_write_bytes_per_gpu
-            .get_or_create(&labels)
-            .inc_by(perf_stats.num_write_bytes_per_gpu);
-    }
-
-    // Sampled KV-cache residency histograms.
-    if !stats.kv_cache_eviction_events.is_empty() {
-        let kv_block_lifetime_seconds = metrics.kv_block_lifetime_seconds.get_or_create(&labels);
-        let kv_block_idle_before_evict_seconds = metrics
-            .kv_block_idle_before_evict_seconds
-            .get_or_create(&labels);
-        let kv_block_reuse_gap_seconds = metrics.kv_block_reuse_gap_seconds.get_or_create(&labels);
-
-        for event in &stats.kv_cache_eviction_events {
-            kv_block_lifetime_seconds.observe(event.lifetime_seconds);
-            kv_block_idle_before_evict_seconds.observe(event.idle_seconds);
-            for reuse_gap_seconds in &event.reuse_gaps_seconds {
-                kv_block_reuse_gap_seconds.observe(*reuse_gap_seconds);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

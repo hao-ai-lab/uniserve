@@ -503,12 +503,22 @@ fn buffer_word(buffer: &PyBuffer<u8>, offset: usize) -> PyResult<*mut u32> {
     if buffer.readonly() {
         return Err(py_runtime("atomic word requires a writable buffer"));
     }
-    if offset % 4 != 0 || offset.saturating_add(4) > buffer.len_bytes() {
-        return Err(py_runtime("atomic word offset is outside its buffer"));
+    if !buffer.is_c_contiguous()
+        || offset
+            .checked_add(4)
+            .is_none_or(|end| end > buffer.len_bytes())
+    {
+        return Err(py_runtime(
+            "atomic word requires four bytes in a contiguous buffer",
+        ));
     }
-    // SAFETY: the offset is aligned and inside the buffer, whose memory the
-    // caller keeps mapped while the returned pointer is used.
-    Ok(unsafe { buffer.buf_ptr().cast::<u8>().add(offset).cast::<u32>() })
+    // SAFETY: contiguous storage and the checked byte range permit this address;
+    // the owning PyBuffer remains alive through the atomic operation.
+    let word = unsafe { buffer.buf_ptr().cast::<u8>().add(offset).cast::<u32>() };
+    if !word.is_aligned() {
+        return Err(py_runtime("atomic word address is not aligned"));
+    }
+    Ok(word)
 }
 
 #[pyfunction]

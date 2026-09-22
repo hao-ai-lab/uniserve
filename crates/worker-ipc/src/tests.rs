@@ -330,7 +330,6 @@ fn lane_report(
     batch_id: u64,
     completions: Vec<RequestOutput>,
     products: Vec<TensorPublication>,
-    visible: bool,
     worker_exec_us: Option<u64>,
     forward_stats: Option<ForwardStats>,
 ) -> BatchOutput {
@@ -340,7 +339,7 @@ fn lane_report(
             .map_or(batch_id, |record| record.call_id.batch_id),
         completions,
         products,
-        registration: RegistrationAck { visible },
+
         worker_exec_us,
         forward_stats,
     }
@@ -356,36 +355,76 @@ fn every_call_kind_round_trips_through_ipc() {
     }
 }
 
+/// Constructs malformed wire input independently of the validated encoder.
+fn malformed_call(
+    forward: crate::schema::uniserve::ipc::ForwardMode,
+    media: crate::schema::uniserve::ipc::MediaCall,
+    computed_len: Option<u32>,
+) -> Vec<u8> {
+    use crate::schema::uniserve::ipc as fbs;
+    let mut builder = flatbuffers::FlatBufferBuilder::new();
+    let component = builder.create_string("model");
+    let key = fbs::RequestKey::create(
+        &mut builder,
+        &fbs::RequestKeyArgs {
+            engine_id: 1,
+            request_id: 1,
+            request_epoch: 1,
+        },
+    );
+    let coordinates = computed_len.map(|kv_computed_len| {
+        fbs::CallCoordinates::create(
+            &mut builder,
+            &fbs::CallCoordinatesArgs {
+                kv_visible_len: 4,
+                kv_computed_len,
+                ..Default::default()
+            },
+        )
+    });
+    let code = fbs::CallKind::new(forward, media, fbs::TransferMode::None);
+    let call = fbs::Call::create(
+        &mut builder,
+        &fbs::CallArgs {
+            request_key: Some(key),
+            call_id: Some(&fbs::CallId::new(1, 0)),
+            component: Some(component),
+            code: Some(&code),
+            coordinates,
+            ..Default::default()
+        },
+    );
+    let calls = builder.create_vector(&[call]);
+    let batch = fbs::Batch::create(
+        &mut builder,
+        &fbs::BatchArgs {
+            batch_id: 1,
+            calls: Some(calls),
+            ..Default::default()
+        },
+    );
+    let root = fbs::WorkerRequest::create(
+        &mut builder,
+        &fbs::WorkerRequestArgs {
+            kind: fbs::ReqKind::Submit,
+            message_id: Some(1),
+            batch: Some(batch),
+        },
+    );
+    builder.finish(root, None);
+    builder.finished_data().to_vec()
+}
+
 #[test]
 fn decoder_requires_one_concrete_computation() {
     use crate::schema::uniserve::ipc as fbs;
-
-    let run = batch_with_calls(1, Vec::new(), vec![ar_decode_call()]);
-    let bytes = encode_request(&WorkerRequest::submit(run)).unwrap();
-    let frame = fbs::root_as_worker_request(&bytes).unwrap().unpack();
-    let invalid = [
-        fbs::CallKindT::default(),
-        fbs::CallKindT {
-            forward_mode: fbs::ForwardMode::Decode,
-            media: fbs::MediaCall::Denoising,
-            transfer: fbs::TransferMode::None,
-        },
-        fbs::CallKindT {
-            forward_mode: fbs::ForwardMode(255),
-            ..Default::default()
-        },
-        fbs::CallKindT {
-            media: fbs::MediaCall(255),
-            ..Default::default()
-        },
-    ];
-    for code in invalid {
-        let mut malformed = frame.clone();
-        malformed.batch.as_mut().unwrap().calls.as_mut().unwrap()[0].code = code;
-        let mut builder = flatbuffers::FlatBufferBuilder::new();
-        let root = malformed.pack(&mut builder);
-        builder.finish(root, None);
-        assert!(decode_request(builder.finished_data()).is_err());
+    for (forward, media) in [
+        (fbs::ForwardMode::None, fbs::MediaCall::None),
+        (fbs::ForwardMode::Decode, fbs::MediaCall::Denoising),
+        (fbs::ForwardMode(255), fbs::MediaCall::None),
+        (fbs::ForwardMode::None, fbs::MediaCall(255)),
+    ] {
+        assert!(decode_request(&malformed_call(forward, media, Some(4))).is_err());
     }
 }
 
@@ -416,38 +455,14 @@ fn a_batch_carries_one_computation_through_one_entry() {
 #[test]
 fn decoder_requires_every_call_to_state_its_coordinates() {
     use crate::schema::uniserve::ipc as fbs;
-
-    let run = batch_with_calls(1, Vec::new(), vec![ar_decode_call()]);
-    let bytes = encode_request(&WorkerRequest::submit(run)).unwrap();
-    let frame = fbs::root_as_worker_request(&bytes).unwrap().unpack();
-
-    let mut absent = frame.clone();
-    absent.batch.as_mut().unwrap().calls.as_mut().unwrap()[0].coordinates = None;
-    let mut builder = flatbuffers::FlatBufferBuilder::new();
-    let root = absent.pack(&mut builder);
-    builder.finish(root, None);
-    let error = decode_request(builder.finished_data()).unwrap_err();
-    assert!(
-        error.to_string().contains("call.coordinates"),
-        "absent coordinates must be named: {error}"
-    );
-
-    let mut uncontained = frame;
-    uncontained.batch.as_mut().unwrap().calls.as_mut().unwrap()[0]
-        .coordinates
-        .as_mut()
-        .unwrap()
-        .kv_computed_len = 1;
-    let mut builder = flatbuffers::FlatBufferBuilder::new();
-    let root = uncontained.pack(&mut builder);
-    builder.finish(root, None);
-    let error = decode_request(builder.finished_data()).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("visible KV beyond the computed extent"),
-        "uncontained KV extents must be named: {error}"
-    );
+    for (computed_len, message) in [
+        (None, "call.coordinates"),
+        (Some(1), "visible KV beyond the computed extent"),
+    ] {
+        let bytes = malformed_call(fbs::ForwardMode::Decode, fbs::MediaCall::None, computed_len);
+        let error = decode_request(&bytes).unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+    }
 }
 
 #[test]
@@ -581,7 +596,6 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
                     },
                 },
             }],
-            true,
             None,
             None,
         );
@@ -692,7 +706,6 @@ fn unchanged_kv_publication_round_trips_without_physical_tensors() {
             ..completion_record()
         }],
         Vec::new(),
-        true,
         None,
         None,
     );
@@ -737,7 +750,7 @@ fn tensor_coverage_preserves_replicas_and_detects_missing_regions() {
 }
 
 #[test]
-fn raw_kv_publication_round_trips_page_representation_and_exact_lineage() {
+fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
     let source = BufferId {
         owner: request_key(),
         producer_call_id: CallId::new(11, 0),
@@ -792,7 +805,6 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_lineage() {
                 ..completion_record()
             }],
             Vec::new(),
-            true,
             None,
             None,
         );
@@ -830,7 +842,7 @@ fn error_completion_round_trips_with_its_error_code() {
     let mut record = completion_record();
     record.status = CallStatus::Error;
     record.error_code = Some(ErrorCode::ComputeError);
-    let report = lane_report(6, vec![record.clone()], Vec::new(), false, None, None);
+    let report = lane_report(6, vec![record.clone()], Vec::new(), None, None);
     let decoded =
         decode_response(&encode_response(&WorkerResponse::result(report)).unwrap()).unwrap();
     assert_eq!(
@@ -840,7 +852,7 @@ fn error_completion_round_trips_with_its_error_code() {
 }
 
 #[test]
-fn request_retirement_requires_unique_buffers_from_its_lineage() {
+fn request_retirement_requires_unique_buffers_from_its_request() {
     let product = tensor_for(
         request_key(),
         CallId::new(7, 0),
@@ -953,7 +965,7 @@ fn validation_rejects_an_output_owned_by_another_call() {
 }
 
 #[test]
-fn validation_allows_shared_encoder_features_and_rejects_foreign_lineage_state() {
+fn validation_allows_shared_encoder_features_and_rejects_foreign_request_state() {
     let foreign_key = RequestKey::new(4, RequestId(8), 2);
     let mut feature = output_product(CallId::new(3, 0));
     feature.request_key = foreign_key;
@@ -1274,15 +1286,8 @@ fn comprehensive_batches() -> Vec<Batch> {
         None,
     )
     .unwrap();
-    let umm_params = NewRequest::new(
-        key_for_request(110),
-        110,
-        None,
-        Some(UmmRequestParams {
-            image: full_image(),
-        }),
-    )
-    .unwrap();
+    let image_params =
+        NewRequest::new(key_for_request(110), 110, None, Some(full_image())).unwrap();
     let variants = CallKind::ALL;
     let mut batches = Vec::new();
     for (index, kind) in variants.into_iter().enumerate() {
@@ -1366,7 +1371,7 @@ fn comprehensive_batches() -> Vec<Batch> {
         // places them ahead of the calls that use them.
         let admissions = if index == 0 {
             calls[0].input_token_ids = vec![7, 8, 9, 10];
-            vec![ar_params.clone(), umm_params.clone()]
+            vec![ar_params.clone(), image_params.clone()]
         } else {
             Vec::new()
         };
@@ -1552,7 +1557,6 @@ fn full_run_result() -> BatchOutput {
         5,
         vec![ok_record, predicated_record, error_record],
         products,
-        true,
         Some(1234),
         Some(full_forward_stats()),
     )

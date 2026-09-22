@@ -302,7 +302,15 @@ impl RequestRegistry {
                 stats.state = RequestLifecycleState::Streaming;
                 stats.internal_tokens = stats.internal_tokens.saturating_add(1);
             }
-            RequestOutput::ReasoningDelta { .. }
+            RequestOutput::Artifact(_) => {
+                stats.state = RequestLifecycleState::Streaming;
+                stats
+                    .timings
+                    .first_visible_output_us
+                    .get_or_insert(elapsed_us);
+            }
+            RequestOutput::MediaProgress { .. }
+            | RequestOutput::ReasoningDelta { .. }
             | RequestOutput::OutputBlockStart { .. }
             | RequestOutput::OutputBlockEnd { .. }
             | RequestOutput::ToolCallStart { .. }

@@ -185,9 +185,9 @@ impl EngineClient {
     pub async fn submit_media(
         &self,
         external_request_id: String,
-        mut request: uniserve_core::DiffusionRequest,
+        request: uniserve_core::DiffusionRequest,
     ) -> Result<EventRx> {
-        let rid = self.register_request(external_request_id.clone(), None)?;
+        let rid = request.request_id;
         self.requests.claim_submission(&external_request_id, rid)?;
         if self.core.runtime_family() != RuntimeFamily::Diffusion {
             self.requests.release_engine(&external_request_id, rid);
@@ -195,7 +195,6 @@ impl EngineClient {
                 message: "diffusion generation is unavailable for this runtime".to_string(),
             });
         }
-        request.request_id = rid;
         let mut scheduler_rx = self
             .core
             .submit(Request::Diffusion(request))

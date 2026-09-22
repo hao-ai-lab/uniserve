@@ -1,18 +1,15 @@
 //! Validation and metadata extraction for PNG artifacts returned by workers.
 
-use std::fmt::Write as _;
 use std::io::Cursor;
 
 use base64::Engine as _;
-use sha2::{Digest as _, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Verified dimensions, size, and digest of a PNG artifact.
-pub(crate) struct ImageArtifactMetadata {
+/// Verified dimensions and encoded size of a PNG image.
+pub(crate) struct PngInfo {
     pub(crate) height: u32,
     pub(crate) width: u32,
     pub(crate) bytes: u64,
-    pub(crate) sha256: String,
 }
 
 /// Parses image dimensions from a base64 PNG's IHDR header, decoding only the
@@ -37,7 +34,7 @@ pub(crate) fn png_artifact_dims_b64(pixels_png_b64: &str) -> Option<(u32, u32)> 
 pub(crate) fn validate_png_artifact(
     pixels_png_b64: &str,
     expected_hw: Option<(u32, u32)>,
-) -> Option<ImageArtifactMetadata> {
+) -> Option<PngInfo> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(pixels_png_b64.as_bytes())
         .ok()?;
@@ -53,14 +50,9 @@ pub(crate) fn validate_png_artifact(
     if (output.height, output.width) != (height, width) {
         return None;
     }
-    let mut sha256 = String::with_capacity(64);
-    for byte in Sha256::digest(&bytes) {
-        write!(&mut sha256, "{byte:02x}").expect("writing to a String is infallible");
-    }
-    Some(ImageArtifactMetadata {
+    Some(PngInfo {
         height,
         width,
         bytes: bytes.len() as u64,
-        sha256,
     })
 }

@@ -13,6 +13,7 @@ mod input;
 mod model;
 mod omni;
 mod preprocessing;
+mod sampling;
 #[cfg(test)]
 mod test_support;
 /// Text tokenization, decoding, and sampling utilities.
@@ -126,8 +127,6 @@ impl From<ServeRequestId> for String {
 pub type RequestOutputStream = Pin<Box<dyn Stream<Item = Result<RequestOutput>> + Send>>;
 /// Result type returned by serving-runtime calls.
 pub type Result<T> = std::result::Result<T, ServeError>;
-
-static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Error)]
 /// Failure while resolving and tokenizing a model input.
@@ -301,9 +300,20 @@ pub(crate) fn cache_isolation_key(namespace: Option<&str>, salt: Option<&str>) -
     })
 }
 
+/// Tokenized input retains only the response processing its computation needs.
+enum Prepared {
+    Generation(Box<(uniserve_core::GenerationRequest, ResponseOptions)>),
+    Diffusion(uniserve_core::DiffusionRequest),
+}
+
+impl From<(uniserve_core::GenerationRequest, ResponseOptions)> for Prepared {
+    fn from((request, response): (uniserve_core::GenerationRequest, ResponseOptions)) -> Self {
+        Self::Generation(Box::new((request, response)))
+    }
+}
+
 /// Single-model serving runtime.
 pub struct ServingRuntime {
-    runtime_id: u64,
     model: Arc<InputProcessor>,
     engine: Arc<EngineClient>,
     _stats_logger: Option<Arc<crate::engine_client::generation::log_stats::StatsLogger>>,
@@ -322,7 +332,6 @@ impl ServingRuntime {
             )
         });
         Self {
-            runtime_id: NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed),
             model: Arc::new(model),
             engine,
             _stats_logger: stats_logger,
@@ -343,11 +352,6 @@ impl ServingRuntime {
     /// Returns the engine client backing this runtime.
     pub fn engine(&self) -> &EngineClient {
         &self.engine
-    }
-
-    /// Returns the process-local identity of this runtime instance.
-    pub fn runtime_id(&self) -> u64 {
-        self.runtime_id
     }
 
     /// Returns an aggregate point-in-time metrics snapshot.
@@ -384,7 +388,9 @@ impl ServingRuntime {
         )?;
         let input_id = request_id.clone();
         self.generate_with(request_id, move |model| {
-            model.preprocess_chat_request(input_id, request)
+            model
+                .preprocess_chat_request(input_id, request)
+                .map(Prepared::from)
         })
         .await
     }
@@ -397,7 +403,9 @@ impl ServingRuntime {
     ) -> crate::openai::Result<RequestOutputStream> {
         let input_id = request_id.clone();
         self.generate_with(request_id, move |model| {
-            model.preprocess_image_request(input_id, request)
+            model
+                .preprocess_image_request(input_id, request)
+                .map(Prepared::from)
         })
         .await
     }
@@ -410,7 +418,23 @@ impl ServingRuntime {
         self.generate_with(request.request_id.clone(), move |model| {
             model
                 .preprocess_text_request(request)
+                .map(Prepared::from)
                 .map_err(crate::openai::serve_error_to_api)
+        })
+        .await
+    }
+
+    /// Tokenizes video prompts on the same blocking pool and lifecycle as text.
+    pub async fn generate_video(
+        &self,
+        request_id: ServeRequestId,
+        request: crate::openai::VideoGenerationRequest,
+    ) -> crate::openai::Result<RequestOutputStream> {
+        let input_id = request_id.clone();
+        self.generate_with(request_id, move |model| {
+            model
+                .preprocess_video_request(&input_id, request)
+                .map(Prepared::Diffusion)
         })
         .await
     }
@@ -419,13 +443,7 @@ impl ServingRuntime {
     async fn generate_with(
         &self,
         request_id: ServeRequestId,
-        preprocess: impl FnOnce(
-            &InputProcessor,
-        ) -> crate::openai::Result<(
-            uniserve_core::GenerationRequest,
-            ResponseOptions,
-        )> + Send
-        + 'static,
+        preprocess: impl FnOnce(&InputProcessor) -> crate::openai::Result<Prepared> + Send + 'static,
     ) -> crate::openai::Result<RequestOutputStream> {
         let compile_started = Instant::now();
         let identity = self.model.event_identity();
@@ -449,6 +467,7 @@ impl ServingRuntime {
             request_id.clone(),
             Arc::clone(&self.metrics),
             Arc::clone(&self.engine.requests),
+            compile_started,
         );
 
         let model = Arc::clone(&self.model);
@@ -479,7 +498,10 @@ impl ServingRuntime {
             .requests
             .mark_submitting(&request_id, compile_duration_us);
 
-        tokenized.0.request_id = engine_request_id;
+        match &mut tokenized {
+            Prepared::Generation(prepared) => prepared.0.request_id = engine_request_id,
+            Prepared::Diffusion(request) => request.request_id = engine_request_id,
+        }
         self.submit_and_stream(tokenized, compile_duration_us, lifecycle)
             .await
             .map_err(crate::openai::serve_error_to_api)
@@ -488,64 +510,96 @@ impl ServingRuntime {
     /// Submits a tokenized request and wraps its output with model and lifecycle processing.
     async fn submit_and_stream(
         &self,
-        (request, response): (uniserve_core::GenerationRequest, ResponseOptions),
+        prepared: Prepared,
         compile_duration_us: u64,
         mut lifecycle: LifecycleGuard,
     ) -> Result<RequestOutputStream> {
-        let request_id = response.request_id.clone();
+        let request_id = lifecycle.request_id.clone();
         if let Some(terminal) = self.engine.requests.control_terminal(&request_id) {
             return Ok(self.control_event_stream(request_id, terminal, lifecycle));
         }
 
-        let ResponseOptions {
-            request_id: _,
-            tokenizer,
-            prompt_token_ids,
-            decode,
-            emit_token_ids,
-            prompt_logprobs_requested,
-            generated_logprobs_requested,
-            output_processor,
-            identity,
-            cache,
-            resources,
-        } = response;
-        let engine_stream = self
-            .engine
-            .submit_generation(request_id.to_string(), request)
-            .await;
-
-        let event_context = EventContext {
-            served_name: identity.served_name.clone(),
-            description: identity.description.clone(),
-            compile_duration_us,
-            cache,
-            resources,
-            metrics: Arc::clone(&self.metrics),
-        };
-
-        let stream_result: Result<RequestOutputStream> = match engine_stream {
-            Ok(stream) => {
-                let assembly = StreamInput {
-                    request_id: request_id.clone(),
-                    event_context,
-                    prompt_token_ids,
+        let stream_result: Result<RequestOutputStream> = match prepared {
+            Prepared::Generation(prepared) => {
+                let (request, response) = *prepared;
+                let ResponseOptions {
+                    request_id: _,
                     tokenizer,
+                    prompt_token_ids,
+                    decode,
+                    emit_token_ids,
                     prompt_logprobs_requested,
                     generated_logprobs_requested,
-                    emit_token_ids,
-                    decode_options: decode,
-                    stream,
+                    output_processor,
+                    identity,
+                    cache,
+                    resources,
+                } = response;
+                let engine_stream = self
+                    .engine
+                    .submit_generation(request_id.to_string(), request)
+                    .await;
+
+                let event_context = EventContext {
+                    served_name: identity.served_name.clone(),
+                    description: identity.description.clone(),
+                    compile_duration_us,
+                    started: lifecycle.started,
+                    cache,
+                    resources,
+                    metrics: Arc::clone(&self.metrics),
                 };
-                let output: RequestOutputStream = match output_processor {
-                    OutputProcessorPolicy::Qwen3(processor) => {
-                        Box::pin(assemble_chat_event_stream(assembly, processor))
+
+                match engine_stream {
+                    Ok(stream) => {
+                        let assembly = StreamInput {
+                            request_id: request_id.clone(),
+                            event_context,
+                            prompt_token_ids,
+                            tokenizer,
+                            prompt_logprobs_requested,
+                            generated_logprobs_requested,
+                            emit_token_ids,
+                            decode_options: decode,
+                            stream,
+                        };
+                        let output: RequestOutputStream = match output_processor {
+                            OutputProcessorPolicy::Qwen3(processor) => {
+                                Box::pin(assemble_chat_event_stream(assembly, processor))
+                            }
+                            output_processor => {
+                                Box::pin(assemble_event_stream(assembly, output_processor))
+                            }
+                        };
+                        Ok(output)
                     }
-                    output_processor => Box::pin(assemble_event_stream(assembly, output_processor)),
-                };
-                Ok(output)
+                    Err(error) => Err(ServeError::Engine(error)),
+                }
             }
-            Err(error) => Err(ServeError::Engine(error)),
+            Prepared::Diffusion(request) => {
+                let prompt_tokens = request.prompt_token_ids.len();
+                let context = EventContext {
+                    served_name: self.model.served_model_name().to_owned(),
+                    description: self.model.event_identity().description,
+                    compile_duration_us,
+                    started: lifecycle.started,
+                    cache: CacheAccounting::default(),
+                    resources: ResourceAccounting::default(),
+                    metrics: Arc::clone(&self.metrics),
+                };
+                self.engine
+                    .submit_media(request_id.to_string(), request)
+                    .await
+                    .map(|stream| {
+                        Box::pin(assembly::assemble_media_event_stream(
+                            request_id.clone(),
+                            context,
+                            prompt_tokens,
+                            stream,
+                        )) as RequestOutputStream
+                    })
+                    .map_err(ServeError::Engine)
+            }
         };
 
         if let Some(terminal) = self.engine.requests.control_terminal(&request_id) {
@@ -558,7 +612,10 @@ impl ServingRuntime {
         let stream = match stream_result {
             Ok(stream) => stream,
             Err(error) => {
-                lifecycle.terminal(LifecycleTerminal::Failed, compile_duration_us);
+                lifecycle.terminal(
+                    LifecycleTerminal::Failed,
+                    lifecycle.started.elapsed().as_micros() as u64,
+                );
                 return Err(error);
             }
         };
@@ -617,11 +674,9 @@ impl ServingRuntime {
     pub async fn abort(
         &self,
         request_id: impl Into<ServeRequestId>,
-        reason: AbortReason,
     ) -> std::result::Result<(), ServeControlError> {
         let request_id = request_id.into();
         self.engine.abort_request(&request_id).await?;
-        let _ = reason;
         Ok(())
     }
 
@@ -644,17 +699,6 @@ impl ServingRuntime {
         self.drain().await;
         self.engine.shutdown().await
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// Caller-visible reason for aborting a live request.
-pub enum AbortReason {
-    /// The request owner cancelled its call.
-    OwnerCancelled,
-    /// An administrative control aborted the request.
-    Admin,
-    /// Runtime shutdown aborted outstanding work.
-    RuntimeShutdown,
 }
 
 #[derive(Debug, Error)]
@@ -753,6 +797,7 @@ impl RequestStatsSnapshot {
 
 #[derive(Debug, Clone)]
 struct EventContext {
+    started: Instant,
     served_name: String,
     description: String,
     compile_duration_us: u64,
@@ -853,10 +898,7 @@ struct LifecycleTrackedStream {
 
 impl LifecycleTrackedStream {
     /// Transfers the preprocessing guard to the caller's response stream.
-    fn new(inner: RequestOutputStream, mut lifecycle: LifecycleGuard) -> Self {
-        // Runtime response timings begin when the output stream is exposed;
-        // preprocessing time is retained separately in request statistics.
-        lifecycle.started = Instant::now();
+    fn new(inner: RequestOutputStream, lifecycle: LifecycleGuard) -> Self {
         Self { inner, lifecycle }
     }
 }
@@ -937,12 +979,13 @@ impl LifecycleGuard {
         request_id: ServeRequestId,
         metrics: Arc<RuntimeLifecycleMetrics>,
         requests: Arc<RequestRegistry>,
+        started: Instant,
     ) -> Self {
         Self {
             request_id,
             metrics,
             requests,
-            started: Instant::now(),
+            started,
             terminal: false,
         }
     }
@@ -1072,15 +1115,19 @@ pub struct RuntimeTimings {
     pub compile_us: u64,
     /// Queue duration in microseconds, when scheduling timestamps are available.
     pub queue_us: Option<u64>,
-    /// Time from admission to the first visible output in microseconds.
+    /// Time from request start to the first visible output in microseconds.
     pub first_visible_output_us: Option<u64>,
     /// End-to-end request duration in microseconds.
     pub total_us: u64,
 }
 
 /// Runtime event consumed by the HTTP response layer.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum RequestOutput {
+    /// Immutable generated media retained through response delivery.
+    Artifact(uniserve_core::ArtifactEvent),
+    /// Latest diffusion progress.
+    MediaProgress { phase: String, completed_steps: u32 },
     /// The engine accepted a compiled request.
     Accepted {
         /// Caller-visible request identifier.
@@ -1210,8 +1257,6 @@ pub enum RequestOutput {
         height: Option<u32>,
         /// Encoded image size in bytes, when reported.
         bytes: Option<u64>,
-        /// SHA-256 digest of the encoded image, when reported.
-        sha256: Option<String>,
         /// Base64-encoded PNG payload, when retained for transport.
         pixels_png_b64: Option<String>,
         /// Elapsed request duration in microseconds.
@@ -1308,8 +1353,8 @@ impl From<&FinishReason> for FinishStatus {
             | uniserve_core::FinishReason::Stop
             | uniserve_core::FinishReason::ImageDone => Self::Stop {
                 cause: reason.as_stop_reason().map(|value| match value {
-                    StopReason::TokenId(id) => StopCause::TokenId(*id),
-                    StopReason::Text(text) => StopCause::Text(text.clone()),
+                    StopReason::Token(id) => StopCause::TokenId(*id),
+                    StopReason::String(text) => StopCause::Text(text.clone()),
                 }),
             },
             uniserve_core::FinishReason::MaxTokens => Self::Length,
@@ -1375,6 +1420,7 @@ mod tests {
 
     fn event_context() -> EventContext {
         EventContext {
+            started: Instant::now(),
             served_name: "profile".to_string(),
             description: "bagel".to_string(),
             compile_duration_us: 7,
@@ -1521,7 +1567,6 @@ mod tests {
             height: 1,
             width: 1,
             bytes: 3,
-            sha256: "0".repeat(64),
             pixels_png_b64: "cG5n".to_string(),
         })
         .await

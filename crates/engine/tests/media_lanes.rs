@@ -104,13 +104,13 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
             "video_decoder",
             (0..decoder_ranks).collect(),
             true,
-            vec![output("units", Some(16))],
+            vec![output("units", Some(32))],
         ),
         component(
             "video_encoder",
             (0..decoder_ranks).collect(),
             true,
-            vec![output("encoded", Some(16))],
+            vec![output("encoded", Some(32))],
         ),
         component("audio_decoder", vec![0], true, vec![output("audio", None)]),
         component("muxer", vec![0], false, Vec::new()),
@@ -242,6 +242,64 @@ impl Served {
             "request {request:?} did not finish after its artifact: {events:?}"
         );
     }
+}
+
+#[test]
+fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
+    let mut executor = SimExecutor::new(video_worker(1, 1));
+    let boundary = executor.observe();
+    let scheduler = Scheduler::new(Box::new(executor), SpecialTokenIds::default(), 32);
+    let (tx, commands) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let mut stream = handle
+        .submit(Request::Diffusion(DiffusionRequest {
+            request_id: RequestId(90),
+            prompt_token_ids: PROMPT.to_vec(),
+            priority: 0,
+            sampling: DiffusionSamplingParams {
+                num_frames: 128,
+                video_units: 32,
+                num_inference_steps: STEPS,
+                seed: 1,
+            },
+        }))
+        .unwrap();
+    let engine = thread::spawn(move || scheduler.run(commands));
+    // Let the entire workload finish while the caller retains an unread stream.
+    // The public executor boundary distinguishes completion from a stalled lane.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = boundary
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        if let BatchEvent::Submitted(batch) = event
+            && batch
+                .commands
+                .iter()
+                .any(|command| matches!(command, uniserve_worker_ipc::BatchCommand::Finish { .. }))
+        {
+            break;
+        }
+    }
+    let mut events = Vec::new();
+    while Instant::now() < deadline {
+        if let Ok(event) = stream.try_recv() {
+            let finished = matches!(event, EngineCoreOutput::Finished { .. });
+            events.push(event);
+            if finished {
+                break;
+            }
+        } else {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    handle.shutdown();
+    assert!(!engine.join().unwrap());
+    Served {
+        submissions: Vec::new(),
+        outcomes: HashMap::from([(RequestId(90), events)]),
+    }
+    .assert_completed(RequestId(90));
 }
 
 /// Media calls of one batch; a batch carrying only lifecycle commands has none.

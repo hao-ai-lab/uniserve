@@ -6,9 +6,8 @@
 //! encoded payload, so the codec, the protocol version and every message shape
 //! are the ones the shared-memory channel uses.
 //!
-//! Only the result wake crosses the process boundary. A command or a worker
-//! death is raised by a thread inside the engine, so those wakes stay local to
-//! the process that raises them and never travel.
+//! Socket readiness advances incoming and outgoing frames. Local process-death
+//! notifications use a separate descriptor.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
@@ -24,7 +23,7 @@ use crate::iceoryx::{Frame, Header, IpcError, IpcResult, WakeEvents, header_for_
 use crate::request::WorkerRequest;
 
 /// Bytes of one encoded frame header.
-const HEADER_BYTES: usize = 32;
+const HEADER_BYTES: usize = 16;
 
 /// Encodes a header in a fixed little-endian layout.
 ///
@@ -33,28 +32,20 @@ const HEADER_BYTES: usize = 32;
 /// here rather than borrowed from the compiler's struct layout.
 fn encode_header(header: &Header) -> [u8; HEADER_BYTES] {
     let mut out = [0u8; HEADER_BYTES];
-    out[0..8].copy_from_slice(&header.batch_id.to_le_bytes());
-    out[8..16].copy_from_slice(&header.message_id.to_le_bytes());
-    out[16..20].copy_from_slice(&header.len.to_le_bytes());
-    out[20..24].copy_from_slice(&header.reserved0.to_le_bytes());
-    out[24..28].copy_from_slice(&header.reserved1.to_le_bytes());
-    out[28..30].copy_from_slice(&header.version.to_le_bytes());
-    out[30] = header.kind;
-    out[31] = header.flags;
+    out[0..8].copy_from_slice(&header.message_id.to_le_bytes());
+    out[8..12].copy_from_slice(&header.len.to_le_bytes());
+    out[12..14].copy_from_slice(&header.version.to_le_bytes());
+    out[14..16].copy_from_slice(&header.reserved.to_le_bytes());
     out
 }
 
 /// Decodes a header from its fixed little-endian layout.
 fn decode_header(bytes: &[u8; HEADER_BYTES]) -> Header {
     Header {
-        batch_id: u64::from_le_bytes(bytes[0..8].try_into().expect("8 bytes")),
-        message_id: u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes")),
-        len: u32::from_le_bytes(bytes[16..20].try_into().expect("4 bytes")),
-        reserved0: u32::from_le_bytes(bytes[20..24].try_into().expect("4 bytes")),
-        reserved1: u32::from_le_bytes(bytes[24..28].try_into().expect("4 bytes")),
-        version: u16::from_le_bytes(bytes[28..30].try_into().expect("2 bytes")),
-        kind: bytes[30],
-        flags: bytes[31],
+        message_id: u64::from_le_bytes(std::array::from_fn(|i| bytes[i])),
+        len: u32::from_le_bytes(std::array::from_fn(|i| bytes[8 + i])),
+        version: u16::from_le_bytes([bytes[12], bytes[13]]),
+        reserved: u16::from_le_bytes([bytes[14], bytes[15]]),
     }
 }
 
@@ -93,7 +84,10 @@ impl FrameReader {
                     closed = true;
                     break;
                 }
-                Ok(read) => self.buffer.extend_from_slice(&chunk[..read]),
+                Ok(read) => {
+                    self.buffer.extend_from_slice(&chunk[..read]);
+                    self.split(bound)?;
+                }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(error) => {
@@ -103,7 +97,11 @@ impl FrameReader {
                 }
             }
         }
-        self.split(bound)?;
+        if closed && !self.buffer.is_empty() {
+            return Err(IpcError::Transport(
+                "rank channel closed with an incomplete frame".into(),
+            ));
+        }
         Ok(closed)
     }
 
@@ -117,11 +115,7 @@ impl FrameReader {
             head.copy_from_slice(&self.buffer[..HEADER_BYTES]);
             let header = decode_header(&head);
             let len = header.len as usize;
-            if len > bound {
-                return Err(IpcError::Transport(format!(
-                    "rank channel frame of {len} bytes exceeds its {bound} byte bound"
-                )));
-            }
+            header.validate(bound)?;
             if self.buffer.len() < HEADER_BYTES + len {
                 return Ok(());
             }
@@ -132,45 +126,102 @@ impl FrameReader {
     }
 }
 
-/// Writes one whole frame, blocking only for the bytes it has already begun.
-fn write_frame(stream: &mut TcpStream, header: &Header, payload: &[u8]) -> IpcResult<()> {
-    let mut framed = Vec::with_capacity(HEADER_BYTES + payload.len());
-    let mut stamped = *header;
-    stamped.len = payload.len() as u32;
-    framed.extend_from_slice(&encode_header(&stamped));
-    framed.extend_from_slice(payload);
+/// Retains partial writes until the socket becomes writable. Queue capacity is
+/// the channel's in-flight depth, so a stalled peer cannot grow memory unboundedly.
+struct FrameWriter {
+    pending: VecDeque<Vec<u8>>,
+    offset: usize,
+    depth: usize,
+}
 
-    let mut written = 0;
-    while written < framed.len() {
-        match stream.write(&framed[written..]) {
-            Ok(0) => {
-                return Err(IpcError::Transport(
-                    "rank channel closed while sending a frame".into(),
-                ));
-            }
-            Ok(count) => written += count,
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                // The frame is partly on the wire and must finish, so this
-                // waits for capacity rather than abandoning it.
-                std::thread::yield_now();
-            }
-            Err(error) => {
-                return Err(IpcError::Transport(format!(
-                    "sending on a rank channel: {error}"
-                )));
-            }
+impl FrameWriter {
+    fn new(depth: usize) -> Self {
+        Self {
+            pending: VecDeque::new(),
+            offset: 0,
+            depth: depth.max(1),
         }
     }
-    stream
-        .flush()
-        .map_err(|error| IpcError::Transport(format!("flushing a rank channel: {error}")))
+
+    fn enqueue(&mut self, header: Header, payload: &[u8], bound: usize) -> IpcResult<()> {
+        let header = header.for_payload(payload.len(), bound)?;
+        if self.pending.len() >= self.depth {
+            return Err(IpcError::WouldBlock);
+        }
+        let mut frame = Vec::with_capacity(HEADER_BYTES + payload.len());
+        frame.extend_from_slice(&encode_header(&header));
+        frame.extend_from_slice(payload);
+        self.pending.push_back(frame);
+        Ok(())
+    }
+
+    fn flush(&mut self, stream: &mut TcpStream) -> IpcResult<()> {
+        while let Some(frame) = self.pending.front() {
+            match stream.write(&frame[self.offset..]) {
+                Ok(0) => {
+                    return Err(IpcError::Transport(
+                        "rank channel closed while sending".into(),
+                    ));
+                }
+                Ok(count) => {
+                    self.offset += count;
+                    if self.offset == frame.len() {
+                        self.pending.pop_front();
+                        self.offset = 0;
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => {
+                    return Err(IpcError::Transport(format!(
+                        "sending on a rank channel: {error}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn events(&self) -> i16 {
+        libc::POLLIN
+            | if self.pending.is_empty() {
+                0
+            } else {
+                libc::POLLOUT
+            }
+    }
+}
+
+/// Parks on current readiness interests, preserving the deadline across signals.
+fn wait_ready(descriptors: &mut [libc::pollfd], timeout: Duration) -> IpcResult<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let millis = left.as_millis() + u128::from(!left.subsec_nanos().is_multiple_of(1_000_000));
+        // SAFETY: poll borrows this live array only for the duration of the call.
+        let result = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                millis.min(i32::MAX as u128) as i32,
+            )
+        };
+        if result >= 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != ErrorKind::Interrupted {
+            return Err(IpcError::Transport(format!(
+                "waiting for rank channel: {error}"
+            )));
+        }
+    }
 }
 
 /// A local wake: one descriptor this process both fires and polls.
 ///
-/// A command and a worker death are raised inside the engine, so a socket
-/// channel raises them here rather than carrying them to the rank and back.
+/// Process death and local worker completion can wake the owner independently
+/// of incoming network traffic.
 struct LocalWake {
     reader: UnixStream,
     writer: UnixStream,
@@ -227,19 +278,25 @@ impl LocalWake {
 pub struct SocketClient {
     stream: TcpStream,
     reader: FrameReader,
+    writer: FrameWriter,
     /// Responses read from the stream before the caller asked for them.
     inbox: HashMap<u64, Frame>,
     /// Largest payload either direction may carry.
     bound: usize,
-    /// Set when the rank closed its end.
-    closed: bool,
-    /// Descriptor the engine's own command and death wakes fire on.
+    /// Terminal IO failure, reported after complete responses have been delivered.
+    failure: Option<String>,
+    /// Descriptor the engine's worker-death watcher fires on.
     local: LocalWake,
 }
 
 impl SocketClient {
     /// Connects to the address a rank reported at registration.
-    pub fn connect(address: &str, bound: usize, timeout: Duration) -> IpcResult<Self> {
+    pub fn connect(
+        address: &str,
+        bound: usize,
+        depth: usize,
+        timeout: Duration,
+    ) -> IpcResult<Self> {
         let target: SocketAddr = address.parse().map_err(|_| {
             IpcError::Transport(format!("rank channel address {address} is not an address"))
         })?;
@@ -254,9 +311,10 @@ impl SocketClient {
         Ok(Self {
             stream,
             reader: FrameReader::new(),
+            writer: FrameWriter::new(depth),
             inbox: HashMap::new(),
             bound,
-            closed: false,
+            failure: None,
             local: LocalWake::new()?,
         })
     }
@@ -285,7 +343,12 @@ impl SocketClient {
 
     /// Sends one frame and returns the identity its response will carry.
     pub fn send_raw(&mut self, header: Header, payload: &[u8]) -> IpcResult<u64> {
-        write_frame(&mut self.stream, &header, payload)?;
+        if let Some(error) = &self.failure {
+            return Err(IpcError::Transport(error.clone()));
+        }
+        self.writer.flush(&mut self.stream)?;
+        self.writer.enqueue(header, payload, self.bound)?;
+        self.writer.flush(&mut self.stream)?;
         Ok(header.message_id)
     }
 
@@ -295,7 +358,15 @@ impl SocketClient {
             return Ok(Some(frame));
         }
         self.pump()?;
-        Ok(self.inbox.remove(&message_id))
+        if let Some(frame) = self.inbox.remove(&message_id) {
+            return Ok(Some(frame));
+        }
+        if self.inbox.is_empty()
+            && let Some(error) = &self.failure
+        {
+            return Err(IpcError::Transport(error.clone()));
+        }
+        Ok(None)
     }
 
     /// Waits for one outstanding response until the deadline passes.
@@ -309,50 +380,68 @@ impl SocketClient {
             if let Some(frame) = self.try_recv_response(message_id)? {
                 return Ok(Some(frame));
             }
-            if self.closed || Instant::now() >= deadline {
+            if self.failure.is_some() || Instant::now() >= deadline {
                 return Ok(None);
             }
-            std::thread::sleep(Duration::from_micros(50));
+            self.wait_wake(deadline.saturating_duration_since(Instant::now()))?;
         }
     }
 
     /// Waits until one of this channel's wake sources fires or the deadline passes.
     pub fn wait_wake(&mut self, timeout: Duration) -> IpcResult<WakeEvents> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let wakes = self.drain_wakes()?;
-            if wakes.any() {
-                return Ok(wakes);
-            }
-            if self.closed || Instant::now() >= deadline {
-                return Ok(WakeEvents::default());
-            }
-            std::thread::sleep(Duration::from_micros(50).min(timeout));
+        let wakes = self.drain_wakes()?;
+        if wakes.any() {
+            return Ok(wakes);
         }
+        wait_ready(&mut self.progress_fds(), timeout)?;
+        self.drain_wakes()
+    }
+
+    /// Readiness interests include writes only while an accepted frame is pending.
+    pub fn progress_fds(&self) -> Vec<libc::pollfd> {
+        vec![
+            libc::pollfd {
+                fd: self.stream.as_raw_fd(),
+                events: self.writer.events(),
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.local_wake_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ]
     }
 
     /// Reports the wakes already observed without waiting.
     ///
-    /// A local wake cannot say whether it was a command or a worker death, so
-    /// it reports both and the engine checks each. Both checks are cheap and a
-    /// missed one would stall the tick that the wake exists to start.
+    /// Buffered results and peer death may be reported together; callers drain
+    /// complete responses before failing the remaining work.
     pub fn drain_wakes(&mut self) -> IpcResult<WakeEvents> {
         self.pump()?;
         let local = self.local.take();
         Ok(WakeEvents {
             result: !self.inbox.is_empty(),
-            command: local,
-            death: local,
+            death: local || self.failure.is_some(),
             other: false,
         })
     }
 
     /// Moves every frame the stream holds into the inbox, keyed by identity.
     fn pump(&mut self) -> IpcResult<()> {
-        if self.closed {
-            return Ok(());
+        if self.failure.is_none() {
+            self.failure = match self.reader.fill(&mut self.stream, self.bound) {
+                Ok(false) => self
+                    .writer
+                    .flush(&mut self.stream)
+                    .err()
+                    .map(|error| error.to_string()),
+                Ok(true) => Some("rank channel closed before its response".into()),
+                Err(error) => Some(error.to_string()),
+            };
         }
-        self.closed = self.reader.fill(&mut self.stream, self.bound)?;
+        // A final read may contain complete responses followed by a truncated
+        // frame or EOF. Preserve those responses before failing outstanding work.
         while let Some(frame) = self.reader.ready.pop_front() {
             self.inbox.insert(frame.header.message_id, frame);
         }
@@ -365,7 +454,9 @@ pub struct SocketServer {
     listener: Option<TcpListener>,
     stream: Option<TcpStream>,
     reader: FrameReader,
+    writer: FrameWriter,
     bound: usize,
+    failure: Option<String>,
     /// The address the engine connects to, as it travels in the registration.
     address: String,
     /// Descriptor this rank's own completion callbacks fire on.
@@ -378,7 +469,7 @@ impl SocketServer {
     /// Registration reports an address that must already exist, so binding and
     /// accepting are separate: the rank reports as soon as the address is real
     /// and accepts when the engine connects.
-    pub fn bind(host: &str, bound: usize) -> IpcResult<Self> {
+    pub fn bind(host: &str, bound: usize, depth: usize) -> IpcResult<Self> {
         let listener = TcpListener::bind((host, 0))
             .map_err(|error| IpcError::Transport(format!("binding a rank channel: {error}")))?;
         let address = listener
@@ -391,7 +482,9 @@ impl SocketServer {
             listener: Some(listener),
             stream: None,
             reader: FrameReader::new(),
+            writer: FrameWriter::new(depth),
             bound,
+            failure: None,
             address,
             local: LocalWake::new()?,
         })
@@ -446,42 +539,30 @@ impl SocketServer {
 
     /// Accepts the engine's connection, waiting up to the deadline.
     pub fn accept(&mut self, timeout: Duration) -> IpcResult<()> {
-        if self.stream.is_some() {
-            return Ok(());
-        }
-        let listener = self
-            .listener
-            .as_ref()
-            .ok_or_else(|| IpcError::Transport("rank channel has no listener".into()))?;
-        listener
-            .set_nonblocking(false)
-            .map_err(|error| IpcError::Transport(format!("awaiting a rank channel: {error}")))?;
         let deadline = Instant::now() + timeout;
         loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nodelay(true).map_err(|error| {
-                        IpcError::Transport(format!("disabling Nagle: {error}"))
-                    })?;
-                    stream.set_nonblocking(true).map_err(|error| {
-                        IpcError::Transport(format!("making a rank channel pollable: {error}"))
-                    })?;
-                    self.stream = Some(stream);
-                    self.listener = None;
-                    return Ok(());
-                }
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                Err(error) if Instant::now() < deadline => {
-                    return Err(IpcError::Transport(format!(
-                        "accepting a rank channel: {error}"
-                    )));
-                }
-                Err(error) => {
-                    return Err(IpcError::Transport(format!(
-                        "rank channel was not connected before its deadline: {error}"
-                    )));
-                }
+            self.accept_if_pending()?;
+            if self.stream.is_some() {
+                return Ok(());
             }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(IpcError::Transport(
+                    "rank channel connection timed out".into(),
+                ));
+            }
+            let listener = self
+                .listener
+                .as_ref()
+                .ok_or_else(|| IpcError::Transport("rank channel has no listener".into()))?;
+            wait_ready(
+                &mut [libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                }],
+                remaining,
+            )?;
         }
     }
 
@@ -493,24 +574,54 @@ impl SocketServer {
         if let Some(frame) = self.reader.ready.pop_front() {
             return Ok(Some(frame));
         }
-        self.reader.fill(stream, self.bound)?;
-        Ok(self.reader.ready.pop_front())
+        if self.failure.is_none() {
+            self.failure = match self.reader.fill(stream, self.bound) {
+                Ok(false) => self
+                    .writer
+                    .flush(stream)
+                    .err()
+                    .map(|error| error.to_string()),
+                Ok(true) => Some("rank channel is closed".into()),
+                Err(error) => Some(error.to_string()),
+            };
+        }
+        if let Some(frame) = self.reader.ready.pop_front() {
+            return Ok(Some(frame));
+        }
+        if let Some(error) = &self.failure {
+            return Err(IpcError::Transport(error.clone()));
+        }
+        Ok(None)
     }
 
     /// Waits until a request is readable, a completion fires, or time passes.
     pub fn wait_incoming(&mut self, timeout: Duration) -> IpcResult<()> {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if !self.reader.ready.is_empty() || self.local.take() {
-                return Ok(());
-            }
-            if let Some(stream) = self.stream.as_mut() {
-                self.reader.fill(stream, self.bound)?;
-                if !self.reader.ready.is_empty() {
-                    return Ok(());
-                }
-            }
-            std::thread::sleep(Duration::from_micros(50));
+        self.accept_if_pending()?;
+        if !self.reader.ready.is_empty() || self.local.take() {
+            return Ok(());
+        }
+        let mut descriptors = vec![libc::pollfd {
+            fd: self.local.reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        if let Some(stream) = &self.stream {
+            descriptors.push(libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: self.writer.events(),
+                revents: 0,
+            });
+        } else if let Some(listener) = &self.listener {
+            descriptors.push(libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        wait_ready(&mut descriptors, timeout)?;
+        self.accept_if_pending()?;
+        if let Some(stream) = &mut self.stream {
+            self.writer.flush(stream)?;
         }
         Ok(())
     }
@@ -521,7 +632,9 @@ impl SocketServer {
             .stream
             .as_mut()
             .ok_or_else(|| IpcError::Transport("rank channel is not connected".into()))?;
-        write_frame(stream, &header, payload)
+        self.writer.flush(stream)?;
+        self.writer.enqueue(header, payload, self.bound)?;
+        self.writer.flush(stream)
     }
 }
 
@@ -529,50 +642,135 @@ impl SocketServer {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_header_survives_its_encoding() {
-        let header = Header {
-            batch_id: 9_876_543_210,
-            message_id: 1_234_567_890,
-            len: 4096,
-            reserved0: 0,
-            reserved1: 0,
-            version: 61,
-            kind: 2,
-            flags: 3,
-        };
-        assert_eq!(decode_header(&encode_header(&header)), header);
+    fn connected(bound: usize, depth: usize) -> (SocketClient, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = SocketClient::connect(
+            &listener.local_addr().unwrap().to_string(),
+            bound,
+            depth,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        (client, peer)
     }
 
     #[test]
-    fn a_reader_forms_frames_from_arbitrary_byte_boundaries() {
-        // A stream may deliver a frame in any number of pieces, so the reader
-        // is fed one byte at a time and must still produce both frames whole.
-        let mut wire = Vec::new();
-        for (id, payload) in [(1u64, vec![7u8; 5]), (2, vec![9u8; 3])] {
-            let header = Header {
-                message_id: id,
-                len: payload.len() as u32,
+    fn completed_responses_survive_a_truncated_last_frame() {
+        let (mut client, mut peer) = connected(1024, 2);
+        let header = Header {
+            message_id: 1,
+            len: 5,
+            ..Header::default()
+        };
+        for byte in encode_header(&header).into_iter().chain(*b"hello") {
+            peer.write_all(&[byte]).unwrap();
+        }
+        peer.write_all(&encode_header(&Header {
+            message_id: 2,
+            len: 9,
+            ..Header::default()
+        }))
+        .unwrap();
+        peer.write_all(b"partial").unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let response = client
+            .recv_response_timeout(1, Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.payload, b"hello");
+        let error = client
+            .recv_response_timeout(2, Duration::from_secs(5))
+            .err()
+            .expect("truncation must fail pending work");
+        assert!(error.to_string().contains("incomplete frame"), "{error}");
+        assert!(client.drain_wakes().unwrap().death);
+    }
+
+    #[test]
+    fn socket_rejects_incompatible_or_oversized_frames() {
+        for header in [
+            Header {
+                version: crate::IPC_VERSION + 1,
                 ..Header::default()
-            };
-            wire.extend_from_slice(&encode_header(&header));
-            wire.extend_from_slice(&payload);
+            },
+            Header {
+                len: 1025,
+                ..Header::default()
+            },
+        ] {
+            let (mut client, mut peer) = connected(1024, 1);
+            peer.write_all(&encode_header(&header)).unwrap();
+            assert!(
+                client
+                    .recv_response_timeout(0, Duration::from_secs(5))
+                    .is_err()
+            );
         }
+    }
 
-        let mut reader = FrameReader::new();
-        for byte in wire {
-            reader.buffer.push(byte);
-            reader.split(1024).expect("frames split");
-        }
-
-        let first = reader.ready.pop_front().expect("first frame");
-        let second = reader.ready.pop_front().expect("second frame");
-        assert_eq!((first.header.message_id, first.payload), (1, vec![7u8; 5]));
+    #[test]
+    fn a_stalled_peer_applies_backpressure_and_partial_writes_resume() {
+        let size = 1 << 20;
+        let (mut client, mut peer) = connected(size, 1);
+        let capacity: libc::c_int = 4096;
+        // Restrict the real socket send buffer so this workload must span writes.
         assert_eq!(
-            (second.header.message_id, second.payload),
-            (2, vec![9u8; 3])
+            unsafe {
+                libc::setsockopt(
+                    client.stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&capacity as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&capacity) as libc::socklen_t,
+                )
+            },
+            0
         );
-        assert!(reader.ready.is_empty());
+        let payload = vec![7; size];
+        client
+            .send_raw(
+                Header {
+                    message_id: 1,
+                    ..Header::default()
+                },
+                &payload,
+            )
+            .unwrap();
+        assert!(matches!(
+            client.send_raw(
+                Header {
+                    message_id: 2,
+                    ..Header::default()
+                },
+                b"next"
+            ),
+            Err(IpcError::WouldBlock)
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut bytes = vec![0; HEADER_BYTES + size];
+            peer.read_exact(&mut bytes).unwrap();
+            tx.send(bytes).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let wire = loop {
+            if let Ok(bytes) = rx.try_recv() {
+                break bytes;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "accepted frame did not finish sending"
+            );
+            client.wait_wake(Duration::from_millis(10)).unwrap();
+        };
+        reader.join().unwrap();
+        assert_eq!(&wire[HEADER_BYTES..], payload);
+        assert_eq!(
+            decode_header(wire[..HEADER_BYTES].try_into().unwrap()).message_id,
+            1
+        );
     }
 
     #[test]
@@ -580,7 +778,7 @@ mod tests {
         // The channel's contract is that a frame arrives as it was sent, under
         // the identity it carried, so the engine can match a result to the
         // batch it answers.
-        let mut server = SocketServer::bind("127.0.0.1", 1 << 20).expect("rank binds");
+        let mut server = SocketServer::bind("127.0.0.1", 1 << 20, 8).expect("rank binds");
         let address = server.address().to_string();
 
         let accepted = std::thread::spawn(move || {
@@ -594,8 +792,6 @@ mod tests {
             };
             let answer = Header {
                 message_id: request.header.message_id,
-                batch_id: request.header.batch_id,
-                kind: 9,
                 ..Header::default()
             };
             server
@@ -604,12 +800,10 @@ mod tests {
             request
         });
 
-        let mut client = SocketClient::connect(&address, 1 << 20, Duration::from_secs(5))
+        let mut client = SocketClient::connect(&address, 1 << 20, 8, Duration::from_secs(5))
             .expect("engine connects");
         let sent = Header {
             message_id: 77,
-            batch_id: 4321,
-            kind: 2,
             ..Header::default()
         };
         let identity = client
@@ -619,8 +813,6 @@ mod tests {
 
         let received = accepted.join().expect("rank thread");
         assert_eq!(received.payload, b"batch-payload");
-        assert_eq!(received.header.batch_id, 4321);
-        assert_eq!(received.header.kind, 2);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let result = loop {
@@ -630,21 +822,5 @@ mod tests {
             assert!(Instant::now() < deadline, "result did not arrive");
         };
         assert_eq!(result.payload, b"result-payload");
-        assert_eq!(result.header.batch_id, 4321);
-    }
-
-    #[test]
-    fn a_frame_above_the_bound_is_refused_by_size() {
-        let header = Header {
-            len: 8192,
-            ..Header::default()
-        };
-        let mut reader = FrameReader::new();
-        reader.buffer.extend_from_slice(&encode_header(&header));
-        let error = reader.split(4096).expect_err("oversized frame is refused");
-        assert!(
-            error.to_string().contains("exceeds its 4096 byte bound"),
-            "{error}"
-        );
     }
 }

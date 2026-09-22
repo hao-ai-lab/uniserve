@@ -54,7 +54,7 @@ fn checked_product(degrees: &[usize]) -> Result<usize, ParallelConfigError> {
             return Err(ParallelConfigError("parallel degrees must be positive"));
         }
         size.checked_mul(degree)
-            .ok_or_else(|| ParallelConfigError("parallel degree product overflow"))
+            .ok_or(ParallelConfigError("parallel degree product overflow"))
     })
 }
 

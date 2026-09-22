@@ -373,7 +373,6 @@ table ArRequestParams {
   initial_position:uint;
 }
 
-table UmmRequestParams { image:ImageParams; }
 
 table DiffusionSamplingParams {
   num_frames:uint;
@@ -386,7 +385,7 @@ table NewRequest {
   request_key:RequestKey;
   request_pool_idx:uint;
   ar:ArRequestParams;
-  umm:UmmRequestParams;
+  image:ImageParams;
   diffusion:DiffusionSamplingParams;
   prompt_token_ids:[uint];
 }
@@ -415,7 +414,6 @@ table Batch {
 
 // Worker response payloads.
 
-table RegistrationAck { visible:bool; }
 
 table Locator {
   source:WorkerEndpoint;
@@ -501,7 +499,6 @@ table BatchOutput {
   batch_id:ulong;
   completions:[RequestOutput];
   products:[TensorPublication];
-  registration:RegistrationAck;
   worker_exec_us:ulong = null;
   forward_stats:ForwardStats;
 }

@@ -39,8 +39,19 @@ def serve_pending_publication(channel, shape=(1024,)) -> None:
         )
         segment.initialize(storage.buf, locator_digest(locator))
         channel.send(locator.to_mapping())
-        assert channel.recv() == "exit"
-        segment.set_state(storage.buf, segment.FAILED)
+        while True:
+            command = channel.recv()
+            if command == "settled":
+                channel.send(
+                    segment.settled(
+                        storage.buf, range(segment.MAX_ACKNOWLEDGMENT_SLOTS)
+                    )
+                )
+            elif command == "exit":
+                segment.set_state(storage.buf, segment.FAILED)
+                break
+            else:
+                raise ValueError(f"unknown publisher command: {command}")
     finally:
         storage.close()
         storage.unlink()

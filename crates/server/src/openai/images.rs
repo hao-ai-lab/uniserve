@@ -20,7 +20,6 @@ pub async fn collect_image_generation(
                 height,
                 width,
                 bytes,
-                sha256,
                 pixels_png_b64,
                 ..
             } => data.push(GeneratedImageData {
@@ -29,7 +28,6 @@ pub async fn collect_image_generation(
                 height: required_image_field(height, "height")?,
                 width: required_image_field(width, "width")?,
                 bytes: required_image_field(bytes, "byte count")?,
-                sha256: required_image_field(sha256, "SHA-256")?,
             }),
             RequestOutput::Finished { reason, .. } => {
                 if matches!(reason, crate::serving::FinishStatus::Error) {
@@ -52,6 +50,11 @@ pub async fn collect_image_generation(
             RequestOutput::Aborted { .. } => {
                 return Err(ApiError::server_error(
                     "image generation request was aborted".to_string(),
+                ));
+            }
+            RequestOutput::Artifact(_) | RequestOutput::MediaProgress { .. } => {
+                return Err(ApiError::server_error(
+                    "image request received a video event".to_owned(),
                 ));
             }
             RequestOutput::Accepted { .. }

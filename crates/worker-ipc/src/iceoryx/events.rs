@@ -1,7 +1,7 @@
 //! Directional wake services for the iceoryx2 request-response boundary.
 //!
 //! Request-response ports do not expose a file descriptor suitable for parking.
-//! A host wake service reports results, commands, and worker death, while a
+//! A host wake service reports results and worker death, while a
 //! worker wake service reports submitted requests. Separate directions prevent
 //! broadcast notifications from accumulating on the sender's listener.
 //!
@@ -68,8 +68,6 @@ fn wait_readable(listener: &Listener<IxService>, timeout: Duration) -> IpcResult
 
 /// `evt_host_wake`: the worker signals the host that a response is available.
 pub const EVT_RESULT: usize = 2;
-/// `evt_host_wake`: command ingress signals that work was enqueued for the host.
-pub const EVT_COMMAND: usize = 3;
 /// `evt_host_wake`: the worker-death watcher signals worker exit to the host.
 pub const EVT_DEATH: usize = 4;
 /// `evt_worker_wake`: the host signals that an IPC request was queued.
@@ -118,7 +116,7 @@ fn make_listener(factory: &EventFactory<IxService>) -> IpcResult<Listener<IxServ
 }
 
 /// A cloneable, thread-safe host wake source plus the `EventId` to stamp.
-/// Commands and worker death can fire from arbitrary frontend / watcher threads.
+/// Worker death can fire from arbitrary frontend / watcher threads.
 #[derive(Clone)]
 pub struct WakeSender {
     /// Shared event notifier safe to call from callback and watcher threads.
@@ -152,8 +150,6 @@ impl WakeSender {
 pub struct WakeEvents {
     /// A worker response became available.
     pub result: bool,
-    /// A host command entered the engine queue.
-    pub command: bool,
     /// A monitored worker process exited.
     pub death: bool,
     /// A notification carried an unrecognized event identity.
@@ -163,40 +159,36 @@ pub struct WakeEvents {
 impl WakeEvents {
     /// Returns whether at least one wake category was observed.
     pub fn any(&self) -> bool {
-        self.result || self.command || self.death || self.other
+        self.result || self.death || self.other
     }
 }
 
-/// Host-side event ports: a listener for {result, command, death}, a host-local
+/// Host-side event ports: a listener for {result, death}, a host-local
 /// notifier, and a distinct notifier for the worker's request listener.
 pub(crate) struct ClientEvents {
-    /// Host-facing listener for results, commands, and process death.
+    /// Host-facing listener for results and process death.
     wake_listener: Listener<IxService>,
-    /// Host-local notifier shared by command and death wake senders.
+    /// Host-local notifier used by death wake senders.
     wake_notifier: Arc<Notifier<IxService>>,
     /// Notifier targeting the worker's request listener.
     request_notifier: Notifier<IxService>,
-    /// Coalescing state for command wakes.
-    command_pending: Arc<AtomicBool>,
     /// Coalescing state for process-death wakes.
     death_pending: Arc<AtomicBool>,
 }
 
 impl ClientEvents {
-    /// Opens host-facing result, command, and death wake ports.
+    /// Opens host-facing result and death wake ports.
     pub(crate) fn open(node: &Node<IxService>, service: &str) -> IpcResult<Self> {
         let wake = open_event_service(node, &host_wake_event_name(service))?;
         let request_wake = open_event_service(node, &worker_wake_event_name(service))?;
-        let wake_notifier = Arc::new(make_notifier(&wake, EVT_COMMAND)?);
+        let wake_notifier = Arc::new(make_notifier(&wake, EVT_DEATH)?);
         let request_notifier = make_notifier(&request_wake, EVT_REQUEST)?;
         let wake_listener = make_listener(&wake)?;
-        let command_pending = Arc::new(AtomicBool::new(false));
         let death_pending = Arc::new(AtomicBool::new(false));
         Ok(Self {
             wake_listener,
             wake_notifier,
             request_notifier,
-            command_pending,
             death_pending,
         })
     }
@@ -212,12 +204,10 @@ impl ClientEvents {
     pub(crate) fn drain(&self) -> IpcResult<WakeEvents> {
         // Re-arm coalesced local producers before draining event identities.
         let mut ev = WakeEvents::default();
-        self.command_pending.store(false, Ordering::Release);
         self.death_pending.store(false, Ordering::Release);
         self.wake_listener
             .try_wait_all(|id| match id.as_value() {
                 EVT_RESULT => ev.result = true,
-                EVT_COMMAND => ev.command = true,
                 EVT_DEATH => ev.death = true,
                 _ => ev.other = true,
             })
@@ -230,15 +220,6 @@ impl ClientEvents {
         // SAFETY: the listener owns this descriptor for at least as long as the
         // endpoint exposing it. Callers borrow it only while the endpoint lives.
         unsafe { self.wake_listener.file_descriptor().native_handle() }
-    }
-
-    /// Returns a cloneable wake source for queued host commands.
-    pub(crate) fn command_wake(&self) -> WakeSender {
-        WakeSender {
-            notifier: Arc::clone(&self.wake_notifier),
-            event_id: EVT_COMMAND,
-            pending: Arc::clone(&self.command_pending),
-        }
     }
 
     /// Returns a cloneable wake source for worker-process exit.
@@ -344,18 +325,8 @@ mod tests {
         let service = format!("uniserve/test/events/{}/{nonce}", std::process::id());
         let events = ClientEvents::open(&node, &service).expect("open client events");
         let server = ServerEvents::open(&node, &service).expect("open server events");
-        let command = events.command_wake();
         let death = events.death_wake();
 
-        for _ in 0..10_000 {
-            command.wake();
-        }
-        assert!(
-            events
-                .wait(Duration::from_secs(1))
-                .expect("drain command wake")
-                .command
-        );
         events.notify_request();
         server
             .wait_request(Duration::from_secs(1))
@@ -373,14 +344,9 @@ mod tests {
                 .result
         );
 
-        command.wake();
-        assert!(
-            events
-                .wait(Duration::from_secs(1))
-                .expect("receive next command wake")
-                .command
-        );
-        death.wake();
+        for _ in 0..10_000 {
+            death.wake();
+        }
         assert!(
             events
                 .wait(Duration::from_secs(1))

@@ -26,8 +26,7 @@ fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<EngineCoreOut
 
 /// EngineCoreOutput journal and usage counters for one request.
 pub(super) struct RequestOutput {
-    pub(super) event_tx: EventTx,
-    pub(super) event_seq: u64,
+    pub(super) events: EventJournal,
     pub(super) tokens_sent: usize,
     pub(super) tokens_acked: usize,
     /// Prompt score positions already consumed and delivered to the caller.
@@ -35,20 +34,33 @@ pub(super) struct RequestOutput {
     pub(super) prompt_logprobs_emitted: usize,
     /// Ends of token batches awaiting a stop-string decoder decision.
     pub(super) decoder_boundaries: VecDeque<usize>,
-    journal: VecDeque<EngineCoreOutput>,
 }
 
 impl RequestOutput {
     /// Creates an output journal with the requested capacity.
     pub(super) fn new(event_tx: EventTx) -> Self {
         Self {
-            event_tx,
-            event_seq: 0,
+            events: EventJournal::new(event_tx),
             tokens_sent: 0,
             tokens_acked: 0,
             prompt_logprobs_processed: 0,
             prompt_logprobs_emitted: 0,
             decoder_boundaries: VecDeque::new(),
+        }
+    }
+}
+
+/// Ordered publication shared by token and media requests. Progress can be
+/// coalesced while terminal events retain their place until the caller reads.
+pub(super) struct EventJournal {
+    pub(super) event_tx: EventTx,
+    journal: VecDeque<EngineCoreOutput>,
+}
+
+impl EventJournal {
+    pub(super) fn new(event_tx: EventTx) -> Self {
+        Self {
+            event_tx,
             journal: VecDeque::new(),
         }
     }
@@ -73,15 +85,20 @@ impl RequestOutput {
     /// Delivers an event or journals it in order when the public channel is full.
     pub(super) fn enqueue(&mut self, event: EngineCoreOutput) -> bool {
         if self.flush() {
+            return false;
+        }
+        if matches!(event, EngineCoreOutput::MediaProgress { .. })
+            && let Some(last @ EngineCoreOutput::MediaProgress { .. }) = self.journal.back_mut()
+        {
+            *last = event;
             return true;
         }
         if self.journal.is_empty() {
             match self.event_tx.send(event) {
                 Ok(()) => {
-                    self.event_seq = self.event_seq.saturating_add(1);
-                    return false;
+                    return true;
                 }
-                Err(EventSendError::Closed(_)) => return true,
+                Err(EventSendError::Closed(_)) => return false,
                 Err(EventSendError::Full(event)) => self.journal.push_back(*event),
             }
         } else {
@@ -91,38 +108,26 @@ impl RequestOutput {
             self.journal.len() <= OUTPUT_JOURNAL_CAPACITY,
             "scheduler exceeded the bounded public output journal"
         );
-        self.event_seq = self.event_seq.saturating_add(1);
-        false
+        true
     }
-}
-
-struct RetiredOutput {
-    event_tx: EventTx,
-    journal: VecDeque<EngineCoreOutput>,
 }
 
 #[derive(Default)]
 /// Non-blocking event publisher with request-local ordered buffering.
 pub(crate) struct OutputSender {
-    retired: HashMap<RequestId, RetiredOutput>,
+    retired: HashMap<RequestId, EventJournal>,
 }
 
 impl OutputSender {
-    /// Returns the number of retained events.
+    /// Returns the number of retired requests still awaiting output delivery.
     pub(super) fn retained_len(&self) -> usize {
         self.retired.len()
     }
 
-    /// Marks journal entries as retired through the supplied sequence.
-    pub(super) fn retire(&mut self, id: RequestId, output: RequestOutput) {
+    /// Retains pending events after computational state has retired.
+    pub(super) fn retire(&mut self, id: RequestId, output: EventJournal) {
         if !output.journal.is_empty() {
-            self.retired.insert(
-                id,
-                RetiredOutput {
-                    event_tx: output.event_tx,
-                    journal: output.journal,
-                },
-            );
+            self.retired.insert(id, output);
         }
     }
 
@@ -210,14 +215,6 @@ impl Scheduler {
                 self.begin_image(id);
                 return;
             }
-            // Once the image budget is spent the image-start trigger is
-            // suppressed host-side: emit a non-trigger token so a bias toward the
-            // trigger returns to ordinary text instead of an un-actionable signal.
-            let tok = if direct_trigger {
-                tok.wrapping_add(1)
-            } else {
-                tok
-            };
             let top_logprobs = is_last.then(|| std::mem::take(&mut record.top_logprobs));
             if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, is_last) {
                 return;
@@ -353,13 +350,6 @@ impl Scheduler {
                             self.begin_image(id);
                             return;
                         }
-
-                        // A trigger that cannot open a branch becomes ordinary text.
-                        let tok = if direct_trigger {
-                            tok.wrapping_add(1)
-                        } else {
-                            tok
-                        };
 
                         if self.emit_or_finish_und_token(
                             id,
@@ -575,7 +565,7 @@ impl Scheduler {
                     let Some(event) = image_done_event(image_id, image_b64) else {
                         return self.finish(id, FinishReason::Error);
                     };
-                    self.emit_visible(id, event);
+                    self.emit(id, event);
                 }
 
                 self.activate_request_tables(id);
@@ -837,42 +827,36 @@ impl Scheduler {
     /// Flushes the output journals.
     pub(super) fn flush_output_journals(&mut self) -> bool {
         let mut progressed = false;
-        for state in self.running.values_mut() {
-            if state.output.is_closed() {
-                state.terminal_intent = TerminalIntent::Finish(FinishReason::Cancelled);
-                continue;
+        for (events, intent) in self
+            .running
+            .values_mut()
+            .map(|state| (&mut state.output.events, &mut state.terminal_intent))
+            .chain(
+                self.running_media
+                    .values_mut()
+                    .map(|state| (&mut state.output, &mut state.terminal_intent)),
+            )
+        {
+            let before = events.journal.len();
+            if events.is_closed() || events.flush() {
+                *intent = TerminalIntent::Finish(FinishReason::Cancelled);
             }
-            let before = state.output.journal.len();
-            if state.output.flush() {
-                state.terminal_intent = TerminalIntent::Finish(FinishReason::Cancelled);
-            }
-            progressed |= state.output.journal.len() != before;
+            progressed |= events.journal.len() != before;
         }
         progressed |= self.output.flush_retired();
         progressed
     }
 
-    /// Emits a public event through the request output journal.
-    pub(super) fn emit(&mut self, id: RequestId, ev: EngineCoreOutput) {
-        if let Some(st) = self.running.get_mut(&id) {
-            if st.output.enqueue(ev) {
-                st.terminal_intent = TerminalIntent::Finish(FinishReason::Cancelled);
-            }
+    /// Returns whether the request accepted an event into its ordered output.
+    pub(super) fn emit(&mut self, id: RequestId, event: EngineCoreOutput) -> bool {
+        let Some(state) = self.running.get_mut(&id) else {
+            return false;
+        };
+        let accepted = state.output.events.enqueue(event);
+        if !accepted {
+            state.terminal_intent = TerminalIntent::Finish(FinishReason::Cancelled);
         }
-    }
-
-    /// Emits an event after its producing result has been accepted.
-    pub(super) fn emit_visible(&mut self, id: RequestId, event: EngineCoreOutput) -> bool {
-        let before = self
-            .running
-            .get(&id)
-            .map_or(0, |state| state.output.event_seq);
-        self.emit(id, event);
-        let published = self
-            .running
-            .get(&id)
-            .is_some_and(|state| state.output.event_seq > before);
-        published
+        accepted
     }
 
     /// Emits a text token and advance output accounting.
@@ -885,7 +869,7 @@ impl Scheduler {
         if !st.req.emits_text() {
             return false;
         }
-        let published = self.emit_visible(id, EngineCoreOutput::TextToken { id: tok, logprob });
+        let published = self.emit(id, EngineCoreOutput::TextToken { id: tok, logprob });
         if published && let Some(state) = self.running.get_mut(&id) {
             state.output.tokens_sent = state.output.tokens_sent.saturating_add(1);
         }
@@ -1080,15 +1064,15 @@ impl Scheduler {
                     .flow_prefix
                     .take()
                     .into_iter()
-                    .flat_map(|prefix| prefix.allocations.into_allocations())
-                    .chain(allocation.into_allocations())
+                    .map(|prefix| prefix.allocations)
+                    .chain([allocation])
                     .collect();
                 self.retiring_requests.insert(
                     id,
                     RetiringRequest {
                         request_key,
                         allocations,
-                        media_allocations: Vec::new(),
+                        media_allocations: None,
                         buffers,
                     },
                 );
@@ -1133,9 +1117,9 @@ impl Scheduler {
                 completion_tokens: st.num_generated_tokens,
                 images: st.num_generated_images,
             };
-            let closed = st.output.enqueue(terminal);
-            if !closed {
-                self.output.retire(id, st.output);
+            let accepted = st.output.events.enqueue(terminal);
+            if accepted {
+                self.output.retire(id, st.output.events);
             }
         }
 

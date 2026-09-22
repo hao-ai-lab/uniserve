@@ -29,17 +29,6 @@ pub struct PrefixCacheStats {
     pub preempted_hits: u64,
 }
 
-/// Timing sample captured when one KV-cache block is evicted.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct KvCacheEvictionEvent {
-    /// Lifetime from allocation to eviction.
-    pub lifetime_seconds: f64,
-    /// Idle time observed before eviction.
-    pub idle_seconds: f64,
-    /// Time gaps between consecutive accesses before eviction.
-    pub reuse_gaps_seconds: Vec<f64>,
-}
-
 /// Token-source breakdown for scheduled prefill work.
 ///
 /// The value serializes as a map with stable field names.
@@ -60,51 +49,6 @@ pub struct PrefillStats {
     /// Tokens to be prefilled from external KV transfer.
     #[serde(default)]
     pub num_external_cached_tokens: u32,
-}
-
-/// Inputs and timing used to inspect performance-estimate calculation.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct DebugPerfStats {
-    /// Time spent calculating these stats.
-    pub calc_duration: f64,
-    /// Number of prefill requests included in the sampled batch.
-    pub num_prefill_requests: u64,
-    /// Number of decode requests included in the sampled batch.
-    pub num_decode_requests: u64,
-    /// Optional execution-context breakdown used for debugging.
-    pub context_breakdown: Option<BTreeMap<String, u64>>,
-    /// Optional per-component FLOPs breakdown.
-    pub num_flops_per_gpu_breakdown: Option<BTreeMap<String, u64>>,
-    /// Optional per-component memory-read breakdown.
-    pub num_read_bytes_per_gpu_breakdown: Option<BTreeMap<String, u64>>,
-    /// Optional per-component memory-write breakdown.
-    pub num_write_bytes_per_gpu_breakdown: Option<BTreeMap<String, u64>>,
-}
-
-/// Estimated compute and memory traffic for one worker update.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct PerfStats {
-    /// Estimated floating point calls per GPU.
-    pub num_flops_per_gpu: u64,
-    /// Estimated bytes read from memory per GPU.
-    pub num_read_bytes_per_gpu: u64,
-    /// Estimated bytes written to memory per GPU.
-    pub num_write_bytes_per_gpu: u64,
-    /// Optional debug-only perf derivation details.
-    pub debug_stats: Option<DebugPerfStats>,
-}
-
-/// Shape and runtime-mode metadata for one CUDA graph execution.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct CudagraphStat {
-    /// Number of real tokens in the captured batch before padding.
-    pub num_unpadded_tokens: u64,
-    /// Number of padded tokens in the captured batch.
-    pub num_padded_tokens: u64,
-    /// Number of padding positions added for capture/runtime shape alignment.
-    pub num_paddings: u64,
-    /// Runtime mode string associated with this CUDA graph sample.
-    pub runtime_mode: String,
 }
 
 /// Worker-local forward/kernel counters folded into scheduler stats.
@@ -320,12 +264,6 @@ pub struct SchedulerStats {
     pub max_queue_wait_us: u64,
     /// Local prefix cache statistics.
     pub prefix_cache_stats: PrefixCacheStats,
-    /// Sampled KV cache eviction events for residency metrics.
-    pub kv_cache_eviction_events: Vec<KvCacheEvictionEvent>,
-    /// CUDA graph runtime stats when graph metrics are enabled.
-    pub cudagraph_stats: Option<CudagraphStat>,
-    /// Estimated MFU/performance stats, when enabled.
-    pub perf_stats: Option<PerfStats>,
     /// Worker-local forward/kernel counters since the previous stats snapshot.
     #[serde(default)]
     pub worker_forward_stats: Option<ForwardStats>,

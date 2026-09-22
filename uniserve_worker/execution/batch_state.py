@@ -20,7 +20,6 @@ from uniserve_worker.execution.rows import (
 from uniserve_worker.foundation.errors import WorkerError, invalid_descriptor
 from uniserve_worker.protocol.batch import (
     Batch,
-    RegistrationAck,
     TensorPublication,
 )
 from uniserve_worker.protocol.call import Call, CallStatus
@@ -109,7 +108,6 @@ class BatchState:
     products: tuple[TensorPublication, ...] = ()
     stats: ForwardStats | None = None
     execution_us: int | None = None
-    visible: bool = False
 
     # Resource retirement decided during execution, applied by the owner.
     retirement_requests: frozenset[RequestKey] = frozenset()
@@ -378,7 +376,6 @@ class BatchState:
         outputs: tuple[PendingOutput | RequestOutput, ...],
         *,
         products: tuple[TensorPublication, ...] = (),
-        visible: bool,
         execution_us: int,
         stats: ForwardStats,
     ) -> None:
@@ -425,7 +422,6 @@ class BatchState:
         self.forward_indices.clear()
         self.forward_stats.clear()
         self.component_us.clear()
-        self.visible = visible
 
     def ready(self) -> bool:
         """Query whether the batch's single result can be delivered."""
@@ -471,9 +467,6 @@ class BatchState:
                 for value in self.products
                 if (value.product.request_key, value.product.producer_call_id)
                 in successful
-            ),
-            registration=RegistrationAck(
-                visible=not self.batch.calls or self.visible
             ),
             worker_exec_us=self.execution_us,
             forward_stats=self.stats,

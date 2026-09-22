@@ -121,7 +121,7 @@ pub enum ResponseKind {
 /// Request and call identity attached to a worker error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorCallIdentity {
-    /// Request lineage owning the failed call.
+    /// Request owning the failed call.
     pub request_key: RequestKey,
     /// Failed call identity.
     pub call_id: CallId,

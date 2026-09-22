@@ -281,7 +281,7 @@ fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
             uniserve_server::openai::VideoGenerationRequest {
                 model: "minimax_h3".to_string(),
                 prompt: prompt.to_string(),
-                seconds: 1.0,
+                seconds: Some(1.0),
                 seed: 17,
             },
         )
@@ -299,7 +299,7 @@ fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
                 uniserve_server::openai::VideoGenerationRequest {
                     model: model_name.to_string(),
                     prompt: prompt.to_string(),
-                    seconds,
+                    seconds: Some(seconds),
                     seed: 17,
                 },
             )
@@ -478,4 +478,66 @@ fn cache_controls_preserve_isolation_and_prompt_logprob_requirements() {
         assert!(!response.cache.read_enabled && response.cache.write_enabled);
         assert!(response.prompt_logprobs_requested);
     }
+}
+
+#[test]
+fn sampling_controls_have_the_same_meaning_across_token_models() {
+    for (description, model_type) in [
+        (ModelDescription::Qwen3, "qwen3"),
+        (ModelDescription::SenseNova, "neo_chat"),
+        (ModelDescription::Bagel, "bagel"),
+    ] {
+        let (_directory, _, model) = resolved_model(description, model_type);
+        for seed in [-1, -2] {
+            let mut input = uniserve_server::serving::TextPromptRequest::new("sampling", "hello");
+            input.sampling.seed = Some(seed);
+            input.stop.logprobs = Some(-1);
+            let (request, _) = model.preprocess_text_request(input.clone()).unwrap();
+            assert_eq!(request.sampling.seed, Some(seed as u64));
+            assert_eq!(request.sampling.n_logprobs, u32::MAX);
+            input.stop.logprobs = Some(-2);
+            assert!(model.preprocess_text_request(input).is_err());
+        }
+    }
+}
+
+#[test]
+fn omitted_video_duration_uses_the_advertised_model_default() {
+    let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
+    let mut config = loaded.config().clone();
+    config.parameters = uniserve_server::profile::ModelParameters::MiniMaxH3 {
+        max_video_seconds: 2.0,
+        num_inference_steps: 4,
+    };
+    let model = InputProcessor::new(
+        config,
+        tokenizer,
+        None,
+        uniserve_server::serving::WorkerCapabilities {
+            limits: runtime_limits(),
+            sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
+            max_model_tokens: 4096,
+            denoise_steps: 4,
+        },
+        true,
+    )
+    .unwrap();
+    let input: uniserve_server::openai::VideoGenerationRequest =
+        serde_json::from_value(serde_json::json!({
+            "model": "minimax_h3", "prompt": "a river"
+        }))
+        .unwrap();
+    assert_eq!(model.video_capabilities()["default_seconds"], 2.0);
+    let id = ServeRequestId::new("duration");
+    let implicit = model.preprocess_video_request(&id, input.clone()).unwrap();
+    let explicit = model
+        .preprocess_video_request(
+            &id,
+            uniserve_server::openai::VideoGenerationRequest {
+                seconds: Some(2.0),
+                ..input
+            },
+        )
+        .unwrap();
+    assert_eq!(implicit.sampling, explicit.sampling);
 }

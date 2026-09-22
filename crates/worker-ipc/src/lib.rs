@@ -80,10 +80,9 @@ pub use channel::{
     Outstanding, RankChannel, RankServer, SHARED_MEMORY_CHANNEL, SOCKET_CHANNEL, Wake,
 };
 pub use iceoryx::{
-    ClientEndpoint, DEFAULT_SERVICE_PREFIX, EVT_COMMAND, EVT_COMPLETION, EVT_DEATH, EVT_REQUEST,
-    EVT_RESULT, Frame, Header, IPC_VERSION, IpcError, IpcResult, Pending, ServerEndpoint,
-    WakeEvents, WakeSender, header_for_request, header_for_response, is_supported_ipc_version,
-    service_name,
+    ClientEndpoint, DEFAULT_SERVICE_PREFIX, EVT_COMPLETION, EVT_DEATH, EVT_REQUEST, EVT_RESULT,
+    Frame, Header, IPC_VERSION, IpcError, IpcResult, Pending, ServerEndpoint, WakeEvents,
+    WakeSender, header_for_request, header_for_response, is_supported_ipc_version, service_name,
 };
 pub use socket::{SocketClient, SocketServer};
 
