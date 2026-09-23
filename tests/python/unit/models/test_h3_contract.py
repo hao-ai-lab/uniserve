@@ -24,12 +24,13 @@ def checkpoint(tmp_path):
     return tmp_path
 
 
-def test_full_vsa_checkpoint_resolves_t2va_and_inference_grid(checkpoint):
+def test_full_vsa_checkpoint_resolves_its_trained_rungs(checkpoint):
     config = read_config(checkpoint, IOConfig())
-    assert config.diffusion.ladder == (1000, 750, 500, 250)
+    assert config.diffusion.ladder == (999, 749, 500, 250)
     assert config.diffusion.time_scale == 1000
     assert config.diffusion.video_shift == 12
     assert config.diffusion.audio_shift == 3
+    assert config.denoiser.vsa_sparsity == 0.9
 
 
 def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
@@ -37,18 +38,12 @@ def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
     inference = json.loads(inference_path.read_text())
     inference.update(
         {
-            "model_id": "FastVideo/FastVideo-FastH3-8-Step-V2",
-            "checkpoint_content_sha256": (
-                "516323fa396fa5dff4e82669d4e9a08a5791692a3d3b98ff6bc3de3fc6a33d11"
-            ),
-            "checkpoint_metadata_sha256": (
-                "ca9f2d609c05742ba465d24989981ec02cca26acb6ca2f163dc0f6dc8d11c27b"
-            ),
-            "fastvideo_commit": "24bbe7fddd05ca6f2c34b3dbed06ac1c75b72086",
             "transformer_forwards": 8,
             "num_inference_steps": 9,
             "dmd_denoising_steps": [999, 874, 749, 624, 500, 375, 250, 125],
             "vsa_sparsity": 0.8,
+            "video_scheduler_shift": 10.0,
+            "audio_scheduler_shift": 3.0,
         }
     )
     inference_path.write_text(json.dumps(inference))
@@ -59,7 +54,7 @@ def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
 
     config = read_config(checkpoint, IOConfig())
 
-    assert config.diffusion.ladder == (1000, 875, 750, 625, 500, 375, 250, 125)
+    assert config.diffusion.ladder == (999, 874, 749, 624, 500, 375, 250, 125)
     assert config.diffusion.video_shift == 10
     assert config.diffusion.audio_shift == 3
     assert config.denoiser.vsa_sparsity == 0.8
@@ -73,7 +68,7 @@ def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
     for name, shift in (("video", 10.0), ("audio", 3.0)):
         sigmas = schedules[name].sigmas
         assert sigmas.shape == (9,)
-        for index, step in ((0, 1000), (7, 125)):
+        for index, step in ((0, 999), (7, 125)):
             t = step / 1000
             expected = shift * t / (1 + (shift - 1) * t)
             torch.testing.assert_close(
@@ -89,8 +84,13 @@ def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
     [
         ("task", "ref2va"),
         ("attention_backend", "FLASH_ATTN"),
+        ("guidance_scale", 3.0),
         ("transformer_forwards", 50),
-        ("vsa_sparsity", 0.8),
+        ("num_inference_steps", 4),
+        ("dmd_denoising_steps", [999, 999, 500, 250]),
+        ("dmd_denoising_steps", [1001, 749, 500, 250]),
+        ("vsa_sparsity", 1.0),
+        ("video_scheduler_shift", 10.0),
         ("schema_version", "unknown"),
     ],
 )
