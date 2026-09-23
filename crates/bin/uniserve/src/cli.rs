@@ -23,6 +23,10 @@ use uniserve_server::{
 
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
 
+/// Call batches kept in flight against a worker when neither the command
+/// line nor the deployment file sets its queue depth.
+const DEFAULT_QUEUE_DEPTH: usize = 2;
+
 /// Top-level parser for the `uniserve` binary.
 #[derive(Debug, Parser)]
 #[command(
@@ -97,7 +101,7 @@ pub(crate) struct ServeArgs {
 impl ServeArgs {
     /// Builds the UniServe-native server config, binding the HTTP listener
     /// directly.
-    pub(crate) fn to_uniserve_config(&self, is_media: bool) -> Config {
+    pub(crate) fn to_uniserve_config(&self) -> Config {
         let listener_mode = match &self.uds {
             Some(path) => HttpListenerMode::BindUnix { path: path.clone() },
             None => HttpListenerMode::BindTcp {
@@ -105,7 +109,7 @@ impl ServeArgs {
                 port: self.port,
             },
         };
-        self.runtime.clone().into_config(listener_mode, is_media)
+        self.runtime.clone().into_config(listener_mode)
     }
 }
 
@@ -256,10 +260,6 @@ impl SharedRuntimeArgs {
         })
     }
 
-    /// Builds the UniServe Rust-engine settings from these CLI arguments.
-    ///
-    /// `is_media` comes from the checkpoint itself; video deployments size their
-    /// queue, batch and IPC slots differently from token deployments.
     /// Returns the hosts the shorthand places ranks on, head's host first.
     ///
     /// Section 7's eight-device configuration spans two hosts, and its muxer
@@ -276,40 +276,33 @@ impl SharedRuntimeArgs {
         hosts
     }
 
-    pub(crate) fn engine_settings(&self, is_media: bool) -> EngineSettings {
+    /// Builds the UniServe Rust-engine settings from these CLI arguments.
+    ///
+    /// The defaults are the same for every model. Each worker bounds what it
+    /// can hold at load time, a media worker's request slots from its
+    /// placement's queue depth, and the engine clamps resident requests and
+    /// batch sizes to what the workers report. The IPC slot capacity a model's
+    /// products require is applied when the model is resolved.
+    pub(crate) fn engine_settings(&self) -> EngineSettings {
         let mut worker_process = self.worker_process.to_args();
         worker_process.host = self.host_identity.clone();
         worker_process.python = self.worker_python.clone();
         worker_process.model = self.model.clone();
-        let queue_depth = self.queue_depth.unwrap_or(if is_media { 6 } else { 2 });
+        let queue_depth = self.queue_depth.unwrap_or(DEFAULT_QUEUE_DEPTH);
         worker_process.queue_depth = queue_depth;
-        worker_process.resp_slot_cap = if is_media {
-            EngineSettings::MEDIA_IPC_SLOT_CAP
-        } else {
-            self.resp_slot_cap
-        };
+        worker_process.resp_slot_cap = self.resp_slot_cap;
         worker_process.kv_token_capacity = self.kv_token_capacity;
         worker_process.block_size = self.block_size;
         worker_process.attention_backend = self.attention_backend.clone();
         EngineSettings {
-            max_batch: self
-                .max_batch
-                .unwrap_or(if is_media { 2 } else { DEFAULT_MAX_BATCH }),
-            max_num_batched_tokens: self.max_num_batched_tokens.unwrap_or(if is_media {
-                2
-            } else {
-                DEFAULT_MAX_NUM_BATCHED_TOKENS
-            }),
-            max_num_seqs: self.max_num_seqs.unwrap_or(if is_media {
-                2
-            } else {
-                DEFAULT_MAX_NUM_SEQS
-            }),
-            long_prefill_threshold: self.long_prefill_threshold.unwrap_or(if is_media {
-                1
-            } else {
-                DEFAULT_LONG_PREFILL_THRESHOLD
-            }),
+            max_batch: self.max_batch.unwrap_or(DEFAULT_MAX_BATCH),
+            max_num_batched_tokens: self
+                .max_num_batched_tokens
+                .unwrap_or(DEFAULT_MAX_NUM_BATCHED_TOKENS),
+            max_num_seqs: self.max_num_seqs.unwrap_or(DEFAULT_MAX_NUM_SEQS),
+            long_prefill_threshold: self
+                .long_prefill_threshold
+                .unwrap_or(DEFAULT_LONG_PREFILL_THRESHOLD),
             mixed_prefill_tokens: self.mixed_prefill_tokens,
             scheduler_policy: self.scheduler_policy.into(),
             // `None` lets `build_state` derive the model's real context length;
@@ -336,8 +329,8 @@ impl SharedRuntimeArgs {
     }
 
     /// Builds the OpenAI-server config for the in-process UniServe engine.
-    fn into_config(self, listener_mode: HttpListenerMode, is_media: bool) -> Config {
-        let engine = self.engine_settings(is_media);
+    fn into_config(self, listener_mode: HttpListenerMode) -> Config {
+        let engine = self.engine_settings();
         let model = self.resolved_model();
         let api_key = self.configured_api_key();
         let request_timeout = self.request_timeout.map(Duration::from_secs);
