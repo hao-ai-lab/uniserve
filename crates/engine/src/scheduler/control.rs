@@ -75,7 +75,7 @@ impl Scheduler {
                         ),
                     });
                 } else {
-                    match request {
+                    match *request {
                         Request::Ar(request) | Request::Umm(request) => {
                             self.enqueue(request, event_tx)
                         }

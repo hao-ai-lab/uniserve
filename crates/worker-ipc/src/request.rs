@@ -42,7 +42,7 @@ pub enum WorkerRequest {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
         /// Fully lowered batch.
-        batch: Batch,
+        batch: Box<Batch>,
     },
     /// Requests orderly worker shutdown.
     Close {
@@ -95,7 +95,7 @@ impl WorkerRequest {
     pub fn submit(batch: Batch) -> Self {
         Self::Submit {
             message_id: None,
-            batch,
+            batch: Box::new(batch),
         }
     }
     /// Constructs a worker-shutdown request.

@@ -694,7 +694,7 @@ fn unchanged_kv_publication_round_trips_without_physical_tensors() {
             code: CallKind::Transfer(TransferMode::KvPublish),
             kv_output: Some(KvTransfer {
                 tensors: Vec::new(),
-                source: source,
+                source,
                 destination: "decoder".into(),
                 base: Some(source),
                 base_extent: 16,
@@ -793,7 +793,7 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
                 code: CallKind::Transfer(TransferMode::KvPublish),
                 kv_output: Some(KvTransfer {
                     tensors,
-                    source: source,
+                    source,
                     destination: "decoder".into(),
                     base: Some(source),
                     base_extent: 3,
@@ -919,7 +919,7 @@ fn every_batch_command_variant_round_trips_through_ipc() {
         decoded.commands,
         vec![
             BatchCommand::Start {
-                request: admission()
+                request: Box::new(admission())
             },
             finish,
             free
@@ -1666,12 +1666,14 @@ fn ipc_decode_rejects_malformed_frames() {
 
 #[test]
 fn a_rank_may_transfer_over_every_mechanism_its_edges_name() {
-    let mut info = WorkerInfo::default();
-    info.transfer_backends = vec![
-        "cuda_vmm".to_owned(),
-        "shm".to_owned(),
-        "channel".to_owned(),
-    ];
+    let mut info = WorkerInfo {
+        transfer_backends: vec![
+            "cuda_vmm".to_owned(),
+            "shm".to_owned(),
+            "channel".to_owned(),
+        ],
+        ..WorkerInfo::default()
+    };
     assert!(info.validate().is_ok());
 
     info.transfer_backends = vec!["cuda_vmm".to_owned(), "socket".to_owned()];

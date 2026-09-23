@@ -437,10 +437,10 @@ impl WorkerProcessOptions {
             download_dir: self.download_dir.clone(),
             load_threads: self.load_threads,
             checksum_manifest: self.checksum_manifest.clone(),
-            model_dtype: self.model_dtype.clone(),
+            model_dtype: self.model_dtype,
             quantization_config: self.quantization_config.clone(),
-            kv_cache_dtype: self.kv_cache_dtype.clone(),
-            kv_storage_fraction: self.kv_storage_fraction.clone(),
+            kv_cache_dtype: self.kv_cache_dtype,
+            kv_storage_fraction: self.kv_storage_fraction,
             mesh: self.worker_mesh.clone(),
             distributed_backend: self.distributed_backend.clone(),
             lanes: self.lanes.clone(),
@@ -453,8 +453,8 @@ impl WorkerProcessOptions {
             video_graph_shapes: self.video_graph_shapes.clone(),
             flashinfer_workspace_size: self.flashinfer_workspace_size,
             flashinfer_use_tensor_core: self.flashinfer_use_tensor_core.clone(),
-            flashinfer_decode_backend: self.flashinfer_decode_backend.clone(),
-            flashinfer_prefill_backend: self.flashinfer_prefill_backend.clone(),
+            flashinfer_decode_backend: self.flashinfer_decode_backend,
+            flashinfer_prefill_backend: self.flashinfer_prefill_backend,
             flashinfer_decode_split_tile_size: self.flashinfer_decode_split_tile_size,
             flashinfer_prefill_split_tile_size: self.flashinfer_prefill_split_tile_size,
             flashinfer_disable_split_kv: self.flashinfer_disable_split_kv,
@@ -504,6 +504,22 @@ fn default_worker_python() -> std::path::PathBuf {
         }
     }
     "python3".into()
+}
+
+/// Parses the canonical worker list without a second configuration wrapper.
+/// Reads the deployment configuration a serve invocation was given.
+///
+/// The configuration is a file rather than an inline argument because it
+/// states a whole deployment -- every rank's node and device, and every
+/// component placed on them -- and is written once and reused, not composed on
+/// a command line.
+fn read_workers(path: &str) -> Result<Box<[WorkerConfig]>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("reading deployment configuration {path}: {error}"))?;
+    let workers: Vec<WorkerConfig> = serde_json::from_str(&text)
+        .map_err(|error| format!("parsing deployment configuration {path}: {error}"))?;
+    WorkerConfig::validate_all(&workers).map_err(|error| error.to_string())?;
+    Ok(workers.into_boxed_slice())
 }
 
 #[cfg(test)]
@@ -677,20 +693,4 @@ mod tests {
         .expect_err("quantization config must be an object");
         assert!(error.to_string().contains("expected a JSON object"));
     }
-}
-
-/// Parses the canonical worker list without a second configuration wrapper.
-/// Reads the deployment configuration a serve invocation was given.
-///
-/// The configuration is a file rather than an inline argument because it
-/// states a whole deployment -- every rank's node and device, and every
-/// component placed on them -- and is written once and reused, not composed on
-/// a command line.
-fn read_workers(path: &str) -> Result<Box<[WorkerConfig]>, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| format!("reading deployment configuration {path}: {error}"))?;
-    let workers: Vec<WorkerConfig> = serde_json::from_str(&text)
-        .map_err(|error| format!("parsing deployment configuration {path}: {error}"))?;
-    WorkerConfig::validate_all(&workers).map_err(|error| error.to_string())?;
-    Ok(workers.into_boxed_slice())
 }

@@ -888,7 +888,7 @@ pub enum BatchCommand {
     /// Establish one request before its first call on a pool.
     Start {
         /// Static request state installed by the worker.
-        request: NewRequest,
+        request: Box<NewRequest>,
     },
     /// Close an exact request epoch after admitted work and physical readers finish.
     Finish {
@@ -1369,7 +1369,9 @@ impl Batch {
             buffer_allocations: Vec::new(),
             commands: admissions
                 .into_iter()
-                .map(|request| BatchCommand::Start { request })
+                .map(|request| BatchCommand::Start {
+                    request: Box::new(request),
+                })
                 .collect(),
             input_products: Vec::new(),
             kv_inputs: Vec::new(),
@@ -1395,7 +1397,7 @@ impl Batch {
     /// Iterates over static request admissions in submission order.
     pub fn admissions(&self) -> impl Iterator<Item = &NewRequest> {
         self.commands.iter().filter_map(|command| match command {
-            BatchCommand::Start { request } => Some(request),
+            BatchCommand::Start { request } => Some(request.as_ref()),
             _ => None,
         })
     }
@@ -1673,10 +1675,7 @@ impl Batch {
 
         let declared_inputs = self
             .calls()
-            .flat_map(|call| {
-                call.tensor_inputs()
-                    .chain(call.predicate.as_ref().into_iter())
-            })
+            .flat_map(|call| call.tensor_inputs().chain(call.predicate.as_ref()))
             .collect::<HashSet<_>>();
 
         let mut supplied_inputs = HashSet::with_capacity(self.input_products.len());

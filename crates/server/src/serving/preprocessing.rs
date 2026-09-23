@@ -132,14 +132,14 @@ fn convert_modalities(modalities: &[ChatModality]) -> ModalitySelection {
 /// Converts the image config.
 fn convert_image_config(config: &ChatImageConfig) -> ImageGenControls {
     ImageGenControls {
-        resolution: config.resolution.clone(),
+        resolution: config.resolution,
         width: config.width,
         height: config.height,
         steps: config.steps,
         cfg_text_scale: config.guidance_scale,
         cfg_img_scale: config.image_guidance_scale,
         cfg_interval: config.cfg_interval,
-        cfg_renorm_type: config.cfg_norm.clone(),
+        cfg_renorm_type: config.cfg_norm,
         cfg_renorm_min: config.cfg_renorm_min,
         timestep_shift: config.timestep_shift,
         seed: config.seed,

@@ -1,5 +1,7 @@
 //! Qwen3 reasoning and tool-call output behavior across stream boundaries.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::sync::Arc;
 
 use futures::{StreamExt, stream};

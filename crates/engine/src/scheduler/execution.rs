@@ -932,10 +932,10 @@ impl Scheduler {
                 component: component.to_owned(),
                 code: work,
                 bounds: Bounds::default(),
-                inputs: inputs,
-                outputs: outputs,
+                inputs,
+                outputs,
                 completion_output,
-                predicate: predicate,
+                predicate,
                 rng: None,
             };
             let state = self.media_state_mut(id).expect("media candidate exists");
@@ -1078,10 +1078,9 @@ impl Scheduler {
                         .any(|(call, _)| call.request_key == request.request_key)
                 })
                 .expect("admitted request has a selected call");
-            starts
-                .entry(owner)
-                .or_default()
-                .push(BatchCommand::Start { request });
+            starts.entry(owner).or_default().push(BatchCommand::Start {
+                request: Box::new(request),
+            });
         }
         let mut batches = Vec::with_capacity(call_order.len() + 1);
         for media_call in call_order {
@@ -1949,7 +1948,7 @@ impl Scheduler {
                         // so the encoded products it consumed retire with the
                         // call; the artifact arrives with the final call.
                         state.muxing_in_flight = false;
-                        consumed_products.extend(state.muxing_inputs.drain(..));
+                        consumed_products.append(&mut state.muxing_inputs);
                         if media.is_some() {
                             state.muxed = true;
                         }
@@ -2053,12 +2052,9 @@ impl Scheduler {
             }
         }
         self.output.retire(id, state.output);
-        match state.admission_state {
-            WorkerRegistration::Unsubmitted => {
-                state.allocations.free(&mut self.storage);
-                return;
-            }
-            _ => {}
+        if state.admission_state == WorkerRegistration::Unsubmitted {
+            state.allocations.free(&mut self.storage);
+            return;
         }
         let request_key = state.admission.request_key;
         self.inflight
@@ -2099,13 +2095,12 @@ impl Scheduler {
             if !released.insert(buffer) {
                 continue;
             }
-            if let Some(allocation) = self.storage.take_encoder_buffer(buffer) {
-                if let Some(previous) = self.storage.pending_buffer_frees.insert(buffer, allocation)
-                {
-                    tracing::error!(?buffer, "buffer free identity was already pending");
-                    self.storage.buffer_pool.free(previous);
-                    self.fatal = true;
-                }
+            if let Some(allocation) = self.storage.take_encoder_buffer(buffer)
+                && let Some(previous) = self.storage.pending_buffer_frees.insert(buffer, allocation)
+            {
+                tracing::error!(?buffer, "buffer free identity was already pending");
+                self.storage.buffer_pool.free(previous);
+                self.fatal = true;
             }
             self.inflight
                 .pending_commands
@@ -2460,8 +2455,7 @@ impl Scheduler {
                 // decides the user-visible prefix and stop-string boundary.
                 let advanced = record.status == CallStatus::Ok && call.advances_state();
                 let latest_token = if advanced {
-                    let token = call.token_output.clone();
-                    token
+                    call.token_output.clone()
                 } else {
                     None
                 };
@@ -2574,14 +2568,12 @@ impl Scheduler {
                 {
                     self.resolve(id, call, record, media.as_deref());
                 }
-                if awaiting_decoder {
-                    if let Some(state) = self.running.get_mut(&id) {
-                        if state.output.tokens_sent > public_tokens_before {
-                            *state.output.decoder_boundaries.back_mut().unwrap() =
-                                state.output.tokens_sent;
-                        } else {
-                            state.output.decoder_boundaries.pop_back();
-                        }
+                if awaiting_decoder && let Some(state) = self.running.get_mut(&id) {
+                    if state.output.tokens_sent > public_tokens_before {
+                        *state.output.decoder_boundaries.back_mut().unwrap() =
+                            state.output.tokens_sent;
+                    } else {
+                        state.output.decoder_boundaries.pop_back();
                     }
                 }
                 self.finish_pending_if_idle(id);
@@ -2844,17 +2836,14 @@ impl Scheduler {
             }
             // A successful later completion may already be waiting behind the now
             // abandoned call. It owns real completion evidence and can drain.
-            loop {
-                let Some(call_id) = self
-                    .inflight
-                    .pending_calls
-                    .get(&id)
-                    .and_then(|queue| queue.front())
-                    .filter(|inflight| inflight.call.request_key == request)
-                    .map(|inflight| inflight.call.call_id)
-                else {
-                    break;
-                };
+            while let Some(call_id) = self
+                .inflight
+                .pending_calls
+                .get(&id)
+                .and_then(|queue| queue.front())
+                .filter(|inflight| inflight.call.request_key == request)
+                .map(|inflight| inflight.call.call_id)
+            {
                 let Some(completion) = self
                     .inflight
                     .pending_completions

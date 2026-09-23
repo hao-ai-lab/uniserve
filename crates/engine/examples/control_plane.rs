@@ -2,6 +2,9 @@
 //!
 //! The example exercises scheduling and lifecycle events without requiring a
 //! model worker or GPU.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
@@ -39,7 +42,6 @@ fn main() {
                 max_kv_tokens: None,
             }],
             sample_feedback_continuation: true,
-            ..ImageGenerationConfig::default()
         };
         let prompt_token_ids = vec![1, 2, 3];
 

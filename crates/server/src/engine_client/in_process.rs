@@ -351,7 +351,6 @@ mod tests {
                 max_kv_tokens: None,
             }],
             sample_feedback_continuation: true,
-            ..ImageGenerationConfig::default()
         };
         let request = GenerationRequest {
             request_id: client
