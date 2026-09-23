@@ -120,7 +120,8 @@ def prepare_call(runner: ModelExecutor, trajectory: VideoState, call, storage):
             trajectory.tensors["denoising"] = storage.view(
                 runner.media_builder.buffers(size)
             )
-        context = runner.denoising.prepare_inputs(size, size)
+        layout = runner.media_builder.layout(size)
+        context = runner.denoising.prepare_inputs(layout, layout)
         return trajectory.tensors["denoising"], context
 
     if kind is MediaCall.VIDEO_DECODING:
@@ -150,14 +151,31 @@ def prepare_call(runner: ModelExecutor, trajectory: VideoState, call, storage):
     return {}, None
 
 
+def _stage_placeholder(builder, size, views, context) -> None:
+    """Fill a slot with a complete request's inputs for startup calls.
+
+    Warmup and capture run the numerical calls a request of ``size`` runs,
+    with a fixed seed and no prompt. Their results are discarded, and the
+    first real request stages its own draw, tables and conditioning.
+    """
+    builder.stage_request(size, views, seed=0)
+    staged = builder.initialize(
+        size,
+        views,
+        constants=context.constants,
+        workspace=context.workspace,
+    )
+    with context.activate():
+        for destination, source in staged:
+            destination.copy_(source)
+        views["text_condition"].zero_()
+
+
 @torch.inference_mode()
 def warmup_denoising(
     runner: ModelExecutor, storage: tuple[TensorBuffers, ...]
 ) -> None:
-    """Compile representative native tile boundaries without advancing.
-
-    samples.
-    """
+    """Compile representative tile boundaries without advancing samples."""
     builder, denoising = runner.media_builder, runner.denoising
     if denoising is None:
         return
@@ -186,22 +204,18 @@ def warmup_denoising(
         if tokens > maximum.num_text_tokens:
             continue
         size = builder.size(frames, tokens)
-        if size in prepared:
+        layout = builder.layout(size)
+        if layout in prepared:
             continue
-        prepared.add(size)
-        context = denoising.prepare_inputs(size, size)
+        prepared.add(layout)
+        context = denoising.prepare_inputs(layout, layout)
         views = storage[0].view(builder.buffers(size))
-        # Warmup has no prompt and uses zero numerical samples. The first real
-        # request draws and stages its own seeded native noise before execution.
-        with context.activate():
-            views["text_condition"].zero_()
-            for name in builder.denoiser.modalities:
-                views[name].zero_()
+        _stage_placeholder(builder, size, views, context)
         denoising.warmup(
             builder.bind(size, views, schedules, 0),
             schedules,
             state=views,
-            input_key=size,
+            input_key=layout,
         )
 
 
@@ -259,14 +273,15 @@ def capture_denoising(
 ) -> None:
     """Make every declared video shape's denoising ladder resident.
 
-    A denoising graph is captured per ladder step at each declared size and
-    serves every request slot, since it reaches a slot's storage through the
-    device slot index rather than through the slot's addresses. A request
-    that first meets its shape would otherwise pay one capture per step on
-    its own path. Capture is collective across the component's ranks and
-    belongs here, where warmup holds them in lockstep. Samples are unchanged
-    when this returns; a shape the deployment does not declare still serves
-    and captures on first use.
+    A denoising graph is captured per ladder step for the layout each
+    declared size occupies. It serves every request slot, since it reaches a
+    slot's storage through the device slot index rather than through the
+    slot's addresses, and every prompt length within the layout, since the
+    lengths differ only in the state the graph gathers from the slot. The
+    layouts stay pinned with their ladders. Capture is collective across the
+    component's ranks and belongs here, where warmup holds them in lockstep;
+    serving never captures, and a request whose layout no declared shape
+    covers runs its steps eagerly.
     """
     builder, denoising = runner.media_builder, runner.denoising
     sizes = declared_sizes(runner)
@@ -278,19 +293,19 @@ def capture_denoising(
         )
 
     schedules = builder.schedules(device=runner.worker_config.device)
+    captured = set()
     for size in sizes:
-        context = denoising.prepare_inputs(size, size)
-        # Any slot's rows serve the capture; the first slot's do. The values
-        # it reads are irrelevant, and the first real request stages its own
-        # seeded noise and conditioning before replay.
+        layout = builder.layout(size)
+        if layout in captured:
+            continue
+        captured.add(layout)
+        context = denoising.prepare_inputs(layout, layout, pin=True)
+        # Any slot's rows serve the capture; the first slot's do.
         views = storage[0].view(builder.buffers(size))
-        with context.activate():
-            views["text_condition"].zero_()
-            for name in builder.denoiser.modalities:
-                views[name].zero_()
+        _stage_placeholder(builder, size, views, context)
 
         trajectory = denoising.bind_inputs(
-            size,
+            layout,
             tuple(
                 builder.bind(size, views, schedules, index)
                 for index in range(builder.num_steps)
@@ -544,14 +559,14 @@ def video_state(runner: ModelExecutor, request: RequestState) -> VideoState:
 def begin_noise(
     runner: ModelExecutor, request: RequestState, request_pool: RequestPool
 ) -> None:
-    """Start an admitted video request's seeded noise draw off the service
-    thread.
+    """Stage an admitted video request's host inputs off the service thread.
 
-    The draw depends only on the seed and the admitted size, so it runs on the
-    rank's noise thread while the service thread launches other device work,
-    this request's text encoding or another request's denoising steps, and
-    latent preparation waits for it. A rank that does not denoise draws none.
-    """  # noqa: D205
+    The seeded draw and the request's state tables depend only on the seed
+    and the admitted size, so they are prepared on the rank's noise thread
+    while the service thread launches other device work, this request's text
+    encoding or another request's denoising steps, and latent preparation
+    waits for them. A rank that does not denoise stages none.
+    """
     media = request.admission.diffusion
     if media is None or runner.noise_draws is None or not runner.state_buffers:
         return
@@ -561,7 +576,8 @@ def begin_noise(
             request.request_pool_idx
         ).view(runner.media_builder.buffers(trajectory.size))
     trajectory.noise = runner.noise_draws.submit(
-        runner.media_builder.draw,
+        runner.media_builder.stage_request,
+        trajectory.size,
         trajectory.tensors["denoising"],
         seed=media.seed,
     )
@@ -630,7 +646,9 @@ def execute(
 
         encoded = conditioning.tensor
         if trajectory.noise is None:
-            model_runner.media_builder.draw(slot, seed=media.seed)
+            model_runner.media_builder.stage_request(
+                numerical_shape, slot, seed=media.seed
+            )
         else:
             trajectory.noise.result()
         initial = model_runner.media_builder.initialize(
@@ -658,10 +676,8 @@ def execute(
                     raise invalid_descriptor(
                         "conditioning computation must return one Tensor"
                     )
-                encoded = result.values[0]
-                slot["text_condition"].copy_(
-                    encoded.reshape_as(slot["text_condition"]),
-                    non_blocking=True,
+                model_runner.media_builder.store_conditioning(
+                    numerical_shape, slot, result.values[0]
                 )
 
     elif call.kind is MediaCall.DENOISING:
@@ -681,7 +697,7 @@ def execute(
             trajectory.denoising = cast(
                 "TrajectoryRunner", model_runner.denoising
             ).bind_inputs(
-                numerical_shape,
+                builder.layout(numerical_shape),
                 tuple(
                     builder.bind(
                         numerical_shape, slot, trajectory.schedules, index

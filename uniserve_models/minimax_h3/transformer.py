@@ -218,18 +218,23 @@ class Transformer(nn.Module):
         inputs: AttentionInput,
         *,
         step_index: int,
-        constants: Mapping[str, torch.Tensor],
+        tables: Mapping[str, torch.Tensor],
         workspace: Mapping[str, torch.Tensor],
     ) -> tuple[torch.Tensor, ...]:
+        """Evaluate the layers over one token shard.
+
+        ``tables`` holds the per-row modulation indices and the rotary
+        ``cos``/``sin`` of every packed row.
+        """
         pipeline = self.mesh.get_group("pp" if "pp" in self.mesh.axes else ())
         if pipeline.rank:
             pipeline.recv(src=pipeline.rank - 1, out=hidden)
 
         buffers = {
             **workspace,
-            "modulation_indices": constants["modulation_indices"],
-            "cos": constants["cos"],
-            "sin": constants["sin"],
+            "modulation_indices": tables["modulation_indices"],
+            "cos": tables["cos"],
+            "sin": tables["sin"],
         }
         chunks = ((inputs.token_slice, hidden),)
         for index, layer in enumerate(self.layers.values()):

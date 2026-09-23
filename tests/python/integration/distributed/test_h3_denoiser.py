@@ -178,27 +178,28 @@ def _run(rank, rendezvous, directory, source):
                 }
             ),
         ).model
+        # The prompt fills 63 rows of one text tile; the call evaluates the
+        # tile's layout with the prompt's own tables.
         size = DenoiserSize(22, 63)
+        layout = model.layout_size(size)
         stream = CUDAStream.external(torch.cuda.Stream(device=device))
         stream.wait(torch.cuda.current_stream(device))
         with (
             stream,
             ExecutionContext(model, stream=stream, vsa="cute") as execution,
         ):
-            execution.prepare(size)
-            requirements = model.state_buffers(size)
+            execution.prepare(layout)
+            requirements = model.state_buffers(layout)
             with (
                 TensorBuffers.allocate(requirements, device="cpu") as host,
                 TensorBuffers.allocate(requirements, device=device) as resident,
             ):
-                state = resident.view(requirements)
-                prepared = {
-                    name: value.unsqueeze(0)
-                    for name, value in host.view(requirements).items()
-                }
+                request = resident.view(requirements)
+                staged = host.view(requirements)
+                state = {name: request[name] for name in model.modalities}
                 noise = {
                     name: torch.empty(
-                        (1, *model.noise_shape(name, size)),
+                        (1, *model.noise_shape(name, layout)),
                         dtype=torch.float32,
                         device="cpu",
                     )
@@ -206,16 +207,27 @@ def _run(rank, rendezvous, directory, source):
                 }
                 normal_noise((923,), out=tuple(noise.values()))
                 model.prepare_latents(
-                    (size,),
+                    (layout,),
                     noise=noise,
-                    state=prepared,
+                    state={
+                        name: staged[name].unsqueeze(0)
+                        for name in model.modalities
+                    },
                     constants=execution.constants,
                     workspace=execution.workspace,
                 )
-                for name, value in state.items():
-                    value.copy_(prepared[name][0])
+                model.prepare_state(
+                    (size,),
+                    out={
+                        name: value
+                        for name, value in staged.items()
+                        if name not in model.modalities
+                    },
+                )
+                for name, value in request.items():
+                    value.copy_(staged[name])
                 features = torch.zeros(
-                    size.num_text_tokens,
+                    layout.num_text_tokens,
                     model.config.hidden_size,
                     device=device,
                     dtype=torch.bfloat16,
@@ -229,7 +241,7 @@ def _run(rank, rendezvous, directory, source):
                         )
                         for name, value in state.items()
                     },
-                    sizes=(size,),
+                    sizes=(layout,),
                     step_index=1,
                     text_features=(features,),
                 )
@@ -240,7 +252,7 @@ def _run(rank, rendezvous, directory, source):
                 }
                 output = model(
                     inputs,
-                    state=state,
+                    state=request,
                     constants=execution.constants,
                     workspace=execution.workspace,
                 )
@@ -254,7 +266,7 @@ def _run(rank, rendezvous, directory, source):
                         )
                         assert (
                             output[name][0].layout
-                            == model.output_layout(size)[name]
+                            == model.output_layout(layout)[name]
                         )
                     else:
                         assert output[name] == (None,)
@@ -265,7 +277,7 @@ def _run(rank, rendezvous, directory, source):
                     model,
                     inputs,
                     schedules,
-                    state,
+                    request,
                     execution.constants,
                     execution.workspace,
                 )
@@ -309,7 +321,7 @@ def _run(rank, rendezvous, directory, source):
     groups.close()
 
 
-def _checkpoint(tmp_path):
+def _native_weights():
     config = _config()
     torch.manual_seed(922)
     native = MiniMaxH3Transformer3DModel(
@@ -320,7 +332,13 @@ def _checkpoint(tmp_path):
         patch_size=(1, 2, 2),
         final_norm_eps=config.norm_eps,
     )
-    source = native.state_dict()
+    return native.state_dict()
+
+
+def _checkpoint(tmp_path):
+    """Save weights whose prediction has a closed form: attention is zero."""
+    config = _config()
+    source = _native_weights()
     for value in source.values():
         value.zero_()
     for name, value in source.items():
@@ -352,6 +370,50 @@ def test_partitioned_denoising_and_feedback(tmp_path):
     )
 
 
+def _load(groups, directory, device):
+    """Load the tiny denoiser on one device as a worker binds it."""
+    mesh = groups.bind(
+        DeviceMesh(ranks=(0,), shape=(1, 1), axes=("pp", "tp"), rank=0),
+        device=device,
+    )
+    return loading.load_model(
+        partial(Denoiser, diffusion=DiffusionConfig()),
+        _config(),
+        checkpoint=(
+            checkpoint.Config("denoiser").resolve(
+                directory, io=loading.Config()
+            ),
+        ),
+        mapping=_mapping,
+        device=device,
+        meshes={"": mesh},
+        weights=weights.Config(
+            dtypes={
+                f"transformer.{name}": torch.float32
+                for name in (
+                    "video_input",
+                    "audio_input",
+                    "video_output",
+                    "audio_output",
+                )
+            }
+        ),
+    ).model
+
+
+def _stage(factory, size, views, context, *, seed, features):
+    """Stage one admitted request into its slot as the worker does."""
+    factory.stage_request(size, views, seed=seed)
+    for target, value in factory.initialize(
+        size,
+        views,
+        constants=context.constants,
+        workspace=context.workspace,
+    ):
+        target.copy_(value, non_blocking=True)
+    factory.store_conditioning(size, views, features)
+
+
 @torch.inference_mode()
 def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
     from uniserve_worker.model_executor.diffusion_runner import TrajectoryRunner
@@ -362,36 +424,17 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
     with initialize_process_groups(
         rank=0, local_rank=0, world_size=1, device=device
     ) as groups:
-        mesh = groups.bind(
-            DeviceMesh(ranks=(0,), shape=(1, 1), axes=("pp", "tp"), rank=0),
-            device=device,
-        )
-        model = loading.load_model(
-            partial(Denoiser, diffusion=DiffusionConfig()),
-            _config(),
-            checkpoint=(
-                checkpoint.Config("denoiser").resolve(
-                    tmp_path, io=loading.Config()
-                ),
-            ),
-            mapping=_mapping,
-            device=device,
-            meshes={"": mesh},
-            weights=weights.Config(
-                dtypes={
-                    f"transformer.{name}": torch.float32
-                    for name in (
-                        "video_input",
-                        "audio_input",
-                        "video_output",
-                        "audio_output",
-                    )
-                }
-            ),
-        ).model
+        model = _load(groups, tmp_path, device)
         factory = MediaBuilder(model, max_frames=22, max_text_tokens=65)
         size = factory.size(22, 63)
+        layout = factory.layout(size)
         matrices = {name: value.to(device) for name, value in source.items()}
+        features = torch.zeros(
+            size.num_text_tokens,
+            model.config.hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
         stream = CUDAStream.external(torch.cuda.Stream(device=device))
         runner = TrajectoryRunner(
             model,
@@ -407,35 +450,33 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
         )
         runner.bind_bank(pool.storage.bank)
         try:
-            context = runner.prepare_inputs(size, size)
+            context = runner.prepare_inputs(layout, layout, pin=True)
             with pool.storage.tensors(1) as storage:
                 views = storage.view(factory.buffers(size))
                 state = {name: views[name] for name in model.modalities}
-                views["text_condition"].zero_()
                 for seed in (31, 92):
                     schedules = factory.schedules(device=device)
-                    copies = factory.initialize(
+                    _stage(
+                        factory,
                         size,
                         views,
+                        context,
                         seed=seed,
-                        constants=context.constants,
-                        workspace=context.workspace,
+                        features=features,
                     )
-                    for target, value in copies:
-                        target.copy_(value, non_blocking=True)
                     initial = {
                         name: value.clone() for name, value in state.items()
                     }
                     inputs = factory.bind(size, views, schedules, 0)
                     runner.warmup(
-                        inputs, schedules, state=state, input_key=size
+                        inputs, schedules, state=views, input_key=layout
                     )
                     for name in model.modalities:
                         torch.testing.assert_close(
                             state[name], initial[name], rtol=0, atol=0
                         )
                     trajectory = runner.bind_inputs(
-                        size,
+                        layout,
                         tuple(
                             factory.bind(size, views, schedules, index)
                             for index in range(4)
@@ -444,6 +485,11 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                         state=views,
                         slot=1,
                     )
+                    # Startup captures the first request's ladder; the second
+                    # request, with its own schedules, replays it.
+                    if seed == 31:
+                        for index in range(4):
+                            runner.capture(trajectory, index)
                     for index in range(4):
                         expected = {}
                         for name, value in state.items():
@@ -462,10 +508,8 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                                 ratio.double() * value.double()
                                 + (1.0 - ratio).double() * clean
                             ).float()
-                        result, _ = runner.step(
-                            trajectory,
-                            index,
-                        )
+                        result, path = runner.step(trajectory, index)
+                        assert path == "graph_replay"
                         for name in model.modalities:
                             torch.testing.assert_close(
                                 result[name][0],
@@ -483,3 +527,149 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
             runner.close()
             pool.close()
             stream.close()
+
+
+@torch.inference_mode()
+def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
+    """One captured ladder serves every prompt length within its layout.
+
+    Startup captures the ladder with a placeholder prompt on one slot. Two
+    requests whose prompts fill the same text tile to different lengths then
+    replay it from both slots, reading their own tile valid counts and rotary
+    tables from their slots, and each final sample equals its eager
+    evaluation bit for bit.
+    """
+    from uniserve_worker.model_executor.diffusion_runner import TrajectoryRunner
+    from uniserve_worker.model_executor.media_inputs import MediaBuilder
+
+    # Every weight is live, so attention depends on the prompt length.
+    config = _config()
+    source = _native_weights()
+    for index in range(config.num_hidden_layers):
+        source[f"transformer_blocks.{index}.attn.to_gate_compress.weight"] = (
+            torch.randn(
+                config.num_attention_heads * config.head_dim,
+                config.hidden_size,
+            )
+            * 0.1
+        )
+    save_file(source, tmp_path / "model.safetensors")
+    device = torch.device("cuda", 0)
+    with initialize_process_groups(
+        rank=0, local_rank=0, world_size=1, device=device
+    ) as groups:
+        model = _load(groups, tmp_path, device)
+        factory = MediaBuilder(model, max_frames=22, max_text_tokens=128)
+        placeholder = factory.size(22, 1)
+        requests = {1: factory.size(22, 40), 2: factory.size(22, 63)}
+        layout = factory.layout(placeholder)
+        assert {factory.layout(size) for size in requests.values()} == {layout}
+        generator = torch.Generator().manual_seed(5)
+        features = {
+            slot: torch.randn(
+                size.num_text_tokens,
+                model.config.hidden_size,
+                generator=generator,
+            ).to(device, torch.bfloat16)
+            for slot, size in requests.items()
+        }
+
+        def denoise(runner, pool, context):
+            samples, paths = {}, []
+            for slot, size in requests.items():
+                views = pool.storage.tensors(slot).view(factory.buffers(size))
+                _stage(
+                    factory,
+                    size,
+                    views,
+                    context,
+                    seed=100 + slot,
+                    features=features[slot],
+                )
+                schedules = factory.schedules(device=device)
+                trajectory = runner.bind_inputs(
+                    layout,
+                    tuple(
+                        factory.bind(size, views, schedules, index)
+                        for index in range(4)
+                    ),
+                    schedules,
+                    state=views,
+                    slot=slot,
+                )
+                for index in range(4):
+                    result, path = runner.step(trajectory, index)
+                    paths.append(path)
+                samples[slot] = {
+                    name: values[0].clone() for name, values in result.items()
+                }
+            return samples, paths
+
+        pool = RequestPool(
+            2, state_buffers=factory.capacity_buffers(), device=device
+        )
+        try:
+            eager = TrajectoryRunner(
+                model, device=device, stream=None, groups=(), capacity=2
+            )
+            try:
+                context = eager.prepare_inputs(layout, layout)
+                expected, paths = denoise(eager, pool, context)
+                assert set(paths) == {"eager"}
+            finally:
+                torch.cuda.current_stream(device).synchronize()
+                eager.close()
+
+            stream = CUDAStream.external(torch.cuda.Stream(device=device))
+            runner = TrajectoryRunner(
+                model, device=device, stream=stream, groups=(), capacity=2
+            )
+            runner.bind_bank(pool.storage.bank)
+            try:
+                context = runner.prepare_inputs(layout, layout, pin=True)
+                views = pool.storage.tensors(1).view(
+                    factory.buffers(placeholder)
+                )
+                _stage(
+                    factory,
+                    placeholder,
+                    views,
+                    context,
+                    seed=0,
+                    features=torch.zeros(
+                        1,
+                        model.config.hidden_size,
+                        dtype=torch.bfloat16,
+                        device=device,
+                    ),
+                )
+                schedules = factory.schedules(device=device)
+                trajectory = runner.bind_inputs(
+                    layout,
+                    tuple(
+                        factory.bind(placeholder, views, schedules, index)
+                        for index in range(4)
+                    ),
+                    schedules,
+                    state=views,
+                    slot=1,
+                )
+                for index in range(4):
+                    runner.capture(trajectory, index)
+
+                actual, paths = denoise(runner, pool, context)
+                assert paths == ["graph_replay"] * 8
+            finally:
+                torch.cuda.current_stream(device).synchronize()
+                runner.close()
+                stream.close()
+        finally:
+            pool.close()
+
+        for slot in requests:
+            for name in model.modalities:
+                torch.testing.assert_close(
+                    actual[slot][name], expected[slot][name], rtol=0, atol=0
+                )
+        # The two prompt lengths are distinct computations.
+        assert not torch.equal(expected[1]["video"], expected[2]["video"])
