@@ -27,7 +27,7 @@ uv pip install -e .
 
 The installation builds the `uniserve` binary and the native worker IPC extension.
 
-The three Python packages (`uniserve`, `uniserve_models` and `uniserve_worker`) are installed together with their `uniserve-kernels` dependency, which holds UniServe's own device kernels. The [Python library guide](docs/python-library.md) shows checkpoint resolution, typed model configuration, explicit loading and direct tensor calls. Its runnable examples produce text logits and reconstruct H3 video through the public computation interfaces.
+The three Python packages (`uniserve`, `uniserve_models` and `uniserve_worker`) are installed together with their `uniserve-kernels` dependency, which holds UniServe's own device kernels.
 
 The `gpu` extra adds FlashAttention-4 and the native `uniserve-kernels` extensions for sparse video attention, CUDA IPC and peer-storage mappings. Install the source workspace with `uv sync --extra gpu`; building these extensions requires a CUDA toolkit compatible with PyTorch, a C++ compiler, and Ninja.
 
@@ -143,13 +143,9 @@ uniserve serve /models/Qwen3-32B \
   --worker-ranks 4
 ```
 
-For sequence and pipeline parallelism, combined layouts, and shared execution capabilities, use the [parallel execution guide](docs/parallel-execution.md).
-
 For text-to-video-and-audio generation with the FastH3 checkpoints, including the packed NVFP4 releases, use the [FastH3 cheat sheet](docs/fast_h3/fast_h3.md).
 
 ## Development and verification
-
-The [Worker lifecycle](docs/worker-lifecycle.md) documents Python startup, IPC ownership, synchronous serving, and direct execution through `Worker.submit`, `advance` and `poll`. Submission returns an immutable handle; the shared Executor owns execution state, and Service owns IPC delivery.
 
 The `justfile` exposes the canonical repository checks:
 
