@@ -1479,7 +1479,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     first.commands.extend(finished.commands);
     first.block_tables.extend(finished.block_tables);
     first.new_cache_pages.extend(finished.new_cache_pages);
-    first.forward.append(finished.forward, 0);
+    first.forward.append(finished.forward, 0)?;
     first.input_products.extend(finished.input_products);
     execute(&mut executor, first)?;
     let mut close = Batch::new(2, Vec::new(), Vec::new());

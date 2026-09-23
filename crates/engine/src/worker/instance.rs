@@ -598,7 +598,12 @@ impl WorkerGroup {
     }
 
     /// Replaces the complete rank group after worker loss and invalidates affected requests.
-    fn recover_workers(&mut self, cause: &anyhow::Error) -> anyhow::Result<()> {
+    ///
+    /// Returns the [`WorkerFailure`] that reports the lost allocations. Recovery
+    /// always invalidates resident work, so the result is an error whether or
+    /// not the replacement group started; a failed replacement also closes
+    /// this group.
+    fn recover_workers(&mut self, cause: &anyhow::Error) -> anyhow::Error {
         let endpoints = self
             .workers
             .iter()
@@ -650,7 +655,7 @@ impl WorkerGroup {
                 format!("rank recovery failed: {error:#}")
             }
         };
-        Err(WorkerFailure {
+        WorkerFailure {
             worker_id: crate::WorkerId(self.process_args.worker_id.clone()),
             endpoints,
             requests,
@@ -662,7 +667,7 @@ impl WorkerGroup {
                 self.process_args.worker_id
             ),
         }
-        .into())
+        .into()
     }
 
     /// Installs a capability-compatible replacement rank group and resets rank-local state.
@@ -1610,8 +1615,7 @@ impl WorkerGroup {
                         error.context(format!("submit to rank {rank} failed"))
                     }
                 };
-                let recovered = self.recover_workers(&error).unwrap_err();
-                return Err(BatchSubmitError::Failed(recovered));
+                return Err(BatchSubmitError::Failed(self.recover_workers(&error)));
             }
         }
         Ok(())
@@ -1625,10 +1629,7 @@ impl WorkerGroup {
         match self.poll_progress(timeout) {
             Ok(report) => Ok(report),
             Err(error) if error.is::<WorkerFailure>() => Err(error),
-            Err(error) => {
-                self.recover_workers(&error)?;
-                unreachable!("WorkerGroup replacement returns its invalidated ownership")
-            }
+            Err(error) => Err(self.recover_workers(&error)),
         }
     }
 

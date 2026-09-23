@@ -20,7 +20,7 @@ use uniserve_engine::{EngineHandle, Scheduler, SimEngine, SimExecutor, SpecialTo
 fn main() {
     let ctrl = SpecialTokenIds::default();
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
-    let sched = Scheduler::new(executor, ctrl, 32);
+    let sched = Scheduler::new(executor, ctrl, 32).unwrap();
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(cmd_tx);
     let jh = thread::spawn(move || sched.run(cmd_rx));

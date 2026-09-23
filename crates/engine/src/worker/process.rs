@@ -228,23 +228,18 @@ impl WorkerProcessArgs {
     /// ranks the placement puts on the same node, and how many ranks that node
     /// holds. Host count enters the system here and nowhere below it. The two
     /// coincide with the global values while an instance occupies one host.
-    fn host_slot(&self, rank: u32) -> (u32, u32) {
-        let node = &self.ranks[rank as usize].node;
-        let resident = self
-            .ranks
-            .iter()
-            .enumerate()
-            .filter(|(_, placed)| &placed.node == node)
-            .map(|(position, _)| position)
-            .collect::<Vec<_>>();
-        let index = resident
-            .iter()
-            .position(|position| *position == rank as usize)
-            .expect("a rank is resident on the node its placement names");
-        (
-            u32::try_from(index).expect("a host's rank index fits the launch arithmetic"),
-            u32::try_from(resident.len()).expect("a host's rank count fits the launch arithmetic"),
-        )
+    fn host_slot(&self, rank: u32) -> anyhow::Result<(u32, u32)> {
+        let rank = rank as usize;
+        let node = &self.ranks[rank].node;
+        let resident = |placed: &&crate::WorkerRank| &placed.node == node;
+
+        // The rank's host index counts the ranks placed before it on its node.
+        let index = self.ranks[..rank].iter().filter(resident).count();
+        let count = self.ranks.iter().filter(resident).count();
+        Ok((
+            u32::try_from(index).context("a host's rank index exceeds u32")?,
+            u32::try_from(count).context("a host's rank count exceeds u32")?,
+        ))
     }
 
     /// Returns the number of ranks in this group.
@@ -334,7 +329,7 @@ impl WorkerProcessArgs {
         }
         fields.insert("device".into(), json!(self.ranks[rank as usize].device));
         fields.insert("rank".into(), json!(rank));
-        fields.insert("local_rank".into(), json!(self.host_slot(rank).0));
+        fields.insert("local_rank".into(), json!(self.host_slot(rank)?.0));
         fields.insert("world_size".into(), json!(self.world_size()));
         fields.insert("components".into(), serde_json::to_value(&self.components)?);
         fields.insert(
@@ -476,18 +471,29 @@ pub(super) struct RankProcess {
 /// The engine cannot bind the rank's channel until the rank names its own
 /// endpoint, so everything the channel needs is retained here meanwhile.
 pub(super) struct PendingRank {
-    /// Taken by adoption; a rank still held here is killed when the launch fails.
-    child: Option<Child>,
+    /// Released by adoption; a rank still held here is killed when the launch fails.
+    child: PendingChild,
     rank: u32,
     world_size: u32,
     depth: usize,
     max_payload: usize,
-    /// Taken by adoption alongside the process it cancels.
-    startup_abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Moves by adoption alongside the process it cancels.
+    startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Retains the launch descriptor until the rank has read it; adoption
     /// transfers it to the channel that outlives this launch phase.
-    launch_descriptor: Option<tempfile::TempDir>,
+    launch_descriptor: tempfile::TempDir,
     components: std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
+}
+
+/// The process of a launched rank that has not been adopted yet, when this
+/// engine started it.
+struct PendingChild(Option<Child>);
+
+impl PendingChild {
+    /// Hands the process to the adopting rank, which owns its termination.
+    fn release(mut self) -> Option<Child> {
+        self.0.take()
+    }
 }
 
 struct PendingRecord {
@@ -547,7 +553,7 @@ impl PendingRank {
             .arg(&descriptor_path);
         // Torch and the numerical libraries read the host-relative pair; the
         // global pair names the rank's place in the whole process world.
-        let (local_rank, local_world_size) = args.host_slot(rank);
+        let (local_rank, local_world_size) = args.host_slot(rank)?;
         cmd.env("RANK", rank.to_string())
             .env("WORLD_SIZE", world_size.to_string())
             .env("LOCAL_RANK", local_rank.to_string())
@@ -591,26 +597,26 @@ impl PendingRank {
                 &cmd,
             )?;
             return Ok(Self {
-                child: None,
+                child: PendingChild(None),
                 rank,
                 world_size,
                 depth,
                 max_payload,
-                startup_abort: Some(startup_abort),
-                launch_descriptor: Some(descriptor_directory),
+                startup_abort,
+                launch_descriptor: descriptor_directory,
                 components: args.components.clone(),
             });
         }
         let child = cmd.spawn().context("spawning python worker")?;
 
         Ok(Self {
-            child: Some(child),
+            child: PendingChild(Some(child)),
             rank,
             world_size,
             depth,
             max_payload,
-            startup_abort: Some(startup_abort),
-            launch_descriptor: Some(descriptor_directory),
+            startup_abort,
+            launch_descriptor: descriptor_directory,
             components: args.components.clone(),
         })
     }
@@ -625,7 +631,7 @@ impl PendingRank {
         // A rank started by another host's launcher has no process here. Its
         // liveness is its connection, as section 5.1 states, and its exit
         // reaches the head as a report from the launcher that owns it.
-        let Some(child) = self.child.as_mut() else {
+        let Some(child) = self.child.0.as_mut() else {
             return Ok(());
         };
         match child.try_wait() {
@@ -639,17 +645,15 @@ impl PendingRank {
     }
 
     /// Binds this rank's channel to the endpoint and mechanism the rank reported.
-    pub(crate) fn adopt(mut self, transport: &str, endpoint: &str) -> anyhow::Result<RankProcess> {
+    pub(crate) fn adopt(self, transport: &str, endpoint: &str) -> anyhow::Result<RankProcess> {
         let rank = self.rank;
-        let world_size = self.world_size;
-        let depth = self.depth;
         // The process stays owned here until the channel exists, so a failed
         // connection terminates the rank instead of orphaning it.
         let client = RankChannel::connect(
             transport,
             endpoint,
             self.max_payload,
-            depth,
+            self.depth,
             CHANNEL_CONNECT_TIMEOUT,
         )
         .with_context(|| format!("connecting to the channel rank {rank} reported"))?;
@@ -661,16 +665,18 @@ impl PendingRank {
             endpoint,
             "bound rank channel from its registration"
         );
-        let child = self.child.take();
-        let launch_descriptor = self
-            .launch_descriptor
-            .take()
-            .expect("an unadopted rank retains its launch descriptor");
-        let startup_abort = self
-            .startup_abort
-            .take()
-            .expect("an unadopted rank retains its startup cancellation");
-        let components = std::mem::take(&mut self.components);
+
+        let PendingRank {
+            child,
+            rank,
+            world_size,
+            depth,
+            max_payload: _,
+            startup_abort,
+            launch_descriptor,
+            components,
+        } = self;
+        let child = child.release();
         // A watcher observes a process identifier, so only a rank this engine
         // started has one. A rank elsewhere falls to the bounded liveness
         // probe, which reads its channel rather than its process.
@@ -700,11 +706,11 @@ impl PendingRank {
     }
 }
 
-impl Drop for PendingRank {
+impl Drop for PendingChild {
     /// A rank that never reported an endpoint has no channel to close through,
     /// so a failed launch terminates its process here rather than leaking it.
     fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
+        if let Some(child) = self.0.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }

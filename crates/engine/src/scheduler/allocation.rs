@@ -17,27 +17,54 @@ pub(super) struct Storage {
     pub(super) pending_buffer_frees: HashMap<BufferId, BufferSpan>,
 }
 
+/// A media allocation named a worker the scheduler holds no media storage for.
+///
+/// Media storage exists for every loaded worker that serves a media call and
+/// every media allocation is taken from it, so this reports a scheduler defect.
+#[derive(Debug)]
+pub(super) struct UnknownMediaWorker(pub(super) crate::WorkerId);
+
+impl std::fmt::Display for UnknownMediaWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "media allocation names worker {:?} without media storage",
+            self.0
+        )
+    }
+}
+
 impl Storage {
-    pub(super) fn free_media_request(&mut self, worker: &crate::WorkerId, allocation: RequestSlot) {
+    pub(super) fn free_media_request(
+        &mut self,
+        worker: &crate::WorkerId,
+        allocation: RequestSlot,
+    ) -> Result<(), UnknownMediaWorker> {
         self.media_storage
             .get_mut(worker)
-            .expect("media allocation names a loaded worker")
+            .ok_or_else(|| UnknownMediaWorker(worker.clone()))?
             .requests
             .free(allocation);
+        Ok(())
     }
 
-    pub(super) fn free_media_buffer(&mut self, worker: &crate::WorkerId, allocation: BufferSpan) {
+    pub(super) fn free_media_buffer(
+        &mut self,
+        worker: &crate::WorkerId,
+        allocation: BufferSpan,
+    ) -> Result<(), UnknownMediaWorker> {
         self.media_storage
             .get_mut(worker)
-            .expect("media allocation names a loaded worker")
+            .ok_or_else(|| UnknownMediaWorker(worker.clone()))?
             .buffers
             .free(allocation);
+        Ok(())
     }
 
-    pub(super) fn cache(&self) -> &KVCacheManager {
-        self.cache
-            .as_ref()
-            .expect("generation requires loaded KV cache")
+    /// Returns the text KV cache, which exists when the worker serves token
+    /// generation; token requests are rejected at submission without it.
+    pub(super) fn cache(&self) -> Option<&KVCacheManager> {
+        self.cache.as_ref()
     }
 
     pub(super) fn free_blocks(&self) -> usize {
@@ -104,7 +131,7 @@ pub(super) struct RequestAllocations {
 impl RequestAllocations {
     /// Returns the request-slot identifier.
     pub(super) fn request_slot(&self) -> u32 {
-        self.request_slot.index
+        self.request_slot.index()
     }
 
     /// Returns shared access to the request block tables.
@@ -181,18 +208,23 @@ impl MediaTensorAllocation {
 impl MediaAllocations {
     /// Returns the request row assigned in one physical worker address space.
     pub(super) fn request_slot(&self, worker: &crate::WorkerId) -> u32 {
-        self.request_slots[worker].index
+        self.request_slots[worker].index()
     }
 
     /// Releases the owned request allocation.
-    pub(super) fn free(self, storage: &mut Storage) {
+    ///
+    /// Every allocation on a worker with media storage is released even when
+    /// another names an unknown worker; the first unknown worker is reported.
+    pub(super) fn free(self, storage: &mut Storage) -> Result<(), UnknownMediaWorker> {
+        let mut released = Ok(());
         for tensor in self.tensors.into_values() {
             for (worker, allocation) in tensor.allocations {
-                storage.free_media_buffer(&worker, allocation);
+                released = released.and(storage.free_media_buffer(&worker, allocation));
             }
         }
         for (worker, allocation) in self.request_slots {
-            storage.free_media_request(&worker, allocation);
+            released = released.and(storage.free_media_request(&worker, allocation));
         }
+        released
     }
 }

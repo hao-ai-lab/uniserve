@@ -240,7 +240,9 @@ impl Scheduler {
     /// Applies one completed call to its request and emits observable output.
     ///
     /// Each phase applies its accepted progress so a worker completion cannot advance
-    /// a request through an unrelated generation stage.
+    /// a request through an unrelated generation stage. The caller resolves only a
+    /// running request, and every path that finishes it returns; a request that is
+    /// no longer running has nothing left to update, so resolution stops there.
     pub(super) fn resolve(
         &mut self,
         id: RequestId,
@@ -332,15 +334,15 @@ impl Scheduler {
                             return self.finish(id, FinishReason::Error);
                         };
 
-                        let (can_open_gen_branch, images_done, max_images) = {
-                            let st = self.running.get_mut(&id).unwrap();
-                            st.num_generated_tokens += 1;
-                            (
-                                st.can_open_gen_branch(),
-                                st.num_generated_images,
-                                st.req.image.max_images as usize,
-                            )
+                        let Some(st) = self.running.get_mut(&id) else {
+                            return;
                         };
+                        st.num_generated_tokens += 1;
+                        let (can_open_gen_branch, images_done, max_images) = (
+                            st.can_open_gen_branch(),
+                            st.num_generated_images,
+                            st.req.image.max_images as usize,
+                        );
 
                         let direct_trigger = self
                             .running
@@ -383,13 +385,13 @@ impl Scheduler {
 
                 // Partial prefill remains in ingest until every text and multimodal
                 // position has been consumed.
-                let (cursor, prompt_len) = {
-                    let st = self.running.get(&id).unwrap();
-                    (
-                        st.num_computed_prompt_tokens as usize,
-                        st.req.prompt_token_ids.len(),
-                    )
+                let Some(st) = self.running.get(&id) else {
+                    return;
                 };
+                let (cursor, prompt_len) = (
+                    st.num_computed_prompt_tokens as usize,
+                    st.req.prompt_token_ids.len(),
+                );
                 if cursor < prompt_len {
                     return;
                 }
@@ -401,11 +403,12 @@ impl Scheduler {
                     return;
                 }
 
-                let (starts_gen_after_context, can_open_gen_branch) = {
-                    let st = self.running.get_mut(&id).unwrap();
-                    st.num_generated_tokens += 1;
-                    (st.starts_gen_after_context(), st.can_open_gen_branch())
+                let Some(st) = self.running.get_mut(&id) else {
+                    return;
                 };
+                st.num_generated_tokens += 1;
+                let (starts_gen_after_context, can_open_gen_branch) =
+                    (st.starts_gen_after_context(), st.can_open_gen_branch());
 
                 if self.running.get(&id).is_some_and(|state| {
                     state.req.sampling.prompt_logprobs_requested()
@@ -419,36 +422,35 @@ impl Scheduler {
                     return self.finish(id, FinishReason::Error);
                 }
 
-                // Only a complete prompt publishes reusable KV blocks.
-                let state = self
-                    .running
-                    .get(&id)
-                    .expect("prefill request remains active");
+                // Only a complete prompt publishes reusable KV blocks, keyed by
+                // the loaded worker that holds them.
+                let Some(state) = self.running.get(&id) else {
+                    return;
+                };
                 let key = RequestKey::new(self.engine_id, id, state.request_epoch);
-                let worker = self
+                let source = self
                     .placement
                     .affinity
                     .get(&(key, DEFAULT_COMPONENT.to_owned()))
-                    .expect("prefill has a bound model component");
-                let source = Arc::new(
-                    self.executor
-                        .info()
-                        .workers
-                        .iter()
-                        .find(|(id, _)| id == worker)
-                        .expect("prefill Worker remains loaded")
-                        .1
-                        .endpoint
-                        .clone(),
-                );
-                if let Some(st) = self.running.get_mut(&id) {
-                    let kv = self
-                        .storage
-                        .cache
-                        .as_ref()
-                        .expect("generation has a KV cache");
-                    cache_prompt_blocks(&kv.coordinator, st, &kv.block_pool, &source);
-                }
+                    .and_then(|worker| {
+                        self.executor
+                            .info()
+                            .workers
+                            .iter()
+                            .find(|(id, _)| id == worker)
+                    })
+                    .map(|(_, worker)| Arc::new(worker.endpoint.clone()));
+                let (Some(source), Some(st), Some(kv)) = (
+                    source,
+                    self.running.get_mut(&id),
+                    self.storage.cache.as_ref(),
+                ) else {
+                    self.invariant_broken(
+                        "a prefilled request keeps its loaded prefill worker and KV cache",
+                    );
+                    return;
+                };
+                cache_prompt_blocks(&kv.coordinator, st, &kv.block_pool, &source);
 
                 // A description-lowered prefix may already end at a branch trigger.
                 if self.prefilled_gen_trigger(id) {
@@ -469,10 +471,11 @@ impl Scheduler {
                     .unwrap_or(self.ctrl.eos[0]);
                 let logprob = record.sampled_logprob;
 
-                let (images_done, max_images) = {
-                    let st = self.running.get(&id).unwrap();
-                    (st.num_generated_images, st.req.image.max_images as usize)
+                let Some(st) = self.running.get(&id) else {
+                    return;
                 };
+                let (images_done, max_images) =
+                    (st.num_generated_images, st.req.image.max_images as usize);
 
                 // An inline image trigger consumes the remaining branch budget.
                 let direct_trigger = self
@@ -512,8 +515,10 @@ impl Scheduler {
             CallKind::Media(MediaCall::Denoising) => {
                 // Publish every newly committed step exactly once, including steps
                 // coalesced into a single worker completion.
+                let Some(st) = self.running.get(&id) else {
+                    return;
+                };
                 let (image_id, h, w, steps, prev_sd) = {
-                    let st = self.running.get_mut(&id).unwrap();
                     let prev = record
                         .num_completed_steps
                         .saturating_sub(call.bounds.max_tokens)
@@ -574,13 +579,13 @@ impl Scheduler {
                 }
 
                 self.activate_request_tables(id);
-                let (continues_after_gen_commit, feedback_source) = {
-                    let st = self.running.get(&id).unwrap();
-                    (
-                        st.continues_after_gen_commit(),
-                        st.req.image_generation.feedback_source.clone(),
-                    )
+                let Some(st) = self.running.get(&id) else {
+                    return;
                 };
+                let (continues_after_gen_commit, feedback_source) = (
+                    st.continues_after_gen_commit(),
+                    st.req.image_generation.feedback_source.clone(),
+                );
 
                 if continues_after_gen_commit {
                     let Some(feedback_source) = feedback_source else {
@@ -662,7 +667,7 @@ impl Scheduler {
 
                             if stored {
                                 let allocation = self.running.get_mut(&id).and_then(|state| {
-                                    state.allocations_mut().take_buffer(feature.buffer_id())
+                                    state.allocations_mut()?.take_buffer(feature.buffer_id())
                                 });
                                 let Some(allocation) = allocation else {
                                     return self.finish(id, FinishReason::Error);
@@ -808,7 +813,7 @@ impl Scheduler {
         let allocated_blocks = self
             .running
             .get(&id)
-            .and_then(|state| state.block_tables().first())
+            .and_then(|state| state.block_tables()?.first())
             .map_or(0, BlockTable::len);
         if !reserves_envelope || allocated_blocks < required_blocks {
             self.finish(id, FinishReason::Error);
@@ -1072,15 +1077,20 @@ impl Scheduler {
                     retained_buffers,
                 };
                 self.inflight.pending_commands.push_back(command);
-                let mut allocation = st.allocations.take().expect("admitted allocations");
-                let buffers = std::mem::take(&mut allocation.buffers);
-                let allocations = st
+                let mut allocations: Vec<RequestAllocations> = st
                     .flow_prefix
                     .take()
                     .into_iter()
                     .map(|prefix| prefix.allocations)
-                    .chain([allocation])
                     .collect();
+                let mut buffers = HashMap::new();
+                match st.allocations.take() {
+                    Some(mut allocation) => {
+                        buffers = std::mem::take(&mut allocation.buffers);
+                        allocations.push(allocation);
+                    }
+                    None => self.invariant_broken("a registered request holds its allocations"),
+                }
                 self.retiring_requests.insert(
                     id,
                     RetiringRequest {
@@ -1162,10 +1172,15 @@ fn cache_prompt_blocks(
     if state.prefix_cached {
         return;
     }
+    // A request holds block tables only once admitted; before that it has no
+    // prompt blocks to cache.
+    let Some(tables) = state.block_tables() else {
+        return;
+    };
     let prompt = state.req.prompt_token_ids.clone();
     if coordinator.cache_prefix(
         pool,
-        state.block_tables(),
+        tables,
         &prompt,
         &state.prefix_block_hashes,
         state.req.cache.write,

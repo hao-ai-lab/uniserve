@@ -414,7 +414,7 @@ impl EngineCore {
             config.runtime_family,
             config.worker_process.model_dtype,
             config.generation_limits,
-        );
+        )?;
         let info = sched.info().clone();
         let model_dtype = config.worker_process.model_dtype;
         let generation_limits = sched.generation_limits().clone();

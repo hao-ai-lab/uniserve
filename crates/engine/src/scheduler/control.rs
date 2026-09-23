@@ -3,27 +3,28 @@
 use super::*;
 
 impl Scheduler {
-    /// Removes the queued media identity while preserving FIFO order for its peers.
-    fn remove_waiting_media(&mut self, request_id: RequestId) -> bool {
-        let Some(index) = self
-            .waiting_media_order
+    /// Removes a queued media request while preserving FIFO order for its peers.
+    fn remove_waiting_media(&mut self, request_id: RequestId) -> Option<PendingMedia> {
+        let index = self
+            .waiting_media
             .iter()
-            .position(|id| *id == request_id)
-        else {
-            return false;
-        };
-        self.waiting_media_order.remove(index);
-        true
+            .position(|submission| submission.request.request_id == request_id)?;
+        self.waiting_media.remove(index)
+    }
+
+    /// Removes a queued token request while preserving admission order for its peers.
+    fn remove_waiting(&mut self, request_id: RequestId) -> Option<RequestState> {
+        let index = self
+            .waiting
+            .iter()
+            .position(|queued| queued.req.request_id == request_id)?;
+        self.waiting.remove(index)
     }
 
     /// Aborts every queued/gated/running request with a terminal event.
     pub(super) fn abort_all_requests(&mut self) {
         self.inflight.pending_submissions.clear();
-        while let Some(id) = self.waiting_media_order.pop_front() {
-            let submission = self
-                .waiting_media
-                .remove(&id)
-                .expect("scheduler media order names runtime state");
+        while let Some(submission) = self.waiting_media.pop_front() {
             let _ = submission.event_tx.send(EngineCoreOutput::Finished {
                 reason: FinishReason::Aborted,
                 stop_reason: None,
@@ -38,11 +39,7 @@ impl Scheduler {
         }
         let queued: Vec<RequestId> = {
             let mut ids = Vec::new();
-            while let Some(id) = self.waiting_order.pop_front() {
-                let st = self
-                    .waiting
-                    .remove(&id)
-                    .expect("scheduler waiting order names runtime state");
+            while let Some(st) = self.waiting.pop_front() {
                 ids.push(st.req.request_id);
                 let _ = st.output.events.event_tx.send(EngineCoreOutput::Finished {
                     reason: FinishReason::Aborted,
@@ -135,9 +132,7 @@ impl Scheduler {
         abort: bool,
         output_token_count: Option<usize>,
     ) {
-        if self.remove_waiting_media(id)
-            && let Some(submission) = self.waiting_media.remove(&id)
-        {
+        if let Some(submission) = self.remove_waiting_media(id) {
             let reason = if abort {
                 FinishReason::Aborted
             } else {
@@ -152,15 +147,12 @@ impl Scheduler {
             });
             return;
         }
-        if self.media_state(id).is_some() {
-            self.media_state_mut(id)
-                .expect("media state exists")
-                .terminal_intent
-                .finish(if abort {
-                    FinishReason::Aborted
-                } else {
-                    FinishReason::Cancelled
-                });
+        if let Some(state) = self.media_state_mut(id) {
+            state.terminal_intent.finish(if abort {
+                FinishReason::Aborted
+            } else {
+                FinishReason::Cancelled
+            });
             let drained = !self.inflight.has_pending_calls(id);
             if drained {
                 self.finish_media(
@@ -190,8 +182,7 @@ impl Scheduler {
             };
         }
         // also drop from the waiting queue if not yet admitted (reporting the reason)
-        if let Some(st) = self.waiting.remove(&id) {
-            self.waiting_order.retain(|queued| *queued != id);
+        if let Some(st) = self.remove_waiting(id) {
             let reason = if abort {
                 FinishReason::Aborted
             } else {

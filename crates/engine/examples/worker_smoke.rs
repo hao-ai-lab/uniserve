@@ -54,7 +54,7 @@ fn main() -> anyhow::Result<()> {
     let ctrl = SpecialTokenIds {
         ..SpecialTokenIds::default()
     };
-    let mut sched = Scheduler::new(Box::new(engine), ctrl, 32);
+    let mut sched = Scheduler::new(Box::new(engine), ctrl, 32)?;
 
     let mut rxs: HashMap<RequestId, (&str, uniserve_engine::EventRx)> = HashMap::new();
     // we drive step directly here instead of the run thread

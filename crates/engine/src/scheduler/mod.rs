@@ -82,6 +82,7 @@ use crate::executor::WorkerFailure;
 use crate::scheduler::image_artifact::validate_png_artifact;
 use allocation::{
     MediaAllocations, MediaStorage, MediaTensorAllocation, RequestAllocations, RetiringRequest,
+    UnknownMediaWorker,
 };
 use denoising::{Denoising, LatentPlacement};
 use generation::RequestState;
@@ -284,8 +285,11 @@ pub struct Scheduler {
     generation_limits: uniserve_core::GenerationLimits,
     family: RuntimeFamily,
     ctrl: SpecialTokenIds,
-    waiting: HashMap<RequestId, RequestState>,
-    waiting_media: HashMap<RequestId, PendingMedia>,
+    /// Token requests awaiting admission, in admission order: arrival order,
+    /// or priority then arrival under the priority policy.
+    waiting: VecDeque<RequestState>,
+    /// Media requests awaiting admission, in arrival order.
+    waiting_media: VecDeque<PendingMedia>,
     running: HashMap<RequestId, RequestState>,
     running_media: HashMap<RequestId, MediaFlowState>,
     retiring_requests: HashMap<RequestId, RetiringRequest>,
@@ -296,19 +300,28 @@ pub struct Scheduler {
     next_product_generation: u64,
     next_request_epoch: u64,
     config: SchedulerConfig,
-    waiting_order: VecDeque<RequestId>,
-    waiting_media_order: VecDeque<RequestId>,
     running_order: Vec<RequestId>,
     output: output::OutputSender,
     prefer_media: bool,
-    /// Engine-fatal latch: set when the executor/worker dies;
-    /// the control loop exits and the host converts this into engine-dead.
+    /// Engine-fatal latch: set when the executor/worker dies or a scheduler
+    /// invariant breaks; the control loop exits and the host converts this
+    /// into engine-dead.
     fatal: bool,
     /// Shared scheduler counters and latency accumulators.
     pub stats: Arc<SchedulerStats>,
 }
 
 impl Scheduler {
+    /// Latches engine-fatal for a scheduler invariant that no longer holds.
+    ///
+    /// Scheduling cannot continue from inconsistent state, so the control loop
+    /// stops at its next check and fails every request, as it does when a
+    /// worker dies. The caller abandons the operation that found the violation.
+    fn invariant_broken(&mut self, invariant: &str) {
+        tracing::error!(invariant, "scheduler invariant broken; stopping the engine");
+        self.fatal = true;
+    }
+
     /// Determines whether this service's configured model accepts a request family.
     const fn accepts_family(&self, family: RuntimeFamily) -> bool {
         matches!(

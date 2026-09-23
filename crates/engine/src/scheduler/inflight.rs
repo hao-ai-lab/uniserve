@@ -183,12 +183,15 @@ impl Inflight {
         }
         ready.sort_unstable_by_key(|(priority, arrival, ..)| (*priority, *arrival));
         let mut completions = Vec::with_capacity(ready.len());
+        // Selection read these completions from the maps it now drains, so
+        // each one is still present.
         for (_, _, id, call_id) in ready {
-            let pending = self
-                .pending_completions
-                .get_mut(&id)
-                .expect("selected completion exists");
-            completions.push(pending.remove(&call_id).expect("selected call exists"));
+            let Some(pending) = self.pending_completions.get_mut(&id) else {
+                continue;
+            };
+            if let Some(completion) = pending.remove(&call_id) {
+                completions.push(completion);
+            }
             if pending.is_empty() {
                 self.pending_completions.remove(&id);
             }
@@ -215,15 +218,12 @@ impl Inflight {
         {
             return None;
         }
-        let inflight = queue.remove(index).expect("selected call exists");
-        if inflight.call.bounds.max_transfer_bytes > 0 {
-            self.num_pending_transfers = self
-                .num_pending_transfers
-                .checked_sub(1)
-                .expect("completed transfer owns a reservation");
-        }
+        let inflight = queue.remove(index)?;
         if queue.is_empty() {
             self.pending_calls.remove(&id);
+        }
+        if inflight.call.bounds.max_transfer_bytes > 0 {
+            self.release_transfer();
         }
         Some(inflight)
     }
@@ -252,12 +252,20 @@ impl Inflight {
             self.pending_calls.remove(&request.request_id);
         }
         if inflight.call.bounds.max_transfer_bytes > 0 {
-            self.num_pending_transfers = self
-                .num_pending_transfers
-                .checked_sub(1)
-                .expect("retired transfer owns a reservation");
+            self.release_transfer();
         }
         Some(inflight)
+    }
+
+    /// Releases the transfer reservation a leaving transfer call holds.
+    ///
+    /// Every registered transfer call holds one reservation, so a release at
+    /// zero reports an accounting defect instead of wrapping the count.
+    fn release_transfer(&mut self) {
+        match self.num_pending_transfers.checked_sub(1) {
+            Some(remaining) => self.num_pending_transfers = remaining,
+            None => tracing::error!("a transfer call released a reservation it did not hold"),
+        }
     }
 
     /// Removes failed calls from the in-flight registry.

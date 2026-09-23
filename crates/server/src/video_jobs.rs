@@ -1,7 +1,7 @@
 //! Bounded process-local video jobs and immutable retained artifacts.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -104,6 +104,11 @@ pub(crate) fn timestamp() -> u64 {
 }
 
 impl VideoJobs {
+    /// Locks the job table and recovers it after poisoning.
+    fn entries(&self) -> MutexGuard<'_, BTreeMap<String, RetainedJob>> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Acquires one bounded job slot before the request reaches the engine.
     pub(crate) fn reserve(&self) -> Result<JobSlot, &'static str> {
         Arc::clone(&self.slots)
@@ -120,7 +125,7 @@ impl VideoJobs {
         record: VideoJob,
         slot: JobSlot,
     ) -> Result<Arc<JobReservation>, &'static str> {
-        let mut entries = self.entries.lock().expect("video job lock poisoned");
+        let mut entries = self.entries();
         if entries.contains_key(&record.id) {
             return Err("video job already exists");
         }
@@ -140,27 +145,18 @@ impl VideoJobs {
     }
 
     pub(crate) fn get(&self, id: &str) -> Option<VideoJob> {
-        self.entries
-            .lock()
-            .expect("video job lock poisoned")
-            .get(id)
-            .map(|job| job.record.clone())
+        self.entries().get(id).map(|job| job.record.clone())
     }
 
     pub(crate) fn list(&self) -> Vec<VideoJob> {
-        let entries = self.entries.lock().expect("video job lock poisoned");
+        let entries = self.entries();
         let mut records: Vec<_> = entries.values().map(|job| job.record.clone()).collect();
         records.sort_by(|a, b| (b.created_at, &b.id).cmp(&(a.created_at, &a.id)));
         records
     }
 
     pub(crate) fn progress(&self, id: &str, phase: &str, steps: u32) {
-        if let Some(job) = self
-            .entries
-            .lock()
-            .expect("video job lock poisoned")
-            .get_mut(id)
-        {
+        if let Some(job) = self.entries().get_mut(id) {
             job.record.status = "in_progress";
             job.record.phase = phase.to_owned();
             job.record.completed_steps = steps;
@@ -173,7 +169,7 @@ impl VideoJobs {
         id: &str,
         result: Result<Arc<SharedMedia>, VideoFailure>,
     ) {
-        let mut entries = self.entries.lock().expect("video job lock poisoned");
+        let mut entries = self.entries();
         let result = result.and_then(|media| {
             let bytes = u32::try_from(media.len())
                 .ok()
@@ -224,21 +220,12 @@ impl VideoJobs {
     }
 
     pub(crate) fn content(&self, id: &str) -> Option<Arc<RetainedMedia>> {
-        self.entries
-            .lock()
-            .expect("video job lock poisoned")
-            .get(id)
-            .and_then(|job| job.media.clone())
+        self.entries().get(id).and_then(|job| job.media.clone())
     }
 
     /// Removal wins over a racing completion; active work drains through runtime cancellation.
     pub(crate) fn delete(&self, id: &str) -> bool {
-        if let Some(job) = self
-            .entries
-            .lock()
-            .expect("video job lock poisoned")
-            .remove(id)
-        {
+        if let Some(job) = self.entries().remove(id) {
             job.cancellation.cancel();
             true
         } else {
@@ -247,12 +234,7 @@ impl VideoJobs {
     }
 
     pub(crate) fn cancel_all(&self) {
-        for job in self
-            .entries
-            .lock()
-            .expect("video job lock poisoned")
-            .values()
-        {
+        for job in self.entries().values() {
             job.cancellation.cancel();
         }
     }

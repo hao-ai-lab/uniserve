@@ -957,7 +957,7 @@ impl InputProcessor {
                 let rendered_text = self
                     .renderer
                     .as_ref()
-                    .expect("Qwen3 requires a chat renderer")
+                    .ok_or(crate::serving::chat::Error::MissingChatTemplate)?
                     .render(&chat_request)?;
                 let ids = self.tokenizer.encode(&rendered_text, false)?;
                 let skip = chat_request.decode_options.skip_special_tokens;

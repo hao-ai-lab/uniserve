@@ -271,7 +271,7 @@ impl Served {
 fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
     let mut executor = SimExecutor::new(video_worker(1, 1));
     let boundary = executor.observe();
-    let scheduler = Scheduler::new(Box::new(executor), SpecialTokenIds::default(), 32);
+    let scheduler = Scheduler::new(Box::new(executor), SpecialTokenIds::default(), 32).unwrap();
     let (tx, commands) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let mut stream = handle
@@ -353,7 +353,7 @@ fn serve(sim: SimEngine, requests: Vec<Request>) -> Served {
 fn serve_bounded(sim: SimEngine, requests: Vec<Request>, max_num_waiting: Option<usize>) -> Served {
     let mut executor = SimExecutor::new(sim);
     let boundary = executor.observe();
-    let mut scheduler = Scheduler::new(Box::new(executor), SpecialTokenIds::default(), 32);
+    let mut scheduler = Scheduler::new(Box::new(executor), SpecialTokenIds::default(), 32).unwrap();
     if let Some(bound) = max_num_waiting {
         scheduler.set_max_num_waiting(bound);
     }

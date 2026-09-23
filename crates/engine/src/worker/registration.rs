@@ -7,6 +7,8 @@
 //! head is what lets a rank on another host present a socket endpoint the head
 //! could not have chosen in advance.
 
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::time::{Duration, Instant};
@@ -134,9 +136,10 @@ impl RankRegistry {
         mut alive: impl FnMut() -> anyhow::Result<()>,
     ) -> anyhow::Result<Vec<RankReport>> {
         let deadline = Instant::now() + REGISTRATION_TIMEOUT;
-        let mut reports: Vec<Option<RankReport>> = (0..expected).map(|_| None).collect();
-        let mut received = 0;
-        while received < expected {
+        // Every key is a distinct rank below `expected`, so a full map holds
+        // exactly ranks `0..expected`, in order.
+        let mut reports = BTreeMap::<usize, RankReport>::new();
+        while reports.len() < expected {
             let stream = match self.listener.accept() {
                 Ok((stream, _)) => stream,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -145,11 +148,9 @@ impl RankRegistry {
                     // failure of what it does next, not of registration.
                     alive()?;
                     if Instant::now() >= deadline {
-                        let silent = reports
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, report)| report.is_none())
-                            .map(|(rank, _)| rank.to_string())
+                        let silent = (0..expected)
+                            .filter(|rank| !reports.contains_key(rank))
+                            .map(|rank| rank.to_string())
                             .collect::<Vec<_>>()
                             .join(", ");
                         anyhow::bail!(
@@ -193,20 +194,21 @@ impl RankRegistry {
                 report.rank,
                 report.transport
             );
-            let slot = reports
-                .get_mut(report.rank as usize)
-                .with_context(|| format!("rank {} is outside this worker", report.rank))?;
+            let rank = report.rank as usize;
             anyhow::ensure!(
-                slot.is_none(),
-                "rank {} reported its endpoint more than once",
+                rank < expected,
+                "rank {} is outside this worker",
                 report.rank
             );
-            *slot = Some(report);
-            received += 1;
+            match reports.entry(rank) {
+                Entry::Vacant(slot) => {
+                    slot.insert(report);
+                }
+                Entry::Occupied(_) => {
+                    anyhow::bail!("rank {} reported its endpoint more than once", report.rank)
+                }
+            }
         }
-        Ok(reports
-            .into_iter()
-            .map(|report| report.expect("every rank slot received a report"))
-            .collect())
+        Ok(reports.into_values().collect())
     }
 }

@@ -79,21 +79,12 @@ impl EncoderCacheManager {
         &mut self,
         buffers: &std::collections::HashSet<uniserve_worker_ipc::BufferId>,
     ) -> Vec<TensorRef> {
-        let hashes = self
+        let revoked = self
             .entries
-            .iter()
-            .filter_map(|(hash, entry)| {
-                buffers
-                    .contains(&entry.product.buffer_id())
-                    .then_some(*hash)
-            })
+            .extract_if(|_, entry| buffers.contains(&entry.product.buffer_id()))
             .collect::<Vec<_>>();
         let mut reclaimable = Vec::new();
-        for hash in hashes {
-            let entry = self
-                .entries
-                .remove(&hash)
-                .expect("selected cache entry exists");
+        for (hash, entry) in revoked {
             self.evictable.remove(&entry.lru);
             self.stats.evictions += 1;
             if entry.ref_cnt == 0 {
@@ -135,10 +126,8 @@ impl EncoderCacheManager {
     /// be freed before a replacement encoder call is admitted.
     pub(crate) fn evict_one(&mut self) -> Option<TensorRef> {
         let (_, victim) = self.evictable.pop_first()?;
-        let entry = self
-            .entries
-            .remove(&victim)
-            .expect("evictable encoder entry is resident");
+        // An index key without a resident entry evicts nothing, as in `insert`.
+        let entry = self.entries.remove(&victim)?;
         debug_assert_eq!(entry.ref_cnt, 0);
         self.stats.evictions += 1;
         Some(entry.product)
