@@ -700,25 +700,26 @@ pub(super) fn register_call(
             return Err(PlanningError::ProductGenerationExhausted);
         }
     }
+    // The preflight above guarantees every generation this call assigns fits.
     let mut acquire_generation = || {
-        let generation =
-            u32::try_from((*next_product_generation).max(1)).expect("generation preflight");
+        let generation = u32::try_from((*next_product_generation).max(1))
+            .map_err(|_| PlanningError::ProductGenerationExhausted)?;
         *next_product_generation = u64::from(generation) + 1;
-        generation
+        Ok::<_, PlanningError>(generation)
     };
     call.request_key = request_key;
     if let Some(output) = &mut call.kv_output {
         output.owner = request_key;
         output.producer_call_id = call_id;
         if output.generation == 0 {
-            output.generation = acquire_generation();
+            output.generation = acquire_generation()?;
         }
     }
     for product in call.tensor_outputs_mut() {
         product.request_key = request_key;
         product.producer_call_id = call_id;
         if product.generation == 0 {
-            product.generation = acquire_generation();
+            product.generation = acquire_generation()?;
         }
     }
     Ok(())
@@ -839,9 +840,9 @@ pub(crate) fn validate_generation_result(
         let terminal_prefix = !listed.is_empty()
             && listed.len() <= drafts.len()
             && listed == &drafts[..listed.len()]
-            && state
-                .finish_token_ids
-                .contains(listed.last().expect("nonempty verified prefix"));
+            && listed
+                .last()
+                .is_some_and(|token| state.finish_token_ids.contains(token));
         if !terminal_prefix {
             let accepted = listed.len().saturating_sub(1);
             if listed.is_empty()
@@ -1064,29 +1065,30 @@ pub(crate) struct RequestState {
 }
 
 impl RequestState {
-    /// Returns the request allocations.
-    pub(super) fn allocations(&self) -> &RequestAllocations {
-        self.allocations.as_ref().expect("request is admitted")
+    /// Returns the request allocations, which admission installs.
+    pub(super) fn allocations(&self) -> Option<&RequestAllocations> {
+        self.allocations.as_ref()
     }
 
-    /// Returns mutable access to the request allocations.
-    pub(super) fn allocations_mut(&mut self) -> &mut RequestAllocations {
-        self.allocations.as_mut().expect("request is admitted")
+    /// Returns mutable access to the request allocations, which admission installs.
+    pub(super) fn allocations_mut(&mut self) -> Option<&mut RequestAllocations> {
+        self.allocations.as_mut()
     }
 
-    /// Returns the request-pool index.
-    pub(super) fn request_pool_idx(&self) -> u32 {
-        self.allocations().request_slot()
+    /// Returns the request-pool row, which admission assigns.
+    pub(super) fn request_pool_idx(&self) -> Option<u32> {
+        self.allocations().map(RequestAllocations::request_slot)
     }
 
-    /// Returns shared access to the request block tables.
-    pub(super) fn block_tables(&self) -> &[BlockTable] {
-        self.allocations().block_tables()
+    /// Returns the request's block tables, one per KV group once admitted.
+    pub(super) fn block_tables(&self) -> Option<&[BlockTable]> {
+        self.allocations().map(RequestAllocations::block_tables)
     }
 
-    /// Returns mutable access to the request block tables.
-    pub(super) fn block_tables_mut(&mut self) -> &mut Vec<BlockTable> {
-        self.allocations_mut().block_tables_mut()
+    /// Returns mutable access to the request's block tables once admitted.
+    pub(super) fn block_tables_mut(&mut self) -> Option<&mut Vec<BlockTable>> {
+        self.allocations_mut()
+            .map(RequestAllocations::block_tables_mut)
     }
 
     /// Returns whether the request includes context images.

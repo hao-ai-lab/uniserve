@@ -1162,17 +1162,29 @@ impl ForwardBatch {
     }
 
     /// Move forward inputs into a physical batch, offsetting only physical row ownership.
-    pub fn append(&mut self, other: Self, call_offset: u32) {
-        self.call_indices
-            .extend(other.call_indices.into_iter().map(|index| {
-                index
-                    .checked_add(call_offset)
-                    .expect("physical call index fits u32")
-            }));
+    ///
+    /// Fails without modifying this batch when an offset call index exceeds `u32`.
+    pub fn append(&mut self, other: Self, call_offset: u32) -> ValidationResult<()> {
+        // Offset every index before extending any column so a failure leaves
+        // the columns aligned.
+        let call_indices = other
+            .call_indices
+            .into_iter()
+            .map(|index| {
+                index.checked_add(call_offset).ok_or_else(|| {
+                    invalid_message!(
+                        "physical call index {index} with offset {call_offset} exceeds u32"
+                    )
+                })
+            })
+            .collect::<ValidationResult<Vec<_>>>()?;
+
+        self.call_indices.extend(call_indices);
         self.request_pool_indices.extend(other.request_pool_indices);
         self.seq_lens.extend(other.seq_lens);
         self.query_lens.extend(other.query_lens);
         self.write_kv.extend(other.write_kv);
+        Ok(())
     }
 
     /// Select a rank's calls and map their forward rows to the local call array.

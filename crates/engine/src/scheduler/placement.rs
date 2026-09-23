@@ -136,22 +136,24 @@ impl Placement {
     }
 
     /// Binds planned work to its configured component and records request residency.
+    ///
+    /// Returns `None`, recording nothing, when no loaded worker can execute the
+    /// call's component.
     pub(super) fn select_worker(
         &mut self,
         executor: &dyn Executor,
         info: &WorkerInfo,
         call: &Call,
-    ) -> (crate::WorkerId, String) {
+    ) -> Option<(crate::WorkerId, String)> {
         let (id, bound_component) = if call.component == DEFAULT_COMPONENT {
             self.worker_target(executor, info, call.request_key, call.code)
         } else {
             self.component_target(executor, call.request_key, call.code, &call.component)
-        }
-        .expect("planned call retains an executable component");
+        }?;
         let target = (id.clone(), bound_component.to_owned());
         self.affinity
             .insert((call.request_key, target.1.clone()), target.0.clone());
-        target
+        Some(target)
     }
 
     /// Includes lifecycle commands in destination ordering, even when a batch has no compute.

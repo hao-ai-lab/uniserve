@@ -202,7 +202,7 @@ impl ExecutionBatch {
         for (call_index, (call, placement)) in requests.into_iter().enumerate() {
             block_tables.extend(placement.block_tables);
             new_cache_pages.extend(placement.new_cache_pages);
-            forward.append(placement.forward, call_index as u32);
+            forward.append(placement.forward, call_index as u32)?;
             latent_params.extend(placement.latent);
             decode_ranges.extend(placement.decode);
             buffer_allocations.extend(placement.buffers);

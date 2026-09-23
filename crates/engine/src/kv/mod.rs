@@ -58,12 +58,10 @@ pub(crate) fn block_hash(
             for token in tokens {
                 hasher.update(token.to_le_bytes());
             }
-            let hash_bytes = hasher.finalize();
-            u64::from_le_bytes(
-                hash_bytes[..8]
-                    .try_into()
-                    .expect("SHA-256 prefix is eight bytes"),
-            )
+            // The page hash is the little-endian first eight digest bytes.
+            let digest: [u8; 32] = hasher.finalize().into();
+            let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = digest;
+            u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7])
         }
     }
 }
@@ -159,13 +157,6 @@ impl PoolInner {
         self.groups[group].free_count = self.groups[group].free_count.saturating_sub(1);
     }
 
-    /// Returns and removes the first free block.
-    fn fq_pop_front(&mut self, group: usize) -> Option<BlockId> {
-        let index = self.groups[group].fq_head?;
-        self.fq_unlink_index(group, index);
-        Some(BlockId(index))
-    }
-
     /// Unlinks a block from its group free queue.
     fn fq_unlink(&mut self, id: BlockId) {
         if self.meta[id.0 as usize].in_fq {
@@ -240,24 +231,6 @@ impl CacheBlockRef {
     }
 }
 
-impl Clone for CacheBlockRef {
-    /// Creates another handle to the same value.
-    fn clone(&self) -> Self {
-        if let Some(pool) = self.pool.upgrade() {
-            let mut inner = lock(&pool);
-            let meta = &mut inner.meta[self.id.0 as usize];
-            meta.ref_cnt = meta
-                .ref_cnt
-                .checked_add(1)
-                .expect("cache page reference count overflow");
-        }
-        Self {
-            id: self.id,
-            pool: Weak::clone(&self.pool),
-        }
-    }
-}
-
 impl Drop for CacheBlockRef {
     /// Releases resources owned by this value.
     fn drop(&mut self) {
@@ -314,15 +287,8 @@ pub(crate) struct BlockPool {
 
 impl BlockPool {
     /// Creates a block pool with one full-attention cache group.
-    pub(crate) fn new(num_blocks: usize, block_size: usize) -> Self {
-        Self::with_groups(
-            num_blocks,
-            block_size,
-            &[(
-                0,
-                u32::try_from(num_blocks).expect("physical KV page capacity exceeds u32"),
-            )],
-        )
+    pub(crate) fn new(num_blocks: u32, block_size: usize) -> Self {
+        Self::with_groups(num_blocks as usize, block_size, &[(0, num_blocks)])
     }
 
     /// Validates that cache groups partition the complete physical page range exactly once.
@@ -491,9 +457,22 @@ impl BlockPool {
         if group >= inner.groups.len() || count > inner.groups[group].free_count {
             return None;
         }
+
+        // Select the first `count` pages of the free queue before changing any
+        // state, so a queue shorter than its count fails with the pool intact.
+        let mut pages = Vec::with_capacity(count);
+        let mut next = inner.groups[group].fq_head;
+        while pages.len() < count {
+            let index = next?;
+            pages.push(BlockId(index));
+            next = inner.meta[index as usize].fq_next;
+        }
+
+        // Page references are built only after selection succeeds: dropping
+        // one here would re-enter this pool's lock.
         let mut refs = Vec::with_capacity(count);
-        for _ in 0..count {
-            let page = inner.fq_pop_front(group).expect("free-count invariant");
+        for page in pages {
+            inner.fq_unlink_index(group, page.0);
             inner.remove_cached(page);
             let meta = &mut inner.meta[page.0 as usize];
             meta.state = BlockState::Reserved;
@@ -512,10 +491,10 @@ impl BlockPool {
     pub(crate) fn activate(&self, blocks: &[CacheBlockRef]) {
         let mut inner = lock(&self.inner);
         for block in blocks {
-            if Arc::ptr_eq(
-                &self.inner,
-                &block.pool.upgrade().expect("cache pool is live"),
-            ) && inner.meta[block.id.0 as usize].state == BlockState::Reserved
+            // Only this pool's pages are activated; the block's pool is compared
+            // by address, which needs no upgrade.
+            if std::ptr::eq(block.pool.as_ptr(), Arc::as_ptr(&self.inner))
+                && inner.meta[block.id.0 as usize].state == BlockState::Reserved
             {
                 inner.meta[block.id.0 as usize].state = BlockState::Active;
             }
@@ -650,7 +629,7 @@ impl fmt::Debug for BlockPool {
 }
 
 /// One cached sequence's logical-page to physical-page mapping.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct BlockTable {
     group_id: usize,
     block_size: usize,
@@ -1006,7 +985,14 @@ mod tests {
         let pool = BlockPool::new(4, 4);
         let mut first = BlockTable::new(0, 4);
         assert_eq!(first.ensure_capacity(&pool, 4), Some(vec![BlockId(1)]));
-        let second = first.clone();
+        let hash = block_hash(0, 0, 0, &[1, 2, 3, 4], HashAlgo::Fnv1a);
+        let source = Arc::new(uniserve_worker_ipc::WorkerInfo::default().endpoint);
+        pool.cache_block(first.block(0).unwrap(), hash, &[1, 2, 3, 4], &source);
+        let mut second = BlockTable::new(0, 4);
+        let shared = pool
+            .acquire_cached(BlockId(1), hash, &[1, 2, 3, 4], &source)
+            .unwrap();
+        assert!(second.append_cached(shared));
         assert!(pool.allocate(0, 3).is_none());
         drop(first);
         assert!(pool.allocate(0, 3).is_none());

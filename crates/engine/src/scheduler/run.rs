@@ -44,7 +44,13 @@ fn resolve_generation_limits(
 
 impl Scheduler {
     /// Constructs an engine loop with the default scheduler configuration.
-    pub fn new(executor: Box<dyn Executor>, ctrl: SpecialTokenIds, max_batch: usize) -> Self {
+    ///
+    /// Fails when the executor exposes an invalid aggregate capacity view.
+    pub fn new(
+        executor: Box<dyn Executor>,
+        ctrl: SpecialTokenIds,
+        max_batch: usize,
+    ) -> anyhow::Result<Self> {
         Self::with_config(
             executor,
             ctrl,
@@ -56,12 +62,14 @@ impl Scheduler {
     }
 
     /// Constructs an engine loop with an explicit scheduling policy.
+    ///
+    /// Fails when the executor exposes an invalid aggregate capacity view.
     pub fn with_policy(
         executor: Box<dyn Executor>,
         ctrl: SpecialTokenIds,
         max_batch: usize,
         policy: SchedulingPolicy,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         Self::with_config(
             executor,
             ctrl,
@@ -75,18 +83,13 @@ impl Scheduler {
 
     /// Constructs an engine loop and infers its runtime family from worker capabilities.
     ///
-    /// # Panics
-    ///
-    /// Panics when the executor exposes an invalid aggregate capacity view.
+    /// Fails when the executor exposes an invalid aggregate capacity view.
     pub fn with_config(
         executor: Box<dyn Executor>,
         ctrl: SpecialTokenIds,
         config: SchedulerConfig,
-    ) -> Self {
-        let info = executor
-            .info()
-            .runtime_info()
-            .expect("executor exposes a valid runtime capacity view");
+    ) -> anyhow::Result<Self> {
+        let info = executor.info().runtime_info()?;
 
         // Capability families are mutually ordered from diffusion-only through
         // unified multimodal support to autoregressive-only execution.
@@ -108,12 +111,14 @@ impl Scheduler {
     }
 
     /// Constructs an engine loop for an explicit runtime family.
+    ///
+    /// Fails when the executor exposes an invalid aggregate capacity view.
     pub fn with_config_for_family(
         executor: Box<dyn Executor>,
         ctrl: SpecialTokenIds,
         config: SchedulerConfig,
         family: RuntimeFamily,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let generation_limits = match family {
             RuntimeFamily::Umm => unbounded_umm_generation_limits(),
             RuntimeFamily::Ar | RuntimeFamily::Diffusion => uniserve_core::GenerationLimits {
@@ -141,9 +146,7 @@ impl Scheduler {
     ///
     /// Worker limits clamp scheduler concurrency and resource capacities.
     ///
-    /// # Panics
-    ///
-    /// Panics when the executor exposes an invalid aggregate capacity view.
+    /// Fails when the executor exposes an invalid aggregate capacity view.
     pub fn with_model_limits(
         executor: Box<dyn Executor>,
         ctrl: SpecialTokenIds,
@@ -151,11 +154,8 @@ impl Scheduler {
         family: RuntimeFamily,
         model_dtype: uniserve_core::ModelDtype,
         generation_limits: uniserve_core::GenerationLimits,
-    ) -> Self {
-        let info = executor
-            .info()
-            .runtime_info()
-            .expect("executor exposes a valid runtime capacity view");
+    ) -> anyhow::Result<Self> {
+        let info = executor.info().runtime_info()?;
         let generation_limits = resolve_generation_limits(generation_limits, &info);
         let latent_dtype = worker_float_dtype(Some(model_dtype));
         let media_storage = executor
@@ -224,7 +224,7 @@ impl Scheduler {
         // Runtime state remains single-owner; executors receive immutable batch
         // inputs assembled from these queues and request records.
 
-        Self {
+        Ok(Self {
             executor,
             inflight: inflight::Inflight::new(),
             placement: placement::Placement::default(),
@@ -246,8 +246,8 @@ impl Scheduler {
             generation_limits,
             family,
             ctrl,
-            waiting: HashMap::new(),
-            waiting_media: HashMap::new(),
+            waiting: VecDeque::new(),
+            waiting_media: VecDeque::new(),
             running: HashMap::new(),
             running_media: HashMap::new(),
             retiring_requests: HashMap::new(),
@@ -257,15 +257,13 @@ impl Scheduler {
             engine_id: 1,
             next_product_generation: 1,
             next_request_epoch: 1,
-            waiting_order: VecDeque::new(),
-            waiting_media_order: VecDeque::new(),
             running_order: Vec::new(),
             output: output::OutputSender::default(),
             prefer_media: true,
             config,
             fatal: false,
             stats,
-        }
+        })
     }
 
     /// Returns the active scheduling policy.
@@ -365,9 +363,7 @@ impl Scheduler {
 
     /// Returns the number of pending requests.
     pub(super) fn pending_request_count(&self) -> usize {
-        self.waiting_order
-            .len()
-            .saturating_add(self.waiting_media_order.len())
+        self.waiting.len().saturating_add(self.waiting_media.len())
     }
 
     /// All drivers consume the same command ingress before scheduling work.

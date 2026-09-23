@@ -109,7 +109,7 @@ fn main() -> anyhow::Result<()> {
     let engine =
         WorkerExecutor::try_new(vec![(WorkerId("local".into()), engine)], Default::default())?;
     let waker = engine.command_waker();
-    let sched = Scheduler::new(Box::new(engine), SpecialTokenIds::default(), 32);
+    let sched = Scheduler::new(Box::new(engine), SpecialTokenIds::default(), 32)?;
 
     let (tx, rx) = crossbeam_channel::unbounded::<Command>();
     let handle = EngineHandle::with_waker(tx, waker);

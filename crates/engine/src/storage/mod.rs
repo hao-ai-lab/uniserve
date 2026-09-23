@@ -11,9 +11,19 @@ use uniserve_worker_ipc::{RequestKey, WorkerInfo};
 use crate::kv::{BlockPool, BlockTable, KvCacheCoordinator};
 
 /// Owned request row, returned only after its request epoch retires.
+///
+/// The row index is private so that only [`RequestPool::allocate`] can
+/// create a slot.
 #[derive(Debug)]
 pub(crate) struct RequestSlot {
-    pub(crate) index: u32,
+    index: u32,
+}
+
+impl RequestSlot {
+    /// Returns the request-state row this slot owns.
+    pub(crate) fn index(&self) -> u32 {
+        self.index
+    }
 }
 
 /// KV page references retain shared prefixes through ordinary ownership.
@@ -58,9 +68,13 @@ pub enum OutOfStorage {
 }
 
 /// Dense pool of stable request-state row identifiers.
+///
+/// Only [`RequestPool::allocate`] creates a [`RequestSlot`] and only
+/// [`RequestPool::free`] consumes one, so a slot in hand names a live row of
+/// the pool that issued it and cannot be released twice.
 pub(crate) struct RequestPool {
     free: Vec<u32>,
-    live: Vec<bool>,
+    capacity: usize,
 }
 
 impl RequestPool {
@@ -69,13 +83,13 @@ impl RequestPool {
         let capacity = capacity.clamp(1, u32::MAX as usize);
         Self {
             free: (1..=capacity as u32).rev().collect(),
-            live: vec![false; capacity + 1],
+            capacity,
         }
     }
 
     /// Returns the allocator capacity.
     pub(crate) fn capacity(&self) -> usize {
-        self.live.len().saturating_sub(1)
+        self.capacity
     }
 
     /// Returns whether the collection contains no entries.
@@ -86,26 +100,6 @@ impl RequestPool {
     /// Returns the number of request rows that can still be assigned.
     pub(crate) fn available(&self) -> usize {
         self.free.len()
-    }
-
-    /// Acquires an available slot.
-    fn acquire(&mut self) -> Option<u32> {
-        let index = self.free.pop()?;
-        self.live[index as usize] = true;
-        Some(index)
-    }
-
-    /// Releases the supplied allocation.
-    fn release(&mut self, index: u32) -> Result<(), &'static str> {
-        let Some(live) = self.live.get_mut(index as usize) else {
-            return Err("request-pool index is outside scheduler capacity");
-        };
-        if index == 0 || !*live {
-            return Err("request-pool index is not live");
-        }
-        *live = false;
-        self.free.push(index);
-        Ok(())
     }
 }
 
@@ -141,13 +135,11 @@ impl LatentPool {
             return false;
         };
         let additional = needed.saturating_sub(pages.len());
-        if additional > self.free.len() {
+        // Pages come from the tail of the free stack, most recently released first.
+        let Some(retained) = self.free.len().checked_sub(additional) else {
             return false;
-        }
-        pages.reserve(additional);
-        for _ in 0..additional {
-            pages.push(self.free.pop().expect("latent free-page invariant"));
-        }
+        };
+        pages.extend(self.free.drain(retained..).rev());
         true
     }
 
@@ -169,7 +161,7 @@ impl KVCacheManager {
     pub(crate) fn from_worker_info(info: &WorkerInfo) -> Option<Self> {
         info.kv_cache.as_ref().map(|kv_cache| {
             let block_pool = if kv_cache.groups.is_empty() {
-                BlockPool::new(kv_cache.num_blocks as usize, kv_cache.block_size as usize)
+                BlockPool::new(kv_cache.num_blocks, kv_cache.block_size as usize)
             } else {
                 let mut offset = 0_u32;
                 let group_shapes = kv_cache
@@ -258,15 +250,17 @@ impl BufferPool {
 impl RequestPool {
     /// Reserve one stable positive row for an admitted request epoch.
     pub(crate) fn allocate(&mut self) -> Result<RequestSlot, OutOfStorage> {
-        let index = self.acquire().ok_or(OutOfStorage::RequestSlots)?;
+        let index = self.free.pop().ok_or(OutOfStorage::RequestSlots)?;
         Ok(RequestSlot { index })
     }
 
     /// Return a row after all participating workers acknowledge its release.
+    ///
+    /// The caller passes the slot this pool issued; consuming it is what
+    /// retires the row, so no liveness check remains to fail.
     pub(crate) fn free(&mut self, allocation: RequestSlot) {
-        let RequestSlot { index, .. } = allocation;
-        self.release(index)
-            .expect("request row remains allocated until release");
+        let RequestSlot { index } = allocation;
+        self.free.push(index);
     }
 }
 

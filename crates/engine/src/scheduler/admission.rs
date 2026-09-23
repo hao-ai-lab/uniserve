@@ -29,13 +29,21 @@ impl Scheduler {
             });
             return;
         }
-        if let Err(error) = req.validate_resources(&self.generation_limits) {
-            let _ = event_tx.send(EngineCoreOutput::Rejected {
-                kind: RejectionKind::Invalid,
-                message: format!("invalid generation resource requirements: {error}"),
-            });
-            return;
-        }
+        // Resource validation includes the KV bound, so a request that passes
+        // it has a worst-case KV token count.
+        let max_kv_tokens = match req
+            .validate_resources(&self.generation_limits)
+            .and_then(|()| req.max_kv_tokens(&self.generation_limits))
+        {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                let _ = event_tx.send(EngineCoreOutput::Rejected {
+                    kind: RejectionKind::Invalid,
+                    message: format!("invalid generation resource requirements: {error}"),
+                });
+                return;
+            }
+        };
         // Waiting-queue backpressure sheds load instead of letting the waiting
         // queue grow without bound under overload —
         // an unbounded burst would otherwise OOM the process and take down every
@@ -48,10 +56,7 @@ impl Scheduler {
             });
             return;
         }
-        let worst = req
-            .max_kv_tokens(&self.generation_limits)
-            .expect("request capacity was validated before queueing")
-            .div_ceil(self.info.kv_block_size() as usize);
+        let worst = max_kv_tokens.div_ceil(self.info.kv_block_size() as usize);
         // Multimodal requests reserve their configured bounded KV envelope at
         // admission so excess concurrency queues instead of exhausting KV.
         let reserve_worstcase = !req.multimodal_inputs.images.is_empty() || req.generates_images();
@@ -105,16 +110,13 @@ impl Scheduler {
             req,
         };
         self.next_request_epoch = self.next_request_epoch.saturating_add(1);
-        let request_id = st.req.request_id;
         let position = match self.config.policy {
-            SchedulingPolicy::Fcfs => self.waiting_order.len(),
-            SchedulingPolicy::Priority => self.waiting_order.partition_point(|id| {
-                let queued = &self.waiting[id];
+            SchedulingPolicy::Fcfs => self.waiting.len(),
+            SchedulingPolicy::Priority => self.waiting.partition_point(|queued| {
                 (queued.req.priority, queued.queued_at) <= (st.req.priority, st.queued_at)
             }),
         };
-        self.waiting_order.insert(position, request_id);
-        self.waiting.insert(request_id, st);
+        self.waiting.insert(position, st);
     }
 
     /// Resolve storage from loaded numerical result contracts before admission.
@@ -303,7 +305,7 @@ impl Scheduler {
             });
             return;
         }
-        if self.waiting_order.len() + self.waiting_media_order.len() + self.output.retained_len()
+        if self.waiting.len() + self.waiting_media.len() + self.output.retained_len()
             >= self.config.max_num_waiting
         {
             let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
@@ -312,130 +314,125 @@ impl Scheduler {
             });
             return;
         }
-        let request_id = submission.request.request_id;
-        self.waiting_media.insert(request_id, submission);
-        self.waiting_media_order.push_back(request_id);
+        self.waiting_media.push_back(submission);
+    }
+
+    /// Reserves a media request's row and output buffers on every routed worker.
+    ///
+    /// Returns `Ok(None)`, with nothing reserved, when some worker lacks
+    /// capacity now; the request then waits at the head of the queue.
+    fn reserve_media(
+        &mut self,
+        route_workers: &HashSet<crate::WorkerId>,
+        request_key: RequestKey,
+        outputs: Vec<(String, u32, DType, ShapeBound)>,
+    ) -> Result<Option<MediaAllocations>, UnknownMediaWorker> {
+        let mut reserved = MediaAllocations {
+            request_slots: HashMap::new(),
+            tensors: HashMap::new(),
+        };
+        for worker in route_workers {
+            let Some(storage) = self.storage.media_storage.get_mut(worker) else {
+                reserved.free(&mut self.storage)?;
+                return Err(UnknownMediaWorker(worker.clone()));
+            };
+            let Ok(slot) = storage.requests.allocate() else {
+                reserved.free(&mut self.storage)?;
+                return Ok(None);
+            };
+            reserved.request_slots.insert(worker.clone(), slot);
+        }
+        for (component, index, dtype, shape_bound) in outputs {
+            let bytes = shape_bound
+                .max_elements()
+                .saturating_mul(dtype.element_bytes());
+            let mut tensor = MediaTensorAllocation {
+                allocations: HashMap::new(),
+                dtype,
+                shape_bound,
+            };
+            for worker in route_workers {
+                let Some(storage) = self.storage.media_storage.get_mut(worker) else {
+                    reserved.tensors.insert((component, index), tensor);
+                    reserved.free(&mut self.storage)?;
+                    return Err(UnknownMediaWorker(worker.clone()));
+                };
+                let Ok(buffer) = storage.buffers.allocate(request_key, bytes, 256) else {
+                    reserved.tensors.insert((component, index), tensor);
+                    reserved.free(&mut self.storage)?;
+                    return Ok(None);
+                };
+                tensor.allocations.insert(worker.clone(), buffer);
+            }
+            reserved.tensors.insert((component, index), tensor);
+        }
+        Ok(Some(reserved))
     }
 
     /// Admits queued media requests while request and product storage remain available.
     pub(super) fn admit_media(&mut self) {
         while self.running_request_count() < self.config.max_num_seqs {
-            let Some(id) = self.waiting_media_order.pop_front() else {
+            let Some(submission) = self.waiting_media.pop_front() else {
                 break;
             };
-            let submission = self
-                .waiting_media
-                .remove(&id)
-                .expect("scheduler media order names runtime state");
+            let id = submission.request.request_id;
             let request_epoch = self.next_request_epoch;
             let request_key = RequestKey::new(self.engine_id, id, request_epoch);
             let sampling = submission.request.sampling;
             let Some(routes) = self.media_routes() else {
-                self.waiting_media.insert(id, submission);
-                self.waiting_media_order.push_front(id);
+                self.waiting_media.push_front(submission);
+                break;
+            };
+            // Submission validated these bounds against the same loaded
+            // components, so a request reaching admission has them.
+            let Some(outputs) =
+                self.media_outputs(sampling, submission.request.prompt_token_ids.len() as u32)
+            else {
+                self.waiting_media.push_front(submission);
+                self.invariant_broken("a queued media request has valid output bounds");
                 break;
             };
             let route_workers = routes.values().cloned().collect::<HashSet<_>>();
-            let mut request_slots = HashMap::new();
-            let mut reserved = true;
-            for worker in &route_workers {
-                let allocation = self
-                    .storage
-                    .media_storage
-                    .get_mut(worker)
-                    .expect("media route names a loaded worker")
-                    .requests
-                    .allocate();
-                match allocation {
-                    Ok(allocation) => {
-                        request_slots.insert(worker.clone(), allocation);
-                    }
-                    Err(_) => {
-                        reserved = false;
-                        break;
-                    }
-                }
-            }
-            if !reserved {
-                for (worker, allocation) in request_slots {
-                    self.storage.free_media_request(&worker, allocation);
-                }
-                self.waiting_media.insert(id, submission);
-                self.waiting_media_order.push_front(id);
-                break;
-            }
-            let outputs = self
-                .media_outputs(sampling, submission.request.prompt_token_ids.len() as u32)
-                .expect("queued media has valid output bounds");
-            let mut tensors = HashMap::new();
-            reserved = true;
-            for (component, index, dtype, shape_bound) in outputs {
-                let bytes = shape_bound
-                    .max_elements()
-                    .saturating_mul(dtype.element_bytes());
-                let mut allocations = HashMap::new();
-                for worker in &route_workers {
-                    let allocation = self
-                        .storage
-                        .media_storage
-                        .get_mut(worker)
-                        .expect("media route names a loaded worker")
-                        .buffers
-                        .allocate(request_key, bytes, 256);
-                    let Ok(allocation) = allocation else {
-                        for (allocated_worker, allocation) in std::mem::take(&mut allocations) {
-                            self.storage
-                                .free_media_buffer(&allocated_worker, allocation);
-                        }
-                        reserved = false;
-                        break;
-                    };
-                    allocations.insert(worker.clone(), allocation);
-                }
-                if !reserved {
+            let allocations = match self.reserve_media(&route_workers, request_key, outputs) {
+                Ok(Some(allocations)) => allocations,
+                Ok(None) => {
+                    self.waiting_media.push_front(submission);
                     break;
                 }
-                tensors.insert(
-                    (component, index),
-                    MediaTensorAllocation {
-                        allocations,
-                        dtype,
-                        shape_bound,
-                    },
-                );
-            }
-            if !reserved {
-                for tensor in tensors.into_values() {
-                    for (worker, allocation) in tensor.allocations {
-                        self.storage.free_media_buffer(&worker, allocation);
-                    }
+                Err(unknown) => {
+                    self.waiting_media.push_front(submission);
+                    self.invariant_broken(&unknown.to_string());
+                    break;
                 }
-                for (worker, allocation) in request_slots {
-                    self.storage.free_media_request(&worker, allocation);
-                }
-                self.waiting_media.insert(id, submission);
-                self.waiting_media_order.push_front(id);
-                break;
-            }
-            let allocations = MediaAllocations {
-                request_slots,
-                tensors,
             };
             let primary_component = self.info.media_components[&MediaCall::Denoising].as_str();
             let request_pool_idx = allocations.request_slot(&routes[primary_component]);
+            // Submission validated the prompt and sampling this admission carries.
+            let admission = match NewRequest::new_media(
+                request_key,
+                request_pool_idx,
+                submission.request.prompt_token_ids.clone(),
+                submission.request.sampling,
+            ) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    let released = allocations.free(&mut self.storage);
+                    self.waiting_media.push_front(submission);
+                    self.invariant_broken(&format!(
+                        "a queued media request forms a valid admission: {error}"
+                    ));
+                    if let Err(unknown) = released {
+                        self.invariant_broken(&unknown.to_string());
+                    }
+                    break;
+                }
+            };
             for (component, worker) in &routes {
                 self.placement
                     .affinity
                     .insert((request_key, component.clone()), worker.clone());
             }
             self.next_request_epoch = self.next_request_epoch.saturating_add(1);
-            let admission = NewRequest::new_media(
-                request_key,
-                request_pool_idx,
-                submission.request.prompt_token_ids.clone(),
-                submission.request.sampling,
-            )
-            .expect("validated media admission");
             let root = CallId::new(0, 0);
             let steps = submission.request.sampling.num_inference_steps;
             let mut state = MediaFlowState {
@@ -547,7 +544,12 @@ impl Scheduler {
         let Ok(request_slot) = self.storage.request_pool.allocate() else {
             return false;
         };
-        let Ok(kv) = self.storage.cache().allocate(prefix_tokens as u32) else {
+        let Some(cache) = self.storage.cache() else {
+            self.storage.request_pool.free(request_slot);
+            self.invariant_broken("a running token request has a KV cache");
+            return false;
+        };
+        let Ok(kv) = cache.allocate(prefix_tokens as u32) else {
             self.storage.request_pool.free(request_slot);
             return false;
         };
@@ -640,13 +642,9 @@ impl Scheduler {
             {
                 break;
             }
-            let Some(head_id) = self.waiting_order.front().copied() else {
+            let Some(head) = self.waiting.front() else {
                 break;
             };
-            let head = self
-                .waiting
-                .get(&head_id)
-                .expect("scheduler waiting order names runtime state");
             if head.reserve_worstcase {
                 let need = head.max_reserved_kv_blocks;
                 let encoder_entries = head.req.num_encoder_cache_entries();
@@ -656,8 +654,9 @@ impl Scheduler {
                     .saturating_add(encoder_entries)
                     <= self.storage.encoder_cache.budget();
                 if need > self.storage.usable_blocks() {
-                    let id = self.waiting_order.pop_front().unwrap();
-                    let st = self.waiting.remove(&id).unwrap();
+                    let Some(st) = self.waiting.pop_front() else {
+                        break;
+                    };
                     let _ = st.output.events.event_tx.send(EngineCoreOutput::Rejected {
                         kind: RejectionKind::Invalid,
                         message: "request exceeds total KV capacity".into(),
@@ -668,10 +667,19 @@ impl Scheduler {
                     let Some((target, _)) = self.prefill_target(head) else {
                         break;
                     };
-                    let id = self.waiting_order.pop_front().unwrap();
-                    let st = self.waiting.remove(&id).unwrap();
+                    let Some(st) = self.waiting.pop_front() else {
+                        break;
+                    };
+                    let reservation = match self.reserve_admission(&target.0) {
+                        Ok(reservation) => reservation,
+                        Err(invariant) => {
+                            self.waiting.push_front(st);
+                            self.invariant_broken(invariant);
+                            break;
+                        }
+                    };
                     let id = st.req.request_id;
-                    self.admit_running(st, target);
+                    self.admit_running(st, target, reservation);
                     // Physically allocate the worst case now: nothing can take
                     // these blocks, so this request can never fail mid-flight.
                     self.ensure_request_capacity(id, need * bs);
@@ -680,8 +688,14 @@ impl Scheduler {
                 }
             } else {
                 let n = head.req.prompt_token_ids.len();
-                let text_usable_blocks = (0..self.storage.cache().block_pool.num_groups())
-                    .map(|group| self.storage.cache().block_pool.group_capacity(group))
+                // Submission rejects token requests when the worker has no KV
+                // cache, so a queued one always finds it.
+                let Some(cache) = self.storage.cache() else {
+                    self.invariant_broken("a queued token request has a KV cache");
+                    break;
+                };
+                let text_usable_blocks = (0..cache.block_pool.num_groups())
+                    .map(|group| cache.block_pool.group_capacity(group))
                     .min()
                     .unwrap_or_default();
                 let Some((target, prefix_hit)) = self.prefill_target(head) else {
@@ -700,8 +714,9 @@ impl Scheduler {
                     .div_ceil(bs)
                     .saturating_sub(cached_prefix_blocks);
                 if n > text_usable_blocks * bs {
-                    let id = self.waiting_order.pop_front().unwrap();
-                    let st = self.waiting.remove(&id).unwrap();
+                    let Some(st) = self.waiting.pop_front() else {
+                        break;
+                    };
                     let _ = st.output.events.event_tx.send(EngineCoreOutput::Rejected {
                         kind: RejectionKind::Invalid,
                         message: "request exceeds total KV capacity".into(),
@@ -709,11 +724,10 @@ impl Scheduler {
                     continue;
                 }
                 let capacity_available = prefix_hit.cached_free_blocks.len()
-                    == self.storage.cache().block_pool.num_groups()
+                    == cache.block_pool.num_groups()
                     && prefix_hit.cached_free_blocks.iter().enumerate().all(
                         |(group, cached_free)| {
-                            self.storage
-                                .cache()
+                            cache
                                 .block_pool
                                 .free_blocks_in_group(group)
                                 .saturating_sub(*cached_free)
@@ -721,9 +735,18 @@ impl Scheduler {
                         },
                     );
                 if capacity_available {
-                    let id = self.waiting_order.pop_front().unwrap();
-                    let st = self.waiting.remove(&id).unwrap();
-                    self.admit_running(st, target);
+                    let Some(st) = self.waiting.pop_front() else {
+                        break;
+                    };
+                    let reservation = match self.reserve_admission(&target.0) {
+                        Ok(reservation) => reservation,
+                        Err(invariant) => {
+                            self.waiting.push_front(st);
+                            self.invariant_broken(invariant);
+                            break;
+                        }
+                    };
+                    self.admit_running(st, target, reservation);
                     continue;
                 }
             }
@@ -740,7 +763,7 @@ impl Scheduler {
         &self,
         state: &RequestState,
     ) -> Option<((crate::WorkerId, String), crate::kv::PrefixHit)> {
-        let cache = self.storage.cache();
+        let cache = self.storage.cache()?;
         self.placement
             .worker_candidates(
                 self.executor.as_ref(),
@@ -780,39 +803,63 @@ impl Scheduler {
             .fetch_max(queue_wait_us, Ordering::Relaxed);
     }
 
-    pub(super) fn admit_running(
+    /// Reserves what admission to `target` needs before the request commits.
+    ///
+    /// Admission checked request-row capacity and chose `target` among loaded
+    /// workers, and the text KV cache exists for every queued token request, so
+    /// an error names the scheduler invariant that no longer holds. Nothing
+    /// stays reserved on error.
+    fn reserve_admission(
         &mut self,
-        mut st: RequestState,
-        target: (crate::WorkerId, String),
-    ) {
-        let id = st.req.request_id;
-        let request_key = RequestKey::new(self.engine_id, id, st.request_epoch);
+        target: &crate::WorkerId,
+    ) -> Result<AdmissionReservation, &'static str> {
         let source = self
             .executor
             .info()
             .workers
             .iter()
-            .find(|(worker, _)| *worker == target.0)
-            .expect("selected prefill Worker remains loaded")
-            .1
-            .endpoint
-            .clone();
-        self.placement
-            .affinity
-            .insert((request_key, target.1), target.0);
-
-        // Admission owns the request row and an initially empty table for every
-        // KV group before the request enters the runnable set.
+            .find(|(worker, _)| worker == target)
+            .map(|(_, worker)| worker.endpoint.clone())
+            .ok_or("the selected prefill worker remains loaded")?;
+        let cache = self
+            .storage
+            .cache
+            .as_ref()
+            .ok_or("a queued token request has a KV cache")?;
         let request_slot = self
             .storage
             .request_pool
             .allocate()
-            .expect("admission checked request-slot capacity");
-        let kv = self
-            .storage
-            .cache()
-            .allocate(0)
-            .expect("empty KV allocation is valid");
+            .map_err(|_| "admission checked request-row capacity")?;
+        // Admission owns the request row and an initially empty table for every
+        // KV group before the request enters the runnable set.
+        let Ok(kv) = cache.allocate(0) else {
+            self.storage.request_pool.free(request_slot);
+            return Err("an empty KV allocation always fits");
+        };
+        Ok(AdmissionReservation {
+            source,
+            request_slot,
+            kv,
+        })
+    }
+
+    pub(super) fn admit_running(
+        &mut self,
+        mut st: RequestState,
+        target: (crate::WorkerId, String),
+        reservation: AdmissionReservation,
+    ) {
+        let id = st.req.request_id;
+        let request_key = RequestKey::new(self.engine_id, id, st.request_epoch);
+        let AdmissionReservation {
+            source,
+            request_slot,
+            kv,
+        } = reservation;
+        self.placement
+            .affinity
+            .insert((request_key, target.1), target.0);
         st.allocations = Some(RequestAllocations {
             request_slot,
             kv,
@@ -845,40 +892,55 @@ impl Scheduler {
 
         // Prefix-cache acquisition pins every reused block to this request's
         // newly installed block tables.
-        if let Some(st) = self.running.get_mut(&id) {
-            let kv = self
-                .storage
-                .cache
-                .as_ref()
-                .expect("generation has a KV cache");
-            acquire_cached_prefix(&kv.coordinator, st, &kv.block_pool, &self.stats, &source);
+        let acquired = match (self.running.get_mut(&id), self.storage.cache.as_ref()) {
+            (Some(st), Some(kv)) => {
+                acquire_cached_prefix(&kv.coordinator, st, &kv.block_pool, &self.stats, &source)
+            }
+            _ => Err("an admitted request runs with a KV cache"),
+        };
+        if let Err(invariant) = acquired {
+            self.invariant_broken(invariant);
         }
     }
 }
 
+/// Resources a token request holds from the moment admission commits it.
+pub(super) struct AdmissionReservation {
+    /// The prefill worker's endpoint, which keys its prefix-cache residency.
+    source: uniserve_worker_ipc::WorkerEndpoint,
+    request_slot: RequestSlot,
+    kv: KvAllocation,
+}
+
 /// Acquires a complete cross-group prefix hit and records cache accounting on the request.
+///
+/// Fails, acquiring nothing, when the request's block tables do not cover the
+/// coordinator's KV groups.
 fn acquire_cached_prefix(
     coordinator: &KvCacheCoordinator,
     state: &mut RequestState,
     pool: &BlockPool,
     stats: &SchedulerStats,
     source: &uniserve_worker_ipc::WorkerEndpoint,
-) {
+) -> Result<(), &'static str> {
     let prompt = state.req.prompt_token_ids.clone();
     let has_context_images = state.has_context_images();
     let cache_read = state.req.cache.read;
     let isolation_key = state.req.cache.isolation_key;
+    let tables = state
+        .block_tables_mut()
+        .ok_or("an admitted request holds its block tables")?;
     let hit = coordinator
         .acquire_prefix(
             pool,
-            state.block_tables_mut(),
+            tables,
             &prompt,
             cache_read,
             has_context_images,
             isolation_key,
             source,
         )
-        .expect("request cache groups match the KV coordinator");
+        .ok_or("an admitted request's block tables cover every KV group")?;
     let block_size = pool.block_size();
     let full_blocks = prompt.len() / block_size;
     let query_blocks = if prompt.len().is_multiple_of(block_size) {
@@ -903,4 +965,5 @@ fn acquire_cached_prefix(
     state.logical_position = state.num_computed_prompt_tokens;
     state.kv_visible_len = state.num_computed_prompt_tokens;
     state.kv_computed_len = state.num_computed_prompt_tokens;
+    Ok(())
 }

@@ -87,7 +87,13 @@ impl Scheduler {
                 .get(&id)
                 .map(|state| self.worker_image_latent_units_for(state).max(1))?;
             let state = self.running.get_mut(&id)?;
-            let allocations = state.allocations_mut();
+            let Some(allocations) = state.allocations_mut() else {
+                for allocation in buffer_allocations {
+                    self.storage.buffer_pool.free(allocation);
+                }
+                self.invariant_broken("a request planning latent storage is admitted");
+                return None;
+            };
             let result = if let Some(allocation) = allocations.latent.as_mut() {
                 self.storage.latent_pool.grow(allocation, latent_units)
             } else {
@@ -215,22 +221,25 @@ impl Scheduler {
                     continue;
                 };
                 let code = call.code;
-                if let std::collections::hash_map::Entry::Vacant(e) = code_batches.entry(code) {
-                    let batch_id = self.inflight.next_batch_id();
-                    e.insert(ExecutionBatch::new(
-                        batch_id,
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    ));
+                let batch = code_batches.entry(code).or_insert_with(|| {
                     code_order.push(code);
-                }
-                let request_index = u32::try_from(code_batches[&code].requests.len())
-                    .expect("selected request count fits the IPC index");
-                call.call_id = CallId::new(code_batches[&code].id, request_index);
-                call.coordinates = self
-                    .projected_coordinates(id)
-                    .expect("scheduled request retains its running state");
+                    ExecutionBatch::new(
+                        self.inflight.next_batch_id(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                });
+                let Ok(request_index) = u32::try_from(batch.requests.len()) else {
+                    self.invariant_broken("a batch's request count fits the IPC index");
+                    return Vec::new();
+                };
+                call.call_id = CallId::new(batch.id, request_index);
+                let Some(coordinates) = self.projected_coordinates(id) else {
+                    self.invariant_broken("a scheduled request retains its running state");
+                    return Vec::new();
+                };
+                call.coordinates = coordinates;
                 let finish_token_ids = self
                     .running
                     .get(&id)
@@ -241,43 +250,42 @@ impl Scheduler {
                 if let Some(st) = self.running.get_mut(&id)
                     && !st.worker_registered
                 {
-                    st.worker_registered = true;
                     let request_key = RequestKey::new(engine_id, id, st.request_epoch);
-                    let admission = NewRequest::new(
-                        request_key,
-                        st.request_pool_idx(),
-                        Some(ArRequestParams {
-                            sampling: st.req.sampling.clone(),
-                            negative_token_ids: st.req.negative_prompt_token_ids.clone(),
-                            finish_token_ids,
-                            initial_position: st.num_computed_prompt_tokens,
-                        }),
-                        st.req.generates_images().then(|| st.req.image.clone()),
-                    )
-                    .expect("validated request produces a valid admission");
+                    // Admission reserved the request row, and submission
+                    // validated the parameters this admission carries.
+                    let admission = st.request_pool_idx().map(|request_pool_idx| {
+                        NewRequest::new(
+                            request_key,
+                            request_pool_idx,
+                            Some(ArRequestParams {
+                                sampling: st.req.sampling.clone(),
+                                negative_token_ids: st.req.negative_prompt_token_ids.clone(),
+                                finish_token_ids,
+                                initial_position: st.num_computed_prompt_tokens,
+                            }),
+                            st.req.generates_images().then(|| st.req.image.clone()),
+                        )
+                    });
+                    let Some(Ok(admission)) = admission else {
+                        self.invariant_broken("a running request forms a valid worker admission");
+                        return Vec::new();
+                    };
+                    st.worker_registered = true;
                     // Admission is the first request-state dependency.
                     st.last_state_call_id = CallId::default();
                     st.latest_token = None;
-                    code_batches
-                        .get_mut(&code)
-                        .expect("computation batch exists")
-                        .commands
-                        .push(BatchCommand::Start {
-                            request: Box::new(admission),
-                        });
+                    batch.commands.push(BatchCommand::Start {
+                        request: Box::new(admission),
+                    });
                     admitted = true;
                 }
-                let mut batch = code_batches
-                    .remove(&code)
-                    .expect("computation batch exists");
                 let prepared = self.prepare_generation_call(
                     call,
                     reserved_buffers,
                     admitted,
                     planned_us,
-                    &mut batch,
+                    batch,
                 );
-                code_batches.insert(code, batch);
                 if prepared.is_none() {
                     // Preparation marks the scheduler fatal before it fails.
                     return Vec::new();
@@ -290,9 +298,9 @@ impl Scheduler {
                 .get(code)
                 .is_some_and(|batch| !batch.requests.is_empty())
         });
-        if code_order.is_empty() {
+        let Some(&last) = code_order.last() else {
             return Vec::new();
-        }
+        };
 
         // Prompt commands remain disjoint from earlier state writers. The
         // round's retirements travel with its last batch so no earlier call
@@ -316,14 +324,12 @@ impl Scheduler {
         } else {
             self.take_commands(|_| true)
         };
-        let last = *code_order
-            .last()
-            .expect("selected calls name a computation");
         let mut batches = Vec::with_capacity(code_order.len());
         for code in code_order {
-            let mut batch = code_batches
-                .remove(&code)
-                .expect("computation batch exists");
+            let Some(mut batch) = code_batches.remove(&code) else {
+                self.invariant_broken("every selected call kind has its batch");
+                return Vec::new();
+            };
             if code == last {
                 batch.commands.extend(commands.iter().cloned());
             }
@@ -627,19 +633,27 @@ impl Scheduler {
         let mut call_new_cache_pages = Vec::new();
         let mut call_forward = ForwardBatch::default();
         if let Some(lengths) = kv_lengths {
+            // Registration above found the request running, and a running
+            // token request always has the text KV cache.
+            let Some((state, tables, request_pool_idx, cache)) =
+                self.running.get(&request_id).and_then(|state| {
+                    Some((
+                        state,
+                        state.block_tables()?,
+                        state.request_pool_idx()?,
+                        self.storage.cache()?,
+                    ))
+                })
+            else {
+                self.invariant_broken("a registered token request is admitted with a KV cache");
+                return None;
+            };
             let table_changed = admitted || new_page_count > 0;
-            for group_id in 0..self.storage.cache().block_pool.num_groups() {
-                let page_ids = self
-                    .running
-                    .get(&request_id)
-                    .and_then(|state| state.block_tables().get(group_id))
+            for group_id in 0..cache.block_pool.num_groups() {
+                let page_ids = tables
+                    .get(group_id)
                     .map(BlockTable::page_ids)
                     .unwrap_or_default();
-                let request_pool_idx = self
-                    .running
-                    .get(&request_id)
-                    .map(|state| state.request_pool_idx())
-                    .expect("registered request has a live slot");
                 if table_changed {
                     call_block_tables.push(IpcBlockTable {
                         request_pool_idx,
@@ -655,13 +669,8 @@ impl Scheduler {
                 }
                 let fresh_pages = if admitted {
                     let retained_pages = if group_id == 0 {
-                        self.running
-                            .get(&request_id)
-                            .map(|state| {
-                                (state.num_computed_prompt_tokens as usize)
-                                    .div_ceil(self.info.kv_block_size() as usize)
-                            })
-                            .unwrap_or_default()
+                        (state.num_computed_prompt_tokens as usize)
+                            .div_ceil(self.info.kv_block_size() as usize)
                             .min(page_ids.len())
                     } else {
                         0
@@ -683,10 +692,7 @@ impl Scheduler {
             if lengths.input > 0 {
                 call_forward.push(
                     0,
-                    self.running
-                        .get(&request_id)
-                        .map(|state| state.request_pool_idx())
-                        .expect("registered request has a live slot"),
+                    request_pool_idx,
                     lengths.visible + lengths.input,
                     lengths.input,
                     true,
@@ -729,16 +735,20 @@ impl Scheduler {
             return None;
         }
         let mut call_buffers = Vec::with_capacity(reserved_buffers.len());
-        let Some(state) = self.running.get_mut(&request_id) else {
+        let Some(allocations) = self
+            .running
+            .get_mut(&request_id)
+            .and_then(|state| state.allocations_mut())
+        else {
             for allocation in reserved_buffers {
                 self.storage.buffer_pool.free(allocation);
             }
-            self.fatal = true;
+            self.invariant_broken("a registered call's request is admitted");
             return None;
         };
         for (buffer, allocation) in persistent_outputs.into_iter().zip(reserved_buffers) {
             let (offset, bytes) = (allocation.offset, allocation.bytes);
-            let replaced = state.allocations_mut().buffers.insert(buffer, allocation);
+            let replaced = allocations.buffers.insert(buffer, allocation);
             debug_assert!(replaced.is_none(), "buffer identity was reused");
             call_buffers.push(BufferAllocation {
                 buffer,
@@ -750,9 +760,14 @@ impl Scheduler {
         // Diffusion rows include the positive branch and any negative CFG
         // branch, each bound to its own request-state row.
         if call.code == CallKind::Media(MediaCall::Denoising) {
-            let conditioning_tokens = kv_lengths
-                .expect("denoising declares its conditioning KV range")
-                .visible;
+            let Some(KvLengths {
+                visible: conditioning_tokens,
+                ..
+            }) = kv_lengths
+            else {
+                self.invariant_broken("denoising declares its conditioning KV range");
+                return None;
+            };
             let query_len = u32::try_from(
                 self.running
                     .get(&request_id)
@@ -765,7 +780,10 @@ impl Scheduler {
                 self.fatal = true;
                 return None;
             };
-            let main_slot = state.request_pool_idx();
+            let Some(main_slot) = state.request_pool_idx() else {
+                self.invariant_broken("a denoising request is admitted");
+                return None;
+            };
             let mut alternative = None;
             if let Some(prefix) = state.flow_prefix.as_mut() {
                 let allocated_tokens = prefix
@@ -821,9 +839,12 @@ impl Scheduler {
                 self.fatal = true;
                 return None;
             };
+            let Some(allocations) = state.allocations() else {
+                self.invariant_broken("a request with latent work is admitted");
+                return None;
+            };
             let placement = LatentPlacement {
-                page_table: state
-                    .allocations()
+                page_table: allocations
                     .latent
                     .as_ref()
                     .map(|allocation| allocation.pages.clone())
@@ -860,21 +881,29 @@ impl Scheduler {
             ));
         }
 
-        let (worker, entry) =
+        let Some((worker, entry)) =
             self.placement
-                .select_worker(self.executor.as_ref(), &self.info, &call);
+                .select_worker(self.executor.as_ref(), &self.info, &call)
+        else {
+            self.invariant_broken("a planned call retains an executable component");
+            return None;
+        };
         call.component = entry;
 
+        let image_kv = if consumes_image_features(&call) {
+            let Some(lengths) = kv_lengths else {
+                self.invariant_broken("an image extension declares its KV input range");
+                return None;
+            };
+            Some((lengths.visible, num_image_kv_tokens))
+        } else {
+            None
+        };
         let submitted_us = uniserve_core::now_monotonic_us();
         self.register_inflight(
             call.clone(),
             InflightInput::Generation {
-                image_kv: if consumes_image_features(&call) {
-                    let lengths = kv_lengths.expect("image extension declares its KV input range");
-                    Some((lengths.visible, num_image_kv_tokens))
-                } else {
-                    None
-                },
+                image_kv,
                 latent: latent.clone(),
             },
             submitted_us.saturating_sub(planned_us),
@@ -978,22 +1007,28 @@ impl Scheduler {
         let Some(state) = self.running.get_mut(&id) else {
             return false;
         };
-        let Some(cache) = self.storage.cache.as_ref() else {
+        let (Some(allocations), Some(cache)) =
+            (state.allocations_mut(), self.storage.cache.as_ref())
+        else {
+            self.invariant_broken("a running token request is admitted with a KV cache");
             return false;
         };
         cache
             .grow(
-                &mut state.allocations_mut().kv,
+                &mut allocations.kv,
                 total_tokens.min(u32::MAX as usize) as u32,
             )
             .is_ok()
     }
 
     /// Activates the KV tables reserved for a request.
+    ///
+    /// A request holds tables only once admitted, and only token requests,
+    /// which always have the KV cache, hold them.
     pub(super) fn activate_request_tables(&self, id: RequestId) {
-        let kv = self.storage.cache();
-        if let Some(state) = self.running.get(&id) {
-            for table in state.block_tables() {
+        let tables = self.running.get(&id).and_then(RequestState::block_tables);
+        if let (Some(tables), Some(kv)) = (tables, self.storage.cache()) {
+            for table in tables {
                 table.activate(&kv.block_pool);
             }
         }
@@ -1017,7 +1052,14 @@ impl Scheduler {
                     // The KV owner keeps page identities. The scheduled record
                     // only needs the number of fresh pages for dispatch and drain.
                     let state = self.running.get_mut(&id)?;
-                    let allocated = state.block_tables()[0].len();
+                    let Some(allocated) = state
+                        .block_tables()
+                        .and_then(|tables| tables.first())
+                        .map(BlockTable::len)
+                    else {
+                        self.invariant_broken("a request planning a forward holds its KV tables");
+                        return None;
+                    };
                     call.bounds.max_kv_pages = allocated
                         .saturating_sub(state.num_kv_blocks_sent)
                         .min(u32::MAX as usize)
@@ -1282,9 +1324,12 @@ impl Scheduler {
             if state.phase == Phase::IngestState {
                 let feature = state.input_image_features.clone()?;
                 let encoder_input = *image.encoders.get(step_index)?;
-                let physical_bound = encoder_input
-                    .kv_token_capacity(&self.generation_limits)
-                    .expect("input encoder capacity was validated at admission");
+                // Submission validated every input encoder's capacity.
+                let Ok(physical_bound) = encoder_input.kv_token_capacity(&self.generation_limits)
+                else {
+                    self.invariant_broken("a queued input encoder has a valid KV capacity");
+                    return None;
+                };
 
                 if !self.ensure_request_capacity(
                     id,

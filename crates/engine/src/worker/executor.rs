@@ -281,9 +281,9 @@ impl WorkerExecutor {
                 if edge.source_rank.is_some_and(|rank| rank != source_rank) {
                     continue;
                 }
-                let source = source
-                    .rank_info(source_rank as usize)
-                    .expect("validated source rank");
+                let source = source.rank_info(source_rank as usize).with_context(|| {
+                    format!("transfer edge source has no rank {source_rank} in its world")
+                })?;
                 for destination_rank in 0..destination.info().world_size {
                     if edge
                         .destination_rank
@@ -293,7 +293,11 @@ impl WorkerExecutor {
                     }
                     let destination = destination
                         .rank_info(destination_rank as usize)
-                        .expect("validated destination rank");
+                        .with_context(|| {
+                            format!(
+                                "transfer edge destination has no rank {destination_rank} in its world"
+                            )
+                        })?;
                     anyhow::ensure!(
                         physical_edges
                             .insert((source.endpoint.clone(), destination.endpoint.clone())),
@@ -1088,10 +1092,11 @@ impl WorkerExecutor {
     /// Publishes ready calls immediately; only lifecycle receipts wait for all workers.
     fn publish_result(&mut self, report: WorkerResult) -> anyhow::Result<()> {
         let batch_id = report.batch_id;
-        let pending = self
-            .pending
-            .get(&batch_id)
-            .context("result has no pending batch")?;
+        let std::collections::btree_map::Entry::Occupied(entry) = self.pending.entry(batch_id)
+        else {
+            anyhow::bail!("result has no pending batch");
+        };
+        let pending = entry.get();
         let done = pending.workers.is_empty();
         let mut result = logical_result(report, done, &pending.commands);
         for receipt in &mut result.command_results {
@@ -1102,10 +1107,7 @@ impl WorkerExecutor {
                 .unwrap_or(CommandOutcome::Applied);
         }
         if done {
-            let pending = self
-                .pending
-                .remove(&batch_id)
-                .expect("completed batch is owned");
+            let pending = entry.remove();
             for (index, command) in pending.commands.into_iter().enumerate() {
                 if pending.command_outcomes.get(&(index as u32)) == Some(&CommandOutcome::Failed) {
                     continue;

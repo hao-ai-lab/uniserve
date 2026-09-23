@@ -93,7 +93,7 @@ pub(super) fn preprocess_sensenova(
         processor
             .renderer
             .as_ref()
-            .expect("text models require a chat renderer"),
+            .ok_or(crate::serving::chat::Error::MissingChatTemplate)?,
         request_id,
         prompt,
         images.into_iter().map(|image| image.b64).collect(),
@@ -153,7 +153,7 @@ pub(super) fn preprocess_bagel(
         processor
             .renderer
             .as_ref()
-            .expect("text models require a chat renderer"),
+            .ok_or(crate::serving::chat::Error::MissingChatTemplate)?,
         request_id,
         prompt,
         images.into_iter().map(|image| image.b64).collect(),

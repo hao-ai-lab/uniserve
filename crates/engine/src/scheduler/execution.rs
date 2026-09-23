@@ -15,11 +15,9 @@ impl Scheduler {
         let mut progressed = false;
         let pending_count = self.inflight.pending_submissions.len();
         for _ in 0..pending_count {
-            let batch = self
-                .inflight
-                .pending_submissions
-                .pop_front()
-                .expect("pending count is fixed");
+            let Some(batch) = self.inflight.pending_submissions.pop_front() else {
+                break;
+            };
             let targets = self.placement.batch_workers(&batch);
             if !targets.is_disjoint(blocked_workers) {
                 // A batch waiting on one destination also orders later work at
@@ -64,7 +62,7 @@ impl Scheduler {
         let allocation = self
             .running
             .get_mut(&id)
-            .and_then(|state| state.allocations_mut().latent.take());
+            .and_then(|state| state.allocations_mut()?.latent.take());
         if let Some(allocation) = allocation {
             self.storage.latent_pool.free(allocation);
         }
@@ -214,22 +212,25 @@ impl Scheduler {
     }
 
     /// Allocates a request-scoped product reference for a terminal media result.
+    ///
+    /// Fails, leaving the generation counter unchanged, once product
+    /// generations are exhausted.
     pub(super) fn media_completion_product(
         &mut self,
         request_key: RequestKey,
         call_id: CallId,
-    ) -> TensorRef {
+    ) -> Result<TensorRef, &'static str> {
         let generation = u32::try_from(self.next_product_generation.max(1))
-            .expect("media product generation exhausted");
+            .map_err(|_| "media product generations remain within u32")?;
         self.next_product_generation = u64::from(generation).saturating_add(1);
-        TensorRef {
+        Ok(TensorRef {
             request_key,
             producer_call_id: call_id,
             output_index: 0,
             generation,
             dtype: DType::U8,
             shape_bound: ShapeBound::default(),
-        }
+        })
     }
 }
 
@@ -272,7 +273,7 @@ struct LaneDemand {
     /// Host lanes this call occupies, each named by its worker and rank with
     /// the number of tasks the call places on it: one per media unit the
     /// rank encodes, one for any other host call.
-    host_ranks: Vec<(crate::WorkerId, u32, u32)>,
+    host_ranks: Vec<(crate::WorkerId, usize, u32)>,
 }
 
 /// Lane occupancy across the media calls in flight.
@@ -282,7 +283,7 @@ struct LaneLedger {
     units: HashMap<(crate::WorkerId, String), u32>,
     /// A host rank owns one host lane, so occupancy is counted per rank of
     /// each worker.
-    host: HashMap<(crate::WorkerId, u32), u32>,
+    host: HashMap<(crate::WorkerId, usize), u32>,
 }
 
 impl LaneLedger {
@@ -453,24 +454,24 @@ impl Scheduler {
     /// run of consecutive pages after its sentinel page, so the worker's
     /// advertised pool and slot count name the pages of `slot`. The raster is
     /// the video the samples decode to.
-    fn sample_placement(&self, worker: &crate::WorkerId, slot: u32) -> LatentPlacement {
-        let info = self
+    ///
+    /// Returns `None` when `worker` is not a loaded worker.
+    fn sample_placement(&self, worker: &crate::WorkerId, slot: u32) -> Option<LatentPlacement> {
+        let (_, info) = self
             .executor
             .info()
             .workers
             .iter()
-            .find(|(id, _)| id == worker)
-            .map(|(_, info)| info)
-            .expect("a placed call's worker is configured");
+            .find(|(id, _)| id == worker)?;
         let pages = info.latent_pages.saturating_sub(1) / info.request_slots.max(1);
         let first = 1 + slot.saturating_sub(1) * pages;
         let (height, width) = self.video_raster();
-        LatentPlacement {
+        Some(LatentPlacement {
             page_table: (first..first + pages).collect(),
             latent_units: pages * info.latent_page_units,
             height,
             width,
-        }
+        })
     }
 
     /// Returns the component whose lanes one media call occupies.
@@ -481,8 +482,10 @@ impl Scheduler {
     /// Returns how many media units one call of this kind covers at once.
     ///
     /// A distributed component reconstructs one media unit per rank per round,
-    /// so its rank count is the width of a round.
-    fn component_width(&self, request: RequestKey, work: CallKind, component: &str) -> u32 {
+    /// so its rank count is the width of a round. Returns `None` when the
+    /// request's owner of `component` is not loaded or its width exceeds the
+    /// decode range.
+    fn component_width(&self, request: RequestKey, work: CallKind, component: &str) -> Option<u32> {
         let owner = self
             .placement
             .affinity
@@ -490,20 +493,17 @@ impl Scheduler {
         let (_, bound, info) = self
             .placement
             .component_candidates(self.executor.as_ref(), work, component)
-            .find(|(worker, _, _)| owner.is_none_or(|owner| *worker == owner))
-            .expect("scheduled decoder has a configured owner");
+            .find(|(worker, _, _)| owner.is_none_or(|owner| *worker == owner))?;
         let component = info
             .components
             .iter()
-            .find(|component| component.name == bound)
-            .expect("scheduled decoder has a loaded component");
+            .find(|component| component.name == bound)?;
         let units_per_rank = if component.config.distribution.is_some() {
             component.config.units_per_rank.max(1)
         } else {
             1
         };
-        u32::try_from(component.config.ranks.len().saturating_mul(units_per_rank))
-            .expect("loaded component rank count fits the decode range")
+        u32::try_from(component.config.ranks.len().saturating_mul(units_per_rank)).ok()
     }
 
     /// Returns a component's device lane capacity in media units.
@@ -574,7 +574,7 @@ impl Scheduler {
         request: RequestKey,
         component: Option<&str>,
         units: u32,
-    ) -> Vec<(crate::WorkerId, u32, u32)> {
+    ) -> Vec<(crate::WorkerId, usize, u32)> {
         let Some(component) = component else {
             return Vec::new();
         };
@@ -615,13 +615,7 @@ impl Scheduler {
         ranks[..width]
             .iter()
             .enumerate()
-            .map(|(position, rank)| {
-                (
-                    worker.clone(),
-                    u32::try_from(*rank).expect("a rank index fits the lane ledger"),
-                    tasks(position),
-                )
-            })
+            .map(|(position, rank)| (worker.clone(), *rank, tasks(position)))
             .collect()
     }
 
@@ -708,6 +702,325 @@ impl Scheduler {
         }
     }
 
+    /// Builds one selected media call and records what it schedules.
+    ///
+    /// Selection checked the request's readiness for `media_call`, so an error
+    /// names the readiness invariant that no longer holds. A request's first
+    /// call also queues its worker admission onto `admissions`.
+    fn plan_media_call(
+        &mut self,
+        id: RequestId,
+        media_call: MediaCall,
+        call_id: CallId,
+        admissions: &mut Vec<NewRequest>,
+    ) -> Result<(Call, RequestPlacement), &'static str> {
+        let work = CallKind::Media(media_call);
+        let component = self.info.media_components[&media_call].clone();
+        let state = self.media_state(id).ok_or("a media candidate is running")?;
+        let request_key = state.admission.request_key;
+        let stateful = work.advances_state();
+        // A video request advances its ladder one step per call.
+        let step = self.scheduled_steps(id, &state.denoising);
+        let last_step = media_call == MediaCall::Denoising && state.denoising.ends(step, 1);
+        // Freeze the actual decode/write interval before advancing scheduled
+        // counters. Completion consumes this same range from the submission.
+        let decode = match media_call {
+            MediaCall::VideoDecoding => Some(DecodeRange {
+                request_key,
+                call_id,
+                cursor: state.scheduled_decode_units,
+                max_units: self
+                    .component_width(request_key, work, &component)
+                    .ok_or("a scheduled decoder has a loaded owner")?
+                    .min(state.request.sampling.video_units - state.scheduled_decode_units),
+            }),
+            MediaCall::VideoEncoding => Some(DecodeRange {
+                request_key,
+                call_id,
+                cursor: state.scheduled_encode_units,
+                max_units: state.decoded_units[&state.scheduled_encode_units].0,
+            }),
+            MediaCall::AudioDecoding => Some(DecodeRange {
+                request_key,
+                call_id,
+                cursor: 0,
+                max_units: self
+                    .component_width(request_key, work, &component)
+                    .ok_or("a scheduled decoder has a loaded owner")?,
+            }),
+            MediaCall::AudioEncoding => Some(DecodeRange {
+                request_key,
+                call_id,
+                cursor: 0,
+                max_units: 1,
+            }),
+            _ => None,
+        };
+        let predicate = if stateful {
+            self.inflight
+                .pending_calls
+                .get(&id)
+                .and_then(|calls| {
+                    calls
+                        .iter()
+                        .find(|call| call.call.call_id == state.predecessor)
+                })
+                .and_then(|call| call.call.completion_output.as_ref())
+                .cloned()
+        } else {
+            None
+        };
+        let inputs = match media_call {
+            MediaCall::LatentPreparation => vec![
+                state
+                    .conditioning
+                    .as_ref()
+                    .ok_or("text encoding has declared its conditioning output")?
+                    .clone(),
+            ],
+            MediaCall::VideoDecoding => vec![state.latents[0].clone()],
+            MediaCall::AudioDecoding => vec![state.latents[1].clone()],
+            MediaCall::VideoEncoding => {
+                let range = decode.as_ref().ok_or("a video write has an input range")?;
+                vec![state.decoded_units[&range.cursor].1.clone()]
+            }
+            MediaCall::AudioEncoding => {
+                vec![
+                    state
+                        .audio
+                        .as_ref()
+                        .ok_or("audio is ready to encode")?
+                        .clone(),
+                ]
+            }
+            // The muxer takes the completed encode rounds that follow the
+            // last it was handed, in media unit order; the final call
+            // carries none.
+            MediaCall::Muxing => Self::ready_encode_rounds(state)
+                .into_iter()
+                .map(|cursor| state.encoded_units[&cursor].1.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut outputs = Vec::new();
+        let mut output_starts = Vec::new();
+        if media_call == MediaCall::TextEncoding
+            || last_step
+            || matches!(
+                media_call,
+                MediaCall::VideoDecoding | MediaCall::AudioDecoding | MediaCall::VideoEncoding
+            )
+        {
+            // A component declares its products in the order its methods
+            // do: the denoiser's last step reserves both latents, every
+            // other call its component's first product.
+            let declared: &[u32] = if last_step { &[0, 1] } else { &[0] };
+            for &index in declared {
+                let reserved = &state.allocations.tensors[&(component.to_owned(), index)];
+                let mut shape_bound = reserved.shape_bound.clone();
+                // A media unit round writes its own slice of the track's
+                // reservation, whether the slice holds decoded media units
+                // or the rows encoded from them.
+                let start = if matches!(
+                    media_call,
+                    MediaCall::VideoDecoding | MediaCall::VideoEncoding
+                ) {
+                    let range = decode.as_ref().ok_or("a media round has a unit range")?;
+                    shape_bound.dims[0] = DimBound::Static(range.max_units);
+                    range.cursor
+                } else {
+                    0
+                };
+                let product = TensorRef {
+                    request_key,
+                    producer_call_id: call_id,
+                    output_index: index as u16,
+                    generation: 1,
+                    dtype: reserved.dtype,
+                    shape_bound,
+                };
+                outputs.push(product);
+                output_starts.push(start);
+            }
+        }
+        // The step interval of a call that advances the trajectory; its
+        // pages follow from the worker the call is placed on.
+        let interval = stateful.then_some(if media_call == MediaCall::Denoising {
+            (step, 1)
+        } else {
+            (0, 0)
+        });
+        let completion_output = if outputs.is_empty() && stateful {
+            Some(self.media_completion_product(request_key, call_id)?)
+        } else {
+            None
+        };
+        let mut call = Call {
+            consumer_slots: Vec::new(),
+            token_input: None,
+            coordinates: CallCoordinates {
+                logical_position: 0,
+                kv_visible_len: 0,
+                kv_computed_len: 0,
+                flow_step: step,
+            },
+
+            token_output: None,
+            vision_input: None,
+            latent_feature_input: None,
+            encoder_output: None,
+            latent_input: None,
+            latent_output: None,
+            image_input: None,
+            image_output: None,
+            transition_output: None,
+
+            input_image: None,
+            kv_input: None,
+            kv_output: None,
+            input_token_ids: Vec::new(),
+            sampling_state: None,
+            request_key,
+            call_id,
+            component: component.to_owned(),
+            code: work,
+            bounds: Bounds::default(),
+            inputs,
+            outputs,
+            completion_output,
+            predicate,
+            rng: None,
+        };
+        let state = self
+            .media_state_mut(id)
+            .ok_or("a media candidate is running")?;
+        if state.admission_state == WorkerRegistration::Unsubmitted {
+            admissions.push(state.admission.clone());
+            state.admission_state = WorkerRegistration::InFlight;
+        }
+        for (product, start) in call.outputs.iter().zip(&output_starts) {
+            let replaced = state.buffer_bindings.insert(
+                product.buffer_id(),
+                (component.clone(), u32::from(product.output_index), *start),
+            );
+            debug_assert!(replaced.is_none(), "media buffer identity was reused");
+        }
+        match media_call {
+            MediaCall::TextEncoding => {
+                state.conditioning = call.outputs.first().cloned();
+                state.text_encoding_scheduled = true;
+            }
+            MediaCall::LatentPreparation => state.latent_preparation_scheduled = true,
+            // Submitted steps are derived from the call's latent interval.
+            MediaCall::Denoising => {}
+            MediaCall::VideoDecoding => {
+                let range = decode.as_ref().ok_or("a video decode has an input range")?;
+                state.scheduled_decode_units += range.max_units;
+                state
+                    .decoded_units
+                    .insert(range.cursor, (range.max_units, call.outputs[0].clone()));
+            }
+            MediaCall::AudioDecoding => {
+                state.audio_decoding_scheduled = true;
+                state.audio = Some(call.outputs[0].clone());
+            }
+            MediaCall::VideoEncoding => {
+                let range = decode.as_ref().ok_or("a video write has an input range")?;
+                state.scheduled_encode_units += range.max_units;
+                state
+                    .encoded_units
+                    .insert(range.cursor, (range.max_units, call.outputs[0].clone()));
+            }
+            MediaCall::AudioEncoding => state.audio_encoding_scheduled = true,
+            MediaCall::Muxing => {
+                let rounds = Self::ready_encode_rounds(state);
+                if rounds.is_empty() {
+                    state.final_muxing_scheduled = true;
+                }
+                for cursor in rounds {
+                    let units = state
+                        .encoded_ready
+                        .remove(&cursor)
+                        .ok_or("a ready encode round was counted")?;
+                    let (_, product) = state
+                        .encoded_units
+                        .remove(&cursor)
+                        .ok_or("a ready encode round has its product")?;
+                    state.handed_units += units;
+                    state.muxing_inputs.push(product);
+                }
+                state.muxing_in_flight = true;
+            }
+            MediaCall::VisionEncoding | MediaCall::LatentEncoding | MediaCall::ImageDecoding => {
+                unreachable!("video scheduling selects only its fixed calls")
+            }
+        }
+        if stateful {
+            state.predecessor = call_id;
+        }
+        if last_step {
+            state.latents = call.outputs.clone();
+        }
+        let (worker, selected_component) = self
+            .placement
+            .select_worker(self.executor.as_ref(), &self.info, &call)
+            .ok_or("a planned call retains an executable component")?;
+        call.component = selected_component;
+        let state = self
+            .media_state(id)
+            .ok_or("a selected media request is running")?;
+        let mut bound = HashSet::new();
+        let buffers = call
+            .buffer_inputs()
+            .chain(call.buffer_outputs())
+            .filter(|product| bound.insert(product.buffer_id()))
+            .map(|product| {
+                let (component, index, start) = &state.buffer_bindings[&product.buffer_id()];
+                state.allocations.tensors[&(component.clone(), *index)]
+                    .bind(product, *start, &worker)
+            })
+            .collect();
+        let request_pool_idx = self
+            .media_state(id)
+            .ok_or("a selected media request is running")?
+            .allocations
+            .request_slot(&worker);
+        let latent = match interval {
+            Some((start_step, step_count)) => {
+                let samples = self
+                    .sample_placement(&worker, request_pool_idx)
+                    .ok_or("a placed call's worker is loaded")?;
+                Some(Denoising::params(
+                    request_key,
+                    call_id,
+                    &samples,
+                    start_step,
+                    step_count,
+                ))
+            }
+            None => None,
+        };
+        let placement = RequestPlacement {
+            worker,
+            request_pool_idx: Some(request_pool_idx),
+            block_tables: Vec::new(),
+            new_cache_pages: Vec::new(),
+            forward: uniserve_worker_ipc::ForwardBatch::default(),
+            latent,
+            decode,
+            buffers,
+        };
+        self.register_inflight(
+            call.clone(),
+            InflightInput::Media {
+                latent: placement.latent.clone(),
+                decode: placement.decode.clone(),
+            },
+            0,
+        );
+        Ok((call, placement))
+    }
+
     /// Select eligible media requests and prepare their bounded computation inputs. Independent
     /// audio and video branches carry Tensor edges, without a state predecessor.
     pub(super) fn prepare_media_batches(&mut self) -> Vec<ExecutionBatch> {
@@ -765,302 +1078,26 @@ impl Scheduler {
         }
         let mut admissions = Vec::new();
         for (id, media_call) in candidates.into_iter() {
-            let (batch_id, request_index) = {
-                let (batch_id, calls) = &call_batches[&media_call];
-                (*batch_id, calls.len())
+            let Some((batch_id, calls)) = call_batches.get_mut(&media_call) else {
+                self.invariant_broken("every selected media call has its batch");
+                return Vec::new();
             };
-            let call_id = CallId::new(
-                batch_id,
-                u32::try_from(request_index).expect("selected request count fits the IPC index"),
-            );
-            let work = CallKind::Media(media_call);
-            let component = self.info.media_components[&media_call].clone();
-            let state = self.media_state(id).expect("media candidate exists");
-            let request_key = state.admission.request_key;
-            let stateful = work.advances_state();
-            // A video request advances its ladder one step per call.
-            let step = self.scheduled_steps(id, &state.denoising);
-            let last_step = media_call == MediaCall::Denoising && state.denoising.ends(step, 1);
-            // Freeze the actual decode/write interval before advancing scheduled
-            // counters. Completion consumes this same range from the submission.
-            let decode = match media_call {
-                MediaCall::VideoDecoding => Some(DecodeRange {
-                    request_key,
-                    call_id,
-                    cursor: state.scheduled_decode_units,
-                    max_units: self
-                        .component_width(request_key, work, &component)
-                        .min(state.request.sampling.video_units - state.scheduled_decode_units),
-                }),
-                MediaCall::VideoEncoding => Some(DecodeRange {
-                    request_key,
-                    call_id,
-                    cursor: state.scheduled_encode_units,
-                    max_units: state.decoded_units[&state.scheduled_encode_units].0,
-                }),
-                MediaCall::AudioDecoding => Some(DecodeRange {
-                    request_key,
-                    call_id,
-                    cursor: 0,
-                    max_units: self.component_width(request_key, work, &component),
-                }),
-                MediaCall::AudioEncoding => Some(DecodeRange {
-                    request_key,
-                    call_id,
-                    cursor: 0,
-                    max_units: 1,
-                }),
-                _ => None,
-            };
-            let predicate = if stateful {
-                self.inflight
-                    .pending_calls
-                    .get(&id)
-                    .and_then(|calls| {
-                        calls
-                            .iter()
-                            .find(|call| call.call.call_id == state.predecessor)
-                    })
-                    .and_then(|call| call.call.completion_output.as_ref())
-                    .cloned()
-            } else {
-                None
-            };
-            let inputs = match media_call {
-                MediaCall::LatentPreparation => vec![
-                    state
-                        .conditioning
-                        .as_ref()
-                        .expect("text encoding has declared its conditioning output")
-                        .clone(),
-                ],
-                MediaCall::VideoDecoding => vec![state.latents[0].clone()],
-                MediaCall::AudioDecoding => vec![state.latents[1].clone()],
-                MediaCall::VideoEncoding => {
-                    let range = decode.as_ref().expect("video write has an input range");
-                    vec![state.decoded_units[&range.cursor].1.clone()]
-                }
-                MediaCall::AudioEncoding => {
-                    vec![state.audio.as_ref().expect("audio is ready").clone()]
-                }
-                // The muxer takes the completed encode rounds that follow the
-                // last it was handed, in media unit order; the final call
-                // carries none.
-                MediaCall::Muxing => Self::ready_encode_rounds(state)
-                    .into_iter()
-                    .map(|cursor| state.encoded_units[&cursor].1.clone())
-                    .collect(),
-                _ => Vec::new(),
-            };
-            let mut outputs = Vec::new();
-            let mut output_starts = Vec::new();
-            if media_call == MediaCall::TextEncoding
-                || last_step
-                || matches!(
+            let planned = match u32::try_from(calls.len()) {
+                Ok(request_index) => self.plan_media_call(
+                    id,
                     media_call,
-                    MediaCall::VideoDecoding | MediaCall::AudioDecoding | MediaCall::VideoEncoding
-                )
-            {
-                // A component declares its products in the order its methods
-                // do: the denoiser's last step reserves both latents, every
-                // other call its component's first product.
-                let declared: &[u32] = if last_step { &[0, 1] } else { &[0] };
-                for &index in declared {
-                    let reserved = &state.allocations.tensors[&(component.to_owned(), index)];
-                    let mut shape_bound = reserved.shape_bound.clone();
-                    // A media unit round writes its own slice of the track's
-                    // reservation, whether the slice holds decoded media units
-                    // or the rows encoded from them.
-                    let start = if matches!(
-                        media_call,
-                        MediaCall::VideoDecoding | MediaCall::VideoEncoding
-                    ) {
-                        let range = decode.as_ref().expect("a media round has a unit range");
-                        shape_bound.dims[0] = DimBound::Static(range.max_units);
-                        range.cursor
-                    } else {
-                        0
-                    };
-                    let product = TensorRef {
-                        request_key,
-                        producer_call_id: call_id,
-                        output_index: index as u16,
-                        generation: 1,
-                        dtype: reserved.dtype,
-                        shape_bound,
-                    };
-                    outputs.push(product);
-                    output_starts.push(start);
-                }
-            }
-            // The step interval of a call that advances the trajectory; its
-            // pages follow from the worker the call is placed on.
-            let interval = stateful.then_some(if media_call == MediaCall::Denoising {
-                (step, 1)
-            } else {
-                (0, 0)
-            });
-            let completion_output = (outputs.is_empty() && stateful)
-                .then(|| self.media_completion_product(request_key, call_id));
-            let mut call = Call {
-                consumer_slots: Vec::new(),
-                token_input: None,
-                coordinates: CallCoordinates {
-                    logical_position: 0,
-                    kv_visible_len: 0,
-                    kv_computed_len: 0,
-                    flow_step: step,
-                },
-
-                token_output: None,
-                vision_input: None,
-                latent_feature_input: None,
-                encoder_output: None,
-                latent_input: None,
-                latent_output: None,
-                image_input: None,
-                image_output: None,
-                transition_output: None,
-
-                input_image: None,
-                kv_input: None,
-                kv_output: None,
-                input_token_ids: Vec::new(),
-                sampling_state: None,
-                request_key,
-                call_id,
-                component: component.to_owned(),
-                code: work,
-                bounds: Bounds::default(),
-                inputs,
-                outputs,
-                completion_output,
-                predicate,
-                rng: None,
+                    CallId::new(*batch_id, request_index),
+                    &mut admissions,
+                ),
+                Err(_) => Err("a batch's request count fits the IPC index"),
             };
-            let state = self.media_state_mut(id).expect("media candidate exists");
-            if state.admission_state == WorkerRegistration::Unsubmitted {
-                admissions.push(state.admission.clone());
-                state.admission_state = WorkerRegistration::InFlight;
-            }
-            for (product, start) in call.outputs.iter().zip(&output_starts) {
-                let replaced = state.buffer_bindings.insert(
-                    product.buffer_id(),
-                    (component.clone(), u32::from(product.output_index), *start),
-                );
-                debug_assert!(replaced.is_none(), "media buffer identity was reused");
-            }
-            match media_call {
-                MediaCall::TextEncoding => {
-                    state.conditioning = call.outputs.first().cloned();
-                    state.text_encoding_scheduled = true;
-                }
-                MediaCall::LatentPreparation => state.latent_preparation_scheduled = true,
-                // Submitted steps are derived from the call's latent interval.
-                MediaCall::Denoising => {}
-                MediaCall::VideoDecoding => {
-                    let range = decode.as_ref().expect("video decode has an input range");
-                    state.scheduled_decode_units += range.max_units;
-                    state
-                        .decoded_units
-                        .insert(range.cursor, (range.max_units, call.outputs[0].clone()));
-                }
-                MediaCall::AudioDecoding => {
-                    state.audio_decoding_scheduled = true;
-                    state.audio = Some(call.outputs[0].clone());
-                }
-                MediaCall::VideoEncoding => {
-                    let range = decode.as_ref().expect("video write has an input range");
-                    state.scheduled_encode_units += range.max_units;
-                    state
-                        .encoded_units
-                        .insert(range.cursor, (range.max_units, call.outputs[0].clone()));
-                }
-                MediaCall::AudioEncoding => state.audio_encoding_scheduled = true,
-                MediaCall::Muxing => {
-                    let rounds = Self::ready_encode_rounds(state);
-                    if rounds.is_empty() {
-                        state.final_muxing_scheduled = true;
-                    }
-                    for cursor in rounds {
-                        let units = state
-                            .encoded_ready
-                            .remove(&cursor)
-                            .expect("a ready encode round was counted");
-                        let (_, product) = state
-                            .encoded_units
-                            .remove(&cursor)
-                            .expect("a ready encode round has its product");
-                        state.handed_units += units;
-                        state.muxing_inputs.push(product);
-                    }
-                    state.muxing_in_flight = true;
-                }
-                MediaCall::VisionEncoding
-                | MediaCall::LatentEncoding
-                | MediaCall::ImageDecoding => {
-                    unreachable!("video scheduling selects only its fixed calls")
+            match planned {
+                Ok(planned) => calls.push(planned),
+                Err(invariant) => {
+                    self.invariant_broken(invariant);
+                    return Vec::new();
                 }
             }
-            if stateful {
-                state.predecessor = call_id;
-            }
-            if last_step {
-                state.latents = call.outputs.clone();
-            }
-            let (worker, selected_component) =
-                self.placement
-                    .select_worker(self.executor.as_ref(), &self.info, &call);
-            call.component = selected_component;
-            let state = self.media_state(id).expect("selected media request exists");
-            let mut bound = HashSet::new();
-            let buffers = call
-                .buffer_inputs()
-                .chain(call.buffer_outputs())
-                .filter(|product| bound.insert(product.buffer_id()))
-                .map(|product| {
-                    let (component, index, start) = &state.buffer_bindings[&product.buffer_id()];
-                    state.allocations.tensors[&(component.clone(), *index)]
-                        .bind(product, *start, &worker)
-                })
-                .collect();
-            let request_pool_idx = self
-                .media_state(id)
-                .expect("selected media request exists")
-                .allocations
-                .request_slot(&worker);
-            let latent = interval.map(|(start_step, step_count)| {
-                Denoising::params(
-                    request_key,
-                    call_id,
-                    &self.sample_placement(&worker, request_pool_idx),
-                    start_step,
-                    step_count,
-                )
-            });
-            let placement = RequestPlacement {
-                worker,
-                request_pool_idx: Some(request_pool_idx),
-                block_tables: Vec::new(),
-                new_cache_pages: Vec::new(),
-                forward: uniserve_worker_ipc::ForwardBatch::default(),
-                latent,
-                decode,
-                buffers,
-            };
-            self.register_inflight(
-                call.clone(),
-                InflightInput::Media {
-                    latent: placement.latent.clone(),
-                    decode: placement.decode.clone(),
-                },
-                0,
-            );
-            call_batches
-                .get_mut(&media_call)
-                .expect("media_call batch exists")
-                .1
-                .push((call, placement));
         }
 
         // A request's admission travels with the first call that uses it, and
@@ -1068,25 +1105,26 @@ impl Scheduler {
         // loses the state it still reads.
         let mut starts: HashMap<MediaCall, Vec<BatchCommand>> = HashMap::new();
         for request in admissions {
-            let owner = call_order
-                .iter()
-                .copied()
-                .find(|media_call| {
-                    call_batches[media_call]
-                        .1
-                        .iter()
-                        .any(|(call, _)| call.request_key == request.request_key)
-                })
-                .expect("admitted request has a selected call");
+            let owner = call_order.iter().copied().find(|media_call| {
+                call_batches[media_call]
+                    .1
+                    .iter()
+                    .any(|(call, _)| call.request_key == request.request_key)
+            });
+            let Some(owner) = owner else {
+                self.invariant_broken("an admitted media request has a selected call");
+                return Vec::new();
+            };
             starts.entry(owner).or_default().push(BatchCommand::Start {
                 request: Box::new(request),
             });
         }
         let mut batches = Vec::with_capacity(call_order.len() + 1);
         for media_call in call_order {
-            let (batch_id, calls) = call_batches
-                .remove(&media_call)
-                .expect("media_call batch exists");
+            let Some((batch_id, calls)) = call_batches.remove(&media_call) else {
+                self.invariant_broken("every selected media call has its batch");
+                return Vec::new();
+            };
             let batch_commands = starts.remove(&media_call).unwrap_or_default();
             let batch = ExecutionBatch::new(batch_id, calls, batch_commands, Vec::new());
             self.inflight.register_pending_batch(&batch, submit_at);
@@ -1448,7 +1486,7 @@ impl Scheduler {
                         self.running
                             .get_mut(&id)
                             .filter(|state| state.request_epoch == buffer.owner.request_epoch)
-                            .and_then(|state| state.allocations_mut().take_buffer(*buffer))
+                            .and_then(|state| state.allocations_mut()?.take_buffer(*buffer))
                     })
                     .or_else(|| {
                         self.retiring_requests
@@ -1461,37 +1499,32 @@ impl Scheduler {
                 }
             } else if let BatchCommand::Finish { request_key, .. } = command {
                 let id = request_key.request_id;
-                let Some(retiring) = self.retiring_requests.get(&id) else {
-                    tracing::error!(
-                        request_id = id.0,
-                        request_epoch = request_key.request_epoch,
-                        "close acknowledgement does not match a retiring request"
-                    );
-                    self.fatal = true;
-                    continue;
+                let retiring = match self.retiring_requests.entry(id) {
+                    std::collections::hash_map::Entry::Occupied(entry)
+                        if entry.get().request_key == *request_key =>
+                    {
+                        entry.remove()
+                    }
+                    _ => {
+                        tracing::error!(
+                            request_id = id.0,
+                            request_epoch = request_key.request_epoch,
+                            "close acknowledgement does not match a retiring request"
+                        );
+                        self.fatal = true;
+                        continue;
+                    }
                 };
-                if retiring.request_key != *request_key {
-                    tracing::error!(
-                        request_id = id.0,
-                        request_epoch = request_key.request_epoch,
-                        "close acknowledgement does not match a retiring request"
-                    );
-                    self.fatal = true;
-                    continue;
-                }
-
-                let retiring = self
-                    .retiring_requests
-                    .remove(&id)
-                    .expect("retiring request exists");
                 for buffer in retiring.buffers.into_values() {
                     self.storage.buffer_pool.free(buffer);
                 }
                 for allocation in retiring.allocations {
                     allocation.free(&mut self.storage);
                 }
-                if let Some(media) = retiring.media_allocations {
-                    media.free(&mut self.storage);
+                if let Some(media) = retiring.media_allocations
+                    && let Err(unknown) = media.free(&mut self.storage)
+                {
+                    self.invariant_broken(&unknown.to_string());
                 }
             }
         }
@@ -1919,18 +1952,21 @@ impl Scheduler {
             } else if let Some(state) = self.media_state_mut(id) {
                 match call.code {
                     CallKind::Media(MediaCall::LatentPreparation) => state.denoising.open(None),
+                    // `valid` requires a denoising result to complete its interval.
                     CallKind::Media(MediaCall::Denoising) => {
-                        let interval = latent.as_ref().expect("a valid step has its interval");
-                        let accepted =
-                            state
-                                .denoising
-                                .accept(interval, record.num_completed_steps, None);
-                        debug_assert!(accepted, "a valid step completes its interval");
+                        if let Some(interval) = latent.as_ref() {
+                            let accepted =
+                                state
+                                    .denoising
+                                    .accept(interval, record.num_completed_steps, None);
+                            debug_assert!(accepted, "a valid step completes its interval");
+                        }
                     }
                     CallKind::Media(MediaCall::VideoEncoding) => {
-                        let range = decode
-                            .as_ref()
-                            .expect("submitted media write includes its input range");
+                        let Some(range) = decode.as_ref() else {
+                            self.invariant_broken("a submitted media write keeps its input range");
+                            return;
+                        };
                         state.encoded_video_units += range.max_units;
                         state.encoded_ready.insert(range.cursor, range.max_units);
                         if let Some((_, product)) = state.decoded_units.remove(&range.cursor) {
@@ -2053,7 +2089,9 @@ impl Scheduler {
         }
         self.output.retire(id, state.output);
         if state.admission_state == WorkerRegistration::Unsubmitted {
-            state.allocations.free(&mut self.storage);
+            if let Err(unknown) = state.allocations.free(&mut self.storage) {
+                self.invariant_broken(&unknown.to_string());
+            }
             return;
         }
         let request_key = state.admission.request_key;
@@ -2234,22 +2272,20 @@ impl Scheduler {
             Self::record_domain_batch(stats, timing);
         }
 
-        let pending = self
-            .inflight
-            .pending_batches
-            .get_mut(&result_batch_id)
-            .expect("validated batch remains owned until reconciliation");
+        let std::collections::hash_map::Entry::Occupied(mut owned) =
+            self.inflight.pending_batches.entry(result_batch_id)
+        else {
+            self.invariant_broken("a validated batch remains owned until reconciliation");
+            return;
+        };
+        let pending = owned.get_mut();
         pending.worker_exec_us = report
             .worker_exec_us
             .into_iter()
             .fold(pending.worker_exec_us, u64::saturating_add);
         let batch_roundtrip_us = pending.started.elapsed().as_micros() as u64;
         let worker_us = if batch_complete {
-            let pending = self
-                .inflight
-                .pending_batches
-                .remove(&result_batch_id)
-                .expect("completed batch is owned");
+            let pending = owned.remove();
             for (index, command) in pending.commands.into_iter().enumerate() {
                 let failed = report.command_results.iter().any(|result| {
                     result.command_index == index as u32
@@ -2551,27 +2587,25 @@ impl Scheduler {
                 // Reserve output space before resolving a terminal token: finishing
                 // must wait for the decoder's stop-string decision on that batch.
                 let awaiting_decoder = token_call
-                    && self
-                        .running
-                        .get(&id)
-                        .is_some_and(|state| !state.req.stop_strings.is_empty());
-                if awaiting_decoder {
-                    self.running
-                        .get_mut(&id)
-                        .unwrap()
-                        .output
-                        .decoder_boundaries
-                        .push_back(usize::MAX);
-                }
+                    && match self.running.get_mut(&id) {
+                        Some(state) if !state.req.stop_strings.is_empty() => {
+                            state.output.decoder_boundaries.push_back(usize::MAX);
+                            true
+                        }
+                        _ => false,
+                    };
                 if self.running.contains_key(&id)
                     && !self.inflight.pending_finishes.contains_key(&id)
                 {
                     self.resolve(id, call, record, media.as_deref());
                 }
                 if awaiting_decoder && let Some(state) = self.running.get_mut(&id) {
+                    // Cancellation clears the boundaries while resolving, which
+                    // leaves no reserved boundary to settle.
                     if state.output.tokens_sent > public_tokens_before {
-                        *state.output.decoder_boundaries.back_mut().unwrap() =
-                            state.output.tokens_sent;
+                        if let Some(boundary) = state.output.decoder_boundaries.back_mut() {
+                            *boundary = state.output.tokens_sent;
+                        }
                     } else {
                         state.output.decoder_boundaries.pop_back();
                     }
@@ -2884,11 +2918,7 @@ impl Scheduler {
         self.inflight.pending_submissions.clear();
         self.fail_inflight_domain_credits();
         let _ = self.inflight.clear_failed_calls();
-        while let Some(id) = self.waiting_media_order.pop_front() {
-            let submission = self
-                .waiting_media
-                .remove(&id)
-                .expect("scheduler media order names runtime state");
+        while let Some(submission) = self.waiting_media.pop_front() {
             let _ = submission.event_tx.send(EngineCoreOutput::Error {
                 message: message.to_string(),
             });
