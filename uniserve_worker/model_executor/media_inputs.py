@@ -10,7 +10,7 @@ from functools import cached_property
 import torch
 
 from uniserve.diffusion import Schedule, normal_noise
-from uniserve.model import Denoiser, LatentInput
+from uniserve.model import LatentInput, VideoDenoiser
 from uniserve.tensors import BufferConfig
 
 #: Pages one request's samples span in the latent pool. Every denoising step
@@ -67,14 +67,14 @@ class MediaBuilder:
     """
 
     def __init__(
-        self, denoiser: Denoiser, *, max_frames: int, max_text_tokens: int
+        self, denoiser: VideoDenoiser, *, max_frames: int, max_text_tokens: int
     ) -> None:
         # Admission advertises complete native windows, including the final
         # overlap. Cover the configured duration with the next legal input.
         frames = denoiser.legal_frame_count(max_frames)
         self.maximum = denoiser.make_size(frames, max_text_tokens)
         self.denoiser = denoiser
-        self.num_steps = len(denoiser.diffusion.ladder)
+        self.num_steps = denoiser.num_steps
         # State descriptions per layout. Describing one builds the layout's
         # packing, which costs milliseconds of host time; layouts are a small
         # finite set bounded by the admitted frame and prompt capacity.

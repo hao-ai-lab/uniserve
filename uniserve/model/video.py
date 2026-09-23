@@ -10,7 +10,7 @@ from torch import nn
 from uniserve.distributed import Communicator
 from uniserve.media import image
 from uniserve.nn.vae import LatentDecoder
-from uniserve.tensors import OutputLayout, TensorOutput
+from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
 
 
 class VideoDecoder(nn.Module):
@@ -118,6 +118,10 @@ class AudioDecoder(nn.Module):
         self.decoder, self.sample_rate = decoder, sample_rate
 
     def latent_frames(self, num_samples: int) -> int:
+        raise NotImplementedError
+
+    def output_layout(self, num_samples: int) -> Mapping[str, OutputLayout]:
+        """Describe the decoded sample-major track of ``num_samples``."""
         raise NotImplementedError
 
     @property
@@ -273,6 +277,13 @@ class VideoPostprocessor(nn.Module):
         """Locate the body and successor overlap.
 
         Within a native decoded segment.
+        """
+        raise NotImplementedError
+
+    def state_buffers(self, num_frames: int) -> Mapping[str, BufferConfig]:
+        """Describe the state carried between the rounds of one video.
+
+        The state holds the decoded overlap a unit's successor blends with.
         """
         raise NotImplementedError
 

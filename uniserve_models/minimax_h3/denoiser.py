@@ -9,8 +9,7 @@ from typing import cast
 import torch
 
 from uniserve.diffusion import CleanSampleEulerSolver, Schedule
-from uniserve.model import Denoiser as BaseDenoiser
-from uniserve.model import LatentInput
+from uniserve.model import LatentInput, VideoDenoiser
 from uniserve.nn import ColumnParallelLinear, RotaryEmbedding
 from uniserve.nn.attention import vsa
 from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
@@ -55,7 +54,7 @@ def schedules(
     return result
 
 
-class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
+class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     """Predict video/audio velocities from explicit latent and text tensors.
 
     Native random draws and their contiguous sample destinations use CPU FP32;
@@ -90,6 +89,11 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
         return DenoiserSize(
             size.num_frames, math.ceil(size.num_text_tokens / 64) * 64
         )
+
+    @property
+    def num_steps(self) -> int:
+        """Number of denoising steps in the checkpoint's trained ladder."""
+        return len(self.diffusion.ladder)
 
     @property
     def text_condition_width(self) -> int:
