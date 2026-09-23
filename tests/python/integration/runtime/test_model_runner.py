@@ -990,11 +990,14 @@ def test_initial_flow_noise_is_stable_across_call_schedules():
 
 
 @pytest.mark.parametrize(
-    ("height", "width", "cfg_text_scale", "cfg_img_scale"),
+    ("height", "width", "cfg_text_scale", "cfg_img_scale", "negative_prompt"),
     (
-        (16, 16, 1.0, 1.0),
-        (16, 32, 4.0, 1.0),
-        (32, 32, 4.0, 2.0),
+        (16, 16, 1.0, 1.0, ()),
+        (16, 32, 4.0, 1.0, ()),
+        (32, 32, 4.0, 2.0, ()),
+        # The text-unconditional branch materializes its own KV prefix from
+        # the negative prompt and reuses it on every later solver step.
+        (16, 32, 4.0, 1.0, (5, 6, 7)),
     ),
 )
 def test_multi_step_quantum_matches_the_serial_model_artifact(
@@ -1002,6 +1005,7 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
     width: int,
     cfg_text_scale: float,
     cfg_img_scale: float,
+    negative_prompt: tuple[int, ...],
 ) -> None:
     def run(step_quantum: int) -> bytes:
         worker = execution_worker()
@@ -1016,6 +1020,11 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
                 cfg_img_scale=cfg_img_scale,
             ),
         )
+        if negative_prompt:
+            admission = replace(
+                admission,
+                generation=GenerationParams(negative_token_ids=negative_prompt),
+            )
         conditioning = _publish_conditioning(
             worker, admission, call_id=CallId(1, 0), batch_id=1
         )

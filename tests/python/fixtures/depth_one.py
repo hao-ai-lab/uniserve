@@ -88,8 +88,17 @@ _BLOCK_SIZE = 1
 _COMMIT_MARKER_TOKENS = 1
 _LATENT_PAGE_UNITS = 1
 _LATENT_DOWNSAMPLE = 1
+# Each request's admitted negative prompt, which the engine keeps in request
+# state and sizes the text-unconditional CFG prefix from on every later call.
+_NEGATIVE_PROMPTS: dict[RequestKey, tuple[int, ...]] = {}
 _ALTERNATIVE_SLOTS: dict[RequestKey, int] = {}
 _ALTERNATIVE_PAGES: dict[RequestKey, tuple[int, ...]] = {}
+# Denoising calls that use their request's alternative prefix, and the
+# requests whose prefix a successful denoising call has materialized. Once
+# materialized, the worker retains the prefix slot's table and KV, so later
+# calls state only their branch rows; an image's final step retires both.
+_PREFIX_CALLS: set[tuple[RequestKey, CallId]] = set()
+_MATERIALIZED_PREFIXES: set[RequestKey] = set()
 _BUFFER_ALLOCATIONS: dict[BufferId, BufferAllocation] = {}
 
 
@@ -118,8 +127,8 @@ def _reset_request(rk: RequestKey) -> None:
     _BLOCK_TABLES[rk] = []
     _REQUEST_POOL_INDICES.pop(rk, None)
     _UNBOUND_PAGES[rk] = []
-    _ALTERNATIVE_SLOTS.pop(rk, None)
-    _ALTERNATIVE_PAGES.pop(rk, None)
+    _NEGATIVE_PROMPTS.pop(rk, None)
+    _discard_flow_prefix(rk)
     _IMAGE_PARAMS.pop(rk, None)
     for ledger in _LEDGERS.values():
         ledger.current.pop(rk, None)
@@ -151,6 +160,16 @@ def _reset_request(rk: RequestKey) -> None:
     ):
         _BUFFER_ALLOCATIONS.pop(buffer, None)
     _CALL_KV_RESULTS[(rk, CallId(0, 0))] = 0
+
+
+def _discard_flow_prefix(rk: RequestKey) -> None:
+    """Forget a request's alternative prefix slot, pages, and progress."""
+    _ALTERNATIVE_SLOTS.pop(rk, None)
+    _ALTERNATIVE_PAGES.pop(rk, None)
+    _MATERIALIZED_PREFIXES.discard(rk)
+    _PREFIX_CALLS.difference_update(
+        identity for identity in tuple(_PREFIX_CALLS) if identity[0] == rk
+    )
 
 
 def _kv_page(value: int) -> int:
@@ -387,6 +406,19 @@ def observe_completions(worker: object, report: BatchOutput) -> None:
     submitted = _ledger(worker).submitted
     detached = _ledger(worker).detached
     for record in report.completions:
+        # A successful denoising call has materialized its request's
+        # alternative prefix. The image's final step retires the prefix on
+        # the worker, as the engine then frees it, so the next image of the
+        # request allocates and materializes its own.
+        if (
+            record.status is CallStatus.OK
+            and (record.request_key, record.call_id) in _PREFIX_CALLS
+        ):
+            steps = int(_IMAGE_PARAMS[record.request_key].steps)
+            if int(record.num_completed_steps) >= steps:
+                _discard_flow_prefix(record.request_key)
+            else:
+                _MATERIALIZED_PREFIXES.add(record.request_key)
         if (record.request_key, record.call_id) in detached:
             continue
         if record.status is CallStatus.ERROR:
@@ -427,6 +459,15 @@ def execution_batch(
     for admission in admissions:
         if admission.image is not None:
             _IMAGE_PARAMS[admission.request_key] = admission.image
+        # Admission starts the request's state on this worker, as the engine's
+        # running state begins: the admitted negative prompt, and no
+        # alternative prefix until the first denoising call allocates one.
+        _NEGATIVE_PROMPTS[admission.request_key] = (
+            ()
+            if admission.generation is None
+            else admission.generation.negative_token_ids
+        )
+        _discard_flow_prefix(admission.request_key)
         _REQUEST_POOL_INDICES[admission.request_key] = int(
             admission.request_pool_idx
         )
@@ -514,34 +555,33 @@ def execution_batch(
             )
             alternative: tuple[int, int] | None = None
             if branches > 1:
+                # The text-unconditional branch owns a request slot sized for
+                # the admitted negative prompt. Its pages are new, and so
+                # zeroed, only on the call that allocates them; the slot's
+                # table and prefix row are restated until a denoising call
+                # succeeds and the worker retains the materialized prefix.
+                negative = _NEGATIVE_PROMPTS.get(call.request_key, ())
+                allocating = call.request_key not in _ALTERNATIVE_SLOTS
                 alt_slot = _alternative_slot(call.request_key)
-                negative = next(
-                    (
-                        admission.generation.negative_token_ids
-                        for admission in admissions
-                        if admission.request_key == call.request_key
-                        and admission.generation is not None
-                    ),
-                    (),
-                )
                 alt_pages = _alternative_pages(call.request_key, len(negative))
-                alt_table = BlockTable(
-                    alt_slot,
-                    0,
-                    alt_pages,
-                    len(alt_pages) * _BLOCK_SIZE,
-                )
-                tables[(alt_slot, 0)] = alt_table
-                if alt_pages:
+                if allocating and alt_pages:
                     allocations.setdefault((alt_slot, 0), set()).update(
                         alt_pages
                     )
-                if negative:
-                    forward_call_indices.append(call_index)
-                    request_pool_indices.append(alt_slot)
-                    seq_lens.append(len(negative))
-                    query_lens.append(len(negative))
-                    write_kv.append(True)
+                _PREFIX_CALLS.add((call.request_key, call.call_id))
+                if call.request_key not in _MATERIALIZED_PREFIXES:
+                    tables[(alt_slot, 0)] = BlockTable(
+                        alt_slot,
+                        0,
+                        alt_pages,
+                        len(alt_pages) * _BLOCK_SIZE,
+                    )
+                    if negative:
+                        forward_call_indices.append(call_index)
+                        request_pool_indices.append(alt_slot)
+                        seq_lens.append(len(negative))
+                        query_lens.append(len(negative))
+                        write_kv.append(True)
                 alternative = (alt_slot, len(negative))
             for branch in range(branches):
                 slot, seq_len = (
