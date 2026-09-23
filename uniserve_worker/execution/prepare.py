@@ -1370,48 +1370,11 @@ def _bind_latent_inputs(
     }
 
     if pool is None:
-        # Fixed request tensors own the trajectory directly. Solver progress
-        # remains explicit, without a second paged-storage reservation.
-        for params in parameters:
-            identity = params.request_key, params.call_id
-            selected = requests.get(identity)
-            if selected is None:
-                raise invalid_descriptor(
-                    "latent params names a call outside its batch"
-                )
-            call, request = selected
-            if params.page_table or params.latent_units:
-                raise invalid_descriptor(
-                    "paged latent params require a resident latent pool"
-                )
+        raise invalid_descriptor("latent params require a resident latent pool")
 
-            # Preparation runs once at step zero; each denoise call advances
-            # exactly one step from the committed solver state.
-            if call.kind is MediaCall.LATENT_PREPARATION:
-                valid = (
-                    int(params.start_step) == 0 and int(params.step_count) == 0
-                )
-            elif call.kind is MediaCall.DENOISING:
-                valid = (
-                    int(params.start_step)
-                    == int(calls.require_progress(request).flow_step)
-                    and int(params.step_count) == 1
-                )
-            else:
-                valid = (
-                    int(params.start_step)
-                    == int(calls.require_progress(request).flow_step)
-                    and int(params.step_count) == 0
-                )
-            if not valid:
-                raise invalid_descriptor(
-                    "pool-free latent params disagrees with resident "
-                    "generation state"
-                )
-        return
-
-    # Pooled models bind each call to validated image dimensions and page
-    # ownership.
+    # Image trajectories bind validated image dimensions and page ownership
+    # and borrow the pool's step staging. A standalone denoiser's runner
+    # stages its own steps, so its calls keep only their parameters.
     rows: list[tuple[CallIdentity, LatentParams, int]] = []
     for params in parameters:
         identity = (params.request_key, params.call_id)
@@ -1423,16 +1386,17 @@ def _bind_latent_inputs(
         call, request = selected
         slot = int(request.request.request_pool_idx)
 
+        if model_runner.image_builder is None:
+            _validate_sample_params(call, request, params, model_runner)
+            request.latent.input_params = params
+            continue
+
         image = request.request.image
         if image is None:
             raise invalid_descriptor(
                 "latent params has no admitted image dimensions"
             )
         flow = model_runner.image_builder
-        if flow is None:
-            raise invalid_descriptor(
-                "image trajectory has no numerical input builder"
-            )
         expected_units = int(
             flow.denoiser.latent_shape(
                 "image",
@@ -1493,6 +1457,9 @@ def _bind_latent_inputs(
             )
 
         rows.append((identity, params, slot))
+    if not rows:
+        return
+
     # Stage every page table together so overlapping physical ownership is
     # rejected before any call receives a writable tensor view.
     staged = pool.stage(
@@ -1510,6 +1477,43 @@ def _bind_latent_inputs(
         request = state.pending_output(identity[0].request_id)
         request.latent.input_params = params
         request.latent.staging = value
+
+
+def _validate_sample_params(
+    call: Call,
+    request: PendingOutput,
+    params: LatentParams,
+    model_runner: ModelExecutor,
+) -> None:
+    """Validate a standalone denoiser's trajectory parameters.
+
+    The request's pages are the run its slot owns, and each call covers the
+    fixed step interval of its kind: preparation opens the trajectory at step
+    zero and each denoising call advances one step from the committed one.
+    """
+    builder = model_runner.media_builder
+    if builder is None:
+        raise invalid_descriptor("latent params has no denoiser to advance")
+    slot = int(request.request.request_pool_idx)
+    if (
+        tuple(params.page_table) != builder.slot_pages(slot)
+        or int(params.latent_units) != builder.sample_pages.units
+    ):
+        raise invalid_descriptor(
+            "latent params does not name the pages of its request slot"
+        )
+
+    step = int(calls.require_progress(request).flow_step)
+    if call.kind is MediaCall.LATENT_PREPARATION:
+        valid = int(params.start_step) == 0 and int(params.step_count) == 0
+    elif call.kind is MediaCall.DENOISING:
+        valid = int(params.start_step) == step and int(params.step_count) == 1
+    else:
+        valid = int(params.start_step) == step and int(params.step_count) == 0
+    if not valid:
+        raise invalid_descriptor(
+            "latent params disagrees with the request's committed step"
+        )
 
 
 def _bind_cache_tables(

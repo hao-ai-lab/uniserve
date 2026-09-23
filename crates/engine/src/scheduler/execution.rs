@@ -447,6 +447,32 @@ impl Scheduler {
         (fixed(2), fixed(3))
     }
 
+    /// Returns where a video request's samples live on its denoiser worker.
+    ///
+    /// A standalone denoiser's latent pool gives every request slot the same
+    /// run of consecutive pages after its sentinel page, so the worker's
+    /// advertised pool and slot count name the pages of `slot`. The raster is
+    /// the video the samples decode to.
+    fn sample_placement(&self, worker: &crate::WorkerId, slot: u32) -> LatentPlacement {
+        let info = self
+            .executor
+            .info()
+            .workers
+            .iter()
+            .find(|(id, _)| id == worker)
+            .map(|(_, info)| info)
+            .expect("a placed call's worker is configured");
+        let pages = info.latent_pages.saturating_sub(1) / info.request_slots.max(1);
+        let first = 1 + slot.saturating_sub(1) * pages;
+        let (height, width) = self.video_raster();
+        LatentPlacement {
+            page_table: (first..first + pages).collect(),
+            latent_units: pages * info.latent_page_units,
+            height,
+            width,
+        }
+    }
+
     /// Returns the component whose lanes one media call occupies.
     fn media_component(&self, media_call: MediaCall) -> Option<String> {
         self.info.media_components.get(&media_call).cloned()
@@ -867,31 +893,13 @@ impl Scheduler {
                     output_starts.push(start);
                 }
             }
-            let latent = if stateful {
-                let (start_step, step_count) = if media_call == MediaCall::Denoising {
-                    (step, 1)
-                } else {
-                    (0, 0)
-                };
-                let (height, width) = self.video_raster();
-                // Fixed request tensors hold the trajectory, so the call names
-                // no pages.
-                let placement = LatentPlacement {
-                    page_table: Vec::new(),
-                    latent_units: 0,
-                    height,
-                    width,
-                };
-                Some(Denoising::params(
-                    request_key,
-                    call_id,
-                    &placement,
-                    start_step,
-                    step_count,
-                ))
+            // The step interval of a call that advances the trajectory; its
+            // pages follow from the worker the call is placed on.
+            let interval = stateful.then_some(if media_call == MediaCall::Denoising {
+                (step, 1)
             } else {
-                None
-            };
+                (0, 0)
+            });
             let completion_output = (outputs.is_empty() && stateful)
                 .then(|| self.media_completion_product(request_key, call_id));
             let mut call = Call {
@@ -1021,6 +1029,15 @@ impl Scheduler {
                 .expect("selected media request exists")
                 .allocations
                 .request_slot(&worker);
+            let latent = interval.map(|(start_step, step_count)| {
+                Denoising::params(
+                    request_key,
+                    call_id,
+                    &self.sample_placement(&worker, request_pool_idx),
+                    start_step,
+                    step_count,
+                )
+            });
             let placement = RequestPlacement {
                 worker,
                 request_pool_idx: Some(request_pool_idx),

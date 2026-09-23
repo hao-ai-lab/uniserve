@@ -168,8 +168,9 @@ def _execute_ready_actions(
                 )
             elif (
                 call.kind is MediaCall.LATENT_PREPARATION
-                and latent_pool is not None
+                and model_runner.image_builder is not None
             ):
+                assert latent_pool is not None
                 result = diffusion.prepare_latent(
                     call,
                     kv_cache=kv_cache,
@@ -279,6 +280,9 @@ def _execute_calls(
                 f"call products contain an unresolved dependency: {blocked!r}"
             )
 
+        # KV-conditioned image denoising and decoding run as forward rows; a
+        # standalone denoiser's calls are media actions.
+        images = model_runner.image_builder is not None
         numerical = tuple(
             index
             for index in frontier
@@ -286,7 +290,7 @@ def _execute_calls(
             or scheduled[index].kind
             in {MediaCall.VISION_ENCODING, MediaCall.LATENT_ENCODING}
             or (
-                latent_pool is not None
+                images
                 and scheduled[index].kind
                 in {
                     MediaCall.DENOISING,
@@ -326,7 +330,7 @@ def _execute_calls(
                 request_tables=request_tables,
                 model_runner=model_runner,
             )
-            if latent_pool is not None
+            if images
             else ({}, 1)
         )
         for offset in range(step_count):

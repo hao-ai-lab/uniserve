@@ -19,12 +19,11 @@ from uniserve.tensors import BufferConfig
 from uniserve_worker.bootstrap.cache import cache_info, resize_cache
 from uniserve_worker.bootstrap.capacity import (
     ArenaCapacity,
-    active_latent_capacity_tokens,
     call_window,
     derive_runtime_kv_capacity,
     device_total_bytes,
     input_buffer_config,
-    latent_pool_capacity_bytes,
+    latent_pool_plan,
     local_product_storage_bytes,
     model_arena_capacity,
     product_storage_bytes,
@@ -270,37 +269,12 @@ def _token_worker_layout(
     bytes_per_token = 0 if cache is None else cache.bytes_per_token
 
     flow = image_builder(model)
-    requested_latent_units = (
-        active_latent_capacity_tokens(
-            flow.max_tokens,
-            worker_config.kv_token_capacity,
-        )
-        if flow is not None
-        else 0
-    )
-    latent_page_units = int(worker_config.block_size) if flow is not None else 0
-    num_latent_pages = (
-        ceil_div(requested_latent_units, latent_page_units) + 1
-        if flow is not None
-        else 0
-    )
-    latent_width = (
-        flow.denoiser.latent_channels * flow.denoiser.patch_size**2
-        if flow is not None
-        else 0
-    )
+    plan = latent_pool_plan(model, worker_config) if flow is not None else None
+    latent_page_units = 0 if plan is None else plan.page_units
+    num_latent_pages = 0 if plan is None else plan.num_pages
+    latent_width = 0 if plan is None else plan.latent_width
     model_dtype_bytes = _model_dtype_bytes(worker_config.model_dtype)
-    latent_pool_bytes = (
-        latent_pool_capacity_bytes(
-            request_pool_size=int(worker_config.max_request_pool_size),
-            num_pages=num_latent_pages,
-            page_units=latent_page_units,
-            latent_width=latent_width,
-            dtype_bytes=model_dtype_bytes,
-        )
-        if flow is not None
-        else 0
-    )
+    latent_pool_bytes = 0 if plan is None else plan.capacity_bytes
 
     max_vit_grid_tokens = vision_tokens(model, image_processor)
     vision = capability(model, PatchEncoder)
@@ -564,6 +538,9 @@ def _request_tensor_worker_layout(
     depth = int(queue_depth)
     unresolved_window = request_tensor_window(depth, slots)
     max_calls = min(slots, int(worker_config.max_batch_calls))
+    # Every rank advertises the pool geometry; only a rank that advances the
+    # samples allocates it.
+    plan = latent_pool_plan(model, worker_config)
 
     info = WorkerInfo(
         model_name=model_name,
@@ -579,8 +556,8 @@ def _request_tensor_worker_layout(
         max_batch_tokens=max_calls,
         request_slots=slots,
         kv_cache=None,
-        latent_page_units=0,
-        latent_pages=0,
+        latent_page_units=0 if plan is None else plan.page_units,
+        latent_pages=0 if plan is None else plan.num_pages,
         buffer_pool_bytes=slots
         * product_storage_bytes(resolve_outputs(model, worker_config)),
         max_unresolved_calls=unresolved_window,

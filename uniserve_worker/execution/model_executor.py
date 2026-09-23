@@ -109,6 +109,7 @@ if TYPE_CHECKING:
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.kv_cache import KVCacheManager
+    from uniserve_worker.storage.latent_pool import LatentPool
 
 logger = logging.getLogger(__name__)
 
@@ -227,10 +228,12 @@ class ModelExecutor:
         self.decode_predicates = None
         self.kv_cache = None
         # A standalone denoiser's component, binding and call, the request
-        # bank its ladders gather through, and one runner per prepared
-        # layout; declared layouts stay pinned with their captured ladders.
+        # bank and latent pool its ladders gather through, and one runner per
+        # prepared layout; declared layouts stay pinned with their captured
+        # ladders.
         self._denoiser = None
         self.diffusion_bank: Mapping[str, torch.Tensor] = {}
+        self.latent_pool: LatentPool | None = None
         self._diffusion_runners: OrderedDict[Hashable, DiffusionRunner] = (
             OrderedDict()
         )
@@ -620,17 +623,21 @@ class ModelExecutor:
         """Whether this rank advances a standalone denoiser's ladders."""
         return self._denoiser is not None
 
-    def bind_diffusion_bank(self, bank: Mapping[str, torch.Tensor]) -> None:
-        """Borrow the request bank the standalone denoiser's ladders gather.
+    def bind_diffusion_storage(
+        self, bank: Mapping[str, torch.Tensor], pool: LatentPool
+    ) -> None:
+        """Borrow the storage the standalone denoiser's ladders gather.
 
-        Every runner borrows the bank at preparation, so it is bound before
-        the first layout is prepared.
+        The request bank holds each request's state and the latent pool its
+        samples. Every runner borrows both at preparation, so they are bound
+        before the first layout is prepared.
         """
         if self._diffusion_runners:
             raise RuntimeError(
                 "bind request storage before preparing diffusion runners"
             )
         self.diffusion_bank = dict(bank)
+        self.latent_pool = pool
 
     def diffusion_runner(self, layout, *, pin: bool = False) -> DiffusionRunner:
         """Return the standalone denoiser's runner for one layout.
@@ -643,7 +650,7 @@ class ModelExecutor:
         uses and retires layouts in the same order, so each finds the same
         runners resident without agreeing on it at run time.
         """
-        if self._denoiser is None:
+        if self._denoiser is None or self.latent_pool is None:
             raise InputError("rank does not own denoising computation")
         runner = self._diffusion_runners.get(layout)
         if runner is None:
@@ -676,6 +683,8 @@ class ModelExecutor:
                 else (),
                 bank=self.diffusion_bank if captures else None,
                 slots=slots,
+                pool=self.latent_pool,
+                pages=self.media_builder.layout_pages(layout),
                 attention=self.attention,
             )
             self._diffusion_runners[layout] = runner
@@ -692,15 +701,19 @@ class ModelExecutor:
             runner.context.stream.synchronize()
         runner.close()
 
-    def run_denoising(self, layout, ladder, index):
-        """Run one denoising step of a bound ladder and time it."""
+    def run_denoising(self, layout, ladder, index, bank):
+        """Run one denoising step of a bound ladder and time it.
+
+        ``bank`` holds the request's committed samples; see
+        ``DiffusionRunner.step``.
+        """
         runner = self.diffusion_runner(layout)
         started = time.perf_counter_ns()
         with profile_range(
             f"uniserve.model.denoise rank={self.worker_config.rank} "
             "work=denoiser"
         ):
-            values, path = runner.step(ladder, index)
+            values, path = runner.step(ladder, index, bank)
         return replace(
             ModelRunner.result(values),
             stats=_observations("denoiser", started, path),

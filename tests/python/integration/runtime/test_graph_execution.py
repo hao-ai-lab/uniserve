@@ -17,6 +17,7 @@ from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.component_binding import Call
 from uniserve_worker.model_executor.diffusion_runner import DiffusionRunner
 from uniserve_worker.model_executor.graph_storage import GraphStorage
+from uniserve_worker.storage.latent_pool import LatentPool
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -55,7 +56,20 @@ def test_initial_inputs_are_ready_for_consumption_after_preparation(
         runner.close()
 
 
-def _runner(model, size, *, device, stream, devices=(), bank=None, slots=2):
+def _pool(slots, *, device):
+    """A consumer-staged latent pool in which slot ``s`` owns page ``s``."""
+    return LatentPool(
+        request_pool_size=slots,
+        num_pages=slots + 1,
+        page_units=64,
+        latent_width=1,
+        dtype=torch.float32,
+        device=device,
+        staging=False,
+    )
+
+
+def _runner(model, size, *, device, stream, pool, devices=(), slots=2):
     """Prepare the linear denoiser's diffusion runner for one size."""
     return DiffusionRunner.for_layout(
         "denoiser",
@@ -65,9 +79,16 @@ def _runner(model, size, *, device, stream, devices=(), bank=None, slots=2):
         stream=stream,
         storage=GraphStorage(),
         devices=devices,
-        bank=bank,
+        bank={},
         slots=slots,
+        pool=pool,
+        pages=1,
     )
+
+
+def _committed(pool, bank, slot, size):
+    """A slot's samples in one bank of its page."""
+    return pool.bank_view(bank, (slot,)).view(-1)[: size.width]
 
 
 def _inputs(schedules, sample, size, steps):
@@ -85,6 +106,18 @@ def _inputs(schedules, sample, size, steps):
     )
 
 
+def _bind(runner, schedules, size, steps, slot):
+    """Bind a slot's ladder over the runner's samples."""
+    sample = runner.samples.view(-1)[: size.width]
+    return runner.bind(
+        _inputs(schedules, sample, size, steps),
+        schedules,
+        state={},
+        slot=slot,
+        pages=(slot,),
+    )
+
+
 def _advanced(size, steps, *, device):
     """The linear denoiser's samples after ``steps`` unit-shift steps."""
     value = torch.full((size.width,), 7.0, device=device)
@@ -96,9 +129,16 @@ def _advanced(size, steps, *, device):
 @pytest.mark.parametrize("graphs", [False, True])
 @pytest.mark.parametrize("execution", ["cuda:0", "cuda:1", "green"])
 @torch.inference_mode()
-def test_denoising_reprepared_constants_and_slot_sizes_advance_one_step(
+def test_denoising_steps_read_the_committed_bank_and_write_the_other(
     graphs, execution
 ):
+    """Each step advances a slot's committed samples into the other bank.
+
+    Runners are prepared again for every size and slot. A step reads the
+    bank holding the committed samples, leaves it unchanged and writes the
+    successor to the other bank of the slot's page, so the next step reads
+    that bank.
+    """
     device = torch.device("cuda:0")
     branch_device = "cuda:0" if execution == "green" else execution
     model = LinearDenoiser().to(device)
@@ -118,47 +158,61 @@ def test_denoising_reprepared_constants_and_slot_sizes_advance_one_step(
         if graphs
         else ()
     )
-    # Slot storage is one bank with a row per request slot; a captured graph
-    # reaches a slot's row through the device slot index.
-    bank = torch.zeros((2, 64), device=device)
+    pool = _pool(2, device=device)
     try:
         for index, (slot, width, key) in enumerate(
             ((1, 32, 2), (1, 64, 3), (2, 32, 2), (1, 32, 2))
         ):
-            sample = bank[slot - 1, :width]
-            sample.fill_(7.0)
-            reference = sample.clone()
             size = Size(width, float(key + index))
+            _committed(pool, 1, slot, size).fill_(7.0)
+            reference = _committed(pool, 1, slot, size).clone()
             runner = _runner(
                 model,
                 size,
                 device=device,
                 stream=stream,
+                pool=pool,
                 devices=devices,
-                bank={"image": bank},
             )
             try:
-                inputs = _inputs(schedules, sample, size, 2)
-                runner.warmup(inputs[0], schedules, state={})
-                torch.testing.assert_close(sample, reference, rtol=0, atol=0)
-                ladder = runner.bind(
-                    inputs, schedules, state={"image": sample}, slot=slot
+                sample = runner.samples.view(-1)[:width]
+                sample.copy_(reference)
+                runner.warmup(
+                    _inputs(schedules, sample, size, 1)[0], schedules, state={}
                 )
+                torch.testing.assert_close(sample, reference, rtol=0, atol=0)
+                ladder = _bind(runner, schedules, size, 2, slot)
                 if graphs:
                     for step in (0, 1):
                         runner.capture(ladder, step)
+                bank = 1
                 for step in (0, 1):
+                    committed = _committed(pool, bank, slot, size).clone()
                     reference.add_(0.5 * (reference * 0.25 + size.offset))
-                    actual, path = runner.step(ladder, step)
+                    actual, path = runner.step(ladder, step, bank)
                     assert path == ("graph_replay" if graphs else "eager")
                     torch.testing.assert_close(
                         actual["image"][0], reference, rtol=1e-6, atol=1e-6
+                    )
+                    torch.testing.assert_close(
+                        _committed(pool, bank, slot, size),
+                        committed,
+                        rtol=0,
+                        atol=0,
+                    )
+                    bank = 1 - bank
+                    torch.testing.assert_close(
+                        _committed(pool, bank, slot, size),
+                        actual["image"][0],
+                        rtol=0,
+                        atol=0,
                     )
             finally:
                 torch.cuda.current_stream(device).synchronize()
                 stream.synchronize()
                 runner.close()
     finally:
+        pool.close()
         stream.close()
 
 
@@ -166,10 +220,10 @@ def test_denoising_reprepared_constants_and_slot_sizes_advance_one_step(
 def test_captured_ladders_replay_on_every_slot_with_eager_values():
     """Startup capture leaves one ladder resident that every slot replays.
 
-    Warmup captures one graph per ladder step; the graph gathers whichever
-    slot the device slot index names, so the steps a request runs on either
-    slot replay rather than capture, and their values match an eager
-    evaluation of the same ladder from the same samples.
+    Warmup captures one graph per ladder step from one slot's pages; the
+    graph reads whichever pages the device rows name, so the steps a request
+    runs on either slot replay rather than capture, and their values match an
+    eager evaluation of the same ladder from the same samples.
     """
     device = torch.device("cuda:0")
     model = LinearDenoiser().to(device)
@@ -178,59 +232,50 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
     size = Size(32, 2.0)
     slots = (1, 2)
 
-    def ladder(runner, samples):
+    def ladder(runner, pool):
         values, paths = {}, []
         for slot in slots:
-            bound = runner.bind(
-                _inputs(schedules, samples[slot], size, steps),
-                schedules,
-                state={"image": samples[slot]},
-                slot=slot,
-            )
+            _committed(pool, 1, slot, size).fill_(7.0)
+            bound = _bind(runner, schedules, size, steps, slot)
+            bank = 1
             for step in range(steps):
-                result, path = runner.step(bound, step)
+                result, path = runner.step(bound, step, bank)
                 paths.append(path)
+                bank = 1 - bank
             values[slot] = result["image"][0].clone()
         return values, paths
 
-    eager = _runner(model, size, device=device, stream=None)
+    pool = _pool(2, device=device)
+    eager = _runner(model, size, device=device, stream=None, pool=pool)
     try:
-        expected, _ = ladder(
-            eager,
-            {slot: torch.full((32,), 7.0, device=device) for slot in slots},
-        )
+        expected, _ = ladder(eager, pool)
     finally:
         torch.cuda.current_stream(device).synchronize()
         eager.close()
 
     stream = CUDAStream.external(torch.cuda.Stream(device=device))
-    bank = torch.zeros((2, 64), device=device)
     runner = _runner(
         model,
         size,
         device=device,
         stream=stream,
+        pool=pool,
         devices=(device,),
-        bank={"image": bank},
     )
     try:
-        samples = {slot: bank[slot - 1, :32] for slot in slots}
-        for sample in samples.values():
-            sample.fill_(7.0)
-        for slot in slots:
-            resting = samples[slot].clone()
-            bound = runner.bind(
-                _inputs(schedules, samples[slot], size, steps),
-                schedules,
-                state={"image": samples[slot]},
-                slot=slot,
-            )
-            for step in range(steps):
-                runner.capture(bound, step)
-            # Capture must leave the slot's samples where it found them.
-            torch.testing.assert_close(samples[slot], resting, rtol=0, atol=0)
+        _committed(pool, 1, 1, size).fill_(7.0)
+        bound = _bind(runner, schedules, size, steps, 1)
+        for step in range(steps):
+            runner.capture(bound, step)
+        # Capture must leave the slot's committed samples where it found them.
+        torch.testing.assert_close(
+            _committed(pool, 1, 1, size),
+            torch.full((size.width,), 7.0, device=device),
+            rtol=0,
+            atol=0,
+        )
 
-        actual, paths = ladder(runner, samples)
+        actual, paths = ladder(runner, pool)
         assert paths == ["graph_replay"] * (len(slots) * steps)
         for slot in slots:
             torch.testing.assert_close(
@@ -239,6 +284,7 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
     finally:
         torch.cuda.current_stream(device).synchronize()
         runner.close()
+        pool.close()
         stream.close()
 
 
@@ -256,30 +302,27 @@ def test_steps_without_a_captured_ladder_run_eagerly():
     schedules = model.make_schedules(steps, shift=1.0, device=device)
     size = Size(32, 2.0)
     stream = CUDAStream.external(torch.cuda.Stream(device=device))
-    bank = torch.zeros((1, 64), device=device)
+    pool = _pool(1, device=device)
     runner = _runner(
         model,
         size,
         device=device,
         stream=stream,
+        pool=pool,
         devices=(device,),
-        bank={"image": bank},
         slots=1,
     )
     try:
-        sample = bank[0, : size.width]
-        bound = runner.bind(
-            _inputs(schedules, sample, size, steps),
-            schedules,
-            state={"image": sample},
-            slot=1,
-        )
+        bound = _bind(runner, schedules, size, steps, 1)
         for expected_path in ("eager", "graph_replay"):
-            sample.fill_(7.0)
-            paths = [runner.step(bound, step)[1] for step in range(steps)]
+            _committed(pool, 1, 1, size).fill_(7.0)
+            bank, paths = 1, []
+            for step in range(steps):
+                paths.append(runner.step(bound, step, bank)[1])
+                bank = 1 - bank
             assert paths == [expected_path] * steps
             torch.testing.assert_close(
-                sample,
+                _committed(pool, bank, 1, size),
                 _advanced(size, steps, device=device),
                 rtol=1e-6,
                 atol=1e-6,
@@ -289,4 +332,5 @@ def test_steps_without_a_captured_ladder_run_eagerly():
     finally:
         torch.cuda.current_stream(device).synchronize()
         runner.close()
+        pool.close()
         stream.close()

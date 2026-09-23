@@ -28,6 +28,7 @@ from uniserve_worker.bootstrap.capacity import (
     check_startup_storage,
     decode_context_blocks,
     device_total_bytes,
+    latent_pool_plan,
     resolve_request_capacity,
 )
 from uniserve_worker.bootstrap.components import (
@@ -473,8 +474,6 @@ class Worker:
                 state_buffers=runner.state_buffers or None,
                 device=worker_config.device,
             )
-            if runner.denoises and self.requests.storage.bank:
-                runner.bind_diffusion_bank(self.requests.storage.bank)
 
             torch_dtype = getattr(
                 torch,
@@ -499,32 +498,33 @@ class Worker:
             else:
                 self.decode_state = None
 
-            # Generation state has its own page pool and may live on
-            # another device.
-            flow = image_builder(model)
-            latent_dtype = getattr(torch, worker_config.model_dtype, None)
-            if flow is not None and not isinstance(latent_dtype, torch.dtype):
-                raise unsupported_setup(
-                    f"unsupported latent dtype {worker_config.model_dtype!r}"
-                )
-
-            if flow is None:
+            # Denoised samples have their own page pool, which may live on
+            # another device. An image worker always holds it; a standalone
+            # denoiser's pool lives on the ranks that advance its samples.
+            plan = latent_pool_plan(model, worker_config)
+            if plan is None or (
+                image_builder(model) is None and not runner.denoises
+            ):
                 self.latent_pool = None
             else:
-                assert isinstance(latent_dtype, torch.dtype)
                 self.latent_pool = LatentPool(
                     request_pool_size=int(info.request_slots),
                     num_pages=int(info.latent_pages),
                     page_units=int(info.latent_page_units),
-                    latent_width=(
-                        flow.denoiser.latent_channels
-                        * flow.denoiser.patch_size**2
-                    ),
-                    dtype=latent_dtype,
+                    latent_width=plan.latent_width,
+                    dtype=plan.dtype,
                     device=worker_config.generation_device
                     or worker_config.device,
+                    staging=plan.staging,
                 )
                 startup.callback(self.latent_pool.close)
+            if runner.denoises:
+                # Ladders gather a request's tables from its slot and its
+                # samples from its pages, so runners borrow both owners.
+                assert self.latent_pool is not None
+                runner.bind_diffusion_storage(
+                    self.requests.storage.bank, self.latent_pool
+                )
 
             if (
                 self.latent_pool is not None

@@ -44,6 +44,7 @@ from uniserve_models.minimax_h3.conditioning import (
 from uniserve_models.minimax_h3.config import TRANSFORMER_FIELDS
 from uniserve_models.minimax_h3.weights import transformer_component
 from uniserve_worker.execution.request import RequestPool
+from uniserve_worker.storage.latent_pool import LatentPool
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -401,12 +402,38 @@ def _load(groups, directory, device):
     ).model
 
 
-def _stage(factory, size, views, context, *, seed, features):
-    """Stage one admitted request into its slot as the worker does."""
+def _latents(factory, *, device):
+    """The latent pool a worker gives the denoiser's samples of two slots."""
+    pages = factory.sample_pages
+    return LatentPool(
+        request_pool_size=2,
+        num_pages=2 * pages.pages + 1,
+        page_units=pages.page_units,
+        latent_width=1,
+        dtype=pages.dtype,
+        device=device,
+        staging=False,
+    )
+
+
+def _committed(factory, latents, size, slot, bank):
+    """A slot's samples of ``size`` in one bank of its pages."""
+    return factory.sample_views(
+        size, latents.bank_view(bank, factory.slot_pages(slot))
+    )
+
+
+def _stage(factory, latents, size, slot, views, context, *, seed, features):
+    """Stage one admitted request as the worker does.
+
+    The request's tables and conditioning go to its slot views and its
+    initial samples to the bank of its pages a fresh trajectory starts in.
+    """
     factory.stage_request(size, views, seed=seed)
     for target, value in factory.initialize(
         size,
         views,
+        _committed(factory, latents, size, slot, 1),
         constants=context.constants,
         workspace=context.workspace,
     ):
@@ -414,7 +441,22 @@ def _stage(factory, size, views, context, *, seed, features):
     factory.store_conditioning(size, views, features)
 
 
-def _diffusion(model, layout, *, device, stream, bank=None):
+def _ladder(factory, runner, size, views, schedules, slot):
+    """Bind a slot's ladder over the runner's samples and the slot's pages."""
+    samples = factory.sample_views(size, runner.samples)
+    return runner.bind(
+        tuple(
+            factory.bind(size, views, samples, schedules, index)
+            for index in range(factory.num_steps)
+        ),
+        schedules,
+        state=views,
+        slot=slot,
+        pages=factory.slot_pages(slot),
+    )
+
+
+def _diffusion(model, factory, layout, latents, *, device, stream, bank=None):
     """Prepare the denoiser's runner for one layout over two request slots."""
     from uniserve.model import EntryPoint
     from uniserve_worker.model_executor.component_binding import Call
@@ -431,6 +473,8 @@ def _diffusion(model, layout, *, device, stream, bank=None):
         devices=(device,) if stream is not None else (),
         bank=bank,
         slots=2,
+        pool=latents,
+        pages=factory.layout_pages(layout),
     )
 
 
@@ -456,54 +500,58 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
         )
         stream = CUDAStream.external(torch.cuda.Stream(device=device))
         # Slot storage is the request pool's bank, whose rows the captured
-        # ladder reaches through the device slot index.
+        # ladder reaches through the device slot index; the samples live in
+        # the slot's pages of the latent pool.
         pool = RequestPool(
             2, state_buffers=factory.capacity_buffers(), device=device
         )
+        latents = _latents(factory, device=device)
         runner = _diffusion(
-            model, layout, device=device, stream=stream, bank=pool.storage.bank
+            model,
+            factory,
+            layout,
+            latents,
+            device=device,
+            stream=stream,
+            bank=pool.storage.bank,
         )
         try:
             context = runner.context
             with pool.storage.tensors(1) as storage:
                 views = storage.view(factory.buffers(size))
-                state = {name: views[name] for name in model.modalities}
+                samples = factory.sample_views(size, runner.samples)
                 for seed in (31, 92):
                     schedules = model.make_schedules(
                         factory.num_steps, shift=None, device=device
                     )
                     _stage(
                         factory,
+                        latents,
                         size,
+                        1,
                         views,
                         context,
                         seed=seed,
                         features=features,
                     )
-                    initial = {
-                        name: value.clone() for name, value in state.items()
-                    }
-                    inputs = factory.bind(size, views, schedules, 0)
+                    initial = _committed(factory, latents, size, 1, 1)
+                    for name in model.modalities:
+                        samples[name].copy_(initial[name])
+                    inputs = factory.bind(size, views, samples, schedules, 0)
                     runner.warmup(inputs, schedules, state=views)
                     for name in model.modalities:
                         torch.testing.assert_close(
-                            state[name], initial[name], rtol=0, atol=0
+                            samples[name], initial[name], rtol=0, atol=0
                         )
-                    ladder = runner.bind(
-                        tuple(
-                            factory.bind(size, views, schedules, index)
-                            for index in range(4)
-                        ),
-                        schedules,
-                        state=views,
-                        slot=1,
-                    )
+                    ladder = _ladder(factory, runner, size, views, schedules, 1)
                     # Startup captures the first request's ladder; the second
                     # request, with its own schedules, replays it.
                     if seed == 31:
                         for index in range(4):
                             runner.capture(ladder, index)
+                    bank = 1
                     for index in range(4):
+                        state = _committed(factory, latents, size, 1, bank)
                         expected = {}
                         for name, value in state.items():
                             prediction = _prediction(value, matrices, name)
@@ -521,14 +569,22 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                                 ratio.double() * value.double()
                                 + (1.0 - ratio).double() * clean
                             ).float()
-                        result, path = runner.step(ladder, index)
+                        result, path = runner.step(ladder, index, bank)
                         assert path == "graph_replay"
+                        bank = 1 - bank
+                        successor = _committed(factory, latents, size, 1, bank)
                         for name in model.modalities:
                             torch.testing.assert_close(
                                 result[name][0],
                                 expected[name],
                                 rtol=2e-2,
                                 atol=2e-2,
+                            )
+                            torch.testing.assert_close(
+                                successor[name],
+                                result[name][0],
+                                rtol=0,
+                                atol=0,
                             )
                     torch.cuda.synchronize(device)
                     # Retired request schedules may be overwritten immediately.
@@ -538,6 +594,7 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                         schedule.sigmas.fill_(float("nan"))
         finally:
             runner.close()
+            latents.close()
             pool.close()
             stream.close()
 
@@ -592,7 +649,9 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                 views = pool.storage.tensors(slot).view(factory.buffers(size))
                 _stage(
                     factory,
+                    latents,
                     size,
+                    slot,
                     views,
                     context,
                     seed=100 + slot,
@@ -601,18 +660,12 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                 schedules = model.make_schedules(
                     factory.num_steps, shift=None, device=device
                 )
-                ladder = runner.bind(
-                    tuple(
-                        factory.bind(size, views, schedules, index)
-                        for index in range(4)
-                    ),
-                    schedules,
-                    state=views,
-                    slot=slot,
-                )
+                ladder = _ladder(factory, runner, size, views, schedules, slot)
+                bank = 1
                 for index in range(4):
-                    result, path = runner.step(ladder, index)
+                    result, path = runner.step(ladder, index, bank)
                     paths.append(path)
+                    bank = 1 - bank
                 samples[slot] = {
                     name: values[0].clone() for name, values in result.items()
                 }
@@ -621,8 +674,11 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
         pool = RequestPool(
             2, state_buffers=factory.capacity_buffers(), device=device
         )
+        latents = _latents(factory, device=device)
         try:
-            eager = _diffusion(model, layout, device=device, stream=None)
+            eager = _diffusion(
+                model, factory, layout, latents, device=device, stream=None
+            )
             try:
                 expected, paths = denoise(eager, pool, eager.context)
                 assert set(paths) == {"eager"}
@@ -633,7 +689,9 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
             stream = CUDAStream.external(torch.cuda.Stream(device=device))
             runner = _diffusion(
                 model,
+                factory,
                 layout,
+                latents,
                 device=device,
                 stream=stream,
                 bank=pool.storage.bank,
@@ -645,7 +703,9 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                 )
                 _stage(
                     factory,
+                    latents,
                     placeholder,
+                    1,
                     views,
                     context,
                     seed=0,
@@ -659,14 +719,8 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                 schedules = model.make_schedules(
                     factory.num_steps, shift=None, device=device
                 )
-                ladder = runner.bind(
-                    tuple(
-                        factory.bind(placeholder, views, schedules, index)
-                        for index in range(4)
-                    ),
-                    schedules,
-                    state=views,
-                    slot=1,
+                ladder = _ladder(
+                    factory, runner, placeholder, views, schedules, 1
                 )
                 for index in range(4):
                     runner.capture(ladder, index)
@@ -678,6 +732,7 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                 runner.close()
                 stream.close()
         finally:
+            latents.close()
             pool.close()
 
         for slot in requests:
