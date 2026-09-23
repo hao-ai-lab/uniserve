@@ -11,9 +11,30 @@ from typing import Any, Self
 
 import torch
 import torch.distributed as dist
+from torch.distributed.constants import (
+    default_pg_nccl_timeout,
+    default_pg_timeout,
+)
 
 from uniserve.distributed.mesh import Communicator, DeviceMesh
 from uniserve.runtime.resources import close_resources
+
+
+@dataclass(frozen=True)
+class Rendezvous:
+    """The TCP store a process world forms at.
+
+    Rank 0 serves the store and every rank connects to it at ``host:port``.
+    ``listen_fd`` is a socket, already bound and listening at that port, that
+    rank 0 serves the store on, so the port is held from whoever reserved it
+    until rank 0 exits and no other process can take it meanwhile. Without
+    one, rank 0 binds the port itself. Only rank 0 takes a socket; it owns the
+    descriptor from then on.
+    """
+
+    host: str
+    port: int
+    listen_fd: int | None = None
 
 
 @dataclass
@@ -162,8 +183,14 @@ def initialize_process_groups(
     device: torch.device | str,
     backend: str | None = None,
     init_method: str | None = None,
+    rendezvous: Rendezvous | None = None,
 ) -> ProcessGroups:
     """Select the rank's device and join or create its physical process world.
+
+    A new world forms at ``rendezvous`` or through the torch ``init_method``
+    URL, which are exclusive; without either, ``MASTER_ADDR`` and
+    ``MASTER_PORT`` name a TCP init method. Both are ignored when the process
+    already has a world, which is borrowed.
 
     The returned ProcessGroups owns any group created here. The caller closes it
     after all dependent execution resources retire, or transfers that obligation
@@ -173,6 +200,10 @@ def initialize_process_groups(
         raise ValueError(
             "launch rank must satisfy 0 <= rank < positive world_size"
         )
+    if init_method is not None and rendezvous is not None:
+        raise ValueError("init_method and rendezvous are exclusive")
+    if rendezvous is not None and rendezvous.listen_fd is not None and rank:
+        raise ValueError("only rank 0 serves the rendezvous store")
 
     local_device = torch.device(device)
     if local_device.type == "cuda":
@@ -199,6 +230,16 @@ def initialize_process_groups(
             raise ValueError(
                 "existing process world disagrees with supplied backend"
             )
+    elif world_size > 1 and rendezvous is not None:
+        dist.init_process_group(
+            backend=backend,
+            store=_rendezvous_store(rendezvous, rank, world_size, backend),
+            rank=rank,
+            world_size=world_size,
+            pg_options=_group_options(backend),
+            device_id=local_device if backend == "nccl" else None,
+        )
+        environment._groups.append(dist.group.WORLD)
     elif world_size > 1:
         if not init_method:
             port = os.environ.get("MASTER_PORT")
@@ -220,6 +261,34 @@ def initialize_process_groups(
         environment._groups.append(dist.group.WORLD)
 
     return environment
+
+
+def _rendezvous_store(
+    rendezvous: Rendezvous, rank: int, world_size: int, backend: str
+) -> dist.TCPStore:
+    """Serve the world's store on rank 0 and connect to it on every rank.
+
+    The store keeps the timeout ``init_process_group`` gives a store it creates
+    from an init method for this backend, which bounds how long ranks wait for
+    one another to join and to publish communicator identifiers.
+    """
+    timeout = default_pg_timeout
+    if backend == "nccl" and default_pg_nccl_timeout is not None:
+        timeout = default_pg_nccl_timeout
+
+    if rendezvous.listen_fd is not None:
+        # The store takes the socket over. A process this rank later starts
+        # must not hold the store's port open after the rank exits, so the
+        # descriptor is not passed on again.
+        os.set_inheritable(rendezvous.listen_fd, False)
+    return dist.TCPStore(
+        rendezvous.host,
+        rendezvous.port,
+        world_size,
+        is_master=rank == 0,
+        timeout=timeout,
+        master_listen_fd=rendezvous.listen_fd,
+    )
 
 
 def _group_options(backend: str):

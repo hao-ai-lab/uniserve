@@ -150,7 +150,7 @@ class Worker:
                 world_size=config.execution.world_size,
                 device=config.execution.device,
                 backend=config.distributed_backend,
-                init_method=config.distributed_init_method,
+                rendezvous=config.rendezvous,
             )
         except ValueError as error:
             # Public numerical resources report ordinary argument errors;
