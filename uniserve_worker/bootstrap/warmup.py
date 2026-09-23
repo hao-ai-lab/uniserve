@@ -655,8 +655,11 @@ def _warmup_flow_tables(
             "generation warmup has no admitted image runtime"
         )
     trajectory = image_state(generation, ImageConfig(height, width), image)
-    branches = trajectory.guidance.branches(
-        trajectory.schedule, request.accepted_progress.flow_step
+    guidance = trajectory.guidance
+    if guidance is None:
+        raise invalid_descriptor("generation warmup requires image guidance")
+    branches = guidance.branches(
+        trajectory.schedules["image"], request.accepted_progress.flow_step
     )
 
     runtime = request.accepted_progress

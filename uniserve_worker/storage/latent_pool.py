@@ -136,9 +136,10 @@ class LatentPool:
             dtype=torch.int64,
             device=self.device,
         )
-        # [request_pool_size + 1, 2]
-        self.timestep_pairs = torch.empty(
-            (self.request_pool_size + 1, 2),
+        # [request_pool_size + 1, 1]: each slot's current network time, the
+        # fixed storage its denoising rows read.
+        self.timesteps = torch.empty(
+            (self.request_pool_size + 1, 1),
             dtype=torch.float32,
             device=self.device,
         )
@@ -172,7 +173,7 @@ class LatentPool:
             self.storage,
             self.step_buffer,
             self.page_table_buffer,
-            self.timestep_pairs,
+            self.timesteps,
         )
         return sum(
             int(value.numel()) * int(value.element_size()) for value in tensors
@@ -526,20 +527,17 @@ class LatentPool:
                 self._clear_slot(slot, self._slot_pages[slot])
 
     def stage_timestep(
-        self,
-        request_pool_idx: int,
-        current: float,
-        following: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Place one analytical schedule pair in fixed request-indexed.
+        self, request_pool_idx: int, value: float
+    ) -> torch.Tensor:
+        """Place one step's network time in the slot's fixed storage.
 
-        storage.
+        Returns the one-element view the slot's denoising rows and solver
+        update read.
         """
         slot = self._validate_slot(int(request_pool_idx))
-        row = self.timestep_pairs[slot]
-        row[0].fill_(float(current))
-        row[1].fill_(float(following))
-        return row[:1], row[1:2]
+        row = self.timesteps[slot]
+        row.fill_(float(value))
+        return row
 
     def validate_updates(
         self,
@@ -887,7 +885,7 @@ class LatentPool:
             ("storage", self.dtype),
             ("step_buffer", self.dtype),
             ("page_table_buffer", torch.int64),
-            ("timestep_pairs", torch.float32),
+            ("timesteps", torch.float32),
         ):
             setattr(self, name, torch.empty(0, dtype=dtype, device=self.device))
 
