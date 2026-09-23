@@ -36,7 +36,10 @@ from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.errors import unsupported_setup
 from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.model_executor.input_buffers import TokenBufferConfig
-from uniserve_worker.model_executor.resources import media_state_buffers
+from uniserve_worker.model_executor.resources import (
+    holds_samples,
+    media_state_buffers,
+)
 from uniserve_worker.protocol.call import MediaCall
 from uniserve_worker.protocol.tensor import OutputInfo
 from uniserve_worker.storage.kv_cache import KVCacheManager
@@ -323,10 +326,12 @@ def latent_pool_capacity_bytes(
     page_units: int,
     latent_width: int,
     dtype_bytes: int,
+    staging: bool = True,
 ) -> int:
     """Calculate double-buffered latent pool storage.
 
-    Covers latent pages, step storage, page tables, and timestep metadata.
+    Covers latent pages, step storage when the pool stages steps, page
+    tables, and timestep metadata.
     """
     slots = int(request_pool_size)
     pages = int(num_pages)
@@ -340,10 +345,88 @@ def latent_pool_capacity_bytes(
     # trajectories.
     usable_pages = pages - 1
     storage = 2 * pages * units * width * element_bytes
-    step_buffer = usable_pages * units * width * element_bytes
+    step_buffer = usable_pages * units * width * element_bytes if staging else 0
     page_table = usable_pages * 8
     timesteps = (slots + 1) * 4
     return storage + step_buffer + page_table + timesteps
+
+
+@dataclass(frozen=True, slots=True)
+class LatentPoolPlan:
+    """The latent pool a worker's denoiser advances its samples in.
+
+    A worker advertises this geometry, budgets its bytes and allocates exactly
+    it. A KV-conditioned image denoiser's trajectories take pages of
+    ``block_size`` latent tokens that the scheduler allocates, and the pool
+    stages each step. A standalone denoiser's unit is one sample element:
+    every request slot owns the same run of consecutive pages after the
+    sentinel page, and the denoiser's runners stage their own steps.
+    """
+
+    request_pool_size: int
+    num_pages: int
+    page_units: int
+    latent_width: int
+    dtype: torch.dtype
+    staging: bool
+
+    @property
+    def capacity_bytes(self) -> int:
+        return latent_pool_capacity_bytes(
+            request_pool_size=self.request_pool_size,
+            num_pages=self.num_pages,
+            page_units=self.page_units,
+            latent_width=self.latent_width,
+            dtype_bytes=self.dtype.itemsize,
+            staging=self.staging,
+        )
+
+
+def latent_pool_plan(
+    model: nn.Module, worker_config: WorkerConfig
+) -> LatentPoolPlan | None:
+    """Plan the latent pool of a model with a denoiser.
+
+    The plan follows the model and the resolved configuration alone, so every
+    rank of a worker plans the same pool; ``max_request_pool_size`` must be
+    resolved.
+    """
+    slots = int(worker_config.max_request_pool_size)
+    flow = image_builder(model)
+    if flow is not None:
+        dtype = getattr(
+            torch, str(worker_config.model_dtype).removeprefix("torch."), None
+        )
+        if not isinstance(dtype, torch.dtype):
+            raise unsupported_setup(
+                f"unsupported latent dtype {worker_config.model_dtype!r}"
+            )
+        page_units = int(worker_config.block_size)
+        units = active_latent_capacity_tokens(
+            flow.max_tokens, worker_config.kv_token_capacity
+        )
+        return LatentPoolPlan(
+            request_pool_size=slots,
+            num_pages=ceil_div(units, page_units) + 1,
+            page_units=page_units,
+            latent_width=flow.denoiser.latent_channels
+            * flow.denoiser.patch_size**2,
+            dtype=dtype,
+            staging=True,
+        )
+
+    builder = media_builder(model, worker_config)
+    if builder is None:
+        return None
+    pages = builder.sample_pages
+    return LatentPoolPlan(
+        request_pool_size=slots,
+        num_pages=slots * pages.pages + 1,
+        page_units=pages.page_units,
+        latent_width=1,
+        dtype=pages.dtype,
+        staging=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,6 +462,7 @@ def request_tensor_arena_capacity(
     queue_depth: int,
     product_bytes_per_request: int,
     concurrent_imports: int = 0,
+    latent_pool_bytes: int = 0,
 ) -> ArenaCapacity:
     """Bound product, relay and transfer storage for fixed request tensors.
 
@@ -401,7 +485,7 @@ def request_tensor_arena_capacity(
         * _REQUEST_RELAY_ROW_BYTES
     )
     return ArenaCapacity(
-        latent_pool_bytes=0,
+        latent_pool_bytes=int(latent_pool_bytes),
         tensor_store=tensor_store,
         device_product_bytes=(
             device_product_capacity_bytes(tensor_store, 1, max_value_bytes=1)
@@ -471,8 +555,17 @@ def model_arena_capacity(
         )
 
     if capability(model, VideoPostprocessor) is not None or state_buffers:
+        # A rank that holds a standalone denoiser's request state advances
+        # its samples in the latent pool.
+        plan = latent_pool_plan(model, worker_config)
         return request_tensor_arena_capacity(
             worker_config,
+            latent_pool_bytes=plan.capacity_bytes
+            if plan is not None
+            and holds_samples(
+                state_buffers, media_builder(model, worker_config)
+            )
+            else 0,
             queue_depth=depth,
             product_bytes_per_request=local_product_storage_bytes(
                 resolve_outputs(model, worker_config),
@@ -675,7 +768,9 @@ __all__ = [
     "RuntimeKVCapacity",
     "derive_runtime_kv_capacity",
     "device_total_bytes",
+    "LatentPoolPlan",
     "latent_pool_capacity_bytes",
+    "latent_pool_plan",
     "latent_trajectory_bytes",
     "model_arena_capacity",
     "call_window",
@@ -714,12 +809,18 @@ def resolve_request_capacity(
                     "request tensor sizing requires its rank group"
                 )
 
+            samples = holds_samples(schema, media_builder(model, worker_config))
+
             def auxiliary_bytes(count: int) -> int:
                 capacity_config = replace(
                     worker_config,
                     max_request_pool_size=count,
                     max_batch_calls=min(count, worker_config.max_batch_calls),
                     max_batch_tokens=min(count, worker_config.max_batch_tokens),
+                )
+                plan = latent_pool_plan(model, capacity_config)
+                latent_bytes = (
+                    plan.capacity_bytes if samples and plan is not None else 0
                 )
                 product_bytes = local_product_storage_bytes(
                     resolve_outputs(model, worker_config),
@@ -731,7 +832,11 @@ def resolve_request_capacity(
                     queue_depth=queue_depth,
                     product_bytes_per_request=product_bytes,
                 )
-                return count * product_bytes + arena.device_product_bytes
+                return (
+                    count * product_bytes
+                    + arena.device_product_bytes
+                    + latent_bytes
+                )
 
             slots = tensor_slot_capacity(
                 schema,

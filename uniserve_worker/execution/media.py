@@ -32,6 +32,7 @@ from uniserve_worker.protocol.batch import (
 from uniserve_worker.protocol.call import Call, CallStatus, MediaCall
 from uniserve_worker.protocol.identity import CallId
 from uniserve_worker.protocol.output import FinishFlags
+from uniserve_worker.storage.latent_pool import LatentUpdate
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -164,8 +165,8 @@ def prepare_call(
     return {}, None
 
 
-def _stage_placeholder(builder, size, views, context) -> None:
-    """Fill a slot with a complete request's inputs for startup calls.
+def _stage_placeholder(builder, size, views, samples, context) -> None:
+    """Fill a slot and samples with a request's inputs for startup calls.
 
     Warmup and capture run the numerical calls a request of ``size`` runs,
     with a fixed seed and no prompt. Their results are discarded, and the
@@ -175,6 +176,7 @@ def _stage_placeholder(builder, size, views, context) -> None:
     staged = builder.initialize(
         size,
         views,
+        samples,
         constants=context.constants,
         workspace=context.workspace,
     )
@@ -220,9 +222,10 @@ def warmup_denoising(
         prepared.add(layout)
         diffusion = runner.diffusion_runner(layout)
         views = storage[0].view(builder.buffers(size))
-        _stage_placeholder(builder, size, views, diffusion.context)
+        samples = builder.sample_views(size, diffusion.samples)
+        _stage_placeholder(builder, size, views, samples, diffusion.context)
         diffusion.warmup(
-            builder.bind(size, views, schedules, 0),
+            builder.bind(size, views, samples, schedules, 0),
             schedules,
             state=views,
         )
@@ -284,8 +287,8 @@ def capture_denoising(
 
     A denoising graph is captured per ladder step for the layout each
     declared size occupies. It serves every request slot, since it reaches a
-    slot's storage through the device slot index rather than through the
-    slot's addresses, and every prompt length within the layout, since the
+    slot's storage and pages through device indices rather than through
+    their addresses, and every prompt length within the layout, since the
     lengths differ only in the state the graph gathers from the slot. The
     layouts stay pinned with their ladders. Capture is collective across the
     component's ranks and belongs here, where warmup holds them in lockstep;
@@ -315,18 +318,20 @@ def capture_denoising(
         if not runner.diffusion_runner(layout).captures:
             return
         diffusion = runner.diffusion_runner(layout, pin=True)
-        # Any slot's rows serve the capture; the first slot's do.
+        # Any slot's rows and pages serve the capture; the first slot's do.
         views = storage[0].view(builder.buffers(size))
-        _stage_placeholder(builder, size, views, diffusion.context)
+        samples = builder.sample_views(size, diffusion.samples)
+        _stage_placeholder(builder, size, views, samples, diffusion.context)
 
         ladder = diffusion.bind(
             tuple(
-                builder.bind(size, views, schedules, index)
+                builder.bind(size, views, samples, schedules, index)
                 for index in range(builder.num_steps)
             ),
             schedules,
             state=views,
             slot=1,
+            pages=builder.slot_pages(1),
         )
         for index in range(builder.num_steps):
             diffusion.capture(ladder, index)
@@ -495,6 +500,36 @@ def mux_config(runner: ModelExecutor, media) -> AvMuxConfig:
     )
 
 
+def sample_generation(step: int) -> int:
+    """Return the pool generation of a trajectory at an accepted step.
+
+    A standalone denoiser's samples are never published from the pool, and
+    one request slot holds one trajectory, so its accepted step count
+    versions it; zero stays the empty slot's generation.
+    """
+    return int(step) + 1
+
+
+def sample_update(
+    slot: int, params, *, step: int, previous: int | None
+) -> LatentUpdate:
+    """Describe the pool publication of a trajectory's successor.
+
+    ``previous`` is the committed step the successor advances, or ``None``
+    for the prepared trajectory at step zero.
+    """
+    return LatentUpdate(
+        int(slot),
+        params=params,
+        expected_generation=0
+        if previous is None
+        else sample_generation(previous),
+        expected_step=0 if previous is None else int(previous),
+        generation=sample_generation(step),
+        step=int(step),
+    )
+
+
 def trajectory_params(call: Call, *, state: BatchState):
     """Return the unique latent trajectory params assigned to a call."""
     selected = tuple(
@@ -645,13 +680,14 @@ def execute(
 
     from uniserve_worker.execution import transfer
 
+    builder = model_runner.media_builder
+    pool = model_runner.latent_pool
+    slot_index = request.request.request_pool_idx
     products: tuple[TensorPublication, ...] = ()
     if call.kind is MediaCall.LATENT_PREPARATION:
+        # Batch preparation validated the call's pages and interval.
         params = trajectory_params(call, state=state)
-        if int(params.start_step) != 0 or int(params.step_count) != 0:
-            raise invalid_descriptor(
-                "video preparation params must carry zero denoise steps"
-            )
+        assert pool is not None
         inputs = call.inputs
         if len(inputs) != 1:
             raise invalid_descriptor(
@@ -671,14 +707,22 @@ def execute(
         encoded = conditioning.tensor
         staging = slot_ladder(trajectory).staging
         if staging is None:
-            model_runner.media_builder.stage_request(
-                numerical_shape, slot, seed=media.seed
-            )
+            builder.stage_request(numerical_shape, slot, seed=media.seed)
         else:
             staging.result()
-        initial = model_runner.media_builder.initialize(
+
+        # The initial samples are copied straight into the request's pages
+        # of the bank a fresh trajectory starts in, overlapping the
+        # conditioning encoder; the batch commit publishes them at step zero.
+        bank = pool.initial_bank(
+            slot_index, params.page_table, latent_units=params.latent_units
+        )
+        initial = builder.initialize(
             numerical_shape,
             slot,
+            builder.sample_views(
+                numerical_shape, pool.bank_view(bank, params.page_table)
+            ),
             constants=context.constants,
             workspace=context.workspace,
         )
@@ -701,9 +745,12 @@ def execute(
                     raise invalid_descriptor(
                         "conditioning computation must return one Tensor"
                     )
-                model_runner.media_builder.store_conditioning(
+                builder.store_conditioning(
                     numerical_shape, slot, result.values[0]
                 )
+        request.latent.update = sample_update(
+            slot_index, params, step=0, previous=None
+        )
 
     elif call.kind is MediaCall.DENOISING:
         params = trajectory_params(call, state=state)
@@ -717,29 +764,52 @@ def execute(
                 "video denoising requires one selected numerical step"
             )
 
-        # ``slot`` holds the request's slot views; its ladder is bound over
-        # them once and replayed by every later step.
+        assert pool is not None
+        source, _ = pool.step_banks(
+            slot_index,
+            params.page_table,
+            step=start_step,
+            generation=sample_generation(start_step),
+            latent_units=params.latent_units,
+            height=params.height,
+            width=params.width,
+        )
+
+        # The ladder is bound over the request's slot views and the samples
+        # of its layout's runner once, and replayed by every later step.
         slot_state = slot_ladder(trajectory)
-        builder = model_runner.media_builder
         layout = builder.layout(numerical_shape)
-        if slot_state.ladder is None:
-            slot_state.ladder = model_runner.diffusion_runner(layout).bind(
+        diffusion = model_runner.diffusion_runner(layout)
+        if slot_state.ladder is None or not diffusion.binds(slot_state.ladder):
+            samples = builder.sample_views(numerical_shape, diffusion.samples)
+            slot_state.ladder = diffusion.bind(
                 tuple(
                     builder.bind(
-                        numerical_shape, slot, trajectory.schedules, index
+                        numerical_shape,
+                        slot,
+                        samples,
+                        trajectory.schedules,
+                        index,
                     )
                     for index in range(builder.num_steps)
                 ),
                 trajectory.schedules,
                 state=slot,
-                slot=request.request.request_pool_idx,
+                slot=slot_index,
+                pages=params.page_table,
             )
         result = model_runner.run_denoising(
-            layout, slot_state.ladder, start_step
+            layout, slot_state.ladder, start_step, source
         )
         if result.stats is None:
             raise RuntimeError("module output has no execution statistics")
         state.forward_stats.append(result.stats)
+        request.latent.update = sample_update(
+            slot_index,
+            params,
+            step=start_step + step_count,
+            previous=start_step,
+        )
         request.progress = replace(
             calls.require_progress(request),
             flow_step=start_step + step_count,

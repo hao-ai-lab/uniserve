@@ -2,14 +2,50 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from functools import cached_property
 
 import torch
 
 from uniserve.diffusion import Schedule, normal_noise
 from uniserve.model import Denoiser, LatentInput
 from uniserve.tensors import BufferConfig
+
+#: Pages one request's samples span in the latent pool. Every denoising step
+#: validates and addresses the request's pages on the host, so a small fixed
+#: count keeps that work constant while padding stays under one page.
+REQUEST_PAGES = 8
+
+#: Element alignment of each modality's samples within a request's pages.
+SAMPLE_ALIGNMENT = 256
+
+
+@dataclass(frozen=True, slots=True)
+class SamplePages:
+    """How a standalone denoiser's samples occupy latent pool pages.
+
+    A pool unit is one sample element and the pool's rows are one element
+    wide. Each request owns ``pages`` pages of ``page_units`` elements, which
+    hold every modality's local samples of the admitted maximum. Within one
+    layout the modalities follow each other in modality order, each starting
+    on a ``SAMPLE_ALIGNMENT`` boundary, so gathering the layout's leading
+    pages yields every sample as a contiguous tensor.
+    """
+
+    page_units: int
+    pages: int
+    dtype: torch.dtype
+
+    @property
+    def units(self) -> int:
+        """Pool units one request's pages hold."""
+        return self.pages * self.page_units
+
+
+def _aligned(elements: int) -> int:
+    return -(-int(elements) // SAMPLE_ALIGNMENT) * SAMPLE_ALIGNMENT
 
 
 class MediaBuilder:
@@ -24,6 +60,10 @@ class MediaBuilder:
     exact size occupies, so every request of one layout binds the same shapes
     and replays the same captured ladder. What distinguishes the request
     within its layout is state the builder stages with its samples.
+
+    The samples a solver step rewrites live in the worker's latent pool (see
+    ``sample_pages``); the request's slot holds only state written once: the
+    denoiser's tables, the retained conditioning and the host staging.
     """
 
     def __init__(
@@ -66,6 +106,68 @@ class MediaBuilder:
             state = self._states[layout] = self.denoiser.state_buffers(layout)
         return state
 
+    @cached_property
+    def sample_pages(self) -> SamplePages:
+        """Size one request's pages from the admitted maximum.
+
+        Each modality's global extent at the maximum bounds its local shard
+        on every rank for every admitted size, as in ``capacity_buffers``.
+        """
+        state = self._state(self.maximum)
+        names = self.denoiser.modalities
+        dtypes = {state[name].dtype for name in names}
+        if len(dtypes) != 1:
+            raise ValueError("pooled sample modalities must share one dtype")
+        capacity = sum(
+            _aligned(math.prod(self.denoiser.latent_shape(name, self.maximum)))
+            for name in names
+        )
+        page_units = _aligned(-(-capacity // REQUEST_PAGES))
+        return SamplePages(page_units, -(-capacity // page_units), dtypes.pop())
+
+    def slot_pages(self, slot: int) -> tuple[int, ...]:
+        """Return the consecutive pool pages request ``slot`` owns.
+
+        Page zero is the pool's sentinel; slot ``s`` owns the ``s``-th run
+        of ``sample_pages.pages`` pages after it.
+        """
+        count = self.sample_pages.pages
+        return tuple(range(1 + (int(slot) - 1) * count, 1 + int(slot) * count))
+
+    def _sample_offsets(self, size) -> tuple[dict[str, int], int]:
+        state = self._state(size)
+        offsets, cursor = {}, 0
+        for name in self.denoiser.modalities:
+            offsets[name] = cursor
+            cursor += _aligned(math.prod(state[name].shape))
+        return offsets, cursor
+
+    def layout_pages(self, size) -> int:
+        """Count the leading request pages that hold the samples of ``size``.
+
+        A denoising step of the layout gathers and writes back only these.
+        """
+        _, elements = self._sample_offsets(size)
+        page_units = self.sample_pages.page_units
+        return -(-elements // page_units)
+
+    def sample_views(
+        self, size, flat: torch.Tensor
+    ) -> Mapping[str, torch.Tensor]:
+        """View each modality's local sample of ``size`` in gathered pages.
+
+        ``flat`` holds a request's leading pages contiguously, in any shape.
+        """
+        flat = flat.view(-1)
+        state = self._state(size)
+        offsets, _ = self._sample_offsets(size)
+        return {
+            name: flat[
+                offsets[name] : offsets[name] + math.prod(state[name].shape)
+            ].view(state[name].shape)
+            for name in self.denoiser.modalities
+        }
+
     def tables(self, size) -> tuple[str, ...]:
         """Name the state fields other than the samples, filled per request."""
         return tuple(
@@ -75,15 +177,16 @@ class MediaBuilder:
         )
 
     def buffers(self, size) -> Mapping[str, BufferConfig]:
-        """Describe one request's storage, shaped by its layout.
+        """Describe one request's slot storage, shaped by its layout.
 
-        The denoiser's device state, the complete CPU draws, a CPU source for
-        every state field to stage from, and the retained conditioning over
-        the layout's text rows, zero past the prompt.
+        The denoiser's device tables, the complete CPU draws, a CPU source for
+        every state field to stage from, samples included, and the retained
+        conditioning over the layout's text rows, zero past the prompt. The
+        device samples live in the latent pool, not here.
         """
         layout = self.layout(size)
         state = self._state(size)
-        result = dict(state)
+        result = {name: state[name] for name in self.tables(size)}
         for name in self.denoiser.modalities:
             result[f"{name}_noise"] = BufferConfig(
                 self.denoiser.noise_shape(name, layout),
@@ -108,8 +211,8 @@ class MediaBuilder:
         result = dict(self.buffers(self.maximum))
         for name in self.denoiser.modalities:
             capacity = self.denoiser.latent_shape(name, self.maximum)
-            for key in (name, f"{name}_source"):
-                result[key] = replace(result[key], capacity_shape=capacity)
+            key = f"{name}_source"
+            result[key] = replace(result[key], capacity_shape=capacity)
         return result
 
     @torch.inference_mode()
@@ -140,13 +243,16 @@ class MediaBuilder:
         self,
         size,
         tensors: Mapping[str, torch.Tensor],
+        samples: Mapping[str, torch.Tensor],
         *,
         constants: Mapping[str, torch.Tensor],
         workspace: Mapping[str, torch.Tensor],
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         """Fill sample sources from the drawn noise.
 
-        Returns destination/source pairs of every state field for staging.
+        Returns destination/source pairs for staging: each modality's source
+        into its device view in ``samples``, and every table's source into
+        the slot.
         """
         names = self.denoiser.modalities
         noise = {name: tensors[f"{name}_noise"].unsqueeze(0) for name in names}
@@ -160,9 +266,12 @@ class MediaBuilder:
             constants=constants,
             workspace=workspace,
         )
-        return tuple(
-            (tensors[name], tensors[f"{name}_source"])
-            for name in (*names, *self.tables(size))
+        return (
+            *((samples[name], tensors[f"{name}_source"]) for name in names),
+            *(
+                (tensors[name], tensors[f"{name}_source"])
+                for name in self.tables(size)
+            ),
         )
 
     def store_conditioning(
@@ -182,10 +291,15 @@ class MediaBuilder:
         self,
         size,
         tensors: Mapping[str, torch.Tensor],
+        samples: Mapping[str, torch.Tensor],
         schedules: Mapping[str, Schedule],
         index: int,
     ):
-        """Assemble one denoising step's typed input from resident tensors."""
+        """Assemble one denoising step's typed input.
+
+        The latents are the ``samples`` views a denoising step advances and
+        the text features are the slot's retained conditioning.
+        """
         if not 0 <= index < self.num_steps:
             raise ValueError("denoising index is outside the fixed schedule")
 
@@ -193,7 +307,7 @@ class MediaBuilder:
             latents={
                 name: (
                     LatentInput(
-                        tensors[name], schedules[name].timesteps[index]
+                        samples[name], schedules[name].timesteps[index]
                     ),
                 )
                 for name in self.denoiser.modalities

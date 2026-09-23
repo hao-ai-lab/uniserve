@@ -40,9 +40,11 @@ class SlotLadder:
     """A standalone request's views of its slot and its bound ladder.
 
     The views borrow request storage whose execution owners retain the
-    backing. ``staging`` is the host staging started at admission (the seeded
-    draw and the request's own state tables); latent preparation reads what
-    it filled, and retirement waits for it.
+    backing. The ladder views the samples of its layout's runner and is bound
+    again when that runner is replaced. ``staging`` is the host staging
+    started at admission (the seeded draw and the request's own state
+    tables); latent preparation reads what it filled, and retirement waits
+    for it.
     """
 
     tensors: dict[str, Mapping[str, torch.Tensor]] = field(default_factory=dict)
