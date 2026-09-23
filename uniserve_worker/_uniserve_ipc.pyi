@@ -1,20 +1,40 @@
 """Native asynchronous request server exposed to the Python worker."""
 
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, Self, final
 
+__all__ = [
+    "Server",
+    "StreamSignal",
+    "atomic_load_u32",
+    "atomic_store_u32",
+    "service_name",
+]
+
+@final
 class Server:
     """Receives bounded IPC requests and publishes their responses."""
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         service_name: str,
         max_payload: int = 1_048_576,
         max_inflight: int = 1,
-    ) -> None:
-        """Bind a named service.
+        transport: str = ...,
+    ) -> Self:
+        """Bind this rank's channel.
 
-        The service bounds payload size and in-flight request capacity.
+        The channel bounds payload size and in-flight request capacity.
+        ``transport`` is ``"iceoryx2"``, the default, for a rank on the head's
+        host, which serves shared storage under ``service_name``, or ``"tcp"``
+        for a rank elsewhere, where ``service_name`` is the interface to bind.
+        """
+        ...
+    def endpoint(self, service: str) -> str:
+        """Return the endpoint this rank reports to the head.
+
+        A shared-storage endpoint is ``service`` itself; a socket endpoint is
+        the address its bind produced.
         """
         ...
     def __enter__(self) -> Self:
@@ -66,10 +86,11 @@ class Server:
         """Publish one response to the request identified by its envelope."""
         ...
 
+@final
 class StreamSignal:
     """Bridges CUDA stream completion into an asyncio-readable signal."""
 
-    def __init__(self) -> None:
+    def __new__(cls) -> Self:
         """Create an owned completion descriptor.
 
         The descriptor receives CUDA stream notifications.
@@ -87,3 +108,23 @@ class StreamSignal:
     def consume(self) -> None:
         """Drain pending readiness notifications from the descriptor."""
         ...
+
+def service_name(id: str) -> str:
+    """Return the shared-storage service name for one endpoint identifier."""
+    ...
+
+def atomic_store_u32(buffer: memoryview, offset: int, value: int) -> None:
+    """Store a 32-bit word with release ordering.
+
+    ``buffer`` must be writable and contiguous, and the word at ``offset``
+    must be four-byte aligned and lie inside it; otherwise ``RuntimeError``
+    is raised.
+    """
+    ...
+
+def atomic_load_u32(buffer: memoryview, offset: int) -> int:
+    """Load a 32-bit word with acquire ordering.
+
+    ``buffer`` carries the same requirements as for ``atomic_store_u32``.
+    """
+    ...
