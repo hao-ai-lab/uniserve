@@ -2,7 +2,7 @@
 
 from torch import nn
 
-from uniserve.model import Denoiser, ImageDenoiser, VideoPostprocessor
+from uniserve.model import ImageDenoiser, VideoDenoiser, VideoPostprocessor
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.model_executor.diffusion_inputs import ImageBuilder
 from uniserve_worker.model_executor.media_inputs import MediaBuilder
@@ -28,8 +28,8 @@ def image_builder(model: nn.Module):
 
 def media_builder(model: nn.Module, config: WorkerConfig):
     """Instantiate the video input builder within the worker's frame budget."""
-    denoiser = capability(model, Denoiser)
-    if denoiser is None or isinstance(denoiser, ImageDenoiser):
+    denoiser = capability(model, VideoDenoiser)
+    if denoiser is None:
         return None
 
     output = capability(model, VideoPostprocessor)

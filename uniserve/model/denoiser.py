@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Protocol, TypeVar
 
 import torch
 from torch import nn
@@ -12,12 +12,25 @@ from uniserve.distributed import DeviceMesh
 from uniserve.media import image
 from uniserve.nn.functional import patchify
 from uniserve.processing import BranchSource
-from uniserve.tensors import TensorOutput
+from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
 
 from .inputs import DenoiserInput, LatentInput
 
 InputT = TypeVar("InputT", bound=DenoiserInput)
 SizeT = TypeVar("SizeT")
+
+
+class VideoSize(Protocol):
+    """A video request's output timeline and conditioning length."""
+
+    @property
+    def num_frames(self) -> int: ...
+
+    @property
+    def num_text_tokens(self) -> int: ...
+
+
+VideoSizeT = TypeVar("VideoSizeT", bound=VideoSize)
 
 
 class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
@@ -124,6 +137,54 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
         draws on the host, as ``prepare_latents`` receives, is the
         preparation's and is absent here.
         """
+        raise NotImplementedError
+
+
+class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
+    """A standalone denoiser that generates a video timeline from text features.
+
+    A request is sized by its output frame count and prompt length. The network
+    fixes its step count, rounds a requested duration to its native windows,
+    and describes the request state and outputs that the caller's storage
+    holds; the caller advances the fixed schedule and supplies each step's
+    borrowed tensors to ``bind_inputs``.
+    """
+
+    @property
+    def num_steps(self) -> int:
+        """Number of denoising steps in the network's fixed schedule."""
+        raise NotImplementedError
+
+    @property
+    def text_condition_width(self) -> int:
+        """Feature width of the retained text conditioning."""
+        raise NotImplementedError
+
+    def legal_frame_count(self, requested: int) -> int:
+        """Round a requested frame count up to one the network generates."""
+        raise NotImplementedError
+
+    def make_size(self, num_frames: int, num_text_tokens: int) -> VideoSizeT:
+        """Build the size descriptor of one request."""
+        raise NotImplementedError
+
+    def state_buffers(self, size: VideoSizeT) -> Mapping[str, BufferConfig]:
+        """Describe one request's state for the layout ``size`` occupies."""
+        raise NotImplementedError
+
+    def output_layout(self, size: VideoSizeT) -> Mapping[str, OutputLayout]:
+        """Describe each modality's predicted samples for ``size``."""
+        raise NotImplementedError
+
+    def bind_inputs(
+        self,
+        *,
+        latents: Mapping[str, tuple[LatentInput, ...]],
+        sizes: tuple[VideoSizeT, ...],
+        step_index: int,
+        text_features: tuple[torch.Tensor, ...],
+    ) -> InputT:
+        """Assemble one denoising step's typed input from borrowed tensors."""
         raise NotImplementedError
 
 

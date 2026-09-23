@@ -14,6 +14,7 @@ from uniserve.model import (
     Denoiser,
     TextEncoder,
     VideoDecoder,
+    VideoDenoiser,
     VideoPostprocessor,
 )
 from uniserve.tensors import BufferConfig, OutputLayout
@@ -181,6 +182,9 @@ def output_layouts(
         config.max_sequence_tokens if prompt_tokens is None else prompt_tokens,
     )
     if isinstance(component, Denoiser):
+        # Only a video denoiser shares the media timeline the builder sizes.
+        if not isinstance(component, VideoDenoiser):
+            raise ValueError("a media timeline's denoiser is a video denoiser")
         return component.output_layout(size)
 
     # Audio length follows from the video frame count at the declared rates.

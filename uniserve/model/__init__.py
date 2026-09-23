@@ -4,7 +4,7 @@ Also shared computation capabilities.
 """
 
 from .decoder import ImageDecoder
-from .denoiser import Denoiser, ImageDenoiser
+from .denoiser import Denoiser, ImageDenoiser, VideoDenoiser, VideoSize
 from .encoder import Encoder, PatchEncoder, TextEncoder
 from .inputs import (
     DEFAULT_COMPONENT,
@@ -39,6 +39,8 @@ __all__ = [
     "TransformerEncoder",
     "Denoiser",
     "ImageDenoiser",
+    "VideoDenoiser",
+    "VideoSize",
     "ImageDecoder",
     "AudioDecoder",
     "VideoDecoder",
