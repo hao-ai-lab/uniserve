@@ -15,10 +15,12 @@ from uniserve.runtime import EventPool
 from uniserve_worker.errors import WorkerError
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.transfer import (
+    MAX_TRANSFER_HANDLE_BYTES,
     KvTransfer,
     Locator,
     TensorTransfer,
 )
+from uniserve_worker.transport import make_transports
 
 pytestmark = pytest.mark.integration
 
@@ -592,6 +594,166 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
             pool.imports.stop()
         for transport in transports:
             transport.close()
+        for pool in pools:
+            pool.close()
+        for event in events:
+            event.close()
+
+
+@pytest.mark.parametrize("dtype", ("bfloat16", "float8_e4m3fn"))
+@pytest.mark.parametrize(
+    "mechanisms,device",
+    (
+        (("local", "shm"), "cpu"),
+        pytest.param(("local", "cuda_vmm"), "cuda:0", marks=pytest.mark.gpu),
+    ),
+)
+def test_deep_kv_publication_fits_its_descriptor_and_installs(
+    mechanisms: tuple[str, str], device: str, dtype: str
+) -> None:
+    """A deep model's KV stays within the transfer descriptor bound.
+
+    Two head shards each publish every layer over both mechanisms their rank
+    binds, as a tensor-parallel producer does, and the head merges their
+    reports into one descriptor. A consumer on another rank installs every
+    layer exactly from that descriptor.
+    """
+    total_layers = 128
+    total_heads = 2
+    extent = 6
+    pages = (3, 1)
+    pools = [
+        mha_pool(
+            num_layers=total_layers,
+            total_layers=total_layers,
+            num_kv_heads=heads,
+            total_kv_heads=total_heads,
+            kv_head_offset=offset,
+            head_dim=1,
+            dtype=torch.bfloat16,
+            store_dtype=getattr(torch, dtype),
+            num_pages=4,
+            page_size=4,
+            device=device,
+            request_pool_size=1,
+            max_blocks_per_request=2,
+        )
+        for heads, offset in ((1, 0), (1, 1), (total_heads, 0))
+    ]
+    sources, target = pools[:2], pools[2]
+    for pool in pools:
+        pool.block_tables.install(((1, 0, pages, 2 * pool.info.block_size),))
+    events = [EventPool() for _ in pools]
+    transports = [
+        make_transports(
+            mechanisms,
+            byte_capacity=1 << 20,
+            ticket_capacity=64,
+            event_pool=event,
+        )
+        for event in events
+    ]
+
+    # Power-of-two ratios within each page keep FP8 encoding and re-encoding
+    # exact, and a sign and scale per layer distinguish the layers.
+    token_values = torch.tensor(
+        (112, 224, 448, 112, 224, 448), dtype=torch.bfloat16, device=device
+    )
+    head_values = torch.tensor(
+        (1, 2), dtype=torch.bfloat16, device=device
+    ).view(1, total_heads, 1)
+    wanted = tuple(
+        token_values.view(extent, 1, 1)
+        * head_values
+        * (-1) ** layer
+        * 2 ** (layer % 3)
+        for layer in range(total_layers)
+    )
+
+    source = _buffer(1)
+    shards = []
+    write = None
+    try:
+        for pool, rank_transports in zip(
+            sources, transports[: len(sources)], strict=True
+        ):
+            heads = slice(
+                pool.info.kv_head_offset,
+                pool.info.kv_head_offset + pool.info.num_kv_heads,
+            )
+            for layer, name in enumerate(pool.layers):
+                pool.cache.state(name).write(
+                    pages,
+                    start=0,
+                    key=wanted[layer][:, heads],
+                    value=-wanted[layer][:, heads] / 2,
+                )
+            if device.startswith("cuda"):
+                torch.cuda.synchronize(device)
+            shard = pool.publish(
+                request_pool_idx=1,
+                group_id=0,
+                visible_length=extent,
+                destination="consumer",
+                buffer=source,
+                transports=rank_transports,
+            )
+            pool.validate_publications(((source, shard),), ())
+            pool.apply_publications(((source, shard),), ())
+            shards.append(shard)
+
+        merged = replace(
+            shards[0],
+            tensors=tuple(
+                replace(
+                    field,
+                    locations=tuple(
+                        location
+                        for shard in shards
+                        for location in shard.tensors[index].locations
+                    ),
+                )
+                for index, field in enumerate(shards[0].tensors)
+            ),
+        )
+        assert merged.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES
+
+        # The consumer reads each layer's region over the peer mechanism.
+        peer = mechanisms[1]
+        write = target.prepare_install(
+            merged,
+            request_pool_idx=1,
+            page_ids=pages,
+            allocated_length=extent,
+            initialized_pages=pages,
+            transports={peer: transports[2][peer]},
+        )
+        write.completion.result(timeout=60)
+        target.install(installed_buffer=_buffer(101), write=write)
+        for layer, name in enumerate(target.layers):
+            key, value = target.cache.state(name).read(
+                pages, start=0, length=extent
+            )
+            torch.testing.assert_close(key, wanted[layer], rtol=0, atol=0)
+            torch.testing.assert_close(
+                value, -wanted[layer] / 2, rtol=0, atol=0
+            )
+    finally:
+        if write is not None:
+            target.imports.abandon(write)
+        for shard, rank_transports in zip(
+            shards, transports[: len(shards)], strict=True
+        ):
+            for tensor in shard.tensors:
+                for location in tensor.locations:
+                    rank_transports[location.backend].release(location)
+        for pool in sources[: len(shards)]:
+            pool.release_buffers((source,))
+        for pool in pools:
+            pool.imports.stop()
+        for rank_transports in transports:
+            for transport in rank_transports.values():
+                transport.close()
         for pool in pools:
             pool.close()
         for event in events:
