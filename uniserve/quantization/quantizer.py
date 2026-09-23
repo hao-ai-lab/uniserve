@@ -30,12 +30,15 @@ class Quantizer:
     FP8 axis zero retains the first dimension when computing extrema. MXFP8
     uses complete K32 blocks; NVFP4 uses K16 blocks and a tensor-wide scale.
     An explicit ``amax`` must cover the same logical domain as ``distribution``.
+    ``calibrated_scale`` freezes NVFP4's tensor-wide scale at a checkpoint's
+    calibrated value, ModelOpt's ``input_scale = amax / (6 * 448)``; only the
+    per-block K16 encoding is then computed from the input.
     ``from_tensors`` borrows existing encoding without recomputing its scales.
     """
 
     format: Literal["fp8", "mxfp8", "nvfp4"]
     axis: Literal[0] | None = field(default=None, kw_only=True)
-    calibrated_amax: float | None = field(default=None, kw_only=True)
+    calibrated_scale: float | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         if self.format not in {"fp8", "mxfp8", "nvfp4"}:
@@ -46,16 +49,16 @@ class Quantizer:
             raise ValueError(
                 "only FP8 supports the retained statistical axis zero"
             )
-        if self.calibrated_amax is not None and (
+        if self.calibrated_scale is not None and (
             self.format != "nvfp4"
             or self.axis is not None
-            or not isinstance(self.calibrated_amax, (int, float))
-            or isinstance(self.calibrated_amax, bool)
-            or not math.isfinite(self.calibrated_amax)
-            or self.calibrated_amax <= 0
+            or not isinstance(self.calibrated_scale, (int, float))
+            or isinstance(self.calibrated_scale, bool)
+            or not math.isfinite(self.calibrated_scale)
+            or self.calibrated_scale <= 0
         ):
             raise ValueError(
-                "calibrated amax requires one positive finite NVFP4 scalar"
+                "calibrated scale requires one positive finite NVFP4 scalar"
             )
 
     @property
@@ -66,7 +69,7 @@ class Quantizer:
         encoded row intervals retain one common statistical domain without
         first materializing every row together.
         """
-        return self.calibrated_amax is None and (
+        return self.calibrated_scale is None and (
             self.format == "nvfp4"
             or (self.format == "fp8" and self.axis is None)
         )
@@ -301,14 +304,15 @@ class Quantizer:
         # A calibrated activation tensor scale is a checkpoint fact. Runtime
         # callers may still supply scratch statistics used by the dynamic
         # path, but those must never replace the frozen calibration domain.
-        if self.calibrated_amax is not None:
+        tensor_scale = None
+        if self.calibrated_scale is not None:
             # A host-to-device scalar copy is illegal while a CUDA graph is
             # being captured. Fill graph-owned device storage instead; the
             # immutable Python value remains the checkpoint fact and replay
             # never searches or changes it.
-            amax = torch.empty((), dtype=torch.float32, device=x.device).fill_(
-                self.calibrated_amax
-            )
+            tensor_scale = torch.empty(
+                (), dtype=torch.float32, device=x.device
+            ).fill_(self.calibrated_scale)
         elif amax is None and self.format != "mxfp8":
             amax = self.amax(x, distribution=distribution)
 
@@ -320,7 +324,7 @@ class Quantizer:
             )
             fields = {"values": values, "scale": scale}
         else:
-            fields = self._encode_blocks(x, amax, layout)
+            fields = self._encode_blocks(x, amax, layout, tensor_scale)
 
         result = self.from_tensors(
             fields, shape=tuple(x.shape), dtype=x.dtype, scale_layout=layout
@@ -331,7 +335,10 @@ class Quantizer:
             out.buffers()[name].copy_(value.reshape_as(out.buffers()[name]))
         return out
 
-    def _encode_blocks(self, x, maximum, layout):
+    def _encode_blocks(self, x, maximum, layout, tensor_scale=None):
+        """Encode K-blocks; NVFP4 derives its tensor scale from `maximum`
+        unless a calibrated `tensor_scale` is supplied.
+        """  # noqa: D205
         if not x.is_cuda or torch.cuda.get_device_capability(x.device) < (
             10,
             0,
@@ -403,7 +410,8 @@ class Quantizer:
             )
             return {"values": values.reshape(x.shape), "scale": scales}
 
-        tensor_scale = maximum.clamp_min(1e-12) / (448.0 * 6.0)
+        if tensor_scale is None:
+            tensor_scale = maximum.clamp_min(1e-12) / (448.0 * 6.0)
         values, scales = flashinfer.nvfp4_quantize(
             matrix,
             1.0 / tensor_scale,

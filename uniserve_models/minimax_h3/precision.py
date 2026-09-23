@@ -119,3 +119,8 @@ def weight_config(
 precisions = MappingProxyType(
     {name: weight_config(preset=name) for name in _formats}
 )
+
+# Dense modules of a calibrated checkpoint keep its BF16 representation, the
+# video VAE included, because its quantized decoder layers produce BF16;
+# decoders and latent heads retain their FP32 accumulation.
+checkpoint_precision = weight_config(preset="quality", video_vae="bf16")

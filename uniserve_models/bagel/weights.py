@@ -36,6 +36,9 @@ precisions = MappingProxyType(
     }
 )
 
+# Dense modules of a calibrated checkpoint keep its stored representation.
+checkpoint_precision = precisions["bf16"]
+
 
 def _backbone_names(backbone: Transformer) -> dict[str, str]:
     """Translate backbone parameter paths to checkpoint language_model names.

@@ -311,12 +311,19 @@ class FP8Weight(Weight):
 
 @dataclass(frozen=True, slots=True)
 class NVFP4Weight(Weight):
-    """Expose packed ModelOpt NVFP4 values in their calibrated scale domain."""
+    """Expose packed ModelOpt NVFP4 values in their calibrated scale domain.
+
+    `tensor_scale` is ModelOpt's `weight_scale_2`, the weight's global amax
+    divided by 6 * 448. `activation_scale` is the static `input_scale` the
+    same calibration recorded for the module's input, in the same domain,
+    when the export quantizes activations.
+    """
 
     name: str
     values: Weight
     block_scale: Weight
     tensor_scale: Weight
+    activation_scale: Weight | None = None
     dtype: torch.dtype = torch.bfloat16
 
     def __post_init__(self):
@@ -336,10 +343,28 @@ class NVFP4Weight(Weight):
             raise ValueError(
                 "NVFP4 block scales must contain one E4M3 value per K16 block"
             )
+        if self.activation_scale is not None and (
+            self.activation_scale.dtype != torch.float32
+            or math.prod(self.activation_scale.shape) != 1
+        ):
+            raise ValueError(
+                "NVFP4 activation input_scale must be one FP32 value"
+            )
 
     @property
     def shape(self):
         return (self.values.shape[0], self.values.shape[1] * 2)
+
+    def input_scale(self) -> float | None:
+        """Return the calibrated activation tensor scale, if the export has one.
+
+        ModelOpt stores `input_scale = amax / (6 * 448)`, the scale that maps
+        the largest E2M1 value times the largest E4M3 block scale onto the
+        calibrated amax. `None` means weight-only NVFP4.
+        """
+        if self.activation_scale is None:
+            return None
+        return float(self.activation_scale.read().reshape(()))
 
     def read(self, region=None) -> QuantizedTensor:
         region = _region(self.shape, region)
@@ -448,30 +473,32 @@ class Reader:
                     self._locations[logical] = (path, name)
         self._weights = dict(sorted(self._weights.items()))
 
-        # ModelOpt exports two E2M1 values per byte, one E4M3 scale per K16
-        # block, and one FP32 tensor multiplier. Present them under the
-        # original logical ``.weight`` name so architecture mappings and TP
-        # slicing remain identical to an unquantized checkpoint.
+        # ModelOpt's unified export keeps an NVFP4 weight under its ordinary
+        # `.weight` name as U8 bytes holding two E2M1 values each, with one
+        # E4M3 scale per K16 block in `.weight_scale`, one FP32 multiplier in
+        # `.weight_scale_2`, and the static activation scale in
+        # `.input_scale`. Presenting them as one weight under `.weight` keeps
+        # architecture mappings and TP slicing identical to a dense
+        # checkpoint.
         for name, values in tuple(self._weights.items()):
-            if not name.endswith(".weight_packed"):
+            if values.dtype != torch.uint8 or not name.endswith(".weight"):
                 continue
-            prefix = name.removesuffix(".weight_packed")
-            logical = prefix + ".weight"
-            if logical in self._weights:
-                raise ValueError(
-                    f"NVFP4 checkpoint {logical!r} also contains a dense weight"
-                )
+            prefix = name.removesuffix(".weight")
+            tensor_scale = self._weights.get(prefix + ".weight_scale_2")
+            if tensor_scale is None:
+                continue
             block_scale = self._weights.get(prefix + ".weight_scale")
-            tensor_scale = self._weights.get(prefix + ".weight_tensor_scale")
-            if block_scale is None or tensor_scale is None:
+            if block_scale is None:
                 raise ValueError(
-                    f"NVFP4 checkpoint {logical!r} requires block and tensor "
-                    "scales"
+                    f"NVFP4 checkpoint {name!r} requires its K16 block scales"
                 )
-            self._weights[logical] = NVFP4Weight(
-                logical, values, block_scale, tensor_scale
+            self._weights[name] = NVFP4Weight(
+                name,
+                values,
+                block_scale,
+                tensor_scale,
+                self._weights.get(prefix + ".input_scale"),
             )
-        self._weights = dict(sorted(self._weights.items()))
 
         # Pair serialized E4M3 weights with their weight_scale tensors into
         # FP8Weight views. The scale's element count selects its statistical
@@ -659,7 +686,11 @@ class _DummyReader(Reader):
             (isinstance(item, FP8Weight) and item.scale.name == logical)
             or (
                 isinstance(item, NVFP4Weight)
-                and item.tensor_scale.name == logical
+                and logical
+                in {
+                    item.tensor_scale.name,
+                    getattr(item.activation_scale, "name", None),
+                }
             )
             for item in self._weights.values()
         ):

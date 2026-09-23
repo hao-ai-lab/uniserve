@@ -85,11 +85,15 @@ def test_modelopt_nvfp4_source_preserves_packed_values_and_scales(tmp_path):
     )
     scale = torch.tensor([[2.0], [1.0]], dtype=torch.float8_e4m3fn)
     tensor_scale = torch.tensor(0.25, dtype=torch.float32)
+    input_scale = torch.tensor(0.5, dtype=torch.float32)
+    # ModelOpt's unified export layout: packed values under `.weight`, K16
+    # block scales, the FP32 `weight_scale_2` and the static `input_scale`.
     save_file(
         {
-            "layer.weight_packed": values,
+            "layer.weight": values,
             "layer.weight_scale": scale,
-            "layer.weight_tensor_scale": tensor_scale,
+            "layer.weight_scale_2": tensor_scale,
+            "layer.input_scale": input_scale,
         },
         tmp_path / "model.safetensors",
     )
@@ -106,6 +110,8 @@ def test_modelopt_nvfp4_source_preserves_packed_values_and_scales(tmp_path):
         torch.testing.assert_close(
             encoded.buffers()["tensor_scale"], tensor_scale
         )
+        assert weight.shape == (2, 16)
+        assert weight.input_scale() == 0.5
 
 
 def test_index_and_checksum_enforce_declared_file_set(tmp_path):

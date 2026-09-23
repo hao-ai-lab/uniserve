@@ -6,7 +6,12 @@ from .inputs import DenoiserInput, ImageConditioning
 from .model import Model, entry_points
 from .processing import flow_prompt, image_processor
 from .transformer import Transformer, TransformerLayer
-from .weights import checkpoint_mappings, checkpoint_sources, precisions
+from .weights import (
+    checkpoint_mappings,
+    checkpoint_precision,
+    checkpoint_sources,
+    precisions,
+)
 
 __all__ = [
     "config_sources",
@@ -25,4 +30,5 @@ __all__ = [
     "checkpoint_sources",
     "checkpoint_mappings",
     "precisions",
+    "checkpoint_precision",
 ]

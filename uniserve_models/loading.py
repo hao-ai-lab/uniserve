@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import math
 import os
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
@@ -22,6 +23,7 @@ from uniserve.loading import checkpoint
 from uniserve.loading import weights as weight_options
 from uniserve.model import ComponentEntry
 from uniserve.nn.attention import AttentionParallelConfig
+from uniserve.nn.linear import Linear
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.quantization import QuantizationConfig, Quantizer
 
@@ -492,6 +494,122 @@ def _exclusions(model, declarations, sources, ignored, io):
     return dict.fromkeys(targets)
 
 
+def _component_quantization(
+    root: Path, declaration: checkpoint.Config
+) -> dict | None:
+    """Return the ModelOpt quantization a component folder declares.
+
+    A diffusers pipeline records each component's quantization in that
+    component's config.json. Only ModelOpt exports are accepted there;
+    runtime quantization is a deployment choice, not a component property.
+    """
+    if not declaration.directory:
+        return None
+    path = root / declaration.directory / "config.json"
+    if not path.is_file():
+        return None
+    declared = _json(path).get("quantization_config")
+    if declared is None:
+        return None
+    if not isinstance(declared, dict) or declared.get("quant_method") != (
+        "modelopt"
+    ):
+        raise ValueError(
+            f"component {declaration.name} declares unsupported quantization "
+            f"{declared!r}"
+        )
+    return declared
+
+
+def _require_static_nvfp4(source: str, declared: Mapping) -> None:
+    """Accept only ModelOpt's static NVFP4 W4A4 recipe with K16 blocks."""
+    groups = declared.get("config_groups")
+    expected = {"num_bits": 4, "type": "float", "group_size": 16}
+    if (
+        declared.get("quant_algo") != "NVFP4"
+        or not isinstance(groups, dict)
+        or not groups
+        or any(
+            not isinstance(group, dict)
+            or any(
+                not isinstance(group.get(role), dict)
+                or group[role].get("dynamic", False)
+                or any(
+                    group[role].get(key) != value
+                    for key, value in expected.items()
+                )
+                for role in ("weights", "input_activations")
+            )
+            for group in groups.values()
+        )
+    ):
+        raise ValueError(
+            f"ModelOpt source {source} must use static NVFP4 weights and "
+            "activations with 16-element blocks"
+        )
+
+
+def _calibrated_quantization(model, declarations, sources, declared, io):
+    """Configure every Linear a ModelOpt NVFP4 export stores packed.
+
+    The checkpoint tensors decide which modules are quantized: a module whose
+    weight is stored as packed NVFP4 executes with that weight and its
+    calibrated static activation scale; every other module stays dense. The
+    activation's per-block K16 encoding is computed at run time against that
+    fixed tensor scale.
+    """
+    for name, value in declared.items():
+        _require_static_nvfp4(name, value)
+
+    paths = dict(model.named_modules(remove_duplicate=False))
+    owners: dict[int, set[str]] = {}
+    for path, module in paths.items():
+        for parameter in module.parameters(recurse=False):
+            owners.setdefault(id(parameter), set()).add(path)
+
+    scales: dict[str, float] = {}
+    for source in sources:
+        if source.name not in declared:
+            continue
+        packed = 0
+        with source.open(io=io) as reader:
+            for component in declarations:
+                if component.source != source.name:
+                    continue
+                for assignment in component.map_weights(reader):
+                    weight = assignment.source
+                    if not isinstance(weight, checkpoint.NVFP4Weight):
+                        continue
+                    value = weight.input_scale()
+                    if value is None or not math.isfinite(value) or value <= 0:
+                        raise ValueError(
+                            f"ModelOpt weight {weight.name!r} requires a "
+                            "positive static input_scale"
+                        )
+                    for path in owners[id(assignment.target)]:
+                        if not isinstance(paths[path], Linear):
+                            raise ValueError(
+                                f"ModelOpt weight {weight.name!r} maps onto "
+                                f"{path}, which is not a Linear"
+                            )
+                        if scales.setdefault(path, value) != value:
+                            raise ValueError(
+                                f"{path} receives conflicting calibrated "
+                                "activation scales"
+                            )
+                    packed += 1
+        if not packed:
+            raise ValueError(
+                f"ModelOpt source {source.name} stores no packed NVFP4 weights"
+            )
+    return {
+        path: QuantizationConfig(
+            Quantizer("nvfp4"), Quantizer("nvfp4", calibrated_scale=value)
+        )
+        for path, value in scales.items()
+    }
+
+
 def _root_metadata(root: Path) -> dict:
     """Read the first root metadata file the checkpoint publishes."""
     for name in _metadata_files:
@@ -632,9 +750,51 @@ def read_config(
     precisions = package.precisions
     checkpoint_format = None
     quantization = metadata.get("quantization_config")
+    if quantization is not None and not isinstance(quantization, dict):
+        raise ValueError("checkpoint quantization_config must be an object")
+
+    # A ModelOpt export declares `quant_method: modelopt` in the root
+    # configuration of a single-model checkpoint, or in each quantized
+    # component's config.json of a diffusers pipeline.
+    modelopt = {}
+    if quantization is not None and (
+        quantization.get("quant_method") == "modelopt"
+    ):
+        modelopt = {
+            declaration.name: quantization
+            for declaration in package.checkpoint_sources
+        }
+        quantization = None
+    # Every rank of the checkpoint agrees that it is calibrated, including a
+    # rank that loads none of the quantized components; only the resolved
+    # sources contribute calibrated modules.
+    for declaration in package.checkpoint_sources:
+        declared = _component_quantization(root, declaration)
+        if declared is not None:
+            modelopt[declaration.name] = declared
+    if modelopt and quantization is not None:
+        raise ValueError(
+            "a calibrated ModelOpt checkpoint cannot also declare a "
+            "dynamic quantization_config"
+        )
+    if modelopt:
+        # Packed weights and their calibrated scales form one immutable
+        # checkpoint contract. Runtime precision presets apply only to dense
+        # checkpoints and must not be offered for this source.
+        base = package.checkpoint_precision
+        precision = replace(
+            base,
+            quantization={
+                **base.quantization,
+                **_calibrated_quantization(
+                    model, declarations, sources, modelopt, io
+                ),
+            },
+        )
+        precisions = MappingProxyType({})
+        checkpoint_format = "modelopt_nvfp4"
+
     if quantization is not None:
-        if not isinstance(quantization, dict):
-            raise ValueError("checkpoint quantization_config must be an object")
         method = quantization.get("quant_method", "unquantized")
         if method != "unquantized":
             if method not in {"fp8", "mxfp8", "nvfp4"}:
@@ -655,25 +815,6 @@ def read_config(
                     **_exclusions(model, declarations, sources, ignored, io),
                 },
             )
-
-    modelopt_manifest = root / "modelopt_manifest.json"
-    if modelopt_manifest.is_file():
-        if quantization is not None:
-            raise ValueError(
-                "a calibrated ModelOpt checkpoint cannot also declare a "
-                "dynamic quantization_config"
-            )
-        factory = getattr(package, "calibrated_weight_config", None)
-        if factory is None:
-            raise ValueError(
-                "checkpoint architecture does not support ModelOpt manifests"
-            )
-        precision = factory(_json(modelopt_manifest), model)
-        # Packed weights and their calibrated scales form one immutable
-        # checkpoint contract. Runtime precision presets apply only to dense
-        # checkpoints and must not be offered for this source.
-        precisions = MappingProxyType({})
-        checkpoint_format = "modelopt_nvfp4"
 
     return Config(
         model_config,
