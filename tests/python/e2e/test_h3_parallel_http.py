@@ -325,20 +325,22 @@ def test_component_bindings_release_cancelled_requests(
             }
         )
         owners.update(dict.fromkeys(names, worker_id))
-    # Media units are encoded and the artifact assembled on a host worker:
-    # one host rank encodes every unit of a round and muxes.
+    # Media units are encoded and the artifact assembled on a host worker, as
+    # in the shipped deployments: each host rank is one codec slot encoding
+    # one unit of a round, and a further rank muxes.
     decoder_units = len(worker_config["video_decoder"]["ranks"])
     workers.append(
         {
             "id": "host",
-            "ranks": [{"node": "localhost", "device": "cpu"}],
+            "ranks": [{"node": "localhost", "device": "cpu"}]
+            * (decoder_units + 1),
             "components": {
                 "video_encoder": {
-                    "ranks": [0],
+                    "ranks": list(range(decoder_units)),
                     "distribution": "temporal_units",
-                    "units_per_rank": decoder_units,
+                    "units_per_rank": 1,
                 },
-                "muxer": {"ranks": [0]},
+                "muxer": {"ranks": [decoder_units]},
             },
             "queue_depth": 6,
         }
