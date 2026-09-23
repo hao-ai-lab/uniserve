@@ -9532,6 +9532,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "uniserve-core",
 ]
 
 [[package]]

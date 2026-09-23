@@ -9,7 +9,11 @@ if TYPE_CHECKING:
     from .events import EventPool, EventPoolError
     from .execution import ExecutionContext
     from .prefix_cache import PrefixCache
-    from .process_groups import ProcessGroups, initialize_process_groups
+    from .process_groups import (
+        ProcessGroups,
+        Rendezvous,
+        initialize_process_groups,
+    )
     from .stream import CUDAStream, partition_streams
     from .tensor_buffers import TensorBuffers
 
@@ -17,6 +21,7 @@ __all__ = [
     "TensorBuffers",
     "PrefixCache",
     "ProcessGroups",
+    "Rendezvous",
     "initialize_process_groups",
     "ExecutionContext",
     "EventPool",
@@ -36,6 +41,7 @@ def __getattr__(name):
         "TensorBuffers": "tensor_buffers",
         "PrefixCache": "prefix_cache",
         "ProcessGroups": "process_groups",
+        "Rendezvous": "process_groups",
         "initialize_process_groups": "process_groups",
         "ExecutionContext": "execution",
         "EventPool": "events",

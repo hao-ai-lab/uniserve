@@ -71,14 +71,16 @@ impl WorkerProcessArgs {
         // registration address. Both are loopback where every rank runs here,
         // which is what a shared directory gave them; where some rank runs
         // elsewhere both name a routable host, because a loopback address
-        // reaches only the host that binds it. The first rank binds the
+        // reaches only the host that binds it. The first rank serves the
         // rendezvous store, so the store is placed on that rank's host: this
-        // one, or the host whose launcher reserved a port for it.
+        // one, or the host whose launcher reserved a port for it. Whichever
+        // process spawns the first rank holds the bound socket until that
+        // rank inherits it, so the port is never free while the rank starts.
         let head = match launchers.as_ref() {
             Some(registry) => Some(super::launcher::lock(registry)?.reachable_host()?),
             None => None,
         };
-        let rendezvous = if self.ranks.len() > 1 {
+        let mut rendezvous = if self.ranks.len() > 1 {
             let first = &self.ranks[0].node;
             Some(match launchers.as_ref() {
                 Some(registry) if *first != self.host => {
@@ -105,12 +107,21 @@ impl WorkerProcessArgs {
                 }),
                 _ => None,
             };
+            // Only the first rank serves the store; the others are its clients
+            // and bind nothing, so they receive only its address.
+            let store_listener = match rendezvous.as_mut() {
+                Some(rendezvous) if rank == 0 => rendezvous.listener.take(),
+                _ => None,
+            };
             ranks.push(PendingRank::spawn_rank(
                 self,
                 rank_device,
                 rank as u32,
                 self.ranks.len() as u32,
-                rendezvous.clone(),
+                rendezvous
+                    .as_ref()
+                    .map(|rendezvous| rendezvous.address.as_str()),
+                store_listener,
                 // A rank on the head's host can offer shared storage; a rank
                 // placed elsewhere has none to offer and serves a socket.
                 if self.ranks[rank].node == self.host {

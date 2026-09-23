@@ -7,14 +7,16 @@
 //! group the deployment places there, spawns them, reports their exits by
 //! worker and rank, stops one group's ranks on instruction ahead of that
 //! group's relaunch, and terminates them all when the head's connection
-//! closes.
+//! closes. For a group whose first rank it runs, it also holds the bound
+//! socket that rank serves the group's collective store on, from the head's
+//! reservation until the rank inherits it at spawn.
 //!
 //! It does nothing else. The head derives every launch value once, so a
 //! launcher's command line is the head's address and its own host identity.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::process::{Child, Command};
 
 use anyhow::Context;
@@ -48,7 +50,8 @@ struct Presentation<'a> {
 enum Instruction {
     /// Start one rank from the descriptor the head derived for it.
     Spawn(Spawn),
-    /// Reserve a collective store endpoint for one group.
+    /// Bind and hold a collective store socket for one group, which that
+    /// group's first rank inherits when it is spawned here.
     Reserve { worker_id: String },
     /// Stop every rank of one worker group this launcher owns.
     Stop { worker_id: String },
@@ -144,7 +147,9 @@ fn supervise(
         .get_ref()
         .set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
     let mut line = Vec::new();
-    let mut rendezvous: HashMap<String, (u16, Option<std::net::TcpListener>)> = HashMap::new();
+    // Bound store sockets by worker group, each held until that group's first
+    // rank is spawned here and inherits it.
+    let mut rendezvous: HashMap<String, TcpListener> = HashMap::new();
     loop {
         report_exits(writer, ranks)?;
         let read = match reader.read_until(b'\n', &mut line) {
@@ -170,30 +175,26 @@ fn supervise(
         line.clear();
         match instruction {
             Instruction::Reserve { worker_id } => {
-                rendezvous.remove(&worker_id);
-                // Keep the reservation until rank zero starts, and never hand
-                // another live group the same port during its startup window.
-                let listener = loop {
-                    let listener =
-                        std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
-                    let port = listener.local_addr()?.port();
-                    if rendezvous.values().all(|(used, _)| *used != port) {
-                        break listener;
-                    }
-                };
+                // The socket stays bound from here until the first rank that
+                // serves it exits, so no other process on this host, and no
+                // other group's reservation, can take the port meanwhile.
+                let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+                    .context("reserving a collective store address")?;
                 let port = listener.local_addr()?.port();
                 let response = serde_json::json!({"worker_id": worker_id, "port": port});
-                rendezvous.insert(worker_id, (port, Some(listener)));
+                rendezvous.insert(worker_id, listener);
                 writeln!(writer, "{response}")?;
             }
             Instruction::Spawn(spawn) => {
-                if spawn.rank == 0
-                    && let Some((_, reservation)) = rendezvous.get_mut(&spawn.worker_id)
-                {
-                    reservation.take();
-                }
+                // The group's first rank serves its store on the reserved
+                // socket; the others connect to it and bind nothing.
+                let store_listener = if spawn.rank == 0 {
+                    rendezvous.remove(&spawn.worker_id)
+                } else {
+                    None
+                };
                 let key = (spawn.worker_id.clone(), spawn.rank);
-                let started = start_rank(args, spawn).with_context(|| {
+                let started = start_rank(args, spawn, store_listener).with_context(|| {
                     format!("starting rank {} of worker {} on this host", key.1, key.0)
                 })?;
                 ranks.insert(key.clone(), started);
@@ -223,14 +224,21 @@ fn supervise(
 }
 
 /// Starts one rank from the descriptor the head derived for it.
-fn start_rank(args: &Args, spawn: Spawn) -> anyhow::Result<Rank> {
+///
+/// `store_listener` is the group's reserved collective store socket when this
+/// rank serves the store. The rank inherits it, the descriptor names the
+/// number it inherits it at, which only this process knows, and this process
+/// keeps no copy once the rank is started.
+fn start_rank(
+    args: &Args,
+    mut spawn: Spawn,
+    store_listener: Option<TcpListener>,
+) -> anyhow::Result<Rank> {
     let directory = tempfile::Builder::new()
         .prefix("uniserve-worker-launch")
         .tempdir()
         .context("creating the launch descriptor directory")?;
     let path = directory.path().join("launch.json");
-    std::fs::write(&path, serde_json::to_vec_pretty(&spawn.descriptor)?)
-        .context("writing the launch descriptor")?;
 
     let mut command = Command::new(&spawn.python);
     command
@@ -247,6 +255,20 @@ fn start_rank(args: &Args, spawn: Spawn) -> anyhow::Result<Rank> {
     for (name, value) in &spawn.environment {
         command.env(name, value);
     }
+    if let Some(listener) = store_listener {
+        let fd = uniserve_core::launch::inherit_listener(&mut command, listener);
+        spawn
+            .descriptor
+            .as_object_mut()
+            .context("the launch descriptor is not an object")?
+            .insert(
+                uniserve_core::launch::RENDEZVOUS_LISTEN_FD.to_owned(),
+                fd.into(),
+            );
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&spawn.descriptor)?)
+        .context("writing the launch descriptor")?;
+
     let child = command
         .spawn()
         .with_context(|| format!("spawning rank {} with {}", spawn.rank, spawn.python))?;
