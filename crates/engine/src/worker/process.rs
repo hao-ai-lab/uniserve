@@ -262,7 +262,8 @@ impl WorkerProcessArgs {
         components: &std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
         transfer_backends: &str,
         publish_backends: &str,
-        distributed_init_method: Option<String>,
+        rendezvous: Option<&str>,
+        rendezvous_listen_fd: Option<std::os::fd::RawFd>,
         channel_transport: &str,
         acknowledgment_slot: u32,
         host_slots: &[u32],
@@ -311,9 +312,15 @@ impl WorkerProcessArgs {
         );
         fields.insert("transfer_backends".into(), json!(transfer_backends));
         fields.insert("publish_backends".into(), json!(publish_backends));
+        // Every rank of a group connects to the collective store at this
+        // address. The group's first rank serves it on the socket it inherits
+        // at the named descriptor rather than binding the port itself; a
+        // first rank placed elsewhere has the number filled in by the
+        // launcher that holds its host's reservation.
+        fields.insert("rendezvous_address".into(), json!(rendezvous));
         fields.insert(
-            "distributed_init_method".into(),
-            json!(distributed_init_method),
+            uniserve_core::launch::RENDEZVOUS_LISTEN_FD.into(),
+            json!(rendezvous_listen_fd),
         );
         fields.insert(
             "distributed_backend".into(),
@@ -413,8 +420,6 @@ pub(super) struct RankProcess {
     /// never visible here; its liveness is its channel connection, which the
     /// launcher closes when it terminates the rank.
     child: Option<Child>,
-    /// The collective rendezvous address this group's ranks share.
-    _rendezvous: Option<String>,
     /// Retains the launch descriptor until the worker has read it.
     _launch_descriptor: tempfile::TempDir,
     depth: usize,
@@ -444,7 +449,6 @@ pub(super) struct PendingRank {
     max_payload: usize,
     /// Taken by adoption alongside the process it cancels.
     startup_abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    rendezvous: Option<String>,
     /// Retains the launch descriptor until the rank has read it; adoption
     /// transfers it to the channel that outlives this launch phase.
     launch_descriptor: Option<tempfile::TempDir>,
@@ -471,13 +475,18 @@ impl PendingRank {
     /// Spawns one rank, which reports its endpoint to `registration`.
     ///
     /// The rank's channel is bound afterwards from that report, so nothing here
-    /// names the endpoint and nothing waits for model readiness.
+    /// names the endpoint and nothing waits for model readiness. `rendezvous`
+    /// is the group's collective store address, and `store_listener` the
+    /// socket this rank serves that store on when it is the group's first rank
+    /// and this process spawns it; the rank inherits the socket and this
+    /// process keeps no copy.
     pub(crate) fn spawn_rank(
         args: &WorkerProcessArgs,
         device: &str,
         rank: u32,
         world_size: u32,
-        rendezvous: Option<String>,
+        rendezvous: Option<&str>,
+        store_listener: Option<std::net::TcpListener>,
         channel_transport: &str,
         remote: Option<&mut super::launcher::RemoteHost<'_>>,
         components: &std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
@@ -504,32 +513,11 @@ impl PendingRank {
                 .collect::<Vec<_>>()
                 .join(",")
         };
-        let distributed_init_method = rendezvous.clone();
-
-        // One typed descriptor carries every launch value. argv keeps the
-        // process identity and the descriptor's location so a running worker
-        // remains identifiable from the process table.
-        let descriptor = args.launch_descriptor(
-            device,
-            rank,
-            world_size,
-            registration,
-            components,
-            &names(&backends),
-            &names(&publications),
-            distributed_init_method,
-            channel_transport,
-            acknowledgment_slot,
-            &host_slots,
-            products_cross_hosts,
-        )?;
         let descriptor_directory = tempfile::Builder::new()
             .prefix("uniserve-worker-launch")
             .tempdir()
             .context("creating the worker launch descriptor directory")?;
         let descriptor_path = descriptor_directory.path().join("launch.json");
-        std::fs::write(&descriptor_path, serde_json::to_vec_pretty(&descriptor)?)
-            .context("writing the worker launch descriptor")?;
 
         let mut cmd = Command::new(&args.python);
         cmd.arg("-m")
@@ -562,6 +550,32 @@ impl PendingRank {
             let pp = std::env::var("PYTHONPATH").unwrap_or_default();
             cmd.env("PYTHONPATH", format!("{}:{}", cwd.display(), pp));
         }
+        // The command owns the store socket from here and closes this
+        // process's copy when it is dropped, after the spawn below.
+        let rendezvous_listen_fd = store_listener
+            .map(|listener| uniserve_core::launch::inherit_listener(&mut cmd, listener));
+
+        // One typed descriptor carries every launch value. argv keeps the
+        // process identity and the descriptor's location so a running worker
+        // remains identifiable from the process table.
+        let descriptor = args.launch_descriptor(
+            device,
+            rank,
+            world_size,
+            registration,
+            components,
+            &names(&backends),
+            &names(&publications),
+            rendezvous,
+            rendezvous_listen_fd,
+            channel_transport,
+            acknowledgment_slot,
+            &host_slots,
+            products_cross_hosts,
+        )?;
+        std::fs::write(&descriptor_path, serde_json::to_vec_pretty(&descriptor)?)
+            .context("writing the worker launch descriptor")?;
+
         // A rank placed on another host is started by that host's launcher,
         // which needs the same descriptor and environment this process would
         // have used. The head derives both once, here, for either path.
@@ -581,7 +595,6 @@ impl PendingRank {
                 depth,
                 max_payload,
                 startup_abort: Some(startup_abort),
-                rendezvous,
                 launch_descriptor: Some(descriptor_directory),
                 components: components.clone(),
             });
@@ -595,7 +608,6 @@ impl PendingRank {
             depth,
             max_payload,
             startup_abort: Some(startup_abort),
-            rendezvous,
             launch_descriptor: Some(descriptor_directory),
             components: components.clone(),
         })
@@ -656,7 +668,6 @@ impl PendingRank {
             .startup_abort
             .take()
             .expect("an unadopted rank retains its startup cancellation");
-        let rendezvous = self.rendezvous.take();
         let components = std::mem::take(&mut self.components);
         // A watcher observes a process identifier, so only a rank this engine
         // started has one. A rank elsewhere falls to the bounded liveness
@@ -669,7 +680,6 @@ impl PendingRank {
             info: WorkerInfo::default(),
             startup_cancel: Some(startup_abort),
             child,
-            _rendezvous: rendezvous,
             _launch_descriptor: launch_descriptor,
             depth,
             rank,

@@ -37,6 +37,8 @@ REQUIRED_FIELDS = (
     "supported_calls",
     "transfer_backends",
     "publish_backends",
+    "rendezvous_address",
+    "rendezvous_listen_fd",
     "attention_backend",
     "block_size",
     "max_batch_calls",
