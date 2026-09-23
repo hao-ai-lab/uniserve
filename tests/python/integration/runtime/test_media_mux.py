@@ -11,7 +11,7 @@ import av
 import numpy as np
 import pytest
 
-from uniserve_worker.media.codec_process import (
+from uniserve_worker.media.container import (
     AvMuxConfig,
     AvMuxSession,
     encode_audio_track,

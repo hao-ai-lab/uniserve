@@ -30,7 +30,10 @@ from uniserve_worker.bootstrap.capacity import (
     device_total_bytes,
     resolve_request_capacity,
 )
-from uniserve_worker.bootstrap.components import MUXER_COMPONENT, codec_workers
+from uniserve_worker.bootstrap.components import (
+    MUXER_COMPONENT,
+    holds_host_components,
+)
 from uniserve_worker.bootstrap.distributed import initialize_components
 from uniserve_worker.bootstrap.inputs import capability, image_builder
 from uniserve_worker.bootstrap.model_loader import (
@@ -50,6 +53,11 @@ from uniserve_worker.execution.executor import Executor, Submission
 from uniserve_worker.execution.host import HostLane
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.execution.request import RequestPool
+from uniserve_worker.media.container import (
+    AUDIO_CODEC,
+    VIDEO_CODEC,
+    require_media_codecs,
+)
 from uniserve_worker.media.mux import MediaMux
 from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.profiling import (
@@ -571,15 +579,17 @@ class Worker:
             )
             startup.callback(self.tensor_store.close)
 
-            # A rank holding host components runs its codecs in the lane's
-            # codec processes, one per media unit it encodes at once plus the
-            # muxer's; any other rank's host work is plain callables, so it
-            # spawns none.
-            codecs = codec_workers(dict(components))
-            self.host_tasks = HostLane(
-                max_inflight=codecs or int(arena.host_lane_inflight),
-                workers=codecs or min(4, int(arena.host_lane_inflight)),
-                codec=codecs > 0,
+            # A rank holding host components is one codec slot: its lane runs
+            # one codec task at a time on one thread. Any other rank's host
+            # work is bounded by its arena.
+            self.codec_slot = holds_host_components(components)
+            self.host_tasks = (
+                HostLane(max_inflight=1, workers=1)
+                if self.codec_slot
+                else HostLane(
+                    max_inflight=int(arena.host_lane_inflight),
+                    workers=min(4, int(arena.host_lane_inflight)),
+                )
             )
             startup.callback(self.host_tasks.close)
 
@@ -634,10 +644,10 @@ class Worker:
                     max_inflight=int(queue_depth),
                 )
 
-            # The muxer rank assembles artifacts in its lane's codec process.
+            # The muxer rank assembles artifacts on its lane.
             muxer = self.runner.bindings.get(MUXER_COMPONENT)
             self.media_mux = (
-                MediaMux(rank=worker_config.rank, lane=self.host_tasks)
+                MediaMux(rank=worker_config.rank)
                 if muxer is not None
                 and muxer.owns
                 and worker_config.rank == info.output_rank(MUXER_COMPONENT)
@@ -736,9 +746,10 @@ class Worker:
                 tokenizer=self.tokenizer, latents=self.latent_pool
             )
             warmup_requests(self)
-        # A host rank is ready once every codec process answers and loads
-        # its codecs, so a missing codec surfaces here and not under a request.
-        self.host_tasks.probe()
+        # A host rank is ready once its codecs load, so a missing codec
+        # surfaces here and not under a request.
+        if self.codec_slot:
+            require_media_codecs(VIDEO_CODEC, AUDIO_CODEC)
         self.runner.complete_startup()
 
         # Startup scenarios must release their requests before service

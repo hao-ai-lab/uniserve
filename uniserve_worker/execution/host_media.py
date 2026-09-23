@@ -1,19 +1,21 @@
 """Host media calls: media unit encoding, audio encoding and muxing.
 
-These calls run on host ranks. A video encode consumes the RGB media units
-its rank is handed from a decode round, borrowed in place from the
-shared-storage segment the decoding rank on this host published, so a codec
-process reads the producer's bytes directly; the encoded unit rows are this
-rank's product, published when the encodes complete. An audio encode
-consumes the request's PCM timeline, imported like any product because its
-decoding ranks may be on other hosts, and staged in a segment of this rank's
-own for the codec; a mux consumes the encoded unit rows.
+These calls run on host ranks, one codec task at a time per rank. A video
+encode consumes the RGB media units its rank is handed from a decode round,
+borrowed in place from the shared-storage segment the decoding rank on this
+host published, so the codec reads the producer's bytes directly; the
+encoded unit rows are this rank's product, published when the encodes
+complete. An audio encode consumes the request's PCM timeline, imported like
+any product because its decoding ranks may be on other hosts; a mux consumes
+the encoded unit rows.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
+
+import numpy as np
 
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.execution import calls
@@ -210,39 +212,17 @@ def read_encoded_units(
     return tuple(units[index] for index in range(tensor.shape[0]))
 
 
-def _stage_tensor(value: torch.Tensor) -> HostBorrow:
-    """Copy a tensor into a segment of this rank's own for a codec process.
+def _host_array(value: torch.Tensor) -> np.ndarray:
+    """Copy an imported tensor into the rank's own host array for a codec.
 
-    Codecs read media bytes from a named shared-storage segment. An input
-    imported from another host instead lives in this rank's tensor store, so
-    it is copied to a local segment whose borrow unlinks it after the codec has
-    read it.
+    An input imported from another host lives in this rank's tensor store,
+    whose storage the call's retirement returns; the codec runs later on the
+    lane, so it reads a copy the task owns.
     """
     import torch
 
-    from uniserve_worker.transport.shared_storage import allocate_shared_storage
-    from uniserve_worker.transport.shm import HostBorrow
-
-    raw = value.detach().to("cpu").contiguous().view(torch.uint8).reshape(-1)
-    nbytes = int(raw.numel())
-    if nbytes < 1:
-        raise invalid_descriptor("codec input is empty")
-    segment = allocate_shared_storage(nbytes)
-    try:
-        # The mapping is dropped before the borrow is released, so closing
-        # the segment finds no exported buffer.
-        torch.frombuffer(segment.buf, dtype=torch.uint8).copy_(raw)
-    except BaseException:
-        segment.close()
-        segment.unlink()
-        raise
-
-    def release() -> None:
-        segment.close()
-        segment.unlink()
-
-    return HostBorrow(
-        segment=segment.name, offset=0, nbytes=nbytes, _release=release
+    return (
+        value.detach().to("cpu").contiguous().view(torch.uint8).numpy().copy()
     )
 
 
@@ -311,40 +291,49 @@ def execute(
                 positions, reservations, strict=True
             ):
                 # The round's product is indexed from its own first unit;
-                # the unit's index in the track names its frame count.
+                # the unit's index in the track names its frame count. The
+                # unit's row is padded to the round's longest unit.
                 unit = cursor + position
+                frames = config.video_unit_frames[unit]
+                expected = frames * config.height * config.width * 3
+                source: HostBorrow | np.ndarray
                 if imported_units is None:
                     borrow = _borrow(
                         publication, position, transports=transports
                     )
+                    borrows.append(borrow)
+                    if borrow.nbytes < expected:
+                        raise invalid_descriptor(
+                            "decoded media unit holds fewer bytes than its "
+                            "frames"
+                        )
+                    borrow.nbytes = expected
+                    source = borrow
                 else:
                     if position >= int(imported_units.shape[0]):
                         raise invalid_descriptor(
                             "video encoding position exceeds the imported "
                             "decoded unit round"
                         )
-                    borrow = _stage_tensor(
-                        imported_units[position : position + 1]
-                    )
-                borrows.append(borrow)
-                frames = config.video_unit_frames[unit]
-                expected = frames * config.height * config.width * 3
-                if borrow.nbytes < expected:
-                    raise invalid_descriptor(
-                        "decoded media unit holds fewer bytes than its frames"
-                    )
-                borrow.nbytes = expected
+                    source = _host_array(imported_units[position])
+                    if source.size < expected:
+                        raise invalid_descriptor(
+                            "decoded media unit holds fewer bytes than its "
+                            "frames"
+                        )
+                    source = source[:expected]
                 scheduled.append(
                     encoder.unit(
                         call.request_key,
                         config=config,
                         unit_index=unit,
-                        source=borrow,
+                        source=source,
                         reservation=reservation,
                         call_id=call.call_id,
                     )
                 )
         except BaseException:
+            # A configured task owns its borrow; release only the rest.
             for borrow in borrows[len(scheduled) :]:
                 borrow.release()
             raise
@@ -412,16 +401,12 @@ def execute(
             raise invalid_descriptor(
                 "audio encoding requires the complete PCM timeline"
             )
-        track = _stage_tensor(read.tensor)
-        try:
-            tasks = (
-                media_mux.audio(
-                    call.request_key, track, reservations[0], call.call_id
-                ),
-            )
-        except BaseException:
-            track.release()
-            raise
+        pcm = _host_array(read.tensor).view(np.int16)
+        tasks = (
+            media_mux.audio(
+                call.request_key, pcm, reservations[0], call.call_id
+            ),
+        )
 
     elif call.kind is MediaCall.MUXING:
         if media_mux is None:

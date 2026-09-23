@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from uniserve.distributed import DeviceMesh, communication_axes
 from uniserve.model import CausalLM
 from uniserve.runtime.process_groups import ProcessGroups
+from uniserve_worker.bootstrap.components import is_host_component
 from uniserve_worker.bootstrap.model_loader import attention_parallel
 from uniserve_worker.config.deployment import ComponentConfig
 from uniserve_worker.model_executor.component_binding import (
@@ -26,7 +27,13 @@ def initialize_components(
     rings = {}
     participation = {}
     for name, component in sorted(components.items()):
-        if component.distribution is not None:
+        if component.distribution is not None and is_host_component(name):
+            # A host component encodes each media unit independently and
+            # exchanges nothing, so its ranks stay outside any collective.
+            if groups.rank not in component.ranks:
+                continue
+            ranks = (groups.rank,)
+        elif component.distribution is not None:
             # Media units are independent local invocations, so the numerical
             # mesh is this rank alone. The ranks holding consecutive units still
             # exchange the overlap between them, over a ring every rank creates

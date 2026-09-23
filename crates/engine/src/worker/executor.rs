@@ -121,71 +121,92 @@ pub struct WorkerExecutor {
     closed: bool,
 }
 
-/// Refuses a placement whose decoded video media units would leave their host.
+/// Returns, for each worker that decodes video, the encoder replicas that
+/// keep every media unit it decodes on the host that decoded it.
 ///
 /// A decoded media unit is a host product of tens of megabytes that its
-/// encoder reads through shared storage; the unit decoded on one rank is
-/// encoded on the rank holding its index, so both must share a host. A
-/// placement that separates them is refused at startup, naming the ranks,
-/// rather than moving every unit through the head's channel.
-pub(crate) fn refuse_units_crossing_hosts(
+/// encoder reads in place from shared storage, which is named in one host's
+/// namespace. A round deals its units to each component's ranks in order,
+/// `units_per_rank` consecutive positions each, so position `p` is decoded by
+/// the decoder's rank `p / per_decoder` and encoded by the encoder's rank
+/// `p / per_encoder`. A pairing is admissible when the encoder covers a whole
+/// round and those two ranks share a host at every position. Requests are
+/// routed only to admissible pairings, and a decoding worker without one is
+/// refused at startup, naming the unit and the hosts it would cross.
+pub(crate) fn video_unit_encoders(
     routing: &std::collections::BTreeMap<uniserve_worker_ipc::MediaCall, String>,
     placements: &[(
         &WorkerId,
         &[crate::WorkerRank],
         &std::collections::BTreeMap<String, crate::ComponentConfig>,
     )],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<std::collections::BTreeMap<WorkerId, std::collections::BTreeSet<WorkerId>>> {
+    let mut pairings = std::collections::BTreeMap::new();
     let (Some(decoder), Some(encoder)) = (
         routing.get(&uniserve_worker_ipc::MediaCall::VideoDecoding),
         routing.get(&uniserve_worker_ipc::MediaCall::VideoEncoding),
     ) else {
-        return Ok(());
+        return Ok(pairings);
     };
-    let owner = |component: &str| {
-        placements.iter().find_map(|(id, ranks, components)| {
-            components
-                .get(component)
-                .map(|config| (*id, *ranks, config))
-        })
+    let holders = |component: &str| {
+        placements
+            .iter()
+            .filter_map(|(id, ranks, components)| {
+                components
+                    .get(component)
+                    .map(|config| (*id, *ranks, config))
+            })
+            .collect::<Vec<_>>()
     };
-    let (
-        Some((decoder_worker, decoder_ranks, decoder_config)),
-        Some((encoder_worker, encoder_ranks, encoder_config)),
-    ) = (owner(decoder), owner(encoder))
-    else {
-        return Ok(());
-    };
-    if decoder_worker == encoder_worker {
-        return Ok(());
-    }
-    // A round deals its media units to each component's ranks in order,
-    // `units_per_rank` consecutive positions each, so position `p` is
-    // decoded by the decoder's rank `p / per_decoder` and encoded by the
-    // encoder's rank `p / per_encoder`.
-    let per_decoder = decoder_config.units_per_rank.max(1);
-    let per_encoder = encoder_config.units_per_rank.max(1);
-    let round_units = decoder_config.ranks.len() * per_decoder;
-    for position in 0..round_units {
-        let decoding_rank = decoder_config.ranks[position / per_decoder];
-        let Some(&encoding_rank) = encoder_config.ranks.get(position / per_encoder) else {
-            continue;
-        };
-        let decoding_host = decoder_ranks
-            .get(decoding_rank)
-            .map_or("<unplaced>", |rank| rank.node.as_str());
-        let encoding_host = encoder_ranks
-            .get(encoding_rank)
-            .map_or("<unplaced>", |rank| rank.node.as_str());
+    let encoders = holders(encoder);
+    for (decoder_worker, decoder_ranks, decoder_config) in holders(decoder) {
+        let per_decoder = decoder_config.units_per_rank.max(1);
+        let round_units = decoder_config.ranks.len() * per_decoder;
+        let mut admissible = std::collections::BTreeSet::new();
+        let mut refusals = Vec::new();
+        for (encoder_worker, encoder_ranks, encoder_config) in &encoders {
+            let per_encoder = encoder_config.units_per_rank.max(1);
+            let coverage = encoder_config.ranks.len() * per_encoder;
+            if coverage < round_units {
+                refusals.push(format!(
+                    "worker {encoder_worker} encodes {coverage} units per round and worker \
+                     {decoder_worker} decodes {round_units}"
+                ));
+                continue;
+            }
+            let crossing = (0..round_units).find_map(|position| {
+                let decoding_rank = decoder_config.ranks[position / per_decoder];
+                let encoding_rank = encoder_config.ranks[position / per_encoder];
+                let decoding_host = decoder_ranks
+                    .get(decoding_rank)
+                    .map_or("<unplaced>", |rank| rank.node.as_str());
+                let encoding_host = encoder_ranks
+                    .get(encoding_rank)
+                    .map_or("<unplaced>", |rank| rank.node.as_str());
+                (decoding_host != encoding_host).then(|| {
+                    format!(
+                        "media unit {position} is decoded by rank {decoding_rank} of worker \
+                         {decoder_worker} on host {decoding_host} and would be encoded by rank \
+                         {encoding_rank} of worker {encoder_worker} on host {encoding_host}"
+                    )
+                })
+            });
+            match crossing {
+                Some(refusal) => refusals.push(refusal),
+                None => {
+                    admissible.insert((*encoder_worker).clone());
+                }
+            }
+        }
         anyhow::ensure!(
-            decoding_host == encoding_host,
-            "media unit {position} is decoded by rank {decoding_rank} of worker {decoder_worker} \
-             on host {decoding_host} and encoded by rank {encoding_rank} of worker \
-             {encoder_worker} on host {encoding_host}; a decoded media unit reaches its encoder \
-             through shared storage and must stay on its host"
+            !admissible.is_empty(),
+            "no video encoder keeps the media units of worker {decoder_worker} on their host, \
+             where their encoder reads them through shared storage: {}",
+            refusals.join("; ")
         );
+        pairings.insert(decoder_worker.clone(), admissible);
     }
-    Ok(())
+    Ok(pairings)
 }
 
 impl WorkerExecutor {
@@ -218,7 +239,7 @@ impl WorkerExecutor {
                 .validate()
                 .with_context(|| format!("worker {id} reported invalid capabilities"))?;
         }
-        let executor_info = ExecutorInfo::from_workers(
+        let mut executor_info = ExecutorInfo::from_workers(
             workers
                 .iter()
                 .map(|worker| (worker.0.clone(), worker.1.info().clone()))
@@ -234,7 +255,7 @@ impl WorkerExecutor {
                 (id, ranks, components)
             })
             .collect::<Vec<_>>();
-        refuse_units_crossing_hosts(&media_routing, &placements)?;
+        executor_info.video_encoders = video_unit_encoders(&media_routing, &placements)?;
         for (_, worker) in &mut workers {
             worker.set_media_routing(media_routing.clone());
         }
@@ -1538,7 +1559,7 @@ impl Executor for WorkerExecutor {
 
 #[cfg(test)]
 mod placement_tests {
-    use super::refuse_units_crossing_hosts;
+    use super::video_unit_encoders;
     use crate::WorkerRank;
     use crate::executor::{ComponentConfig, WorkerId};
     use std::collections::BTreeMap;
@@ -1682,6 +1703,12 @@ mod placement_tests {
         );
     }
 
+    fn pairing(
+        placements: &[(&WorkerId, &[WorkerRank], &BTreeMap<String, ComponentConfig>)],
+    ) -> anyhow::Result<BTreeMap<WorkerId, std::collections::BTreeSet<WorkerId>>> {
+        video_unit_encoders(&routing(), placements)
+    }
+
     #[test]
     fn units_encoded_on_their_own_host_are_admitted() {
         let model = WorkerId("model".to_owned());
@@ -1692,26 +1719,29 @@ mod placement_tests {
             rank("b", "cuda:0"),
             rank("b", "cuda:1"),
         ];
-        let host_ranks = vec![rank("a", "cpu"), rank("b", "cpu")];
+        let host_ranks = vec![
+            rank("a", "cpu"),
+            rank("a", "cpu"),
+            rank("b", "cpu"),
+            rank("b", "cpu"),
+        ];
         let model_components =
             BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
         let host_components =
-            BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0, 1], 2))]);
-        refuse_units_crossing_hosts(
-            &routing(),
-            &[
-                (&model, &model_ranks, &model_components),
-                (&host, &host_ranks, &host_components),
-            ],
-        )
-        .expect("two units per host rank stay on their host");
+            BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
+        let pairings = pairing(&[
+            (&model, &model_ranks, &model_components),
+            (&host, &host_ranks, &host_components),
+        ])
+        .expect("each unit is encoded on its own host");
+        assert_eq!(pairings[&model], [host].into());
     }
 
     #[test]
     fn a_decoder_dealing_several_units_per_rank_keeps_them_on_its_host() {
-        // Two units per decoding rank and four per host rank: positions 0
-        // to 3 come from host a's decoders and go to host a's encoder,
-        // positions 4 to 7 likewise on host b.
+        // Two units per decoding rank: positions 0 to 3 come from host a's
+        // decoders and go to host a's encoders, positions 4 to 7 likewise on
+        // host b.
         let model = WorkerId("model".to_owned());
         let host = WorkerId("host".to_owned());
         let model_ranks = vec![
@@ -1720,54 +1750,112 @@ mod placement_tests {
             rank("b", "cuda:0"),
             rank("b", "cuda:1"),
         ];
-        let host_ranks = vec![rank("a", "cpu"), rank("b", "cpu")];
+        let host_ranks = [["a"; 4], ["b"; 4]]
+            .concat()
+            .into_iter()
+            .map(|node| rank(node, "cpu"))
+            .collect::<Vec<_>>();
         let model_components =
             BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1, 2, 3], 2))]);
         let host_components =
-            BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0, 1], 4))]);
-        refuse_units_crossing_hosts(
-            &routing(),
-            &[
-                (&model, &model_ranks, &model_components),
-                (&host, &host_ranks, &host_components),
-            ],
-        )
+            BTreeMap::from([("video_encoder".to_owned(), distributed((0..8).collect(), 1))]);
+        pairing(&[
+            (&model, &model_ranks, &model_components),
+            (&host, &host_ranks, &host_components),
+        ])
         .expect("each host's units are encoded on it");
 
-        // Three per host rank splits host a's fourth unit off to host b.
-        let host_components =
-            BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0, 1], 3))]);
-        let error = refuse_units_crossing_hosts(
-            &routing(),
-            &[
-                (&model, &model_ranks, &model_components),
-                (&host, &host_ranks, &host_components),
-            ],
-        )
+        // Host a holding three encoders sends its fourth unit to host b.
+        let host_ranks = [["a"; 3].as_slice(), ["b"; 5].as_slice()]
+            .concat()
+            .into_iter()
+            .map(|node| rank(node, "cpu"))
+            .collect::<Vec<_>>();
+        let error = pairing(&[
+            (&model, &model_ranks, &model_components),
+            (&host, &host_ranks, &host_components),
+        ])
         .expect_err("the fourth unit leaves host a");
         assert!(error.to_string().contains("media unit 3"), "{error}");
     }
 
     #[test]
-    fn a_unit_encoded_on_another_host_is_refused_by_name() {
-        let model = WorkerId("model".to_owned());
-        let host = WorkerId("host".to_owned());
-        let model_ranks = vec![rank("a", "cuda:0"), rank("b", "cuda:0")];
-        let host_ranks = vec![rank("a", "cpu")];
-        let model_components =
-            BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1], 1))]);
-        let host_components =
-            BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0], 2))]);
-        let error = refuse_units_crossing_hosts(
-            &routing(),
-            &[
-                (&model, &model_ranks, &model_components),
-                (&host, &host_ranks, &host_components),
-            ],
-        )
-        .expect_err("the second unit leaves host b");
+    fn every_shipped_deployment_encodes_its_units_on_their_host() {
+        // The deployment files in `config/` must pass the placement checks
+        // the engine applies at startup, including the pairing of every
+        // decoding worker with an encoder on its host.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&root).expect("the deployment directory exists") {
+            let path = entry.expect("readable entry").path();
+            let is_media = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("minimax-h3-") && name.ends_with(".json"));
+            if !is_media {
+                continue;
+            }
+            let workers: Vec<crate::WorkerConfig> =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("readable file"))
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            crate::WorkerConfig::validate_all(&workers)
+                .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
+            let ids = workers
+                .iter()
+                .map(|worker| worker.id.clone())
+                .collect::<Vec<_>>();
+            let placements = workers
+                .iter()
+                .zip(&ids)
+                .map(|(worker, id)| (id, worker.ranks.as_slice(), &worker.components))
+                .collect::<Vec<_>>();
+            let pairings = pairing(&placements)
+                .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
+            let decoders = workers
+                .iter()
+                .filter(|worker| worker.components.contains_key("video_decoder"))
+                .count();
+            assert_eq!(pairings.len(), decoders, "{}", path.display());
+            checked += 1;
+        }
+        assert!(checked > 0, "no FastH3 deployment was checked");
+    }
+
+    #[test]
+    fn each_replica_decoder_pairs_with_the_encoders_on_its_host() {
+        // Single-device flow replicas decode one unit per round, so every
+        // round is position zero: an encoder replica is admissible only on
+        // the replica's own host.
+        let flows = [
+            (WorkerId("flow-a".to_owned()), vec![rank("a", "cuda:0")]),
+            (WorkerId("flow-b".to_owned()), vec![rank("b", "cuda:0")]),
+        ];
+        let encoders = [
+            (WorkerId("encoder-a".to_owned()), vec![rank("a", "cpu")]),
+            (WorkerId("encoder-b".to_owned()), vec![rank("b", "cpu")]),
+        ];
+        let decoder = BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0], 1))]);
+        let encoder = BTreeMap::from([("video_encoder".to_owned(), distributed(vec![0], 1))]);
+        let placements = flows
+            .iter()
+            .map(|(id, ranks)| (id, ranks.as_slice(), &decoder))
+            .chain(
+                encoders
+                    .iter()
+                    .map(|(id, ranks)| (id, ranks.as_slice(), &encoder)),
+            )
+            .collect::<Vec<_>>();
+
+        let pairings = pairing(&placements).expect("every host has an encoder");
+
+        assert_eq!(pairings[&flows[0].0], [encoders[0].0.clone()].into());
+        assert_eq!(pairings[&flows[1].0], [encoders[1].0.clone()].into());
+
+        // Without an encoder on host b, the replica there is refused by name
+        // even though another replica pairs.
+        let error = pairing(&placements[..3]).expect_err("host b has no encoder");
         let message = error.to_string();
-        assert!(message.contains("media unit 1"), "{message}");
+        assert!(message.contains("worker flow-b"), "{message}");
         assert!(
             message.contains("host b") && message.contains("host a"),
             "{message}"
