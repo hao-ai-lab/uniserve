@@ -106,17 +106,13 @@ async fn async_main(cli: Cli) -> Result<()> {
             args.runtime
                 .served_model_name
                 .get_or_insert_with(|| args.runtime.model.clone());
-            // The checkpoint decides whether this deployment serves video, and
-            // that choice sizes the queue, batch and IPC slot budgets.
-            let is_media =
-                uniserve_server::profile::assets::is_media_checkpoint(&args.runtime.model).await;
             // The model states which components it owns and how each one
             // partitions; this process places its ranks across the hosts.
-            let settings = args.runtime.engine_settings(is_media);
+            let settings = args.runtime.engine_settings();
             info!(model = %args.runtime.model,
                 workers = ?settings.workers, resident_requests = settings.max_num_seqs,
                 python = %args.runtime.worker_python.display(), "resolved deployment");
-            uniserve_server::serve(args.to_uniserve_config(is_media), shutdown_signal()).await
+            uniserve_server::serve(args.to_uniserve_config(), shutdown_signal()).await
         }
     }
 }

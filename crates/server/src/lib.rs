@@ -61,7 +61,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         .await
         .with_context(|| format!("failed to resolve model assets for `{}`", config.model))?;
     let effective_max_model_len = model_config.max_model_tokens();
-    let request_slot_capacity = model_config.request_slot_capacity();
+    let channel_payload_capacity = model_config.channel_payload_capacity();
     let control_tokens = special_token_ids(&model_config);
     let generation_limits =
         model_config.generation_limits(config.engine.worker_process.model_dtype.clone());
@@ -84,7 +84,12 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         .context("max_num_batched_tokens exceeds the worker field width")?;
     let worker_process = WorkerProcessArgs {
         model: config.model.clone(),
-        req_slot_cap: request_slot_capacity,
+        req_slot_cap: channel_payload_capacity,
+        resp_slot_cap: config
+            .engine
+            .worker_process
+            .resp_slot_cap
+            .max(channel_payload_capacity),
         max_batch_calls,
         max_batch_tokens,
         max_model_len: effective_max_model_len,

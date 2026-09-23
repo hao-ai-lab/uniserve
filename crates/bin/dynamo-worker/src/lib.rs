@@ -26,7 +26,10 @@ use serde_json::{Map, Value, json};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 use uniserve_core::MediaKind;
-use uniserve_engine::{SchedulingPolicy, WorkerConfig, WorkerProcessArgs};
+use uniserve_engine::{
+    DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
+    SchedulingPolicy, WorkerConfig, WorkerProcessArgs,
+};
 use uniserve_server::{
     AppState, Config, EngineSettings, HttpListenerMode,
     openai::{VideoGenerationRequest, serve_error_to_api},
@@ -39,9 +42,6 @@ const H3_HEIGHT: u32 = 768;
 const H3_MIN_FRAMES: u32 = 22;
 const H3_DENOISE_STEPS: i32 = 4;
 const H3_AUDIO_SAMPLE_RATE: i32 = 32_000;
-/// Call batches kept in flight against each Worker, matching the serving
-/// command's media default.
-const MEDIA_QUEUE_DEPTH: usize = 6;
 
 #[derive(Clone, Parser)]
 #[command(
@@ -180,8 +180,6 @@ impl DynamoFastH3Engine {
             python: self.args.worker_python.clone(),
             model: self.args.model_path.clone(),
             host: self.args.host_identity.clone(),
-            queue_depth: MEDIA_QUEUE_DEPTH,
-            resp_slot_cap: EngineSettings::MEDIA_IPC_SLOT_CAP,
             quantization_config: self.args.quantization_config.clone(),
             graph_policy: self.args.graph_policy.clone(),
             ..WorkerProcessArgs::default()
@@ -189,10 +187,10 @@ impl DynamoFastH3Engine {
 
         let config = Config {
             engine: EngineSettings {
-                max_batch: 2,
-                max_num_batched_tokens: 2,
+                max_batch: DEFAULT_MAX_BATCH,
+                max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
                 max_num_seqs: self.args.max_running_requests,
-                long_prefill_threshold: 1,
+                long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
                 mixed_prefill_tokens: 0,
                 scheduler_policy: SchedulingPolicy::Fcfs,
                 max_model_len: Some(self.args.max_model_len),

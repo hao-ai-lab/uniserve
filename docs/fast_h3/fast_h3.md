@@ -99,8 +99,6 @@ uniserve serve "$H3_MODEL" \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
   --max-running-requests 8 \
-  --max-batch 8 \
-  --max-num-batched-tokens 8 \
   --video-graph-shapes 5x1000
 ```
 
@@ -115,7 +113,7 @@ The two supplied placements isolate the main topology choices:
 
 Each GPU decoder has one native media unit per rank, so a one-GPU flow replica reconstructs an eight-unit request in eight bounded decode rounds. The host video encoder accepts all eight units on its one CPU rank and exposes eight bounded codec processes; creating eight separate CPU workers would duplicate mux ownership without increasing the useful codec parallelism. Audio encoding and final MP4 muxing stay serialized per request in the host worker because they are short relative to denoising and need one ordered artifact owner.
 
-The queue depths are intentional capacity values. A media request slot retains three unresolved execution windows, and every flow worker must expose at least two resident slots, so each one-GPU flow uses depth 6. The shared TP8 text worker uses depth 24 for eight slots; each of the two TP4 text workers uses depth 12 for four slots. The host worker also uses depth 24 so its shared request-row bank exposes eight slots. The narrowest aggregate component capacity is therefore eight complete routes in either deployment.
+The queue depths are intentional capacity values. A resident media request slot occupies three positions of its worker's batch queue, one reserved pipeline position and two unresolved outputs, and every flow worker must expose at least two resident slots, so each one-GPU flow uses depth 6. The shared TP8 text worker uses depth 24 for eight slots; each of the two TP4 text workers uses depth 12 for four slots. The host worker also uses depth 24 so its shared request-row bank exposes eight slots. The narrowest aggregate component capacity is therefore eight complete routes in either deployment.
 
 The `memory_fraction` on each GPU worker is its per-process static storage ceiling. A text worker and a flow worker intentionally share every GPU, so neither inherits the global `--mem-fraction-static` default. Both supplied layouts grant 0.18 to each text rank and 0.81 to each flow replica; the physical free-storage check still caps their combined allocations. On 96 GB RTX PRO 6000 devices, the TP8 layout retained 5.5 GiB or more at the measured concurrency-eight peak. TP4×2 reached 97,244 MiB on the two GPUs holding text rank 0, leaving only 100 MiB; it is a measured maximum-throughput option, not the production default. Treat the supplied split as part of the five-second, 1000-token deployment contract and revalidate it when checkpoint precision, maximum duration, prompt bound, graph shapes, or hardware change.
 
