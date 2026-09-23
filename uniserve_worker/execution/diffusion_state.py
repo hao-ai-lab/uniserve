@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -46,3 +47,6 @@ class VideoState:
     schedules: dict[str, Schedule]
     tensors: dict[str, dict[str, torch.Tensor]] = field(default_factory=dict)
     denoising: Trajectory | None = None
+    #: The seeded noise draw started when the request was admitted; latent
+    #: preparation reads the noise, and retirement waits, once it completes.
+    noise: Future[None] | None = None

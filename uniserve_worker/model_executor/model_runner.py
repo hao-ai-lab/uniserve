@@ -18,7 +18,6 @@ from uniserve.tensors import TensorOutput
 from uniserve_worker.errors import ComputeError
 from uniserve_worker.protocol.output import ForwardStats
 
-from .component_binding import capture_required
 from .cuda_graph import (
     CUDAGraphRunner,
     Execution,
@@ -137,10 +136,9 @@ class ModelRunner(Execution, ABC):
         resources = self.resources()
         with context.activate():
             if self.pools:
-                missing = capture_required(
-                    graph is None, self.call.groups, self.device
-                )
-                if missing:
+                # A component's ranks run the same calls with the same input
+                # signatures, so they find the same graph resident.
+                if graph is None:
                     self.close_bucket(key)
                     with self.graph_storage.allocate(self):
                         static = clone_inputs(values)
