@@ -105,29 +105,25 @@
   {
     "id": "host",
     "ranks": [
-      {
-        "node": "rank-0",
-        "device": "cpu"
-      },
-      {
-        "node": "rank-1",
-        "device": "cpu"
-      }
+      { "node": "rank-0", "device": "cpu" },
+      { "node": "rank-0", "device": "cpu" },
+      { "node": "rank-0", "device": "cpu" },
+      { "node": "rank-0", "device": "cpu" },
+      { "node": "rank-1", "device": "cpu" },
+      { "node": "rank-1", "device": "cpu" },
+      { "node": "rank-1", "device": "cpu" },
+      { "node": "rank-1", "device": "cpu" },
+      { "node": "rank-0", "device": "cpu" }
     ],
     "components": {
       "video_encoder": {
-        "ranks": [
-          0,
-          1
-        ],
+        "ranks": [0, 1, 2, 3, 4, 5, 6, 7],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 4
+        "units_per_rank": 1
       },
       "muxer": {
-        "ranks": [
-          0
-        ],
+        "ranks": [8],
         "parallel_config": {}
       }
     },

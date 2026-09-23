@@ -209,11 +209,21 @@ impl Scheduler {
             if routes.contains_key(&component) {
                 continue;
             }
+            // A request's media units are encoded where they were decoded, so
+            // its encoder is one of the replicas admissible for its decoder.
+            let admissible = (call == MediaCall::VideoEncoding)
+                .then(|| {
+                    let decoder = self.info.media_components.get(&MediaCall::VideoDecoding)?;
+                    let worker = routes.get(decoder)?;
+                    self.executor.info().video_encoders.get(worker)
+                })
+                .flatten();
             let candidates = self
                 .placement
                 .component_candidates(self.executor.as_ref(), CallKind::Media(call), &component)
                 .filter(|(worker, _, _)| {
-                    self.executor.is_ready(worker)
+                    admissible.is_none_or(|encoders| encoders.contains(*worker))
+                        && self.executor.is_ready(worker)
                         && (selected_workers.contains(*worker)
                             || self
                                 .storage

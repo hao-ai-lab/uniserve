@@ -57,21 +57,13 @@ def is_host_component(name: str) -> bool:
     return name in HOST_COMPONENTS
 
 
-def codec_workers(components: Mapping[str, ComponentConfig]) -> int:
-    """Count the codec processes a rank holding these components runs.
+def holds_host_components(names: Iterable[str]) -> bool:
+    """Report whether a rank holding these components is a codec slot.
 
-    One process encodes each media unit the rank takes in a round, and a
-    muxer needs one more for the audio track and the container it assembles
-    while units are still being encoded. A rank holding no host component
-    runs none.
+    A host rank runs one codec task at a time in its own process: one media
+    unit's encode, the audio track's, or one step of a container's assembly.
     """
-    count = 0
-    encoder = components.get(VIDEO_ENCODER_COMPONENT)
-    if encoder is not None:
-        count += max(1, int(encoder.units_per_rank))
-    if MUXER_COMPONENT in components:
-        count += 1
-    return count
+    return any(is_host_component(name) for name in names)
 
 
 def call_kinds(calls: Iterable[Call]) -> frozenset[CallKind]:
@@ -322,12 +314,12 @@ def validate_components(
                     "the muxer assembles one artifact and is not distributed"
                 )
             if name == VIDEO_ENCODER_COMPONENT and (
-                component.distribution not in (None, "temporal_units")
-                or component.units_per_rank < 1
+                component.distribution != "temporal_units"
+                or component.units_per_rank != 1
             ):
                 raise unsupported_setup(
-                    "video encoding distributes by temporal_units with at "
-                    "least one media unit per rank"
+                    "video encoding distributes by temporal_units with one "
+                    "media unit per rank, each rank one codec slot"
                 )
             continue
         if any(isinstance(call.module, VideoDecoder) for call in calls):

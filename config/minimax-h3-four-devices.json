@@ -35,15 +35,24 @@
   },
   {
     "id": "host",
-    "ranks": [{ "node": "localhost", "device": "cpu" }],
+    "ranks": [
+      { "node": "localhost", "device": "cpu" },
+      { "node": "localhost", "device": "cpu" },
+      { "node": "localhost", "device": "cpu" },
+      { "node": "localhost", "device": "cpu" },
+      { "node": "localhost", "device": "cpu" }
+    ],
     "components": {
       "video_encoder": {
-        "ranks": [0],
+        "ranks": [0, 1, 2, 3],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 4
+        "units_per_rank": 1
       },
-      "muxer": { "ranks": [0], "parallel_config": {} }
+      "muxer": {
+        "ranks": [4],
+        "parallel_config": {}
+      }
     },
     "queue_depth": 6
   }
