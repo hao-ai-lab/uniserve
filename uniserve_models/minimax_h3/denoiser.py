@@ -77,6 +77,19 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
         """Build this network's size descriptor for one admitted request."""
         return DenoiserSize(num_frames, num_text_tokens)
 
+    def layout_size(self, size: DenoiserSize) -> DenoiserSize:
+        """Return the size whose packing ``size`` occupies.
+
+        Text occupies whole 64-row tiles, so every prompt length within one
+        tile has the same packed shapes, index tables and captured graphs.
+        Within a tile only the valid count of the last text tile and the
+        rotary coordinates after the text prefix differ, which the request's
+        state carries.
+        """
+        return DenoiserSize(
+            size.num_frames, math.ceil(size.num_text_tokens / 64) * 64
+        )
+
     @property
     def text_condition_width(self) -> int:
         """Feature width of the retained text conditioning."""
@@ -192,17 +205,78 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
         return result
 
     def state_buffers(self, size: DenoiserSize) -> Mapping[str, BufferConfig]:
-        """Describe one sample's local canonical storage on the caller's device."""  # noqa: E501
-        return {
+        """Describe one request's state on the caller's device.
+
+        The state is each modality's local canonical sample and the tables
+        that depend on the exact prompt length within its layout: every
+        tile's valid row count and the rotary ``cos``/``sin`` of every packed
+        row. Their shapes follow the layout alone.
+        """
+        size = self.layout_size(size)
+        samples = {
             name: BufferConfig(
                 tuple(part.stop - part.start for part in layout.local_slice),
                 layout.dtype,
             )
             for name, layout in self.output_layout(size).items()
         }
+        rows = self._packing(size).padded_tokens
+        width = self._rotary_width()
+        return {
+            **samples,
+            "tile_valid_sizes": BufferConfig((rows // 64,), torch.int32),
+            "cos": BufferConfig((rows, width), torch.float32),
+            "sin": BufferConfig((rows, width), torch.float32),
+        }
+
+    def _rotary_width(self) -> int:
+        """Width of one packed row's flattened rotary coordinates."""
+        cosine, _ = self.rotary(
+            torch.zeros((1, 3), dtype=torch.float64),
+            dtype=torch.float32,
+            sequence_length=1,
+        )
+        return int(cosine.flatten(1).shape[1])
+
+    @torch.inference_mode()
+    def prepare_state(
+        self,
+        sizes: tuple[DenoiserSize, ...],
+        *,
+        out: Mapping[str, torch.Tensor],
+    ) -> None:
+        """Fill the prompt-length tables of one request on the host.
+
+        The packing of the exact prompt length has its layout's shapes; its
+        last text tile holds only the prompt's remaining rows, and every row
+        after the text prefix sits at the prompt's exact length on the
+        rotary timeline.
+        """
+        if len(sizes) != 1 or set(out) != {"tile_valid_sizes", "cos", "sin"}:
+            raise ValueError(
+                "H3 request state covers one sample's prompt-length tables"
+            )
+        packing = self._packing(sizes[0])
+        cosine, sine = self.rotary(
+            packing.position_ids,
+            dtype=torch.float32,
+            sequence_length=packing.padded_tokens,
+        )
+        for name, value in (
+            ("tile_valid_sizes", packing.tile_valid_sizes),
+            ("cos", cosine.flatten(1)),
+            ("sin", sine.flatten(1)),
+        ):
+            if out[name].shape != value.shape or out[name].dtype != value.dtype:
+                raise ValueError(
+                    f"H3 request table {name!r} does not match its layout"
+                )
+            out[name].copy_(value)
 
     def _metadata(self, size: DenoiserSize) -> dict[str, torch.Tensor]:
-        packing = self._packing(size)
+        # Constants depend on the layout alone; the prompt-length tables are
+        # request state.
+        packing = self._packing(self.layout_size(size))
         interval = self._token_slice(packing)
         values = {}
         for name, indices in (
@@ -228,7 +302,6 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
         values["modulation_indices"] = (tags == AUDIO_TAG).long() * 3 + tags
 
         values.update(
-            tile_valid_sizes=packing.tile_valid_sizes,
             prefix_key_indices=torch.arange(
                 packing.prefix_tiles, dtype=torch.int32, device="cpu"
             ),
@@ -241,13 +314,6 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
                 packing.prefix_tiles, dtype=torch.int32, device="cpu"
             ),
         )
-
-        cosine, sine = self.rotary(
-            packing.position_ids,
-            dtype=torch.float32,
-            sequence_length=packing.padded_tokens,
-        )
-        values["cos"], values["sin"] = cosine.flatten(1), sine.flatten(1)
         return values
 
     def constant_buffers(
@@ -360,6 +426,11 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
                 "H3 denoising requires one sample on its checkpoint ladder"
             )
         size = inputs.sizes[0]
+        if size != self.layout_size(size):
+            raise ValueError(
+                "H3 denoising evaluates a layout; prompt-length tables are "
+                "request state"
+            )
         packing = self._packing(size)
         interval = self._token_slice(packing)
         attention = AttentionInput(
@@ -371,7 +442,7 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
                 packing.prefix_tiles,
                 packing.video_tiles,
                 packing.prefix_tiles + packing.video_tiles,
-                constants["tile_valid_sizes"],
+                state["tile_valid_sizes"],
                 constants["prefix_key_indices"],
                 constants["dense_key_indices"],
                 constants["prefix_count"],
@@ -400,7 +471,9 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
                 )
 
             # Scatter text and projected latents into the packed token rows;
-            # padding rows stay zero.
+            # padding rows stay zero. Text features cover the layout's text
+            # rows, zero past the prompt, so every prompt length within one
+            # layout gathers the same rows.
             hidden.zero_()
             hidden.index_copy_(
                 0,
@@ -443,7 +516,11 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
             hidden,
             attention,
             step_index=inputs.step_index,
-            constants=constants,
+            tables={
+                "modulation_indices": constants["modulation_indices"],
+                "cos": state["cos"],
+                "sin": state["sin"],
+            },
             workspace=workspace,
         )
         if not predictions:

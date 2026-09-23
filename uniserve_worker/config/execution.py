@@ -312,8 +312,8 @@ class WorkerConfig:
         (2048, 1152),
     )
     # Video request shapes, as (duration in seconds, prompt tokens), whose
-    # denoising ladders warmup makes resident on every request slot. A shape a
-    # deployment does not declare still serves; its first request captures.
+    # denoising ladders warmup captures for their layouts. Requests of any
+    # other layout denoise eagerly; serving never captures.
     video_graph_shapes: tuple[tuple[float, int], ...] = ()
     flashinfer: FlashInferConfig = FlashInferConfig()
 

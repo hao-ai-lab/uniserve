@@ -81,8 +81,15 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
 
     A bound trajectory states its input correspondence once. Replays select a
     step and a slot, update live temporal values and gather/scatter that slot.
-    Prepared sizes and graph buckets each have the configured ``shapes`` limit;
-    evicting a bucket leaves its context usable for eager work or recapture.
+
+    Graphs are captured only through ``capture``, at startup, on pinned
+    contexts, and stay resident until the runner closes. A step replays when
+    its trajectory's ladder is resident and otherwise runs eagerly, so serving
+    never captures: a request pays no capture latency and claims no graph
+    storage, and every rank of the component takes the same path because the
+    resident set is fixed before serving begins. Unpinned contexts serve
+    eager work; at most ``shapes`` of them stay prepared, retired least
+    recently used first.
     """
 
     def __init__(
@@ -114,6 +121,7 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
         self._devices = (device, *additional_devices) if self.captures else ()
         self.cache, self.attention, self.matmul = cache, attention, matmul
         self.prepared: OrderedDict[Hashable, Execution] = OrderedDict()
+        self._pinned: set[Hashable] = set()
         self._bank: dict[str, torch.Tensor] = {}
         self._slot_index = (
             torch.zeros(1, dtype=torch.int64, device=device)
@@ -128,13 +136,24 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
         """Graph policy is independent of the granted execution stream."""
         return self._captures
 
-    def prepare_inputs(self, key: Hashable, size: SizeT) -> ExecutionContext:
-        """Prepare and retain one exact size through its dependent graphs."""
+    def prepare_inputs(
+        self, key: Hashable, size: SizeT, *, pin: bool = False
+    ) -> ExecutionContext:
+        """Prepare one size's context and retain it under ``key``.
+
+        A pinned context stays prepared, with the ladders ``capture`` makes
+        resident on it, until the runner closes; pinning an unpinned context
+        keeps it. Preparing an unpinned size beyond ``shapes`` retires the
+        least recently used unpinned context.
+        """
         if self._closed:
             raise RuntimeError("denoising runner is closed")
         if key not in self.prepared:
-            if len(self.prepared) >= self.shapes:
-                self.release_inputs(next(iter(self.prepared)))
+            unpinned = [
+                name for name in self.prepared if name not in self._pinned
+            ]
+            if not pin and len(unpinned) >= self.shapes:
+                self.release_inputs(unpinned[0])
             context = ExecutionContext(
                 self.model,
                 cache=self.cache,
@@ -156,6 +175,8 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
                 entry.close()
                 raise
             self.prepared[key] = entry
+        if pin:
+            self._pinned.add(key)
         self.prepared.move_to_end(key)
         return self.prepared[key].context
 
@@ -282,16 +303,6 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
         entry = self.prepared[trajectory.input_key]
         bucket = entry.buckets.get(trajectory.signature)
         if bucket is None:
-            # Context capacity and captured trajectory capacity are independent.
-            # Entries own their stages and graphs; evict the oldest bucket.
-            residents = [
-                (bucket.last_used, owner, key)
-                for owner in self.prepared.values()
-                for key, bucket in owner.buckets.items()
-            ]
-            if len(residents) >= self.shapes:
-                _, owner, key = min(residents, key=lambda value: value[0])
-                owner.close_bucket(key)
             stages, gathers, scatters = {}, [], []
             mutable = {
                 trajectory.fields[id(value.tensor)]
@@ -328,6 +339,14 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
             ).pin_memory()
         return self._slot_values[slot]
 
+    def _resident(self, trajectory, index):
+        """Return the step's captured graph, or None when it has none."""
+        entry = self.prepared.get(trajectory.input_key)
+        bucket = (
+            None if entry is None else entry.buckets.get(trajectory.signature)
+        )
+        return None if bucket is None else bucket.graphs.get(index)
+
     def _graph(self, trajectory, index):
         if self._closed:
             raise RuntimeError("denoising runner is closed")
@@ -335,16 +354,7 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
         context = entry.context
         slot_index = cast(torch.Tensor, self._slot_index)
         graph = bucket.graphs.get(index)
-        # Every rank of the component runs the same calls in the same order
-        # and retires contexts and buckets by the same deterministic recency:
-        # other runners' uses advance the shared use counter differently per
-        # rank, but never reorder this runner's buckets relative to each
-        # other. Each rank therefore finds the same graph resident, and none
-        # synchronizes with the device or its peers to agree on it.
-        missing = graph is None
-        if missing:
-            if graph is not None:
-                graph.close()
+        if graph is None:
             live = trajectory.inputs[index]
             self.warmup(
                 live,
@@ -405,20 +415,36 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
             except BaseException:
                 self.release_inputs(trajectory.input_key)
                 raise
-        return graph, context, missing
 
     @torch.inference_mode()
     def capture(self, trajectory: Trajectory, index: int):
-        """Capture one bound step without advancing the request's samples."""
+        """Make one bound step's graph resident without advancing samples.
+
+        The graph serves every slot of the trajectory's pinned context: it
+        gathers the slot the device slot index names, so any request whose
+        trajectory has the same signature replays it. Capture is collective
+        across the component's ranks and belongs to startup.
+        """
         if not self.captures:
             raise RuntimeError("denoising graph capture requires a stream")
+        if trajectory.input_key not in self._pinned:
+            raise RuntimeError(
+                "denoising graphs are captured on pinned contexts only"
+            )
         self._graph(trajectory, index)
 
     @torch.inference_mode()
     def step(self, trajectory: Trajectory, index: int):
-        """Advance a bound step; the worker commits request progress."""
+        """Advance a bound step; the worker commits request progress.
+
+        Returns the samples and the execution path, ``"graph_replay"`` when
+        the step's graph is resident and ``"eager"`` otherwise.
+        """
+        if self._closed:
+            raise RuntimeError("denoising runner is closed")
         live = trajectory.inputs[index]
-        if not self.captures:
+        graph = self._resident(trajectory, index) if self.captures else None
+        if graph is None:
             context, call = self._call(
                 live,
                 trajectory.schedules,
@@ -438,7 +464,7 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
             finally:
                 if context.stream is not None:
                     current.wait_stream(context.stream.stream)
-        graph, context, captured = self._graph(trajectory, index)
+        context = self.prepared[trajectory.input_key].context
         current = torch.cuda.current_stream(self.device)
         context.stream.wait(current)
         with context.activate():
@@ -453,10 +479,11 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
         return {
             name: tuple(value.tensor for value in values)
             for name, values in live.latents.items()
-        }, "graph_capture" if captured else "graph_replay"
+        }, "graph_replay"
 
     def release_inputs(self, key):
         """Retire one prepared size and every graph that borrows it."""
+        self._pinned.discard(key)
         entry = self.prepared.pop(key, None)
         if entry is not None:
             if self.device.type == "cuda":

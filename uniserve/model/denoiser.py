@@ -76,6 +76,30 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
         """
         raise NotImplementedError
 
+    def layout_size(self, size: SizeT) -> SizeT:
+        """Return the size whose numerical layout ``size`` occupies.
+
+        Sizes with one layout share constants, workspace and captured graphs,
+        so callers key those by this size; whatever distinguishes the sizes
+        within a layout is request state, which ``prepare_state`` fills. By
+        default every size is its own layout.
+        """
+        return size
+
+    def prepare_state(
+        self, sizes: tuple[SizeT, ...], *, out: Mapping[str, torch.Tensor]
+    ) -> None:
+        """Fill the request state that does not derive from a native draw.
+
+        ``out`` holds CPU views of the state fields other than the sample
+        modalities, which the caller stages next to the samples. A network
+        whose state is its samples alone receives no views.
+        """
+        if out:
+            raise NotImplementedError(
+                "denoiser declares request state it does not prepare"
+            )
+
     @abstractmethod
     def prepare_latents(
         self, sizes: tuple[SizeT, ...], *, noise, state, constants, workspace
@@ -92,11 +116,13 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
     ) -> Mapping[str, tuple[TensorOutput | None, ...]]:
         """Predict each sample.
 
-        Without committing a solver step or request progress. ``state`` names
-        the sample storage of the request being advanced, which a captured
-        step reads through fixed staging rather than at the request's own
-        addresses; storage a request draws on the host, as ``prepare_latents``
-        receives, is the preparation's and is absent here.
+        Without committing a solver step or request progress. ``inputs.sizes``
+        are layouts (see ``layout_size``). ``state`` names the device state of
+        the request being advanced, its samples and the fields
+        ``prepare_state`` fills, which a captured step reads through fixed
+        staging rather than at the request's own addresses; storage a request
+        draws on the host, as ``prepare_latents`` receives, is the
+        preparation's and is absent here.
         """
         raise NotImplementedError
 
