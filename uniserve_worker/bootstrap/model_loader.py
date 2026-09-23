@@ -391,13 +391,19 @@ def _devices(
 def loaded_worker_config(
     model: nn.Module, config: WorkerConfig, queue_depth: int
 ) -> WorkerConfig:
-    """Resolve media request slots from the worker's publication lifetime."""
+    """Resolve media request slots from the worker's publication lifetime.
+
+    A resident media slot occupies three positions of the worker's batch
+    queue, one reserved pipeline position and two unresolved outputs, and a
+    media worker keeps at least two slots resident.
+    """
     if any(isinstance(module, VideoDecoder) for module in model.modules()):
         state_slots = min(config.max_batch_calls, queue_depth // 3)
         if state_slots < 2:
             raise unsupported_setup(
-                "resident media execution requires two slots with "
-                "two unresolved outputs each"
+                "resident media execution requires two slots of three queue "
+                f"positions each; queue depth {queue_depth} holds "
+                f"{queue_depth // 3}"
             )
         config = replace(
             config,

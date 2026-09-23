@@ -275,10 +275,18 @@ impl ModelConfig {
             .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN)
     }
 
-    /// IPC payload capacity required by this model's request descriptors.
-    pub(crate) fn request_slot_capacity(&self) -> usize {
+    /// Worker IPC slot capacity this model's messages require in each direction.
+    ///
+    /// A host product stays in a shared-storage segment on its host; across
+    /// hosts its bytes ride the rank channel, in the producing rank's result
+    /// and in the consuming rank's batch, so the capacity admits the largest
+    /// such product a rank publishes at once. A native FastH3 decode unit
+    /// holds 22 RGB frames at 1344x768 (68,124,672 bytes) plus its protocol
+    /// envelope. The rings grow to what a message needs, so the capacity costs
+    /// nothing until a message uses it.
+    pub(crate) fn channel_payload_capacity(&self) -> usize {
         if matches!(self.parameters, ModelParameters::MiniMaxH3 { .. }) {
-            EngineSettings::MEDIA_IPC_SLOT_CAP
+            72 << 20
         } else {
             1 << 20
         }
