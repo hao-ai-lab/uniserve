@@ -245,7 +245,7 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
             "SenseNova checkpoint has conflicting rotary type aliases"
         )
 
-    recipe = None
+    recipe: RoPEScaling | None = None
     if kind != "default":
 
         def option(name, default=None):

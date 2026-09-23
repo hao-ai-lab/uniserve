@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import TypeGuard
 
 import torch
 
@@ -14,7 +15,7 @@ from . import _binding
 from .functional._tensors import as_matrix
 
 
-def tensor_statistics(quantizer: Quantizer | None) -> bool:
+def tensor_statistics(quantizer: Quantizer | None) -> TypeGuard[Quantizer]:
     """Return whether encoding derives scales from whole-tensor statistics.
 
     Dynamic NVFP4 and per-tensor FP8 scales span every source value, so

@@ -182,7 +182,9 @@ class QuantizedTensor(torch.Tensor):
             self.scale_layout,
         )
 
-    def __repr__(self):
+    # torch's stub for Tensor.__repr__ declares an unnamed keyword-only
+    # parameter that no override can match.
+    def __repr__(self):  # type: ignore[override]
         return (
             f"QuantizedTensor(format={self.quantizer.format!r}, "
             f"shape={tuple(self.shape)}, dtype={self.dtype}, "
@@ -197,8 +199,10 @@ class QuantizedTensor(torch.Tensor):
             return linear(*args, **(kwargs or {}))
         return super().__torch_function__(func, types, args, kwargs or {})
 
+    # torch's stub assigns a plain function here, which mypy reads as an
+    # instance method; torch's own subclasses override it the same way.
     @classmethod
-    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # type: ignore[override]
         kwargs = kwargs or {}
         aten = torch.ops.aten
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Sequence
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from functools import partial
 from queue import SimpleQueue
@@ -429,6 +429,7 @@ class Executor:
         # capture window counts these steps, and the step name becomes the NVTX
         # range that Nsight shows for the batch. Lifecycle-only batches carry no
         # computation and are not counted.
+        step: AbstractContextManager[None]
         if self.worker.profiler is not None and batch.calls:
             first = batch.calls[0]
             step = self.worker.profiler.step(
@@ -504,17 +505,17 @@ class Executor:
         starts = tuple(
             command for command in batch.commands if isinstance(command, Start)
         )
-        for command in starts:
-            slots = self.worker.requests.apply_commands((command,))
+        for start in starts:
+            slots = self.worker.requests.apply_commands((start,))
             if slots and self.worker.decode_state is not None:
                 self.worker.decode_state.reset(slots)
-            if slots and command.request.diffusion is not None:
+            if slots and start.request.diffusion is not None:
                 # A video request's seeded noise is drawn while this batch and
                 # the ones before latent preparation run on the device.
                 begin_noise(
                     self.worker.runner,
                     self.worker.requests.get(
-                        command.request.request_key.request_id
+                        start.request.request_key.request_id
                     ),
                     self.worker.requests,
                 )

@@ -14,7 +14,7 @@ from threading import RLock
 
 import torch
 
-from uniserve.cache import block_spans
+from uniserve.cache import block_spans, mha
 from uniserve.runtime import PrefixCache
 from uniserve_worker.errors import invalid_descriptor, resource_error
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
@@ -83,6 +83,8 @@ class KVCacheManager:
             )
         for name in self.layers:
             state = cache.state(name)
+            if not isinstance(state, mha.State):
+                raise ValueError("cache backing must hold MHA state layers")
             # Physical K/V pages are
             # [page, token within page, KV head, head dim].
             if state.key.shape != (
@@ -96,7 +98,10 @@ class KVCacheManager:
                     "extents"
                 )
 
-        self.compute_dtype = cache.config.layers[self.layers[0]].compute_dtype
+        layout = cache.config.layers[self.layers[0]]
+        if not isinstance(layout, mha.Config):
+            raise ValueError("cache backing must hold MHA state layers")
+        self.compute_dtype = layout.compute_dtype
         self.group_ranges = self._group_ranges(group_ranges)
         self.group_count = len(self.group_ranges)
         # Reuse normalized page tuples after their bounds and group ownership
@@ -646,7 +651,7 @@ class KVCacheManager:
                 # follows the cache's allocation runs and the rank's
                 # mechanisms, never the model's depth.
                 for field in fields:
-                    locations = []
+                    locations: list[Locator] = []
                     for layer, stack in self._layer_stacks(f"{field}.values"):
                         # Stacks are [layers, pages, page tokens, kv heads,
                         # head dim]; each span view is [tokens, layers, kv

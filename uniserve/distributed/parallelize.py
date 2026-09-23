@@ -308,7 +308,7 @@ def parallelize_(
 
     # Record per-module channel facts before partitioning any weights:
     # interleaved-branch projections and each QKV layer's KV head geometry.
-    kv = {}
+    kv: dict[int, tuple[int, int, slice]] = {}
     projected = {}
     for child in modules:
         if (
@@ -325,7 +325,7 @@ def parallelize_(
                 axis for axis in mesh.axes if axis in ("tp", head_axis)
             )
             projection_group = mesh.get_group(axes)
-            for branch in child.projections.values():
+            for _, branch in child._branches():
                 if branch.out_features % (
                     projection_group.size * child.branch_width
                 ):
@@ -462,10 +462,10 @@ def parallelize_(
 
         if isinstance(child, ColumnParallelLinear):
             weight_dim = 0
-            heads = kv.get(id(child))
-            if heads is not None and heads[0] < group.size:
+            kv_partition = kv.get(id(child))
+            if kv_partition is not None and kv_partition[0] < group.size:
                 # Replicated KV heads: this rank projects its one head.
-                _, head_dim, local = heads
+                _, head_dim, local = kv_partition
                 row = slice(local.start * head_dim, local.stop * head_dim)
             else:
                 if child.out_features % column_group.size:

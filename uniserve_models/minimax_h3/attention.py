@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterator, Mapping
+from typing import cast
 
 import torch
 from torch import nn
 
 from uniserve.distributed import DeviceMesh
-from uniserve.nn import MergedColumnParallelLinear, RMSNorm, RowParallelLinear
+from uniserve.nn import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    RMSNorm,
+    RowParallelLinear,
+)
 from uniserve.nn.attention import vsa
 from uniserve.tensors import BufferConfig
 
@@ -54,10 +60,10 @@ class Attention(nn.Module):
                 "H3 attention requires complete query and key tiles"
             )
 
-        # VSA addresses keys and queries in 64-token tiles.
-        heads = (
-            self.projection.projections["q"].weight.shape[0] // self.head_dim
-        )
+        # VSA addresses keys and queries in 64-token tiles. Every merged
+        # branch is a column-parallel linear holding this rank's heads.
+        query = cast(ColumnParallelLinear, self.projection.projections["q"])
+        heads = query.weight.shape[0] // self.head_dim
         queries, keys = num_query_tokens // 64, num_tokens // 64
         return {
             "attention_output": BufferConfig(

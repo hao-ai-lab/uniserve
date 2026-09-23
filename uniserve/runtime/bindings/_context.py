@@ -54,13 +54,21 @@ class _ContextPlan:
         )
         self.tokens = self.mesh.get_group(token_axes)
 
-        self.queries = TokenShard(batch.queries.num_tokens, self.tokens)
         key_lengths = (
             batch.keys
             if isinstance(batch, (VarlenInput, VisibleInput))
             else batch.queries
         )
-        self.keys = TokenShard(key_lengths.num_tokens, self.tokens)
+        query_tokens, key_tokens = (
+            batch.queries.num_tokens,
+            key_lengths.num_tokens,
+        )
+        if query_tokens is None or key_tokens is None:
+            raise ValueError(
+                "context attention requires exact host sequence lengths"
+            )
+        self.queries = TokenShard(query_tokens, self.tokens)
+        self.keys = TokenShard(key_tokens, self.tokens)
 
         device = batch.queries.values.device
         self.query_members = layer.exchange.group.ranks
@@ -90,7 +98,9 @@ class _ContextPlan:
             tuple(self.query_counts), device=device
         )
         self.visible = torch.empty(
-            (local.batch_size, local.maximum), dtype=torch.int32, device=device
+            (local.batch_size, max(self.query_counts, default=0)),
+            dtype=torch.int32,
+            device=device,
         )
         self.key_values = torch.empty(
             local.batch_size, dtype=torch.int32, device=device
@@ -103,8 +113,8 @@ class _ContextPlan:
             from uniserve.tensors import BufferConfig
 
             capacity = (
-                table.indices.numel() * table.block_size
-                + batch.queries.num_tokens
+                batch.block_table.indices.numel() * batch.block_table.block_size
+                + query_tokens
             )
             shape = (capacity, layer.local_kv_heads, layer.head_dim)
             views = allocate(
@@ -131,7 +141,7 @@ class _ContextPlan:
             owner_capacity = self.keys.capacity * layer.exchange.group.size
             # Walk owners in topology order, pairing each physical slot with
             # the logical token index it carries.
-            physical = []
+            physical: list[tuple[int, int]] = []
             for owner_index, rank in enumerate(members):
                 offset = owner_index * owner_capacity
                 heads = next(
@@ -146,9 +156,7 @@ class _ContextPlan:
 
             # Ordering by logical token index turns the slots into a gather map.
             physical.sort(key=lambda item: item[1])
-            if [index for _, index in physical] != list(
-                range(key_lengths.num_tokens)
-            ):
+            if [index for _, index in physical] != list(range(key_tokens)):
                 raise ValueError(
                     "context publication must cover each logical key token once"
                 )
@@ -277,7 +285,11 @@ class _ContextPlan:
 
         from uniserve.nn.attention._parallel import context_scope
 
-        with context_scope({self.parallel: self._transport}):
+        # Without context transport this layer binds no context buffers.
+        bindings = (
+            {} if self._transport is None else {self.parallel: self._transport}
+        )
+        with context_scope(bindings):
             key, value = self.parallel.distribute_key_value(key, value)
             if self.key_indices is not None:
                 # Dense kernels consume compact sequences, and the gathered

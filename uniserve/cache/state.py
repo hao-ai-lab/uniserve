@@ -128,7 +128,7 @@ class State:
 
     def _storage(self) -> Mapping[str, torch.Tensor]:
         """Flatten each field into its physical buffers plus its flag vector."""
-        result = {}
+        result: dict[str, torch.Tensor] = {}
         for name, tensor in self.tensors.items():
             fields = (
                 tensor.buffers()
@@ -163,10 +163,8 @@ class State:
             for tensor in self._storage().values()
         )
 
-        vector = isinstance(source, torch.Tensor) or isinstance(
-            target, torch.Tensor
-        )
-        if vector:
+        if isinstance(source, torch.Tensor) or isinstance(target, torch.Tensor):
+            vector = True
             if (
                 not isinstance(source, torch.Tensor)
                 or not isinstance(target, torch.Tensor)
@@ -206,6 +204,7 @@ class State:
                 source.device: (source.clamp(0, max(0, count - 1)), target)
             }
         else:
+            vector = False
             _blocks(source, count)
             _blocks(target, count)
             if len(source) != len(target) or len(set(target)) != len(target):

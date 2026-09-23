@@ -235,13 +235,14 @@ class RotaryEmbedding(nn.Module):
             rope_theta=self.theta,
             partial_rotary_factor=self._partial,
         )
-        config = PretrainedConfig(
-            head_dim=self._head_dim * (2 if self.keep_freq_range else 1),
-            hidden_size=self._head_dim,
-            num_attention_heads=1,
-            max_position_embeddings=self._maximum,
-            rope_parameters=parameters,
-        )
+        # The base config declares none of these fields; like its keyword
+        # constructor, attribute assignment stores them as plain attributes.
+        config = PretrainedConfig()
+        config.head_dim = self._head_dim * (2 if self.keep_freq_range else 1)
+        config.hidden_size = self._head_dim
+        config.num_attention_heads = 1
+        config.max_position_embeddings = self._maximum
+        config.rope_parameters = parameters
         frequencies, scale = ROPE_INIT_FUNCTIONS[parameters["rope_type"]](
             config, device, seq_len=sequence_length
         )

@@ -33,6 +33,8 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
     framing_tokens = 2
     image_unconditional = BranchSource.CONDITIONING
 
+    markers: torch.Tensor
+
     def __init__(self, config: Config, backbone: Transformer):
         super().__init__(
             patch_size=config.latent_patch_size,
@@ -119,7 +121,8 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
             raise ValueError("BAGEL predicts the image latent modality")
 
         group = self.mesh.get_group("pp" if "pp" in self.mesh.axes else ())
-        chunks, routes = [], []
+        chunks: list[torch.Tensor] = []
+        routes: list[RouteSpan] = []
         cursor = 0
         for latent, size, positions, count in zip(
             inputs.latents["image"],

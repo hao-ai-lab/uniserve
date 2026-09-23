@@ -7,6 +7,8 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from math import prod
+from pathlib import Path
+from typing import Literal
 
 from uniserve.loading import Config as IOConfig
 from uniserve.runtime.process_groups import Rendezvous
@@ -491,13 +493,22 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
 def _load_config(namespace: argparse.Namespace) -> IOConfig:
     """Separate the serialized reader selector into format and loading mode."""
     selected = str(namespace.load_format)
-    mode = selected if selected in {"dummy", "layered"} else "eager"
+    file_format: Literal["auto", "safetensors", "pt"]
+    mode: Literal["eager", "layered", "dummy"]
+    match selected:
+        case "auto" | "safetensors" | "pt":
+            file_format, mode = selected, "eager"
+        case "dummy" | "layered":
+            file_format, mode = "auto", selected
+        case _:
+            raise ValueError(f"unknown checkpoint load format {selected!r}")
+
     return IOConfig(
-        format="auto" if selected in {"dummy", "layered"} else selected,
+        format=file_format,
         mode=mode,
-        download_dir=_optional_text(namespace.download_dir),
+        download_dir=_optional_path(namespace.download_dir),
         num_threads=namespace.load_threads,
-        checksum_manifest=_optional_text(namespace.checksum_manifest),
+        checksum_manifest=_optional_path(namespace.checksum_manifest),
     )
 
 
@@ -662,3 +673,9 @@ def _optional_text(value: object | None) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _optional_path(value: object | None) -> Path | None:
+    """Normalize an optional value to a path or ``None`` when blank."""
+    text = _optional_text(value)
+    return None if text is None else Path(text)

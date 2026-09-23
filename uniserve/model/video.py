@@ -237,6 +237,8 @@ class VideoPostprocessor(nn.Module):
     reconstruction.
     """
 
+    overlap_weights: torch.Tensor
+
     def __init__(
         self,
         overlap_weights: torch.Tensor,

@@ -78,9 +78,11 @@ class TextRunner(ModelRunner):
         Device offsets select positions on every replay.
         """
         hidden = self.model(inputs)
-        indices = (
-            inputs.attention.queries.offsets[1:].to(torch.int64) - 1
-        ).clamp_min(0)
+        attention = inputs.attention
+        if isinstance(attention, DenseInput):
+            raise ValueError("final-position logits require sequence offsets")
+        offsets = attention.queries.offsets
+        indices = (offsets[1:].to(torch.int64) - 1).clamp_min(0)
 
         if self.pipeline.rank == self.pipeline.size - 1:
             values = self.model.compute_logits(
@@ -117,7 +119,12 @@ class TextRunner(ModelRunner):
                 * count
             )
         else:
-            lengths = inputs.attention.queries.host
+            host = inputs.attention.queries.host
+            if host is None:
+                raise ValueError(
+                    "text output selection requires host query lengths"
+                )
+            lengths = host
             offsets = inputs.attention.queries.offsets
 
         if len(selections) != len(lengths) or any(

@@ -11,8 +11,9 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 import torch
 from safetensors import safe_open
@@ -203,12 +204,27 @@ class Source:
 class Weight(ABC):
     """Borrow tensor metadata and read native rectangular slices.
 
-    From a source.
+    From a source. Metadata is read-only: a view derives it from its sources,
+    and a stored value is a frozen dataclass field. Such a field is declared
+    with ``field()`` so the inherited property is not taken as its default,
+    and its dataclass uses ``slots=True`` so the field's slot replaces the
+    abstract property.
     """
 
-    name: str
-    shape: tuple[int, ...]
-    dtype: torch.dtype
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Logical checkpoint tensor name."""
+
+    @property
+    @abstractmethod
+    def shape(self) -> tuple[int, ...]:
+        """Logical tensor shape."""
+
+    @property
+    @abstractmethod
+    def dtype(self) -> torch.dtype:
+        """Logical tensor dtype."""
 
     @abstractmethod
     def read(self, region: tuple[slice, ...] | None = None) -> torch.Tensor:
@@ -228,7 +244,7 @@ def _region(shape, region):
 
 @dataclass(frozen=True, slots=True)
 class _TensorWeight(Weight):
-    name: str
+    name: str = field()
     tensor: torch.Tensor
 
     @property
@@ -245,9 +261,9 @@ class _TensorWeight(Weight):
 
 @dataclass(frozen=True, slots=True)
 class _FileWeight(Weight):
-    name: str
-    shape: tuple[int, ...]
-    dtype: torch.dtype
+    name: str = field()
+    shape: tuple[int, ...] = field()
+    dtype: torch.dtype = field()
     reader: Reader
     source_name: str
 
@@ -263,7 +279,7 @@ class FP8Weight(Weight):
 
     values: Weight
     scale: Weight
-    axis: int | None
+    axis: Literal[0] | None
     dtype: torch.dtype = torch.bfloat16
 
     def __post_init__(self):
@@ -319,7 +335,7 @@ class NVFP4Weight(Weight):
     when the export quantizes activations.
     """
 
-    name: str
+    name: str = field()
     values: Weight
     block_scale: Weight
     tensor_scale: Weight
@@ -401,7 +417,7 @@ class _ScaleWeight(Weight):
     """
 
     source: Weight
-    shape: tuple[int, ...]
+    shape: tuple[int, ...] = field()
 
     @property
     def name(self):
@@ -423,11 +439,12 @@ class Reader:
         self.source = source
         self.io = io
         self._stack = ExitStack()
-        self._weights = {}
-        self._locations = {}
-        self._files = {}
-        self._states = {}
-        self._consumed = set()
+        self._weights: dict[str, Weight] = {}
+        # logical name -> (file, name within that file)
+        self._locations: dict[str, tuple[Path, str]] = {}
+        self._files: dict[Path, safe_open] = {}
+        self._states: dict[Path, Mapping[str, torch.Tensor]] = {}
+        self._consumed: set[str] = set()
         self._closed = False
         try:
             self._open()
@@ -516,6 +533,7 @@ class Reader:
                     f"FP8 checkpoint {name!r} requires its weight_scale tensor"
                 )
             count = math.prod(scale.shape)
+            axis: Literal[0] | None
             if count == 1:
                 axis, shape = None, ()
             elif count == value.shape[0] and all(
@@ -564,7 +582,8 @@ class _SafetensorsReader(Reader):
     Using scoped mappings or decoded files.
     """
 
-    def _index(self, path):
+    # Indexing reads only file headers, so dummy and layered readers reuse it.
+    def _index(self: Reader, path):
         with safe_open(path, framework="pt", device="cpu") as handle:
             metadata = tuple(
                 (

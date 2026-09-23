@@ -131,7 +131,9 @@ class RoutedTensor:
             raise ValueError("routed interval exceeds its packed token extent")
 
         offsets = dict.fromkeys(self.values, 0)
-        pieces = {route: [] for route in self.values}
+        pieces: dict[str, list[torch.Tensor]] = {
+            route: [] for route in self.values
+        }
         for span in spans:
             start, stop = (
                 max(span.start, interval.start),
@@ -155,7 +157,9 @@ class RoutedTensor:
             }
         )
 
-    def apply(self, modules: Mapping[str, nn.Module]) -> RoutedTensor:
+    def apply(
+        self, modules: Mapping[str, nn.Module] | nn.ModuleDict
+    ) -> RoutedTensor:
         """Run each route's tensor through its corresponding module."""
         if set(self.values).difference(modules):
             raise ValueError(

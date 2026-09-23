@@ -154,69 +154,75 @@ def _sampling_params_from_mapping(
     Maps validation errors to descriptors.
     """
     data = _map(value, where)
-    values = {
-        "temperature": _float(
-            data.get("temperature", 0.0), f"{where}.temperature"
-        ),
-        "top_k": _uint(data.get("top_k", 0), f"{where}.top_k"),
-        "top_p": _float(data.get("top_p", 1.0), f"{where}.top_p"),
-        "ignore_eos": _bool(
-            data.get("ignore_eos", False), f"{where}.ignore_eos"
-        ),
-        "seed": _optional_uint(data.get("seed"), f"{where}.seed"),
-        "min_p": _float(data.get("min_p", 0.0), f"{where}.min_p"),
-        "repetition_penalty": _float(
-            data.get("repetition_penalty", 1.0), f"{where}.repetition_penalty"
-        ),
-        "frequency_penalty": _float(
-            data.get("frequency_penalty", 0.0), f"{where}.frequency_penalty"
-        ),
-        "presence_penalty": _float(
-            data.get("presence_penalty", 0.0), f"{where}.presence_penalty"
-        ),
-        "logit_bias": tuple(
-            (
-                _uint(pair[0], f"{where}.logit_bias[{index}][0]"),
-                _float(pair[1], f"{where}.logit_bias[{index}][1]"),
-            )
-            for index, item in enumerate(
-                _seq(data.get("logit_bias", ()), f"{where}.logit_bias")
-            )
-            for pair in (_pair(item, f"{where}.logit_bias[{index}]"),)
-        ),
-        "min_tokens": _uint(data.get("min_tokens", 0), f"{where}.min_tokens"),
-        "return_logprobs": _bool(
-            data.get("return_logprobs", False), f"{where}.return_logprobs"
-        ),
-        "n_logprobs": _uint(data.get("n_logprobs", 0), f"{where}.n_logprobs"),
-        "return_prompt_logprobs": _bool(
-            data.get("return_prompt_logprobs", False),
-            f"{where}.return_prompt_logprobs",
-        ),
-        "n_prompt_logprobs": _uint(
-            data.get("n_prompt_logprobs", 0), f"{where}.n_prompt_logprobs"
-        ),
-        "logprob_token_ids": _uints(
-            data.get("logprob_token_ids", ()), f"{where}.logprob_token_ids"
-        ),
-        "bad_words_ids": tuple(
-            _uints(item, f"{where}.bad_words_ids[{index}]")
-            for index, item in enumerate(
-                _seq(data.get("bad_words_ids", ()), f"{where}.bad_words_ids")
-            )
-        ),
-        "allowed_token_ids": (
-            None
-            if data.get("allowed_token_ids") is None
-            else _uints(data["allowed_token_ids"], f"{where}.allowed_token_ids")
-        ),
-        "typical_p": _float(data.get("typical_p", 1.0), f"{where}.typical_p"),
-        "forced_token_ids": _uints(
-            data.get("forced_token_ids", ()), f"{where}.forced_token_ids"
-        ),
-    }
+    # Field decoders raise descriptor errors directly; only the parameter
+    # invariants checked by SamplingParams raise ValueError.
     try:
-        return sampling.SamplingParams(**values)
+        return sampling.SamplingParams(
+            temperature=_float(
+                data.get("temperature", 0.0), f"{where}.temperature"
+            ),
+            top_k=_uint(data.get("top_k", 0), f"{where}.top_k"),
+            top_p=_float(data.get("top_p", 1.0), f"{where}.top_p"),
+            ignore_eos=_bool(
+                data.get("ignore_eos", False), f"{where}.ignore_eos"
+            ),
+            seed=_optional_uint(data.get("seed"), f"{where}.seed"),
+            min_p=_float(data.get("min_p", 0.0), f"{where}.min_p"),
+            repetition_penalty=_float(
+                data.get("repetition_penalty", 1.0),
+                f"{where}.repetition_penalty",
+            ),
+            frequency_penalty=_float(
+                data.get("frequency_penalty", 0.0), f"{where}.frequency_penalty"
+            ),
+            presence_penalty=_float(
+                data.get("presence_penalty", 0.0), f"{where}.presence_penalty"
+            ),
+            logit_bias=tuple(
+                (
+                    _uint(pair[0], f"{where}.logit_bias[{index}][0]"),
+                    _float(pair[1], f"{where}.logit_bias[{index}][1]"),
+                )
+                for index, item in enumerate(
+                    _seq(data.get("logit_bias", ()), f"{where}.logit_bias")
+                )
+                for pair in (_pair(item, f"{where}.logit_bias[{index}]"),)
+            ),
+            min_tokens=_uint(data.get("min_tokens", 0), f"{where}.min_tokens"),
+            return_logprobs=_bool(
+                data.get("return_logprobs", False), f"{where}.return_logprobs"
+            ),
+            n_logprobs=_uint(data.get("n_logprobs", 0), f"{where}.n_logprobs"),
+            return_prompt_logprobs=_bool(
+                data.get("return_prompt_logprobs", False),
+                f"{where}.return_prompt_logprobs",
+            ),
+            n_prompt_logprobs=_uint(
+                data.get("n_prompt_logprobs", 0), f"{where}.n_prompt_logprobs"
+            ),
+            logprob_token_ids=_uints(
+                data.get("logprob_token_ids", ()), f"{where}.logprob_token_ids"
+            ),
+            bad_words_ids=tuple(
+                _uints(item, f"{where}.bad_words_ids[{index}]")
+                for index, item in enumerate(
+                    _seq(
+                        data.get("bad_words_ids", ()), f"{where}.bad_words_ids"
+                    )
+                )
+            ),
+            allowed_token_ids=(
+                None
+                if data.get("allowed_token_ids") is None
+                else _uints(
+                    data["allowed_token_ids"], f"{where}.allowed_token_ids"
+                )
+            ),
+            typical_p=_float(data.get("typical_p", 1.0), f"{where}.typical_p"),
+            forced_token_ids=_uints(
+                data.get("forced_token_ids", ()), f"{where}.forced_token_ids"
+            ),
+        )
     except ValueError as error:
         raise invalid_descriptor(f"{where}.{error}") from error
 
@@ -738,14 +744,14 @@ class Call:
             if product.output_index in output_indices:
                 raise invalid_descriptor("call repeats an output index")
             output_indices.add(product.output_index)
-        for product in (
+        for media_output in (
             self.encoder_output,
             self.latent_output,
             self.image_output,
         ):
             if (
-                product is not None
-                and product.max_bytes > self.bounds.max_latent_bytes
+                media_output is not None
+                and media_output.max_bytes > self.bounds.max_latent_bytes
             ):
                 raise invalid_descriptor(
                     "image or trajectory output exceeds its declared byte "

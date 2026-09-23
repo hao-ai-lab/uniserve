@@ -507,7 +507,7 @@ def publish_deferred_product(
         else (tuple(slice(0, n) for n in value.shape),)
     )
     origin = (0,) * value.ndim if region is None else _slices.offset(region)
-    locations = []
+    locations: list[Locator] = []
     try:
         for view in views:
             if not _slices.within(view, value.shape):

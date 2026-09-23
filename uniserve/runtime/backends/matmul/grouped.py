@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from functools import partial
 from math import ceil
 
 import torch
@@ -356,7 +358,8 @@ def _output(
     )
 
 
-_compiled = {}
+# (operand format, group count, active maps) -> compiled grouped GEMM
+_compiled: dict[tuple[str | torch.dtype, int, int], Callable[..., object]] = {}
 
 
 class GroupedOperator(_MergedOperator):
@@ -397,11 +400,12 @@ class GroupedOperator(_MergedOperator):
         self.format = _format(self.first.weight)
         self.block_scaled = self.format in {"nvfp4", "mxfp8"}
         self.vector = 16 if self.format == "nvfp4" else 32
-        self._initial = self._metadata = self._maps = self._kernel = None
+        # The compiled kernel bound to its descriptor tensors; each launch
+        # supplies only the current stream.
+        self._kernel: Callable[..., object] | None = None
 
-    def _prepare_kernel(self):
+    def _prepare_kernel(self) -> Callable[..., object]:
         import cuda.bindings.driver as cuda
-        import cutlass
         import cutlass.cute as cute
         from cutlass.cute.runtime import from_dlpack
         from flashinfer.data.cutlass.examples.python.CuTeDSL.blackwell.grouped_blockscaled_gemm import (  # noqa: E501
@@ -412,21 +416,21 @@ class GroupedOperator(_MergedOperator):
         )
 
         encoded = {
-            torch.float16: cutlass.Float16,
-            torch.bfloat16: cutlass.BFloat16,
-            "fp8": cutlass.Float8E4M3FN,
-            "nvfp4": cutlass.Float4E2M1FN,
-            "mxfp8": cutlass.Float8E4M3FN,
+            torch.float16: cute.Float16,
+            torch.bfloat16: cute.BFloat16,
+            "fp8": cute.Float8E4M3FN,
+            "nvfp4": cute.Float4E2M1FN,
+            "mxfp8": cute.Float8E4M3FN,
         }[self.format]
 
-        names = ("a", "b", "c")
-        types = (encoded, encoded, cutlass.Float32)
-        fields = ("shapes", "strides", "pointers")
+        names: tuple[str, ...] = ("a", "b", "c")
+        types: tuple[type[cute.Numeric], ...] = (encoded, encoded, cute.Float32)
+        fields: tuple[str, ...] = ("shapes", "strides", "pointers")
         if self.block_scaled:
             scale = (
-                cutlass.Float8E4M3FN
+                cute.Float8E4M3FN
                 if self.format == "nvfp4"
-                else cutlass.Float8E8M0FNU
+                else cute.Float8E8M0FNU
             )
             names += ("sfa", "sfb")
             types += (scale, scale)
@@ -459,9 +463,7 @@ class GroupedOperator(_MergedOperator):
                     self.vector, (128, 128), (1, 1)
                 )
                 if self.block_scaled
-                else GroupedGemmKernel(
-                    cutlass.Float32, False, (128, 128), (1, 1)
-                )
+                else GroupedGemmKernel(cute.Float32, False, (128, 128), (1, 1))
             )
             _compiled[key] = cute.compile(
                 kernel,
@@ -474,12 +476,7 @@ class GroupedOperator(_MergedOperator):
                 stream,
                 options="--opt-level 2",
             )
-        self._initial, self._metadata, self._maps = (
-            tuple(initial),
-            metadata,
-            maps,
-        )
-        self._kernel = _compiled[key]
+        return partial(_compiled[key], *initial, *metadata, maps)
 
     def __call__(self, x, biases, *, out):
         import cuda.bindings.driver as cuda
@@ -508,7 +505,7 @@ class GroupedOperator(_MergedOperator):
         if self._kernel is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("grouped GEMM must be warmed before capture")
-            self._prepare_kernel()
+            self._kernel = self._prepare_kernel()
 
         left = x.buffers() if isinstance(x, QuantizedTensor) else {"values": x}
         input_values = left["values"]
@@ -529,7 +526,7 @@ class GroupedOperator(_MergedOperator):
         input_scale = (
             left[field].view(torch.uint8) if self.block_scaled else None
         )
-        if self.block_scaled and x.scale_layout is ScaleLayout.LINEAR:
+        if input_scale is not None and x.scale_layout is ScaleLayout.LINEAR:
             destination = self.workspace["grouped.input_scale"]
             size = ceil(rows / 128) * 128 * self.scale_columns
             _pack_scale[(triton.cdiv(size, 512), 1)](
@@ -597,7 +594,7 @@ class GroupedOperator(_MergedOperator):
             num_warps=1,
         )
         stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
-        self._kernel(*self._initial, *self._metadata, self._maps, stream)
+        self._kernel(stream)
 
         names = tuple(self.weights)
         for branch, (length, count, _, _) in enumerate(self.parts):

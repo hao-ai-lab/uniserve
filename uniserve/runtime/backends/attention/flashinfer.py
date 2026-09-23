@@ -146,6 +146,11 @@ class _PagePlan:
             )
             self.counts = torch.empty_like(self.last)
 
+            # Custom-mask metadata exists together, only for custom masks.
+            self.mask: torch.Tensor | None
+            self.mask_offsets: torch.Tensor | None
+            self.key_offsets: torch.Tensor | None
+            self.causal: torch.Tensor | None
             if custom:
                 # Table capacity bounds any key distribution across these
                 # query rows, including byte padding between sequences.
@@ -164,6 +169,10 @@ class _PagePlan:
                 self.mask = self.mask_offsets = self.key_offsets = (
                     self.causal
                 ) = None
+            self.wrapper: (
+                flashinfer.BatchDecodeWithPagedKVCacheWrapper
+                | flashinfer.BatchPrefillWithPagedKVCacheWrapper
+            )
             if decode:
                 self.wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                     owner.workspace["scratch"],
@@ -251,6 +260,11 @@ class _PagePlan:
                 )
 
         if self.mask is not None:
+            assert (
+                self.mask_offsets is not None
+                and self.key_offsets is not None
+                and self.causal is not None
+            )
             byte_offsets = tuple(
                 accumulate(
                     (
@@ -444,6 +458,7 @@ class _RaggedPlan:
             # The native packed-mask plan derives bit offsets from Q/K indptr.
             # Its kernel consumes byte offsets, with each sequence padded to a
             # whole byte; install those explicit offsets after native planning.
+            assert self.mask_offsets is not None and self.causal is not None
             offsets = tuple(
                 accumulate(
                     (
@@ -574,14 +589,14 @@ class _FlashInfer(_Operator):
         ):
             self._ragged = self._ragged_plan(batch)
         elif isinstance(batch, PagedInput):
+            # The base binding has required exact host lengths above.
+            prefixes, queries = batch.prefixes.host, batch.queries.host
+            assert prefixes is not None and queries is not None
             lengths = tuple(
-                a + b
-                for a, b in zip(
-                    batch.prefixes.host, batch.queries.host, strict=True
-                )
+                a + b for a, b in zip(prefixes, queries, strict=True)
             )
             self._paged = self._page_plan(
-                batch.queries.host,
+                queries,
                 lengths,
                 batch.block_table,
                 causal=batch.causal,
@@ -691,6 +706,10 @@ class _FlashInfer(_Operator):
                     )
             return out
         if isinstance(batch, SegmentedInput):
+            if self._ragged is None or self._paged is None:
+                raise RuntimeError(
+                    "segmented attention requires a bound input plan"
+                )
             # Merge the current-window and prefix partial states with
             # online softmax.
             current = self._ragged.run(
@@ -719,6 +738,8 @@ class _FlashInfer(_Operator):
             if isinstance(batch, VisibleInput) and not batch.fully_visible
             else None
         )
+        if self._paged is None:
+            raise RuntimeError("paged attention requires a bound input plan")
         return self._paged.run(
             q,
             key,

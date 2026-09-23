@@ -190,7 +190,7 @@ class Quantizer:
                     continue
                 if self.axis == 0 and dim == 0:
                     continue
-                selected = (axis,)
+                selected: tuple[str, ...] = (axis,)
                 mesh = distribution.mesh
                 if selected not in mesh._groups:
                     # A factored head topology can borrow its encompassing TP
@@ -318,6 +318,9 @@ class Quantizer:
 
         layout = ScaleLayout.LINEAR if out is None else out.scale_layout
         if self.format == "fp8":
+            # FP8 never carries a calibrated scale, so amax was supplied or
+            # computed above.
+            assert amax is not None
             scale = amax.clamp_min(1e-12) / 448.0
             values = (
                 (x.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
@@ -532,7 +535,7 @@ class Quantizer:
                     "FP8 scale must match the retained statistical axis and "
                     "FP32 dtype"
                 )
-            cls = _FP8Tensor
+            cls: type[QuantizedTensor] = _FP8Tensor
         else:
             block = 32 if self.format == "mxfp8" else 16
             rows, columns = prod(shape[:-1]), shape[-1] // block

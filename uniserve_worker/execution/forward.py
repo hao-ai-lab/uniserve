@@ -17,8 +17,9 @@ from uniserve_worker.execution import calls
 from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.execution.output import PendingOutput, capture_samples
+from uniserve_worker.model_executor.diffusion_inputs import DiffusionRow
 from uniserve_worker.model_executor.image_inputs import DecodeRow, PreparedImage
-from uniserve_worker.model_executor.input_batch import InputRow
+from uniserve_worker.model_executor.input_batch import InputRow, TokenRow
 from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.call import Call, ForwardMode, MediaCall
 from uniserve_worker.sampling.metadata import SamplingMetadata
@@ -49,7 +50,7 @@ ForwardValue = tuple[
 ]
 SampleCandidate = tuple[
     int,
-    InputRow,
+    TokenRow | DiffusionRow,
     torch.Tensor,
     SamplingMetadata | None,
     SamplerRow | None,
@@ -272,7 +273,7 @@ def prepare_diffusion_step(
     from uniserve_worker.execution import diffusion, token
 
     step_inputs: dict[int, tuple[tuple[Branch, ...], torch.Tensor]] = {}
-    prefixes: list[tuple[int, Branch, InputRow]] = []
+    prefixes: list[tuple[int, Branch, TokenRow]] = []
 
     for index, trajectory in trajectories.items():
         call = scheduled[index]
@@ -506,6 +507,8 @@ def publish_forward_values(
         if index in trajectories:
             predictions[index].append(value)
         elif isinstance(call.kind, ForwardMode):
+            # A sequence call's row comes from token.prepare_forward.
+            assert isinstance(task, (TokenRow, DiffusionRow))
             if graph_sample is not None:
                 request = state.pending_output(call.request_key.request_id)
                 token.commit_kv(

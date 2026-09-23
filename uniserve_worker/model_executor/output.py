@@ -72,7 +72,10 @@ class ExecutionOutput:
             return self
 
         # Bucket rows that share one vocabulary shard so they gather together.
-        groups = {}
+        groups: dict[
+            tuple[int, int, int, int, int, torch.device, torch.dtype],
+            tuple[VocabShard, list[int]],
+        ] = {}
         for index, vocab in enumerate(self.vocabularies):
             if vocab is not None:
                 key = (
@@ -84,11 +87,10 @@ class ExecutionOutput:
                     self.values[index].device,
                     self.values[index].dtype,
                 )
-                groups.setdefault(key, []).append(index)
+                groups.setdefault(key, (vocab, []))[1].append(index)
 
         values = list(self.values)
-        for indexes in groups.values():
-            vocab = self.vocabularies[indexes[0]]
+        for vocab, indexes in groups.values():
             sources = tuple(self.values[index] for index in indexes)
             # Adjacent request rows already share backing; gather them together
             # without adding another allocation or collective per request.

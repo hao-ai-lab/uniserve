@@ -38,7 +38,7 @@ def media_state_buffers(
     if builder is None:
         return {}
 
-    result = {}
+    result: dict[str, BufferConfig] = {}
     for binding in bindings.values():
         for call in binding.calls:
             if (

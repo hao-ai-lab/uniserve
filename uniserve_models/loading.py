@@ -197,14 +197,15 @@ def _hub_checkpoint_identity(repository: str, revision: str, io) -> str:
     reads sidecar contents through the cache. The result equals
     ``checkpoint_identity`` of a complete local copy of the revision.
     """
-    from huggingface_hub import HfApi, hf_hub_download
+    from huggingface_hub import HfApi, RepoFolder, hf_hub_download
 
+    # The recursive tree lists folders beside files; only files have sizes.
     files = [
         (entry.path, int(entry.size))
         for entry in HfApi().list_repo_tree(
             repo_id=repository, revision=revision, recursive=True
         )
-        if getattr(entry, "size", None) is not None
+        if not isinstance(entry, RepoFolder)
     ]
 
     def content(name: str) -> bytes:
@@ -258,7 +259,7 @@ def _root(path: str | Path, io: loading.Config):
 def _inventory(root, repository, revision, io):
     """List checkpoint files, excluding caller-configured ignore patterns."""
     if repository is None:
-        names = (
+        names: Iterable[str] = (
             path.relative_to(root).as_posix()
             for path in root.rglob("*")
             if path.is_file()
@@ -394,7 +395,7 @@ def _tokens(processor, root):
 
     # Merge every vocabulary spelling a checkpoint may carry; later files
     # override earlier ones for the same token text.
-    vocabulary = {}
+    vocabulary: dict[str, object] = {}
     path = root / "tokenizer.json"
     if path.is_file():
         data = _json(path)
@@ -459,7 +460,7 @@ def _exclusions(model, declarations, sources, ignored, io):
     # One parameter can be reachable under several module paths (tied or
     # shared weights); excluding any alias must exclude the shared parameter
     # everywhere.
-    aliases = {}
+    aliases: dict[int, set[str]] = {}
     paths = dict(model.named_modules(remove_duplicate=False))
     for path, module in paths.items():
         for parameter in module.parameters(recurse=False):

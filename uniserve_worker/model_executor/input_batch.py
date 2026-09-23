@@ -66,6 +66,11 @@ class AttentionRow(InputRow):
     write_kv: bool = False
     causal: bool = True
 
+    @property
+    def query_tokens(self) -> int:
+        """Return the query length this row appends after its cached prefix."""
+        raise NotImplementedError
+
 
 @dataclass(frozen=True, slots=True)
 class TokenRow(AttentionRow):

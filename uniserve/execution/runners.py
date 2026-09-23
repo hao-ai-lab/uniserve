@@ -75,7 +75,7 @@ class ModelRunner(Generic[ModelT, SizeT]):
         with self.context.activate():
             result = call(*args, **kwargs)
 
-        if caller is not None and caller != owner.stream:
+        if owner is not None and caller is not None and caller != owner.stream:
             caller.wait_stream(owner.stream)
         return result
 

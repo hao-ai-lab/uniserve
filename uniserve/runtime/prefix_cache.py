@@ -191,7 +191,7 @@ class PrefixCache:
         _blocks(blocks, next(iter(state.tensors.values())).shape[0])
 
         # Adjacent blocks merge into one fill range per contiguous run.
-        ranges = []
+        ranges: list[tuple[int, int]] = []
         for block in sorted(set(blocks)):
             if ranges and ranges[-1][1] == block:
                 ranges[-1] = (ranges[-1][0], block + 1)

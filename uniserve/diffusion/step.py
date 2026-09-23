@@ -16,9 +16,10 @@ from uniserve.tensors import TensorOutput
 from .schedule import Schedule
 
 if TYPE_CHECKING:
-    from uniserve.model import Denoiser, LatentInput
+    from uniserve.model import Denoiser, DenoiserInput, LatentInput
 
-InputT = TypeVar("InputT")
+# Matches the input bound of ``uniserve.model.Denoiser``.
+InputT = TypeVar("InputT", bound="DenoiserInput")
 SizeT = TypeVar("SizeT")
 
 

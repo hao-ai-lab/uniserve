@@ -7,7 +7,10 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 
 import torch
 
-_ACTIVE = ContextVar("uniserve_transfers", default=None)
+# The active activation key and the bindings its hooks deliver through.
+_ACTIVE: ContextVar[tuple[object, dict[int, "_Binding"]] | None] = ContextVar(
+    "uniserve_transfers", default=None
+)
 
 
 def _map(value, function):
@@ -58,7 +61,9 @@ class _Call:
 class _Binding:
     def __init__(self, device, streams):
         self.device, self.streams = device, streams
-        self.calls = ContextVar("uniserve_transfer_calls", default=())
+        self.calls: ContextVar[tuple[_Call, ...]] = ContextVar(
+            "uniserve_transfer_calls", default=()
+        )
 
     def prepare(self, args, kwargs):
         """Record devices, select the stream, and move inputs.
@@ -111,7 +116,8 @@ class _Binding:
                 _Call(target, scope, origin, stream, kwargs.get("out")),
             )
         )
-        if stream is not None:
+        # Origin and delivery streams exist together, for a CUDA binding.
+        if origin is not None and stream is not None:
             if stream != origin:
                 stream.wait_stream(origin)
             scope.enter_context(torch.cuda.device(self.device))
@@ -148,7 +154,11 @@ class _Binding:
             )
         finally:
             try:
-                if call.origin is not None and call.stream != call.origin:
+                if (
+                    call.origin is not None
+                    and call.stream is not None
+                    and call.stream != call.origin
+                ):
                     call.origin.wait_stream(call.stream)
             finally:
                 call.scope.close()
@@ -163,7 +173,12 @@ class _Transfers:
     """
 
     def __init__(self, module, device):
-        self.modules, self.bindings, self.streams = {}, {}, {}
+        self.modules: dict[int, torch.nn.Module] = {}
+        self.bindings: dict[int, _Binding] = {}
+        # (origin device, origin stream handle, destination device) -> stream
+        self.streams: dict[
+            tuple[torch.device, int, torch.device], torch.cuda.Stream
+        ] = {}
 
         # A submodule inherits its parent's placement unless every parameter
         # (or, failing that, every buffer) agrees on one different device.

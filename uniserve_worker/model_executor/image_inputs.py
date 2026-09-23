@@ -19,6 +19,7 @@ from uniserve.processing import (
     ImageProcessor,
     PatchTransform,
     StrideResize,
+    TowerTransform,
 )
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.model_executor.input_batch import InputRow
@@ -39,7 +40,9 @@ class PreparedImage:
     width: int
 
 
-def _image_plan(processor, kind, height, width):
+def _image_plan(
+    processor: ImageProcessor, kind: MediaCall, height: int, width: int
+) -> tuple[PatchTransform | TowerTransform, tuple[int, int], tuple[int, int]]:
     """Resolve canvas and tower dimensions independently of pixel storage."""
     transform = (
         processor.vit if kind is MediaCall.VISION_ENCODING else processor.vae

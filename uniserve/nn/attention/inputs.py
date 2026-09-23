@@ -217,7 +217,7 @@ class PagedInput:
 
         width = max(map(len, blocks), default=0)
         rows = []
-        addresses = []
+        addresses: list[int] = []
         for row, query, prefix in zip(
             blocks, query_lengths, prefix_lengths, strict=True
         ):

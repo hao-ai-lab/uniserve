@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+import torch
+
 from .mesh import Communicator
 
 
@@ -55,7 +57,7 @@ class TokenShard:
         interval = self.token_slice
         return interval.stop - interval.start
 
-    def local(self, value, *, dim=0):
+    def local(self, value: torch.Tensor, *, dim: int = 0) -> torch.Tensor:
         """Select this member's token interval from a complete-domain tensor."""
         if value.shape[dim] != self.num_tokens:
             raise ValueError(

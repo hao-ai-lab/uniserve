@@ -42,7 +42,7 @@ from uniserve_worker.config.deployment import (
     WorkerProcessArgs,
 )
 from uniserve_worker.config.execution import WorkerConfig
-from uniserve_worker.errors import unsupported_setup
+from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.model_executor.component_binding import (
     Call,
     ComponentBinding,
@@ -336,6 +336,8 @@ def load_worker_model(
     )
     override = config.model.quantization_config.get("kv_cache_dtype")
     if override is not None:
+        if not isinstance(override, str):
+            raise invalid_descriptor("worker KV dtype is unsupported")
         worker_config = replace(worker_config, kv_cache_dtype=override)
 
     logger.info("loaded numerical model %s", type(model).__qualname__)

@@ -1,5 +1,7 @@
 """Q/K/V network composition with explicit normalization and rotary axes."""
 
+from typing import cast
+
 import torch
 from torch import nn
 
@@ -180,7 +182,10 @@ class AxialQKVProjection(QKVProjection):
         outputs = []
         for tensor, norm in ((q, self.query_norm), (k, self.key_norm)):
             if isinstance(norm, nn.ModuleList):
-                widths = tuple(module.weight.numel() for module in norm)
+                # Construction admits only RMSNorm domains in a ModuleList.
+                widths = tuple(
+                    cast(RMSNorm, module).weight.numel() for module in norm
+                )
                 normalized = torch.cat(
                     tuple(
                         module(part)

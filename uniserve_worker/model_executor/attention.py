@@ -95,10 +95,13 @@ def from_blocks(
             device="cpu",
         )
         if not all(write):
+            writes = result.write_indices
+            if writes is None:
+                raise ValueError("paged appends require cache write addresses")
             offset = 0
             for length, enabled in zip(query_lengths, write, strict=True):
                 if not enabled:
-                    result.write_indices[offset : offset + length].fill_(-1)
+                    writes[offset : offset + length].fill_(-1)
                 offset += length
         return result
 
@@ -113,6 +116,9 @@ def from_blocks(
         raise ValueError(
             "read-only prefix/current calls require noncausal current sequences"
         )
+    maximum = queries.maximum
+    if maximum is None:
+        raise ValueError("read-only calls require host query lengths")
 
     # Read-only rows write no KV and see their whole current segment, so the
     # per-position visibility end is simply each row's own query length.
@@ -121,7 +127,7 @@ def from_blocks(
         prefixes,
         BlockTable(table, block_size),
         None,
-        queries.values[:, None].expand(-1, queries.maximum),
+        queries.values[:, None].expand(-1, maximum),
         True,
     )
 

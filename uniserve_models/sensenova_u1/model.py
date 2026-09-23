@@ -41,8 +41,14 @@ class Model(nn.Module):
             backbone,
             VocabParallelHead(config.text.hidden_size, config.text.vocab_size),
         )
+        # Construction precedes pipeline binding, so both modules are present.
         if config.text.tie_word_embeddings:
-            self.text.lm_head.weight = backbone.embedding.weight
+            embedding, head = backbone.embedding, self.text.lm_head
+            if embedding is None or head is None:
+                raise ValueError(
+                    "tied embeddings require the embedding and head"
+                )
+            head.weight = embedding.weight
         self.denoiser = Denoiser(config, backbone)
 
         self.vision_encoder = PatchEncoder(

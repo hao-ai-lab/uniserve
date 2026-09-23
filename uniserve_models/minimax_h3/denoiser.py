@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from typing import cast
 
 import torch
 
 from uniserve.diffusion import CleanSampleEulerSolver, Schedule
 from uniserve.model import Denoiser as BaseDenoiser
 from uniserve.model import LatentInput
-from uniserve.nn import RotaryEmbedding
+from uniserve.nn import ColumnParallelLinear, RotaryEmbedding
 from uniserve.nn.attention import vsa
 from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
 
@@ -25,7 +26,7 @@ from .packing import (
     patchify_video,
     video_latent_frames,
 )
-from .transformer import Transformer
+from .transformer import Transformer, TransformerLayer
 
 
 def schedules(
@@ -125,10 +126,15 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
         )
 
     def _sequence_group(self):
-        layer = next(iter(self.transformer.layers.values()))
-        distribution = layer.attention.projection.projections[
-            "q"
-        ].input_distribution
+        # Resident layers are TransformerLayers whose merged attention
+        # branches are column-parallel linears.
+        layer = cast(
+            TransformerLayer, next(iter(self.transformer.layers.values()))
+        )
+        query = cast(
+            ColumnParallelLinear, layer.attention.projection.projections["q"]
+        )
+        distribution = query.input_distribution
         return distribution.mesh.get_group(distribution.shard_axes(0))
 
     def _packing(self, size: DenoiserSize) -> Packing:
@@ -359,8 +365,16 @@ class Denoiser(BaseDenoiser[DenoiserInput, DenoiserSize]):
     ) -> Mapping[str, BufferConfig]:
         packing = self._packing(size)
         interval = self._token_slice(packing)
-        attention = next(iter(self.transformer.layers.values())).attention
-        distribution = attention.projection.projections["q"].output_distribution
+        # Resident layers are TransformerLayers whose merged attention
+        # branches are column-parallel linears.
+        layer = cast(
+            TransformerLayer, next(iter(self.transformer.layers.values()))
+        )
+        attention = layer.attention
+        query = cast(
+            ColumnParallelLinear, attention.projection.projections["q"]
+        )
+        distribution = query.output_distribution
         context = distribution.mesh.get_group(distribution.shard_axes(0))
         return {
             "hidden": BufferConfig(

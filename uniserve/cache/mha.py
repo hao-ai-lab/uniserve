@@ -253,7 +253,7 @@ class State(PrefixState):
         values: torch.Tensor,
     ) -> None:
         tensor = self.tensors[name]
-        index = (block, *interval)
+        index: tuple[int | slice, ...] = (block, *interval)
         if isinstance(values, QuantizedTensor):
             values = values.dequantize()
 
@@ -403,7 +403,7 @@ class State(PrefixState):
         touched.scatter_(0, blocks, True)
         touched = touched[:count]
 
-        encoded = []
+        encoded: list[torch.Tensor] = []
         for name, source in (("key", key), ("value", value)):
             target = self.tensors[name]
             if isinstance(source, QuantizedTensor):
@@ -452,13 +452,16 @@ class State(PrefixState):
             )
             self.initialized[name].logical_or_(touched)
 
-        stores = tuple(
+        key_store, value_store = (
             tensor.buffers()["values"]
             if isinstance(tensor, QuantizedTensor)
             else tensor
             for tensor in (self.key, self.value)
         )
-        paged_kv_write(*stores, indices, *encoded)
+        key_encoded, value_encoded = encoded
+        paged_kv_write(
+            key_store, value_store, indices, key_encoded, value_encoded
+        )
 
     def transfer_blocks(
         self, block_ids: tuple[int, ...], *, start: int, length: int

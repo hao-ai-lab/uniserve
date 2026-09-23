@@ -2,18 +2,26 @@
 
 from __future__ import annotations
 
-from contextlib import ExitStack, contextmanager
+from collections.abc import Mapping
+from contextlib import AbstractContextManager, ExitStack, contextmanager
+from contextvars import ContextVar
 from functools import partial
 from types import MappingProxyType
-from typing import Generic, TypeVar
+from typing import Generic, TypeVar, cast
 
 import torch
 from torch import nn
 
 from uniserve.distributed import communicators
+from uniserve.distributed.mesh import Communicator
 from uniserve.model.inputs import TextSize
 from uniserve.nn import _binding
 from uniserve.nn.attention import Attention
+from uniserve.nn.attention._parallel import (
+    AttentionBuffers,
+    OutputBuffers,
+    ParallelAttention,
+)
 from uniserve.nn.attention.vsa import BlockAttention
 from uniserve.nn.linear import (
     ColumnParallelLinear,
@@ -33,6 +41,15 @@ from .stream import CUDAStream
 from .tensor_buffers import TensorBuffers
 
 SizeT = TypeVar("SizeT")
+ValueT = TypeVar("ValueT")
+
+
+def _install(
+    scope: ExitStack, variable: ContextVar[ValueT], value: ValueT
+) -> None:
+    """Bind ``variable`` to ``value`` until ``scope`` exits."""
+    token = variable.set(value)
+    scope.callback(variable.reset, token)
 
 
 def _representation(module, inherited):
@@ -71,7 +88,9 @@ class ExecutionContext(Generic[SizeT]):
         matmul="auto",
         groups=None,
     ):
-        self.module, self.stream, self.cache = module, stream, cache
+        # Close releases the module; a closed context never executes again.
+        self.module: nn.Module | None = module
+        self.stream, self.cache = stream, cache
         self._groups = (
             communicators(module) if groups is None else tuple(groups)
         )
@@ -81,7 +100,7 @@ class ExecutionContext(Generic[SizeT]):
             matmul,
         )
 
-        reference = next(
+        reference: torch.Tensor | None = next(
             (value for value in module.parameters() if not value.is_meta), None
         )
         if reference is None:
@@ -107,32 +126,41 @@ class ExecutionContext(Generic[SizeT]):
                 "the execution stream must belong to the root module device"
             )
 
-        self.constants = self.workspace = MappingProxyType({})
-        self._allocations = []
-        self._scratch = {}
-        self._matmul_scratch = {}
+        self.constants: Mapping[str, torch.Tensor] = MappingProxyType({})
+        self.workspace: Mapping[str, torch.Tensor] = self.constants
+        self._allocations: list[TensorBuffers] = []
+        # Work areas are keyed by device and their buffer requirements.
+        self._scratch: dict[tuple[object, ...], torch.Tensor] = {}
+        self._matmul_scratch: dict[
+            tuple[object, ...], Mapping[str, torch.Tensor]
+        ] = {}
 
-        self._operators = {}
-        self._merged = {}
-        self._attention = {}
-        self._vsa = {}
-        self._vsa_backing = {}
-        self._vsa_output = {}
-        self._vsa_context = {}
-        self._context_backing = {}
-        self._vsa_transport = {}
-        self._exchange = {}
-        self._chunks = {}
-        self._gather_pools = {}
+        self._operators: dict[int, MatmulBinding] = {}
+        self._merged: dict[int | _binding.MergedKey, MatmulBinding] = {}
+        self._attention: dict[int, AttentionBinding] = {}
+        self._vsa: dict[int, VsaBinding] = {}
+        self._vsa_backing: dict[
+            tuple[object, ...], Mapping[str, torch.Tensor]
+        ] = {}
+        self._vsa_output: dict[ParallelAttention, OutputBuffers] = {}
+        self._vsa_context: dict[ParallelAttention, AttentionBuffers] = {}
+        self._context_backing: dict[tuple[object, ...], AttentionBuffers] = {}
+        self._vsa_transport: dict[
+            tuple[object, ...], tuple[OutputBuffers, AttentionBuffers | None]
+        ] = {}
+        self._exchange: dict[int, ExchangeBuffers] = {}
+        self._chunks: dict[int, _binding.ChunkStorage] = {}
+        self._gather_pools: dict[Communicator, GatherPool] = {}
 
         from ._transfers import _Transfers
 
-        self._transfers = _Transfers(module, self._device)
+        # Close releases the transfers after their final reset.
+        self._transfers: _Transfers | None = _Transfers(module, self._device)
         # Streams created for graphs that borrow this context without an
         # execution stream; their replays read this context's backing.
         self._graph_streams: set[torch.cuda.Stream] = set()
-        self._entered = None
-        self._max_tokens = None
+        self._entered: AbstractContextManager[None] | None = None
+        self._max_tokens: int | None = None
         self._closed = False
 
     def _allocate(self, requirements, device):
@@ -241,15 +269,19 @@ class ExecutionContext(Generic[SizeT]):
                         (buffers.local, buffers.receive),
                     )
 
-                output = self.stream.communication.windows(
-                    ("vsa_output", key), group, registered
+                # Only registered() stores values under "vsa_output" keys.
+                output = cast(
+                    OutputBuffers,
+                    self.stream.communication.windows(
+                        ("vsa_output", key), group, registered
+                    ),
                 )
             else:
                 outputs = allocate()
                 self._allocations.extend(outputs.allocations)
                 output = outputs.views[parallel]
 
-            context = allocate_context_storage(
+            contexts = allocate_context_storage(
                 (parallel,),
                 rows=rows,
                 heads=heads,
@@ -257,7 +289,7 @@ class ExecutionContext(Generic[SizeT]):
                 dtype=dtype,
                 block_size=64,
             )
-            self._vsa_transport[key] = (output, context.get(parallel))
+            self._vsa_transport[key] = (output, contexts.get(parallel))
 
         output, context = self._vsa_transport[key]
         self._vsa_output[parallel] = output
@@ -292,6 +324,9 @@ class ExecutionContext(Generic[SizeT]):
             raise
 
     def _prepare(self, size, *, constants, workspace):
+        module = self.module
+        if module is None:
+            raise RuntimeError("execution context is closed")
         max_rows = size.num_tokens if isinstance(size, TextSize) else None
         self._max_tokens = max_rows
 
@@ -308,7 +343,7 @@ class ExecutionContext(Generic[SizeT]):
                 ("workspace", workspace),
             ):
                 query = getattr(
-                    self.module,
+                    module,
                     "constant_buffers"
                     if name == "constants"
                     else "workspace_buffers",
@@ -322,13 +357,13 @@ class ExecutionContext(Generic[SizeT]):
                 )
                 setattr(self, name, views)
 
-            prepare = getattr(self.module, "prepare_constants", None)
+            prepare = getattr(module, "prepare_constants", None)
             if prepare is not None:
                 prepare(size, out=self.constants)
 
             representations = {"": (self._device, self._dtype)}
             vsa_slot = 0
-            for path, child in self.module.named_modules():
+            for path, child in module.named_modules():
                 inherited = representations[path.rpartition(".")[0]]
                 device, dtype = _representation(child, inherited)
                 representations[path] = device, dtype
@@ -350,7 +385,12 @@ class ExecutionContext(Generic[SizeT]):
                             child.branch_width,
                         )
                         self._merged[key] = binding
-                        branches = tuple(child.projections.values())
+                        # ModuleDict does not carry its value type; merged
+                        # construction registers only column projections.
+                        branches = cast(
+                            tuple[ColumnParallelLinear, ...],
+                            tuple(child.projections.values()),
+                        )
                         quantizers = {
                             branch.input_quantizer for branch in branches
                         }
@@ -415,7 +455,7 @@ class ExecutionContext(Generic[SizeT]):
                         state = self.cache.state(child.cache_name)
                         device, dtype = state.key.device, state.key.dtype
 
-                    binding = AttentionBinding(
+                    attention_binding = AttentionBinding(
                         child,
                         self._attention_backend,
                         state,
@@ -425,10 +465,10 @@ class ExecutionContext(Generic[SizeT]):
                         self._attention_workspace,
                         self._context_transport,
                     )
-                    self._attention[id(child)] = binding
+                    self._attention[id(child)] = attention_binding
 
                     if isinstance(size, TextSize):
-                        binding.prepare(dtype, size)
+                        attention_binding.prepare(dtype, size)
                         self._prepare_exchange(
                             child, size.num_tokens, device, dtype
                         )
@@ -535,14 +575,6 @@ class ExecutionContext(Generic[SizeT]):
         bindings.
         """
         self._open()
-        variables = (
-            (_binding.matmul, self._operators),
-            (_binding.merged_matmul, self._merged),
-            (_binding.attention, self._attention),
-            (_binding.vsa, self._vsa),
-            (_binding.attention_storage, self._exchange),
-            (_binding.linear_chunks, self._chunks),
-        )
 
         with ExitStack() as scope:
             collectives = None
@@ -560,9 +592,12 @@ class ExecutionContext(Generic[SizeT]):
 
             scope.enter_context(output_scope(self._vsa_output))
             scope.enter_context(context_scope(self._vsa_context))
-            for variable, value in variables:
-                token = variable.set(value)
-                scope.callback(variable.reset, token)
+            _install(scope, _binding.matmul, self._operators)
+            _install(scope, _binding.merged_matmul, self._merged)
+            _install(scope, _binding.attention, self._attention)
+            _install(scope, _binding.vsa, self._vsa)
+            _install(scope, _binding.attention_storage, self._exchange)
+            _install(scope, _binding.linear_chunks, self._chunks)
             yield
 
     def _release(self):
@@ -622,7 +657,11 @@ class ExecutionContext(Generic[SizeT]):
         if self._closed or self._device.type != "cuda":
             return True
         streams = [
-            *self._transfers.streams.values(),
+            *(
+                self._transfers.streams.values()
+                if self._transfers is not None
+                else ()
+            ),
             *self._graph_streams,
         ]
         if self.stream is not None:
@@ -673,6 +712,10 @@ class ExecutionContext(Generic[SizeT]):
 
     def __exit__(self, exc_type, exc, traceback):
         try:
+            if self._entered is None:
+                raise RuntimeError(
+                    "execution context ownership was not entered"
+                )
             self._entered.__exit__(exc_type, exc, traceback)
         finally:
             self._entered = None

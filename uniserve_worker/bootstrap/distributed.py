@@ -32,7 +32,7 @@ def initialize_components(
             # exchanges nothing, so its ranks stay outside any collective.
             if groups.rank not in component.ranks:
                 continue
-            ranks = (groups.rank,)
+            ranks: tuple[int, ...] = (groups.rank,)
         elif component.distribution is not None:
             # Media units are independent local invocations, so the numerical
             # mesh is this rank alone. The ranks holding consecutive units still

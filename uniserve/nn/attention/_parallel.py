@@ -157,7 +157,9 @@ class ParallelAttention(torch.nn.Module):
 
         heads = () if parallel.heads is None else (parallel.heads.axis,)
         context = parallel.context
-        context_axes = () if context is None else (context.gather_axis,)
+        context_axes: tuple[str, ...] = (
+            () if context is None else (context.gather_axis,)
+        )
         # Validate before ordering by topology: misspelled axes must not
         # silently disappear, and flattened token order follows the declared
         # mesh.

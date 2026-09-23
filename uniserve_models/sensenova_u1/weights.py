@@ -6,16 +6,16 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from uniserve.loading import checkpoint, weights
+from uniserve.model import TransformerDecoder
 
 if TYPE_CHECKING:
     from .model import Model
-    from .transformer import Transformer
 
 
 checkpoint_sources = (checkpoint.Config("primary"),)
 
 
-def _backbone_names(backbone: Transformer):
+def _backbone_names(backbone: TransformerDecoder):
     """Translate backbone parameter paths to checkpoint language_model names.
 
     Text experts keep the plain checkpoint names; flow experts carry the

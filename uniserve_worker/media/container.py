@@ -148,6 +148,8 @@ def encode_video_unit(config: AvMuxConfig, rgb24: np.ndarray) -> bytes:
         stream = container.add_stream(
             config.video_codec, rate=config.frame_rate
         )
+        if not isinstance(stream, av.VideoStream):
+            raise ValueError(f"{config.video_codec} is not a video encoder")
         stream.width, stream.height = config.width, config.height
         stream.pix_fmt = "yuv420p"
         stream.options = {"preset": "ultrafast", "tune": "zerolatency"}
@@ -186,6 +188,8 @@ def encode_audio_track(config: AvMuxConfig, pcm: np.ndarray) -> bytes:
         stream = container.add_stream(
             config.audio_codec, rate=config.audio_rate
         )
+        if not isinstance(stream, av.AudioStream):
+            raise ValueError(f"{config.audio_codec} is not an audio encoder")
         stream.layout = "stereo"
         stream.sample_rate = config.audio_rate
         stream.bit_rate = 144_000
@@ -249,7 +253,7 @@ class AvMuxSession:
 
         self._buffer = io.BytesIO()
         self._container = av.open(self._buffer, mode="w", format="mp4")
-        source = av.open(io.BytesIO(first_unit))
+        source = av.open(io.BytesIO(first_unit), mode="r")
         try:
             self._video_out = self._container.add_stream_from_template(
                 source.streams.video[0]
@@ -260,7 +264,7 @@ class AvMuxSession:
             replace(self.config, frame_count=1, video_unit_frames=(1,)),
             np.zeros((1, 2), dtype=np.int16),
         )
-        track = av.open(io.BytesIO(template))
+        track = av.open(io.BytesIO(template), mode="r")
         try:
             self._audio_out = self._container.add_stream_from_template(
                 track.streams.audio[0]
@@ -279,7 +283,7 @@ class AvMuxSession:
         for payload in units:
             if self._container is None:
                 self._open(payload)
-            source = av.open(io.BytesIO(payload))
+            source = av.open(io.BytesIO(payload), mode="r")
             try:
                 stream = source.streams.video[0]
                 last = self._offset
@@ -304,7 +308,7 @@ class AvMuxSession:
             raise ValueError(
                 "artifact assembly requires every media unit of the request"
             )
-        track = av.open(io.BytesIO(audio))
+        track = av.open(io.BytesIO(audio), mode="r")
         try:
             for packet in track.demux(track.streams.audio[0]):
                 if packet.dts is None:

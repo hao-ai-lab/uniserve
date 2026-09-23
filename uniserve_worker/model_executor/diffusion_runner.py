@@ -165,7 +165,8 @@ class DiffusionRunner(ModelRunner):
         Preparation, the runner's samples included, is charged to
         ``storage``, whose budget it must fit.
         """
-        context = ExecutionContext(
+        # The worker holds the denoiser's layout as an opaque size value.
+        context: ExecutionContext[object] = ExecutionContext(
             call.module, attention=attention, stream=stream, groups=call.groups
         )
         runner = cls(
@@ -563,13 +564,8 @@ class DiffusionRunner(ModelRunner):
         graph = None if bucket is None else bucket.graphs.get(index)
         context = self.context
         stream = context.stream
-        current = (
-            torch.cuda.current_stream(self.device)
-            if stream is not None
-            else None
-        )
         if stream is not None:
-            stream.wait(current)
+            stream.wait(torch.cuda.current_stream(self.device))
         try:
             with context.activate():
                 cast(torch.Tensor, self._rows).copy_(
@@ -593,8 +589,11 @@ class DiffusionRunner(ModelRunner):
                 for name, values in live.latents.items()
             }, "graph_replay"
         finally:
+            # Activation has restored the caller's stream on this device.
             if stream is not None:
-                current.wait_stream(stream.stream)
+                torch.cuda.current_stream(self.device).wait_stream(
+                    stream.stream
+                )
 
     def close(self):
         # Pinned copies retain their destination stream; release them before

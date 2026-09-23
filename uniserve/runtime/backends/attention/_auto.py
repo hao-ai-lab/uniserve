@@ -15,6 +15,7 @@ from uniserve.nn.attention.inputs import (
     VisibleInput,
 )
 from uniserve.quantization import QuantizedTensor
+from uniserve.tensors import BufferConfig
 
 from . import Backend as _Backend
 from . import Operator as _Operator
@@ -257,7 +258,7 @@ class Backend(_Backend):
 
     def workspace_buffers(self, **kwargs):
         _, requirements = self._requirements(kwargs)
-        result = {}
+        result: dict[str, BufferConfig] = {}
 
         # Providers share the scratch grant; other buffers are namespaced per
         # provider so independently prepared operators cannot collide.

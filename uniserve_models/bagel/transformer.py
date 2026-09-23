@@ -123,12 +123,16 @@ class Transformer(TransformerDecoder):
         super().__init__(
             VocabParallelEmbedding(config.vocab_size, config.hidden_size),
             nn.ModuleDict(
-                (str(index), TransformerLayer(config, index))
-                for index in range(config.num_hidden_layers)
+                {
+                    str(index): TransformerLayer(config, index)
+                    for index in range(config.num_hidden_layers)
+                }
             ),
             nn.ModuleDict(
-                (route, RMSNorm(config.hidden_size, config.rms_norm_eps))
-                for route in ("text", "flow")
+                {
+                    route: RMSNorm(config.hidden_size, config.rms_norm_eps)
+                    for route in ("text", "flow")
+                }
             ),
             default_route="text",
         )

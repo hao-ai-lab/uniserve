@@ -14,6 +14,7 @@ from uniserve.model import (
     VideoDecoder,
     VideoPostprocessor,
 )
+from uniserve.tensors import OutputLayout
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.model_executor.resources import output_layouts
 from uniserve_worker.protocol.tensor import (
@@ -70,7 +71,8 @@ def resolve_outputs(
     result = {}
     for component, calls in describe_components(model).items():
         outputs = []
-        layouts = [
+        # The encoded media units are not the output of any numerical module.
+        layouts: list[tuple[nn.Module | None, str, OutputLayout]] = [
             (call.module, name, layout)
             for call in calls
             for name, layout in output_layouts(

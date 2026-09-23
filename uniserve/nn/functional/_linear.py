@@ -158,7 +158,7 @@ def apply_merged_linear(
             # domains and therefore distinct GEMMs. Give each native kernel a
             # contiguous destination instead of copying from a temporary into
             # channel views of an output it cannot fuse.
-            outputs = {
+            outputs: Mapping[str, torch.Tensor] = {
                 name: torch.empty(
                     (*x.shape[:-1], weight.shape[0]),
                     dtype=dtype,

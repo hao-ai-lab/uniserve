@@ -126,7 +126,7 @@ class Worker:
             # the initiating error before entering teardown so it is not lost.
             logger.error(
                 "worker execution failed before resource cleanup",
-                exc_info=(exc_type, exc_value, traceback),
+                exc_info=(type(exc_value), exc_value, traceback),
             )
         try:
             # A scope leaving on an error releases without its peers: they are
