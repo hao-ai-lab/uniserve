@@ -582,7 +582,9 @@ class Worker:
             # A rank holding host components is one codec slot: its lane runs
             # one codec task at a time on one thread. Any other rank's host
             # work is bounded by its arena.
-            self.codec_slot = holds_host_components(components)
+            self.codec_slot = holds_host_components(
+                name for name, _ in components
+            )
             self.host_tasks = (
                 HostLane(max_inflight=1, workers=1)
                 if self.codec_slot
