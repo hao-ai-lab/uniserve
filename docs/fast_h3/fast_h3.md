@@ -42,6 +42,8 @@ The `gpu` extra installs the locked GPU providers FastH3 serves through: FlashIn
 
 The two `skx618` repositories are self-describing ModelOpt PTQ checkpoints. UniServe loads them natively, with no conversion step and no precision flags: see [Precision and graphs](#precision-and-graphs).
 
+Each checkpoint's `fastvideo_inference.json` supplies its sampling schedule: the trained DMD rungs in `dmd_denoising_steps`, one transformer forward per rung, and the VSA sparsity. The video and audio shifts come from `scheduler/` and `audio_scheduler/`, and a manifest that restates them must agree. The loader refuses a manifest that is not a `fasth3-inference-contract-v1` text-to-video-and-audio contract without guidance. The table lists the checkpoints UniServe has validated end to end.
+
 `uniserve serve` takes either a repository id, which loads the latest published revision, or a local model directory.
 
 ## Download the model

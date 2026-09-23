@@ -1,4 +1,4 @@
-"""H3's trained four-evaluation endpoints retain their materialization order."""
+"""H3's trained four-evaluation rungs retain their materialization order."""
 
 import pytest
 import torch
@@ -15,10 +15,14 @@ def test_fixed_modality_endpoints():
         model = Denoiser(TransformerConfig(), DiffusionConfig())
     schedules = model.make_schedules(4, shift=None, device="cpu")
     assert tuple(schedules) == ("video", "audio")
-    for name, expected in (
-        ("video", (1.0, 36.0 / 37.0, 12.0 / 13.0, 0.8, 0.0)),
-        ("audio", (1.0, 0.9, 0.75, 0.5, 0.0)),
-    ):
+    for name, shift in (("video", 12.0), ("audio", 3.0)):
+        # Each rung is an unshifted noise level on the 1000-step clock,
+        # shifted once per modality and materialized in double precision
+        # before rounding to FP32; the clean endpoint follows the last rung.
+        expected = tuple(
+            shift * (rung / 1000) / (1 + (shift - 1) * (rung / 1000))
+            for rung in (999, 749, 500, 250, 0)
+        )
         sigma = torch.tensor(expected, dtype=torch.float32)
         torch.testing.assert_close(
             schedules[name].sigmas, sigma, rtol=0, atol=0

@@ -12,98 +12,111 @@ from typing import Any
 from . import audio_vae, output, video_vae
 from .encoder import TextEncoderConfig
 
-FASTH3_LADDER = (1000, 750, 500, 250)
-FASTH3_SHIFTS = (12.0, 3.0)
-FASTH3_8_STEP_LADDER = (1000, 875, 750, 625, 500, 375, 250, 125)
-FASTH3_8_STEP_SHIFTS = (10.0, 3.0)
-FASTH3_TIME_SCALE = 1000.0
+# Inference contract schema a FastH3 export publishes in its manifest.
+INFERENCE_SCHEMA = "fasth3-inference-contract-v1"
 
-FASTH3_MODEL_ID = "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree"
-FASTH3_REVISION = "5ea076f35b84da4c3c82217112fa733d8eea2ae1"
-FASTH3_8_STEP_MODEL_ID = "FastVideo/FastVideo-FastH3-8-Step-V2"
-FASTH3_8_STEP_REVISION = "3da2ddfe1954d9cda4c05b643dc0f26007a655c5"
-
-FASTH3_VARIANTS = {
-    FASTH3_MODEL_ID: {
-        "revision": FASTH3_REVISION,
-        "checkpoint_content_sha256": (
-            "b36987515e4c75fa4c7aaa632a7842c829ea141b235358a54d782b51230497b3"
-        ),
-        "checkpoint_metadata_sha256": (
-            "dcad0fbee2a7c7e75e53435f4fd98fccf3138844883874edf057962ab48fa428"
-        ),
-        "fastvideo_commit": "48a047c05ff4138f20cfa33351499c6ec5945f5d",
-        "transformer_forwards": 4,
-        "num_inference_steps": 5,
-        "dmd_denoising_steps": [999, 749, 500, 250],
-        "vsa_sparsity": 0.9,
-        "ladder": FASTH3_LADDER,
-        "shifts": FASTH3_SHIFTS,
-    },
-    FASTH3_8_STEP_MODEL_ID: {
-        "revision": FASTH3_8_STEP_REVISION,
-        "checkpoint_content_sha256": (
-            "516323fa396fa5dff4e82669d4e9a08a5791692a3d3b98ff6bc3de3fc6a33d11"
-        ),
-        "checkpoint_metadata_sha256": (
-            "ca9f2d609c05742ba465d24989981ec02cca26acb6ca2f163dc0f6dc8d11c27b"
-        ),
-        "fastvideo_commit": "24bbe7fddd05ca6f2c34b3dbed06ac1c75b72086",
-        "transformer_forwards": 8,
-        "num_inference_steps": 9,
-        "dmd_denoising_steps": [999, 874, 749, 624, 500, 375, 250, 125],
-        "vsa_sparsity": 0.8,
-        "ladder": FASTH3_8_STEP_LADDER,
-        "shifts": FASTH3_8_STEP_SHIFTS,
-    },
-}
+# DMD rungs are unshifted noise levels on the 1000-step training clock.
+TRAINING_CLOCK = 1000.0
 
 
-def _validate_manifest(manifest: Mapping[str, object]) -> Mapping[str, object]:
-    """Validate a supported full VSA checkpoint before allocating components.
+def _is_integer(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
-    The manifest's training indices do not select the inference schedule. The
-    numerical ladder is owned by the pinned deployment contract for each
-    checkpoint variant.
+
+def _is_positive_number(value: object) -> bool:
+    return (
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
+def _inference_contract(
+    manifest: Mapping[str, object],
+    shifts: Mapping[str, float],
+) -> tuple[tuple[int, ...], float]:
+    """Validate a FastH3 inference contract and return its rungs and sparsity.
+
+    The export's trained DMD rungs are the denoising ladder: each rung is an
+    unshifted noise level on the training clock, and a uniform grid over the
+    same number of points is not a substitute for them. `shifts` holds the
+    video and audio scheduler shifts, which a contract may restate and must
+    then agree with.
+
+    Raises:
+        ValueError: The manifest is not a text-to-video-and-audio contract
+            this implementation serves, naming the offending field.
     """
-    model_id = manifest.get("model_id")
-    variant = FASTH3_VARIANTS.get(model_id)
-    if variant is None:
-        raise ValueError(
-            f"unsupported FastH3 checkpoint: model_id must be one of "
-            f"{tuple(FASTH3_VARIANTS)}, got {model_id!r}"
-        )
-    expected = {
-        "schema_version": "fasth3-inference-contract-v1",
-        "model_id": model_id,
-        "task": "t2av",
-        "guidance_scale": 1.0,
-        "attention_backend": "VIDEO_SPARSE_ATTN_H3",
-        "vsa_tile_size": 64,
-        **{
-            name: variant[name]
-            for name in (
-                "checkpoint_content_sha256",
-                "checkpoint_metadata_sha256",
-                "fastvideo_commit",
-                "transformer_forwards",
-                "num_inference_steps",
-                "dmd_denoising_steps",
-                "vsa_sparsity",
-            )
-        },
-    }
-    for name, value in expected.items():
-        if (
-            type(manifest.get(name)) is not type(value)
-            or manifest.get(name) != value
-        ):
+    for name, expected in (
+        ("schema_version", INFERENCE_SCHEMA),
+        ("task", "t2av"),
+        ("attention_backend", "VIDEO_SPARSE_ATTN_H3"),
+    ):
+        if manifest.get(name) != expected:
             raise ValueError(
-                f"unsupported FastH3 checkpoint: {name} must be {value!r}, "
-                f"got {manifest.get(name)!r}; "
-                f"use {model_id}@{variant['revision']}"
+                f"unsupported FastH3 checkpoint: {name} must be "
+                f"{expected!r}, got {manifest.get(name)!r}"
             )
-    return variant
+    # The model has no unconditional branch and the sparse-attention kernel
+    # tiles 64 rows.
+    for name, expected in (("guidance_scale", 1.0), ("vsa_tile_size", 64)):
+        value = manifest.get(name)
+        if not _is_positive_number(value) or value != expected:
+            raise ValueError(
+                f"unsupported FastH3 checkpoint: {name} must be "
+                f"{expected!r}, got {value!r}"
+            )
+
+    rungs = manifest.get("dmd_denoising_steps")
+    if (
+        not isinstance(rungs, list)
+        or not rungs
+        or any(
+            not _is_integer(rung) or not 0 < rung <= TRAINING_CLOCK
+            for rung in rungs
+        )
+        or any(left <= right for left, right in zip(rungs, rungs[1:]))
+    ):
+        raise ValueError(
+            "unsupported FastH3 checkpoint: dmd_denoising_steps must be "
+            "strictly decreasing integers in (0, 1000], got "
+            f"{rungs!r}"
+        )
+    # `num_inference_steps` counts sigma-grid points, including the clean
+    # endpoint the solver reaches after the last rung.
+    for name, expected in (
+        ("transformer_forwards", len(rungs)),
+        ("num_inference_steps", len(rungs) + 1),
+    ):
+        value = manifest.get(name)
+        if not _is_integer(value) or value != expected:
+            raise ValueError(
+                f"unsupported FastH3 checkpoint: {name} must be {expected} "
+                f"for {len(rungs)} DMD rungs, got {value!r}"
+            )
+
+    sparsity = manifest.get("vsa_sparsity")
+    if (
+        not isinstance(sparsity, int | float)
+        or isinstance(sparsity, bool)
+        or not math.isfinite(sparsity)
+        or not 0 <= sparsity < 1
+    ):
+        raise ValueError(
+            "unsupported FastH3 checkpoint: vsa_sparsity must lie in [0, 1), "
+            f"got {sparsity!r}"
+        )
+
+    for modality in ("video", "audio"):
+        name = f"{modality}_scheduler_shift"
+        if name in manifest and manifest[name] != shifts[modality]:
+            raise ValueError(
+                f"unsupported FastH3 checkpoint: {name}={manifest[name]!r} "
+                f"disagrees with the {modality} scheduler shift "
+                f"{shifts[modality]!r}"
+            )
+    return tuple(rungs), float(sparsity)
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,34 +189,38 @@ class TransformerConfig:
 
 @dataclass(frozen=True, slots=True)
 class DiffusionConfig:
-    """A checkpoint-owned FastH3 clean-sample Euler recipe."""
+    """A checkpoint-owned FastH3 clean-sample Euler recipe.
 
-    ladder: tuple[int, ...] = FASTH3_LADDER
-    video_shift: float = FASTH3_SHIFTS[0]
-    audio_shift: float = FASTH3_SHIFTS[1]
-    time_scale: float = FASTH3_TIME_SCALE
+    `ladder` holds the trained DMD rungs on the `time_scale` clock; each
+    modality shifts them once with its own scheduler shift. The defaults are
+    the four-rung Preview export's recipe.
+    """
+
+    ladder: tuple[int, ...] = (999, 749, 500, 250)
+    video_shift: float = 12.0
+    audio_shift: float = 3.0
+    time_scale: float = TRAINING_CLOCK
 
     def __post_init__(self) -> None:
         if (
             not isinstance(self.ladder, tuple)
+            or not self.ladder
             or any(
-                not isinstance(value, int) or isinstance(value, bool)
-                for value in self.ladder
+                not _is_integer(rung) or not 0 < rung <= self.time_scale
+                for rung in self.ladder
             )
-            or self.ladder not in {FASTH3_LADDER, FASTH3_8_STEP_LADDER}
-        ):
-            raise ValueError("FastH3 requires a supported checkpoint ladder")
-        expected_shifts = (
-            FASTH3_SHIFTS
-            if self.ladder == FASTH3_LADDER
-            else FASTH3_8_STEP_SHIFTS
-        )
-        if (self.video_shift, self.audio_shift) != expected_shifts or (
-            self.time_scale != FASTH3_TIME_SCALE
+            or any(
+                left <= right
+                for left, right in zip(self.ladder, self.ladder[1:])
+            )
         ):
             raise ValueError(
-                "FastH3 requires its trained video/audio shifts and time scale"
+                "FastH3 ladder must be strictly decreasing integer rungs "
+                "within its time scale"
             )
+        for name in ("video_shift", "audio_shift", "time_scale"):
+            if not _is_positive_number(getattr(self, name)):
+                raise ValueError(f"FastH3 {name} must be finite and positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,13 +268,6 @@ class Config:
                         f"FastH3 {name}.{field.name} must be {supported!r}, "
                         f"got {value!r}"
                     )
-        expected_sparsity = (
-            0.9 if self.diffusion.ladder == FASTH3_LADDER else 0.8
-        )
-        if self.denoiser.vsa_sparsity != expected_sparsity:
-            raise ValueError(
-                "FastH3 denoiser VSA sparsity must match its checkpoint ladder"
-            )
 
 
 # Checkpoint field names differ from the mathematical modules' established
@@ -308,7 +318,14 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
     ):
         if not isinstance(metadata.get(name), Mapping):
             raise ValueError(f"FastH3 requires {name} metadata")
-    variant = _validate_manifest(metadata["inference"])
+    for name in ("scheduler", "audio_scheduler"):
+        if "shift" not in metadata[name]:
+            raise ValueError(f"FastH3 {name} is missing field shift")
+    shifts = {
+        "video": metadata["scheduler"]["shift"],
+        "audio": metadata["audio_scheduler"]["shift"],
+    }
+    ladder, sparsity = _inference_contract(metadata["inference"], shifts)
     transformer = metadata["transformer"]
     missing = set(TRANSFORMER_FIELDS) - transformer.keys()
     if missing:
@@ -323,7 +340,7 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
             "FastH3 transformer final_norm_eps must equal norm_eps"
         )
     denoiser = TransformerConfig(
-        vsa_sparsity=variant["vsa_sparsity"],
+        vsa_sparsity=sparsity,
         **{
             target: transformer[source]
             for source, target in TRANSFORMER_FIELDS.items()
@@ -399,19 +416,15 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
             value = tuple(value)
         audio_values[field.name] = value
 
-    for name in ("scheduler", "audio_scheduler"):
-        if "shift" not in metadata[name]:
-            raise ValueError(f"FastH3 {name} is missing field shift")
-
     return Config(
         text_encoder=encoder,
         denoiser=denoiser,
         video_decoder=video_vae.Config(**video_values),
         audio_decoder=audio_vae.Config(**audio_values),
         diffusion=DiffusionConfig(
-            ladder=variant["ladder"],
-            video_shift=metadata["scheduler"]["shift"],
-            audio_shift=metadata["audio_scheduler"]["shift"],
+            ladder=ladder,
+            video_shift=shifts["video"],
+            audio_shift=shifts["audio"],
         ),
     )
 
