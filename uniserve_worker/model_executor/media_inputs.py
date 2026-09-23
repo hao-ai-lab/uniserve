@@ -112,14 +112,6 @@ class MediaBuilder:
                 result[key] = replace(result[key], capacity_shape=capacity)
         return result
 
-    def schedules(
-        self, *, device: torch.device | str
-    ) -> Mapping[str, Schedule]:
-        """Build the fixed denoising schedule for every modality."""
-        return self.denoiser.make_schedules(
-            self.num_steps, shift=None, device=device
-        )
-
     @torch.inference_mode()
     def stage_request(
         self, size, tensors: Mapping[str, torch.Tensor], *, seed: int

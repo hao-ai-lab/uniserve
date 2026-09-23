@@ -65,7 +65,7 @@ The saved dictionary contains CPU `input_ids` shaped `[tokens]` and `logits` sha
 
 `ExecutionContext` owns prepared backend state, communication scratch and numerical workspace. Enter the context before calling its module, prepare the required size, and bind attention inputs before graph capture. `bind_attention` refreshes planning metadata; captured calls read numerical tensor contents from their fixed addresses.
 
-The capability runners in `uniserve.execution` provide the ordinary direct-call boundary over an existing context. `TextRunner` binds attention before `forward` and keeps vocabulary projection separate; `EncoderRunner`, `LatentRunner`, `DenoisingRunner`, `ImageRunner`, `VideoRunner`, `VideoProcessor`, and `AudioRunner` expose the corresponding numerical methods. Runners borrow the model and context, connect the context stream back to the caller's current stream, and never own request state or scheduling policy.
+The capability runners in `uniserve.execution` provide the ordinary direct-call boundary over an existing context. `TextRunner` binds attention before `forward` and keeps vocabulary projection separate; `EncoderRunner`, `LatentRunner`, `DenoisingRunner`, `ImageRunner`, `VideoRunner`, `VideoProcessor`, and `AudioRunner` expose the corresponding numerical methods; `DenoisingRunner` prepares a request's samples and remaining state (`prepare_latents`, `prepare_state`) and advances one layout's steps (`step`). Runners borrow the model and context, connect the context stream back to the caller's current stream, and never own request state or scheduling policy.
 
 ```python
 from uniserve.execution import TextRunner

@@ -15,7 +15,7 @@ from uniserve.tensors import OutputLayout
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution import calls
 from uniserve_worker.execution.batch import BatchState
-from uniserve_worker.execution.diffusion_state import ImageState
+from uniserve_worker.execution.diffusion_state import DiffusionState
 from uniserve_worker.execution.output import PendingOutput, capture_samples
 from uniserve_worker.model_executor.image_inputs import DecodeRow, PreparedImage
 from uniserve_worker.model_executor.input_batch import InputRow
@@ -220,11 +220,11 @@ def initialize_trajectories(
     latent_pool: LatentPool,
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
-) -> tuple[dict[int, ImageState], int]:
+) -> tuple[dict[int, DiffusionState], int]:
     """Open diffusion trajectories and return the longest declared interval."""
     from uniserve_worker.execution import diffusion
 
-    trajectories: dict[int, ImageState] = {}
+    trajectories: dict[int, DiffusionState] = {}
     for index in numerical:
         call = scheduled[index]
         if call.kind is not MediaCall.DENOISING or index in outcomes:
@@ -255,7 +255,7 @@ def initialize_trajectories(
 
 def prepare_diffusion_step(
     offset: int,
-    trajectories: dict[int, ImageState],
+    trajectories: dict[int, DiffusionState],
     scheduled: tuple[Call, ...],
     outcomes: dict[int, PendingOutput],
     *,
@@ -267,13 +267,11 @@ def prepare_diffusion_step(
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
     tokenizer: PreTrainedTokenizerBase | None,
-) -> dict[int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]]:
+) -> dict[int, tuple[tuple[Branch, ...], torch.Tensor]]:
     """Prepare one solver step and materialize any missing CFG prefixes."""
     from uniserve_worker.execution import diffusion, token
 
-    step_inputs: dict[
-        int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]
-    ] = {}
+    step_inputs: dict[int, tuple[tuple[Branch, ...], torch.Tensor]] = {}
     prefixes: list[tuple[int, Branch, InputRow]] = []
 
     for index, trajectory in trajectories.items():
@@ -291,7 +289,7 @@ def prepare_diffusion_step(
         if offset >= int(params.step_count):
             continue
 
-        guide, timestep, next_timestep, prefix_rows = diffusion.prepare_step(
+        guide, timestep, prefix_rows = diffusion.prepare_step(
             call,
             trajectory,
             int(params.start_step) + offset,
@@ -301,7 +299,7 @@ def prepare_diffusion_step(
             tokenizer=tokenizer,
             state=state,
         )
-        step_inputs[index] = guide, timestep, next_timestep
+        step_inputs[index] = guide, timestep
         prefixes.extend((index, branch, task) for branch, task in prefix_rows)
 
     active_prefixes = tuple(
@@ -337,8 +335,10 @@ def prepare_diffusion_step(
             request_tables=request_tables,
             decode_state=decode_state,
         )
-        entry = trajectories[index].entries[branch]
-        trajectories[index].entries[branch] = (
+        # The branch's prefix is now materialized up to the committed rows.
+        kv = diffusion.kv_conditioning(trajectories[index])
+        entry = kv.entries[branch]
+        kv.entries[branch] = (
             entry[0],
             entry[1],
             entry[2] + task.query_tokens,
@@ -351,10 +351,8 @@ def prepare_diffusion_step(
 def prepare_forward_rows(
     numerical: tuple[int, ...],
     offset: int,
-    step_inputs: Mapping[
-        int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]
-    ],
-    trajectories: Mapping[int, ImageState],
+    step_inputs: Mapping[int, tuple[tuple[Branch, ...], torch.Tensor]],
+    trajectories: Mapping[int, DiffusionState],
     scheduled: tuple[Call, ...],
     outcomes: dict[int, PendingOutput],
     *,
@@ -379,7 +377,7 @@ def prepare_forward_rows(
         if index in trajectories:
             if index not in step_inputs:
                 continue
-            guide, timestep, _next_timestep = step_inputs[index]
+            guide, timestep = step_inputs[index]
             row = state.pending_output(call.request_key.request_id)
             params = row.latent.input_params
             staging = row.latent.staging
@@ -479,7 +477,7 @@ def publish_forward_values(
     forward: list[tuple[int, InputRow]],
     values: tuple[ForwardValue | None, ...],
     images: Mapping[int, PreparedImage],
-    trajectories: Mapping[int, ImageState],
+    trajectories: Mapping[int, DiffusionState],
     scheduled: tuple[Call, ...],
     outcomes: dict[int, PendingOutput],
     *,
@@ -575,10 +573,8 @@ def publish_forward_values(
 
 def integrate_predictions(
     predictions: Mapping[int, list[torch.Tensor]],
-    step_inputs: Mapping[
-        int, tuple[tuple[Branch, ...], torch.Tensor, torch.Tensor]
-    ],
-    trajectories: Mapping[int, ImageState],
+    step_inputs: Mapping[int, tuple[tuple[Branch, ...], torch.Tensor]],
+    trajectories: Mapping[int, DiffusionState],
     offset: int,
     scheduled: tuple[Call, ...],
     outcomes: dict[int, PendingOutput],
@@ -602,7 +598,7 @@ def integrate_predictions(
         if index in outcomes:
             continue
 
-        guide, timestep, next_timestep = step_inputs[index]
+        _, timestep = step_inputs[index]
         row = state.pending_output(call.request_key.request_id)
         params = row.latent.input_params
         staging = row.latent.staging
@@ -613,14 +609,12 @@ def integrate_predictions(
 
         # The solver updates only the model-visible portion of this
         # call's staging, preserving page padding.
-        diffusion.integrate(
-            diffusion.require_inputs(model_runner),
+        model_runner.diffusion_entry(call).integrate(
             trajectories[index],
             staging.value[: int(params.latent_units)],
+            timestep,
             tuple(values),
             int(params.start_step) + offset,
-            timestep,
-            next_timestep,
         )
         if offset + 1 == int(params.step_count):
             outcomes[index] = diffusion.finish(

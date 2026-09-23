@@ -12,7 +12,10 @@ from uniserve.nn.rng import flow_noise_seed
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution import calls
 from uniserve_worker.execution.batch import BatchState
-from uniserve_worker.execution.diffusion_state import ImageState
+from uniserve_worker.execution.diffusion_state import (
+    DiffusionState,
+    KVConditioning,
+)
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.model_executor.diffusion_inputs import (
     DiffusionRow,
@@ -57,21 +60,32 @@ def _to_device(
     return value.to(device, non_blocking=device.type != "cpu")
 
 
-def image_state(builder, size, image: ImageParams) -> ImageState:
-    """Bind admitted sampling choices to the denoiser's mathematical recipes."""
-    schedule = builder.denoiser.make_schedules(
-        image.steps,
+def image_state(builder, size, image: ImageParams) -> DiffusionState:
+    """Open an admitted image's diffusion state from its sampling choices."""
+    denoiser = builder.denoiser
+    return DiffusionState.open(
+        denoiser,
+        size,
+        steps=image.steps,
         shift=image.timestep_shift if image.timestep_shift > 0 else None,
         device="cpu",
-    )["image"]
-    guidance = builder.denoiser.make_guidance(
-        text_scale=image.cfg_text_scale,
-        image_scale=image.cfg_img_scale,
-        interval=image.cfg_interval,
-        renorm=Renorm(image.cfg_renorm_type),
-        renorm_min=image.cfg_renorm_min,
+        guidance=denoiser.make_guidance(
+            text_scale=image.cfg_text_scale,
+            image_scale=image.cfg_img_scale,
+            interval=image.cfg_interval,
+            renorm=Renorm(image.cfg_renorm_type),
+            renorm_min=image.cfg_renorm_min,
+        ),
     )
-    return ImageState(size, schedule, guidance)
+
+
+def kv_conditioning(trajectory: DiffusionState) -> KVConditioning:
+    """Return the KV conditioning of an image request's diffusion state."""
+    if trajectory.kv is None:
+        raise invalid_descriptor(
+            "image diffusion requires KV-conditioned request state"
+        )
+    return trajectory.kv
 
 
 def require_inputs(runner):
@@ -228,7 +242,7 @@ def initialize(
     latent_pool: LatentPool,
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
-) -> ImageState:
+) -> DiffusionState:
     """Bind reusable request state and refill the call from its exact.
 
     latent version.
@@ -299,20 +313,21 @@ def initialize(
 
     size = media_image.Config(int(params.height), int(params.width))
     trajectory = row.request.diffusion
-    if not isinstance(trajectory, ImageState) or trajectory.size != size:
+    if not isinstance(trajectory, DiffusionState) or trajectory.size != size:
         trajectory = image_state(require_inputs(model_runner), size, image)
         row.request.diffusion = trajectory
 
     # Prefix initialization follows this submission's descriptors, including
     # retries after a failed call; retained metadata is not accepted state.
-    trajectory.cache = cache
-    trajectory.entries.clear()
+    kv = kv_conditioning(trajectory)
+    kv.cache = cache
+    kv.entries.clear()
     return trajectory
 
 
 def prepare_step(
     call: Call,
-    trajectory: ImageState,
+    trajectory: DiffusionState,
     step_index: int,
     *,
     state: BatchState,
@@ -322,7 +337,6 @@ def prepare_step(
     tokenizer: PreTrainedTokenizerBase | None,
 ) -> tuple[
     tuple[Branch, ...],
-    torch.Tensor,
     torch.Tensor,
     tuple[tuple[Branch, TokenRow], ...],
 ]:
@@ -342,20 +356,22 @@ def prepare_step(
     if params is None or staging is None:
         raise invalid_descriptor("trajectory call has no staged latent inputs")
 
-    schedule = trajectory.schedule
+    schedule = trajectory.schedules["image"]
     if not 0 <= step_index < schedule.num_steps:
         raise IndexError(step_index)
     times = schedule.timesteps
-    t, t_next = latent_pool.stage_timestep(
-        row.request.request_pool_idx,
-        float(times[step_index]),
-        float(times[step_index + 1]),
+    t = latent_pool.stage_timestep(
+        row.request.request_pool_idx, float(times[step_index])
     )
 
-    branches = trajectory.guidance.branches(schedule, step_index)
+    guidance = trajectory.guidance
+    if guidance is None:
+        raise invalid_descriptor("image diffusion requires guidance")
+    branches = guidance.branches(schedule, step_index)
     prefix_rows = []
     prefix_branches = []
-    entries = trajectory.entries
+    kv = kv_conditioning(trajectory)
+    entries = kv.entries
     descriptors = state.forward_indices.get(calls.call_identity(call), ())
     if len(descriptors) < len(branches):
         raise invalid_descriptor(
@@ -370,8 +386,8 @@ def prepare_step(
             continue
 
         source = builder.branch_source(branch)
-        if source not in trajectory.prefixes:
-            trajectory.prefixes[source] = resolve_prefix(
+        if source not in kv.prefixes:
+            kv.prefixes[source] = resolve_prefix(
                 model_runner.flow_prompt,
                 source,
                 image_prompt=image.image_prompts[0]
@@ -381,11 +397,11 @@ def prepare_step(
                 negative_token_ids=request.request.negative_token_ids,
                 tokenizer=tokenizer,
             )
-        prefix, copy_conditioning = trajectory.prefixes[source]
+        prefix, copy_conditioning = kv.prefixes[source]
         descriptor = denoise_descriptors[branch_index]
 
         if copy_conditioning:
-            entry = trajectory.cache
+            entry = kv.cache
         else:
             slot = state.batch.request_pool_indices[descriptor]
             page_tables = request_tables
@@ -423,9 +439,7 @@ def prepare_step(
                 capacity,
             )
 
-        prefix_length = (
-            trajectory.cache[2] if copy_conditioning else len(prefix)
-        )
+        prefix_length = kv.cache[2] if copy_conditioning else len(prefix)
         if prefix_length > entry[3]:
             raise invalid_descriptor("flow prefix exceeds scheduler params")
         if entry[2] not in {0, prefix_length}:
@@ -443,14 +457,13 @@ def prepare_step(
     return (
         branches,
         t,
-        t_next,
         tuple(zip(prefix_branches, prefix_rows, strict=True)),
     )
 
 
 def finish(
     call: Call,
-    trajectory: ImageState,
+    trajectory: DiffusionState,
     *,
     state: BatchState,
     worker_info: WorkerInfo,
@@ -511,9 +524,10 @@ def finish(
     )
 
     request.status = CallStatus.OK
+    kv = kv_conditioning(trajectory)
     request.progress = calls.execution_runtime(
         request,
-        trajectory.cache,
+        kv.cache,
         flow_step=final_step,
     )
     request.finish_flags = FinishFlags()
@@ -525,7 +539,7 @@ def finish(
     main_slot = int(request.request.request_pool_idx)
     alternative_slots = {
         int(entry[0])
-        for entry in trajectory.entries.values()
+        for entry in kv.entries.values()
         if int(entry[0]) != main_slot
     }
     if alternative_slots and final_step >= int(request.request.image.steps):
@@ -643,20 +657,20 @@ def flow_rows(
     current = _to_device(current, device)
     timestep = _to_device(timestep, device)
 
-    size, rows = trajectory.size, []
+    size, rows, kv = trajectory.size, [], kv_conditioning(trajectory)
     for branch in branches:
-        entry = trajectory.entries[branch]
+        entry = kv.entries[branch]
         temporal = (
             conditioning_position if branch is Branch.CONDITIONED else entry[2]
         )
-        if temporal not in trajectory.positions:
-            trajectory.positions[temporal] = builder.positions(
+        if temporal not in kv.positions:
+            kv.positions[temporal] = builder.positions(
                 size, temporal, device=device
             )
         rows.append(
             DiffusionRow(
                 forward_mode=MediaCall.DENOISING,
-                positions=trajectory.positions[temporal],
+                positions=kv.positions[temporal],
                 timestep=timestep.reshape(1),
                 latent=current,
                 image_tokens=builder.sequence_length(size),
@@ -670,30 +684,3 @@ def flow_rows(
             )
         )
     return tuple(rows)
-
-
-def integrate(
-    builder, trajectory, current, outputs, index, timestep, next_timestep
-):
-    """Apply guidance and the model's public solver to the call's.
-
-    sample.
-    """
-    schedule, guidance = trajectory.schedule, trajectory.guidance
-    branches = guidance.branches(schedule, index)
-    velocity = guidance.combine(
-        {
-            branch: _to_device(output, current.device)
-            for branch, output in zip(branches, outputs, strict=True)
-        },
-        schedule,
-        index,
-    )
-    builder.denoiser.solver.step_(
-        velocity,
-        current,
-        timestep,
-        next_timestep,
-        sigma=schedule.sigmas[index],
-        next_sigma=schedule.sigmas[index + 1],
-    )

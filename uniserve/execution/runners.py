@@ -139,9 +139,13 @@ class DenoisingRunner(
     ModelRunner[Denoiser[DenoiserInputT, SizeT], SizeT],
     Generic[DenoiserInputT, SizeT],
 ):
-    """Prepare latent state and run one denoising step.
+    """Prepare a request's state and run its denoising steps.
 
-    Without request policy.
+    The context is prepared for a layout (``Denoiser.layout_size``), and
+    steps evaluate that layout. ``prepare_latents`` fills the samples from
+    native draws and ``prepare_state`` the request's remaining state fields
+    from its exact size; the caller stages both into the state views it passes
+    to ``step``. The runner holds no request policy.
     """
 
     def __init__(
@@ -168,6 +172,15 @@ class DenoisingRunner(
             constants=self.context.constants,
             workspace=self.context.workspace,
         )
+
+    def prepare_state(
+        self,
+        sizes: tuple[SizeT, ...],
+        *,
+        out: Mapping[str, torch.Tensor],
+    ) -> None:
+        """Fill host views of the state fields other than the samples."""
+        self.model.prepare_state(sizes, out=out)
 
     def step(
         self,

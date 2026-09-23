@@ -414,9 +414,28 @@ def _stage(factory, size, views, context, *, seed, features):
     factory.store_conditioning(size, views, features)
 
 
+def _diffusion(model, layout, *, device, stream, bank=None):
+    """Prepare the denoiser's runner for one layout over two request slots."""
+    from uniserve.model import EntryPoint
+    from uniserve_worker.model_executor.component_binding import Call
+    from uniserve_worker.model_executor.diffusion_runner import DiffusionRunner
+    from uniserve_worker.model_executor.graph_storage import GraphStorage
+
+    return DiffusionRunner.for_layout(
+        "denoiser",
+        Call("denoiser", model, EntryPoint("forward")),
+        layout,
+        device=device,
+        stream=stream,
+        storage=GraphStorage(),
+        devices=(device,) if stream is not None else (),
+        bank=bank,
+        slots=2,
+    )
+
+
 @torch.inference_mode()
 def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
-    from uniserve_worker.model_executor.diffusion_runner import TrajectoryRunner
     from uniserve_worker.model_executor.media_inputs import MediaBuilder
 
     source = _checkpoint(tmp_path)
@@ -436,26 +455,23 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
             device=device,
         )
         stream = CUDAStream.external(torch.cuda.Stream(device=device))
-        runner = TrajectoryRunner(
-            model,
-            device=device,
-            stream=stream,
-            groups=(),
-            capacity=2,
-        )
         # Slot storage is the request pool's bank, whose rows the captured
         # ladder reaches through the device slot index.
         pool = RequestPool(
             2, state_buffers=factory.capacity_buffers(), device=device
         )
-        runner.bind_bank(pool.storage.bank)
+        runner = _diffusion(
+            model, layout, device=device, stream=stream, bank=pool.storage.bank
+        )
         try:
-            context = runner.prepare_inputs(layout, layout, pin=True)
+            context = runner.context
             with pool.storage.tensors(1) as storage:
                 views = storage.view(factory.buffers(size))
                 state = {name: views[name] for name in model.modalities}
                 for seed in (31, 92):
-                    schedules = factory.schedules(device=device)
+                    schedules = model.make_schedules(
+                        factory.num_steps, shift=None, device=device
+                    )
                     _stage(
                         factory,
                         size,
@@ -468,15 +484,12 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                         name: value.clone() for name, value in state.items()
                     }
                     inputs = factory.bind(size, views, schedules, 0)
-                    runner.warmup(
-                        inputs, schedules, state=views, input_key=layout
-                    )
+                    runner.warmup(inputs, schedules, state=views)
                     for name in model.modalities:
                         torch.testing.assert_close(
                             state[name], initial[name], rtol=0, atol=0
                         )
-                    trajectory = runner.bind_inputs(
-                        layout,
+                    ladder = runner.bind(
                         tuple(
                             factory.bind(size, views, schedules, index)
                             for index in range(4)
@@ -489,7 +502,7 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                     # request, with its own schedules, replays it.
                     if seed == 31:
                         for index in range(4):
-                            runner.capture(trajectory, index)
+                            runner.capture(ladder, index)
                     for index in range(4):
                         expected = {}
                         for name, value in state.items():
@@ -508,7 +521,7 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                                 ratio.double() * value.double()
                                 + (1.0 - ratio).double() * clean
                             ).float()
-                        result, path = runner.step(trajectory, index)
+                        result, path = runner.step(ladder, index)
                         assert path == "graph_replay"
                         for name in model.modalities:
                             torch.testing.assert_close(
@@ -519,7 +532,7 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                             )
                     torch.cuda.synchronize(device)
                     # Retired request schedules may be overwritten immediately.
-                    # A later trajectory supplies its own endpoints to replay.
+                    # A later ladder supplies its own endpoints to replay.
                     for schedule in schedules.values():
                         schedule.timesteps.fill_(float("nan"))
                         schedule.sigmas.fill_(float("nan"))
@@ -539,7 +552,6 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
     tables from their slots, and each final sample equals its eager
     evaluation bit for bit.
     """
-    from uniserve_worker.model_executor.diffusion_runner import TrajectoryRunner
     from uniserve_worker.model_executor.media_inputs import MediaBuilder
 
     # Every weight is live, so attention depends on the prompt length.
@@ -586,9 +598,10 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                     seed=100 + slot,
                     features=features[slot],
                 )
-                schedules = factory.schedules(device=device)
-                trajectory = runner.bind_inputs(
-                    layout,
+                schedules = model.make_schedules(
+                    factory.num_steps, shift=None, device=device
+                )
+                ladder = runner.bind(
                     tuple(
                         factory.bind(size, views, schedules, index)
                         for index in range(4)
@@ -598,7 +611,7 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                     slot=slot,
                 )
                 for index in range(4):
-                    result, path = runner.step(trajectory, index)
+                    result, path = runner.step(ladder, index)
                     paths.append(path)
                 samples[slot] = {
                     name: values[0].clone() for name, values in result.items()
@@ -609,24 +622,24 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
             2, state_buffers=factory.capacity_buffers(), device=device
         )
         try:
-            eager = TrajectoryRunner(
-                model, device=device, stream=None, groups=(), capacity=2
-            )
+            eager = _diffusion(model, layout, device=device, stream=None)
             try:
-                context = eager.prepare_inputs(layout, layout)
-                expected, paths = denoise(eager, pool, context)
+                expected, paths = denoise(eager, pool, eager.context)
                 assert set(paths) == {"eager"}
             finally:
                 torch.cuda.current_stream(device).synchronize()
                 eager.close()
 
             stream = CUDAStream.external(torch.cuda.Stream(device=device))
-            runner = TrajectoryRunner(
-                model, device=device, stream=stream, groups=(), capacity=2
+            runner = _diffusion(
+                model,
+                layout,
+                device=device,
+                stream=stream,
+                bank=pool.storage.bank,
             )
-            runner.bind_bank(pool.storage.bank)
             try:
-                context = runner.prepare_inputs(layout, layout, pin=True)
+                context = runner.context
                 views = pool.storage.tensors(1).view(
                     factory.buffers(placeholder)
                 )
@@ -643,9 +656,10 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                         device=device,
                     ),
                 )
-                schedules = factory.schedules(device=device)
-                trajectory = runner.bind_inputs(
-                    layout,
+                schedules = model.make_schedules(
+                    factory.num_steps, shift=None, device=device
+                )
+                ladder = runner.bind(
                     tuple(
                         factory.bind(placeholder, views, schedules, index)
                         for index in range(4)
@@ -655,7 +669,7 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                     slot=1,
                 )
                 for index in range(4):
-                    runner.capture(trajectory, index)
+                    runner.capture(ladder, index)
 
                 actual, paths = denoise(runner, pool, context)
                 assert paths == ["graph_replay"] * 8

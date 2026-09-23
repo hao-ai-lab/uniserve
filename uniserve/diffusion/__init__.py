@@ -10,7 +10,7 @@ from .solver import (
     clean_sample_to_velocity,
     euler_step,
 )
-from .step import DenoisingStep
+from .step import DenoisingStep, advance_
 
 __all__ = [
     "AdditiveGuidance",
@@ -19,6 +19,7 @@ __all__ = [
     "NestedGuidance",
     "Renorm",
     "DenoisingStep",
+    "advance_",
     "NoiseScale",
     "normal_noise",
     "Schedule",

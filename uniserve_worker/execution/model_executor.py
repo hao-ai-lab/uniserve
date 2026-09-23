@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import OrderedDict, defaultdict
-from collections.abc import Iterator
+from collections.abc import Hashable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
@@ -71,7 +71,7 @@ from uniserve_worker.model_executor.cuda_graph import (
     input_signature,
 )
 from uniserve_worker.model_executor.diffusion_inputs import DiffusionRow
-from uniserve_worker.model_executor.diffusion_runner import TrajectoryRunner
+from uniserve_worker.model_executor.diffusion_runner import DiffusionRunner
 from uniserve_worker.model_executor.graph_inputs import (
     PrefillShape,
     select_flow_captures,
@@ -226,7 +226,15 @@ class ModelExecutor:
         self.decode_context_blocks = 0
         self.decode_predicates = None
         self.kv_cache = None
-        self.denoising = None
+        # A standalone denoiser's component, binding and call, the request
+        # bank its ladders gather through, and one runner per prepared
+        # layout; declared layouts stay pinned with their captured ladders.
+        self._denoiser = None
+        self.diffusion_bank: Mapping[str, torch.Tensor] = {}
+        self._diffusion_runners: OrderedDict[Hashable, DiffusionRunner] = (
+            OrderedDict()
+        )
+        self._pinned_layouts: set[Hashable] = set()
 
         self.uses_lanes = False
         self._startup_complete = self._closed = False
@@ -246,25 +254,7 @@ class ModelExecutor:
                     if self.media_builder is not None and isinstance(
                         call.module, Denoiser
                     ):
-                        self.denoising = TrajectoryRunner(
-                            call.module,
-                            device=binding.device,
-                            stream=self.module_stream(
-                                name, method=call.entry_point.method
-                            ),
-                            capture=worker_config.graph_policy != "off",
-                            graph_storage=self.graph_storage,
-                            groups=call.groups,
-                            capacity=worker_config.max_request_pool_size,
-                            # Each resident request may carry its own
-                            # undeclared layout. Declared layouts hold their
-                            # captured ladders on pinned contexts beyond this.
-                            shapes=worker_config.max_request_pool_size,
-                            attention=self.attention,
-                            additional_devices=self._capture_devices(
-                                binding.device
-                            ),
-                        )
+                        self._denoiser = name, binding, call
             # A rank that denoises draws each request's seeded CPU noise on
             # its own thread, off the service thread that launches device
             # work, as soon as the request is admitted.
@@ -272,7 +262,7 @@ class ModelExecutor:
                 ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="worker-noise"
                 )
-                if self.denoising is not None
+                if self._denoiser is not None
                 else None
             )
         except BaseException as error:
@@ -446,6 +436,20 @@ class ModelExecutor:
             self._module_streams[key] = owner
         return self._module_streams[key]
 
+    def diffusion_entry(self, call) -> DiffusionRunner:
+        """Return the batched runner that predicts a KV-conditioned call.
+
+        A denoising call whose denoiser attends to KV prefixes is predicted
+        in its component's batched entry; that runner also integrates the
+        call's guided predictions.
+        """
+        entry = self._forward_calls.get((call.component, MediaCall.DENOISING))
+        if not isinstance(entry, DiffusionRunner):
+            raise invalid_descriptor(
+                "denoising call has no batched diffusion runner"
+            )
+        return entry
+
     def call_stream(self, call):
         """Select a standalone capability's stream.
 
@@ -611,16 +615,92 @@ class ModelExecutor:
                 )
                 raise
 
-    def run_denoising(self, trajectory, index):
-        """Run one denoising step for a resident trajectory and time it."""
-        if self.denoising is None:
+    @property
+    def denoises(self) -> bool:
+        """Whether this rank advances a standalone denoiser's ladders."""
+        return self._denoiser is not None
+
+    def bind_diffusion_bank(self, bank: Mapping[str, torch.Tensor]) -> None:
+        """Borrow the request bank the standalone denoiser's ladders gather.
+
+        Every runner borrows the bank at preparation, so it is bound before
+        the first layout is prepared.
+        """
+        if self._diffusion_runners:
+            raise RuntimeError(
+                "bind request storage before preparing diffusion runners"
+            )
+        self.diffusion_bank = dict(bank)
+
+    def diffusion_runner(self, layout, *, pin: bool = False) -> DiffusionRunner:
+        """Return the standalone denoiser's runner for one layout.
+
+        The runner's context is prepared on first use. A pinned layout, one
+        that warmup captures ladders for, stays prepared until the worker
+        closes, and pinning an unpinned layout keeps it. Other layouts serve
+        eager steps: at most one per request slot stays prepared, the least
+        recently used retired first. Every rank of the component prepares,
+        uses and retires layouts in the same order, so each finds the same
+        runners resident without agreeing on it at run time.
+        """
+        if self._denoiser is None:
             raise InputError("rank does not own denoising computation")
+        runner = self._diffusion_runners.get(layout)
+        if runner is None:
+            slots = self.worker_config.max_request_pool_size
+            unpinned = [
+                key
+                for key in self._diffusion_runners
+                if key not in self._pinned_layouts
+            ]
+            if not pin and len(unpinned) >= slots:
+                self._retire_diffusion(unpinned[0])
+
+            name, binding, call = self._denoiser
+            stream = self.module_stream(name, method=call.entry_point.method)
+            captures = (
+                self.worker_config.graph_policy != "off" and stream is not None
+            )
+            runner = DiffusionRunner.for_layout(
+                name,
+                call,
+                layout,
+                device=binding.device,
+                stream=stream,
+                storage=self.graph_storage,
+                devices=(
+                    binding.device,
+                    *self._capture_devices(binding.device),
+                )
+                if captures
+                else (),
+                bank=self.diffusion_bank if captures else None,
+                slots=slots,
+                attention=self.attention,
+            )
+            self._diffusion_runners[layout] = runner
+        if pin:
+            self._pinned_layouts.add(layout)
+        self._diffusion_runners.move_to_end(layout)
+        return runner
+
+    def _retire_diffusion(self, layout) -> None:
+        """Drain a layout's runner before releasing its context and graphs."""
+        self._pinned_layouts.discard(layout)
+        runner = self._diffusion_runners.pop(layout)
+        if runner.context.stream is not None:
+            runner.context.stream.synchronize()
+        runner.close()
+
+    def run_denoising(self, layout, ladder, index):
+        """Run one denoising step of a bound ladder and time it."""
+        runner = self.diffusion_runner(layout)
         started = time.perf_counter_ns()
         with profile_range(
             f"uniserve.model.denoise rank={self.worker_config.rank} "
             "work=denoiser"
         ):
-            values, path = self.denoising.step(trajectory, index)
+            values, path = runner.step(ladder, index)
         return replace(
             ModelRunner.result(values),
             stats=_observations("denoiser", started, path),
@@ -1105,10 +1185,9 @@ class ModelExecutor:
             for entry in (
                 *self.entries.values(),
                 *self._module_entries.values(),
+                *self._diffusion_runners.values(),
             )
         ]
-        if self.denoising is not None:
-            actions.append(self.denoising.close)
         close_resources(*actions)
 
     def close(self, *, aborted: bool = False):
@@ -1151,6 +1230,9 @@ class ModelExecutor:
         actions = [self.synchronize]
         actions.append(self.close_graphs)
         actions.extend(entry.close for entry in self._module_entries.values())
+        actions.extend(
+            runner.close for runner in self._diffusion_runners.values()
+        )
         for entry in self.entries.values():
             actions.append(entry.close)
 
@@ -1171,6 +1253,8 @@ class ModelExecutor:
         finally:
             self.entries.clear()
             self._module_entries.clear()
+            self._diffusion_runners.clear()
+            self._pinned_layouts.clear()
             self.graph_storage.close()
             self._module_streams.clear()
             self._lane_streams.clear()
