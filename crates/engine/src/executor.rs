@@ -7,7 +7,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub use uniserve_core::{ComponentConfig, ComponentDistribution, ParallelConfig, SequenceParallel};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +29,10 @@ pub use batch::{ExecutionBatch, RequestPlacement};
 pub struct ExecutorInfo {
     /// Physical pool identities and their reported capabilities.
     pub workers: Vec<(WorkerId, WorkerInfo)>,
+    /// For each worker that decodes video, the encoder replicas whose rank
+    /// dealing keeps every media unit on the host that decoded it. A decoder
+    /// absent from the map places no host constraint on its encoder.
+    pub video_encoders: BTreeMap<WorkerId, BTreeSet<WorkerId>>,
 }
 
 impl ExecutorInfo {
@@ -36,6 +40,7 @@ impl ExecutorInfo {
     pub fn single(id: WorkerId, info: WorkerInfo) -> Self {
         Self {
             workers: vec![(id, info)],
+            video_encoders: BTreeMap::new(),
         }
     }
 
@@ -68,7 +73,10 @@ impl ExecutorInfo {
                 }
             }
         }
-        Ok(Self { workers: pools })
+        Ok(Self {
+            workers: pools,
+            video_encoders: BTreeMap::new(),
+        })
     }
 
     /// Resolves which component serves each media call across every worker.
@@ -1215,6 +1223,7 @@ mod tests {
                 (WorkerId("model".to_owned()), model),
                 (WorkerId("host".to_owned()), host),
             ],
+            video_encoders: BTreeMap::new(),
         };
         let routing = info.media_routing().expect("the union is complete");
         assert_eq!(routing.len(), MediaCall::VIDEO.len());
@@ -1231,6 +1240,7 @@ mod tests {
                 (WorkerId("model".to_owned()), model.clone()),
                 (WorkerId("host".to_owned()), host),
             ],
+            video_encoders: BTreeMap::new(),
         };
         let message = info
             .media_routing()
@@ -1244,6 +1254,7 @@ mod tests {
                 (WorkerId("model".to_owned()), model),
                 (WorkerId("other".to_owned()), other),
             ],
+            video_encoders: BTreeMap::new(),
         };
         let message = info
             .media_routing()

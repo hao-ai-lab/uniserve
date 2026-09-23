@@ -33,8 +33,8 @@ from uniserve_worker.bootstrap.capacity import (
 )
 from uniserve_worker.bootstrap.components import (
     call_kinds,
-    codec_workers,
     describe_components,
+    holds_host_components,
     media_components,
     supported_calls,
 )
@@ -605,21 +605,14 @@ def _request_tensor_worker_layout(
         bytes_per_token=0,
     )
 
-    # A host worker advertises one lane slot per codec process a rank holding
-    # every one of its host components runs, the same on each of its ranks:
-    # the engine keeps one capacity per worker and counts occupancy per rank,
-    # and a rank holding fewer components is never handed more tasks than
-    # its own processes serve. Any other worker's host lane is the arena's
-    # executor.
-    codecs = codec_workers(
-        {}
-        if bindings is None
-        else {name: binding.config for name, binding in bindings.items()}
-    )
+    # A host rank is one codec slot, the same on each of a host worker's
+    # ranks, so the engine's ledger admits one host task per rank. Any other
+    # worker's host lane is the arena's executor.
+    host = bindings is not None and holds_host_components(bindings)
     return WorkerLayout(
         info=replace(
             info,
-            host_lane_capacity=codecs or int(arena.host_lane_inflight),
+            host_lane_capacity=1 if host else int(arena.host_lane_inflight),
         ),
         arena=arena,
         input_config=None,

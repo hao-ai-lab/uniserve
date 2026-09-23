@@ -1,53 +1,36 @@
-"""Codec work of a rank's host lane, executed in the lane's codec processes.
+"""Media codecs and MP4 assembly run on a host worker's ranks.
 
-A rank's interpreter must not run a media codec. Closing an x264 encoder joins
-its thread pool while PyAV holds the interpreter lock, and inside a rank
-process that join takes hundreds of milliseconds, during which the rank's
-service thread can neither launch device work nor report completions. The
-host lane therefore owns codec processes, and this module is both sides of
-that boundary: the jobs a rank describes, the loop a codec process runs, and
-the client the lane talks to it through.
-
-A codec process reads its media unit inputs from shared mappings the rank
-pins for device-to-host copies, so a unit is handed over by offset rather than
-copied. The module imports no torch, so a codec process stays small.
+A host rank is one codec slot: it encodes one media unit, the audio track, or
+one container step at a time on its host lane's thread, in its own process.
+Closing an x264 encoder joins its thread pool while PyAV holds the
+interpreter lock, which stalls the rank's service thread for that time; a
+host rank has no device work to launch and no other task in flight, so the
+stall only extends the task it belongs to.
 """
 
 from __future__ import annotations
 
 import io
-import mmap
-import os
-import socket
-import subprocess
-import sys
 from dataclasses import dataclass, replace
 from fractions import Fraction
-from multiprocessing.connection import Connection
-from threading import Lock
 from typing import Any
 
 import numpy as np
 
-from uniserve_worker.media.storage import publish_media_bytes
-
 __all__ = [
+    "AUDIO_CODEC",
+    "VIDEO_CODEC",
     "AvMuxConfig",
     "AvMuxSession",
-    "CodecJob",
-    "CodecProcess",
-    "EncodeAudioTrack",
-    "EncodeVideoUnit",
-    "MuxAppend",
-    "MuxClose",
-    "MuxFinalize",
-    "Probe",
-    "SessionKey",
-    "SharedSlice",
     "encode_audio_track",
     "encode_video_unit",
+    "encoded_video_bytes",
     "require_media_codecs",
 ]
+
+# The encoders every served container uses.
+VIDEO_CODEC = "libx264"
+AUDIO_CODEC = "aac"
 
 # Each media unit is its own encoder session, and several ranks encode at once
 # on one host, so a session must not size its thread pool to the machine.
@@ -86,11 +69,6 @@ def encoded_video_bytes(frames: int, height: int, width: int) -> int:
     )
 
 
-# A mux session is identified by the request it assembles: the engine id, the
-# request id and the request epoch, which is what a RequestKey carries.
-SessionKey = tuple[int, int, int]
-
-
 def require_media_codecs(video_codec: str, audio_codec: str) -> None:
     """Verify that the configured encoders are available through PyAV.
 
@@ -125,8 +103,8 @@ class AvMuxConfig:
     frame_rate: int
     audio_rate: int
     video_unit_frames: tuple[int, ...]
-    video_codec: str = "libx264"
-    audio_codec: str = "aac"
+    video_codec: str = VIDEO_CODEC
+    audio_codec: str = AUDIO_CODEC
     audio_frame_samples: int = 1024
 
     def __post_init__(self) -> None:
@@ -354,285 +332,3 @@ class AvMuxSession:
         self._buffer = None
         self._video_out = None
         self._audio_out = None
-
-
-@dataclass(frozen=True, slots=True)
-class SharedSlice:
-    """A media unit's bytes inside a POSIX shared-storage segment.
-
-    The segment is a host product's publication, named in this host's
-    shared-storage namespace; a codec process maps it for the job that reads
-    it and unmaps it afterwards, so the producer's retirement of the segment
-    never waits on a codec process.
-    """
-
-    segment: str
-    offset: int
-    nbytes: int
-
-
-@dataclass(frozen=True, slots=True)
-class Probe:
-    """Confirm the process serves and its codecs load; the result is True."""
-
-    video_codec: str = "libx264"
-    audio_codec: str = "aac"
-
-
-@dataclass(frozen=True, slots=True)
-class EncodeVideoUnit:
-    """Encode the RGB24 frames of one media unit; the result is its bytes."""
-
-    config: AvMuxConfig
-    source: SharedSlice
-
-
-@dataclass(frozen=True, slots=True)
-class EncodeAudioTrack:
-    """Encode a request's complete stereo int16 PCM timeline into its track."""
-
-    session: SessionKey
-    config: AvMuxConfig
-    source: SharedSlice
-
-
-@dataclass(frozen=True, slots=True)
-class MuxAppend:
-    """Append encoded media units, in order, to a request's container."""
-
-    session: SessionKey
-    config: AvMuxConfig
-    units: tuple[bytes, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class MuxFinalize:
-    """Mux the session's audio track and publish the artifact.
-
-    The result is the artifact's shared-storage name and its byte count; the
-    session is gone afterwards.
-    """
-
-    session: SessionKey
-
-
-@dataclass(frozen=True, slots=True)
-class MuxClose:
-    """Discard a session whose request ended before its artifact."""
-
-    session: SessionKey
-
-
-CodecJob = (
-    Probe
-    | EncodeVideoUnit
-    | EncodeAudioTrack
-    | MuxAppend
-    | MuxFinalize
-    | MuxClose
-)
-
-
-class _Session:
-    """One request's assembly state inside a codec process."""
-
-    def __init__(self, config: AvMuxConfig) -> None:
-        self.container = AvMuxSession(config)
-        self.audio: bytes | None = None
-
-
-def _read(source: SharedSlice) -> np.ndarray:
-    """View a media unit's bytes in its shared-storage segment without copying.
-
-    The segment is opened by name in this host's shared-storage namespace,
-    read-only; the mapping lives as long as the returned view and is released
-    with it, so a codec that keeps a frame's storage alive keeps the mapping.
-    """
-    if source.offset < 0 or source.nbytes < 0:
-        raise ValueError("media unit lies outside its shared-storage segment")
-    name = source.segment.removeprefix("/")
-    descriptor = os.open(f"/dev/shm/{name}", os.O_RDONLY)
-    try:
-        size = os.fstat(descriptor).st_size
-        if source.offset + source.nbytes > size:
-            raise ValueError(
-                "media unit lies outside its shared-storage segment"
-            )
-        mapping = mmap.mmap(
-            descriptor,
-            source.offset + source.nbytes,
-            prot=mmap.PROT_READ,
-        )
-    finally:
-        os.close(descriptor)
-    return np.frombuffer(
-        mapping, dtype=np.uint8, count=source.nbytes, offset=source.offset
-    )
-
-
-def _execute(job: CodecJob, sessions: dict[SessionKey, _Session]) -> object:
-    """Run one job against the process's sessions."""
-    if isinstance(job, Probe):
-        require_media_codecs(job.video_codec, job.audio_codec)
-        return True
-
-    if isinstance(job, EncodeVideoUnit):
-        raster = job.config.height * job.config.width * 3
-        if job.source.nbytes % raster != 0:
-            raise ValueError("video capture has invalid RGB24 dimensions")
-        pixels = _read(job.source).reshape(
-            -1, job.config.height, job.config.width, 3
-        )
-        return encode_video_unit(job.config, pixels)
-
-    if isinstance(job, EncodeAudioTrack):
-        session = sessions.get(job.session)
-        if session is None:
-            session = sessions[job.session] = _Session(job.config)
-        if session.audio is not None:
-            raise ValueError("audio output is already written")
-        track = _read(job.source).view(np.int16).reshape(-1, 2)
-        session.audio = encode_audio_track(job.config, track)
-        return None
-
-    if isinstance(job, MuxAppend):
-        session = sessions.get(job.session)
-        if session is None:
-            session = sessions[job.session] = _Session(job.config)
-        session.container.append(job.units)
-        return None
-
-    if isinstance(job, MuxFinalize):
-        session = sessions.pop(job.session, None)
-        if session is None:
-            raise ValueError("artifact finalization has no assembly session")
-        if session.audio is None:
-            raise ValueError("artifact assembly has no encoded audio")
-        payload = session.container.finalize(session.audio)
-        return publish_media_bytes(payload), len(payload)
-
-    if isinstance(job, MuxClose):
-        session = sessions.pop(job.session, None)
-        if session is not None:
-            session.container.close()
-        return None
-
-    raise TypeError(f"unsupported codec job {type(job).__name__}")
-
-
-def codec_main(connection: Connection) -> None:
-    """Serve jobs over one connection until it closes or sends None.
-
-    Every message is answered with ("ok", value) or ("error", exception), so
-    a failure of one job reaches its task without ending the process.
-    """
-    sessions: dict[SessionKey, _Session] = {}
-    try:
-        while True:
-            try:
-                message = connection.recv()
-            except EOFError:
-                break
-            if message is None:
-                break
-
-            kind = message[0]
-            try:
-                if kind == "job":
-                    value = _execute(message[1], sessions)
-                else:
-                    raise TypeError(f"unsupported codec message {kind!r}")
-            except BaseException as error:  # noqa: BLE001 - answered
-                connection.send(("error", error))
-            else:
-                connection.send(("ok", value))
-    finally:
-        for session in sessions.values():
-            session.container.close()
-        connection.close()
-
-
-class CodecProcess:
-    """One codec process and the rank's side of its connection.
-
-    The process is started as its own interpreter running this module, so it
-    inherits nothing of the rank but its environment; the connection is one
-    end of a socket pair. A job names the shared-storage segment it reads, so
-    nothing but the job travels. Calls are serialized by a lock, because a
-    process runs one job at a time; the host lane keeps one process per
-    worker so its capacity is the lane's. Transfer releases the interpreter
-    lock, so a job in flight costs the rank nothing but the bytes it
-    exchanges.
-    """
-
-    def __init__(self) -> None:
-        ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            self._process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    _MODULE,
-                    str(theirs.fileno()),
-                ],
-                pass_fds=(theirs.fileno(),),
-                stdin=subprocess.DEVNULL,
-            )
-        finally:
-            theirs.close()
-        self._connection = Connection(ours.detach())
-        self._lock = Lock()
-
-    def execute(self, job: CodecJob) -> object:
-        """Run one job to completion and return its result."""
-        with self._lock:
-            self._connection.send(("job", job))
-            return self._reply()
-
-    def _reply(self) -> object:
-        try:
-            kind, value = self._connection.recv()
-        except (EOFError, OSError) as error:
-            raise RuntimeError(
-                "codec process ended before answering"
-            ) from error
-        if kind == "error":
-            raise value
-        return value
-
-    def abort(self) -> None:
-        """Stop the codec without acquiring its in-flight job lock."""
-        if self._process.poll() is None:
-            self._process.kill()
-
-    def close(self) -> None:
-        """End the process, forcibly if it does not exit on request."""
-        with self._lock:
-            try:
-                self._connection.send(None)
-            except (BrokenPipeError, OSError):
-                pass
-            try:
-                self._process.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait()
-            self._connection.close()
-
-
-_MODULE = "uniserve_worker.media.codec_process"
-
-
-def _serve(argv: list[str]) -> None:
-    """Entry point of a codec process: serve the connection it was handed."""
-    if len(argv) != 2:
-        raise SystemExit(f"usage: python -m {_MODULE} <connection-fd>")
-    codec_main(Connection(int(argv[1])))
-
-
-if __name__ == "__main__":
-    # Serve through the module under its import name, so the jobs a rank sends
-    # unpickle as the classes the executor tests them against.
-    from uniserve_worker.media import codec_process
-
-    codec_process._serve(sys.argv)

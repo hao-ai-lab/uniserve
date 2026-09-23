@@ -1,40 +1,42 @@
 """Media unit encoding and artifact assembly scheduled on a host rank's lane.
 
 A host rank encodes the media units it is handed and, when it is the muxer,
-encodes the audio track and concatenates the encoded tracks in the mux
-session's codec process. Every input is a host product borrowed in place from
-the shared-storage segment its producer published. This module owns the
-rank-side scheduling: which job runs for which call, on which borrow, and
-what its result becomes.
+encodes the audio track and assembles the encoded tracks into the request's
+container, each as a task on the rank's lane. A unit decoded on this host is
+read in place from the shared-storage segment its producer published. This
+module owns the rank-side scheduling: which task runs for which call, on
+which input, and what its result becomes.
 """
 
 from __future__ import annotations
 
-import concurrent.futures
-from dataclasses import dataclass
+import mmap
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from threading import Lock
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from uniserve_worker.errors import invalid_descriptor
-from uniserve_worker.media.codec_process import (
+from uniserve_worker.media.container import (
     AvMuxConfig,
-    EncodeAudioTrack,
-    EncodeVideoUnit,
-    MuxAppend,
-    MuxFinalize,
-    SessionKey,
-    SharedSlice,
+    AvMuxSession,
+    encode_audio_track,
+    encode_video_unit,
     encoded_video_bytes,
     require_media_codecs,
 )
+from uniserve_worker.media.storage import publish_media_bytes
 from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.protocol.output import MediaOutput, PosixShmArtifact
 
 if TYPE_CHECKING:
     import torch
 
-    from uniserve_worker.execution.host import HostLane, HostTask
+    from uniserve_worker.execution.host import HostTask
     from uniserve_worker.transport.shm import HostBorrow
 
 __all__ = [
@@ -89,28 +91,79 @@ def read_encoded_unit(row: torch.Tensor) -> bytes:
     return values[_LENGTH_BYTES : _LENGTH_BYTES + length].tobytes()
 
 
-def session_key(request_key: RequestKey) -> SessionKey:
-    """Name the mux session of one request epoch."""
-    return (
-        int(request_key.engine_id),
-        int(request_key.request_id),
-        int(request_key.request_epoch),
+def _pixels(source: HostBorrow | np.ndarray, config: AvMuxConfig) -> np.ndarray:
+    """Return a media unit's RGB24 frames without copying borrowed bytes.
+
+    A borrowed unit stays in its producer's shared-storage segment, mapped
+    read-only for as long as the returned view lives.
+    """
+    raw = source if isinstance(source, np.ndarray) else _map(source)
+    raster = config.height * config.width * 3
+    if raw.size % raster != 0:
+        raise invalid_descriptor("video capture has invalid RGB24 dimensions")
+    return raw.reshape(-1, config.height, config.width, 3)
+
+
+def _map(source: HostBorrow) -> np.ndarray:
+    """Map a borrowed region of a shared-storage segment read-only."""
+    if source.offset < 0 or source.nbytes < 0:
+        raise invalid_descriptor(
+            "media unit lies outside its shared-storage segment"
+        )
+    name = source.segment.removeprefix("/")
+    descriptor = os.open(f"/dev/shm/{name}", os.O_RDONLY)
+    try:
+        if source.offset + source.nbytes > os.fstat(descriptor).st_size:
+            raise invalid_descriptor(
+                "media unit lies outside its shared-storage segment"
+            )
+        mapping = mmap.mmap(
+            descriptor, source.offset + source.nbytes, prot=mmap.PROT_READ
+        )
+    finally:
+        os.close(descriptor)
+    return np.frombuffer(
+        mapping, dtype=np.uint8, count=source.nbytes, offset=source.offset
     )
 
 
 @dataclass(slots=True)
 class MuxSession:
-    """One request epoch's assembly bookkeeping on the muxer rank.
+    """One request epoch's container and encoded audio on the muxer rank.
 
-    The container itself lives in the codec process that owns the session.
+    Lane tasks hold ``lock`` while they touch the container. A request that
+    ends early is marked discarded, and whichever of the discard and a task
+    in progress releases the lock last closes the container.
     """
 
     config: AvMuxConfig
-    #: The audio encode task, which finalization follows.
-    audio_tail: concurrent.futures.Future[object] | None = None
-    #: The last append task, which the next append and the finalization follow.
-    mux_tail: concurrent.futures.Future[object] | None = None
+    container: AvMuxSession
+    lock: Lock = field(default_factory=Lock)
+    audio: bytes | None = None
+    audio_scheduled: bool = False
     finalized: bool = False
+    discarded: bool = False
+
+    @contextmanager
+    def held(self) -> Iterator[AvMuxSession]:
+        """Hold the container for one task, refusing a discarded session."""
+        with self.lock:
+            try:
+                if self.discarded:
+                    raise invalid_descriptor("media assembly was discarded")
+                yield self.container
+            finally:
+                if self.discarded:
+                    self.container.close()
+
+    def discard(self) -> None:
+        """Close the container now, or after the task that holds it."""
+        self.discarded = True
+        if self.lock.acquire(blocking=False):
+            try:
+                self.container.close()
+            finally:
+                self.lock.release()
 
 
 class MediaEncoder:
@@ -125,25 +178,24 @@ class MediaEncoder:
         *,
         config: AvMuxConfig,
         unit_index: int,
-        source: HostBorrow,
+        source: HostBorrow | np.ndarray,
         reservation: HostTask,
         call_id: CallId,
     ) -> HostTask:
-        """Schedule one media unit's encode from its borrowed RGB bytes.
+        """Schedule one media unit's encode from its RGB bytes.
 
-        The bytes become this call's product when the job completes; the
-        encoded length is not known until then. The borrow is released, and
-        the producer's segment acknowledged, once the encoder has read it.
+        A borrowed unit is read in place and its borrow released, which
+        acknowledges the producer's segment, once the encoder has read it.
+        The encoded bytes become this call's product when the task
+        completes; their length is not known until then.
         """
+
+        def encode() -> bytes:
+            return encode_video_unit(config, _pixels(source, config))
+
         return reservation.configure(
-            EncodeVideoUnit(
-                config,
-                SharedSlice(source.segment, source.offset, source.nbytes),
-            ),
-            dependencies=(),
-            input_ready=None,
-            input_completion=None,
-            release=source.release,
+            encode,
+            release=None if isinstance(source, np.ndarray) else source.release,
             profile_name=(
                 f"uniserve.host.encode request={_key_label(request_key)} "
                 f"step={call_id.batch_id} "
@@ -154,69 +206,60 @@ class MediaEncoder:
 
 
 class MediaMux:
-    """Request-indexed artifact assembly on the muxer rank."""
+    """Request-indexed artifact assembly on the muxer rank.
 
-    def __init__(self, *, rank: int, lane: HostLane) -> None:
+    The engine orders a request's assembly: it schedules the next append only
+    after the previous one completed and the final call only after the audio
+    track and every unit are in, so the rank's single lane runs them in
+    order without dependencies between its tasks.
+    """
+
+    def __init__(self, *, rank: int) -> None:
         self.rank = rank
-        self._lane = lane
         self._sessions: dict[RequestKey, MuxSession] = {}
 
     def open(self, request_key: RequestKey, *, config: AvMuxConfig) -> None:
         """Create the request-owned assembly session under its settings."""
         if request_key in self._sessions:
             return
-        self._sessions[request_key] = MuxSession(config)
+        self._sessions[request_key] = MuxSession(config, AvMuxSession(config))
 
     def config(self, request_key: RequestKey) -> AvMuxConfig:
         """Return the container settings this request assembles under."""
-        session = self._sessions.get(request_key)
-        if session is None:
-            raise invalid_descriptor("media output has no active session")
-        return session.config
+        return self._session(request_key).config
 
     def audio(
         self,
         request_key: RequestKey,
-        source: HostBorrow,
+        pcm: np.ndarray,
         reservation: HostTask,
         call_id: CallId,
     ) -> HostTask:
-        """Schedule the audio track's encode from its staged PCM bytes.
+        """Schedule the audio track's encode from its stereo int16 PCM.
 
-        The borrow holds the complete raw PCM timeline, which the job reads
-        as stereo int16 samples, and its release returns the segment once
-        the codec has read it. The encoded track is the session's own state
-        rather than a result, because only the assembled artifact is this
-        request's output.
+        The encoded track is the session's own state rather than a result,
+        because only the assembled artifact is this request's output.
         """
-        session = self._sessions.get(request_key)
-        if session is None:
-            raise invalid_descriptor("media output has no active session")
-        if session.finalized or session.audio_tail is not None:
+        session = self._session(request_key)
+        if session.finalized or session.audio_scheduled:
             raise invalid_descriptor("audio output is already written")
+        session.audio_scheduled = True
 
-        key = session_key(request_key)
+        def encode() -> None:
+            with session.held():
+                session.audio = encode_audio_track(
+                    session.config, pcm.reshape(-1, 2)
+                )
 
-        task = reservation.configure(
-            EncodeAudioTrack(
-                key,
-                session.config,
-                SharedSlice(source.segment, source.offset, source.nbytes),
-            ),
-            dependencies=(),
-            input_ready=None,
-            input_completion=None,
-            release=source.release,
+        return reservation.configure(
+            encode,
             profile_name=(
                 f"uniserve.host.encode request={_key_label(request_key)} "
                 f"step={call_id.batch_id} "
                 f"call={call_id.request_index} "
                 f"kind=audio rank={self.rank}"
             ),
-            session=key,
         )
-        session.audio_tail = task.promise
-        return task
 
     def append_units(
         self,
@@ -225,37 +268,28 @@ class MediaMux:
         reservation: HostTask,
         call_id: CallId,
     ) -> HostTask:
-        """Schedule the next media units into the request's container.
-
-        Units of consecutive rounds are appended in order, so a round's task
-        follows the previous round's on the host lane through its dependency.
-        """
-        session = self._sessions.get(request_key)
-        if session is None or session.finalized:
+        """Schedule the next media units into the request's container."""
+        session = self._session(request_key)
+        if session.finalized:
             raise invalid_descriptor(
                 "media assembly requires an open assembly session"
             )
         if not units:
             raise invalid_descriptor("media assembly received no media units")
-        dependencies = () if session.mux_tail is None else (session.mux_tail,)
 
-        key = session_key(request_key)
-        task = reservation.configure(
-            MuxAppend(key, session.config, tuple(units)),
-            dependencies=dependencies,
-            input_ready=None,
-            input_completion=None,
-            release=None,
+        def append() -> None:
+            with session.held() as container:
+                container.append(tuple(units))
+
+        return reservation.configure(
+            append,
             profile_name=(
                 f"uniserve.host.mux request={_key_label(request_key)} "
                 f"step={call_id.batch_id} "
                 f"call={call_id.request_index} "
                 f"kind=units rank={self.rank}"
             ),
-            session=key,
         )
-        session.mux_tail = task.promise
-        return task
 
     def finalize_artifact(
         self,
@@ -265,72 +299,59 @@ class MediaMux:
     ) -> HostTask:
         """Schedule the artifact's assembly after every unit and the audio.
 
-        The engine schedules this call after the last encode round and the
-        audio track have completed, so the task depends on the last append
-        and on the audio encode rather than on any input of its own. The job
-        publishes the artifact from the codec process; its result is the
-        artifact handle.
+        The task muxes the audio track, publishes the MP4 to shared storage,
+        and results in the artifact's handle.
         """
-        session = self._sessions.get(request_key)
-        if session is None or session.finalized:
+        session = self._session(request_key)
+        if session.finalized:
             raise invalid_descriptor(
                 "media finalization requires an open assembly session"
             )
-        if session.audio_tail is None:
+        if not session.audio_scheduled:
             raise invalid_descriptor(
                 "artifact finalization precedes the audio track's encode"
             )
-        dependencies = tuple(
-            promise
-            for promise in (session.mux_tail, session.audio_tail)
-            if promise is not None
-        )
+        session.finalized = True
 
-        key = session_key(request_key)
-        task = reservation.configure(
-            MuxFinalize(key),
-            dependencies=dependencies,
-            input_ready=None,
-            input_completion=None,
-            release=None,
+        def finalize() -> MediaOutput:
+            with session.held() as container:
+                if session.audio is None:
+                    raise invalid_descriptor(
+                        "artifact assembly has no encoded audio"
+                    )
+                payload = container.finalize(session.audio)
+            return MediaOutput(
+                handle=PosixShmArtifact(name=publish_media_bytes(payload)),
+                bytes=len(payload),
+            )
+
+        return reservation.configure(
+            finalize,
             profile_name=(
                 f"uniserve.host.mux request={_key_label(request_key)} "
                 f"step={call_id.batch_id} "
                 f"call={call_id.request_index} "
                 f"kind=artifact rank={self.rank}"
             ),
-            session=key,
-            ends_session=True,
-            transform=_artifact_output,
         )
-        session.finalized = True
-        return task
 
     def drop(self, request_id: int) -> None:
         """Remove every assembly session owned by a request identifier."""
         for key in [
             key for key in self._sessions if key.request_id == int(request_id)
         ]:
-            self._discard(key)
+            self._sessions.pop(key).discard()
 
     def close(self) -> None:
         """Discard all active assembly sessions and reject new media work."""
         for key in list(self._sessions):
-            self._discard(key)
+            self._sessions.pop(key).discard()
 
-    def _discard(self, request_key: RequestKey) -> None:
-        """Forget a session here and in the codec process that holds it."""
-        session = self._sessions.pop(request_key)
-        if not session.finalized:
-            self._lane.discard_session(session_key(request_key))
-
-
-def _artifact_output(value: object) -> MediaOutput:
-    """Wrap a finalized artifact's shared-storage name and size."""
-    name, nbytes = value  # type: ignore[misc]
-    return MediaOutput(
-        handle=PosixShmArtifact(name=str(name)), bytes=int(nbytes)
-    )
+    def _session(self, request_key: RequestKey) -> MuxSession:
+        session = self._sessions.get(request_key)
+        if session is None:
+            raise invalid_descriptor("media output has no active session")
+        return session
 
 
 def _key_label(request_key: RequestKey) -> str:

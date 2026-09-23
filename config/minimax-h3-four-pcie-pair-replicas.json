@@ -128,16 +128,79 @@
     "queue_depth": 6
   },
   {
-    "id": "host",
-    "ranks": [{ "node": "localhost", "device": "cpu" }],
+    "id": "encoder-0",
+    "ranks": [
+      { "node": "localhost", "device": "cpu" },
+      { "node": "localhost", "device": "cpu" }
+    ],
     "components": {
       "video_encoder": {
-        "ranks": [0],
+        "ranks": [0, 1],
         "parallel_config": {},
         "distribution": "temporal_units",
-        "units_per_rank": 8
-      },
-      "muxer": { "ranks": [0], "parallel_config": {} }
+        "units_per_rank": 1
+      }
+    },
+    "queue_depth": 6
+  },
+  {
+    "id": "encoder-1",
+    "ranks": [
+      { "node": "localhost", "device": "cpu" },
+      { "node": "localhost", "device": "cpu" }
+    ],
+    "components": {
+      "video_encoder": {
+        "ranks": [0, 1],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 1
+      }
+    },
+    "queue_depth": 6
+  },
+  {
+    "id": "encoder-2",
+    "ranks": [
+      { "node": "localhost", "device": "cpu" },
+      { "node": "localhost", "device": "cpu" }
+    ],
+    "components": {
+      "video_encoder": {
+        "ranks": [0, 1],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 1
+      }
+    },
+    "queue_depth": 6
+  },
+  {
+    "id": "encoder-3",
+    "ranks": [
+      { "node": "localhost", "device": "cpu" },
+      { "node": "localhost", "device": "cpu" }
+    ],
+    "components": {
+      "video_encoder": {
+        "ranks": [0, 1],
+        "parallel_config": {},
+        "distribution": "temporal_units",
+        "units_per_rank": 1
+      }
+    },
+    "queue_depth": 6
+  },
+  {
+    "id": "muxer",
+    "ranks": [
+      { "node": "localhost", "device": "cpu" }
+    ],
+    "components": {
+      "muxer": {
+        "ranks": [0],
+        "parallel_config": {}
+      }
     },
     "queue_depth": 24
   }
