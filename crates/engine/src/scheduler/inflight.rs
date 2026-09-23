@@ -9,14 +9,23 @@ pub(super) enum InflightInput {
         /// Physical KV start and exact token contribution, when known, from the
         /// submitted image-extension input. The call carries its capacity.
         image_kv: Option<(u32, Option<u32>)>,
-        /// Actual latent input step; cancellation can stop accepted progress
-        /// while later submitted intervals still need result validation.
-        start_step: Option<u32>,
+        /// The submitted latent interval; cancellation can stop accepted
+        /// progress while later submitted intervals still need validation.
+        latent: Option<LatentParams>,
     },
     Media {
         latent: Option<LatentParams>,
         decode: Option<DecodeRange>,
     },
+}
+
+impl InflightInput {
+    /// Returns the latent interval a submitted call covers.
+    pub(super) const fn latent(&self) -> Option<&LatentParams> {
+        match self {
+            Self::Generation { latent, .. } | Self::Media { latent, .. } => latent.as_ref(),
+        }
+    }
 }
 
 /// Submitted call awaiting completion.

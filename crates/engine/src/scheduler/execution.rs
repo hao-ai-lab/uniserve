@@ -369,7 +369,9 @@ impl Scheduler {
         if !state.latent_preparation_scheduled {
             return vec![MediaCall::LatentPreparation];
         }
-        if state.num_scheduled_steps < sampling.num_inference_steps {
+        if self.scheduled_steps(state.request.request_id, &state.denoising)
+            < state.denoising.steps()
+        {
             return vec![MediaCall::Denoising];
         }
 
@@ -405,6 +407,44 @@ impl Scheduler {
             }
         }
         ready
+    }
+
+    /// Returns the steps of a request's trajectory covered once its submitted
+    /// calls complete, from their latent intervals.
+    pub(super) fn scheduled_steps(&self, id: RequestId, progress: &Denoising) -> u32 {
+        progress.scheduled(
+            self.inflight
+                .pending_calls
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .filter_map(|pending| match pending.call.code {
+                    CallKind::Media(media_call) => Some((media_call, pending.input.latent())),
+                    _ => None,
+                }),
+        )
+    }
+
+    /// Returns the raster of the video the denoiser's samples decode to, as the
+    /// video decoder declares its media unit output: units, frames, height,
+    /// width and channels.
+    fn video_raster(&self) -> (u32, u32) {
+        let component = self.media_component(MediaCall::VideoDecoding);
+        let dims = self
+            .executor
+            .info()
+            .workers
+            .iter()
+            .flat_map(|(_, info)| &info.components)
+            .find(|binding| Some(&binding.name) == component.as_ref())
+            .and_then(|binding| binding.outputs.first())
+            .map(|output| output.shape_bound.dims.clone())
+            .unwrap_or_default();
+        let fixed = |index: usize| match dims.get(index) {
+            Some(DimBound::Static(value)) => *value,
+            _ => 0,
+        };
+        (fixed(2), fixed(3))
     }
 
     /// Returns the component whose lanes one media call occupies.
@@ -712,9 +752,9 @@ impl Scheduler {
             let state = self.media_state(id).expect("media candidate exists");
             let request_key = state.admission.request_key;
             let stateful = work.advances_state();
-            let step = state.num_scheduled_steps;
-            let last_step = media_call == MediaCall::Denoising
-                && step + 1 == state.request.sampling.num_inference_steps;
+            // A video request advances its ladder one step per call.
+            let step = self.scheduled_steps(id, &state.denoising);
+            let last_step = media_call == MediaCall::Denoising && state.denoising.ends(step, 1);
             // Freeze the actual decode/write interval before advancing scheduled
             // counters. Completion consumes this same range from the submission.
             let decode = match media_call {
@@ -833,16 +873,22 @@ impl Scheduler {
                 } else {
                     (0, 0)
                 };
-                Some(LatentParams {
-                    request_key,
-                    call_id,
+                let (height, width) = self.video_raster();
+                // Fixed request tensors hold the trajectory, so the call names
+                // no pages.
+                let placement = LatentPlacement {
                     page_table: Vec::new(),
                     latent_units: 0,
-                    height: 768,
-                    width: 1344,
+                    height,
+                    width,
+                };
+                Some(Denoising::params(
+                    request_key,
+                    call_id,
+                    &placement,
                     start_step,
                     step_count,
-                })
+                ))
             } else {
                 None
             };
@@ -902,7 +948,8 @@ impl Scheduler {
                     state.text_encoding_scheduled = true;
                 }
                 MediaCall::LatentPreparation => state.latent_preparation_scheduled = true,
-                MediaCall::Denoising => state.num_scheduled_steps = step + 1,
+                // Submitted steps are derived from the call's latent interval.
+                MediaCall::Denoising => {}
                 MediaCall::VideoDecoding => {
                     let range = decode.as_ref().expect("video decode has an input range");
                     state.scheduled_decode_units += range.max_units;
@@ -1220,32 +1267,14 @@ impl Scheduler {
             } else {
                 state.kv_computed_len.max(kv_visible_len)
             },
-            flow_step: u32::from(self.num_scheduled_denoise_steps(id)?),
+            flow_step: self.num_scheduled_denoise_steps(id)?,
         })
     }
 
     /// Last denoising step covered by submitted intervals, without accepting them.
-    pub(super) fn num_scheduled_denoise_steps(&self, id: RequestId) -> Option<u16> {
+    pub(super) fn num_scheduled_denoise_steps(&self, id: RequestId) -> Option<u32> {
         let state = self.running.get(&id)?;
-        Some(
-            self.inflight
-                .pending_calls
-                .get(&id)
-                .into_iter()
-                .flatten()
-                .fold(
-                    state.num_completed_denoise_steps,
-                    |steps, pending| match pending.call.code {
-                        CallKind::Media(
-                            MediaCall::LatentPreparation | MediaCall::ImageDecoding,
-                        ) => 0,
-                        CallKind::Media(MediaCall::Denoising) => steps.saturating_add(
-                            pending.call.bounds.max_tokens.min(u32::from(u16::MAX)) as u16,
-                        ),
-                        _ => steps,
-                    },
-                ),
-        )
+        Some(self.scheduled_steps(id, &state.denoising))
     }
 
     /// Returns the next feedback encoder index and number of pending image completions.
@@ -1354,7 +1383,9 @@ impl Scheduler {
             {
                 Phase::DecodeUnd
             }
-            Phase::DenoiseGen if self.num_scheduled_denoise_steps(id)? >= state.req.image.steps => {
+            Phase::DenoiseGen
+                if self.num_scheduled_denoise_steps(id)? >= state.denoising.steps() =>
+            {
                 Phase::CommitGen
             }
             phase => phase,
@@ -1849,9 +1880,9 @@ impl Scheduler {
             media.is_none()
         };
         let step_valid = call.code != CallKind::Media(MediaCall::Denoising)
-            || latent.as_ref().is_some_and(|interval| {
-                record.num_completed_steps == interval.start_step + interval.step_count
-            });
+            || latent
+                .as_ref()
+                .is_some_and(|interval| Denoising::completes(interval, record.num_completed_steps));
         let valid = record.status == CallStatus::Ok
             && record.request_key == call.request_key
             && record.call_id == call.call_id
@@ -1871,8 +1902,14 @@ impl Scheduler {
                 }
             } else if let Some(state) = self.media_state_mut(id) {
                 match call.code {
+                    CallKind::Media(MediaCall::LatentPreparation) => state.denoising.open(None),
                     CallKind::Media(MediaCall::Denoising) => {
-                        state.num_completed_steps = record.num_completed_steps;
+                        let interval = latent.as_ref().expect("a valid step has its interval");
+                        let accepted =
+                            state
+                                .denoising
+                                .accept(interval, record.num_completed_steps, None);
+                        debug_assert!(accepted, "a valid step completes its interval");
                     }
                     CallKind::Media(MediaCall::VideoEncoding) => {
                         let range = decode
@@ -1906,7 +1943,7 @@ impl Scheduler {
                     CallKind::Media(MediaCall::TextEncoding) => "preparing",
                     CallKind::Media(MediaCall::LatentPreparation)
                     | CallKind::Media(MediaCall::Denoising) => {
-                        if state.num_completed_steps == state.request.sampling.num_inference_steps {
+                        if state.denoising.is_complete() {
                             "decoding"
                         } else {
                             "denoising"
@@ -1923,7 +1960,7 @@ impl Scheduler {
                 };
                 let _ = state.output.enqueue(EngineCoreOutput::MediaProgress {
                     phase: phase.to_owned(),
-                    completed_steps: state.num_completed_steps,
+                    completed_steps: state.denoising.completed(),
                 });
                 if let Some(media) = media {
                     state.artifact = Some(ArtifactEvent {
@@ -2283,15 +2320,12 @@ impl Scheduler {
 
                 // Media calls update their independent call progress immediately;
                 // generation calls continue through semantic validation.
-                let (image_kv, start_step) = match input {
+                let (image_kv, latent) = match input {
                     InflightInput::Media { latent, decode } => {
                         self.process_diffusion_result(call, latent, decode, record, media);
                         continue;
                     }
-                    InflightInput::Generation {
-                        image_kv,
-                        start_step,
-                    } => (image_kv, start_step),
+                    InflightInput::Generation { image_kv, latent } => (image_kv, latent),
                 };
 
                 if self
@@ -2334,7 +2368,7 @@ impl Scheduler {
                 if generation::validate_generation_result(
                     &call,
                     image_kv,
-                    start_step,
+                    latent.as_ref(),
                     state,
                     &record,
                     media.as_deref(),
@@ -2392,9 +2426,9 @@ impl Scheduler {
                 }
 
                 let progress_result = if record.status == CallStatus::Ok {
-                    self.running
-                        .get_mut(&id)
-                        .map(|state| state.process_generation_result(&call, &record))
+                    self.running.get_mut(&id).map(|state| {
+                        state.process_generation_result(&call, latent.as_ref(), &record)
+                    })
                 } else {
                     None
                 };
@@ -2430,9 +2464,10 @@ impl Scheduler {
                 // making its public output eligible for resolution.
                 let free_flow_prefix = call_variant == CallKind::Media(MediaCall::Denoising)
                     && record.status == CallStatus::Ok
-                    && self.running.get(&id).is_some_and(|state| {
-                        record.num_completed_steps >= u32::from(state.req.image.steps)
-                    });
+                    && self
+                        .running
+                        .get(&id)
+                        .is_some_and(|state| record.num_completed_steps >= state.denoising.steps());
                 if call_variant == CallKind::Media(MediaCall::Denoising)
                     && record.status == CallStatus::Ok
                     && let Some(prefix) = self

@@ -34,6 +34,7 @@ mod admission;
 mod allocation;
 mod batching;
 mod control;
+mod denoising;
 mod execution;
 pub(crate) mod generation;
 pub(crate) mod image_artifact;
@@ -82,6 +83,7 @@ use crate::scheduler::image_artifact::validate_png_artifact;
 use allocation::{
     MediaAllocations, MediaStorage, MediaTensorAllocation, RequestAllocations, RetiringRequest,
 };
+use denoising::{Denoising, LatentPlacement};
 use generation::RequestState;
 use inflight::{InflightCall, InflightInput, PendingCompletion, PendingFinish};
 use output::RequestOutput;
@@ -209,8 +211,8 @@ struct MediaFlowState {
     admission_state: WorkerRegistration,
     text_encoding_scheduled: bool,
     latent_preparation_scheduled: bool,
-    num_scheduled_steps: u32,
-    num_completed_steps: u32,
+    /// Solver progress of the request's latent trajectory.
+    denoising: Denoising,
     scheduled_decode_units: u32,
     scheduled_encode_units: u32,
     encoded_video_units: u32,
