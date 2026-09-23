@@ -95,7 +95,9 @@ def test_model_loading_failure_releases_the_reported_endpoint(tmp_path):
         assert endpoint.try_recv() is None
 
 
-def _stub_config(directory, *, rank=0, world_size=1, init_method=None):
+def _stub_config(
+    directory, *, rank=0, world_size=1, rendezvous=None, listen_fd=None
+):
     """Launch one weightless rank of a tensor-parallel stub component."""
     directory.mkdir(parents=True, exist_ok=True)
     return worker_args(
@@ -116,7 +118,8 @@ def _stub_config(directory, *, rank=0, world_size=1, init_method=None):
                 "parallel_config": {"tensor_parallel_size": world_size},
             }
         },
-        distributed_init_method=init_method,
+        rendezvous_address=rendezvous,
+        rendezvous_listen_fd=listen_fd,
     )
 
 
@@ -154,7 +157,7 @@ def test_worker_preserves_a_caller_owned_process_group(tmp_path, failure):
         dist.destroy_process_group()
 
 
-def _owned_world(rank, directory, failure):
+def _owned_world(rank, directory, failure, store):
     from dataclasses import replace
     from pathlib import Path
 
@@ -165,11 +168,20 @@ def _owned_world(rank, directory, failure):
     from uniserve_worker.errors import WorkerError
     from uniserve_worker.worker import Worker
 
+    # Every rank inherits the store socket the parent bound; the first rank
+    # serves the world's store on it, as it does under the engine.
+    address = "{}:{}".format(*store.getsockname())
+    if rank == 0:
+        listen_fd = store.detach()
+    else:
+        listen_fd = None
+        store.close()
     config = _stub_config(
         Path(directory) / f"owned-world-{rank}",
         rank=rank,
         world_size=2,
-        init_method=f"file://{directory}/world-{failure}",
+        rendezvous=address,
+        listen_fd=listen_fd,
     )
     if failure == "model_loading":
         config = replace(
@@ -209,7 +221,15 @@ def test_worker_releases_process_groups_created_by_its_factory(
 ):
     import torch.multiprocessing as mp
 
-    mp.spawn(_owned_world, args=(str(tmp_path), failure), nprocs=2, join=True)
+    # Spawning passes the listening socket to each rank at launch, so the
+    # store's port stays bound from here until the ranks exit.
+    with socket.create_server(("127.0.0.1", 0)) as store:
+        mp.spawn(
+            _owned_world,
+            args=(str(tmp_path), failure, store),
+            nprocs=2,
+            join=True,
+        )
 
 
 @pytest.mark.gpu

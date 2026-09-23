@@ -9,6 +9,7 @@ from dataclasses import dataclass, fields
 from math import prod
 
 from uniserve.loading import Config as IOConfig
+from uniserve.runtime.process_groups import Rendezvous
 from uniserve_worker.config.execution import (
     WorkerConfig,
     worker_config_from_namespace,
@@ -363,7 +364,8 @@ class WorkerProcessArgs:
     ipc: WorkerIpcConfig
     local_rank: int
     distributed_backend: str | None
-    distributed_init_method: str | None
+    # Where a multi-rank group forms its process world; None for one rank.
+    rendezvous: Rendezvous | None
     model: ModelLaunchConfig | None
     data_plane: DataPlaneConfig
     execution: WorkerConfig
@@ -417,9 +419,7 @@ class WorkerProcessArgs:
             ),
             local_rank=int(namespace.local_rank),
             distributed_backend=_optional_text(namespace.distributed_backend),
-            distributed_init_method=_optional_text(
-                namespace.distributed_init_method
-            ),
+            rendezvous=_rendezvous(namespace),
             model=(
                 ModelLaunchConfig(
                     path=model_path,
@@ -623,6 +623,37 @@ def _parse_transfer_backends(value: object) -> tuple[str, ...]:
     ):
         raise ValueError("transfer backends must name local, shm, or cuda_vmm")
     return backends
+
+
+def _rendezvous(namespace: argparse.Namespace) -> Rendezvous | None:
+    """Resolve where this rank's group forms its process world.
+
+    The process that spawns the group's first rank, the engine or the
+    launcher of that rank's host, binds the store's socket before the rank
+    exists and the rank inherits it, so the store's port is never free while
+    the rank starts. A first rank without the socket would bind the port
+    itself and could lose it to another process, so the descriptor must name
+    one for that rank and for no other.
+    """
+    address = _optional_text(namespace.rendezvous_address)
+    listen_fd = namespace.rendezvous_listen_fd
+    if address is None:
+        if listen_fd is not None:
+            raise ValueError("a rendezvous socket requires its address")
+        return None
+
+    first = int(namespace.rank) == 0
+    if first and listen_fd is None:
+        raise ValueError("the first rank must inherit its rendezvous socket")
+    if not first and listen_fd is not None:
+        raise ValueError("only the first rank inherits a rendezvous socket")
+
+    host, _, port = address.rpartition(":")
+    return Rendezvous(
+        host=host,
+        port=int(port),
+        listen_fd=None if listen_fd is None else int(listen_fd),
+    )
 
 
 def _optional_text(value: object | None) -> str | None:

@@ -39,18 +39,27 @@ pub(crate) struct RankReport {
     pub endpoint: String,
 }
 
-/// The head's registration address for one worker group's ranks.
+/// A worker group's collective rendezvous.
+pub(crate) struct Rendezvous {
+    /// The store address every rank connects to, as `host:port`.
+    pub address: String,
+    /// The bound, listening socket the group's first rank serves the store
+    /// on, held by the process that spawns that rank until it hands the
+    /// socket over. None when the first rank runs on another host, whose
+    /// launcher holds that host's reservation.
+    pub listener: Option<TcpListener>,
+}
+
 /// Reserves the address a worker group's ranks rendezvous at.
 ///
 /// The collective store is a TCP store so ranks on different hosts can reach
 /// it; an instance on one host reserves a loopback address and keeps the
 /// semantics it had over a shared directory, and one spanning hosts reserves
-/// an address those hosts can route to. The head fixes the address and
-/// the group's first rank binds the store, because a store bound here could
-/// not be handed to the process that must own it. A port taken between the
-/// reservation and that bind fails the launch at initialization by name
-/// instead of being silently rebound.
-pub(crate) fn reserve_rendezvous(head: Option<IpAddr>) -> anyhow::Result<String> {
+/// an address those hosts can route to. The head binds the socket and the
+/// group's first rank, which it spawns, inherits it and serves the store on
+/// it. The port therefore stays bound from this reservation until that rank
+/// exits: nothing else on the host can take it while the rank starts.
+pub(crate) fn reserve_rendezvous(head: Option<IpAddr>) -> anyhow::Result<Rendezvous> {
     let (bind, advertise) = interface(head);
     let listener = TcpListener::bind(SocketAddr::from((bind, 0)))
         .context("reserving the collective rendezvous address")?;
@@ -58,7 +67,10 @@ pub(crate) fn reserve_rendezvous(head: Option<IpAddr>) -> anyhow::Result<String>
         .local_addr()
         .context("reading the collective rendezvous address")?
         .port();
-    Ok(format!("tcp://{advertise}:{port}"))
+    Ok(Rendezvous {
+        address: format!("{advertise}:{port}"),
+        listener: Some(listener),
+    })
 }
 
 /// Returns the interface to bind and the host a descriptor names.
@@ -75,6 +87,7 @@ fn interface(head: Option<IpAddr>) -> (Ipv4Addr, String) {
     }
 }
 
+/// The head's registration address for one worker group's ranks.
 pub(crate) struct RankRegistry {
     listener: TcpListener,
     address: String,

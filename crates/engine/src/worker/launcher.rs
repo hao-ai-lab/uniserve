@@ -45,14 +45,12 @@ pub(crate) struct RankExit {
 enum Instruction<'a> {
     /// Start one rank from the descriptor the head derived for it.
     Spawn(RemoteLaunch<'a>),
-    Reserve {
-        worker_id: &'a str,
-    },
+    /// Bind and hold a collective store socket for one worker group, which
+    /// the launcher hands to that group's first rank when it spawns it.
+    Reserve { worker_id: &'a str },
     /// Stop every rank of one worker group the launcher owns, before the
     /// group is relaunched.
-    Stop {
-        worker_id: &'a str,
-    },
+    Stop { worker_id: &'a str },
     /// Stop every rank the launcher owns.
     Terminate,
 }
@@ -255,13 +253,19 @@ impl LauncherRegistry {
         ))
     }
 
-    /// Returns the rendezvous address for a group whose first rank runs on
-    /// `host`, which is another machine.
+    /// Returns the rendezvous for a group whose first rank runs on `host`,
+    /// which is another machine.
     ///
-    /// The first rank binds the collective store, so the store's address has
+    /// The first rank serves the collective store, so the store's address has
     /// to be one of that rank's own host: the address its launcher connected
-    /// from, at the port the launcher reserved there.
-    pub(crate) fn rendezvous_on(&mut self, host: &str, worker_id: &str) -> anyhow::Result<String> {
+    /// from, at the port the launcher reserved there. The launcher keeps that
+    /// port bound and hands its socket to the first rank it spawns for the
+    /// group, so the rendezvous returned here carries no listener.
+    pub(crate) fn rendezvous_on(
+        &mut self,
+        host: &str,
+        worker_id: &str,
+    ) -> anyhow::Result<super::registration::Rendezvous> {
         let launcher = self
             .hosts
             .get_mut(host)
@@ -286,7 +290,10 @@ impl LauncherRegistry {
                         report["worker_id"] == worker_id && port > 0 && port <= u16::MAX as u64,
                         "invalid rendezvous reservation"
                     );
-                    return Ok(format!("tcp://{}", SocketAddr::new(address, port as u16)));
+                    return Ok(super::registration::Rendezvous {
+                        address: SocketAddr::new(address, port as u16).to_string(),
+                        listener: None,
+                    });
                 }
                 let exit: RankExit = serde_json::from_value(report)?;
                 self.exits

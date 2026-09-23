@@ -21,10 +21,10 @@ fn receive(reader: &mut BufReader<TcpStream>) -> serde_json::Value {
     serde_json::from_str(&line).unwrap()
 }
 
-#[test]
-fn groups_reserve_distinct_ports_and_exits_arrive_without_another_instruction() {
+/// Starts a launcher against a head bound here and reads its presentation.
+fn start_launcher() -> (Launcher, TcpStream, BufReader<TcpStream>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let _launcher = Launcher(
+    let launcher = Launcher(
         Command::new(env!("CARGO_BIN_EXE_uniserve-host"))
             .args([
                 "--head",
@@ -36,12 +36,18 @@ fn groups_reserve_distinct_ports_and_exits_arrive_without_another_instruction() 
             .spawn()
             .unwrap(),
     );
-    let (mut stream, _) = listener.accept().unwrap();
+    let (stream, _) = listener.accept().unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     assert_eq!(receive(&mut reader)["host"], "host");
+    (launcher, stream, reader)
+}
+
+#[test]
+fn groups_reserve_distinct_ports_and_exits_arrive_without_another_instruction() {
+    let (_launcher, mut stream, mut reader) = start_launcher();
 
     // A partial instruction must survive the supervisor's child-exit polling.
     stream.write_all(b"{\"reserve\":").unwrap();
@@ -72,4 +78,64 @@ fn groups_reserve_distinct_ports_and_exits_arrive_without_another_instruction() 
     assert_eq!(exit["worker_id"], "first");
     assert_eq!(exit["rank"], 0);
     assert_eq!(exit["status"], "exit status: 1");
+}
+
+#[test]
+fn the_first_rank_serves_its_store_on_the_reserved_port() {
+    let (_launcher, mut stream, mut reader) = start_launcher();
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({"reserve": {"worker_id": "group"}})
+    )
+    .unwrap();
+    let port = receive(&mut reader)["port"].as_u64().unwrap() as u16;
+
+    // The rank's module accepts one peer on the socket its descriptor names,
+    // which is how a collective store serves on an inherited socket. The
+    // package is regular so it shadows any installed worker package.
+    let modules = tempfile::tempdir().unwrap();
+    let package = modules.path().join("uniserve_worker");
+    std::fs::create_dir(&package).unwrap();
+    std::fs::write(package.join("__init__.py"), "").unwrap();
+    std::fs::write(
+        package.join("main.py"),
+        "import json, socket, sys\n\
+         path = sys.argv[sys.argv.index('--launch-descriptor') + 1]\n\
+         descriptor = json.load(open(path))\n\
+         store = socket.socket(fileno=descriptor['rendezvous_listen_fd'])\n\
+         peer, _ = store.accept()\n\
+         peer.sendall(b'served\\n')\n",
+    )
+    .unwrap();
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({"spawn": {
+            "rank": 0, "worker_id": "group", "world_size": 2,
+            "python": "python3", "descriptor": {},
+            "environment": {"PYTHONPATH": modules.path()}
+        }})
+    )
+    .unwrap();
+
+    let peer = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let mut served = String::new();
+    BufReader::new(peer).read_line(&mut served).unwrap();
+    assert_eq!(served, "served\n");
+
+    let exit = receive(&mut reader);
+    assert_eq!(
+        (exit["worker_id"].as_str(), exit["rank"].as_u64()),
+        (Some("group"), Some(0))
+    );
+    assert_eq!(exit["status"], "exit status: 0");
+    // The launcher kept no copy of the socket it handed over, so the port
+    // closes with the rank that served it.
+    assert_eq!(
+        TcpStream::connect(("127.0.0.1", port)).unwrap_err().kind(),
+        std::io::ErrorKind::ConnectionRefused
+    );
 }
