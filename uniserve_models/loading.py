@@ -28,14 +28,25 @@ from uniserve.quantization import QuantizationConfig, Quantizer
 ConfigT = TypeVar("ConfigT")
 ModelT = TypeVar("ModelT", bound=nn.Module)
 
+# Architecture a checkpoint declares, mapped to the package implementing it.
+# A model checkpoint declares `architectures` in its root `config.json`; a
+# diffusers pipeline declares its pipeline class in a root index instead.
 _catalog: Mapping[str, str] = MappingProxyType(
     {
         "Qwen3ForCausalLM": "uniserve_models.qwen3",
         "Qwen3MoeForCausalLM": "uniserve_models.qwen3",
         "BagelForConditionalGeneration": "uniserve_models.bagel",
         "NEOChatModel": "uniserve_models.sensenova_u1",
-        "MiniMaxH3Transformer3DModel": "uniserve_models.minimax_h3",
+        "MiniMaxH3ModularPipeline": "uniserve_models.minimax_h3",
     }
+)
+
+# Root metadata files, in the order they identify a checkpoint: a model
+# configuration, then the classic and modular diffusers pipeline indexes.
+_metadata_files = (
+    "config.json",
+    "model_index.json",
+    "modular_model_index.json",
 )
 
 
@@ -222,7 +233,7 @@ def _root(path: str | Path, io: loading.Config):
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError
 
-    for name in ("config.json", "modular_model_index.json"):
+    for name in _metadata_files:
         try:
             file = Path(
                 hf_hub_download(
@@ -481,6 +492,28 @@ def _exclusions(model, declarations, sources, ignored, io):
     return dict.fromkeys(targets)
 
 
+def _root_metadata(root: Path) -> dict:
+    """Read the first root metadata file the checkpoint publishes."""
+    for name in _metadata_files:
+        if (root / name).is_file():
+            return _json(root / name)
+    raise FileNotFoundError(
+        f"checkpoint {root} has no model metadata; expected one of "
+        f"{', '.join(_metadata_files)}"
+    )
+
+
+def _architectures(metadata: Mapping) -> tuple[str, ...]:
+    """Return the architectures a root metadata file declares.
+
+    A pipeline index declares its pipeline class; a model configuration
+    declares its architectures.
+    """
+    if "_class_name" in metadata:
+        return (metadata["_class_name"],)
+    return tuple(metadata.get("architectures", ()))
+
+
 def read_config(
     path: str | Path,
     *,
@@ -495,14 +528,8 @@ def read_config(
     source. Tokenizer files remain paths until the caller loads a tokenizer.
     """  # noqa: D205
     root, repository, revision = _root(path, io)
-    metadata = (
-        _json(root / "config.json")
-        if (root / "config.json").is_file()
-        else _json(root / "modular_model_index.json")
-    )
-    architectures = metadata.get("architectures", ())
-    if metadata.get("_class_name") == "MiniMaxH3ModularPipeline":
-        architectures = ("MiniMaxH3Transformer3DModel",)
+    metadata = _root_metadata(root)
+    architectures = _architectures(metadata)
     if len(architectures) != 1 or architectures[0] not in _catalog:
         raise ValueError(
             f"checkpoint must declare one supported architecture; "
