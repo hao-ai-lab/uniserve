@@ -86,6 +86,7 @@ def test_native_draws_and_canonical_shards(frames, seed, tokens):
                 state = {
                     name: value.unsqueeze(0)
                     for name, value in state_owner.view(buffers).items()
+                    if name in model.modalities
                 }
                 model.prepare_latents(
                     (size,),

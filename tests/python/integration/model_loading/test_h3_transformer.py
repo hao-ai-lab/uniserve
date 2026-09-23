@@ -266,7 +266,7 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
         selections["video"],
         selections["audio"],
     )
-    constants = {
+    tables = {
         "cos": cosine,
         "sin": sine,
         "modulation_indices": (tags == 2).long() * 3 + tags,
@@ -293,7 +293,7 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
                     hidden,
                     inputs,
                     step_index=step,
-                    constants=constants,
+                    tables=tables,
                     workspace=workspace,
                 )
                 for result, reference in zip(actual, expected, strict=True):
@@ -306,7 +306,7 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
                         hidden,
                         inputs,
                         step_index=3,
-                        constants=constants,
+                        tables=tables,
                         workspace=workspace,
                     )
                 )

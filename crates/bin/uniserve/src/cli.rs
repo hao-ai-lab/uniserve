@@ -408,7 +408,9 @@ pub(crate) struct WorkerProcessOptions {
     #[arg(long, hide = true)]
     pub flow_graph_shapes: Option<String>,
     /// Video request shapes whose denoising ladders warmup captures,
-    /// as `SECONDSxTOKENS` items, e.g. `5x1000,15x10000`.
+    /// as `SECONDSxTOKENS` items, e.g. `5x1000,15x10000`. A ladder serves
+    /// every request of its shape's layout; other requests denoise without
+    /// graphs.
     #[arg(long)]
     pub video_graph_shapes: Option<String>,
     #[arg(long, default_value_t = 512 * 1024 * 1024, hide = true)]

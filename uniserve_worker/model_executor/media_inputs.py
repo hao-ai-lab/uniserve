@@ -19,6 +19,11 @@ class MediaBuilder:
     to serving. The model sees only the exact sample, constants and workspace
     views required for one invocation, and states its own native window and
     size descriptor.
+
+    A request's storage, constants and denoising calls follow the layout its
+    exact size occupies, so every request of one layout binds the same shapes
+    and replays the same captured ladder. What distinguishes the request
+    within its layout is state the builder stages with its samples.
     """
 
     def __init__(
@@ -30,6 +35,10 @@ class MediaBuilder:
         self.maximum = denoiser.make_size(frames, max_text_tokens)
         self.denoiser = denoiser
         self.num_steps = len(denoiser.diffusion.ladder)
+        # State descriptions per layout. Describing one builds the layout's
+        # packing, which costs milliseconds of host time; layouts are a small
+        # finite set bounded by the admitted frame and prompt capacity.
+        self._states: dict[object, Mapping[str, BufferConfig]] = {}
 
     def size(self, num_frames: int, num_text_tokens: int):
         size = self.denoiser.make_size(num_frames, num_text_tokens)
@@ -42,19 +51,49 @@ class MediaBuilder:
             )
         return size
 
-    def buffers(self, size) -> Mapping[str, BufferConfig]:
-        """Describe request state.
+    def layout(self, size):
+        """Return the size whose numerical layout ``size`` occupies.
 
-        complete CPU draws and transfer source views.
+        Requests of one layout share its prepared context and captured
+        graphs; see ``Denoiser.layout_size``.
         """
-        result = dict(self.denoiser.state_buffers(size))
+        return self.denoiser.layout_size(size)
+
+    def _state(self, size) -> Mapping[str, BufferConfig]:
+        layout = self.layout(size)
+        state = self._states.get(layout)
+        if state is None:
+            state = self._states[layout] = self.denoiser.state_buffers(layout)
+        return state
+
+    def tables(self, size) -> tuple[str, ...]:
+        """Name the state fields other than the samples, filled per request."""
+        return tuple(
+            name
+            for name in self._state(size)
+            if name not in self.denoiser.modalities
+        )
+
+    def buffers(self, size) -> Mapping[str, BufferConfig]:
+        """Describe one request's storage, shaped by its layout.
+
+        The denoiser's device state, the complete CPU draws, a CPU source for
+        every state field to stage from, and the retained conditioning over
+        the layout's text rows, zero past the prompt.
+        """
+        layout = self.layout(size)
+        state = self._state(size)
+        result = dict(state)
         for name in self.denoiser.modalities:
             result[f"{name}_noise"] = BufferConfig(
-                self.denoiser.noise_shape(name, size), torch.float32, host=True
+                self.denoiser.noise_shape(name, layout),
+                torch.float32,
+                host=True,
             )
-            result[f"{name}_source"] = replace(result[name], host=True)
+        for name, config in state.items():
+            result[f"{name}_source"] = replace(config, host=True)
         result["text_condition"] = BufferConfig(
-            (size.num_text_tokens, self.denoiser.text_condition_width),
+            (layout.num_text_tokens, self.denoiser.text_condition_width),
             torch.bfloat16,
         )
         return result
@@ -82,11 +121,14 @@ class MediaBuilder:
         )
 
     @torch.inference_mode()
-    def draw(self, tensors: Mapping[str, torch.Tensor], *, seed: int) -> None:
-        """Fill the request's CPU noise with its seeded draw.
+    def stage_request(
+        self, size, tensors: Mapping[str, torch.Tensor], *, seed: int
+    ) -> None:
+        """Fill a request's host inputs that its admission determines.
 
-        The draw depends only on the seed and the admitted size, so it can
-        run on another thread before the request's latents are prepared.
+        The seeded native draw and the request's own state tables depend only
+        on the seed and the exact size, so they can be prepared on another
+        thread before the request's latents are.
         """
         # The denoiser's numerical calls batch over leading size 1.
         normal_noise(
@@ -95,6 +137,10 @@ class MediaBuilder:
                 tensors[f"{name}_noise"].unsqueeze(0)
                 for name in self.denoiser.modalities
             ),
+        )
+        self.denoiser.prepare_state(
+            (size,),
+            out={name: tensors[f"{name}_source"] for name in self.tables(size)},
         )
 
     @torch.inference_mode()
@@ -106,9 +152,9 @@ class MediaBuilder:
         constants: Mapping[str, torch.Tensor],
         workspace: Mapping[str, torch.Tensor],
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
-        """Fill CPU sources from the drawn noise.
+        """Fill sample sources from the drawn noise.
 
-        Returns destination/source pairs for staging.
+        Returns destination/source pairs of every state field for staging.
         """
         names = self.denoiser.modalities
         noise = {name: tensors[f"{name}_noise"].unsqueeze(0) for name in names}
@@ -116,15 +162,29 @@ class MediaBuilder:
             name: tensors[f"{name}_source"].unsqueeze(0) for name in names
         }
         self.denoiser.prepare_latents(
-            (size,),
+            (self.layout(size),),
             noise=noise,
             state=source,
             constants=constants,
             workspace=workspace,
         )
         return tuple(
-            (tensors[name], tensors[f"{name}_source"]) for name in names
+            (tensors[name], tensors[f"{name}_source"])
+            for name in (*names, *self.tables(size))
         )
+
+    def store_conditioning(
+        self, size, tensors: Mapping[str, torch.Tensor], features
+    ) -> None:
+        """Retain a prompt's conditioning in the leading rows of its layout.
+
+        The rows past the prompt are zero, as the layout's denoising calls
+        require. Both writes are ordered on the caller's current stream.
+        """
+        target = tensors["text_condition"]
+        rows = size.num_text_tokens
+        target[:rows].copy_(features.reshape(rows, -1), non_blocking=True)
+        target[rows:].zero_()
 
     def bind(
         self,
@@ -146,7 +206,7 @@ class MediaBuilder:
                 )
                 for name in self.denoiser.modalities
             },
-            sizes=(size,),
+            sizes=(self.layout(size),),
             step_index=index,
             text_features=(tensors["text_condition"],),
         )

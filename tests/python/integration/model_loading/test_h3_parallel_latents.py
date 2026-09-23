@@ -178,8 +178,11 @@ def _generate(
             pipeline = mesh.get_group("pp" if "pp" in axes else ())
             tensor = mesh.get_group("tp" if "tp" in axes else ())
             size = DenoiserSize(frames, len(token_ids))
-            conditioning = torch.empty(
-                len(token_ids),
+            # Calls evaluate the prompt's layout: its conditioning fills the
+            # leading text rows, and its own tables are request state.
+            layout = denoiser.layout_size(size)
+            conditioning = torch.zeros(
+                layout.num_text_tokens,
                 denoiser.config.hidden_size,
                 dtype=torch.bfloat16,
                 device=device,
@@ -187,38 +190,47 @@ def _generate(
             if pipeline.rank == 0:
                 with ExecutionContext(denoiser.conditioner) as context:
                     context.prepare(TextSize(len(token_ids), 1))
-                    conditioning.copy_(
+                    conditioning[: len(token_ids)].copy_(
                         denoiser.conditioner.encode((features,))[0]
                     )
-            requirements = denoiser.state_buffers(size)
+            requirements = denoiser.state_buffers(layout)
             with (
                 ExecutionContext(denoiser) as context,
                 TensorBuffers.allocate(requirements, device="cpu") as host,
                 TensorBuffers.allocate(requirements, device=device) as backing,
             ):
-                context.prepare(size)
-                state = backing.view(requirements)
-                initial = {
-                    name: value.unsqueeze(0)
-                    for name, value in host.view(requirements).items()
-                }
+                context.prepare(layout)
+                request = backing.view(requirements)
+                staged = host.view(requirements)
+                state = {name: request[name] for name in denoiser.modalities}
                 noise = {
                     name: torch.empty(
-                        (1, *denoiser.noise_shape(name, size)),
+                        (1, *denoiser.noise_shape(name, layout)),
                         dtype=torch.float32,
                     )
                     for name in denoiser.modalities
                 }
                 normal_noise((1000 + index,), out=tuple(noise.values()))
                 denoiser.prepare_latents(
-                    (size,),
+                    (layout,),
                     noise=noise,
-                    state=initial,
+                    state={
+                        name: staged[name].unsqueeze(0)
+                        for name in denoiser.modalities
+                    },
                     constants=context.constants,
                     workspace=context.workspace,
                 )
-                for name, value in state.items():
-                    value.copy_(initial[name][0])
+                denoiser.prepare_state(
+                    (size,),
+                    out={
+                        name: value
+                        for name, value in staged.items()
+                        if name not in denoiser.modalities
+                    },
+                )
+                for name, value in request.items():
+                    value.copy_(staged[name])
                 schedules = denoiser.make_schedules(
                     4, shift=None, device=device
                 )
@@ -232,7 +244,7 @@ def _generate(
                             )
                             for name, value in state.items()
                         },
-                        (size,),
+                        (layout,),
                         step_index,
                         (conditioning,),
                     )
@@ -240,7 +252,7 @@ def _generate(
                         denoiser,
                         inputs,
                         schedules,
-                        state,
+                        request,
                         context.constants,
                         context.workspace,
                     )
@@ -265,7 +277,7 @@ def _generate(
                                 value, expected[name], rtol=2e-2, atol=2e-2
                             )
                 if pipeline.rank + 1 == pipeline.size and tensor.rank == 0:
-                    layouts = denoiser.output_layout(size)
+                    layouts = denoiser.output_layout(layout)
                     torch.save(
                         {
                             name: {

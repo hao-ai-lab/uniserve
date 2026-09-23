@@ -256,13 +256,10 @@ class ModelExecutor:
                             graph_storage=self.graph_storage,
                             groups=call.groups,
                             capacity=worker_config.max_request_pool_size,
-                            # Resident requests may carry different numerical
-                            # sizes, and every declared video shape holds the
-                            # context its captured ladders borrow.
-                            shapes=max(
-                                worker_config.max_request_pool_size,
-                                len(worker_config.video_graph_shapes),
-                            ),
+                            # Each resident request may carry its own
+                            # undeclared layout. Declared layouts hold their
+                            # captured ladders on pinned contexts beyond this.
+                            shapes=worker_config.max_request_pool_size,
                             attention=self.attention,
                             additional_devices=self._capture_devices(
                                 binding.device
