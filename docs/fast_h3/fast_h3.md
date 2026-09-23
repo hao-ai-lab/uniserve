@@ -60,19 +60,19 @@ Pass the model root containing `modular_model_index.json`, `fastvideo_inference.
 
 ```bash
 uniserve serve "$H3_MODEL" \
-  --workers config/minimax-h3-four-devices.json \
+  --workers configs/minimax-h3-four-devices.json \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
   --max-running-requests 2
 ```
 
-`config/minimax-h3-four-devices.json` is a deployment file: it lists the participating devices and, under `components`, the placement and parallel configuration of each of FastH3's five components. It places the numerical components on four devices of one host, as the `model` worker: four-way Ulysses denoising, TP4 text encoding, one video and one audio media unit per rank. A second worker, `host`, has five ranks on the host with `"device": "cpu"` and holds the two host components every video deployment needs: `video_encoder` on ranks 0 to 3, one media unit of each decode round per rank, and `muxer` on rank 4, which encodes the audio track and assembles the MP4. Each host rank is one codec slot: it runs one encode or assembly step at a time in its own process. The muxer must be on the head's host, and every worker that decodes video needs an encoder that keeps each media unit on the host that decoded it; the server refuses a placement that violates either at startup and routes each request to such an encoder. It does not shard denoiser weights. Serving a different width, or sharding the denoiser by tensor or pipeline, is a different deployment file.
+`configs/minimax-h3-four-devices.json` is a deployment file: it lists the participating devices and, under `components`, the placement and parallel configuration of each of FastH3's five components. It places the numerical components on four devices of one host, as the `model` worker: four-way Ulysses denoising, TP4 text encoding, one video and one audio media unit per rank. A second worker, `host`, has five ranks on the host with `"device": "cpu"` and holds the two host components every video deployment needs: `video_encoder` on ranks 0 to 3, one media unit of each decode round per rank, and `muxer` on rank 4, which encodes the audio track and assembles the MP4. Each host rank is one codec slot: it runs one encode or assembly step at a time in its own process. The muxer must be on the head's host, and every worker that decodes video needs an encoder that keeps each media unit on the host that decoded it; the server refuses a placement that violates either at startup and routes each request to such an encoder. It does not shard denoiser weights. Serving a different width, or sharding the denoiser by tensor or pipeline, is a different deployment file.
 
-`config/minimax-h3-eight-devices.json` is the same placement over eight devices on two hosts, named `rank-0` and `rank-1` in the file: eight-way Ulysses denoising, TP8 text encoding, one video and one audio media unit per rank, and a host worker with four encoder ranks on each host, which encode that host's four media units per round, and a muxer rank on `rank-0`. The head runs on the host named `rank-0`, which holds ranks 0 to 3 of the model worker, and a launcher on the other host runs ranks 4 to 7 of the model worker and encoder ranks 4 to 7 of the host worker. Start the head first:
+`configs/minimax-h3-eight-devices.json` is the same placement over eight devices on two hosts, named `rank-0` and `rank-1` in the file: eight-way Ulysses denoising, TP8 text encoding, one video and one audio media unit per rank, and a host worker with four encoder ranks on each host, which encode that host's four media units per round, and a muxer rank on `rank-0`. The head runs on the host named `rank-0`, which holds ranks 0 to 3 of the model worker, and a launcher on the other host runs ranks 4 to 7 of the model worker and encoder ranks 4 to 7 of the host worker. Start the head first:
 
 ```bash
 uniserve serve "$H3_MODEL" \
-  --workers config/minimax-h3-eight-devices.json \
+  --workers configs/minimax-h3-eight-devices.json \
   --host-identity rank-0 \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
@@ -87,7 +87,7 @@ uniserve-host --head <address the head logs> --host-identity rank-1
 
 One launcher serves every worker of the deployment that places a rank on its host, here ranks 4 to 7 of the model worker and ranks 4 to 7 of the host worker. The launcher starts each rank with the Python interpreter and launch descriptor the head resolved, so the other host needs the same Python environment and the checkpoint at the same path.
 
-`config/minimax-h3-eight-devices-single-node.json` places the same components on eight devices of one host, so it needs no launcher and starts exactly like the four-device file: eight-way Ulysses denoising, TP8 text encoding, one video and one audio media unit per rank, and a host worker with eight encoder ranks, one per media unit of a round, and a muxer rank.
+`configs/minimax-h3-eight-devices-single-node.json` places the same components on eight devices of one host, so it needs no launcher and starts exactly like the four-device file: eight-way Ulysses denoising, TP8 text encoding, one video and one audio media unit per rank, and a host worker with eight encoder ranks, one per media unit of a round, and a muxer rank.
 
 ## Data parallel serving
 
@@ -97,7 +97,7 @@ The NVFP4 checkpoints are the intended DP8 weights. Dense BF16 denoiser replicat
 
 ```bash
 uniserve serve "$H3_MODEL" \
-  --workers config/minimax-h3-dp8-text-tp8.json \
+  --workers configs/minimax-h3-dp8-text-tp8.json \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
   --max-running-requests 8 \
@@ -111,7 +111,7 @@ The two supplied placements isolate the main topology choices:
 | `minimax-h3-dp8-text-tp8.json` | One TP8 worker shared by all requests | Eight complete one-GPU replicas | Eight one-rank encoder workers and one muxer worker | Lower text-weight storage per GPU and the conservative starting point; conditioning is one shared stage and its TP collective spans all devices. |
 | `minimax-h3-dp8-text-tp4x2.json` | Two TP4 replicas, one on devices 0–3 and one on devices 4–7 | Eight complete one-GPU replicas | The same encoder and muxer workers | Two conditioning requests can run concurrently and each collective stays within a four-GPU island, at the cost of a larger text shard on every GPU. |
 
-`config/minimax-h3-dp8-text-tp8-two-node.json` extends the shared-TP8 layout across two four-GPU hosts. The text collective spans both hosts, each host owns four one-GPU flow replicas, and each host holds the four one-rank encoder workers that serve its flow replicas, with the muxer worker on `rank-0`. A request is routed to an encoder on its flow replica's host, so every decoded unit is borrowed in place from shared storage; only the encoded unit rows, a fraction of a raw unit, cross to the muxer. Start it with the same head-plus-`uniserve-host` procedure as the two-host Ulysses placement above.
+`configs/minimax-h3-dp8-text-tp8-two-node.json` extends the shared-TP8 layout across two four-GPU hosts. The text collective spans both hosts, each host owns four one-GPU flow replicas, and each host holds the four one-rank encoder workers that serve its flow replicas, with the muxer worker on `rank-0`. A request is routed to an encoder on its flow replica's host, so every decoded unit is borrowed in place from shared storage; only the encoded unit rows, a fraction of a raw unit, cross to the muxer. Start it with the same head-plus-`uniserve-host` procedure as the two-host Ulysses placement above.
 
 Each GPU decoder has one native media unit per rank, so a one-GPU flow replica reconstructs an eight-unit request in eight bounded decode rounds, and its units reach the encoder one at a time. Each request is therefore bound to one single-rank encoder worker on its replica's host, chosen at admission, and the eight encoder workers encode eight requests' units concurrently. Audio encoding and MP4 assembly run on the one muxer worker, serialized per request because they are short relative to denoising and need one ordered artifact owner.
 
@@ -172,7 +172,7 @@ docker run --rm \
   -p 8000:8000 \
   -v "$H3_MODEL:/models/fast_h3:ro" \
   uniserve-h3 serve /models/fast_h3 \
-    --workers config/minimax-h3-four-devices.json \
+    --workers configs/minimax-h3-four-devices.json \
     --served-model-name FastH3 \
     --host 0.0.0.0 \
     --max-running-requests 2
@@ -252,7 +252,7 @@ On four GB200 devices, the packed 8-Step V2 checkpoint serves every measured dur
 
 ```bash
 uniserve serve skx618/FastVideo-FastH3-8-Step-V2-NVFP4 \
-  --workers config/minimax-h3-four-devices.json \
+  --workers configs/minimax-h3-four-devices.json \
   --served-model-name FastH3
 ```
 

@@ -17,7 +17,7 @@ def test_fast_h3_serves_the_deployment_configuration_it_is_given(
 ) -> None:
     """A width is a deployment, so serving another one names another file."""
     monkeypatch.setenv(
-        "UNISERVE_H3_DEPLOYMENT", "config/minimax-h3-two-devices.json"
+        "UNISERVE_H3_DEPLOYMENT", "configs/minimax-h3-two-devices.json"
     )
     monkeypatch.setenv("UNISERVE_H3_CUDA_VISIBLE_DEVICES", "0,1")
     monkeypatch.setenv("UNISERVE_H3_MEM_FRACTION", "0.99")
@@ -28,7 +28,7 @@ def test_fast_h3_serves_the_deployment_configuration_it_is_given(
     fraction_value = server.command.index("--mem-fraction-static") + 1
     precision_value = server.command.index("--quantization-config") + 1
 
-    assert server.command[deployment] == "config/minimax-h3-two-devices.json"
+    assert server.command[deployment] == "configs/minimax-h3-two-devices.json"
     assert server.command[fraction_value] == "0.99"
     assert json.loads(server.command[precision_value]) == {
         "mode": "performance"

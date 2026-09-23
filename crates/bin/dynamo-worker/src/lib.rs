@@ -64,7 +64,7 @@ struct Args {
 
     /// JSON deployment configuration: the Worker instances, their node/device
     /// ranks, and the FastH3 components placed on them, for example
-    /// `config/minimax-h3-four-devices.json`.
+    /// `configs/minimax-h3-four-devices.json`.
     #[arg(long, value_name = "FILE", value_parser = read_workers)]
     workers: Box<[WorkerConfig]>,
 

@@ -500,7 +500,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         )
     deployment = (
         Path(__file__).resolve().parents[3]
-        / "config"
+        / "configs"
         / "minimax-h3-four-devices.json"
     )
     port = find_free_port()
