@@ -15,7 +15,6 @@ from threading import RLock
 import torch
 
 from uniserve.cache import block_spans
-from uniserve.quantization import QuantizedTensor
 from uniserve.runtime import PrefixCache
 from uniserve_worker.errors import invalid_descriptor, resource_error
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
@@ -579,6 +578,21 @@ class KVCacheManager:
         for name in self.layers:
             self.cache.zero_blocks(name, pages)
 
+    def _layer_stacks(
+        self, buffer: str
+    ) -> tuple[tuple[int, torch.Tensor], ...]:
+        """Pair each allocation run of `buffer` with its first logical layer.
+
+        Runs cover the resident layers in order, so a run's first logical
+        layer is this rank's layer offset plus the layers of earlier runs.
+        """
+        stacks = []
+        layer = self.info.layer_offset
+        for names, stack in self.cache.layer_stacks(buffer):
+            stacks.append((layer, stack))
+            layer += len(names)
+        return tuple(stacks)
+
     def publish(
         self,
         *,
@@ -625,25 +639,25 @@ class KVCacheManager:
                 spans = block_spans(
                     pages, base_extent, suffix, self.info.block_size
                 )
+                encoded = self.info.dtype == "float8_e4m3fn"
                 fields = ("key", "value")
+                # Each run of layers sharing one backing exports as a single
+                # tensor per mechanism, so the descriptor's locator count
+                # follows the cache's allocation runs and the rank's
+                # mechanisms, never the model's depth.
                 for field in fields:
                     locations = []
-                    for layer, name in enumerate(
-                        self.layers, self.info.layer_offset
-                    ):
-                        tensor = self.cache.state(name).tensors[field]
-                        values = (
-                            tensor.buffers()["values"]
-                            if isinstance(tensor, QuantizedTensor)
-                            else tensor
-                        )
-                        # Each span view is [tokens, 1, kv heads, head dim]:
-                        # the unsqueezed axis is this layer's slice.
+                    for layer, stack in self._layer_stacks(f"{field}.values"):
+                        # Stacks are [layers, pages, page tokens, kv heads,
+                        # head dim]; each span view is [tokens, layers, kv
+                        # heads, head dim] over the run's layers.
                         views = tuple(
-                            values[page, start : start + count].unsqueeze(1)
+                            stack[:, page, start : start + count].permute(
+                                1, 0, 2, 3
+                            )
                             for page, start, count in spans
                         )
-                        if isinstance(tensor, QuantizedTensor):
+                        if encoded:
                             # Appending can enlarge a block's scale and
                             # re-encode its prefix. Freeze exported bytes so
                             # an immutable publication survives later
@@ -672,21 +686,20 @@ class KVCacheManager:
 
                 # FP8 exports additionally carry one scale row per
                 # published page.
-                if self.info.dtype == "float8_e4m3fn":
+                if encoded:
                     locations = []
-                    for layer, name in enumerate(
-                        self.layers, self.info.layer_offset
-                    ):
-                        for field_index, field in enumerate(fields):
-                            scales = (
-                                self.cache.state(name)
-                                .tensors[field]
-                                .buffers()["scale"]
-                            )
+                    for field_index, field in enumerate(fields):
+                        for layer, stack in self._layer_stacks(
+                            f"{field}.scale"
+                        ):
+                            # Scale stacks are [layers, pages, 1, 1, 1] with
+                            # one scale per page; published rows are [page,
+                            # K/V, layers, head group], frozen like the values
+                            # they encode.
                             views = (
                                 torch.cat(
                                     tuple(
-                                        scales[page : page + 1]
+                                        stack[:, page].reshape(1, 1, -1, 1)
                                         for page, _, _ in spans
                                     ),
                                     dim=0,
