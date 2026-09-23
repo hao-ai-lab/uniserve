@@ -21,6 +21,7 @@ from uniserve_worker.errors import (
     resource_error,
 )
 from uniserve_worker.execution.batch import BatchState
+from uniserve_worker.execution.media import begin_noise
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.execution.prepare import (
     capture_predicates,
@@ -507,6 +508,16 @@ class Executor:
             slots = self.worker.requests.apply_commands((command,))
             if slots and self.worker.decode_state is not None:
                 self.worker.decode_state.reset(slots)
+            if slots and command.request.diffusion is not None:
+                # A video request's seeded noise is drawn while this batch and
+                # the ones before latent preparation run on the device.
+                begin_noise(
+                    self.worker.runner,
+                    self.worker.requests.get(
+                        command.request.request_key.request_id
+                    ),
+                    self.worker.requests,
+                )
 
         state.predecessors = self.worker.requests.predecessors(batch.calls)
         validate_batch(

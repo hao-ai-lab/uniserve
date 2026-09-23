@@ -13,7 +13,6 @@ from uniserve.diffusion import DenoisingStep, Schedule
 from uniserve.distributed import Communicator
 from uniserve.model import Denoiser, DenoiserInput
 from uniserve.runtime import CUDAStream, ExecutionContext, PrefixCache
-from uniserve_worker.model_executor.component_binding import capture_required
 from uniserve_worker.model_executor.cuda_graph import (
     CUDAGraphRunner,
     Execution,
@@ -336,7 +335,13 @@ class TrajectoryRunner(Generic[InputT, SizeT]):
         context = entry.context
         slot_index = cast(torch.Tensor, self._slot_index)
         graph = bucket.graphs.get(index)
-        missing = capture_required(graph is None, self.groups, self.device)
+        # Every rank of the component runs the same calls in the same order
+        # and retires contexts and buckets by the same deterministic recency:
+        # other runners' uses advance the shared use counter differently per
+        # rank, but never reorder this runner's buckets relative to each
+        # other. Each rank therefore finds the same graph resident, and none
+        # synchronizes with the device or its peers to agree on it.
+        missing = graph is None
         if missing:
             if graph is not None:
                 graph.close()
