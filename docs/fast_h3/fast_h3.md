@@ -40,7 +40,7 @@ The `gpu` extra installs the locked GPU providers FastH3 serves through: FlashIn
 | [`skx618/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4`](https://huggingface.co/skx618/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4) | Packed NVFP4 | 4 | 0.9 | 123 GB |
 | [`skx618/FastVideo-FastH3-8-Step-V2-NVFP4`](https://huggingface.co/skx618/FastVideo-FastH3-8-Step-V2-NVFP4) | Packed NVFP4 | 8 | 0.8 | 123 GB |
 
-The two `skx618` repositories are self-describing ModelOpt PTQ checkpoints. UniServe loads them natively, with no conversion step and no precision flags: see [Precision and graphs](#precision-and-graphs).
+The two `skx618` repositories are ModelOpt PTQ checkpoints. UniServe loads ModelOpt's unified Hugging Face layout with no precision flags: see [Precision and graphs](#precision-and-graphs). These repositories publish an earlier packed layout, so rewrite a downloaded copy with `scripts/convert_h3_modelopt_checkpoint.py` before serving it, as shown below.
 
 Each checkpoint's `fastvideo_inference.json` supplies its sampling schedule: the trained DMD rungs in `dmd_denoising_steps`, one transformer forward per rung, and the VSA sparsity. The video and audio shifts come from `scheduler/` and `audio_scheduler/`, and a manifest that restates them must agree. The loader refuses a manifest that is not a `fasth3-inference-contract-v1` text-to-video-and-audio contract without guidance. The table lists the checkpoints UniServe has validated end to end.
 
@@ -51,10 +51,13 @@ Each checkpoint's `fastvideo_inference.json` supplies its sampling schedule: the
 ```bash
 export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2-NVFP4
 
-hf download skx618/FastVideo-FastH3-8-Step-V2-NVFP4 --local-dir "$H3_MODEL"
+hf download skx618/FastVideo-FastH3-8-Step-V2-NVFP4 --local-dir "$H3_MODEL.packed"
+python scripts/convert_h3_modelopt_checkpoint.py "$H3_MODEL.packed" "$H3_MODEL"
 ```
 
-Pass the model root containing `modular_model_index.json`, `fastvideo_inference.json`, `transformer/`, `text_encoder/`, `vae/`, `audio_vae/`, `scheduler/`, `audio_scheduler/`, and `tokenizer/`. A packed NVFP4 root also contains `modelopt_manifest.json`. The server identifies the model from the pipeline class that `modular_model_index.json` declares and reads the tokenizer from the component folder the index names; the loader then requires `fastvideo_inference.json` to match one of the checkpoints above.
+The conversion copies the packed values and scales bit for bit, turns each calibrated activation amax into its module's `input_scale`, and hardlinks every file outside the quantized `transformer/` and `vae/` components. The BF16 checkpoints need no conversion.
+
+Pass the model root containing `modular_model_index.json`, `fastvideo_inference.json`, `transformer/`, `text_encoder/`, `vae/`, `audio_vae/`, `scheduler/`, `audio_scheduler/`, and `tokenizer/`. In an NVFP4 root in ModelOpt's unified layout, `transformer/config.json` and `vae/config.json` also declare a `quantization_config` with `quant_method: modelopt`. The server identifies the model from the pipeline class that `modular_model_index.json` declares and reads the tokenizer from the component folder the index names; the loader then validates the inference contract in `fastvideo_inference.json`.
 
 ## Start the server
 
@@ -244,9 +247,9 @@ Omitting `--quantization-config` selects `balanced`.
 
 CUDA graphs are always on. The denoising step and the media-decoding calls are captured on first use and replayed afterwards, so the first request after startup is slower than steady state; a capture failure is raised rather than silently degrading to eager execution. Precision, placement, duration capacity, and prompt capacity are startup settings; restart the server after changing them.
 
-The four tiers above are runtime dynamic-quantization presets for dense checkpoints. A packed ModelOpt PTQ checkpoint is self-describing and loads without `--quantization-config`. Its static activation tensor scales come from the recorded calibration cohort; the runtime computes only the per-input K16 NVFP4 block encoding and does not search a new global scale. Because every row interval uses that same checkpoint-owned scale, singleton DP replicas encode and project bounded 64 MiB intervals instead of materializing a full-token MLP intermediate. Packed checkpoints reject runtime precision presets and component overrides because their weights and scales form one immutable numerical contract.
+The four tiers above are runtime dynamic-quantization presets for dense checkpoints. A ModelOpt PTQ checkpoint loads without `--quantization-config`. Each quantized Linear stores its packed NVFP4 values under `.weight`, its K16 block scales in `.weight_scale`, its FP32 weight scale in `.weight_scale_2`, and the static activation scale its calibration cohort recorded in `.input_scale`; the runtime computes only the per-input K16 NVFP4 block encoding against that input scale and does not search a new global scale. Because every row interval uses that same checkpoint-owned scale, singleton DP replicas encode and project bounded 64 MiB intervals instead of materializing a full-token MLP intermediate. Packed checkpoints reject runtime precision presets and component overrides because their weights and scales form one immutable numerical contract.
 
-Both published packed checkpoints quantize their calibrated denoiser MLP projections and Video VAE Transformer projections to NVFP4 and retain the BF16 text encoder. Each repository's `modelopt_manifest.json` is the authoritative component and scale contract, and loading fails if it does not describe exactly those modules.
+Both published packed checkpoints quantize their calibrated denoiser MLP projections and Video VAE Transformer projections to NVFP4 and retain the BF16 text encoder. The stored tensors are the contract: exactly the Linears whose weights are packed run in NVFP4, every other module runs in BF16 with FP32 decoders and latent heads, and loading refuses a ModelOpt recipe other than static NVFP4 weights and activations with 16-element blocks.
 
 On four GB200 devices, the packed 8-Step V2 checkpoint serves every measured duration and prompt length faster than any runtime tier applied to the dense 8-Step V2 checkpoint, and at lower peak device memory. Measurements outside that hardware and workload require their own run.
 

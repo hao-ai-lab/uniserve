@@ -106,7 +106,7 @@ def test_calibrated_nvfp4_projection_chunks_match_complete_input():
     ):
         pytest.skip("NVFP4 projection requires an SM100-class CUDA device")
 
-    quantizer = Quantizer("nvfp4", calibrated_amax=8.0)
+    quantizer = Quantizer("nvfp4", calibrated_scale=8.0 / (448.0 * 6.0))
     layer = ColumnParallelLinear(
         32, 32, bias=False, device="cuda", dtype=torch.bfloat16
     )

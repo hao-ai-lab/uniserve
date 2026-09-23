@@ -14,11 +14,10 @@ from .denoiser import Denoiser
 from .encoder import TextEncoder, TextEncoderConfig
 from .inputs import AttentionInput, DenoiserInput, DenoiserSize
 from .model import Model, entry_points
-from .modelopt import calibrated_weight_config
 from .modulation import OutputNorm, TimestepEmbedding
 from .output import VideoPostprocessor
 from .packing import Packing
-from .precision import precisions, weight_config
+from .precision import checkpoint_precision, precisions, weight_config
 from .transformer import Transformer, TransformerLayer
 from .weights import checkpoint_mappings, checkpoint_sources
 
@@ -56,6 +55,6 @@ __all__ = [
     "checkpoint_mappings",
     "entry_points",
     "precisions",
+    "checkpoint_precision",
     "weight_config",
-    "calibrated_weight_config",
 ]
