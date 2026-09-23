@@ -48,15 +48,15 @@ def _inference_contract(
         ValueError: The manifest is not a text-to-video-and-audio contract
             this implementation serves, naming the offending field.
     """
-    for name, expected in (
+    for name, required in (
         ("schema_version", INFERENCE_SCHEMA),
         ("task", "t2av"),
         ("attention_backend", "VIDEO_SPARSE_ATTN_H3"),
     ):
-        if manifest.get(name) != expected:
+        if manifest.get(name) != required:
             raise ValueError(
                 f"unsupported FastH3 checkpoint: {name} must be "
-                f"{expected!r}, got {manifest.get(name)!r}"
+                f"{required!r}, got {manifest.get(name)!r}"
             )
     # The model has no unconditional branch and the sparse-attention kernel
     # tiles 64 rows.

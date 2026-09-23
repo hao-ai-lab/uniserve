@@ -413,6 +413,7 @@ class ShmTransport(Transport):
                     # into it has retired.
                     torch.cuda.current_stream(first.device).synchronize()
                 if first.is_cuda:
+                    assert buffer is not None
                     segment.set_state(buffer, segment.FAILED)
                     self._publications.complete(locator)
             else:

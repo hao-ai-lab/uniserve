@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from itertools import chain
+from typing import cast
 
 import torch
 from torch import nn
 
 from uniserve.distributed import DeviceMesh
-from uniserve.nn import GatedMLP, Linear, Modulation, RMSNorm, functional
+from uniserve.nn import (
+    ColumnParallelLinear,
+    GatedMLP,
+    Linear,
+    Modulation,
+    RMSNorm,
+    functional,
+)
 from uniserve.quantization import Quantizer
 
 from .attention import Attention
@@ -39,18 +47,28 @@ class TransformerLayer(nn.Module):
     ):
         """Connect token-local residual updates to the following layer's projection."""  # noqa: E501
         if isinstance(hidden, torch.Tensor):
-            source = ((inputs.token_slice, hidden),)
+            source: Iterable[tuple[slice, torch.Tensor]] = (
+                (inputs.token_slice, hidden),
+            )
         else:
-            source = iter(hidden)
-            first = next(source)
+            chunks = iter(hidden)
+            first = next(chunks)
             hidden = first[1].new_empty(
                 (
                     inputs.token_slice.stop - inputs.token_slice.start,
                     self.hidden_size,
                 )
             )
-            source = chain((first,), source)
+            source = chain((first,), chunks)
         indices = workspace["modulation_indices"]
+
+        # Module containers hold one class each: the pre-attention and pre-MLP
+        # RMSNorms, and the column-parallel gate/up branches.
+        attention_norm = cast(RMSNorm, self.norm[0])
+        mlp_norm = cast(RMSNorm, self.norm[1])
+        gate = cast(ColumnParallelLinear, self.mlp.gate_up.projections["gate"])
+        up = cast(ColumnParallelLinear, self.mlp.gate_up.projections["up"])
+
         # Six per-token affine vectors: shift/scale/gate for attention and MLP.
         shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = (
             value.to(hidden.dtype)
@@ -72,11 +90,11 @@ class TransformerLayer(nn.Module):
                     interval,
                     functional.modulated_rms_norm(
                         value,
-                        self.norm[0].weight,
+                        attention_norm.weight,
                         shift_attn,
                         scale_attn,
                         indices[local],
-                        eps=self.norm[0].eps,
+                        eps=attention_norm.eps,
                         retain=hidden[local],
                     ),
                 )
@@ -95,25 +113,25 @@ class TransformerLayer(nn.Module):
                 interval.stop - inputs.token_slice.start,
             )
             selected = indices[local]
-            quantizer = self.mlp.gate_up.projections["gate"].input_quantizer
+            quantizer = gate.input_quantizer
             if (
-                quantizer == Quantizer("fp8", axis=0)
-                and self.mlp.gate_up.projections["up"].input_quantizer
-                == quantizer
+                quantizer is not None
+                and quantizer == Quantizer("fp8", axis=0)
+                and up.input_quantizer == quantizer
             ):
                 residual, values, scales = (
                     functional.gated_residual_rms_norm_fp8(
                         hidden[local],
                         update,
                         gate_attn,
-                        self.norm[1].weight,
+                        mlp_norm.weight,
                         shift_mlp,
                         scale_mlp,
                         selected,
-                        eps=self.norm[1].eps,
+                        eps=mlp_norm.eps,
                     )
                 )
-                normalized = quantizer.from_tensors(
+                normalized: torch.Tensor = quantizer.from_tensors(
                     {"values": values, "scale": scales},
                     shape=tuple(values.shape),
                     dtype=hidden.dtype,
@@ -123,11 +141,11 @@ class TransformerLayer(nn.Module):
                     hidden[local],
                     update,
                     gate_attn,
-                    self.norm[1].weight,
+                    mlp_norm.weight,
                     shift_mlp,
                     scale_mlp,
                     selected,
-                    eps=self.norm[1].eps,
+                    eps=mlp_norm.eps,
                 )
             return functional.gated_residual(
                 residual, self.mlp(normalized), gate_mlp, selected
@@ -136,8 +154,8 @@ class TransformerLayer(nn.Module):
         # Tensor-wide activation statistics require the complete source domain.
         # Row/block quantizers retain interval consumption and transfer overlap.
         quantizers = (
-            self.mlp.gate_up.projections["gate"].input_quantizer,
-            self.mlp.gate_up.projections["up"].input_quantizer,
+            gate.input_quantizer,
+            up.input_quantizer,
             self.mlp.down.input_quantizer,
         )
         if any(
@@ -238,6 +256,7 @@ class Transformer(nn.Module):
         }
         chunks = ((inputs.token_slice, hidden),)
         for index, layer in enumerate(self.layers.values()):
+            layer = cast(TransformerLayer, layer)
             # Adjacent layers alternate between the two attention scratch sets
             # so a completed chunk can feed the next projection in place.
             prefix = f"attention.{index % 2}."

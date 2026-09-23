@@ -9,11 +9,13 @@ import math
 import torch
 from torch import nn
 
-from uniserve.distributed import Communicator
+from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.distributed.tokens import HeadExchange, TokenShard
 from uniserve.nn import _binding, functional
 from uniserve.nn.functional._tensors import result
 
+from ._parallel import ParallelAttention
+from .config import AttentionParallelConfig
 from .inputs import AttentionInput, DenseInput, PagedInput, SegmentedInput
 
 
@@ -24,6 +26,10 @@ class Attention(nn.Module):
     assigns local query/KV heads, token ownership and the global cache-head IDs.
     Cache state and mutable kernel resources are borrowed from the active call.
     """
+
+    # Recorded by parallelize_ once the layer is bound to its partition.
+    _parallel_mesh: DeviceMesh
+    _attention_parallel: AttentionParallelConfig
 
     def __init__(
         self,
@@ -57,7 +63,7 @@ class Attention(nn.Module):
         self.local_kv_heads = num_kv_heads
         self.head_indices = tuple(range(num_kv_heads))
         self.exchange = HeadExchange(Communicator())
-        self.context_parallel = None
+        self.context_parallel: ParallelAttention | None = None
 
     def forward(
         self,
@@ -99,14 +105,20 @@ class Attention(nn.Module):
             raise ValueError(
                 "Ulysses attention requires explicit packed sequence lengths"
             )
-        if batch.queries.num_tokens is None:
+        sequences = batch
+        if sequences.queries.num_tokens is None:
             if operator is None:
                 raise RuntimeError(
                     "device-only Ulysses lengths require an active "
                     "ExecutionContext"
                 )
-            batch = operator.sequence_inputs(batch)
-        partition = TokenShard(batch.queries.num_tokens, group)
+            sequences = operator.sequence_inputs(sequences)
+        num_tokens = sequences.queries.num_tokens
+        if num_tokens is None:
+            raise RuntimeError(
+                "Ulysses token partitions require host sequence lengths"
+            )
+        partition = TokenShard(num_tokens, group)
         if partition.num_tokens == 0:
             return torch.empty_like(q) if out is None else out
 
@@ -120,7 +132,7 @@ class Attention(nn.Module):
                 ("query", "key", "value"), (q, k, v), strict=True
             )
         )
-        attended = self._compute(operator, query, key, value, batch, None)
+        attended = self._compute(operator, query, key, value, sequences, None)
 
         # Head shard -> token shard. The exchange spans the padded physical
         # token count, so a short compute result is zero-filled first.

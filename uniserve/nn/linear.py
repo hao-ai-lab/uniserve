@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import ItemsView, Iterator, Mapping
 from math import sqrt
+from typing import cast
 
 import torch
 from torch import nn
@@ -13,6 +14,7 @@ from uniserve.distributed import Communicator, DeviceMesh, Distribution
 from uniserve.quantization import QuantizedTensor, Quantizer
 
 from . import _binding
+from .attention.config import AttentionParallelConfig
 from .functional._linear import apply_linear, apply_merged_linear
 from .functional._tensors import as_matrix
 
@@ -108,6 +110,10 @@ class Linear(nn.Module):
     without retaining an execution context.
     """
 
+    # Recorded by parallelize_ once the layer is bound to its partition.
+    _parallel_mesh: DeviceMesh
+    _attention_parallel: AttentionParallelConfig
+
     def __init__(
         self,
         in_features: int,
@@ -194,6 +200,11 @@ def _check_output(out, shape, dtype, device):
 
 class ColumnParallelLinear(Linear):
     """Project replicated channels into the local output-channel shard."""
+
+    # Input token axes this projection gathers. parallelize_ binds them when
+    # interleaved branches project directly into Ulysses heads; otherwise
+    # every sharded input token axis gathers.
+    gather_axes: tuple[str, ...]
 
     def __init__(
         self,
@@ -407,6 +418,13 @@ class MergedColumnParallelLinear(nn.Module):
         self.branch_width = branch_width
         _coalesce(self.projections)
 
+    def _branches(self) -> ItemsView[str, ColumnParallelLinear]:
+        # ModuleDict does not carry its value type. Construction registers
+        # only ColumnParallelLinear branches, and no binding replaces them.
+        return cast(
+            ItemsView[str, ColumnParallelLinear], self.projections.items()
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -419,9 +437,9 @@ class MergedColumnParallelLinear(nn.Module):
                 "merged output names must match the projection branches"
             )
 
-        branches = tuple(self.projections.values())
+        branches = tuple(branch for _, branch in self._branches())
         dtype = x.dtype if output_dtype is None else output_dtype
-        for name, branch in self.projections.items():
+        for name, branch in self._branches():
             _check_output(
                 None if out is None else out[name],
                 (*x.shape[:-1], branch.weight.shape[0]),
@@ -448,8 +466,8 @@ class MergedColumnParallelLinear(nn.Module):
         targets = None if encoded is not x or out is None else out
         values = apply_merged_linear(
             encoded,
-            {name: branch.weight for name, branch in self.projections.items()},
-            {name: branch.bias for name, branch in self.projections.items()},
+            {name: branch.weight for name, branch in self._branches()},
+            {name: branch.bias for name, branch in self._branches()},
             branch_width=self.branch_width,
             output_dtype=dtype,
             out=targets,
@@ -484,7 +502,7 @@ class MergedColumnParallelLinear(nn.Module):
             projection_inputs,
         )
 
-        branches = tuple(self.projections.values())
+        branches = tuple(branch for _, branch in self._branches())
         if len({branch.input_quantizer for branch in branches}) != 1:
             if not isinstance(x, torch.Tensor):
                 x = _assemble(
@@ -564,6 +582,10 @@ def _vocabulary(size: int, group: Communicator):
 
 class VocabParallelEmbedding(nn.Module):
     """Embed owned vocabulary IDs, masking padding before a numerical sum."""
+
+    # Recorded by parallelize_ once the layer is bound to its partition.
+    _parallel_mesh: DeviceMesh
+    _attention_parallel: AttentionParallelConfig
 
     def __init__(
         self,

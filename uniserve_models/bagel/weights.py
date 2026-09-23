@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 
 from uniserve.loading import checkpoint, weights
+from uniserve.model import TransformerDecoder
 from uniserve_models import siglip
 
 from . import vae
 
 if TYPE_CHECKING:
     from .model import Model
-    from .transformer import Transformer
+    from .vision import Encoder
 
 
 checkpoint_sources = (
@@ -40,7 +41,7 @@ precisions = MappingProxyType(
 checkpoint_precision = precisions["bf16"]
 
 
-def _backbone_names(backbone: Transformer) -> dict[str, str]:
+def _backbone_names(backbone: TransformerDecoder) -> dict[str, str]:
     """Translate backbone parameter paths to checkpoint language_model names.
 
     Text experts keep the plain checkpoint names; flow experts carry the
@@ -186,7 +187,8 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
     denoiser_names["position.weight"] = "latent_pos_embed.pos_embed"
     components.append(_mapped(model.denoiser, denoiser_names))
 
-    vision = model.vision_encoder.network
+    # The model always composes its vision encoder around BAGEL's Encoder.
+    vision = cast("Encoder", model.vision_encoder.network)
     vision_names = {
         "network.connector." + name: "connector."
         + name.replace("projection.0.", "fc1.").replace("projection.2.", "fc2.")

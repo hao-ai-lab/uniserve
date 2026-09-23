@@ -21,7 +21,7 @@ class _Rows:
     Own selected query maps for one serialized row-wise attention execution.
     """
 
-    fine_attention: Callable[..., torch.Tensor]
+    fine_attention: Callable[..., object]
     plans: dict[
         tuple[object, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ] = field(default_factory=dict)
@@ -120,13 +120,13 @@ class _Rows:
                 # Map each segment's packed local tiles onto its owners' query
                 # tiles in the full row domain: owner stride owner_rows,
                 # offset start.
-                selected = []
+                segment_tiles = []
                 for start, count in segments:
                     local = torch.arange(owners * count // _TILE)
                     tiles = local // (count // _TILE) * (owner_rows // _TILE)
                     tiles += start // _TILE + local % (count // _TILE)
-                    selected.append(tiles)
-                selected = torch.cat(selected).to(device=query.device)
+                    segment_tiles.append(tiles)
+                selected = torch.cat(segment_tiles).to(device=query.device)
                 plan = (
                     selected,
                     torch.empty(

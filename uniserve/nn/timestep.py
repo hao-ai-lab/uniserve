@@ -1,6 +1,7 @@
 """Sinusoidal scalar time features and their learned projection."""
 
 import math
+from typing import cast
 
 import torch
 from torch import nn
@@ -42,4 +43,6 @@ class TimestepEmbedding(nn.Module):
 
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
         features = timestep_embedding(timesteps, self.frequency_dim)
-        return self.projection(features.to(self.projection[0].weight.dtype))
+        # Sequential indexing is untyped; construction places a Linear first.
+        first = cast(Linear, self.projection[0])
+        return self.projection(features.to(first.weight.dtype))

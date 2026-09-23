@@ -14,7 +14,12 @@ from uniserve.model import (
     ImageDenoiser,
     TransformerDecoder,
 )
-from uniserve.nn.attention import PagedInput, SegmentedInput
+from uniserve.nn.attention import (
+    Attention,
+    DenseInput,
+    PagedInput,
+    SegmentedInput,
+)
 from uniserve.tensors import OutputLayout, TensorOutput
 
 from .config import Config
@@ -83,6 +88,13 @@ class Denoiser(ImageDenoiser):
 
         # Latent-feature prefill and image prediction share the scalar cache
         # layer. Read-only attention inputs leave the prefix untouched.
+        if (
+            isinstance(inputs.attention, DenseInput)
+            or inputs.attention.queries.num_tokens is None
+        ):
+            raise ValueError(
+                "simulation denoising requires packed host query lengths"
+            )
         count = inputs.attention.queries.num_tokens
         reference = inputs.latents["image"][0].tensor
         values = reference.new_zeros((count, 1, 1))
@@ -90,7 +102,13 @@ class Denoiser(ImageDenoiser):
             isinstance(inputs.attention, (PagedInput, SegmentedInput))
             and inputs.attention.write_indices is not None
         ):
-            self.backbone.layers["0"].attention.update_cache(
+            cache = self.backbone.layers["0"].attention
+            if not isinstance(cache, Attention):
+                raise ValueError(
+                    "simulation backbone must publish through its scalar "
+                    "attention cache layer"
+                )
+            cache.update_cache(
                 values, values, indices=inputs.attention.write_indices
             )
 

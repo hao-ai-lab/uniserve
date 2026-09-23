@@ -28,8 +28,10 @@ class ImageDecoder(nn.Module):
         if not latents:
             return ()
 
-        results = [None] * len(latents)
-        groups = {}
+        results: dict[int, torch.Tensor] = {}
+        groups: dict[
+            tuple[image.Config, torch.dtype, torch.device], list[int]
+        ] = {}
         for index, (latent, size) in enumerate(
             zip(latents, sizes, strict=True)
         ):
@@ -47,4 +49,4 @@ class ImageDecoder(nn.Module):
                 )
             for index, value in zip(indices, pixels.unbind(0), strict=True):
                 results[index] = value
-        return tuple(results)
+        return tuple(results[index] for index in range(len(latents)))

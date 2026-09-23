@@ -143,7 +143,7 @@ class TransformerLayer(nn.Module):
             self.temporal_rotary.scaling, (DynamicScaling, LongRoPEScaling)
         )
         if not dynamic:
-            length = positions.shape[1]
+            length: int | None = positions.shape[1]
         elif isinstance(attention, (PagedInput, SegmentedInput)):
             if (
                 attention.queries.host is None
@@ -237,12 +237,16 @@ class Transformer(TransformerDecoder):
                 padding_idx=config.pad_token_id,
             ),
             nn.ModuleDict(
-                (str(index), TransformerLayer(config, index))
-                for index in range(config.num_hidden_layers)
+                {
+                    str(index): TransformerLayer(config, index)
+                    for index in range(config.num_hidden_layers)
+                }
             ),
             nn.ModuleDict(
-                (route, RMSNorm(config.hidden_size, config.rms_norm_eps))
-                for route in ("text", "flow")
+                {
+                    route: RMSNorm(config.hidden_size, config.rms_norm_eps)
+                    for route in ("text", "flow")
+                }
             ),
             default_route="text",
         )

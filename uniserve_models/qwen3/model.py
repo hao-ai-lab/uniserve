@@ -28,9 +28,15 @@ class Model(CausalLM):
         self.config = config
 
         # Tied checkpoints store one embedding matrix; the head shares that
-        # same Parameter instead of holding a second copy.
+        # same Parameter instead of holding a second copy. Construction
+        # precedes pipeline binding, so both modules are still present.
         if config.tie_word_embeddings:
-            self.lm_head.weight = self.backbone.embedding.weight
+            embedding, head = self.backbone.embedding, self.lm_head
+            if embedding is None or head is None:
+                raise ValueError(
+                    "tied embeddings require the embedding and head"
+                )
+            head.weight = embedding.weight
 
 
 def entry_points(config: Config) -> Mapping[str, ComponentEntry]:

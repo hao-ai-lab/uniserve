@@ -58,9 +58,10 @@ class NcclCommunicator:
 
         self._nccl = nccl
         self._stream = stream
-        self._transfer = None
+        # The owned publication stream exists from construction until close.
+        self._transfer: torch.cuda.ExternalStream | None = None
         self._raw_transfer = None
-        self._pending = None
+        self._pending: _CollectiveWork | None = None
         self._comm = c_void_p()
         self._windows: dict[tuple[int, int], tuple[c_void_p, torch.Tensor]] = {}
         self._rank = dist.get_rank(group)
@@ -159,6 +160,8 @@ class NcclCommunicator:
             )
 
         if asynchronous:
+            if self._transfer is None:
+                raise RuntimeError("computation collective is closed")
             return self._comm.value, self._transfer.cuda_stream
 
         if self._pending is not None:
@@ -173,18 +176,21 @@ class NcclCommunicator:
 
         Launch on the transfer stream after the computation stream's inputs.
         """
-        self._transfer.wait_stream(self._stream)
+        transfer = self._transfer
+        if transfer is None:
+            raise RuntimeError("computation collective is closed")
+        transfer.wait_stream(self._stream)
         completed = torch.cuda.Event()
         try:
             call(*args)
         except BaseException:
             # Join the partial launch back so the computation stream never
             # overtakes a failed transfer's still-running kernel.
-            completed.record(self._transfer)
+            completed.record(transfer)
             self._stream.wait_event(completed)
             raise
 
-        completed.record(self._transfer)
+        completed.record(transfer)
         work = _CollectiveWork(completed, self)
         self._pending = work
         return work

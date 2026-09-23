@@ -385,7 +385,7 @@ class CudaVmmTransport(Transport):
             if exported is not None:
                 descriptor, storage_size, storage_offset = exported
             else:
-                assert chunk is not None
+                assert pool is not None and chunk is not None
                 shared = chunk.storage.view(first.dtype).view(shape)
                 submitted = True
                 for target, value in copy_pairs(source, shared):
@@ -516,6 +516,7 @@ class CudaVmmTransport(Transport):
                 if grants is not None:
                     grants.release(publication_id)
                 if chunk is not None:
+                    assert pool is not None
                     pool.release(chunk)
                 elif (
                     descriptor is not None

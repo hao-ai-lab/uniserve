@@ -136,6 +136,10 @@ class InputBuffers:
 
     row_type: type[InputRow]
 
+    # Each field ``config.buffers()`` names becomes a fixed-address column
+    # attribute of the same name at construction.
+    request_pool_indices: torch.Tensor
+
     def __init__(self, *, config: RowBufferConfig, device, max_inflight=1):
         self.config = config
         self.device = torch.device(device)
@@ -178,6 +182,19 @@ class InputBuffers:
         inputs, selections, finish = self._prepare_inputs(rows, **numerical)
         return InputBatch(forward_mode, inputs, requests, selections, finish)
 
+    def _prepare_inputs(
+        self, rows, *, attention=None, cache=None, tables=None, states=None
+    ):
+        """Stage validated rows into this capability's numerical input.
+
+        ``attention`` supplies prepared attention columns; otherwise staging
+        builds them from ``cache`` and ``tables``. ``states`` holds resident
+        decode continuations. Returns the input, the rows' output selections
+        and the optional decode force-finish column. Stagings that need none
+        of these keywords ignore them.
+        """
+        raise NotImplementedError
+
     def _device_view(self, value):
         if value is None or value.device != self.device:
             raise ValueError(f"input tensor must already be on {self.device}")
@@ -186,6 +203,14 @@ class InputBuffers:
 
 class AttentionBuffers(InputBuffers):
     """Copy attention metadata and positions into fixed-address columns."""
+
+    positions: torch.Tensor
+    block_tables: torch.Tensor
+    cache_lengths: torch.Tensor
+    query_lengths: torch.Tensor
+    cumulative_query_lengths: torch.Tensor
+    cumulative_prefix_lengths: torch.Tensor
+    write_indices: torch.Tensor
 
     def __init__(self, *, config: AttentionBufferConfig, **options):
         super().__init__(config=config, **options)
@@ -243,13 +268,18 @@ class AttentionBuffers(InputBuffers):
             raise ValueError(
                 "image staging requires fully visible current sequences"
             )
+        maximum = queries.maximum
+        if maximum is None:
+            raise ValueError(
+                "image staging requires host query lengths for visibility"
+            )
 
         return SegmentedInput(
             queries,
             prefixes,
             blocks,
             writes,
-            queries.values[:, None].expand(-1, queries.maximum),
+            queries.values[:, None].expand(-1, maximum),
             True,
         )
 
@@ -280,6 +310,12 @@ class TokenBuffers(AttentionBuffers):
     """Stage text and resident decode continuations on their execution lane."""
 
     row_type = TokenRow
+
+    input_ids: torch.Tensor
+    embedding_mask: torch.Tensor
+    decode_force_finish: torch.Tensor
+    # Provisioned only when the configuration declares a hidden width.
+    input_embeddings: torch.Tensor | None
 
     def __init__(
         self, *, config: TokenBufferConfig, image_builder=None, **options
@@ -401,10 +437,12 @@ class TokenBuffers(AttentionBuffers):
             self.image_builder is not None
             and any(row.forward_mode is not ForwardMode.DECODE for row in rows)
         )
+        embeddings = None
         if use_embeddings:
-            if self.input_embeddings is None:
+            embeddings = self.input_embeddings
+            if embeddings is None:
                 raise ValueError("the lane does not provision embedding inputs")
-            self.input_embeddings[:total].zero_()
+            embeddings[:total].zero_()
         # Adjacent continuation rows already share backing. Preserve that
         # layout; concatenate only disjoint columns on a common source device.
         values = tuple(row.token_ids.reshape(-1) for row in rows)
@@ -434,8 +472,13 @@ class TokenBuffers(AttentionBuffers):
                     raise ValueError(
                         "input embeddings must match the hidden width"
                     )
+                # A row with embeddings makes the call use embedding inputs.
+                if embeddings is None:
+                    raise ValueError(
+                        "the lane does not provision embedding inputs"
+                    )
 
-                self.input_embeddings[offset : offset + length].copy_(
+                embeddings[offset : offset + length].copy_(
                     values, non_blocking=True
                 )
                 mask = self.embedding_mask[offset : offset + length]
@@ -455,9 +498,9 @@ class TokenBuffers(AttentionBuffers):
             else self.positions[:axes, :total],
             attention,
             EmbeddingReplacement(
-                self.input_embeddings[:total], self.embedding_mask[:total]
+                embeddings[:total], self.embedding_mask[:total]
             )
-            if use_embeddings
+            if embeddings is not None
             else None,
         )
 
@@ -519,6 +562,8 @@ class DiffusionBuffers(AttentionBuffers):
     """Stage spatial attention and solver times without text storage."""
 
     row_type = DiffusionRow
+
+    timesteps: torch.Tensor
 
     def __init__(self, *, image_builder: ImageBuilder, **options):
         super().__init__(**options)

@@ -14,6 +14,9 @@ class LatentDecoder(nn.Module):
     during meta construction; loading moves their backing with the decoder.
     """
 
+    mean: torch.Tensor
+    std: torch.Tensor
+
     def __init__(
         self,
         decoder: nn.Module,

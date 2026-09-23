@@ -18,6 +18,7 @@ from uniserve_kernels.attention.vsa_rows import (
 from uniserve.distributed import DeviceMesh
 from uniserve.nn import _binding
 
+from ..config import AttentionParallelConfig
 from .inputs import BlockInput, Input, NormRope, Workspace
 
 
@@ -175,6 +176,10 @@ class Attention(nn.Module):
     ``forward_chunks`` consumes tile-aligned projection intervals, pools each
     interval once, and supplies complete keys to each fine-query interval.
     """
+
+    # Recorded by parallelize_ once the layer is bound to its partition.
+    _parallel_mesh: DeviceMesh
+    _attention_parallel: AttentionParallelConfig
 
     def __init__(
         self,
@@ -366,9 +371,12 @@ class Attention(nn.Module):
         ``norm_rope`` applies the model's Q/K normalization and rotation to
         each chunk while it is prepared, so callers pass raw projections.
         """
-        from uniserve.nn.attention._parallel import AttentionRowExchange
+        from uniserve.nn.attention._parallel import (
+            AttentionRowExchange,
+            ParallelAttention,
+        )
 
-        parallel = getattr(self, "parallel", None)
+        parallel: ParallelAttention | None = getattr(self, "parallel", None)
         context_size = 1 if parallel is None else parallel.context_group.size
         context_rank = 0 if parallel is None else parallel.context_group.rank
         owners = 1 if parallel is None else parallel.ulysses_group.size
@@ -464,6 +472,7 @@ class Attention(nn.Module):
         q, k, v = prepared.packed.unbind(0)
         if context_size > 1:
             # Complete pooled keys and values across the context partition.
+            assert parallel is not None
             group = parallel.context_group
             group.all_gather_into(
                 workspace.pooled_key, workspace.pooled_key[query_tiles].clone()
@@ -503,6 +512,7 @@ class Attention(nn.Module):
                 # This path computes its own head shards and restores rows
                 # with a copy-engine exchange, so it borrows its own
                 # destination rather than the group's peer storage.
+                assert parallel is not None
                 local_output = parallel.output_destination(q).view_as(q)
                 exchange = AttentionRowExchange(
                     parallel,
@@ -517,6 +527,8 @@ class Attention(nn.Module):
                         output,
                     )
             else:
+                # The first prepared chunk borrowed the output backing.
+                assert output_backing is not None
                 for start in range(0, query_tokens, prepared.chunk_tokens):
                     stop = min(query_tokens, start + prepared.chunk_tokens)
                     # Fine-attention scratch can be reused by sequential dense

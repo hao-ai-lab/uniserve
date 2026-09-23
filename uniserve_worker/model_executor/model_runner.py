@@ -14,7 +14,7 @@ import torch
 from uniserve.nn.attention import PagedInput, SegmentedInput
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.runtime.resources import close_resources
-from uniserve.tensors import TensorOutput
+from uniserve.tensors import OutputLayout, TensorOutput
 from uniserve_worker.errors import ComputeError
 from uniserve_worker.protocol.output import ForwardStats
 
@@ -200,20 +200,18 @@ class ModelRunner(Execution, ABC):
 
         fenced on both sides.
         """
-        context = self.context
-        current = (
-            torch.cuda.current_stream(self.device)
-            if self.device.type == "cuda"
-            else None
-        )
-        if context.stream is not None:
-            context.stream.wait(current)
+        context, stream = self.context, self.context.stream
+        if stream is not None:
+            stream.wait(torch.cuda.current_stream(self.device))
         try:
             with context.activate():
                 self._capture_batch(batch, forward)
         finally:
-            if context.stream is not None:
-                current.wait_stream(context.stream.stream)
+            # Activation has restored the caller's stream on this device.
+            if stream is not None:
+                torch.cuda.current_stream(self.device).wait_stream(
+                    stream.stream
+                )
 
     def _capture_batch(self, batch, forward):
         if self._startup_complete:
@@ -333,7 +331,8 @@ class ModelRunner(Execution, ABC):
                 value for values in result.values() for value in values
             )
 
-        values, layouts = [], []
+        values: list[torch.Tensor] = []
+        layouts: list[OutputLayout | None] = []
         for value in result:
             if isinstance(value, TensorOutput):
                 values.append(value.tensor)

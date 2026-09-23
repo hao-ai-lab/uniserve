@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -29,7 +30,7 @@ class SiLUAndMul(nn.Module):
 class GELUAndMul(nn.Module):
     """Apply GELU gating to equal channel halves of a packed tensor."""
 
-    def __init__(self, approximate: str = "none") -> None:
+    def __init__(self, approximate: Literal["none", "tanh"] = "none") -> None:
         """Select the PyTorch GELU approximation used by the gate."""
         super().__init__()
         self.approximate = approximate

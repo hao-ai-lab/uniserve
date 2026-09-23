@@ -79,7 +79,9 @@ def pack(cache, k, v, batch, offsets, *, out):
         # Reference path: gather each sequence's pages with plain indexing.
         from .torch import _paged
 
-        keys, values, start = [], [], 0
+        keys: list[torch.Tensor] = []
+        values: list[torch.Tensor] = []
+        start = 0
         for row, count in enumerate(batch.queries.host):
             table, prefix = (
                 batch.block_table.indices[row],

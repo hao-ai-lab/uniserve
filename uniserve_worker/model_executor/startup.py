@@ -17,7 +17,7 @@ from uniserve_worker.model_executor.diffusion_inputs import (
     resolve_prefix,
 )
 from uniserve_worker.model_executor.input_batch import InputBatch, TokenRow
-from uniserve_worker.model_executor.input_buffers import InputBuffers
+from uniserve_worker.model_executor.input_buffers import TokenBuffers
 from uniserve_worker.model_executor.model_runner import ModelRunner
 from uniserve_worker.model_executor.output import ExecutionOutput
 from uniserve_worker.protocol.call import ForwardMode, ImageParams
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 
 def stage_text(
-    buffers: InputBuffers,
+    buffers: TokenBuffers,
     cache: KVCacheManager,
     tokens: tuple[tuple[int, ...], ...],
     pages: Sequence[Sequence[int]],
@@ -91,7 +91,7 @@ def stage_text(
 def prepare_prefill(
     runner: ModelExecutor,
     entry: ModelRunner,
-    buffers: InputBuffers,
+    buffers: TokenBuffers,
     forward: Callable[[InputBatch], ExecutionOutput],
     shapes: tuple[PrefillShape, ...],
 ) -> None:
@@ -114,14 +114,17 @@ def prepare_prefill(
             for length in lengths
         )
 
-        with runner.kv_cache.startup_pages(sum(counts)) as scratch:
+        cache = runner.kv_cache
+        if cache is None:
+            raise ValueError("prefill capture requires the worker KV cache")
+        with cache.startup_pages(sum(counts)) as scratch:
             pages = tuple(
                 scratch[sum(counts[:index]) : sum(counts[: index + 1])]
                 for index in range(len(counts))
             )
             batch = stage_text(
                 buffers,
-                runner.kv_cache,
+                cache,
                 tuple((0,) * count for count in lengths),
                 pages,
                 causal=shape.causal,
@@ -133,7 +136,7 @@ def prepare_prefill(
 def prepare_decode(
     runner: ModelExecutor,
     entry: ModelRunner,
-    buffers: InputBuffers,
+    buffers: TokenBuffers,
     forward: Callable[[InputBatch], ExecutionOutput],
 ) -> None:
     """Prepare valid one-token prefixes.
@@ -146,17 +149,20 @@ def prepare_decode(
         else (1,)
     )
     for rows in row_counts:
-        with runner.kv_cache.startup_pages(rows) as scratch:
+        cache = runner.kv_cache
+        if cache is None:
+            raise ValueError("decode capture requires the worker KV cache")
+        with cache.startup_pages(rows) as scratch:
             pages = tuple((page,) for page in scratch)
 
             # Warm the one-token prompt eagerly so the decode capture below
             # reads valid K/V prefixes instead of uninitialized pages.
-            prompt = stage_text(buffers, runner.kv_cache, ((0,),) * rows, pages)
+            prompt = stage_text(buffers, cache, ((0,),) * rows, pages)
             entry.eager_batch(prompt, forward)
 
             batch = stage_text(
                 buffers,
-                runner.kv_cache,
+                cache,
                 ((0,),) * rows,
                 pages,
                 prefixes=(1,) * rows,
@@ -325,19 +331,19 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                         ),
                     )
                     prefix_stream = prefix_entry.context.stream
-                    current_stream = (
-                        torch.cuda.current_stream(entry.device)
-                        if entry.device.type == "cuda"
-                        else None
-                    )
                     if prefix_stream is not None:
-                        prefix_stream.wait(current_stream)
+                        prefix_stream.wait(
+                            torch.cuda.current_stream(entry.device)
+                        )
                     prefix_entry.eager_batch(
                         batch,
                         prefix_entry.batch_forward,
                     )
+                    # The prefix activation has restored the caller's stream.
                     if prefix_stream is not None:
-                        current_stream.wait_stream(prefix_stream.stream)
+                        torch.cuda.current_stream(entry.device).wait_stream(
+                            prefix_stream.stream
+                        )
 
                 attention = from_blocks(
                     pages=tuple(pages),

@@ -15,6 +15,8 @@ class GatedMLP(nn.Module):
     projection.
     """  # noqa: D205
 
+    activation: SiLUAndMul | GELUAndMul
+
     def __init__(
         self,
         hidden_size: int,

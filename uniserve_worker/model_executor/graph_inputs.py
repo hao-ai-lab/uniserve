@@ -82,8 +82,10 @@ def select_prefill_captures(
     Each row bucket carries the previous bucket's row count as its live-row
     minimum, so a bucket only serves batches larger than the next smaller one.
     """
-    buckets = []
-    variants = ((True, TokenSelection.LAST_LOGITS),)
+    buckets: list[PrefillShape] = []
+    variants: tuple[tuple[bool, TokenSelection], ...] = (
+        (True, TokenSelection.LAST_LOGITS),
+    )
     if visual:
         # Feature appends expose the whole image to each query, optionally
         # sampling at its trailing marker after publishing the prefix.
@@ -137,9 +139,12 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
     causal = attention.causal[0]
     if any(value is not selection for value in batch.token_selections):
         return None
-    if any(value != causal for value in attention.causal) or any(
-        length < 1 for length in attention.queries.host
-    ):
+    if any(value != causal for value in attention.causal):
+        return None
+    queries = attention.queries.host
+    if queries is None:
+        raise ValueError("graph shape selection requires host query lengths")
+    if any(length < 1 for length in queries):
         return None
 
     width = max(context_blocks, attention.block_table.indices.shape[1])
@@ -147,7 +152,7 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
         batch.forward_mode is ForwardMode.DECODE
         and selection is TokenSelection.LAST_LOGITS
         and causal
-        and all(length == 1 for length in attention.queries.host)
+        and all(length == 1 for length in queries)
     ):
         rows = next(
             (value for value in decode_sizes if value >= batch.row_count), None
@@ -321,15 +326,18 @@ def restore_writes(batch, cache: PrefixCache | None):
     Capturing or warming a call is observationally neutral to the live prefix.
     Reading addresses here is startup preparation, outside graph capture.
     """
-    snapshots = []
+    snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
     attention = getattr(batch.inputs, "attention", None)
-    writes = getattr(attention, "write_indices", None)
-    if cache is not None and writes is not None:
+    if (
+        cache is not None
+        and isinstance(attention, (PagedInput, SegmentedInput))
+        and attention.write_indices is not None
+    ):
         blocks = tuple(
             sorted(
                 {
                     int(value) // attention.block_table.block_size
-                    for value in writes.cpu().tolist()
+                    for value in attention.write_indices.cpu().tolist()
                     if value >= 0
                 }
             )
@@ -394,6 +402,10 @@ def replay_batch(graph: CUDAGraphRunner, batch, *, rows=None, borrow=False):
             if view is None:
                 raise ValueError(
                     "hidden graph results must share contiguous output storage"
+                )
+            if attention is None:
+                raise ValueError(
+                    "hidden graph results require live attention sequences"
                 )
             values = view.reshape(-1, values[0].shape[-1]).split(
                 attention.queries.host

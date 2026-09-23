@@ -100,8 +100,8 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         # adaptive time head, or a shallow two-layer MLP, exactly one of which
         # is active per checkpoint.
         if config.flow.use_pixel_head:
-            head = nn.Identity()
-            decoder = flow.Decoder(
+            head: nn.Module = nn.Identity()
+            decoder: nn.Module = flow.Decoder(
                 config.text.hidden_size, final_upscale=stride // 4
             )
         elif config.flow.head.num_layers > 2:

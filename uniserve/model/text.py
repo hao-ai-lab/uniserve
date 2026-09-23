@@ -7,12 +7,15 @@ import torch
 from torch import nn
 
 from .inputs import TextInput
-from .logits import Logits
+from .logits import Logits, VocabShard
 from .transformer import TransformerDecoder
 
 
 class CausalLM(nn.Module):
     """Compose embedding replacement, a decoder, and a vocabulary head."""
+
+    # Pipeline binding drops the head outside the last stage.
+    lm_head: nn.Module | None
 
     def __init__(self, backbone: TransformerDecoder, lm_head: nn.Module):
         super().__init__()
@@ -60,5 +63,12 @@ class CausalLM(nn.Module):
         if token_indices.dtype not in {torch.int32, torch.int64}:
             raise ValueError("token indices must be integers")
 
+        # The last stage retains the head, which exposes its vocabulary shard.
+        head = self.lm_head
+        assert head is not None
+        vocab = head.vocab
+        if not isinstance(vocab, VocabShard):
+            raise TypeError("the vocabulary head must expose a VocabShard")
+
         selected = hidden.index_select(0, token_indices)
-        return Logits(self.lm_head(selected), self.lm_head.vocab)
+        return Logits(head(selected), vocab)

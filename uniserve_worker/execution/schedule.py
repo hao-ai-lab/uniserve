@@ -319,8 +319,10 @@ def _execute_calls(
             )
             continue
 
-        trajectories, step_count = (
-            initialize_trajectories(
+        if images:
+            # An image worker always holds its latent pool.
+            assert latent_pool is not None
+            trajectories, step_count = initialize_trajectories(
                 numerical,
                 scheduled,
                 outcomes,
@@ -330,9 +332,8 @@ def _execute_calls(
                 request_tables=request_tables,
                 model_runner=model_runner,
             )
-            if images
-            else ({}, 1)
-        )
+        else:
+            trajectories, step_count = {}, 1
         for offset in range(step_count):
             # The numerical schedule is local to this loop. Accepted request
             # progress is published only after the complete declared interval.
@@ -355,7 +356,7 @@ def _execute_calls(
             else:
                 step_inputs = {}
 
-            forward, images = prepare_forward_rows(
+            forward, prepared_images = prepare_forward_rows(
                 numerical,
                 offset,
                 step_inputs,
@@ -388,7 +389,7 @@ def _execute_calls(
             predictions = publish_forward_values(
                 forward,
                 values,
-                images,
+                prepared_images,
                 trajectories,
                 scheduled,
                 outcomes,

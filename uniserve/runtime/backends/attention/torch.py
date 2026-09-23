@@ -7,6 +7,7 @@ from uniserve.nn.attention.inputs import (
     DenseInput,
     PagedInput,
     SegmentedInput,
+    SequenceLengths,
     VarlenInput,
     VisibleInput,
 )
@@ -14,6 +15,15 @@ from uniserve.quantization import QuantizedTensor
 
 from . import Backend as _Backend
 from . import Operator as _Operator
+
+
+def _host(lengths: SequenceLengths) -> tuple[int, ...]:
+    """Return the exact host lengths that eager row evaluation indexes."""
+    if lengths.host is None:
+        raise ValueError(
+            "this attention preparation requires exact host sequence lengths"
+        )
+    return lengths.host
 
 
 def _paged(value, table, length):
@@ -172,8 +182,11 @@ def _captured(q, k, v, batch, cache, scale):
         local_query = query_indices - query_start
         queries = (local_query >= 0) & (local_query < query_count)
 
-        if isinstance(batch, (PagedInput, SegmentedInput)) or (
-            isinstance(batch, VisibleInput) and batch.block_table is not None
+        # Paged and segmented inputs always carry a block table; visible
+        # inputs may instead hold their keys densely.
+        if (
+            isinstance(batch, (PagedInput, SegmentedInput, VisibleInput))
+            and batch.block_table is not None
         ):
             key, value = (k, v) if cache is None else (cache.key, cache.value)
             key_count = (
@@ -279,7 +292,7 @@ class _TorchOperator(_Operator):
             query = q[qstart : qstart + count]
 
             if isinstance(batch, VarlenInput):
-                key_count = batch.keys.host[row]
+                key_count = _host(batch.keys)[row]
                 keys, values = (
                     k[kstart : kstart + key_count],
                     v[kstart : kstart + key_count],
@@ -294,7 +307,7 @@ class _TorchOperator(_Operator):
                     if self.cache is None
                     else (self.cache.key, self.cache.value)
                 )
-                key_count = batch.prefixes.host[row] + count
+                key_count = _host(batch.prefixes)[row] + count
                 keys = _paged(key, batch.block_table.indices[row], key_count)
                 values = _paged(
                     value, batch.block_table.indices[row], key_count
@@ -303,7 +316,7 @@ class _TorchOperator(_Operator):
                     query, keys, values, causal=batch.causal[row], scale=scale
                 )
             elif isinstance(batch, VisibleInput):
-                key_count = batch.keys.host[row]
+                key_count = _host(batch.keys)[row]
                 if batch.block_table is None:
                     keys, values = (
                         k[kstart : kstart + key_count],
@@ -334,7 +347,7 @@ class _TorchOperator(_Operator):
                 )
                 kstart += key_count
             elif isinstance(batch, SegmentedInput):
-                prefix = batch.prefixes.host[row]
+                prefix = _host(batch.prefixes)[row]
                 keys = _paged(
                     self.cache.key, batch.block_table.indices[row], prefix
                 )

@@ -579,7 +579,7 @@ class DeviceMesh:
             for index, axis in enumerate(self.axes)
             if axis not in selected
         )
-        fibers = {}
+        fibers: dict[tuple[int, ...], list[tuple[tuple[int, ...], int]]] = {}
         for rank in self.ranks:
             coordinate = self.coordinate(rank)
             key = tuple(coordinate[index] for index in fixed)

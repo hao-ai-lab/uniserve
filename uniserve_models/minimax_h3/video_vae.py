@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 from torch import nn
@@ -359,6 +360,14 @@ class TransformerLayer(nn.Module):
         self.output = RowParallelLinear(width, width)
         self.mlp = GatedMLP(width, width * config.decoder_ffn_mult, bias=True)
 
+    def _norm(self, index: int) -> tuple[torch.Tensor, float]:
+        """Return one normalization's weight and epsilon for fused kernels."""
+        # Both entries are torch RMSNorms constructed with the config epsilon.
+        norm = cast(nn.RMSNorm, self.norms[index])
+        if norm.eps is None:
+            raise ValueError("H3 video normalization requires an epsilon")
+        return norm.weight, norm.eps
+
     def _advance(self, hidden, normalized, cos, sin, maximum=None):
         projections, biases = _project_branches(self.qkv, normalized, maximum)
         batch, sequence, _ = hidden.shape
@@ -387,6 +396,7 @@ class TransformerLayer(nn.Module):
             self.output, attended.transpose(1, 2).reshape(batch, sequence, -1)
         )
 
+        weight, eps = self._norm(1)
         quantized = isinstance(
             self.mlp.gate_up.projections["gate"].weight, QuantizedTensor
         )
@@ -395,32 +405,31 @@ class TransformerLayer(nn.Module):
                 hidden,
                 attended,
                 self.scales[0],
-                self.norms[1].weight,
+                weight,
                 update_bias=bias,
-                eps=self.norms[1].eps,
+                eps=eps,
             )
         else:
             hidden, normalized = scaled_residual_rms_norm_(
                 hidden,
                 attended,
                 self.scales[0],
-                self.norms[1].weight,
+                weight,
                 update_bias=bias,
-                eps=self.norms[1].eps,
+                eps=eps,
             )
             maximum = None
         update, bias = _feed_forward(self.mlp, normalized, maximum)
         return hidden, update, bias
 
     def forward(self, hidden, cos, sin):
+        weight, eps = self._norm(0)
         if isinstance(self.qkv.projections["q"].weight, QuantizedTensor):
             normalized, maximum = weighted_rms_norm_absmax(
-                hidden, self.norms[0].weight, eps=self.norms[0].eps
+                hidden, weight, eps=eps
             )
         else:
-            normalized = weighted_rms_norm(
-                hidden, self.norms[0].weight, eps=self.norms[0].eps
-            )
+            normalized = weighted_rms_norm(hidden, weight, eps=eps)
             maximum = None
         hidden, update, bias = self._advance(
             hidden, normalized, cos, sin, maximum
@@ -513,15 +522,15 @@ class Transformer(nn.Module):
             value.flatten(2, 3).to(compute_dtype) for value in (cos, sin)
         )
 
-        first = self.layers[0]
+        # Every decoder layer is a TransformerLayer by construction.
+        first = cast(TransformerLayer, self.layers[0])
+        weight, eps = first._norm(0)
         if isinstance(first.qkv.projections["q"].weight, QuantizedTensor):
             normalized, maximum = weighted_rms_norm_absmax(
-                hidden, first.norms[0].weight, eps=first.norms[0].eps
+                hidden, weight, eps=eps
             )
         else:
-            normalized = weighted_rms_norm(
-                hidden, first.norms[0].weight, eps=first.norms[0].eps
-            )
+            normalized = weighted_rms_norm(hidden, weight, eps=eps)
             maximum = None
         hidden, update, bias = first._advance(
             hidden, normalized, cos, sin, maximum
@@ -529,23 +538,25 @@ class Transformer(nn.Module):
         previous = first
         # Keep the unrounded residual sum available to the next normalization.
         for layer in self.layers[1:]:
+            layer = cast(TransformerLayer, layer)
+            weight, eps = layer._norm(0)
             if isinstance(layer.qkv.projections["q"].weight, QuantizedTensor):
                 hidden, normalized, maximum = scaled_residual_rms_norm_absmax_(
                     hidden,
                     update,
                     previous.scales[1],
-                    layer.norms[0].weight,
+                    weight,
                     update_bias=bias,
-                    eps=layer.norms[0].eps,
+                    eps=eps,
                 )
             else:
                 hidden, normalized = scaled_residual_rms_norm_(
                     hidden,
                     update,
                     previous.scales[1],
-                    layer.norms[0].weight,
+                    weight,
                     update_bias=bias,
-                    eps=layer.norms[0].eps,
+                    eps=eps,
                 )
                 maximum = None
             hidden, update, bias = layer._advance(
@@ -590,6 +601,8 @@ class Transformer(nn.Module):
 class Decoder(SpatialDecoder):
     """Project latent channels and reconstruct overlapping spatial tiles."""
 
+    decoder: Transformer
+
     def __init__(self, config: Config):
         super().__init__(
             Transformer(config),
@@ -610,6 +623,8 @@ class Decoder(SpatialDecoder):
 
 class Model(LatentDecoder):
     """Denormalize one native temporal segment, decode tiles, and crop its pad."""  # noqa: E501
+
+    decoder: Decoder
 
     def __init__(self, config: Config, *, frame_size: image.Config):
         if (

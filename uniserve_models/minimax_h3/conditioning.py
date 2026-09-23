@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from torch import nn
 
 from uniserve.loading import weights
 from uniserve.model import Encoder
 from uniserve.nn import (
+    ColumnParallelLinear,
     GatedMLP,
     Linear,
     QKVParallelLinear,
@@ -100,6 +103,8 @@ class Conditioner(Encoder[tuple[torch.Tensor, ...]]):
     homogeneous batching and restores the caller's sample order.
     """
 
+    network: nn.Sequential
+
     def __init__(self, config: TransformerConfig):
         super().__init__(nn.Sequential(TokenRefiner(config)))
 
@@ -109,7 +114,7 @@ class Conditioner(Encoder[tuple[torch.Tensor, ...]]):
 
     @property
     def refiner(self) -> TokenRefiner:
-        return self.network[0]
+        return cast(TokenRefiner, self.network[0])
 
 
 def assignments(model: Conditioner, reader):
@@ -123,7 +128,10 @@ def assignments(model: Conditioner, reader):
         refiner.norm.weight, reader.get("token_refiner.final_norm.weight")
     )
 
+    # Module containers hold one class each: RefinerBlock, RMSNorm, and the
+    # column-parallel branches of the merged projections.
     for index, block in enumerate(refiner.blocks):
+        block = cast(RefinerBlock, block)
         prefix = f"token_refiner.refiner_blocks.{index}"
         for name, norm in zip(
             ("norm1", "norm2", "attn.norm_q", "attn.norm_k"),
@@ -131,11 +139,13 @@ def assignments(model: Conditioner, reader):
             strict=True,
         ):
             yield weights.Assignment(
-                norm.weight, reader.get(f"{prefix}.{name}.weight")
+                cast(RMSNorm, norm).weight,
+                reader.get(f"{prefix}.{name}.weight"),
             )
         for name, projection in block.qkv.projections.items():
             yield weights.Assignment(
-                projection.weight, reader.get(f"{prefix}.attn.to_{name}.weight")
+                cast(ColumnParallelLinear, projection).weight,
+                reader.get(f"{prefix}.attn.to_{name}.weight"),
             )
         yield weights.Assignment(
             block.output.weight, reader.get(f"{prefix}.attn.to_out.0.weight")
@@ -145,8 +155,11 @@ def assignments(model: Conditioner, reader):
         source = reader.get(f"{prefix}.ff.net.0.proj.weight")
         width = source.shape[0] // 2
         for name, begin in (("up", 0), ("gate", width)):
+            branch = cast(
+                ColumnParallelLinear, block.mlp.gate_up.projections[name]
+            )
             yield weights.Assignment(
-                block.mlp.gate_up.projections[name].weight,
+                branch.weight,
                 source,
                 source_slice=(
                     slice(begin, begin + width),

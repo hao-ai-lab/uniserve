@@ -462,7 +462,9 @@ class _Loader:
             incomplete = {}
             for name in loaded:
                 parameter = parameters[name]
-                uncovered = (_full(parameter.shape),)
+                uncovered: tuple[tuple[slice, ...], ...] = (
+                    _full(parameter.shape),
+                )
                 if id(parameter) in self._padding:
                     uncovered = subtract(
                         uncovered[0], self._padding[id(parameter)]
@@ -590,7 +592,7 @@ class _Loader:
         return reports
 
     def _fuse(self):
-        assigned = set()
+        assigned: set[int] = set()
         for module in self.model.modules():
             if isinstance(module, MergedColumnParallelLinear):
                 _coalesce(module.projections, assigned=assigned)
@@ -683,7 +685,7 @@ class _Loader:
                 for module in module_mapping.module.modules()
             }
         )
-        moved = {}
+        moved: dict[int, torch.Tensor] = {}
         buffers = [
             (path, module, name, buffer)
             for path, module in self.model.named_modules(remove_duplicate=False)

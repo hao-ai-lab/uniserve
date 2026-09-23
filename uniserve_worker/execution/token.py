@@ -14,7 +14,7 @@ from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.execution import calls, image
 from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.output import PendingOutput, capture_logprobs
-from uniserve_worker.model_executor.input_batch import TokenRow
+from uniserve_worker.model_executor.input_batch import InputRow, TokenRow
 from uniserve_worker.protocol.call import (
     Call,
     CallStatus,
@@ -36,7 +36,10 @@ from uniserve_worker.storage.tensor_store import FeatureMetadata, TensorRecord
 if TYPE_CHECKING:
     from uniserve.distributed.mesh import Communicator
     from uniserve_worker.execution.model_executor import ModelExecutor
-    from uniserve_worker.model_executor.diffusion_inputs import ImageBuilder
+    from uniserve_worker.model_executor.diffusion_inputs import (
+        DiffusionRow,
+        ImageBuilder,
+    )
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.tensor_store import TensorStore
@@ -50,7 +53,7 @@ def prepare_forward(
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
     decode_state: DecodeState | None,
-) -> TokenRow:
+) -> TokenRow | DiffusionRow:
     """Pack autoregressive extension, decode.
 
     or verification work into model-forward rows.
@@ -154,7 +157,7 @@ def prepare_forward(
 
 def prepare_sampling(
     call: Call,
-    task: TokenRow,
+    task: TokenRow | DiffusionRow,
     output: torch.Tensor,
     *,
     state: BatchState,
@@ -251,7 +254,7 @@ def prepare_sampling(
 
 def publish_sample(
     call: Call,
-    task: TokenRow,
+    task: TokenRow | DiffusionRow,
     logits: torch.Tensor,
     sample_work: SamplingMetadata | None,
     sampled: SamplerRow,
@@ -299,6 +302,8 @@ def publish_sample(
         )
 
     if mode in (ForwardMode.PREFILL, ForwardMode.DECODE):
+        # Only visual extension builds a diffusion row, and it returned above.
+        assert isinstance(task, TokenRow)
         if mode is ForwardMode.PREFILL:
             parameters = require_sampling(request)
             if (
@@ -390,7 +395,7 @@ def _prepare_visual(
     tensor_store: TensorStore,
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
-) -> TokenRow:
+) -> TokenRow | DiffusionRow:
     """Resolve image features and interleave them with prompt tokens for model.
 
     execution.
@@ -417,6 +422,7 @@ def _prepare_visual(
     position = int(calls.require_progress(request).logical_position)
     close_image = call.completion_output is not None
     sample_token = call.token_output is not None
+    task: TokenRow | DiffusionRow
     if call.vision_input is not None:
         task = image.vision_state_row(
             call,
@@ -451,7 +457,7 @@ def _prepare_visual(
 
 def _prepare_visual_sampling(
     call: Call,
-    task: TokenRow,
+    task: TokenRow | DiffusionRow,
     output: torch.Tensor,
     *,
     state: BatchState,
@@ -531,7 +537,7 @@ def _finish_visual(
 def graph_decode_samples(
     calls: tuple[Call, ...],
     requests: tuple[PendingOutput, ...],
-    tasks: tuple[TokenRow, ...],
+    tasks: tuple[InputRow, ...],
     output: SamplerOutput | None,
     *,
     sampling_group: Communicator | None,
@@ -601,6 +607,7 @@ def graph_decode_samples(
             or bool(sampling_state.suppressed_token_ids)
             or bool(sampling_state.transition_token_ids)
             or request.transition_write is not None
+            or not isinstance(task, TokenRow)
             or task.decode_predicate is None
             or not task.decode_predicate_tagged
             or bool(sampling_state.force_finish)
@@ -855,7 +862,7 @@ def token_task(
 
 
 def commit_kv(
-    task: TokenRow,
+    task: TokenRow | DiffusionRow,
     tokens: int,
     request: PendingOutput,
     *,
@@ -969,12 +976,14 @@ def publish_token_products(
             continue
 
         if transitions:
-            values = tuple(sample.transition for sample in selected)
-            if any(value is None for value in values):
+            transition_values = tuple(sample.transition for sample in selected)
+            if any(value is None for value in transition_values):
                 raise RuntimeError(
                     "sampling result lost a declared transition output"
                 )
-            tensors = tuple(cast(torch.Tensor, value) for value in values)
+            tensors = tuple(
+                cast(torch.Tensor, value) for value in transition_values
+            )
             values = adjacent_view(tensors)
             if values is None:
                 values = torch.cat(tensors, dim=0)

@@ -8,7 +8,7 @@ from importlib import import_module
 
 from torch import nn
 
-from uniserve.distributed import Communicator, DeviceMesh, communicators
+from uniserve.distributed import DeviceMesh, communicators
 from uniserve.model import (
     AudioDecoder,
     CausalLM,
@@ -391,7 +391,7 @@ def bind_components(
             # reconstruction still exchanges overlaps with adjacent ranks.
             # Bind that ring to both the model and its prepared call scope.
             if binding.units is not None and isinstance(
-                call.module.__dict__.get("units"), Communicator
+                call.module, VideoPostprocessor
             ):
                 call.module.units = binding.units
                 if binding.units.size > 1:

@@ -84,7 +84,7 @@ class Encoder(nn.Module):
         self.levels = nn.ModuleList()
         for index, multiplier in enumerate(config.channel_multipliers):
             width = config.base_channels * multiplier
-            blocks = []
+            blocks: list[nn.Module] = []
             for _ in range(config.num_res_blocks):
                 blocks.append(ResidualBlock(channels, width))
                 channels = width
@@ -128,7 +128,7 @@ class Decoder(nn.Module):
         self.levels = nn.ModuleList()
         for index in reversed(range(len(config.channel_multipliers))):
             width = config.base_channels * config.channel_multipliers[index]
-            blocks = []
+            blocks: list[nn.Module] = []
             for _ in range(config.num_res_blocks + 1):
                 blocks.append(ResidualBlock(channels, width))
                 channels = width
@@ -236,7 +236,7 @@ def assignments(
                             f"{tower_name}.mid.attn_1.{branch}.{field}"
                         )
                         if source_name in available:
-                            source = reader.get(source_name)
+                            weight = reader.get(source_name)
                             region = (
                                 slice(index * channels, (index + 1) * channels),
                             ) + tuple(
@@ -244,7 +244,7 @@ def assignments(
                             )
                             result.append(
                                 weights.Assignment(
-                                    target, source, target_slice=region
+                                    target, weight, target_slice=region
                                 )
                             )
 
@@ -253,7 +253,7 @@ def assignments(
             if parent in names:
                 source_name = f"{tower_name}.{names[parent]}.{field}"
                 if source_name in available:
-                    source = reader.get(source_name)
-                    result.append(weights.Assignment(target, source))
+                    weight = reader.get(source_name)
+                    result.append(weights.Assignment(target, weight))
 
     return tuple(result)

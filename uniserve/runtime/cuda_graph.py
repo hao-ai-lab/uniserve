@@ -57,7 +57,8 @@ class CUDAGraph(Generic[ResultT]):
         if context._device.type != "cuda":
             raise ValueError("CUDA graph execution requires a CUDA module")
 
-        self.context = context
+        # Close releases the borrowed context.
+        self._context: ExecutionContext | None = context
         self.pools = dict(pools or {})
         if context.stream is not None:
             self._computation = context.stream.stream
@@ -71,10 +72,18 @@ class CUDAGraph(Generic[ResultT]):
         self._raw_capture, self._capture = create_sibling_stream(
             self._computation, "graph capture"
         )
-        self._graph = None
-        self._output = None
-        self._call = None
+        # The captured graph, its retained output views and the captured call.
+        self._captured: (
+            tuple[torch.cuda.CUDAGraph, ResultT, Callable[[], ResultT]] | None
+        ) = None
         self._closed = False
+
+    @property
+    def context(self) -> ExecutionContext:
+        """Borrow the execution context whose backing this graph reads."""
+        if self._context is None:
+            raise CUDAGraphError("CUDA graph is closed")
+        return self._context
 
     @torch.inference_mode()
     def capture(
@@ -89,12 +98,13 @@ class CUDAGraph(Generic[ResultT]):
         When given, ``restore`` runs after the capture attempt, successful or
         not, to return mutated inputs to their pre-capture state.
         """
-        if self._closed or self._graph is not None:
+        context = self._context
+        if self._closed or context is None or self._captured is not None:
             raise CUDAGraphError("capture requires an open uncaptured graph")
-        self.context._open()
+        context._open()
 
         graph = torch.cuda.CUDAGraph(keep_graph=True)
-        device = self.context._device
+        device = context._device
         current = torch.cuda.current_stream(device)
         # Capture observes all work the caller has already submitted.
         self._capture.wait_stream(current)
@@ -110,12 +120,15 @@ class CUDAGraph(Generic[ResultT]):
                             torch.cuda.use_mem_pool(pool, target)
                         )
 
-                pool = self.pools.get(device)
+                device_pool = self.pools.get(device)
                 try:
                     with torch.cuda.graph(
                         graph,
                         stream=self._capture,
-                        pool=None if pool is None else pool.id,
+                        # MemPool.id is the pool handle graph capture accepts.
+                        pool=None
+                        if device_pool is None
+                        else torch.cuda._POOL_HANDLE(device_pool.id),
                     ):
                         # The computation stream joins the capture before
                         # the call's first launch and the capture stream
@@ -125,18 +138,23 @@ class CUDAGraph(Generic[ResultT]):
                         self._computation.wait_stream(self._capture)
                         with (
                             torch.cuda.stream(self._computation),
-                            self.context.activate(),
+                            context.activate(),
                         ):
                             output = call()
                         self._capture.wait_stream(self._computation)
                     graph.instantiate()
 
-                    if self.context.stream is not None:
+                    if context.stream is not None:
                         cu = driver()
+                        transfers = context._transfers
                         streams = (
                             self._capture,
                             self._computation,
-                            *self.context._transfers.streams.values(),
+                            *(
+                                transfers.streams.values()
+                                if transfers is not None
+                                else ()
+                            ),
                         )
                         expected = frozenset(
                             int(
@@ -152,7 +170,7 @@ class CUDAGraph(Generic[ResultT]):
                         verify_graph_context(graph, expected)
                 finally:
                     if restore is not None:
-                        with self.context.activate():
+                        with context.activate():
                             restore()
         except BaseException as error:
             try:
@@ -167,21 +185,23 @@ class CUDAGraph(Generic[ResultT]):
             current.wait_stream(self._computation)
             current.wait_stream(self._capture)
 
-        self._graph, self._output, self._call = graph, output, call
+        self._captured = graph, output, call
 
     def replay(self) -> ResultT:
         """Replay the captured call and return its retained output views."""
-        if self._closed or self._graph is None:
+        context = self._context
+        if self._closed or context is None or self._captured is None:
             raise CUDAGraphError("replay requires an open captured graph")
-        self.context._open()
+        graph, output, _ = self._captured
+        context._open()
         try:
-            with self.context.activate():
-                self._graph.replay()
+            with context.activate():
+                graph.replay()
         except BaseException as error:
             raise CUDAGraphError(
                 f"CUDA graph replay failed: {error}"
             ) from error
-        return self._output
+        return output
 
     def close(self, *, aborted: bool = False) -> None:
         """Release the graph after its final readers have completed.
@@ -198,13 +218,14 @@ class CUDAGraph(Generic[ResultT]):
             retain_until_exit(self)
             return
         try:
-            if self._graph is not None:
-                self._graph.reset()
+            if self._captured is not None:
+                self._captured[0].reset()
         finally:
-            self._graph = self._output = self._call = None
+            self._captured = None
             self.pools.clear()
-            self.context._graph_streams.discard(self._computation)
-            self.context = None
+            if self._context is not None:
+                self._context._graph_streams.discard(self._computation)
+            self._context = None
             if self._raw_capture is not None:
                 # Only capture bookkeeping was ever launched here, and the
                 # caller has ordered its final readers before closing.

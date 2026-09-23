@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve.cache import block_spans
+from uniserve.cache import block_spans, mha
 from uniserve.cache.state import decode_region
 from uniserve.quantization import QuantizedTensor, Quantizer
 from uniserve_worker.errors import invalid_descriptor, resource_error
@@ -482,7 +482,7 @@ class CacheImports:
 
         for layer, name in enumerate(self.pool.layers, info.layer_offset):
             # Limit physical reads to one layer, independent of model depth.
-            tickets = []
+            tickets: list[TransferTicket] = []
             state = self.pool.cache.state(name)
             for index, tensor_name in enumerate(("key", "value")):
                 tensor = state.tensors[tensor_name]
@@ -715,7 +715,10 @@ class CacheImports:
                         slice(0, self.pool.info.num_kv_heads),
                         slice(0, self.pool.info.head_dim),
                     )
-                    self.pool.cache.state(name).copy_region(
+                    # The cache manager admits only MHA state layers.
+                    state = self.pool.cache.state(name)
+                    assert isinstance(state, mha.State)
+                    state.copy_region(
                         values[:, layer],
                         field=("key", "value")[field_index],
                         block=page,

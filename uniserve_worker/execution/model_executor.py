@@ -41,6 +41,7 @@ from uniserve.runtime.backends.attention.flashinfer import Backend as FlashInfer
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.runtime.device import canonical_device
 from uniserve.runtime.resources import close_resources
+from uniserve.tensors import OutputLayout
 from uniserve_worker.bootstrap.components import (
     VIDEO_ENCODER_COMPONENT,
     bind_components,
@@ -54,7 +55,7 @@ from uniserve_worker.bootstrap.inputs import (
 )
 from uniserve_worker.bootstrap.outputs import resolve_outputs
 from uniserve_worker.config.deployment import ComponentConfig
-from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.config.execution import LaneConfig, WorkerConfig
 from uniserve_worker.errors import (
     ComputeError,
     InputError,
@@ -73,6 +74,7 @@ from uniserve_worker.model_executor.cuda_graph import (
 from uniserve_worker.model_executor.diffusion_inputs import DiffusionRow
 from uniserve_worker.model_executor.diffusion_runner import DiffusionRunner
 from uniserve_worker.model_executor.graph_inputs import (
+    DiffusionShape,
     PrefillShape,
     select_flow_captures,
     select_prefill_captures,
@@ -98,6 +100,7 @@ from uniserve_worker.model_executor.resources import (
 from uniserve_worker.profiling import record_component
 from uniserve_worker.protocol.call import (
     Call,
+    CallKind,
     ForwardMode,
     MediaCall,
 )
@@ -208,22 +211,24 @@ class ModelExecutor:
             self.bindings, self.media_builder
         )
 
-        self.entries = {}
-        self._forward_calls = {}
+        self.entries: dict[tuple[str, str, str | None], ModelRunner] = {}
+        self._forward_calls: dict[tuple[str, CallKind], ModelRunner] = {}
         self._module_calls = {}
         self._call_kinds = {}
         self._runner_types = {}
         self._calls_by_kind = defaultdict(list)
         self._module_entries: OrderedDict[tuple, ModelRunner] = OrderedDict()
-        self._module_streams = {}
+        self._module_streams: dict[tuple[str, str, str], CUDAStream] = {}
 
-        self._lane_streams = []
-        self._preparation_stream = None
+        self._lane_streams: list[tuple[LaneConfig | None, CUDAStream]] = []
+        self._preparation_stream: torch.cuda.Stream | None = None
 
         self.graph_storage = GraphStorage()
-        self.decode_shapes, self.prefill_shapes = {}, {}
-        self.prefill_row_sizes = ()
-        self.flow_captures, self.flow_cfg_branches = (), ()
+        self.decode_shapes: dict[ModelRunner, tuple[int, ...]] = {}
+        self.prefill_shapes: dict[ModelRunner, tuple[PrefillShape, ...]] = {}
+        self.prefill_row_sizes: tuple[int, ...] = ()
+        self.flow_captures: tuple[DiffusionShape, ...] = ()
+        self.flow_cfg_branches: tuple[int, ...] = ()
         self.decode_context_blocks = 0
         self.decode_predicates = None
         self.kv_cache = None
@@ -350,7 +355,8 @@ class ModelExecutor:
                 self._retire_module(resident[0])
 
             stream = self.module_stream(name, method=call.entry_point.method)
-            context = ExecutionContext(
+            # The worker holds a module's preparation size as an opaque value.
+            context: ExecutionContext[object] = ExecutionContext(
                 call.module,
                 attention=self.attention,
                 stream=stream,
@@ -736,7 +742,7 @@ class ModelExecutor:
             return None
 
         frames = None if media is None else media.num_frames
-        results = tuple(
+        results: tuple[tuple[nn.Module | None, str, OutputLayout], ...] = tuple(
             (call.module, name, layout)
             for call in self._declarations[entry]
             for name, layout in output_layouts(

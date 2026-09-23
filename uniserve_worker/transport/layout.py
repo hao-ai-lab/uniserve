@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from itertools import product
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, overload
 
 from uniserve import _slices
 from uniserve_worker.errors import invalid_descriptor
@@ -107,6 +107,18 @@ def validate_destination(
             left[1] > right[0] for left, right in zip(intervals, intervals[1:])
         ):
             raise invalid_descriptor("transfer destination spans overlap")
+
+
+@overload
+def region_view(
+    destination: torch.Tensor, region: tuple[slice, ...]
+) -> torch.Tensor: ...
+
+
+@overload
+def region_view(
+    destination: tuple[torch.Tensor, ...], region: tuple[slice, ...]
+) -> tuple[torch.Tensor, ...]: ...
 
 
 def region_view(

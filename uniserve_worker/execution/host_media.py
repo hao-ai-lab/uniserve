@@ -89,13 +89,15 @@ def _input_publication(
 
 
 def _shm(transports: Mapping[str, Transport]) -> ShmTransport:
+    from uniserve_worker.transport.shm import ShmTransport
+
     transport = transports.get("shm")
-    if transport is None:
+    if not isinstance(transport, ShmTransport):
         raise unsupported_setup(
             "host media inputs are borrowed over shared storage, which this "
             "rank does not bind"
         )
-    return transport  # type: ignore[return-value]
+    return transport
 
 
 def _locations(publication: TensorPublication) -> str:
@@ -152,6 +154,7 @@ def read_encoded_units(
     import torch
 
     from uniserve_worker.transport.shared_storage import open_shared_storage
+    from uniserve_worker.transport.shm import ShmTransport
 
     if len(tensor.shape) != 2 or tensor.dtype != "uint8":
         raise invalid_descriptor("encoded units require byte rows")
@@ -179,16 +182,22 @@ def read_encoded_units(
         indices = range(first, first + location.shape[0])
         if all(index in units for index in indices):
             continue
+        # Each location's mechanism was found reachable above.
         if isinstance(handle, LocalTransfer):
+            assert local is not None
             ticket = local.fetch(location, device=torch.device("cpu"))
             try:
+                # A product region is published as one tensor, so a borrowed
+                # read yields that tensor rather than first-axis spans.
                 rows = ticket.result()
+                assert isinstance(rows, torch.Tensor)
                 for index, row in zip(indices, rows.unbind(0), strict=True):
                     units[index] = read_encoded_unit(row)
             finally:
                 ticket.close()
             continue
         if isinstance(handle, PosixShmTransfer):
+            assert isinstance(shm, ShmTransport)
             borrow = shm.borrow(location)
             try:
                 with open_shared_storage(

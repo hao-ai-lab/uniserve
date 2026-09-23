@@ -1,6 +1,7 @@
 """Shared homogeneous feature batching with explicit numerical boundaries."""
 
 from collections import defaultdict
+from collections.abc import Sequence
 from typing import Generic, TypeVar
 
 import torch
@@ -27,12 +28,21 @@ class Encoder(nn.Module, Generic[InputT]):
         super().__init__()
         self.network = network
 
-    def encode(self, inputs: InputT) -> tuple[torch.Tensor, ...]:
-        groups = defaultdict(list)
+    def encode(self, inputs: InputT) -> tuple[torch.Tensor, ...] | None:
+        """Encode each sample, or return None on a non-final pipeline stage.
+
+        This default batches indexable tensor samples; encoders of structured
+        inputs override it.
+        """
+        if not isinstance(inputs, (Sequence, torch.Tensor)):
+            raise TypeError("the default encoder batches indexable samples")
+        groups: defaultdict[
+            tuple[torch.Size, torch.dtype, torch.device], list[int]
+        ] = defaultdict(list)
         for index, value in enumerate(inputs):
             groups[(value.shape, value.dtype, value.device)].append(index)
 
-        result = [None] * len(inputs)
+        result: dict[int, torch.Tensor] = {}
         for indices in groups.values():
             values = self.network(
                 torch.stack(tuple(inputs[index] for index in indices))
@@ -43,7 +53,7 @@ class Encoder(nn.Module, Generic[InputT]):
                 )
             for index, value in zip(indices, values.unbind(), strict=True):
                 result[index] = value
-        return tuple(result)
+        return tuple(result[index] for index in range(len(inputs)))
 
 
 class PatchEncoder(Encoder[VisionInput]):
@@ -91,7 +101,7 @@ class PatchEncoder(Encoder[VisionInput]):
             )
             groups[key].append(index)
 
-        result = [None] * inputs.batch_size
+        result: dict[int, torch.Tensor] = {}
         for indices in groups.values():
             pixels, grids, shapes = [], [], []
             for index in indices:
@@ -153,7 +163,7 @@ class PatchEncoder(Encoder[VisionInput]):
                 indices, features.split(counts), strict=True
             ):
                 result[index] = features
-        return tuple(result)
+        return tuple(result[index] for index in range(inputs.batch_size))
 
     def output_layout(self, size: image.Config):
         stride = self.patch_size * self.downsample
@@ -179,6 +189,8 @@ class TextEncoder(Encoder[tuple[torch.Tensor, ...]]):
     network; an Identity norm exposes its unnormalized final residual stream.
     """
 
+    network: TransformerDecoder
+
     def __init__(
         self, network: TransformerDecoder, retained_layers: tuple[int, ...]
     ):
@@ -196,8 +208,10 @@ class TextEncoder(Encoder[tuple[torch.Tensor, ...]]):
             )
         self.retained_layers = retained_layers
         network.layers = nn.ModuleDict(
-            (str(index), network.layers[str(index)])
-            for index in retained_layers
+            {
+                str(index): network.layers[str(index)]
+                for index in retained_layers
+            }
         )
 
     def encode(
