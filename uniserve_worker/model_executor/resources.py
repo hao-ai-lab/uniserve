@@ -29,9 +29,11 @@ def media_state_buffers(
     bindings: Mapping[str, ComponentBinding],
     builder: MediaBuilder | None,
 ) -> dict[str, BufferConfig]:
-    """Reserve resident samples and transfer staging only on participating.
+    """Reserve per-request state and transfer staging on participating ranks.
 
-    ranks.
+    A rank that denoises holds the denoiser's tables, conditioning and host
+    staging, and a rank that post-processes video holds its overlap state.
+    The denoiser's samples live in the latent pool instead.
     """
     if builder is None:
         return {}
@@ -56,6 +58,19 @@ def media_state_buffers(
                     )
                 result[name] = field
     return result
+
+
+def holds_samples(
+    state_buffers: Mapping[str, BufferConfig], builder: MediaBuilder | None
+) -> bool:
+    """Whether a rank's request storage holds a standalone denoiser's state.
+
+    Such a rank advances the denoiser's samples, and its latent pool holds
+    them.
+    """
+    return builder is not None and set(builder.capacity_buffers()) <= set(
+        state_buffers
+    )
 
 
 def decoded_units_layout(

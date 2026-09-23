@@ -117,9 +117,9 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
         """Predict each sample.
 
         Without committing a solver step or request progress. ``inputs.sizes``
-        are layouts (see ``layout_size``). ``state`` names the device state of
-        the request being advanced, its samples and the fields
-        ``prepare_state`` fills, which a captured step reads through fixed
+        are layouts (see ``layout_size``) and ``inputs.latents`` carry the
+        samples. ``state`` names the device fields ``prepare_state`` fills for
+        the request being advanced, which a captured step reads through fixed
         staging rather than at the request's own addresses; storage a request
         draws on the host, as ``prepare_latents`` receives, is the
         preparation's and is absent here.

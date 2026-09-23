@@ -93,10 +93,14 @@ class LatentPool:
         latent_width: int,
         dtype: torch.dtype,
         device: torch.device | str,
+        staging: bool = True,
     ) -> None:
         """Allocate double-buffered latent pages and request-indexed progress.
 
-        metadata.
+        ``staging`` allocates the fixed step buffer through which ``stage``
+        lends contiguous views. A consumer that gathers and scatters a
+        trajectory's pages itself, naming them with ``initial_bank`` and
+        ``step_banks``, allocates none.
         """
         if (
             min(int(request_pool_size), int(page_units), int(latent_width)) < 1
@@ -124,9 +128,9 @@ class LatentPool:
             dtype=self.dtype,
             device=self.device,
         )
-        # [capacity_units, latent_width]
+        # [capacity_units, latent_width], or no rows without pool staging.
         self.step_buffer = torch.empty(
-            (self.capacity_units, self.latent_width),
+            (self.capacity_units if staging else 0, self.latent_width),
             dtype=self.dtype,
             device=self.device,
         )
@@ -291,6 +295,95 @@ class LatentPool:
         # adopted imports.
         self._require_writable(1, pages)
         self._write_pages(1, staging.pages, staging.value)
+
+    @property
+    def page_rows(self) -> torch.Tensor:
+        """Every page of both banks as one row each.
+
+        Row ``bank * num_pages + page`` holds ``page`` of ``bank``:
+        [2 * num_pages, page_units * latent_width].
+        """
+        return self.storage.view(2 * self.num_pages, -1)
+
+    def bank_view(self, bank: int, page_table: Sequence[int]) -> torch.Tensor:
+        """View a trajectory's pages of one bank as contiguous memory.
+
+        The pages must be consecutive, as the pages a request slot owns in a
+        consumer-staged pool are: [len(page_table) * page_units, latent_width].
+        """
+        pages = tuple(int(page) for page in page_table)
+        first = pages[0] if pages else 0
+        if (
+            int(bank) not in (0, 1)
+            or not pages
+            or pages != tuple(range(first, first + len(pages)))
+            or first < 1
+            or first + len(pages) > self.num_pages
+        ):
+            raise invalid_descriptor(
+                "latent bank view requires consecutive pool pages"
+            )
+        return self.storage[int(bank), first : first + len(pages)].view(
+            -1, self.latent_width
+        )
+
+    def initial_bank(
+        self,
+        request_pool_idx: int,
+        page_table: Sequence[int],
+        *,
+        latent_units: int,
+    ) -> int:
+        """Name the bank a fresh trajectory's consumer writes.
+
+        Applies the checks ``initialize`` does for a trajectory whose
+        consumer writes its pages itself; the caller then publishes an
+        initialization update with the batch.
+        """
+        slot = self._validate_slot(int(request_pool_idx))
+        pages = self._validate_page_table(page_table, int(latent_units))
+        self._require_empty(slot)
+        self._require_page_owners(pages, 0)
+
+        # A fresh trajectory starts in bank one, as in ``initialize``.
+        self._require_writable(1, pages)
+        return 1
+
+    def step_banks(
+        self,
+        request_pool_idx: int,
+        page_table: Sequence[int],
+        *,
+        step: int,
+        generation: int,
+        latent_units: int,
+        height: int,
+        width: int,
+    ) -> tuple[int, int]:
+        """Name the banks of one step over a committed trajectory.
+
+        Applies the checks ``gather_current`` and ``write_inactive`` do, for a
+        consumer that gathers and scatters the trajectory's pages itself.
+        Returns the bank holding the committed trajectory and the inactive
+        bank its successor is written to; the caller publishes the successor
+        with the batch, which makes it the committed bank.
+        """
+        slot = self._validate_slot(int(request_pool_idx))
+        pages = self._validate_page_table(page_table, int(latent_units))
+        self._require_current(
+            slot,
+            step=int(step),
+            generation=int(generation),
+            latent_units=int(latent_units),
+            height=int(height),
+            width=int(width),
+        )
+        self._require_slot_pages(slot, pages)
+        self._require_page_owners(pages, slot)
+
+        bank = int(self._active[slot].item())
+        self._require_writable(1 - bank, pages)
+        return bank, 1 - bank
 
     def gather_current(
         self,

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Hashable, Mapping
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -23,6 +23,9 @@ from uniserve_worker.protocol.call import MediaCall
 
 from .model_runner import ModelRunner
 from .output import ExecutionOutput
+
+if TYPE_CHECKING:
+    from uniserve_worker.storage.latent_pool import LatentPool
 
 
 def restore_samples(inputs: DenoiserInput):
@@ -43,9 +46,12 @@ def restore_samples(inputs: DenoiserInput):
 
 @dataclass(frozen=True)
 class Ladder:
-    """One request's bound denoising steps and named spans of its slot.
+    """One request's bound denoising steps over its slot and its pages.
 
-    Tensor contents remain live. Changing static parameters or tensor layouts
+    The latents view the runner's samples, which each step fills from the
+    request's committed pages and writes back to the pages' other bank. The
+    other state fields are named spans of the request's slot. Tensor
+    contents remain live. Changing static parameters or tensor layouts
     requires a new binding; each solver step already has its own typed input.
     """
 
@@ -53,11 +59,15 @@ class Ladder:
     schedules: Mapping[str, Schedule]
     state: Mapping[str, torch.Tensor]
     slot: int
+    # The request's leading pages that hold the layout's samples.
+    pages: tuple[int, ...]
     signature: Hashable
     # Tensor identity maps to an explicitly named field, never to a bank search.
     fields: Mapping[int, str]
     spans: Mapping[str, tuple[int, tuple[int, ...]]]
     temporal: tuple[tuple[torch.Tensor, ...], ...]
+    # The runner storage the latents view; a ladder serves only its runner.
+    samples: torch.Tensor
 
 
 @dataclass
@@ -66,7 +76,6 @@ class LadderBucket(GraphBucket):
 
     state: Mapping[str, torch.Tensor] = field(default_factory=dict)
     gathers: tuple = ()
-    scatters: tuple = ()
 
 
 class DiffusionRunner(ModelRunner):
@@ -81,13 +90,16 @@ class DiffusionRunner(ModelRunner):
       and ``integrate`` combines one request's branch predictions and applies
       the solver.
     - A standalone denoiser owns explicit constants and workspace, and one
-      runner serves each prepared layout. ``bind`` states a request's ladder
-      over its slot of the request bank once; ``step`` advances it through
-      the fused prediction, solver update and pipeline feedback, replaying
-      the step's graph when ``capture`` made it resident and evaluating it
-      eagerly otherwise. A captured graph gathers and scatters the slot the
-      device slot index names, so it serves every slot and every request of
-      the layout.
+      runner serves each prepared layout. The runner's samples hold one
+      request's samples of the layout at a time: a step gathers them from
+      the request's committed pages of the latent pool, evaluates the fused
+      prediction, solver update and pipeline feedback on them, and scatters
+      the successor to the pages' other bank. ``bind`` states a request's
+      ladder over its slot of the request bank and its pages once; ``step``
+      advances it, replaying the step's graph when ``capture`` made it
+      resident and evaluating the same computation eagerly otherwise. A
+      captured graph addresses the pages and the slot through device
+      indices, so it serves every slot and every request of the layout.
 
     Both forms apply the solver through ``uniserve.diffusion.advance_``.
     """
@@ -97,6 +109,8 @@ class DiffusionRunner(ModelRunner):
         *args,
         bank: Mapping[str, torch.Tensor] | None = None,
         slots: int = 0,
+        pool: LatentPool | None = None,
+        pages: int = 0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -116,6 +130,14 @@ class DiffusionRunner(ModelRunner):
         )
         self._slot_values: dict[int, torch.Tensor] = {}
 
+        # A standalone denoiser's samples: ``pages`` pool pages, gathered
+        # from the source rows and scattered to the target rows ``_rows``
+        # names, [2, pages] int64. Both are allocated with the context.
+        self.pool, self.pages = pool, int(pages)
+        self.samples: torch.Tensor | None = None
+        self._rows: torch.Tensor | None = None
+        self._row_values: dict[tuple[int, tuple[int, ...]], torch.Tensor] = {}
+
     @classmethod
     def for_layout(
         cls,
@@ -129,6 +151,8 @@ class DiffusionRunner(ModelRunner):
         devices=(),
         bank: Mapping[str, torch.Tensor] | None = None,
         slots: int = 0,
+        pool: LatentPool,
+        pages: int,
         attention="auto",
     ) -> DiffusionRunner:
         """Prepare a standalone denoiser's runner for one layout.
@@ -136,7 +160,9 @@ class DiffusionRunner(ModelRunner):
         ``devices`` lists the devices graphs may allocate on; without them,
         or without a ``stream``, the runner evaluates every step eagerly.
         Capturing runners borrow ``bank``, the request bank of ``slots`` rows
-        their ladders gather and scatter. Preparation is charged to
+        their ladders gather state from. Every runner borrows ``pool``, whose
+        leading ``pages`` pages of a request hold the layout's samples.
+        Preparation, the runner's samples included, is charged to
         ``storage``, whose budget it must fit.
         """
         context = ExecutionContext(
@@ -153,12 +179,27 @@ class DiffusionRunner(ModelRunner):
             devices=devices,
             bank=bank,
             slots=slots,
+            pool=pool,
+            pages=pages,
         )
         try:
+            if pool.device != runner.device or not 0 < pages < pool.num_pages:
+                raise ValueError(
+                    "a denoiser runner requires layout pages of a pool on "
+                    "its device"
+                )
             if stream is not None:
                 stream.wait(torch.cuda.current_stream(device))
             with storage.allocate(runner):
                 context.prepare(layout)
+                runner.samples = torch.empty(
+                    (pages * pool.page_units, pool.latent_width),
+                    dtype=pool.dtype,
+                    device=runner.device,
+                )
+                runner._rows = torch.empty(
+                    (2, pages), dtype=torch.int64, device=runner.device
+                )
             storage.check()
         except BaseException:
             runner.close()
@@ -269,20 +310,49 @@ class DiffusionRunner(ModelRunner):
                 context.stream or torch.cuda.current_stream(self.device)
             ).synchronize()
 
-    def bind(self, inputs, schedules, *, state, slot) -> Ladder:
-        """Bind a request's complete ladder to its named slot storage.
+    def bind(
+        self, inputs, schedules, *, state, slot, pages: Sequence[int]
+    ) -> Ladder:
+        """Bind a request's complete ladder to its slot and its pages.
 
-        State field names come from the request bank. For each banked field,
-        record its offset in the slot's row once and validate that the view
-        lies in that row. Models receive only the numerical views.
+        Every latent must view the runner's samples. State field names come
+        from the request bank: for each banked field, record its offset in
+        the slot's row once and validate that the view lies in that row.
+        ``pages`` is the request's page table, whose leading pages hold the
+        layout's samples. Models receive only the numerical views.
         """
-        if not 1 <= slot <= self.slots or not inputs:
-            raise ValueError("a ladder requires a valid slot and solver steps")
+        samples = self.samples
+        if samples is None or self.pool is None:
+            raise ValueError("a ladder requires the runner's sample pages")
+        if not 1 <= slot <= self.slots or not inputs or len(pages) < self.pages:
+            raise ValueError(
+                "a ladder requires a valid slot, its layout's pages and "
+                "solver steps"
+            )
         inputs = tuple(inputs)
         if any(value.step_index != index for index, value in enumerate(inputs)):
             raise ValueError(
                 "ladder inputs must enumerate solver steps in order"
             )
+
+        latents = {
+            id(value.tensor): value.tensor
+            for step in inputs
+            for values in step.latents.values()
+            for value in values
+        }
+        for tensor in latents.values():
+            start = tensor.storage_offset() - samples.storage_offset()
+            if (
+                tensor.untyped_storage().data_ptr()
+                != samples.untyped_storage().data_ptr()
+                or tensor.dtype != samples.dtype
+                or not tensor.is_contiguous()
+                or start < 0
+                or start + tensor.numel() > samples.numel()
+            ):
+                raise ValueError("every latent must view the runner's samples")
+
         spans, names = {}, {}
         if self.captures:
             for name, tensor in state.items():
@@ -305,24 +375,17 @@ class DiffusionRunner(ModelRunner):
                     )
                 spans[name] = start, tuple(tensor.shape)
                 names[id(tensor)] = name
-            if any(
-                id(value.tensor) not in names
-                for inputs_at_step in inputs
-                for values in inputs_at_step.latents.values()
-                for value in values
-            ):
-                raise ValueError(
-                    "every latent must name a supplied bank state field"
-                )
         signature = (
             input_signature((inputs, schedules)),
             tuple(sorted(spans.items())),
         )
+        # The samples and banked fields have fixed storage; the remaining
+        # tensors, timesteps among them, are copied into graph inputs.
         temporal = tuple(
             tuple(
                 value
                 for _, value in Inputs(step).tensors
-                if id(value) not in names
+                if id(value) not in names and id(value) not in latents
             )
             for step in inputs
         )
@@ -331,42 +394,76 @@ class DiffusionRunner(ModelRunner):
             schedules,
             state,
             slot,
+            tuple(int(page) for page in pages[: self.pages]),
             signature,
             names,
             spans,
             temporal,
+            samples,
         )
+
+    def binds(self, ladder: Ladder) -> bool:
+        """Whether ``ladder`` was bound over this runner's samples."""
+        return ladder.samples is self.samples
 
     def _bucket(self, ladder: Ladder) -> LadderBucket:
         bucket = self.buckets.get(ladder.signature)
         if bucket is None:
-            stages, gathers, scatters = {}, [], []
-            mutable = {
-                ladder.fields[id(value.tensor)]
-                for step in ladder.inputs
-                for values in step.latents.values()
-                for value in values
-            }
+            stages, gathers = {}, []
             for name, (start, shape) in ladder.spans.items():
                 with self.graph_storage.allocate(self):
                     stage = torch.empty_like(ladder.state[name])
                 stages[name] = stage
                 if stage.numel():
                     rows = self.bank[name].view(self.slots, -1)
-                    pair = (
-                        rows[:, start : start + stage.numel()],
-                        stage.view(1, -1),
+                    gathers.append(
+                        (
+                            rows[:, start : start + stage.numel()],
+                            stage.view(1, -1),
+                        )
                     )
-                    gathers.append(pair)
-                    if name in mutable:
-                        scatters.append(pair)
-            bucket = LadderBucket(
-                state=stages,
-                gathers=tuple(gathers),
-                scatters=tuple(scatters),
-            )
+            bucket = LadderBucket(state=stages, gathers=tuple(gathers))
             self.buckets[ladder.signature] = bucket
         return cast(LadderBucket, bucket)
+
+    def _row_value(self, bank: int, pages: tuple[int, ...]) -> torch.Tensor:
+        """Return the pool rows one step reads and writes, [2, pages] int64.
+
+        Row ``b * num_pages + page`` is ``page`` of bank ``b``: the first row
+        of the pair reads the committed ``bank`` and the second writes the
+        other one. Values are immutable and retained, so an asynchronous copy
+        never outlives its source.
+        """
+        key = int(bank), pages
+        value = self._row_values.get(key)
+        if value is None:
+            pool = cast("LatentPool", self.pool)
+            ids = torch.tensor(pages, dtype=torch.int64)
+            value = torch.stack(
+                (bank * pool.num_pages + ids, (1 - bank) * pool.num_pages + ids)
+            )
+            if self.device.type == "cuda":
+                value = value.pin_memory()
+            self._row_values[key] = value
+        return value
+
+    def _advance(self, call, gathers=(), slot_index=None):
+        """Evaluate one step over the pages ``_rows`` names.
+
+        Gathers the committed samples, and with ``gathers`` the slot's banked
+        state the device ``slot_index`` names, evaluates ``call`` and
+        scatters the successor samples. Eager steps and captured graphs run
+        this same computation.
+        """
+        rows = cast("LatentPool", self.pool).page_rows
+        indices = cast(torch.Tensor, self._rows)
+        staged = cast(torch.Tensor, self.samples).view(self.pages, -1)
+        torch.index_select(rows, 0, indices[0], out=staged)
+        for bank_rows, stage in gathers:
+            torch.index_select(bank_rows, 0, slot_index, out=stage)
+        samples = call()
+        rows.index_copy_(0, indices[1], staged)
+        return samples
 
     def _slot_value(self, slot):
         if slot not in self._slot_values:
@@ -380,9 +477,10 @@ class DiffusionRunner(ModelRunner):
         """Make one bound step's graph resident without advancing samples.
 
         The graph serves every slot: it gathers the slot the device slot
-        index names, so any request whose ladder has the same signature
-        replays it. Capture is collective across the component's ranks and
-        belongs to startup; the owner retains a capturing runner for the
+        index names and the pages the device rows name, so any request whose
+        ladder has the same signature replays it. Capture is collective
+        across the component's ranks and belongs to startup, while no request
+        owns the ladder's pages; the owner retains a capturing runner for the
         worker's lifetime.
         """
         if not self.captures:
@@ -404,11 +502,20 @@ class DiffusionRunner(ModelRunner):
                 id(value): staged
                 for value, staged in zip(sources, temporal[1], strict=True)
             }
+            # Banked fields read the bucket's staging and the samples stay
+            # the runner's own.
+            samples = {
+                id(value.tensor)
+                for values in live.latents.values()
+                for value in values
+            }
             stepped = map_tensors(
                 live,
                 lambda value: (
                     bucket.state[ladder.fields[id(value)]]
                     if id(value) in ladder.fields
+                    else value
+                    if id(value) in samples
                     else replacements[id(value)]
                 ),
             )
@@ -420,15 +527,15 @@ class DiffusionRunner(ModelRunner):
                 context.constants,
                 context.workspace,
             )
+            # Capture addresses the ladder's pages as a fresh trajectory's,
+            # committed in bank one; replay sets the request's own rows.
+            cast(torch.Tensor, self._rows).copy_(
+                self._row_value(1, ladder.pages), non_blocking=True
+            )
             slot_index.copy_(self._slot_value(ladder.slot), non_blocking=True)
 
             def compute(_):
-                for rows, stage in bucket.gathers:
-                    torch.index_select(rows, 0, slot_index, out=stage)
-                samples = call()
-                for rows, stage in bucket.scatters:
-                    rows.index_copy_(0, slot_index, stage)
-                return samples
+                return self._advance(call, bucket.gathers, slot_index)
 
             bucket.graphs[index] = CUDAGraphRunner.capture(
                 context,
@@ -440,12 +547,17 @@ class DiffusionRunner(ModelRunner):
             self.graph_storage.check()
 
     @torch.inference_mode()
-    def step(self, ladder: Ladder, index: int):
+    def step(self, ladder: Ladder, index: int, bank: int):
         """Advance a bound step; the worker commits request progress.
 
-        Returns the samples and the execution path, ``"graph_replay"`` when
-        the step's graph is resident and ``"eager"`` otherwise.
+        ``bank`` holds the request's committed samples; the successor is
+        written to the other bank of its pages. Returns the successor
+        samples, which the runner's samples hold until its next step, and
+        the execution path, ``"graph_replay"`` when the step's graph is
+        resident and ``"eager"`` otherwise.
         """
+        if not self.binds(ladder):
+            raise ValueError("the ladder was bound by another runner")
         live = ladder.inputs[index]
         bucket = self.buckets.get(ladder.signature)
         graph = None if bucket is None else bucket.graphs.get(index)
@@ -458,28 +570,31 @@ class DiffusionRunner(ModelRunner):
         )
         if stream is not None:
             stream.wait(current)
-        if graph is None:
-            try:
-                with context.activate():
-                    return self._call(
-                        live, ladder.schedules, ladder.state
-                    )(), "eager"
-            finally:
-                if stream is not None:
-                    current.wait_stream(stream.stream)
-        with context.activate():
-            # The ladder's non-bank tensors have known positions. Keep their
-            # correspondence per binding, including new schedule objects.
-            temporal = ladder.schedules, ladder.temporal[index]
-            cast(torch.Tensor, self._slot_index).copy_(
-                self._slot_value(ladder.slot), non_blocking=True
-            )
-            graph.replay(temporal)
-        current.wait_stream(stream.stream)
-        return {
-            name: tuple(value.tensor for value in values)
-            for name, values in live.latents.items()
-        }, "graph_replay"
+        try:
+            with context.activate():
+                cast(torch.Tensor, self._rows).copy_(
+                    self._row_value(bank, ladder.pages), non_blocking=True
+                )
+                if graph is None:
+                    return self._advance(
+                        self._call(live, ladder.schedules, ladder.state)
+                    ), "eager"
+
+                # The ladder's non-bank tensors have known positions. Keep
+                # their correspondence per binding, including new schedule
+                # objects.
+                temporal = ladder.schedules, ladder.temporal[index]
+                cast(torch.Tensor, self._slot_index).copy_(
+                    self._slot_value(ladder.slot), non_blocking=True
+                )
+                graph.replay(temporal)
+            return {
+                name: tuple(value.tensor for value in values)
+                for name, values in live.latents.items()
+            }, "graph_replay"
+        finally:
+            if stream is not None:
+                current.wait_stream(stream.stream)
 
     def close(self):
         # Pinned copies retain their destination stream; release them before
@@ -488,5 +603,7 @@ class DiffusionRunner(ModelRunner):
             super().close()
         finally:
             self._slot_values.clear()
+            self._row_values.clear()
             self._slot_index = None
+            self.samples = self._rows = self.pool = None
             self.bank = {}

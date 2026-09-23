@@ -104,6 +104,10 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
         .map(|call| CallKind::Media(*call))
         .collect();
     info.num_inference_steps = STEPS;
+    // The denoiser's latent pool gives every request slot two pages of
+    // samples after its sentinel page.
+    info.latent_page_units = 256;
+    info.latent_pages = 2 * info.request_slots + 1;
     info.world_size = decoder_ranks as u32;
     info.host_lane_capacity = host_lane_capacity;
     info.components = vec![
