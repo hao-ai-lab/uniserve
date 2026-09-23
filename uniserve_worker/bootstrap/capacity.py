@@ -342,8 +342,8 @@ def latent_pool_capacity_bytes(
     storage = 2 * pages * units * width * element_bytes
     step_buffer = usable_pages * units * width * element_bytes
     page_table = usable_pages * 8
-    timestep_pairs = (slots + 1) * 2 * 4
-    return storage + step_buffer + page_table + timestep_pairs
+    timesteps = (slots + 1) * 4
+    return storage + step_buffer + page_table + timesteps
 
 
 @dataclass(frozen=True, slots=True)

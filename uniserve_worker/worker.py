@@ -473,8 +473,8 @@ class Worker:
                 state_buffers=runner.state_buffers or None,
                 device=worker_config.device,
             )
-            if runner.denoising is not None and self.requests.storage.bank:
-                runner.denoising.bind_bank(self.requests.storage.bank)
+            if runner.denoises and self.requests.storage.bank:
+                runner.bind_diffusion_bank(self.requests.storage.bank)
 
             torch_dtype = getattr(
                 torch,

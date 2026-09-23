@@ -23,7 +23,7 @@ from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.storage.request_slots import RequestSlots
 
 if TYPE_CHECKING:
-    from uniserve_worker.execution.diffusion_state import ImageState, VideoState
+    from uniserve_worker.execution.diffusion_state import DiffusionState
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +84,7 @@ class RequestState:
     # from the logical position, the scheduled span or the image identity.
     prompt_logits_ready: bool = False
     rng_counter: int = 0
-    diffusion: ImageState | VideoState | None = None
+    diffusion: DiffusionState | None = None
     pending_calls: dict[CallId, Call] = field(default_factory=dict)
     closed: bool = False
     retired: bool = False
@@ -329,11 +329,11 @@ class RequestPool:
             raise RuntimeError(
                 "request retirement requires closed, completed execution"
             )
-        # A noise draw started at admission writes the slot's storage; the
+        # Host staging started at admission writes the slot's storage; the
         # slot is reused only after it ends, whatever its outcome.
-        noise = getattr(row.diffusion, "noise", None)
-        if noise is not None:
-            wait((noise,))
+        slot = None if row.diffusion is None else row.diffusion.slot
+        if slot is not None and slot.staging is not None:
+            wait((slot.staging,))
         row.pending_calls.clear()
         row.diffusion = None
         row.retired = True

@@ -24,7 +24,6 @@ from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.diffusion import (
     flow_rows,
     image_state,
-    integrate,
     prefix_row,
 )
 from uniserve_worker.execution.model_executor import ModelExecutor
@@ -178,7 +177,8 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
         factory.initialize(size, seed=51, out=sample)
         retained = []
         for index, prefix_length in enumerate((2, 5)):
-            branches = trajectory.guidance.branches(trajectory.schedule, index)
+            schedule = trajectory.schedules["image"]
+            branches = trajectory.guidance.branches(schedule, index)
             prefixes = tuple(
                 tuple(
                     (token + branch * 3) % 30 + 1
@@ -186,7 +186,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                 )
                 for branch in range(len(branches))
             )
-            trajectory.entries = {
+            trajectory.kv.entries = {
                 branch: (slot + 1, 0, prefix_length, 32)
                 for slot, branch in enumerate(branches)
             }
@@ -222,8 +222,8 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                 .values()
                 for tensor in fields
             )
-            time = trajectory.schedule.timesteps[index].to("cuda:0")
-            next_time = trajectory.schedule.timesteps[index + 1].to("cuda:0")
+            time = schedule.timesteps[index].to("cuda:0")
+            next_time = schedule.timesteps[index + 1].to("cuda:0")
             positions = tuple(
                 factory.positions(size, prefix_length, device="cuda:0")
                 for _ in branches
@@ -286,20 +286,14 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
                 torch.testing.assert_close(value, reference, rtol=0, atol=0)
             velocity = trajectory.guidance.combine(
                 dict(zip(branches, expected, strict=True)),
-                trajectory.schedule,
+                schedule,
                 index,
             )
             expected_sample = (
                 sample + velocity * (next_time - time).to(sample.dtype)
             ).to(sample.dtype)
-            integrate(
-                factory,
-                trajectory,
-                sample,
-                result.values,
-                index,
-                time,
-                next_time,
+            runner.diffusion_entry(calls(MediaCall.DENOISING)[0]).integrate(
+                trajectory, sample, time, result.values, index
             )
             torch.testing.assert_close(
                 sample, expected_sample, rtol=2e-2, atol=2e-3

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -16,7 +16,10 @@ from uniserve.tensors import TensorOutput, concatenate_views
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.execution import calls
 from uniserve_worker.execution.batch import BatchState
-from uniserve_worker.execution.diffusion_state import VideoState
+from uniserve_worker.execution.diffusion_state import (
+    DiffusionState,
+    SlotLadder,
+)
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.media.mux import AvMuxConfig
 from uniserve_worker.protocol.batch import (
@@ -36,7 +39,6 @@ if TYPE_CHECKING:
     from uniserve.runtime.tensor_buffers import TensorBuffers
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool, RequestState
-    from uniserve_worker.model_executor.diffusion_runner import TrajectoryRunner
     from uniserve_worker.storage.tensor_store import TensorStore
     from uniserve_worker.transport.interface import Transport
 
@@ -101,43 +103,54 @@ def audio_unit_windows(
     return decoder.unit_frames(num_samples, units)
 
 
-def prepare_call(runner: ModelExecutor, trajectory: VideoState, call, storage):
+def slot_ladder(trajectory: DiffusionState) -> SlotLadder:
+    """Return the slot state of a standalone denoiser's request."""
+    if trajectory.slot is None:
+        raise invalid_descriptor("video diffusion requires request slot state")
+    return trajectory.slot
+
+
+def prepare_call(
+    runner: ModelExecutor, trajectory: DiffusionState, call, storage
+):
     """Bind request state and prepare the exact call's runtime-owned resources.
 
-    Only request state survives in the trajectory. Contexts own their constants
-    and workspace and may be retired after their dependent graphs drain.
+    Only request state survives in the trajectory. Runners own their
+    constants and workspace and may be retired after their dependent graphs
+    drain.
     """
-    kind, size = call.kind, trajectory.size
+    kind, size, slot = call.kind, trajectory.size, slot_ladder(trajectory)
 
     if kind in {MediaCall.LATENT_PREPARATION, MediaCall.DENOISING}:
-        if runner.denoising is None:
+        if not runner.denoises:
             raise RuntimeError("rank does not own denoising execution")
-        if "denoising" not in trajectory.tensors:
+        if "denoising" not in slot.tensors:
             if storage is None:
                 raise RuntimeError(
                     "denoising requires reserved request storage"
                 )
-            trajectory.tensors["denoising"] = storage.view(
+            slot.tensors["denoising"] = storage.view(
                 runner.media_builder.buffers(size)
             )
         layout = runner.media_builder.layout(size)
-        context = runner.denoising.prepare_inputs(layout, layout)
-        return trajectory.tensors["denoising"], context
+        return slot.tensors["denoising"], runner.diffusion_runner(
+            layout
+        ).context
 
     if kind is MediaCall.VIDEO_DECODING:
         # A decode round also converts its media unit to RGB, cross-faded with
         # the neighbouring unit's tail held in the request's overlap state.
         postprocessor = runner.video_postprocessor
-        if "video_overlap" not in trajectory.tensors:
+        if "video_overlap" not in slot.tensors:
             if storage is None:
                 raise RuntimeError(
                     "video reconstruction requires reserved overlap storage"
                 )
-            trajectory.tensors["video_overlap"] = storage.view(
+            slot.tensors["video_overlap"] = storage.view(
                 postprocessor.state_buffers(size.num_frames)
             )
         runner.prepare_module(call.component, size.num_frames, method="forward")
-        return trajectory.tensors["video_overlap"], runner.prepare_module(
+        return slot.tensors["video_overlap"], runner.prepare_module(
             call.component, size.num_frames, method="decode"
         ).context
 
@@ -176,8 +189,8 @@ def warmup_denoising(
     runner: ModelExecutor, storage: tuple[TensorBuffers, ...]
 ) -> None:
     """Compile representative tile boundaries without advancing samples."""
-    builder, denoising = runner.media_builder, runner.denoising
-    if denoising is None:
+    builder = runner.media_builder
+    if not runner.denoises:
         return
     if builder is None or not storage:
         raise RuntimeError(
@@ -196,10 +209,7 @@ def warmup_denoising(
         (maximum.num_frames, maximum.num_text_tokens),
     )
 
-    schedules, prepared = (
-        builder.schedules(device=runner.worker_config.device),
-        set(),
-    )
+    schedules, prepared = open_state(runner, builder.maximum).schedules, set()
     for frames, tokens in shapes:
         if tokens > maximum.num_text_tokens:
             continue
@@ -208,14 +218,13 @@ def warmup_denoising(
         if layout in prepared:
             continue
         prepared.add(layout)
-        context = denoising.prepare_inputs(layout, layout)
+        diffusion = runner.diffusion_runner(layout)
         views = storage[0].view(builder.buffers(size))
-        _stage_placeholder(builder, size, views, context)
-        denoising.warmup(
+        _stage_placeholder(builder, size, views, diffusion.context)
+        diffusion.warmup(
             builder.bind(size, views, schedules, 0),
             schedules,
             state=views,
-            input_key=layout,
         )
 
 
@@ -283,29 +292,34 @@ def capture_denoising(
     serving never captures, and a request whose layout no declared shape
     covers runs its steps eagerly.
     """
-    builder, denoising = runner.media_builder, runner.denoising
+    builder = runner.media_builder
     sizes = declared_sizes(runner)
-    if denoising is None or not sizes or not denoising.captures:
+    if (
+        not runner.denoises
+        or not sizes
+        or runner.worker_config.graph_policy == "off"
+    ):
         return
     if builder is None or not storage:
         raise RuntimeError(
             "denoising capture requires its input builder and request storage"
         )
 
-    schedules = builder.schedules(device=runner.worker_config.device)
+    schedules = open_state(runner, builder.maximum).schedules
     captured = set()
     for size in sizes:
         layout = builder.layout(size)
         if layout in captured:
             continue
         captured.add(layout)
-        context = denoising.prepare_inputs(layout, layout, pin=True)
+        if not runner.diffusion_runner(layout).captures:
+            return
+        diffusion = runner.diffusion_runner(layout, pin=True)
         # Any slot's rows serve the capture; the first slot's do.
         views = storage[0].view(builder.buffers(size))
-        _stage_placeholder(builder, size, views, context)
+        _stage_placeholder(builder, size, views, diffusion.context)
 
-        trajectory = denoising.bind_inputs(
-            layout,
+        ladder = diffusion.bind(
             tuple(
                 builder.bind(size, views, schedules, index)
                 for index in range(builder.num_steps)
@@ -315,7 +329,7 @@ def capture_denoising(
             slot=1,
         )
         for index in range(builder.num_steps):
-            denoising.capture(trajectory, index)
+            diffusion.capture(ladder, index)
 
 
 @torch.inference_mode()
@@ -532,7 +546,19 @@ def validate_batch(
             )
 
 
-def video_state(runner: ModelExecutor, request: RequestState) -> VideoState:
+def open_state(runner: ModelExecutor, size) -> DiffusionState:
+    """Open a video request's diffusion state on the fixed schedule."""
+    builder = runner.media_builder
+    return DiffusionState.open(
+        builder.denoiser,
+        size,
+        steps=builder.num_steps,
+        shift=None,
+        device=runner.worker_config.device,
+    )
+
+
+def video_state(runner: ModelExecutor, request: RequestState) -> DiffusionState:
     """Return the admitted video request's state, creating it on first use."""
     media = request.admission.diffusion
     if media is None:
@@ -540,16 +566,13 @@ def video_state(runner: ModelExecutor, request: RequestState) -> VideoState:
     size = video_shape(runner, media, len(request.admission.prompt_token_ids))
     trajectory = request.diffusion
     if trajectory is None:
-        trajectory = VideoState(
-            size=size,
-            schedules=dict(
-                runner.media_builder.schedules(
-                    device=runner.worker_config.device
-                )
-            ),
-        )
+        trajectory = open_state(runner, size)
         request.diffusion = trajectory
-    if not isinstance(trajectory, VideoState) or trajectory.size != size:
+    if (
+        not isinstance(trajectory, DiffusionState)
+        or trajectory.slot is None
+        or trajectory.size != size
+    ):
         raise invalid_descriptor(
             "video request changed its admitted numerical dimensions"
         )
@@ -571,14 +594,15 @@ def begin_noise(
     if media is None or runner.noise_draws is None or not runner.state_buffers:
         return
     trajectory = video_state(runner, request)
-    if "denoising" not in trajectory.tensors:
-        trajectory.tensors["denoising"] = request_pool.storage.tensors(
+    slot = slot_ladder(trajectory)
+    if "denoising" not in slot.tensors:
+        slot.tensors["denoising"] = request_pool.storage.tensors(
             request.request_pool_idx
         ).view(runner.media_builder.buffers(trajectory.size))
-    trajectory.noise = runner.noise_draws.submit(
+    slot.staging = runner.noise_draws.submit(
         runner.media_builder.stage_request,
         trajectory.size,
-        trajectory.tensors["denoising"],
+        slot.tensors["denoising"],
         seed=media.seed,
     )
 
@@ -645,12 +669,13 @@ def execute(
             )
 
         encoded = conditioning.tensor
-        if trajectory.noise is None:
+        staging = slot_ladder(trajectory).staging
+        if staging is None:
             model_runner.media_builder.stage_request(
                 numerical_shape, slot, seed=media.seed
             )
         else:
-            trajectory.noise.result()
+            staging.result()
         initial = model_runner.media_builder.initialize(
             numerical_shape,
             slot,
@@ -692,12 +717,13 @@ def execute(
                 "video denoising requires one selected numerical step"
             )
 
-        if trajectory.denoising is None:
-            builder = model_runner.media_builder
-            trajectory.denoising = cast(
-                "TrajectoryRunner", model_runner.denoising
-            ).bind_inputs(
-                builder.layout(numerical_shape),
+        # ``slot`` holds the request's slot views; its ladder is bound over
+        # them once and replayed by every later step.
+        slot_state = slot_ladder(trajectory)
+        builder = model_runner.media_builder
+        layout = builder.layout(numerical_shape)
+        if slot_state.ladder is None:
+            slot_state.ladder = model_runner.diffusion_runner(layout).bind(
                 tuple(
                     builder.bind(
                         numerical_shape, slot, trajectory.schedules, index
@@ -708,7 +734,9 @@ def execute(
                 state=slot,
                 slot=request.request.request_pool_idx,
             )
-        result = model_runner.run_denoising(trajectory.denoising, start_step)
+        result = model_runner.run_denoising(
+            layout, slot_state.ladder, start_step
+        )
         if result.stats is None:
             raise RuntimeError("module output has no execution statistics")
         state.forward_stats.append(result.stats)
