@@ -1781,10 +1781,10 @@ mod placement_tests {
 
     #[test]
     fn every_shipped_deployment_encodes_its_units_on_their_host() {
-        // The deployment files in `config/` must pass the placement checks
+        // The deployment files in `configs/` must pass the placement checks
         // the engine applies at startup, including the pairing of every
         // decoding worker with an encoder on its host.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
         let mut checked = 0;
         for entry in std::fs::read_dir(&root).expect("the deployment directory exists") {
             let path = entry.expect("readable entry").path();
