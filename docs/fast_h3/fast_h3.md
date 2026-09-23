@@ -37,10 +37,10 @@ The `gpu` extra installs the locked GPU providers FastH3 serves through: FlashIn
 | --- | --- | --- | --- | --- |
 | [`FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree) | BF16 | 4 | 0.9 | 148 GB |
 | [`FastVideo/FastVideo-FastH3-8-Step-V2`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2) | BF16 | 8 | 0.8 | 148 GB |
-| [`skx618/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4`](https://huggingface.co/skx618/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4) | Packed NVFP4 | 4 | 0.9 | 123 GB |
-| [`skx618/FastVideo-FastH3-8-Step-V2-NVFP4`](https://huggingface.co/skx618/FastVideo-FastH3-8-Step-V2-NVFP4) | Packed NVFP4 | 8 | 0.8 | 123 GB |
+| [`skx618/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4`](https://huggingface.co/skx618/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4) | ModelOpt NVFP4 | 4 | 0.9 | 123 GB |
+| [`skx618/FastVideo-FastH3-8-Step-V2-NVFP4`](https://huggingface.co/skx618/FastVideo-FastH3-8-Step-V2-NVFP4) | ModelOpt NVFP4 | 8 | 0.8 | 123 GB |
 
-The two `skx618` repositories are ModelOpt PTQ checkpoints. UniServe loads ModelOpt's unified Hugging Face layout with no precision flags: see [Precision and graphs](#precision-and-graphs). These repositories publish an earlier packed layout, so rewrite a downloaded copy with `scripts/convert_h3_modelopt_checkpoint.py` before serving it, as shown below.
+The two `skx618` repositories are ModelOpt PTQ checkpoints in ModelOpt's unified Hugging Face layout, which UniServe loads with no precision flags: see [Precision and graphs](#precision-and-graphs).
 
 Each checkpoint's `fastvideo_inference.json` supplies its sampling schedule: the trained DMD rungs in `dmd_denoising_steps`, one transformer forward per rung, and the VSA sparsity. The video and audio shifts come from `scheduler/` and `audio_scheduler/`, and a manifest that restates them must agree. The loader refuses a manifest that is not a `fasth3-inference-contract-v1` text-to-video-and-audio contract without guidance. The table lists the checkpoints UniServe has validated end to end.
 
@@ -51,11 +51,8 @@ Each checkpoint's `fastvideo_inference.json` supplies its sampling schedule: the
 ```bash
 export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2-NVFP4
 
-hf download skx618/FastVideo-FastH3-8-Step-V2-NVFP4 --local-dir "$H3_MODEL.packed"
-python scripts/convert_h3_modelopt_checkpoint.py "$H3_MODEL.packed" "$H3_MODEL"
+hf download skx618/FastVideo-FastH3-8-Step-V2-NVFP4 --local-dir "$H3_MODEL"
 ```
-
-The conversion copies the packed values and scales bit for bit, turns each calibrated activation amax into its module's `input_scale`, and hardlinks every file outside the quantized `transformer/` and `vae/` components. The BF16 checkpoints need no conversion.
 
 Pass the model root containing `modular_model_index.json`, `fastvideo_inference.json`, `transformer/`, `text_encoder/`, `vae/`, `audio_vae/`, `scheduler/`, `audio_scheduler/`, and `tokenizer/`. In an NVFP4 root in ModelOpt's unified layout, `transformer/config.json` and `vae/config.json` also declare a `quantization_config` with `quant_method: modelopt`. The server identifies the model from the pipeline class that `modular_model_index.json` declares and reads the tokenizer from the component folder the index names; the loader then validates the inference contract in `fastvideo_inference.json`.
 
@@ -96,7 +93,7 @@ One launcher serves every worker of the deployment that places a rank on its hos
 
 The single-node DP8 deployment uses eight independent one-GPU flow workers instead of one eight-rank Ulysses worker. Each flow worker owns a complete denoiser, video decoder, and audio decoder, so eight requests can denoise and decode concurrently without a collective between GPUs. The scheduler selects one flow replica when it admits a request, keeps that request on the same replica through latent preparation, denoising, and device decoding, and accounts its request rows, product buffers, queue, and execution lane in that worker's address space. Replica capacities add; a shared component remains an independently bounded stage of the route.
 
-Packed NVFP4 checkpoints are the intended DP8 weights. Dense BF16 denoiser replication is not expected to fit on 96 GB devices. Start with the shared-TP8 conditioning layout:
+The NVFP4 checkpoints are the intended DP8 weights. Dense BF16 denoiser replication is not expected to fit on 96 GB devices. Start with the shared-TP8 conditioning layout:
 
 ```bash
 uniserve serve "$H3_MODEL" \
