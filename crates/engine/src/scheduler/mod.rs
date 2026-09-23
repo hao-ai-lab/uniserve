@@ -68,7 +68,7 @@ use uniserve_core::{
     ArtifactEvent, DiffusionRequest, EngineCoreOutput, FinishReason, GenerationRequest, MediaKind,
     PositionLogprobs, Request, SharedMedia, TokenLogprob,
 };
-use uniserve_core::{BlockId, ImageIngestStep, encoder_cache_key};
+use uniserve_core::{BlockId, ImageIngestStep, RejectionKind, encoder_cache_key};
 use uniserve_core::{HashAlgo, RequestId, RuntimeFamily};
 use uniserve_worker_ipc::{
     ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
@@ -244,6 +244,8 @@ enum DiffusionTerminal {
 struct PendingMedia {
     request: DiffusionRequest,
     event_tx: EventTx,
+    /// Unix timestamp at which the request entered the waiting queue.
+    queued_at: f64,
 }
 
 /// Permissive unified-multimodal limits for a scheduler built without

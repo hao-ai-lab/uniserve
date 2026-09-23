@@ -8,7 +8,11 @@ use thiserror::Error;
 pub enum Error {
     /// Admission rejected a validly framed request before model execution.
     #[error("request `{request_id}` rejected: {message}")]
-    Rejected { request_id: String, message: String },
+    Rejected {
+        request_id: String,
+        kind: uniserve_core::RejectionKind,
+        message: String,
+    },
     /// The tokenizer cannot encode or decode model text.
     #[error("tokenizer error: {0}")]
     Tokenizer(String),

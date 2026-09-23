@@ -13,7 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use uniserve_core::{
-    DiffusionRequest, DiffusionSamplingParams, EngineCoreOutput, FinishReason, Request, RequestId,
+    DiffusionRequest, DiffusionSamplingParams, EngineCoreOutput, FinishReason, RejectionKind,
+    Request, RequestId,
 };
 use uniserve_engine::{
     BatchEvent, ComponentConfig, ComponentDistribution, EngineHandle, ExecutionBatch, Scheduler,
@@ -323,9 +324,17 @@ fn media_calls(batch: &ExecutionBatch) -> Vec<ObservedCall> {
 /// Serves the requests, queued together in order, until each stream reaches
 /// a terminal event.
 fn serve(sim: SimEngine, requests: Vec<Request>) -> Served {
+    serve_bounded(sim, requests, None)
+}
+
+/// Serves the requests with an optional bound on waiting request state.
+fn serve_bounded(sim: SimEngine, requests: Vec<Request>, max_num_waiting: Option<usize>) -> Served {
     let mut executor = SimExecutor::new(sim);
     let boundary = executor.observe();
-    let scheduler = Scheduler::new(Box::new(executor), SpecialTokenIds::default(), 32);
+    let mut scheduler = Scheduler::new(Box::new(executor), SpecialTokenIds::default(), 32);
+    if let Some(bound) = max_num_waiting {
+        scheduler.set_max_num_waiting(bound);
+    }
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
 
@@ -555,4 +564,58 @@ fn a_host_lane_admits_no_more_tasks_than_its_rank_advertises() {
             served.submissions
         );
     }
+}
+
+#[test]
+fn an_admitted_video_request_reports_scheduling_before_its_progress() {
+    let request = RequestId(1);
+    let served = serve(video_worker(2, 1), vec![video_request(request.0, 2)]);
+    served.assert_completed(request);
+
+    // A job's public phases start at admission: the scheduling event carries
+    // the queue interval and precedes every progress report.
+    let events = &served.outcomes[&request];
+    let scheduled = events
+        .iter()
+        .position(|event| matches!(event, EngineCoreOutput::Scheduled { .. }))
+        .unwrap_or_else(|| panic!("the request was never reported as scheduled: {events:?}"));
+    let first_progress = events
+        .iter()
+        .position(|event| matches!(event, EngineCoreOutput::MediaProgress { .. }))
+        .expect("the request reported progress");
+    assert!(scheduled < first_progress, "{events:?}");
+    let EngineCoreOutput::Scheduled {
+        queued_at,
+        scheduled_at,
+    } = events[scheduled]
+    else {
+        unreachable!("position matched a scheduling event");
+    };
+    assert!(queued_at <= scheduled_at);
+}
+
+#[test]
+fn a_full_waiting_queue_rejects_a_video_request_as_overloaded() {
+    let admitted = RequestId(1);
+    let refused = RequestId(2);
+    let served = serve_bounded(
+        video_worker(2, 1),
+        vec![video_request(admitted.0, 2), video_request(refused.0, 2)],
+        Some(1),
+    );
+    served.assert_completed(admitted);
+
+    // The second request arrives while the first still waits, so the bound
+    // refuses it as retryable overload rather than as an invalid request.
+    let events = &served.outcomes[&refused];
+    assert!(
+        matches!(
+            events.as_slice(),
+            [EngineCoreOutput::Rejected {
+                kind: RejectionKind::Overloaded,
+                ..
+            }]
+        ),
+        "{events:?}"
+    );
 }

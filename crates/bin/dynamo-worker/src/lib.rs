@@ -313,8 +313,8 @@ impl RawEngine for DynamoFastH3Engine {
                         yield Err(engine_error(format!("video generation ended without an artifact: {reason:?}")));
                         return;
                     }
-                    Some(Ok(RequestOutput::Rejected { message, .. })) => {
-                        yield Err(invalid_argument(message));
+                    Some(Ok(RequestOutput::Rejected { kind, message, .. })) => {
+                        yield Err(api_error(uniserve_server::openai::ApiError::rejected(kind, message)));
                         return;
                     }
                     Some(Ok(RequestOutput::Failed { message, .. })) => {

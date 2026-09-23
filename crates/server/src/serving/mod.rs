@@ -1292,6 +1292,8 @@ pub enum RequestOutput {
     Rejected {
         /// Identifier of the rejected request.
         request_id: ServeRequestId,
+        /// Whether the request is unservable or the engine is full.
+        kind: uniserve_core::RejectionKind,
         /// Caller-visible rejection description.
         message: String,
     },

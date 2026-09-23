@@ -39,6 +39,11 @@ pub enum ApiError {
         /// Human-readable conflict description.
         message: String,
     },
+    /// The engine's waiting queue is full; the same request may succeed later.
+    Overloaded {
+        /// Human-readable admission failure.
+        message: String,
+    },
 }
 
 /// Result type for OpenAI request validation and conversion.
@@ -81,6 +86,16 @@ impl ApiError {
         }
     }
 
+    /// Maps an engine admission rejection to its caller-facing category.
+    pub fn rejected(kind: uniserve_core::RejectionKind, message: impl Into<String>) -> Self {
+        match kind {
+            uniserve_core::RejectionKind::Invalid => Self::invalid_request(message, None),
+            uniserve_core::RejectionKind::Overloaded => Self::Overloaded {
+                message: message.into(),
+            },
+        }
+    }
+
     /// Returns the HTTP status associated with this error category.
     pub fn status_code(&self) -> StatusCode {
         match self {
@@ -88,6 +103,7 @@ impl ApiError {
             Self::ModelNotFound { .. } => StatusCode::NOT_FOUND,
             Self::ServerError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Conflict { .. } => StatusCode::CONFLICT,
+            Self::Overloaded { .. } => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -124,6 +140,12 @@ impl ApiError {
                 error_type: "conflict_error".to_string(),
                 param: None,
                 code: Some("runtime_state_conflict".to_string()),
+            },
+            Self::Overloaded { message } => ErrorDetail {
+                message: message.clone(),
+                error_type: "server_error".to_string(),
+                param: None,
+                code: Some("server_overloaded".to_string()),
             },
         };
 
@@ -190,3 +212,22 @@ macro_rules! server_error {
 }
 
 pub(crate) use server_error;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uniserve_core::RejectionKind;
+
+    #[test]
+    fn an_overloaded_engine_is_retryable_and_an_invalid_request_is_not() {
+        let overloaded = ApiError::rejected(RejectionKind::Overloaded, "queue full");
+        assert_eq!(overloaded.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            overloaded.to_error_response().error.code.as_deref(),
+            Some("server_overloaded")
+        );
+
+        let invalid = ApiError::rejected(RejectionKind::Invalid, "unsupported");
+        assert_eq!(invalid.status_code(), StatusCode::BAD_REQUEST);
+    }
+}

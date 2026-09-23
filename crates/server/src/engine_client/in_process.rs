@@ -306,7 +306,7 @@ mod tests {
                     finish = Some(reason);
                     break;
                 }
-                EngineCoreOutput::Rejected { message } => panic!("request rejected: {message}"),
+                EngineCoreOutput::Rejected { message, .. } => panic!("request rejected: {message}"),
                 EngineCoreOutput::Error { message }
                 | EngineCoreOutput::ArtifactUnavailable { message } => {
                     panic!("engine error: {message}")
@@ -397,7 +397,7 @@ mod tests {
                     finished = true;
                     break;
                 }
-                EngineCoreOutput::Rejected { message } => panic!("request rejected: {message}"),
+                EngineCoreOutput::Rejected { message, .. } => panic!("request rejected: {message}"),
                 EngineCoreOutput::Error { message }
                 | EngineCoreOutput::ArtifactUnavailable { message } => {
                     panic!("engine error: {message}")

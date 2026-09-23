@@ -38,8 +38,8 @@ pub async fn collect_image_generation(
                 finished = true;
                 break;
             }
-            RequestOutput::Rejected { message, .. } => {
-                return Err(ApiError::invalid_request(message, None));
+            RequestOutput::Rejected { kind, message, .. } => {
+                return Err(ApiError::rejected(kind, message));
             }
             RequestOutput::Failed { message, .. } => return Err(ApiError::server_error(message)),
             RequestOutput::Cancelled { .. } => {

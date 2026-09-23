@@ -8,18 +8,21 @@ impl Scheduler {
     pub(super) fn enqueue(&mut self, req: GenerationRequest, event_tx: EventTx) {
         if self.storage.cache.is_none() {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
                 message: "generation request requires worker KV resources".into(),
             });
             return;
         }
         if let Err(error) = req.validate() {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
                 message: format!("invalid generation request: {error:?}"),
             });
             return;
         }
         if let Some(feature) = self.missing_required_feature(&req) {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
                 message: format!(
                     "generation request requires worker feature `{feature}`, but the worker does not support it"
                 ),
@@ -28,6 +31,7 @@ impl Scheduler {
         }
         if let Err(error) = req.validate_resources(&self.generation_limits) {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
                 message: format!("invalid generation resource requirements: {error}"),
             });
             return;
@@ -39,6 +43,7 @@ impl Scheduler {
         let waiting = self.pending_request_count() + self.output.retained_len();
         if waiting >= self.config.max_num_waiting {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Overloaded,
                 message: "scheduler waiting queue is full".into(),
             });
             return;
@@ -245,6 +250,7 @@ impl Scheduler {
         let request = &submission.request;
         if let Err(message) = request.validate() {
             let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
                 message: message.to_string(),
             });
             return;
@@ -258,12 +264,14 @@ impl Scheduler {
             .contains_key(&uniserve_worker_ipc::MediaCall::Muxing)
         {
             let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
                 message: "worker does not provide the video media components".to_string(),
             });
             return;
         }
         if request.sampling.num_inference_steps != self.info.num_inference_steps {
             let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
                 message: "request prediction count disagrees with the loaded model".to_string(),
             });
             return;
@@ -273,6 +281,7 @@ impl Scheduler {
             .is_none()
         {
             let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
                 message: "loaded media components cannot represent the requested output bounds"
                     .into(),
             });
@@ -280,6 +289,7 @@ impl Scheduler {
         }
         if self.info.request_slots < 2 {
             let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
                 message: "worker does not provide two resident media state slots".to_string(),
             });
             return;
@@ -288,6 +298,7 @@ impl Scheduler {
             >= self.config.max_num_waiting
         {
             let _ = submission.event_tx.send(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Overloaded,
                 message: "scheduler waiting queue is full".to_string(),
             });
             return;
@@ -417,43 +428,51 @@ impl Scheduler {
             )
             .expect("validated media admission");
             let root = CallId::new(0, 0);
+            let mut state = MediaFlowState {
+                request: submission.request,
+                output: output::EventJournal::new(submission.event_tx),
+                allocations,
+                buffer_bindings: HashMap::new(),
+                conditioning: None,
+                latents: Vec::new(),
+                decoded_units: BTreeMap::new(),
+                encoded_units: BTreeMap::new(),
+                encoded_ready: BTreeMap::new(),
+                handed_units: 0,
+                muxing_inputs: Vec::new(),
+                audio: None,
+                admission,
+                admission_state: WorkerRegistration::Unsubmitted,
+                text_encoding_scheduled: false,
+                latent_preparation_scheduled: false,
+                num_scheduled_steps: 0,
+                num_completed_steps: 0,
+                scheduled_decode_units: 0,
+                scheduled_encode_units: 0,
+                encoded_video_units: 0,
+                audio_decoding_scheduled: false,
+                audio_encoding_scheduled: false,
+                audio_encoded: false,
+                muxing_in_flight: false,
+                final_muxing_scheduled: false,
+                muxed: false,
+                predecessor: root,
+                terminal_intent: TerminalIntent::None,
+                artifact: None,
+            };
+
             // The interval from receipt to admission is the queue wait. The
-            // engine and rank own the preparation that follows.
-            self.running_media.insert(
-                id,
-                MediaFlowState {
-                    request: submission.request,
-                    output: output::EventJournal::new(submission.event_tx),
-                    allocations,
-                    buffer_bindings: HashMap::new(),
-                    conditioning: None,
-                    latents: Vec::new(),
-                    decoded_units: BTreeMap::new(),
-                    encoded_units: BTreeMap::new(),
-                    encoded_ready: BTreeMap::new(),
-                    handed_units: 0,
-                    muxing_inputs: Vec::new(),
-                    audio: None,
-                    admission,
-                    admission_state: WorkerRegistration::Unsubmitted,
-                    text_encoding_scheduled: false,
-                    latent_preparation_scheduled: false,
-                    num_scheduled_steps: 0,
-                    num_completed_steps: 0,
-                    scheduled_decode_units: 0,
-                    scheduled_encode_units: 0,
-                    encoded_video_units: 0,
-                    audio_decoding_scheduled: false,
-                    audio_encoding_scheduled: false,
-                    audio_encoded: false,
-                    muxing_in_flight: false,
-                    final_muxing_scheduled: false,
-                    muxed: false,
-                    predecessor: root,
-                    terminal_intent: TerminalIntent::None,
-                    artifact: None,
-                },
-            );
+            // engine and rank own the preparation that follows, which the
+            // request's public phases report from here on.
+            let scheduled_at = now();
+            self.record_queue_wait(submission.queued_at, scheduled_at);
+            if !state.output.enqueue(EngineCoreOutput::Scheduled {
+                queued_at: submission.queued_at,
+                scheduled_at,
+            }) {
+                state.terminal_intent.finish(FinishReason::Cancelled);
+            }
+            self.running_media.insert(id, state);
             self.running_order.push(id);
         }
     }
@@ -631,6 +650,7 @@ impl Scheduler {
                     let id = self.waiting_order.pop_front().unwrap();
                     let st = self.waiting.remove(&id).unwrap();
                     let _ = st.output.events.event_tx.send(EngineCoreOutput::Rejected {
+                        kind: RejectionKind::Invalid,
                         message: "request exceeds total KV capacity".into(),
                     });
                     continue;
@@ -674,6 +694,7 @@ impl Scheduler {
                     let id = self.waiting_order.pop_front().unwrap();
                     let st = self.waiting.remove(&id).unwrap();
                     let _ = st.output.events.event_tx.send(EngineCoreOutput::Rejected {
+                        kind: RejectionKind::Invalid,
                         message: "request exceeds total KV capacity".into(),
                     });
                     continue;
@@ -733,6 +754,23 @@ impl Scheduler {
     }
 
     /// Reserves request resources and moves one validated request into the runnable set.
+    /// Accumulates one request's interval from queue entry to admission.
+    fn record_queue_wait(&self, queued_at: f64, scheduled_at: f64) {
+        let queue_wait_us = ((scheduled_at - queued_at).max(0.0) * 1_000_000.0) as u64;
+        self.stats
+            .timing
+            .queue_wait_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .timing
+            .queue_wait_us_total
+            .fetch_add(queue_wait_us, Ordering::Relaxed);
+        self.stats
+            .timing
+            .queue_wait_us_max
+            .fetch_max(queue_wait_us, Ordering::Relaxed);
+    }
+
     pub(super) fn admit_running(
         &mut self,
         mut st: RequestState,
@@ -777,19 +815,7 @@ impl Scheduler {
         // public scheduling event.
         let q = st.queued_at;
         let scheduled_at = now();
-        let queue_wait_us = ((scheduled_at - q).max(0.0) * 1_000_000.0) as u64;
-        self.stats
-            .timing
-            .queue_wait_count
-            .fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .timing
-            .queue_wait_us_total
-            .fetch_add(queue_wait_us, Ordering::Relaxed);
-        self.stats
-            .timing
-            .queue_wait_us_max
-            .fetch_max(queue_wait_us, Ordering::Relaxed);
+        self.record_queue_wait(q, scheduled_at);
 
         let encoder_entries = st.req.num_encoder_cache_entries();
         if !st.output.events.enqueue(EngineCoreOutput::Scheduled {

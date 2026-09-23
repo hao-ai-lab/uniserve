@@ -13,6 +13,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt as _;
+use uniserve_core::RejectionKind;
 
 use crate::AppState;
 
@@ -54,8 +55,8 @@ pub(crate) async fn videos_sync(
                 ))
                 .into_response();
             }
-            Some(RequestOutput::Rejected { message, .. }) => {
-                return ApiError::invalid_request(message, None).into_response();
+            Some(RequestOutput::Rejected { kind, message, .. }) => {
+                return ApiError::rejected(kind, message).into_response();
             }
             Some(RequestOutput::Failed { message, .. }) => {
                 return ApiError::server_error(message).into_response();
@@ -206,6 +207,13 @@ pub(crate) async fn videos_create(
             Ok(options) => options,
             Err(error) => return error.into_response(),
         };
+    // Job capacity is claimed before submission, so a request refused for it
+    // never reaches the engine. The slot is released if this handler is
+    // dropped before the job record owns it.
+    let slot = match state.videos.reserve() {
+        Ok(slot) => slot,
+        Err(message) => return job_capacity_exceeded(message),
+    };
     let mut stream = match state
         .runtime()
         .generate_video(request_id.clone(), body)
@@ -231,17 +239,9 @@ pub(crate) async fn videos_create(
         total_steps: sampling.num_inference_steps,
         error: None,
     };
-    let cancellation = match state.videos.insert(record.clone()) {
+    let cancellation = match state.videos.insert(record.clone(), slot) {
         Ok(token) => token,
-        Err(message) => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                axum::Json(serde_json::json!({"error": {
-                    "code": "video_job_capacity_exceeded", "message": message
-                }})),
-            )
-                .into_response();
-        }
+        Err(message) => return job_capacity_exceeded(message),
     };
     // No await separates reservation and detachment. Dropping this HTTP response cannot abort the job.
     tokio::spawn(async move {
@@ -284,7 +284,14 @@ pub(crate) async fn videos_create(
                             message: format!("generation ended: {reason:?}"),
                         });
                     }
-                    Some(RequestOutput::Rejected { message, .. } | RequestOutput::Failed { message, .. }) => {
+                    Some(RequestOutput::Rejected { kind, message, .. }) => {
+                        let code = match kind {
+                            RejectionKind::Invalid => "invalid_request",
+                            RejectionKind::Overloaded => "server_overloaded",
+                        };
+                        return Err(VideoFailure { code, message });
+                    }
+                    Some(RequestOutput::Failed { message, .. }) => {
                         return Err(VideoFailure { code: "generation_failed", message });
                     }
                     Some(RequestOutput::Cancelled { .. } | RequestOutput::Aborted { .. }) => {
@@ -310,6 +317,16 @@ pub(crate) async fn videos_create(
         state.videos.finish(&id, result);
     });
     (StatusCode::OK, axum::Json(record)).into_response()
+}
+
+fn job_capacity_exceeded(message: &str) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        axum::Json(serde_json::json!({"error": {
+            "code": "video_job_capacity_exceeded", "message": message
+        }})),
+    )
+        .into_response()
 }
 
 fn missing_video() -> Response {
