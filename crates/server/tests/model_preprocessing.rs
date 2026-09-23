@@ -101,8 +101,14 @@ fn try_resolved_model(
         ChatTemplateContentFormatOption::String,
     )
     .unwrap();
-    let config =
-        ModelConfig::from_files(description.id(), &files, None, tokenizer.as_ref()).unwrap();
+    // A pipeline family has no root configuration; it resolves from its
+    // pipeline index with the model's default duration limit.
+    let config = match description {
+        ModelDescription::MiniMaxH3 => {
+            ModelConfig::from_pipeline(description.id(), description, 15.0, Some(4096)).unwrap()
+        }
+        _ => ModelConfig::from_files(description.id(), &files, None, tokenizer.as_ref()).unwrap(),
+    };
     let model = InputProcessor::new(
         config,
         Arc::clone(&tokenizer),

@@ -28,14 +28,20 @@ pub enum Error {
     MissingFile {
         /// Model identifier or local directory.
         model: String,
-        /// Required filename.
-        file: &'static str,
+        /// Required checkpoint-relative file path.
+        file: String,
     },
     #[error("model metadata is missing required field `{field}`")]
     /// Required model metadata is absent.
     MissingField {
         /// Required metadata field name.
         field: &'static str,
+    },
+    #[error("unsupported diffusers pipeline {class_name}")]
+    /// A pipeline index declares a pipeline class UniServe does not serve.
+    UnsupportedPipeline {
+        /// Pipeline class declared by the checkpoint's root index.
+        class_name: String,
     },
     #[error("unsupported model type {actual}")]
     /// Model metadata declares an architecture family UniServe does not serve.
