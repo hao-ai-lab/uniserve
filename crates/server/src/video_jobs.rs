@@ -43,6 +43,12 @@ struct RetainedJob {
     cancellation: Arc<JobReservation>,
 }
 
+/// A job slot acquired before submission and not yet bound to a record.
+///
+/// Dropping it releases the slot, so a caller that abandons a request between
+/// admission and job creation leaves no record behind.
+pub(crate) struct JobSlot(OwnedSemaphorePermit);
+
 /// A slot remains reserved through deletion until its physical execution drains.
 pub(crate) struct JobReservation {
     cancellation: CancellationToken,
@@ -98,18 +104,29 @@ pub(crate) fn timestamp() -> u64 {
 }
 
 impl VideoJobs {
-    /// Reserve a bounded record before detaching generation from its HTTP caller.
-    pub(crate) fn insert(&self, record: VideoJob) -> Result<Arc<JobReservation>, &'static str> {
+    /// Acquires one bounded job slot before the request reaches the engine.
+    pub(crate) fn reserve(&self) -> Result<JobSlot, &'static str> {
+        Arc::clone(&self.slots)
+            .try_acquire_owned()
+            .map(JobSlot)
+            .map_err(|_| {
+                "video job limit reached; delete retained jobs or wait for cancellations to drain"
+            })
+    }
+
+    /// Binds a reserved slot to its record before detaching generation from its HTTP caller.
+    pub(crate) fn insert(
+        &self,
+        record: VideoJob,
+        slot: JobSlot,
+    ) -> Result<Arc<JobReservation>, &'static str> {
         let mut entries = self.entries.lock().expect("video job lock poisoned");
         if entries.contains_key(&record.id) {
             return Err("video job already exists");
         }
-        let slot = Arc::clone(&self.slots).try_acquire_owned().map_err(
-            |_| "video job limit reached; delete retained jobs or wait for cancellations to drain",
-        )?;
         let cancellation = Arc::new(JobReservation {
             cancellation: CancellationToken::new(),
-            _slot: slot,
+            _slot: slot.0,
         });
         entries.insert(
             record.id.clone(),
@@ -263,10 +280,26 @@ mod tests {
         }
     }
 
+    fn insert(jobs: &VideoJobs, id: &str) -> Result<Arc<JobReservation>, &'static str> {
+        jobs.insert(record(id), jobs.reserve()?)
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_reservation_releases_its_slot_without_a_record() {
+        let jobs = Arc::new(VideoJobs::default());
+        let slots = (0..MAX_VIDEO_JOBS)
+            .map(|_| jobs.reserve().unwrap())
+            .collect::<Vec<_>>();
+        assert!(jobs.reserve().is_err());
+        drop(slots);
+        assert!(jobs.reserve().is_ok());
+        assert!(jobs.list().is_empty());
+    }
+
     #[tokio::test]
     async fn deleted_work_is_cancelled_and_cannot_reappear() {
         let jobs = Arc::new(VideoJobs::default());
-        let cancellation = jobs.insert(record("video-a")).unwrap();
+        let cancellation = insert(&jobs, "video-a").unwrap();
         jobs.progress("video-a", "denoising", 2);
         let running = jobs.get("video-a").unwrap();
         assert_eq!(
@@ -285,20 +318,20 @@ mod tests {
         assert!(jobs.get("video-a").is_none());
         assert!(jobs.list().is_empty());
         for index in 0..127 {
-            jobs.insert(record(&format!("video-{index}"))).unwrap();
+            insert(&jobs, &format!("video-{index}")).unwrap();
         }
-        assert!(jobs.insert(record("video-next")).is_err());
+        assert!(insert(&jobs, "video-next").is_err());
         drop(cancellation);
-        assert!(jobs.insert(record("video-next")).is_ok());
+        assert!(insert(&jobs, "video-next").is_ok());
     }
 
     #[tokio::test]
     async fn failures_have_retention_and_deletion_releases_record_capacity() {
         let jobs = Arc::new(VideoJobs::default());
         for index in 0..128 {
-            jobs.insert(record(&format!("video-{index}"))).unwrap();
+            insert(&jobs, &format!("video-{index}")).unwrap();
         }
-        assert!(jobs.insert(record("video-overflow")).is_err());
+        assert!(insert(&jobs, "video-overflow").is_err());
         jobs.finish(
             "video-0",
             Err(VideoFailure {
@@ -314,7 +347,7 @@ mod tests {
             3600
         );
         assert!(jobs.delete("video-0"));
-        assert!(jobs.insert(record("video-next")).is_ok());
+        assert!(insert(&jobs, "video-next").is_ok());
         assert_eq!(jobs.list().len(), 128);
     }
 }

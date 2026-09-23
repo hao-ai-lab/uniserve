@@ -479,9 +479,10 @@ pub async fn decoded_text_event_stream(
                 .await;
                 return Ok(());
             }
-            EngineCoreOutput::Rejected { message } => {
+            EngineCoreOutput::Rejected { kind, message } => {
                 return Err(Error::Rejected {
                     request_id,
+                    kind,
                     message,
                 });
             }

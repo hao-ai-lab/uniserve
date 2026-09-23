@@ -283,8 +283,8 @@ async fn collect_chat_events(
                 finish_status = Some(reason);
                 break;
             }
-            Ok(RequestOutput::Rejected { message, .. }) => {
-                return Err(ApiError::invalid_request(message, None));
+            Ok(RequestOutput::Rejected { kind, message, .. }) => {
+                return Err(ApiError::rejected(kind, message));
             }
             Ok(RequestOutput::Failed {
                 request_id,
@@ -613,8 +613,8 @@ pub async fn chat_completion_chunk_stream(
 
                 return Ok(());
             }
-            Ok(RequestOutput::Rejected { message, .. }) => {
-                return Err(ApiError::invalid_request(message, None));
+            Ok(RequestOutput::Rejected { kind, message, .. }) => {
+                return Err(ApiError::rejected(kind, message));
             }
             Ok(RequestOutput::Failed { .. }) => {
                 bail_server_error!("Internal server error");

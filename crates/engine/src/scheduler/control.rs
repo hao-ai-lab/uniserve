@@ -67,6 +67,7 @@ impl Scheduler {
             Command::Submit { request, event_tx } => {
                 if !self.accepts_family(request.family()) {
                     let _ = event_tx.send(EngineCoreOutput::Rejected {
+                        kind: RejectionKind::Invalid,
                         message: format!(
                             "request family {:?} does not match the {:?} runtime",
                             request.family(),
@@ -78,9 +79,11 @@ impl Scheduler {
                         Request::Ar(request) | Request::Umm(request) => {
                             self.enqueue(request, event_tx)
                         }
-                        Request::Diffusion(request) => {
-                            self.enqueue_media(PendingMedia { request, event_tx })
-                        }
+                        Request::Diffusion(request) => self.enqueue_media(PendingMedia {
+                            request,
+                            event_tx,
+                            queued_at: now(),
+                        }),
                     }
                 }
             }
