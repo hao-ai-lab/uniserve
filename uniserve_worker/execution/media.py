@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
     from uniserve.runtime.tensor_buffers import TensorBuffers
     from uniserve_worker.execution.model_executor import ModelExecutor
-    from uniserve_worker.execution.request import RequestPool
+    from uniserve_worker.execution.request import RequestPool, RequestState
     from uniserve_worker.model_executor.diffusion_runner import TrajectoryRunner
     from uniserve_worker.storage.tensor_store import TensorStore
     from uniserve_worker.transport.interface import Transport
@@ -517,6 +517,56 @@ def validate_batch(
             )
 
 
+def video_state(runner: ModelExecutor, request: RequestState) -> VideoState:
+    """Return the admitted video request's state, creating it on first use."""
+    media = request.admission.diffusion
+    if media is None:
+        raise invalid_descriptor("video call has no admitted media dimensions")
+    size = video_shape(runner, media, len(request.admission.prompt_token_ids))
+    trajectory = request.diffusion
+    if trajectory is None:
+        trajectory = VideoState(
+            size=size,
+            schedules=dict(
+                runner.media_builder.schedules(
+                    device=runner.worker_config.device
+                )
+            ),
+        )
+        request.diffusion = trajectory
+    if not isinstance(trajectory, VideoState) or trajectory.size != size:
+        raise invalid_descriptor(
+            "video request changed its admitted numerical dimensions"
+        )
+    return trajectory
+
+
+def begin_noise(
+    runner: ModelExecutor, request: RequestState, request_pool: RequestPool
+) -> None:
+    """Start an admitted video request's seeded noise draw off the service
+    thread.
+
+    The draw depends only on the seed and the admitted size, so it runs on the
+    rank's noise thread while the service thread launches other device work,
+    this request's text encoding or another request's denoising steps, and
+    latent preparation waits for it. A rank that does not denoise draws none.
+    """  # noqa: D205
+    media = request.admission.diffusion
+    if media is None or runner.noise_draws is None or not runner.state_buffers:
+        return
+    trajectory = video_state(runner, request)
+    if "denoising" not in trajectory.tensors:
+        trajectory.tensors["denoising"] = request_pool.storage.tensors(
+            request.request_pool_idx
+        ).view(runner.media_builder.buffers(trajectory.size))
+    trajectory.noise = runner.noise_draws.submit(
+        runner.media_builder.draw,
+        trajectory.tensors["denoising"],
+        seed=media.seed,
+    )
+
+
 def execute(
     call: Call,
     *,
@@ -542,24 +592,7 @@ def execute(
         model_runner, media, len(request.request.admission.prompt_token_ids)
     )
 
-    trajectory = request.request.diffusion
-    if trajectory is None:
-        trajectory = VideoState(
-            size=numerical_shape,
-            schedules=dict(
-                model_runner.media_builder.schedules(
-                    device=model_runner.worker_config.device
-                )
-            ),
-        )
-        request.request.diffusion = trajectory
-    if (
-        not isinstance(trajectory, VideoState)
-        or trajectory.size != numerical_shape
-    ):
-        raise invalid_descriptor(
-            "video request changed its admitted numerical dimensions"
-        )
+    trajectory = video_state(model_runner, request.request)
 
     slot, context = prepare_call(
         model_runner,
@@ -596,10 +629,13 @@ def execute(
             )
 
         encoded = conditioning.tensor
+        if trajectory.noise is None:
+            model_runner.media_builder.draw(slot, seed=media.seed)
+        else:
+            trajectory.noise.result()
         initial = model_runner.media_builder.initialize(
             numerical_shape,
             slot,
-            seed=media.seed,
             constants=context.constants,
             workspace=context.workspace,
         )

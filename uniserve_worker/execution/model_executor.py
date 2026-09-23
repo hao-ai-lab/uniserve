@@ -6,6 +6,7 @@ import logging
 import time
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from functools import partial
@@ -267,6 +268,16 @@ class ModelExecutor:
                                 binding.device
                             ),
                         )
+            # A rank that denoises draws each request's seeded CPU noise on
+            # its own thread, off the service thread that launches device
+            # work, as soon as the request is admitted.
+            self.noise_draws = (
+                ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="worker-noise"
+                )
+                if self.denoising is not None
+                else None
+            )
         except BaseException as error:
             try:
                 self.close(aborted=True)
@@ -1116,6 +1127,12 @@ class ModelExecutor:
         if self._closed:
             return
         self._closed = True
+
+        # A draw writes request storage, so it completes before its owners
+        # release anything; an aborted release leaves it running until exit.
+        noise_draws = getattr(self, "noise_draws", None)
+        if noise_draws is not None:
+            noise_draws.shutdown(wait=not aborted, cancel_futures=True)
 
         if aborted:
             from uniserve.runtime.resources import retain_until_exit

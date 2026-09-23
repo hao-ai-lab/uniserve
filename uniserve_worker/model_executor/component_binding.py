@@ -14,18 +14,6 @@ from uniserve_worker.config.deployment import ComponentConfig
 from uniserve_worker.protocol.call import CallKind
 
 
-def capture_required(
-    missing: bool, groups: tuple[Communicator, ...], device: torch.device
-) -> bool:
-    """Coordinate first-use work over the numerical communication groups."""
-    if not groups:
-        return missing
-    decision = torch.tensor(int(missing), dtype=torch.int32, device=device)
-    for group in groups:
-        group.all_reduce(decision, op="max")
-    return bool(decision.item())
-
-
 @dataclass(frozen=True, slots=True)
 class Call:
     """A borrowed capability method and its numerical participation groups."""

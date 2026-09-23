@@ -82,24 +82,39 @@ class MediaBuilder:
         )
 
     @torch.inference_mode()
+    def draw(self, tensors: Mapping[str, torch.Tensor], *, seed: int) -> None:
+        """Fill the request's CPU noise with its seeded draw.
+
+        The draw depends only on the seed and the admitted size, so it can
+        run on another thread before the request's latents are prepared.
+        """
+        # The denoiser's numerical calls batch over leading size 1.
+        normal_noise(
+            (seed,),
+            out=tuple(
+                tensors[f"{name}_noise"].unsqueeze(0)
+                for name in self.denoiser.modalities
+            ),
+        )
+
+    @torch.inference_mode()
     def initialize(
         self,
         size,
         tensors: Mapping[str, torch.Tensor],
         *,
-        seed: int,
         constants: Mapping[str, torch.Tensor],
         workspace: Mapping[str, torch.Tensor],
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
-        """Fill CPU sources and return destination/source pairs for staging."""
+        """Fill CPU sources from the drawn noise.
+
+        Returns destination/source pairs for staging.
+        """
         names = self.denoiser.modalities
-        # The denoiser's numerical calls batch over leading size 1.
         noise = {name: tensors[f"{name}_noise"].unsqueeze(0) for name in names}
         source = {
             name: tensors[f"{name}_source"].unsqueeze(0) for name in names
         }
-
-        normal_noise((seed,), out=tuple(noise.values()))
         self.denoiser.prepare_latents(
             (size,),
             noise=noise,

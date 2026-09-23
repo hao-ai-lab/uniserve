@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from concurrent.futures import wait
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -328,6 +329,11 @@ class RequestPool:
             raise RuntimeError(
                 "request retirement requires closed, completed execution"
             )
+        # A noise draw started at admission writes the slot's storage; the
+        # slot is reused only after it ends, whatever its outcome.
+        noise = getattr(row.diffusion, "noise", None)
+        if noise is not None:
+            wait((noise,))
         row.pending_calls.clear()
         row.diffusion = None
         row.retired = True
