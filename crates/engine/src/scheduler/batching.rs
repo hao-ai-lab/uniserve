@@ -470,7 +470,7 @@ impl Scheduler {
             Phase::CloseKv => CallKind::Forward(ForwardMode::Prefill),
             Phase::PublishKv => CallKind::Transfer(TransferMode::KvPublish),
             Phase::PrepareGen => CallKind::Media(MediaCall::LatentPreparation),
-            Phase::DenoiseGen if st.num_completed_denoise_steps >= st.req.image.steps => {
+            Phase::DenoiseGen if st.denoising.is_complete() => {
                 CallKind::Media(MediaCall::ImageDecoding)
             }
             Phase::DenoiseGen => CallKind::Media(MediaCall::Denoising),
@@ -601,9 +601,7 @@ impl Scheduler {
         };
         let start_step = match call.code {
             CallKind::Media(MediaCall::LatentPreparation) => Some(0),
-            CallKind::Media(MediaCall::Denoising) => {
-                self.num_scheduled_denoise_steps(request_id).map(u32::from)
-            }
+            CallKind::Media(MediaCall::Denoising) => self.num_scheduled_denoise_steps(request_id),
             CallKind::Media(MediaCall::ImageDecoding) => self
                 .running
                 .get(&request_id)
@@ -829,13 +827,20 @@ impl Scheduler {
                 self.fatal = true;
                 return None;
             };
-            let page_table = state
-                .allocations()
-                .latent
-                .as_ref()
-                .map(|allocation| allocation.pages.clone())
-                .unwrap_or_default();
-            let latent_units = self.worker_image_latent_units_for(state).max(1);
+            let placement = LatentPlacement {
+                page_table: state
+                    .allocations()
+                    .latent
+                    .as_ref()
+                    .map(|allocation| allocation.pages.clone())
+                    .unwrap_or_default(),
+                latent_units: self
+                    .worker_image_latent_units_for(state)
+                    .max(1)
+                    .min(u64::from(u32::MAX)) as u32,
+                height: state.req.image.height,
+                width: state.req.image.width,
+            };
             let Some(start_step) = start_step else {
                 tracing::error!(
                     request_id = request_id.0,
@@ -845,21 +850,20 @@ impl Scheduler {
                 self.fatal = true;
                 return None;
             };
+            // A denoising call declares its planned step count as its token
+            // bound; the interval repeats it for the worker.
             let step_count = if call.code == CallKind::Media(MediaCall::Denoising) {
                 call.bounds.max_tokens
             } else {
                 0
             };
-            latent = Some(LatentParams {
-                request_key: call.request_key,
-                call_id: call.call_id,
-                page_table,
-                latent_units: latent_units.min(u64::from(u32::MAX)) as u32,
-                height: state.req.image.height,
-                width: state.req.image.width,
+            latent = Some(Denoising::params(
+                call.request_key,
+                call.call_id,
+                &placement,
                 start_step,
                 step_count,
-            });
+            ));
         }
 
         let (worker, entry) =
@@ -877,7 +881,7 @@ impl Scheduler {
                 } else {
                     None
                 },
-                start_step: latent.as_ref().map(|input| input.start_step),
+                latent: latent.clone(),
             },
             submitted_us.saturating_sub(planned_us),
         );
@@ -1151,16 +1155,15 @@ impl Scheduler {
                 // Each scheduled interval consumes only the remaining model steps.
                 // Accepted completion remains separately tracked on the request.
                 let st = self.running.get(&id)?;
-                let timestep = self.num_scheduled_denoise_steps(id)?;
-                let remaining = st.req.image.steps.saturating_sub(timestep);
-                if remaining == 0 {
-                    return None;
-                }
-                let denoise_step_count = self.denoise_step_burst.max(1).min(remaining);
+                let scheduled = self.num_scheduled_denoise_steps(id)?;
+                let (_, count) = st
+                    .denoising
+                    .next(scheduled, u32::from(self.denoise_step_burst))?;
+                let denoise_step_count = u16::try_from(count).ok()?;
                 let conditioning = self.kv_conditioning(id)?;
                 let latent = self
                     .pending_output(id, |call| call.latent_output.as_ref())
-                    .or(self.running.get(&id)?.image_latent.as_ref())
+                    .or(self.running.get(&id)?.denoising.latent())
                     .cloned()?;
                 self.plan_computation(id, |scheduler, request| {
                     generation::plan_diffusion_step(
@@ -1176,7 +1179,7 @@ impl Scheduler {
             Phase::CommitGen => {
                 let latent = self
                     .pending_output(id, |call| call.latent_output.as_ref())
-                    .or(self.running.get(&id)?.image_latent.as_ref())
+                    .or(self.running.get(&id)?.denoising.latent())
                     .cloned()?;
                 self.plan_computation(id, |_scheduler, request| {
                     generation::plan_diffusion_finalize(request, latent)

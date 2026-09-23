@@ -81,9 +81,8 @@ impl Scheduler {
             image_id: 0,
             num_generated_images: 0,
             image_reservation_pending: false,
-            num_completed_denoise_steps: 0,
+            denoising: Denoising::new(u32::from(req.image.steps)),
             image_conditioning: None,
-            image_latent: None,
             feedback_encoder_index: 0,
             feedback_source: None,
             feedback_features: None,
@@ -438,6 +437,7 @@ impl Scheduler {
             )
             .expect("validated media admission");
             let root = CallId::new(0, 0);
+            let steps = submission.request.sampling.num_inference_steps;
             let mut state = MediaFlowState {
                 request: submission.request,
                 output: output::EventJournal::new(submission.event_tx),
@@ -455,8 +455,7 @@ impl Scheduler {
                 admission_state: WorkerRegistration::Unsubmitted,
                 text_encoding_scheduled: false,
                 latent_preparation_scheduled: false,
-                num_scheduled_steps: 0,
-                num_completed_steps: 0,
+                denoising: Denoising::new(steps),
                 scheduled_decode_units: 0,
                 scheduled_encode_units: 0,
                 encoded_video_units: 0,

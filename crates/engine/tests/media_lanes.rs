@@ -67,6 +67,24 @@ fn output(name: &str, units: Option<u32>) -> OutputInfo {
     }
 }
 
+/// A decoded media unit result as a video decoder declares it: units along a
+/// device-actual leading axis, then frames, height, width and RGB channels.
+fn media_units(name: &str, units: u32) -> OutputInfo {
+    OutputInfo {
+        name: name.to_owned(),
+        dtype: DType::U8,
+        shape_bound: ShapeBound {
+            dims: vec![
+                DimBound::Device { max: units },
+                DimBound::Static(4),
+                DimBound::Static(16),
+                DimBound::Static(24),
+                DimBound::Static(3),
+            ],
+        },
+    }
+}
+
 /// A video worker whose text encoder, denoiser, audio decoder and muxer live on
 /// rank 0 and whose video decoder and video encoder are distributed over
 /// `decoder_ranks` ranks, each reconstructing and encoding one media unit per
@@ -105,7 +123,7 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
             "video_decoder",
             (0..decoder_ranks).collect(),
             true,
-            vec![output("units", Some(32))],
+            vec![media_units("units", 32)],
         ),
         component(
             "video_encoder",

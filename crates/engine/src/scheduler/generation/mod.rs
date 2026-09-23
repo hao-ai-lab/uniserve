@@ -9,7 +9,7 @@ use crate::kv::BlockTable;
 
 use std::collections::HashSet;
 use uniserve_worker_ipc::{
-    CallCoordinates, DEFAULT_COMPONENT, ForwardMode, MediaCall, TransferMode,
+    CallCoordinates, DEFAULT_COMPONENT, ForwardMode, LatentParams, MediaCall, TransferMode,
 };
 
 use uniserve_core::{GenerationRequest, ImageIngestStep, RequestId, SamplingParams};
@@ -165,6 +165,7 @@ impl RequestState {
     pub(crate) fn process_generation_result(
         &mut self,
         call: &Call,
+        latent: Option<&LatentParams>,
         record: &RequestOutput,
     ) -> Result<(), GenerationResultError> {
         if call.call_id.batch_id == 0 {
@@ -236,23 +237,32 @@ impl RequestState {
             }
             CallKind::Media(MediaCall::LatentPreparation)
             | CallKind::Media(MediaCall::Denoising) => {
-                self.image_latent = call.latent_output.clone();
-                if self.image_latent.is_none() {
+                if call.latent_output.is_none() {
                     return Err(GenerationResultError::MissingLatentProduct);
                 }
                 if call.code == CallKind::Media(MediaCall::LatentPreparation) {
-                    self.num_completed_denoise_steps = 0;
+                    self.denoising.open(call.latent_output.clone());
                     self.phase = GenerationPhase::DenoiseGen;
                 } else {
-                    self.num_completed_denoise_steps =
-                        record.num_completed_steps.min(u32::from(u16::MAX)) as u16;
+                    let accepted = latent.is_some_and(|interval| {
+                        self.denoising.accept(
+                            interval,
+                            record.num_completed_steps,
+                            call.latent_output.clone(),
+                        )
+                    });
+                    if !accepted {
+                        return Err(GenerationResultError::Progress {
+                            detail: "denoise_step_mismatch",
+                        });
+                    }
                     self.replayable = false;
                 }
             }
             CallKind::Media(MediaCall::ImageDecoding) => {
                 // Decoding the artifact releases the trajectory, so the request
                 // leaves the flow and its next call enters at step zero.
-                self.num_completed_denoise_steps = 0;
+                self.denoising.close();
                 self.feedback_source = call.image_output.clone();
                 self.feedback_encoder_index = 0;
                 self.feedback_features = None;
@@ -718,7 +728,7 @@ pub(super) fn register_call(
 pub(crate) fn validate_generation_result(
     call: &Call,
     image_kv: Option<(u32, Option<u32>)>,
-    start_step: Option<u32>,
+    latent: Option<&LatentParams>,
     state: &RequestState,
     record: &RequestOutput,
     media: Option<&uniserve_core::SharedMedia>,
@@ -752,12 +762,10 @@ pub(crate) fn validate_generation_result(
         });
     }
     if call.code == CallKind::Media(MediaCall::Denoising) {
-        let expected_step = start_step
-            .ok_or(GenerationResultError::Progress {
-                detail: "denoise_input_step_missing",
-            })?
-            .saturating_add(call.bounds.max_tokens);
-        if record.num_completed_steps != expected_step {
+        let interval = latent.ok_or(GenerationResultError::Progress {
+            detail: "denoise_input_step_missing",
+        })?;
+        if !super::Denoising::completes(interval, record.num_completed_steps) {
             return Err(GenerationResultError::Progress {
                 detail: "denoise_step_mismatch",
             });
@@ -1023,10 +1031,10 @@ pub(crate) struct RequestState {
     pub(super) image_id: u32,
     pub(super) num_generated_images: usize,
     pub(super) image_reservation_pending: bool,
-    pub(super) num_completed_denoise_steps: u16,
+    /// Solver progress of the current image's latent trajectory.
+    pub(super) denoising: super::Denoising,
     /// Exact generations retained for conditioning, denoising, and feedback.
     pub(super) image_conditioning: Option<uniserve_worker_ipc::BufferId>,
-    pub(super) image_latent: Option<TensorRef>,
     pub(super) feedback_encoder_index: usize,
     pub(super) feedback_source: Option<TensorRef>,
     pub(super) feedback_features: Option<TensorRef>,

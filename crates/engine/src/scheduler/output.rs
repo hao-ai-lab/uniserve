@@ -530,8 +530,8 @@ impl Scheduler {
                 let sd = self
                     .running
                     .get(&id)
-                    .map(|s| s.num_completed_denoise_steps)
-                    .unwrap_or(0);
+                    .map_or(0, |s| s.denoising.completed())
+                    .min(u32::from(u16::MAX)) as u16;
 
                 if prev_sd == 0 && sd >= 1 {
                     self.emit(
@@ -827,7 +827,7 @@ impl Scheduler {
         if let Some(st) = self.running.get_mut(&id) {
             st.speculative_chain_invalidated |= has_unresolved_descendants;
 
-            st.num_completed_denoise_steps = 0;
+            st.denoising.close();
             st.image_id += 1;
             st.text_tokens_since_image = 0;
             st.phase = Phase::CloseKv;
@@ -1051,7 +1051,7 @@ impl Scheduler {
                 generated_tokens = state.num_generated_tokens,
                 images_done = state.num_generated_images,
                 image_id = state.image_id,
-                denoise_steps_done = state.num_completed_denoise_steps,
+                denoise_steps_done = state.denoising.completed(),
                 logical_position = state.logical_position,
                 physical_kv_len = state.kv_visible_len,
                 "scheduler request terminated with an internal error"
