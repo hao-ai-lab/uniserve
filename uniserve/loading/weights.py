@@ -133,6 +133,11 @@ def _source_names(weight):
             *_source_names(weight.values),
             *_source_names(weight.block_scale),
             *_source_names(weight.tensor_scale),
+            *(
+                ()
+                if weight.activation_scale is None
+                else _source_names(weight.activation_scale)
+            ),
         }
     return {weight.name}
 
@@ -152,6 +157,9 @@ def _source_identity(weight):
             _source_identity(weight.values),
             _source_identity(weight.block_scale),
             _source_identity(weight.tensor_scale),
+            None
+            if weight.activation_scale is None
+            else _source_identity(weight.activation_scale),
             weight.dtype,
         )
     return id(weight)

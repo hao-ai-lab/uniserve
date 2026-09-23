@@ -202,3 +202,6 @@ def checkpoint_mappings(model: Model):
 
 
 precisions = MappingProxyType({"bf16": weights.Config()})
+
+# Dense modules of a calibrated checkpoint keep its stored representation.
+checkpoint_precision = precisions["bf16"]

@@ -3,7 +3,12 @@
 from .config import Config, config_sources, read_config
 from .model import Model, entry_points
 from .transformer import Attention, MoE, Transformer, TransformerLayer
-from .weights import checkpoint_mappings, checkpoint_sources, precisions
+from .weights import (
+    checkpoint_mappings,
+    checkpoint_precision,
+    checkpoint_sources,
+    precisions,
+)
 
 image_processor = None
 flow_prompt = None
@@ -23,4 +28,5 @@ __all__ = [
     "checkpoint_sources",
     "checkpoint_mappings",
     "precisions",
+    "checkpoint_precision",
 ]

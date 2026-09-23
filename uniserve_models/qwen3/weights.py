@@ -23,6 +23,9 @@ precisions = MappingProxyType(
     {"bf16": weights.Config(), "fp16": weights.Config(dtype=torch.float16)}
 )
 
+# Dense modules of a calibrated checkpoint keep its stored representation.
+checkpoint_precision = precisions["bf16"]
+
 
 def parameter_sources(config: Config) -> Mapping[str, str]:
     """Map complete logical Qwen parameters to checkpoint names before partitioning."""  # noqa: E501
