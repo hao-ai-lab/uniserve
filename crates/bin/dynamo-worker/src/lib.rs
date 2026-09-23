@@ -31,7 +31,7 @@ use uniserve_engine::{
     SchedulingPolicy, WorkerConfig, WorkerProcessArgs,
 };
 use uniserve_server::{
-    AppState, Config, EngineSettings, HttpListenerMode,
+    AppState, Config, EngineSettings, HttpListenerMode, ModelDescription,
     openai::{VideoGenerationRequest, serve_error_to_api},
     serving::{FinishStatus, RequestOutput, ServeRequestId},
 };
@@ -169,9 +169,15 @@ impl DynamoFastH3Engine {
     }
 
     async fn build_state(&self) -> Result<Arc<AppState>, DynamoError> {
-        // Video checkpoints publish a root manifest in place of config.json;
-        // refuse anything else before a rank starts.
-        if !uniserve_server::profile::assets::is_media_checkpoint(&self.args.model_path).await {
+        // A MiniMax H3 checkpoint names its pipeline class in a root index in
+        // place of config.json; refuse anything else before a rank starts.
+        let pipeline =
+            uniserve_server::profile::assets::resolve_pipeline_index(&self.args.model_path)
+                .await
+                .map_err(|error| invalid_argument(error.to_string()))?;
+        if pipeline.and_then(|index| ModelDescription::from_pipeline_class(&index.class_name))
+            != Some(ModelDescription::MiniMaxH3)
+        {
             return Err(invalid_argument(
                 "model-path is not a FastH3 video-generation checkpoint",
             ));

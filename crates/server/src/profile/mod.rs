@@ -36,6 +36,9 @@ pub enum ModelDescription {
 }
 
 impl ModelDescription {
+    /// Every served model family.
+    const ALL: [Self; 4] = [Self::Qwen3, Self::SenseNova, Self::Bagel, Self::MiniMaxH3];
+
     /// Returns the stable profile identifier.
     pub const fn id(self) -> &'static str {
         match self {
@@ -46,13 +49,23 @@ impl ModelDescription {
         }
     }
 
-    /// Returns the model-family identifier.
-    const fn model_type(self) -> &'static str {
+    /// Returns the `model_type` a root `config.json` declares for this family,
+    /// or `None` for a family that ships as a diffusers pipeline.
+    const fn model_type(self) -> Option<&'static str> {
         match self {
-            Self::Qwen3 => "qwen3",
-            Self::SenseNova => "neo_chat",
-            Self::Bagel => "bagel",
-            Self::MiniMaxH3 => "minimax_h3",
+            Self::Qwen3 => Some("qwen3"),
+            Self::SenseNova => Some("neo_chat"),
+            Self::Bagel => Some("bagel"),
+            Self::MiniMaxH3 => None,
+        }
+    }
+
+    /// Returns the pipeline class a family that ships as a diffusers pipeline
+    /// declares in its root index.
+    const fn pipeline_class(self) -> Option<&'static str> {
+        match self {
+            Self::MiniMaxH3 => Some("MiniMaxH3ModularPipeline"),
+            Self::Qwen3 | Self::SenseNova | Self::Bagel => None,
         }
     }
 
@@ -62,9 +75,16 @@ impl ModelDescription {
     /// checkpoint UniServe does not implement is rejected here rather than
     /// mismatching a separately supplied name.
     pub fn from_model_type(model_type: &str) -> Option<Self> {
-        [Self::Qwen3, Self::SenseNova, Self::Bagel, Self::MiniMaxH3]
+        Self::ALL
             .into_iter()
-            .find(|description| description.model_type() == model_type)
+            .find(|description| description.model_type() == Some(model_type))
+    }
+
+    /// Resolves the served profile from a pipeline checkpoint's `_class_name`.
+    pub fn from_pipeline_class(class_name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|description| description.pipeline_class() == Some(class_name))
     }
 }
 
@@ -170,10 +190,13 @@ impl ModelConfig {
                 ModelParameters::SenseNova(SenseNovaProfile::resolve(tokenizer)?)
             }
             ModelDescription::Bagel => ModelParameters::Bagel(BagelProfile::resolve(tokenizer)?),
-            ModelDescription::MiniMaxH3 => ModelParameters::MiniMaxH3 {
-                max_video_seconds: 15.0,
-                num_inference_steps: 4,
-            },
+            // `from_model_type` resolves only families described by a root
+            // configuration; a pipeline family resolves through `from_pipeline`.
+            ModelDescription::MiniMaxH3 => {
+                return Err(assets::Error::UnsupportedModelType {
+                    actual: actual_model_type.to_owned(),
+                });
+            }
         };
         Ok(Self {
             served_name: model_id.to_owned(),
@@ -182,6 +205,43 @@ impl ModelConfig {
             max_model_tokens: max_model_tokens.or(model_config.max_position_embeddings()),
             primary_eos_token_id,
             eos_token_ids,
+        })
+    }
+
+    /// Resolves a family that ships as a diffusers pipeline.
+    ///
+    /// A pipeline checkpoint has no root generation or tokenizer metadata, and
+    /// its denoising step count belongs to the loaded numerical plan, which the
+    /// worker handshake binds. `max_model_tokens` overrides the family's prompt
+    /// bound.
+    pub fn from_pipeline(
+        model_id: &str,
+        description: ModelDescription,
+        max_video_seconds: f64,
+        max_model_tokens: Option<u32>,
+    ) -> assets::Result<Self> {
+        let (parameters, default_max_model_tokens) = match description {
+            // MiniMax H3's text encoder serves prompts of up to 16,384 tokens.
+            ModelDescription::MiniMaxH3 => (
+                ModelParameters::MiniMaxH3 {
+                    max_video_seconds,
+                    num_inference_steps: 0,
+                },
+                16_384,
+            ),
+            ModelDescription::Qwen3 | ModelDescription::SenseNova | ModelDescription::Bagel => {
+                return Err(assets::Error::UnsupportedPipeline {
+                    class_name: description.id().to_owned(),
+                });
+            }
+        };
+        Ok(Self {
+            served_name: model_id.to_owned(),
+            parameters,
+            sampling_defaults: SamplingDefaults::default(),
+            max_model_tokens: Some(max_model_tokens.unwrap_or(default_max_model_tokens)),
+            primary_eos_token_id: None,
+            eos_token_ids: BTreeSet::new(),
         })
     }
 
@@ -356,6 +416,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_pipeline_family_resolves_from_its_pipeline_class() {
+        assert_eq!(
+            ModelDescription::from_pipeline_class("MiniMaxH3ModularPipeline"),
+            Some(ModelDescription::MiniMaxH3)
+        );
+        assert_eq!(ModelDescription::from_model_type("minimax_h3"), None);
+
+        let profile =
+            ModelConfig::from_pipeline("h3", ModelDescription::MiniMaxH3, 15.0, None).unwrap();
+        assert_eq!(profile.description(), ModelDescription::MiniMaxH3);
+        assert_eq!(profile.max_model_tokens, Some(16_384));
     }
 
     #[test]

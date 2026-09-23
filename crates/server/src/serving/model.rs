@@ -8,11 +8,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::EngineSettings;
-use crate::profile::assets::{ResolvedModelFiles, is_media_checkpoint, resolve_model_file};
+use crate::profile::assets::{ResolvedModelFiles, resolve_model_file, resolve_pipeline_index};
 use crate::profile::omni::bagel::BagelProfile;
 use crate::profile::omni::sensenova::SenseNovaProfile;
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
-use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
+use crate::profile::{ModelConfig, ModelDescription, ModelParameters};
 use thiserror::Error;
 use uniserve_core::{
     CachePolicy, GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest,
@@ -214,30 +214,30 @@ impl ModelConfig {
             .served_model_name
             .clone()
             .unwrap_or_else(|| config.model.clone());
-        // A video checkpoint declares itself with its inference manifest rather
-        // than a root `config.json`, so the manifest selects this profile before
-        // any diffusion asset is resolved. The denoise-step count is a property
-        // of the loaded numerical plan and is bound from the worker handshake
-        // once the engine reports it.
-        if is_media_checkpoint(&config.model).await {
-            let tokenizer_path =
-                resolve_model_file(&config.model, "tokenizer/tokenizer.json").await?;
+        // A diffusers pipeline declares its class and component folders in a
+        // root index rather than a root `config.json`, so the index selects the
+        // profile and locates the tokenizer component before any other asset
+        // is resolved.
+        if let Some(index) = resolve_pipeline_index(&config.model).await? {
+            let description =
+                ModelDescription::from_pipeline_class(&index.class_name).ok_or_else(|| {
+                    crate::profile::assets::Error::UnsupportedPipeline {
+                        class_name: index.class_name.clone(),
+                    }
+                })?;
+            let tokenizer_path = resolve_model_file(
+                &config.model,
+                &index.component_file("tokenizer", "tokenizer.json")?,
+            )
+            .await?;
             let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&tokenizer_path)?);
-            return Ok((
-                Self {
-                    served_name,
-                    parameters: ModelParameters::MiniMaxH3 {
-                        max_video_seconds: config.engine.max_video_seconds,
-                        num_inference_steps: 0,
-                    },
-                    sampling_defaults: SamplingDefaults::default(),
-                    max_model_tokens: Some(config.engine.max_model_len.unwrap_or(16_384)),
-                    primary_eos_token_id: None,
-                    eos_token_ids: Default::default(),
-                },
-                tokenizer,
-                None,
-            ));
+            let model = Self::from_pipeline(
+                &served_name,
+                description,
+                config.engine.max_video_seconds,
+                config.engine.max_model_len,
+            )?;
+            return Ok((model, tokenizer, None));
         }
         let files = ResolvedModelFiles::new(&config.model).await?;
         let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path)?);

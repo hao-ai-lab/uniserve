@@ -52,7 +52,7 @@ export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2-NVFP4
 hf download skx618/FastVideo-FastH3-8-Step-V2-NVFP4 --local-dir "$H3_MODEL"
 ```
 
-Pass the model root containing `modular_model_index.json`, `fastvideo_inference.json`, `transformer/`, `text_encoder/`, `vae/`, `audio_vae/`, `scheduler/`, `audio_scheduler/`, and `tokenizer/`. A packed NVFP4 root also contains `modelopt_manifest.json`. The server recognizes a FastH3 deployment by the presence of `fastvideo_inference.json`, and that manifest must match one of the checkpoints above.
+Pass the model root containing `modular_model_index.json`, `fastvideo_inference.json`, `transformer/`, `text_encoder/`, `vae/`, `audio_vae/`, `scheduler/`, `audio_scheduler/`, and `tokenizer/`. A packed NVFP4 root also contains `modelopt_manifest.json`. The server identifies the model from the pipeline class that `modular_model_index.json` declares and reads the tokenizer from the component folder the index names; the loader then requires `fastvideo_inference.json` to match one of the checkpoints above.
 
 ## Start the server
 

@@ -40,36 +40,13 @@ impl ResolvedModelFiles {
     }
 }
 
-/// Name of the manifest a video-generation checkpoint publishes at its root.
-///
-/// Media checkpoints ship component directories instead of a root
-/// `config.json`, so this manifest is what identifies the family before any
-/// component is resolved.
-const MEDIA_CHECKPOINT_MANIFEST: &str = "fastvideo_inference.json";
-
-/// Reports whether `model_id` resolves to a video-generation checkpoint.
-///
-/// A local directory is probed directly; a Hub repository is probed through the
-/// same cache-then-download path used for any other required file. A repository
-/// that does not publish the manifest is simply not a media checkpoint, so a
-/// resolution failure here is not an error.
-pub async fn is_media_checkpoint(model_id: &str) -> bool {
-    let local = Path::new(model_id);
-    if local.is_dir() {
-        return local.join(MEDIA_CHECKPOINT_MANIFEST).is_file();
-    }
-    resolve_model_file(model_id, MEDIA_CHECKPOINT_MANIFEST)
-        .await
-        .is_ok()
-}
-
 /// Resolves one required file from a local model directory, the local Hub cache, or the Hub.
-pub async fn resolve_model_file(model_id: &str, filename: &'static str) -> Result<PathBuf> {
+pub async fn resolve_model_file(model_id: &str, filename: &str) -> Result<PathBuf> {
     let local = Path::new(model_id);
     if local.is_dir() {
         return local_file_if_exists(local, filename).ok_or_else(|| Error::MissingFile {
             model: local.display().to_string(),
-            file: filename,
+            file: filename.to_owned(),
         });
     }
     let cache_repo = Cache::from_env().model(model_id.to_string());
@@ -85,7 +62,7 @@ fn resolve_local_model_files(model_dir: &Path) -> Result<ResolvedModelFiles> {
     let tokenizer_path =
         local_file_if_exists(model_dir, "tokenizer.json").ok_or_else(|| Error::MissingFile {
             model: model_dir.display().to_string(),
-            file: "tokenizer.json",
+            file: "tokenizer.json".to_owned(),
         })?;
     Ok(ResolvedModelFiles {
         tokenizer_path,
@@ -113,7 +90,7 @@ async fn resolve_remote_model_files(model_id: &str) -> Result<ResolvedModelFiles
     if !siblings.contains("tokenizer.json") {
         return Err(Error::MissingFile {
             model: model_id.to_owned(),
-            file: "tokenizer.json",
+            file: "tokenizer.json".to_owned(),
         });
     }
     let tokenizer_path = download_known_file(&repo, model_id, "tokenizer.json").await?;

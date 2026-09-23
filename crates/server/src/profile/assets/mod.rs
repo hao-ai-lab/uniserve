@@ -4,10 +4,12 @@
 pub mod config;
 pub mod error;
 pub mod model_files;
+pub mod pipeline_index;
 
 pub use config::{
     GenerationConfig, HfSpecialTokens, HfTokenizerConfig, ModelConfig, NamedSpecialToken,
     OneOrManyTokenIds, load_generation_config, load_model_config, load_tokenizer_config,
 };
 pub use error::{Error, Result};
-pub use model_files::{ResolvedModelFiles, is_media_checkpoint, resolve_model_file};
+pub use model_files::{ResolvedModelFiles, resolve_model_file};
+pub use pipeline_index::{PipelineIndex, resolve_pipeline_index};
