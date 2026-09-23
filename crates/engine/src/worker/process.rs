@@ -247,6 +247,23 @@ impl WorkerProcessArgs {
         )
     }
 
+    /// Returns the number of ranks in this group.
+    fn world_size(&self) -> u32 {
+        self.ranks.len() as u32
+    }
+
+    /// Names the channel mechanism `rank` serves its endpoint over.
+    ///
+    /// A rank on the head's host can offer shared storage; a rank placed
+    /// elsewhere has none to offer and serves a socket.
+    fn channel_transport(&self, rank: u32) -> &'static str {
+        if self.ranks[rank as usize].node == self.host {
+            uniserve_worker_ipc::SHARED_STORAGE_CHANNEL
+        } else {
+            uniserve_worker_ipc::SOCKET_CHANNEL
+        }
+    }
+
     /// Builds the typed launch descriptor the worker process consumes.
     ///
     /// Every tuning value is stated explicitly, so the launching side is the
@@ -255,40 +272,58 @@ impl WorkerProcessArgs {
     /// identity and endpoint travel on argv.
     fn launch_descriptor(
         &self,
-        device: &str,
         rank: u32,
-        world_size: u32,
         registration: &str,
-        components: &std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
-        transfer_backends: &str,
-        publish_backends: &str,
         rendezvous: Option<&str>,
         rendezvous_listen_fd: Option<std::os::fd::RawFd>,
-        channel_transport: &str,
-        acknowledgment_slot: u32,
-        host_slots: &[u32],
-        products_cross_hosts: bool,
     ) -> anyhow::Result<serde_json::Value> {
         let depth = self.queue_depth.max(1);
         let max_payload = self.req_slot_cap.max(self.resp_slot_cap).max(1);
+        // Resolve mechanism ownership from the physical rank's incident edges.
+        let (transfer_backends, publish_backends) =
+            self.transfer.rank_backends(&self.worker_id, rank);
+        let names = |backends: &std::collections::BTreeSet<crate::executor::TransferBackend>| {
+            backends
+                .iter()
+                .map(|backend| backend.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         let mut fields = serde_json::Map::new();
         fields.insert("worker_id".into(), json!(self.worker_id));
         fields.insert("registration_address".into(), json!(registration));
         // The placement decides the mechanism and the rank names the endpoint:
         // a rank on the head's host can offer shared storage, a rank elsewhere
         // cannot, and only the head knows where a rank was placed.
-        fields.insert("channel_transport".into(), json!(channel_transport));
-        // A consumer writes its own slot's word in every chunk or segment it
-        // reads; the slots a producer watches travel on each producing call.
-        fields.insert("acknowledgment_slot".into(), json!(acknowledgment_slot));
+        fields.insert(
+            "channel_transport".into(),
+            json!(self.channel_transport(rank)),
+        );
+        // A rank cannot name the ranks that read what it publishes: it knows
+        // its own component, not which component consumes its products, and a
+        // product is consumed in a later batch than the one producing it. The
+        // head states a product's readers on the call that produces it and
+        // gives the rank its own slot here. A consumer writes its own slot's
+        // word in every chunk or segment it reads; the slots a producer
+        // watches travel on each producing call.
+        fields.insert(
+            "acknowledgment_slot".into(),
+            json!(self.transfer.acknowledgment_slot(&self.worker_id, rank)),
+        );
         // Which of those slots are on this rank's host decides the mechanism
         // a host product is published over: shared storage reaches the host,
         // the rank channel reaches the rest.
-        fields.insert("host_slots".into(), json!(host_slots));
+        fields.insert(
+            "host_slots".into(),
+            json!(self.transfer.host_slots(&self.worker_id, rank)),
+        );
         // Readiness is a producer synchronize only where an interprocess event
         // cannot carry it, which is exactly where a consumer is on another
         // host. Only the placement knows that.
-        fields.insert("products_cross_hosts".into(), json!(products_cross_hosts));
+        fields.insert(
+            "products_cross_hosts".into(),
+            json!(self.transfer.products_cross_hosts(&self.worker_id, rank)),
+        );
         fields.insert("queue_depth".into(), json!(depth));
         fields.insert("ipc_payload_cap".into(), json!(max_payload));
         fields.insert("model".into(), json!(self.model));
@@ -297,11 +332,11 @@ impl WorkerProcessArgs {
         if let Some(identity) = &self.checkpoint_identity {
             fields.insert("checkpoint_identity".into(), json!(identity));
         }
-        fields.insert("device".into(), json!(device));
+        fields.insert("device".into(), json!(self.ranks[rank as usize].device));
         fields.insert("rank".into(), json!(rank));
         fields.insert("local_rank".into(), json!(self.host_slot(rank).0));
-        fields.insert("world_size".into(), json!(world_size));
-        fields.insert("components".into(), serde_json::to_value(components)?);
+        fields.insert("world_size".into(), json!(self.world_size()));
+        fields.insert("components".into(), serde_json::to_value(&self.components)?);
         fields.insert(
             "supported_calls".into(),
             if self.capability_groups.is_empty() {
@@ -310,8 +345,8 @@ impl WorkerProcessArgs {
                 json!(self.capability_groups.join(","))
             },
         );
-        fields.insert("transfer_backends".into(), json!(transfer_backends));
-        fields.insert("publish_backends".into(), json!(publish_backends));
+        fields.insert("transfer_backends".into(), json!(names(&transfer_backends)));
+        fields.insert("publish_backends".into(), json!(names(&publish_backends)));
         // Every rank of a group connects to the collective store at this
         // address. The group's first rank serves it on the socket it inherits
         // at the named descriptor rather than binding the port itself; a
@@ -482,37 +517,17 @@ impl PendingRank {
     /// process keeps no copy.
     pub(crate) fn spawn_rank(
         args: &WorkerProcessArgs,
-        device: &str,
         rank: u32,
-        world_size: u32,
         rendezvous: Option<&str>,
         store_listener: Option<std::net::TcpListener>,
-        channel_transport: &str,
         remote: Option<&mut super::launcher::RemoteHost<'_>>,
-        components: &std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
         startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
         registration: &str,
     ) -> anyhow::Result<Self> {
         let depth = args.queue_depth.max(1);
         let max_payload = args.req_slot_cap.max(args.resp_slot_cap).max(1);
+        let world_size = args.world_size();
 
-        // Resolve mechanism ownership from the physical rank's incident edges.
-        let (backends, publications) = args.transfer.rank_backends(&args.worker_id, rank);
-        // A rank cannot name the ranks that read what it publishes: it knows
-        // its own component, not which component consumes its products, and a
-        // product is consumed in a later batch than the one producing it. The
-        // head states a product's readers on the call that produces it and
-        // gives the rank its own slot here.
-        let acknowledgment_slot = args.transfer.acknowledgment_slot(&args.worker_id, rank);
-        let products_cross_hosts = args.transfer.products_cross_hosts(&args.worker_id, rank);
-        let host_slots = args.transfer.host_slots(&args.worker_id, rank);
-        let names = |backends: &std::collections::BTreeSet<crate::executor::TransferBackend>| {
-            backends
-                .iter()
-                .map(|backend| backend.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        };
         let descriptor_directory = tempfile::Builder::new()
             .prefix("uniserve-worker-launch")
             .tempdir()
@@ -558,21 +573,8 @@ impl PendingRank {
         // One typed descriptor carries every launch value. argv keeps the
         // process identity and the descriptor's location so a running worker
         // remains identifiable from the process table.
-        let descriptor = args.launch_descriptor(
-            device,
-            rank,
-            world_size,
-            registration,
-            components,
-            &names(&backends),
-            &names(&publications),
-            rendezvous,
-            rendezvous_listen_fd,
-            channel_transport,
-            acknowledgment_slot,
-            &host_slots,
-            products_cross_hosts,
-        )?;
+        let descriptor =
+            args.launch_descriptor(rank, registration, rendezvous, rendezvous_listen_fd)?;
         std::fs::write(&descriptor_path, serde_json::to_vec_pretty(&descriptor)?)
             .context("writing the worker launch descriptor")?;
 
@@ -596,7 +598,7 @@ impl PendingRank {
                 max_payload,
                 startup_abort: Some(startup_abort),
                 launch_descriptor: Some(descriptor_directory),
-                components: components.clone(),
+                components: args.components.clone(),
             });
         }
         let child = cmd.spawn().context("spawning python worker")?;
@@ -609,7 +611,7 @@ impl PendingRank {
             max_payload,
             startup_abort: Some(startup_abort),
             launch_descriptor: Some(descriptor_directory),
-            components: components.clone(),
+            components: args.components.clone(),
         })
     }
 
@@ -673,7 +675,11 @@ impl PendingRank {
         // started has one. A rank elsewhere falls to the bounded liveness
         // probe, which reads its channel rather than its process.
         let death_watcher = child.as_ref().and_then(|child| {
-            DeathWatcher::spawn(child.id(), client.death_wake(), startup_abort.clone())
+            DeathWatcher::spawn(
+                child.id(),
+                client.death_wake(),
+                std::sync::Arc::clone(&startup_abort),
+            )
         });
         Ok(RankProcess {
             client,
@@ -801,10 +807,10 @@ impl RankProcess {
         {
             bail!("worker startup cancelled during {context}");
         }
-        if let Some(child) = self.child.as_mut() {
-            if let Some(status) = child.try_wait()? {
-                bail!("worker process exited during {context}: {status}");
-            }
+        if let Some(child) = self.child.as_mut()
+            && let Some(status) = child.try_wait()?
+        {
+            bail!("worker process exited during {context}: {status}");
         }
         Ok(())
     }
@@ -980,7 +986,7 @@ impl RankProcess {
     pub(super) fn submit_batch(&mut self, batch: Batch) -> Result<(), BatchSubmitError> {
         self.drain_ready().map_err(BatchSubmitError::Failed)?;
         if self.pending.len() >= self.depth {
-            return Err(BatchSubmitError::WouldBlock(batch));
+            return Err(BatchSubmitError::WouldBlock(Box::new(batch)));
         }
         let batch_id = batch.batch_id;
         let message_id = self.alloc_call_id();

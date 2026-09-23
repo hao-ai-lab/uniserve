@@ -19,7 +19,7 @@ use process::{PendingRank, RankProcess};
 pub enum BatchSubmitError {
     /// Returns the unaccepted physical submission when the instance has no capacity.
     #[error("worker run queue is full")]
-    WouldBlock(uniserve_worker_ipc::Batch),
+    WouldBlock(Box<uniserve_worker_ipc::Batch>),
     /// Reports a terminal transport or execution failure.
     #[error(transparent)]
     Failed(anyhow::Error),

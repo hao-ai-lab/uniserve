@@ -438,20 +438,20 @@ pub(crate) fn logical_result(
     BatchResult {
         batch_id: report.batch_id,
         results: report.results,
-        command_results: done
-            .then(|| {
-                commands
-                    .iter()
-                    .filter(|command| !matches!(command, BatchCommand::Start { .. }))
-                    .enumerate()
-                    .map(|(index, command)| CommandResult {
-                        command_index: index as u32,
-                        request_key: command.request_key(),
-                        outcome: CommandOutcome::Applied,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        command_results: if done {
+            commands
+                .iter()
+                .filter(|command| !matches!(command, BatchCommand::Start { .. }))
+                .enumerate()
+                .map(|(index, command)| CommandResult {
+                    command_index: index as u32,
+                    request_key: command.request_key(),
+                    outcome: CommandOutcome::Applied,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
         done,
         worker_exec_us,
         forward_stats,
@@ -1101,17 +1101,18 @@ mod tests {
     use super::*;
 
     fn media_info(routes: &[(MediaCall, &str)], steps: u32) -> WorkerInfo {
-        let mut info = WorkerInfo::default();
-        info.media_components = routes
-            .iter()
-            .map(|(call, component)| (*call, (*component).to_owned()))
-            .collect();
-        info.supported_calls = routes
-            .iter()
-            .map(|(call, _)| CallKind::Media(*call))
-            .collect();
-        info.num_inference_steps = steps;
-        info
+        WorkerInfo {
+            media_components: routes
+                .iter()
+                .map(|(call, component)| (*call, (*component).to_owned()))
+                .collect(),
+            supported_calls: routes
+                .iter()
+                .map(|(call, _)| CallKind::Media(*call))
+                .collect(),
+            num_inference_steps: steps,
+            ..WorkerInfo::default()
+        }
     }
 
     fn media_pool(

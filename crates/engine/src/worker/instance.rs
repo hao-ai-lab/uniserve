@@ -97,7 +97,6 @@ impl WorkerProcessArgs {
         let registry = RankRegistry::bind(head)?;
         let mut ranks = Vec::with_capacity(self.ranks.len());
         for rank in 0..self.ranks.len() {
-            let rank_device = &self.ranks[rank].device;
             // A rank placed elsewhere is delivered to the launcher that owns
             // its host; a rank placed here is spawned by this process.
             let mut remote = match (&launchers, self.ranks[rank].node == self.host) {
@@ -115,23 +114,13 @@ impl WorkerProcessArgs {
             };
             ranks.push(PendingRank::spawn_rank(
                 self,
-                rank_device,
                 rank as u32,
-                self.ranks.len() as u32,
                 rendezvous
                     .as_ref()
                     .map(|rendezvous| rendezvous.address.as_str()),
                 store_listener,
-                // A rank on the head's host can offer shared storage; a rank
-                // placed elsewhere has none to offer and serves a socket.
-                if self.ranks[rank].node == self.host {
-                    uniserve_worker_ipc::SHARED_STORAGE_CHANNEL
-                } else {
-                    uniserve_worker_ipc::SOCKET_CHANNEL
-                },
                 remote.as_mut(),
-                &self.components,
-                cancel.clone(),
+                Arc::clone(&cancel),
                 registry.address(),
             )?);
         }
@@ -1541,7 +1530,7 @@ impl WorkerGroup {
             )));
         }
         if !self.is_ready() || self.pending_batches.len() >= self.depth {
-            return Err(BatchSubmitError::WouldBlock(batch));
+            return Err(BatchSubmitError::WouldBlock(Box::new(batch)));
         }
         batch
             .validate()
@@ -1604,7 +1593,7 @@ impl WorkerGroup {
                     .iter()
                     .map(|call| call_identity(call.request_key, call.call_id))
                     .collect(),
-                batch: batch,
+                batch,
                 ranks,
             },
         );

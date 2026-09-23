@@ -869,7 +869,7 @@ impl InputProcessor {
             },
             resources: ResourceAccounting {
                 expected_kv_tokens: max_kv_tokens as u64,
-                image_latent_units: image_latent_units,
+                image_latent_units,
                 encoder_cache_pins: generation.num_encoder_cache_entries(),
                 replayable: !generation.feeds_back_images(),
             },

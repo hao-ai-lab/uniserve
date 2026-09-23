@@ -11,7 +11,6 @@ use axum::response::{IntoResponse, Response};
 use crate::AppState;
 use crate::http::routes::openai::utils::validated_json::ValidatedJson;
 use crate::http::utils::{resolve_request_id, unix_timestamp};
-use crate::openai::ApiError;
 
 /// Validates, submits, and collects one image-generation request.
 pub(crate) async fn images_generations(
@@ -30,6 +29,6 @@ pub(crate) async fn images_generations(
     };
     match collect_image_generation(serve_stream, unix_timestamp()).await {
         Ok(response) => axum::Json(response).into_response(),
-        Err(error) => ApiError::from(error).into_response(),
+        Err(error) => error.into_response(),
     }
 }

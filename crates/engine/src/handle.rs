@@ -295,7 +295,7 @@ pub enum Command {
     /// Admits a request and binds its event channel.
     Submit {
         /// Request admitted by the scheduler.
-        request: Request,
+        request: Box<Request>,
         /// Destination for public request events.
         event_tx: EventTx,
     },
@@ -382,8 +382,11 @@ impl EngineHandle {
                 acknowledge_on_receive,
             }),
         );
-        self.send(Command::Submit { request, event_tx })
-            .map_err(|_| SubmitError::Closed)?;
+        self.send(Command::Submit {
+            request: Box::new(request),
+            event_tx,
+        })
+        .map_err(|_| SubmitError::Closed)?;
         Ok(event_rx)
     }
 

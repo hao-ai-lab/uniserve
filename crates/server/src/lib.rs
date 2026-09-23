@@ -64,7 +64,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let channel_payload_capacity = model_config.channel_payload_capacity();
     let control_tokens = special_token_ids(&model_config);
     let generation_limits =
-        model_config.generation_limits(config.engine.worker_process.model_dtype.clone());
+        model_config.generation_limits(config.engine.worker_process.model_dtype);
 
     info!(
         workers = ?config.engine.workers,

@@ -18,7 +18,6 @@ use tracing_futures::Instrument as _;
 use crate::AppState;
 use crate::http::routes::openai::utils::validated_json::ValidatedJson;
 use crate::http::utils::{resolve_request_id, unix_timestamp};
-use crate::openai::ApiError;
 
 /// Validates one chat completion request and run it through the serving runtime.
 pub(crate) async fn chat_completions(
@@ -85,7 +84,7 @@ pub(crate) async fn chat_completions(
         .await
         {
             Ok(response) => response,
-            Err(error) => return ApiError::from(error).into_response(),
+            Err(error) => return error.into_response(),
         };
 
         if log_request {

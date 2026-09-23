@@ -58,17 +58,9 @@ impl Scheduler {
         let request_key = self
             .running
             .get(&id)
-            .map(|state| RequestKey::new(self.engine_id, id, state.request_epoch));
-        let Some(request_key) = request_key else {
-            return None;
-        };
-        if self
-            .placement
-            .worker_target(self.executor.as_ref(), &self.info, request_key, call.code)
-            .is_none()
-        {
-            return None;
-        }
+            .map(|state| RequestKey::new(self.engine_id, id, state.request_epoch))?;
+        self.placement
+            .worker_target(self.executor.as_ref(), &self.info, request_key, call.code)?;
         let mut buffer_allocations = Vec::new();
         for bytes in call.buffer_outputs().map(TensorRef::max_bytes) {
             let allocation = match self.storage.buffer_pool.allocate(request_key, bytes, 256) {
@@ -94,9 +86,7 @@ impl Scheduler {
                 .running
                 .get(&id)
                 .map(|state| self.worker_image_latent_units_for(state).max(1))?;
-            let Some(state) = self.running.get_mut(&id) else {
-                return None;
-            };
+            let state = self.running.get_mut(&id)?;
             let allocations = state.allocations_mut();
             let result = if let Some(allocation) = allocations.latent.as_mut() {
                 self.storage.latent_pool.grow(allocation, latent_units)
@@ -225,12 +215,14 @@ impl Scheduler {
                     continue;
                 };
                 let code = call.code;
-                if !code_batches.contains_key(&code) {
+                if let std::collections::hash_map::Entry::Vacant(e) = code_batches.entry(code) {
                     let batch_id = self.inflight.next_batch_id();
-                    code_batches.insert(
-                        code,
-                        ExecutionBatch::new(batch_id, Vec::new(), Vec::new(), Vec::new()),
-                    );
+                    e.insert(ExecutionBatch::new(
+                        batch_id,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ));
                     code_order.push(code);
                 }
                 let request_index = u32::try_from(code_batches[&code].requests.len())
@@ -270,7 +262,9 @@ impl Scheduler {
                         .get_mut(&code)
                         .expect("computation batch exists")
                         .commands
-                        .push(BatchCommand::Start { request: admission });
+                        .push(BatchCommand::Start {
+                            request: Box::new(admission),
+                        });
                     admitted = true;
                 }
                 let mut batch = code_batches
@@ -398,7 +392,7 @@ impl Scheduler {
             .running_order
             .iter()
             .enumerate()
-            .filter_map(|(index, id)| self.running.get(id).is_some().then_some((index, *id)))
+            .filter_map(|(index, id)| self.running.contains_key(id).then_some((index, *id)))
             .collect();
         ids.sort_by_key(|(idx, id)| (self.assembly_priority(*id), *idx));
         ids.into_iter().map(|(_, id)| id).collect()

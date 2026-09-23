@@ -335,7 +335,7 @@ impl Scheduler {
 
     /// Returns a shared handle to scheduler counters.
     pub fn stats_handle(&self) -> Arc<SchedulerStats> {
-        self.stats.clone()
+        Arc::clone(&self.stats)
     }
 
     /// Returns shared access to a media request state.

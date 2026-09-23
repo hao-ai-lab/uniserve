@@ -64,7 +64,7 @@ impl ExecutionBatch {
     /// Iterates over request admissions carried by batch commands.
     pub fn admissions(&self) -> impl Iterator<Item = &NewRequest> {
         self.commands.iter().filter_map(|command| match command {
-            BatchCommand::Start { request } => Some(request),
+            BatchCommand::Start { request } => Some(request.as_ref()),
             _ => None,
         })
     }

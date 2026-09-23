@@ -133,7 +133,7 @@ impl VideoJobs {
             RetainedJob {
                 record,
                 media: None,
-                cancellation: cancellation.clone(),
+                cancellation: Arc::clone(&cancellation),
             },
         );
         Ok(cancellation)

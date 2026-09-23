@@ -1723,6 +1723,106 @@ fn opt_string(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Opt
     }
 }
 
+fn tensor_transfer_to_py<'py>(
+    py: Python<'py>,
+    tensor: &TensorTransfer,
+) -> PyResult<Bound<'py, PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("shape", PyTuple::new(py, &tensor.shape)?)?;
+    let locations = tensor
+        .locations
+        .iter()
+        .map(|location| transfer_locator_to_py(py, location))
+        .collect::<PyResult<Vec<_>>>()?;
+    dict.set_item("locations", PyTuple::new(py, locations)?)?;
+    construct(py, "TensorTransfer", &dict)
+}
+
+fn tensor_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<TensorTransfer> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
+    let raw = get(dict, intern!(py, "locations"))?;
+    let locations = raw
+        .cast::<PyList>()
+        .ok()?
+        .iter()
+        .map(|location| transfer_locator_from_py(&location))
+        .collect::<Option<Vec<_>>>()?;
+    let tensor = TensorTransfer {
+        shape: u64_vec(&get(dict, intern!(py, "shape"))?)?,
+        locations,
+    };
+    tensor.validate().ok()?;
+    Some(tensor)
+}
+
+fn kv_transfer_to_py<'py>(py: Python<'py>, transfer: &KvTransfer) -> PyResult<Bound<'py, PyAny>> {
+    let KvTransfer {
+        tensors,
+        source,
+        destination,
+        base,
+        base_extent,
+        published_extent,
+        group_id,
+        compute_dtype,
+        page_size,
+    } = transfer;
+    let value = PyDict::new(py);
+    // KV publications may contain multiple physical tensors but share
+    // one published buffer and destination contract.
+    let tensors = tensors
+        .iter()
+        .map(|tensor| tensor_transfer_to_py(py, tensor))
+        .collect::<PyResult<Vec<_>>>()?;
+    value.set_item(intern!(py, "tensors"), PyTuple::new(py, tensors)?)?;
+    value.set_item(intern!(py, "source"), buffer_id_to_py(py, source)?)?;
+    value.set_item(intern!(py, "destination"), destination.as_str())?;
+    value.set_item(
+        intern!(py, "base"),
+        base.as_ref()
+            .map(|buffer| buffer_id_to_py(py, buffer))
+            .transpose()?,
+    )?;
+    value.set_item(intern!(py, "base_extent"), base_extent)?;
+    value.set_item(intern!(py, "published_extent"), published_extent)?;
+    value.set_item(intern!(py, "group_id"), group_id)?;
+    value.set_item(intern!(py, "compute_dtype"), compute_dtype.as_str())?;
+    value.set_item(intern!(py, "page_size"), page_size)?;
+    construct(py, "KvTransfer", &value)
+}
+
+fn kv_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<KvTransfer> {
+    let py = value.py();
+    let payload = value.cast::<PyDict>().ok()?;
+    // Preserve tensor order because it identifies the worker's
+    // physical KV tensor layout.
+    let raw_tensors = get(payload, intern!(py, "tensors"))?;
+    let raw_tensors = raw_tensors.cast::<PyList>().ok()?;
+    let mut tensors = Vec::with_capacity(raw_tensors.len());
+    for tensor in raw_tensors.iter() {
+        tensors.push(tensor_transfer_from_py(&tensor)?);
+    }
+    Some(KvTransfer {
+        tensors,
+        source: buffer_id_mapping_from_py(&get(payload, intern!(py, "source"))?)?,
+        destination: string_of(&get(payload, intern!(py, "destination"))?)?,
+        base: if absent_or_none(payload, intern!(py, "base"))? {
+            None
+        } else {
+            Some(buffer_id_mapping_from_py(&get(
+                payload,
+                intern!(py, "base"),
+            )?)?)
+        },
+        base_extent: u32_of(&get(payload, intern!(py, "base_extent"))?)?,
+        published_extent: u32_of(&get(payload, intern!(py, "published_extent"))?)?,
+        group_id: u32_of(&get(payload, intern!(py, "group_id"))?)?,
+        compute_dtype: string_of(&get(payload, intern!(py, "compute_dtype"))?)?,
+        page_size: u32_of(&get(payload, intern!(py, "page_size"))?)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime};
@@ -2257,104 +2357,4 @@ mod tests {
             .expect("native result response");
         assert_eq!(response.decode_response().unwrap(), expected);
     }
-}
-
-fn tensor_transfer_to_py<'py>(
-    py: Python<'py>,
-    tensor: &TensorTransfer,
-) -> PyResult<Bound<'py, PyAny>> {
-    let dict = PyDict::new(py);
-    dict.set_item("shape", PyTuple::new(py, &tensor.shape)?)?;
-    let locations = tensor
-        .locations
-        .iter()
-        .map(|location| transfer_locator_to_py(py, location))
-        .collect::<PyResult<Vec<_>>>()?;
-    dict.set_item("locations", PyTuple::new(py, locations)?)?;
-    construct(py, "TensorTransfer", &dict)
-}
-
-fn tensor_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<TensorTransfer> {
-    let py = value.py();
-    let dict = value.cast::<PyDict>().ok()?;
-    let raw = get(dict, intern!(py, "locations"))?;
-    let locations = raw
-        .cast::<PyList>()
-        .ok()?
-        .iter()
-        .map(|location| transfer_locator_from_py(&location))
-        .collect::<Option<Vec<_>>>()?;
-    let tensor = TensorTransfer {
-        shape: u64_vec(&get(dict, intern!(py, "shape"))?)?,
-        locations,
-    };
-    tensor.validate().ok()?;
-    Some(tensor)
-}
-
-fn kv_transfer_to_py<'py>(py: Python<'py>, transfer: &KvTransfer) -> PyResult<Bound<'py, PyAny>> {
-    let KvTransfer {
-        tensors,
-        source,
-        destination,
-        base,
-        base_extent,
-        published_extent,
-        group_id,
-        compute_dtype,
-        page_size,
-    } = transfer;
-    let value = PyDict::new(py);
-    // KV publications may contain multiple physical tensors but share
-    // one published buffer and destination contract.
-    let tensors = tensors
-        .iter()
-        .map(|tensor| tensor_transfer_to_py(py, tensor))
-        .collect::<PyResult<Vec<_>>>()?;
-    value.set_item(intern!(py, "tensors"), PyTuple::new(py, tensors)?)?;
-    value.set_item(intern!(py, "source"), buffer_id_to_py(py, source)?)?;
-    value.set_item(intern!(py, "destination"), destination.as_str())?;
-    value.set_item(
-        intern!(py, "base"),
-        base.as_ref()
-            .map(|buffer| buffer_id_to_py(py, buffer))
-            .transpose()?,
-    )?;
-    value.set_item(intern!(py, "base_extent"), base_extent)?;
-    value.set_item(intern!(py, "published_extent"), published_extent)?;
-    value.set_item(intern!(py, "group_id"), group_id)?;
-    value.set_item(intern!(py, "compute_dtype"), compute_dtype.as_str())?;
-    value.set_item(intern!(py, "page_size"), page_size)?;
-    construct(py, "KvTransfer", &value)
-}
-
-fn kv_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<KvTransfer> {
-    let py = value.py();
-    let payload = value.cast::<PyDict>().ok()?;
-    // Preserve tensor order because it identifies the worker's
-    // physical KV tensor layout.
-    let raw_tensors = get(payload, intern!(py, "tensors"))?;
-    let raw_tensors = raw_tensors.cast::<PyList>().ok()?;
-    let mut tensors = Vec::with_capacity(raw_tensors.len());
-    for tensor in raw_tensors.iter() {
-        tensors.push(tensor_transfer_from_py(&tensor)?);
-    }
-    Some(KvTransfer {
-        tensors,
-        source: buffer_id_mapping_from_py(&get(payload, intern!(py, "source"))?)?,
-        destination: string_of(&get(payload, intern!(py, "destination"))?)?,
-        base: if absent_or_none(payload, intern!(py, "base"))? {
-            None
-        } else {
-            Some(buffer_id_mapping_from_py(&get(
-                payload,
-                intern!(py, "base"),
-            )?)?)
-        },
-        base_extent: u32_of(&get(payload, intern!(py, "base_extent"))?)?,
-        published_extent: u32_of(&get(payload, intern!(py, "published_extent"))?)?,
-        group_id: u32_of(&get(payload, intern!(py, "group_id"))?)?,
-        compute_dtype: string_of(&get(payload, intern!(py, "compute_dtype"))?)?,
-        page_size: u32_of(&get(payload, intern!(py, "page_size"))?)?,
-    })
 }

@@ -4,7 +4,7 @@
 //! executors. It enforces request identity, lifecycle, and dependency invariants
 //! and reports accepted tokens, progress, and synthetic media.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::thread::JoinHandle;
@@ -986,12 +986,12 @@ impl SimEngine {
             }
         }
         for command in &batch.commands {
-            if let uniserve_worker_ipc::BatchCommand::Free { buffer } = command {
-                if let Some(request) = self.requests.get_mut(&buffer.owner.request_id) {
-                    request
-                        .predicate_values
-                        .retain(|product, _| product.buffer_id() != *buffer);
-                }
+            if let uniserve_worker_ipc::BatchCommand::Free { buffer } = command
+                && let Some(request) = self.requests.get_mut(&buffer.owner.request_id)
+            {
+                request
+                    .predicate_values
+                    .retain(|product, _| product.buffer_id() != *buffer);
             }
         }
         let vocab = self.vocab;
@@ -1039,15 +1039,15 @@ impl SimEngine {
             if let Some(predicate) = call.predicate.as_ref() {
                 request.predicate_values.remove(predicate);
             }
-            if let Some(predicate_value) = predicate_value {
-                if !predicate_value {
-                    for output in call.tensor_outputs() {
-                        request.predicate_values.insert(output.clone(), false);
-                    }
-                    let completion = Self::predicated_completion(&call, request);
-                    completions.push(completion);
-                    continue;
+            if let Some(predicate_value) = predicate_value
+                && !predicate_value
+            {
+                for output in call.tensor_outputs() {
+                    request.predicate_values.insert(output.clone(), false);
                 }
+                let completion = Self::predicated_completion(&call, request);
+                completions.push(completion);
+                continue;
             }
 
             let completion = Self::execute_call(vocab, text_len, fake_eos, &call, request)?;
@@ -1172,7 +1172,9 @@ mod tests {
                     buffers: Vec::new(),
                 },
             )],
-            vec![uniserve_worker_ipc::BatchCommand::Start { request: admission }],
+            vec![uniserve_worker_ipc::BatchCommand::Start {
+                request: Box::new(admission),
+            }],
             Vec::new(),
         )
     }

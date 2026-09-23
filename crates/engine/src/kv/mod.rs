@@ -253,7 +253,7 @@ impl Clone for CacheBlockRef {
         }
         Self {
             id: self.id,
-            pool: self.pool.clone(),
+            pool: Weak::clone(&self.pool),
         }
     }
 }

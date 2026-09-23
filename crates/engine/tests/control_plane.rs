@@ -152,7 +152,6 @@ fn generation_request(
             max_kv_tokens: None,
         }],
         sample_feedback_continuation: true,
-        ..ImageGenerationConfig::default()
     };
 
     let cache = Default::default();

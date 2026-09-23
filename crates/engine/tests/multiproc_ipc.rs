@@ -1,6 +1,7 @@
 //! Multiprocess framing, single-submit delivery, and physical-rank recovery.
 
 #![cfg(target_os = "linux")]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs::{OpenOptions, remove_file};
 use std::os::unix::fs::FileExt;
@@ -1031,13 +1032,14 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
             if case == "short-storage" {
                 assert!(results[0].media.is_err());
             } else {
-                let media = results[0]
-                    .media
-                    .as_ref()
-                    .map_err(|error| anyhow::anyhow!(error.clone()))?
-                    .as_ref()
-                    .context("media result has no storage")?
-                    .clone();
+                let media = Arc::clone(
+                    results[0]
+                        .media
+                        .as_ref()
+                        .map_err(|error| anyhow::anyhow!(error.clone()))?
+                        .as_ref()
+                        .context("media result has no storage")?,
+                );
                 worker.close()?;
                 drop(results);
                 assert_eq!(media.as_bytes(), b"generated media content");
@@ -2551,7 +2553,6 @@ fn text_admission(
     )?)
 }
 
-#[allow(clippy::too_many_arguments)]
 /// The coordinates a call entering after `output` executes at, as the engine
 /// derives them from the completion it observed.
 fn coordinates_after(output: &uniserve_worker_ipc::RequestOutput) -> CallCoordinates {
@@ -2563,6 +2564,7 @@ fn coordinates_after(output: &uniserve_worker_ipc::RequestOutput) -> CallCoordin
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn token_batch(
     batch_id: u64,
     collective_seq: u64,

@@ -541,9 +541,7 @@ fn resolve_image_params(
             image.cfg_img_scale.unwrap_or(defaults.cfg_img_scale),
             "image.cfg_img_scale",
         )?,
-        cfg_renorm_type: image
-            .cfg_renorm_type
-            .unwrap_or_else(|| defaults.cfg_renorm_type.clone()),
+        cfg_renorm_type: image.cfg_renorm_type.unwrap_or(defaults.cfg_renorm_type),
         cfg_renorm_min: finite(
             image.cfg_renorm_min.unwrap_or(defaults.cfg_renorm_min),
             "image.cfg_renorm_min",

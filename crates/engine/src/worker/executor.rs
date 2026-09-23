@@ -753,7 +753,9 @@ impl WorkerExecutor {
             .collect::<Vec<_>>();
         let commands = admissions
             .into_iter()
-            .map(|request| BatchCommand::Start { request })
+            .map(|request| BatchCommand::Start {
+                request: Box::new(request),
+            })
             .chain(batch.commands.iter().cloned())
             .collect();
         let mut inputs = batch.input_transfers.clone();
@@ -920,10 +922,7 @@ impl WorkerExecutor {
                 if self.workers[worker_index].1.take_readiness_change() {
                     self.refresh_worker(worker_index);
                 }
-                let report = match polled {
-                    Ok(report) => report,
-                    Err(error) => return Err(error),
-                };
+                let report = polled?;
                 let Some(report) = report else {
                     break;
                 };
@@ -1479,15 +1478,12 @@ impl Executor for WorkerExecutor {
                 })?;
             }
             for command in &batch.commands {
-                match command {
-                    BatchCommand::Free { buffer } => {
-                        self.transfer_products
-                            .retain(|identity, _| *identity != *buffer);
-                        self.buffer_routes
-                            .retain(|identity, _| *identity != *buffer);
-                        self.kv_transfers.remove(buffer);
-                    }
-                    _ => {}
+                if let BatchCommand::Free { buffer } = command {
+                    self.transfer_products
+                        .retain(|identity, _| *identity != *buffer);
+                    self.buffer_routes
+                        .retain(|identity, _| *identity != *buffer);
+                    self.kv_transfers.remove(buffer);
                 }
             }
             Ok(())

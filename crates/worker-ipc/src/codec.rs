@@ -151,7 +151,7 @@ fn request_from_table(request: fbs::WorkerRequest<'_>) -> CodecResult<WorkerRequ
         }
         RequestKind::Submit => WorkerRequest::Submit {
             message_id,
-            batch: batch.context("submit request has no batch")?,
+            batch: Box::new(batch.context("submit request has no batch")?),
         },
         RequestKind::Close => {
             codec_ensure!(batch.is_none(), "close carries a payload");
@@ -604,9 +604,9 @@ fn command_from_table(envelope: fbs::BatchCommandEnvelope<'_>) -> CodecResult<Ba
                 .command_as_start_command()
                 .context("start command table is missing")?;
             BatchCommand::Start {
-                request: admission_from_table(
+                request: Box::new(admission_from_table(
                     start.request().context("start control has no request")?,
-                )?,
+                )?),
             }
         }
 
