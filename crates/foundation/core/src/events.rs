@@ -151,6 +151,8 @@ pub enum EngineCoreOutput {
     },
     /// Rejects a request before execution begins.
     Rejected {
+        /// Whether the request itself is unservable or the engine is full.
+        kind: RejectionKind,
         /// Human-readable rejection reason.
         message: String,
     },
@@ -159,6 +161,20 @@ pub enum EngineCoreOutput {
         /// Human-readable failure reason.
         message: String,
     },
+}
+
+/// Why admission refused a request.
+///
+/// Callers map the kind to their own vocabulary: an invalid request fails the
+/// same way on every retry, while an overloaded engine may accept the same
+/// request once its waiting queue drains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectionKind {
+    /// The deployment cannot serve the request as specified.
+    Invalid,
+    /// The waiting queue is at its bound.
+    Overloaded,
 }
 
 /// Kind of media referenced by an artifact event.

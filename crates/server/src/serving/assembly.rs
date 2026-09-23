@@ -204,11 +204,13 @@ pub(super) async fn assemble_chat_event_stream(
     while let Some(next) = output.next().await {
         let next = match next {
             Err(crate::serving::chat::Error::Text(crate::serving::text::Error::Rejected {
+                kind,
                 message,
                 ..
             })) => {
                 y.yield_ok(RequestOutput::Rejected {
                     request_id,
+                    kind,
                     message,
                 })
                 .await;
@@ -903,10 +905,11 @@ pub(super) async fn assemble_event_stream(
                 .await;
                 return Ok(());
             }
-            EngineCoreOutput::Rejected { message } => {
+            EngineCoreOutput::Rejected { kind, message } => {
                 state.flush_pending_images(&mut y).await;
                 y.yield_ok(RequestOutput::Rejected {
                     request_id: request_id.clone(),
+                    kind,
                     message,
                 })
                 .await;
@@ -1035,9 +1038,10 @@ pub(super) async fn assemble_media_event_stream(
                 .await;
                 return Ok(());
             }
-            EngineCoreOutput::Rejected { message } => {
+            EngineCoreOutput::Rejected { kind, message } => {
                 y.yield_ok(RequestOutput::Rejected {
                     request_id,
+                    kind,
                     message,
                 })
                 .await;

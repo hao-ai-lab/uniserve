@@ -28,8 +28,8 @@ pub mod sampling;
 pub use codec::stats::ForwardStats;
 pub use events::{
     ArtifactEvent, DiffusionRequest, DiffusionRequestError, DiffusionSamplingParams,
-    EngineCoreOutput, FinishReason, MediaKind, PositionLogprobs, Request, RuntimeFamily,
-    StopReason, TokenLogprob,
+    EngineCoreOutput, FinishReason, MediaKind, PositionLogprobs, RejectionKind, Request,
+    RuntimeFamily, StopReason, TokenLogprob,
 };
 pub use generation::{
     CachePolicy, FeedbackNextToken, FeedbackSource, GenerationConstraint,
