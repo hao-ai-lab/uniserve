@@ -1,4 +1,10 @@
-"""Qwen3 checkpoint assignments and numerical precision presets."""
+"""Qwen3 checkpoint assignments and numerical precision presets.
+
+Checkpoint names follow the Transformers ``Qwen3ForCausalLM`` and
+``Qwen3MoeForCausalLM`` layouts in one checkpoint source, ``primary``, at the
+checkpoint root. Parameters map to complete logical tensors; the loader
+applies each layer's tensor-parallel partition.
+"""
 
 from __future__ import annotations
 
@@ -18,17 +24,27 @@ if TYPE_CHECKING:
 
 checkpoint_sources = (checkpoint.Config(name="primary"),)
 
-
+# Named presets that load_model accepts; a calibrated ModelOpt checkpoint
+# offers none. With no "default" entry, uniserve_models.loading.read_config
+# starts from "bf16".
 precisions = MappingProxyType(
     {"bf16": weights.Config(), "fp16": weights.Config(dtype=torch.float16)}
 )
 
-# Dense modules of a calibrated checkpoint keep its stored representation.
+# Base precision of a calibrated ModelOpt checkpoint: the loader adds the
+# calibrated quantization on top of it, and every module the checkpoint does
+# not store packed stays dense in this precision.
 checkpoint_precision = precisions["bf16"]
 
 
 def parameter_sources(config: Config) -> Mapping[str, str]:
-    """Map complete logical Qwen parameters to checkpoint names before partitioning."""  # noqa: E501
+    """Map complete logical Qwen parameters to checkpoint names before partitioning.
+
+    The result covers every parameter of a complete, unbound ``Model``,
+    keyed by module path. A tied head maps to the embedding tensor. The
+    MiniMax H3 text encoder reuses the ``backbone.`` entries under its own
+    prefixes.
+    """  # noqa: E501
     names = {
         "backbone.embedding.weight": "model.embed_tokens.weight",
         "backbone.norm.weight": "model.norm.weight",
@@ -86,6 +102,16 @@ def parameter_sources(config: Config) -> Mapping[str, str]:
 
 
 def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
+    """Declare how the resident parameters of ``model`` load from ``primary``.
+
+    ``uniserve_models.loading.read_config`` calls this on the complete meta
+    skeleton, and ``uniserve.loading.load_model`` calls it again after
+    ``parallelize_`` has bound the pipeline stage, so ``model`` may lack
+    layers, the embedding or the head. Checkpoint tensors of those absent
+    parameters are declared nonresident rather than unexpected. A parameter
+    whose tensor the checkpoint lacks receives no assignment; outside dummy
+    loading, the load fails reporting it missing when it is selected.
+    """
     names = parameter_sources(model.config)
     parameters = dict(model.named_parameters(remove_duplicate=False))
     off_stage = frozenset(
@@ -95,9 +121,14 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
     # unique source for their shared Parameter on either pipeline endpoint.
     if model.config.tie_word_embeddings:
         off_stage |= {"lm_head.weight"}
+    # A tensor still read by a resident parameter is never nonresident; with
+    # tied embeddings the last stage's head reads the embedding tensor.
     used_sources = {names[target] for target in parameters}
     off_stage -= used_sources
 
+    # ``parameters`` lists a tied Parameter under both of its paths, as the
+    # loader's own remove_duplicate=False view does. Both paths assign the
+    # same tensor, and the loader skips the identical repeat.
     def assign(reader):
         available = frozenset(reader.names())
         result = []

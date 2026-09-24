@@ -1,4 +1,12 @@
-"""MiniMax H3 numerical models and checkpoint definitions."""
+"""MiniMax H3 numerical models and checkpoint definitions.
+
+H3 generates a video with a stereo audio track from a text prompt. The
+package composes four independently placeable components (see
+``entry_points``): the Qwen text encoder, the denoiser with its token
+refiner, the video decoder with its RGB post-processor, and the audio
+decoder. ``read_config`` normalizes the checkpoint's JSON sidecars and
+``checkpoint_mappings`` maps its tensors onto the modules.
+"""
 
 from .attention import Attention
 from .conditioning import Conditioner, RefinerBlock, TokenRefiner
@@ -21,6 +29,9 @@ from .precision import checkpoint_precision, precisions, weight_config
 from .transformer import Transformer, TransformerLayer
 from .weights import checkpoint_mappings, checkpoint_sources
 
+# The model loader reads these package attributes. H3 accepts no image inputs
+# and runs without classifier-free guidance, so it supplies neither an image
+# processor nor guidance prompt framing.
 image_processor = None
 flow_prompt = None
 

@@ -19,6 +19,28 @@ from uniserve.nn.vae.layers import (
 
 @dataclass(frozen=True)
 class Config:
+    """FLUX autoencoder dimensions and latent normalization.
+
+    Attributes:
+        resolution: Image resolution the checkpoint declares; validated but
+            unused by the modules.
+        in_channels: Pixel channels the encoder consumes.
+        downsample: Pixels per latent position along each spatial axis; one
+            2x stage separates each pair of adjacent levels.
+        base_channels: Channel unit that ``channel_multipliers`` scale, and the
+            width of the encoder's input convolution; a multiple of the 32
+            GroupNorm groups.
+        out_channels: Pixel channels the decoder produces.
+        channel_multipliers: Per-level multiples of ``base_channels``, ordered
+            from the pixel end.
+        num_res_blocks: Residual blocks per encoder level; each decoder level
+            holds one more.
+        latent_channels: Channels of one latent position.
+        scale_factor: Scale of the normalized latent
+            ``scale_factor * (sample - shift_factor)``.
+        shift_factor: Shift of that normalization.
+    """
+
     resolution: int
     in_channels: int
     downsample: int
@@ -79,8 +101,8 @@ class Encoder(nn.Module):
         channels = config.base_channels
         self.input = nn.Conv2d(config.in_channels, channels, 3, padding=1)
 
-        # Each level holds num_res_blocks residual blocks at one channel width,
-        # followed by a 2x downsampling between levels.
+        # Each level holds num_res_blocks residual blocks at one channel width;
+        # every level but the last ends with a 2x downsampling.
         self.levels = nn.ModuleList()
         for index, multiplier in enumerate(config.channel_multipliers):
             width = config.base_channels * multiplier
@@ -125,6 +147,7 @@ class Decoder(nn.Module):
 
         # Mirror of the encoder: one extra residual block per level, with 2x
         # upsampling between levels, executing from the latent end outward.
+        # ``assignments`` reverses these indices to the checkpoint's order.
         self.levels = nn.ModuleList()
         for index in reversed(range(len(config.channel_multipliers))):
             width = config.base_channels * config.channel_multipliers[index]
@@ -146,6 +169,10 @@ class Decoder(nn.Module):
         return self.output(F.silu(self.norm(hidden)))
 
 
+# ``uniserve_models.bagel.model.Model`` borrows only this model's encoder,
+# decoder and posterior, and ``PatchAutoencoder`` applies the same scale and
+# shift. The ``encode`` and ``decode`` methods here serve direct use of the
+# codec.
 class Model(nn.Module):
     """Encode normalized posterior samples and decode their inverse transform."""  # noqa: E501
 
@@ -181,6 +208,10 @@ def assignments(
     Both Model and PatchAutoencoder expose the same encoder/decoder modules.
     Checkpoint decoder levels count from the pixel end; module levels execute
     from the latent end. Q/K/V fragments cover disjoint output channels.
+
+    Checkpoint names absent from ``reader`` produce no assignment; the loader
+    then reports a required parameter as missing, or a partly covered Q/K/V
+    parameter as incomplete.
     """
     result = []
     available = frozenset(reader.names())
@@ -192,6 +223,8 @@ def assignments(
 
         for name, layer in tower.named_modules():
             if isinstance(layer, ResidualBlock):
+                # The middle's residual blocks sit at indices 0 and 2 around
+                # its attention block; the checkpoint numbers them 1 and 2.
                 if name.startswith("middle."):
                     source = f"mid.block_{1 if name == 'middle.0' else 2}"
                 else:
@@ -248,6 +281,8 @@ def assignments(
                                 )
                             )
 
+        # Assign every whole parameter whose parent module has a checkpoint
+        # prefix; packed Q/K/V parameters have none and were sliced above.
         for name, target in parameters.items():
             parent, field = name.rsplit(".", 1)
             if parent in names:

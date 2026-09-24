@@ -30,7 +30,10 @@ class Model(nn.Module):
 
     The text LM and the image denoiser share the same MoT transformer; the
     vision encoder feeds SigLIP features into it, and the latent codec maps
-    between pixels and the VAE latents the denoiser predicts.
+    between pixels and the VAE latents the denoiser predicts. ``text.backbone``
+    and ``denoiser.backbone`` are one module instance, as are
+    ``latent_encoder`` and ``image_decoder.decoder``, so each shared part
+    holds one set of weights.
     """
 
     def __init__(self, config: Config):
@@ -44,6 +47,9 @@ class Model(nn.Module):
         )
         self.denoiser = Denoiser(config, backbone)
 
+        # BAGEL's ``Encoder`` applies its own connector and language-width
+        # positions, so the wrapper's connector is the identity; downsample=1
+        # keeps one feature per SigLIP patch.
         self.vision_encoder = PatchEncoder(
             Encoder(config),
             nn.Identity(),
@@ -69,6 +75,14 @@ class Model(nn.Module):
 
 
 def entry_points(config: Config):
+    """Declare the one BAGEL component and the methods serving ranks call.
+
+    Token embedding runs on the first pipeline stage, the only one pipeline
+    binding keeps the embedding on, and logits on the last, the only one it
+    keeps the vocabulary head on; both join only the tensor-parallel group.
+    The backbone forwards join the tensor, sequence and pipeline groups, and
+    the media methods join no communication group.
+    """
     return MappingProxyType(
         {
             DEFAULT_COMPONENT: ComponentEntry(

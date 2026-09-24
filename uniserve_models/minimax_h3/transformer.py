@@ -1,4 +1,15 @@
-"""H3's modulated multimodal transformer and separate latent output heads."""
+"""H3's modulated multimodal transformer and separate latent output heads.
+
+On the first pipeline stage, ``Denoiser.forward`` scatters refined text and
+projected latent rows into this rank's packed hidden shard; every stage then
+calls ``Transformer.forward`` once per solver step. Each
+``TransformerLayer.forward_chunks`` yields ``(global row slice, rows)``
+chunks, so a layer's completed rows feed the next layer's attention
+projection before the whole shard is finished. Timestep conditioning comes
+from ``Modulation`` products that ``weights._prepare_modulation`` precomputes
+at load time for the fixed solver ladder; no timestep embedding runs per
+request.
+"""
 
 from __future__ import annotations
 
@@ -45,12 +56,33 @@ class TransformerLayer(nn.Module):
     def forward_chunks(
         self, hidden, modulation, inputs: AttentionInput, *, workspace
     ):
-        """Connect token-local residual updates to the following layer's projection."""  # noqa: E501
+        """Connect token-local residual updates to the following layer's projection.
+
+        Args:
+            hidden: The layer input rows of ``inputs.token_slice``: the whole
+                shard as one tensor, or an iterable of ``(global row slice,
+                rows)`` chunks, such as a preceding layer's output.
+                ``Transformer.forward`` passes the first layer one chunk
+                covering the shard.
+            modulation: This layer's products at the current step,
+                ``[2, 18 * hidden_size]``; see ``Transformer.modulation``.
+            inputs: The attention input of this rank's token shard.
+            workspace: ``modulation_indices``, rotary ``cos``/``sin`` and
+                this layer's attention scratch set.
+
+        Yields:
+            ``(global row slice, rows)`` output chunks covering the shard, or
+            the whole shard as one chunk when a feed-forward input quantizer
+            needs dynamic tensor-wide statistics.
+        """  # noqa: E501
         if isinstance(hidden, torch.Tensor):
             source: Iterable[tuple[slice, torch.Tensor]] = (
                 (inputs.token_slice, hidden),
             )
         else:
+            # Chunked input arrives as separate per-interval tensors. Allocate
+            # this layer's contiguous residual for the shard; the
+            # normalization pass fills it through ``retain``.
             chunks = iter(hidden)
             first = next(chunks)
             hidden = first[1].new_empty(
@@ -69,7 +101,10 @@ class TransformerLayer(nn.Module):
         gate = cast(ColumnParallelLinear, self.mlp.gate_up.projections["gate"])
         up = cast(ColumnParallelLinear, self.mlp.gate_up.projections["up"])
 
-        # Six per-token affine vectors: shift/scale/gate for attention and MLP.
+        # Six affine vectors: shift/scale/gate for attention and MLP, each
+        # [6, hidden] after the reshape. The six rows are the (video, text,
+        # audio) token groups under the video timestep, then under the audio
+        # timestep; ``indices`` selects one row per token.
         shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = (
             value.to(hidden.dtype)
             for value in modulation.reshape(-1, 6 * self.hidden_size).chunk(
@@ -113,6 +148,10 @@ class TransformerLayer(nn.Module):
                 interval.stop - inputs.token_slice.start,
             )
             selected = indices[local]
+            # gated_residual_rms_norm_fp8 returns E4M3 rows with [rows, 1]
+            # FP32 scales, which is the row-wise FP8 encoding. Both gate and
+            # up must consume exactly that encoding to borrow it without
+            # requantizing.
             quantizer = gate.input_quantizer
             if (
                 quantizer is not None
@@ -151,8 +190,9 @@ class TransformerLayer(nn.Module):
                 residual, self.mlp(normalized), gate_mlp, selected
             )
 
-        # Tensor-wide activation statistics require the complete source domain.
-        # Row/block quantizers retain interval consumption and transfer overlap.
+        # Dynamic tensor-wide statistics (uncalibrated NVFP4, tensor-wide FP8)
+        # require the complete shard before any feed-forward input is encoded.
+        # Row-wise FP8, MXFP8 and calibrated NVFP4 consume intervals directly.
         quantizers = (
             gate.input_quantizer,
             up.input_quantizer,
@@ -185,6 +225,11 @@ class Transformer(nn.Module):
     Latent input heads belong to the first pipeline stage. The final stage
     normalizes and projects each modality independently. The caller supplies
     contiguous activations and owns every state, constant, and workspace tensor.
+
+    Construction builds every layer and both head pairs on each rank;
+    ``weights._resident_layers`` then keeps only this pipeline stage's share.
+    ``layers`` keys remain the global checkpoint layer numbers, while
+    ``modulation`` is indexed by resident position.
     """
 
     def __init__(self, config: TransformerConfig, *, num_steps: int = 4):
@@ -206,9 +251,10 @@ class Transformer(nn.Module):
             }
         )
         # Precomputed affine products of the checkpoint evaluation ladder:
-        # [step, layer, modality, packed shift/scale/gate] per transformer
-        # layer, and [step, modality, shift + scale] for the final output
-        # norm.
+        # [step, layer, timestep (video, audio), 3 token groups x 6 vectors x
+        # hidden] per transformer layer, and [step, timestep, shift + scale]
+        # for the final output norm. The empty tensors are placeholders that
+        # the post-load hook weights._prepare_modulation replaces.
         self.modulation = Modulation(
             torch.empty(
                 num_steps,
@@ -243,6 +289,11 @@ class Transformer(nn.Module):
 
         ``tables`` holds the per-row modulation indices and the rotary
         ``cos``/``sin`` of every packed row.
+
+        A stage after the first receives its input into ``hidden`` from the
+        preceding stage. A stage before the last sends its output onward and
+        returns an empty tuple; the last stage returns the FP32 video and
+        audio predictions for this shard's local video and audio rows.
         """
         pipeline = self.mesh.get_group("pp" if "pp" in self.mesh.axes else ())
         if pipeline.rank:
@@ -258,7 +309,9 @@ class Transformer(nn.Module):
         for index, layer in enumerate(self.layers.values()):
             layer = cast(TransformerLayer, layer)
             # Adjacent layers alternate between the two attention scratch sets
-            # so a completed chunk can feed the next projection in place.
+            # that Denoiser.workspace_buffers declares, so a completed chunk
+            # can feed the next projection in place. The loop only composes
+            # generators; the layers run when ``chunks`` is consumed below.
             prefix = f"attention.{index % 2}."
             layer_buffers = {
                 **buffers,

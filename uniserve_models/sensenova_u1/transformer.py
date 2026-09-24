@@ -1,4 +1,17 @@
-"""SenseNova U1 text and flow experts with axial rotary attention."""
+"""SenseNova U1 text and flow experts with axial rotary attention.
+
+The backbone is a mixture-of-transformers (MoT): every layer holds separate
+``text`` and ``flow`` weights for its norms, Q/K/V and output projections and
+MLP, but runs one attention call over the packed sequence, so both routes
+share each layer's K/V cache. ``RouteSpan`` values assign packed token ranges
+to routes. Text calls take the decoder's default ``text`` route, and
+``Denoiser.forward`` routes every image token through ``flow``.
+
+Attention heads carry three rotary axes: temporal over the first half of the
+head width and height and width over one quarter each. Image tokens carry
+their patch row and column on the spatial axes; one-dimensional positions
+leave both spatial coordinates at zero.
+"""
 
 from __future__ import annotations
 
@@ -57,8 +70,10 @@ class TransformerLayer(nn.Module):
         )
         for route in ("text", "flow"):
             self.input_norms[route] = RMSNorm(hidden, eps)
-            # Head width splits into temporal / height / width rotary partitions
-            # with per-axis QK norms (temporal half, then two spatial quarters).
+            # Head width splits into temporal / height / width rotary
+            # partitions (a half, then two quarters). Q and K each have two
+            # RMS norm domains: the temporal half and the combined spatial
+            # half, so height and width share one RMS denominator.
             self.projections[route] = AxialQKVProjection(
                 QKVParallelLinear(
                     hidden,
@@ -82,12 +97,16 @@ class TransformerLayer(nn.Module):
                 hidden, config.intermediate_size, activation=activation
             )
 
+        # One attention module serves both routes. Its cache name is its
+        # module path under ``Model``; the denoiser calls the same module, so
+        # text and denoising calls address the same K/V cache layer.
         self.attention = Attention(
             config.num_attention_heads,
             config.num_key_value_heads,
             dim,
             cache_name=f"text.backbone.layers.{index}.attention",
         )
+        # Always None: ``TransformerConfig`` rejects sliding_attention layers.
         self.window = (
             config.sliding_window
             if config.layer_types[index] == "sliding_attention"
@@ -101,6 +120,8 @@ class TransformerLayer(nn.Module):
             partial_rotary_factor=config.partial_rotary_factor,
             keep_freq_range=True,
         )
+        # Height and width share one rotary table with the spatial theta and
+        # context length and the same scaling recipe as the temporal axis.
         self.spatial_rotary = RotaryEmbedding(
             dim // 4,
             theta=config.rope_theta_hw,
@@ -119,6 +140,13 @@ class TransformerLayer(nn.Module):
         *,
         routes: tuple[RouteSpan, ...],
     ):
+        """Apply one routed layer to this rank's token shard.
+
+        ``positions`` is ``[3, tokens]`` or ``[tokens]`` for the shard and
+        ``routes`` are shard-local spans. Returns ``(mlp_output, residual)``
+        as per-route tensors; the next layer or the decoder's final norm adds
+        them.
+        """
         hidden = hidden if residual is None else hidden.add(residual)
         normalized = hidden.apply(self.input_norms)
 
@@ -139,6 +167,7 @@ class TransformerLayer(nn.Module):
 
         # Dynamic and LongRoPE scalings are functions of the full sequence
         # length, which cached attention knows only from its host metadata.
+        # Static recipes ignore the length, so the shard width stands in.
         dynamic = isinstance(
             self.temporal_rotary.scaling, (DynamicScaling, LongRoPEScaling)
         )
@@ -193,6 +222,8 @@ class TransformerLayer(nn.Module):
             (spatial[0][0], spatial[1][0]),
             (spatial[0][1], spatial[1][1]),
         )
+        # Split each axis's factors with the hidden stream's route spans so
+        # every expert rotates exactly its own tokens.
         cos, sin = (
             tuple(
                 RoutedTensor.from_packed(pair[index], routes, routes=names)
@@ -201,6 +232,9 @@ class TransformerLayer(nn.Module):
             for index in (0, 1)
         )
 
+        # Experts project their own tokens; Q/K/V are then repacked into
+        # sequence order for the single shared attention call, and the
+        # result is split again for the per-route output projections.
         projected = {
             route: self.projections[route](
                 value,
@@ -227,7 +261,10 @@ class TransformerLayer(nn.Module):
 
 
 class Transformer(TransformerDecoder):
-    """Stack routed MoT layers over a shared embedding with per-route norms."""
+    """Stack routed MoT layers over a shared embedding with per-route norms.
+
+    Calls without explicit routes take the ``text`` route.
+    """
 
     def __init__(self, config: TransformerConfig):
         super().__init__(

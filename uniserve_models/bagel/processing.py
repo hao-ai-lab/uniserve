@@ -13,17 +13,27 @@ from uniserve.processing import (
 
 from .config import Config
 
+# Side bounds and strides in pixels. The ViT tower's maximum side and stride
+# come from the SigLIP config, so its inputs hold whole patches.
 _BAGEL_VIT_MIN_SIZE = 224
 
+# The VAE stride is one flow token in pixels (autoencoder downsample times
+# latent patch size) for BAGEL's default config; these constants do not follow
+# ``Config``.
 _BAGEL_VAE_MIN_SIZE = 512
 _BAGEL_VAE_MAX_SIZE = 1024
 _BAGEL_VAE_STRIDE = 16
 
+# Both towers share one per-image pixel budget.
 _BAGEL_MAX_IMAGE_PIXELS = 14 * 14 * 9 * 1024
 
 
 def image_processor(config: Config) -> ImageProcessor:
-    """Build the checkpoint architecture's caller-owned image transforms."""
+    """Build the checkpoint architecture's caller-owned image transforms.
+
+    Encoded image features enter the language sequence framed by the
+    start/end-of-image tokens and take temporal positions only.
+    """
     return ImageProcessor(
         vit=TowerTransform(
             resize=StrideResize(
@@ -50,5 +60,6 @@ def image_processor(config: Config) -> ImageProcessor:
     )
 
 
-# BAGEL has no guidance prompt framing beyond its chat template.
+# BAGEL has no guidance prompt framing beyond its chat template. Without one,
+# the worker's ``resolve_prefix`` rejects a generation prompt override.
 flow_prompt = None

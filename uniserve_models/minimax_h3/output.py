@@ -1,4 +1,11 @@
-"""H3 output raster and sampling clocks."""
+"""H3 output raster, sampling clocks and RGB reconstruction.
+
+A video of ``17 * n + 5`` frames is decoded as ``n`` media units. Each unit
+decodes to 25 frames: a 17-frame body, three VAE padding frames, and a
+five-frame tail. The next unit cross-fades that tail into its leading
+frames; the last unit's tail ends the video. ``VideoPostprocessor`` supplies
+these slices and blend weights.
+"""
 
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -12,6 +19,8 @@ from uniserve.tensors import BufferConfig, OutputLayout
 
 @dataclass(frozen=True, slots=True)
 class Config:
+    """Output raster and the video frame and audio sample clocks in Hz."""
+
     frame_size: image.Config = image.Config(768, 1344)
     frame_rate: int = 24
     sample_rate: int = 32000
@@ -42,6 +51,8 @@ class VideoPostprocessor(BaseVideoPostprocessor):
     """Remove H3's three-frame decoder padding and cross-fade five-frame overlaps."""  # noqa: E501
 
     def __init__(self, *, frame_size: image.Config, frame_rate: int):
+        # Weight of the current unit across the five overlap frames: 0, 0.2,
+        # ..., 0.8, so the first blended frame is entirely the predecessor's.
         weights = torch.arange(5, device="cpu", dtype=torch.float16) / 5
         super().__init__(weights, frame_size=frame_size, frame_rate=frame_rate)
 
@@ -116,7 +127,9 @@ class VideoPostprocessor(BaseVideoPostprocessor):
             raise ValueError(
                 "RGB constants must contain mean and standard deviation"
             )
-        # Per-channel statistics that normalize the RGB raster.
+        # The decoder emits normalized RGB; the post-processor restores it as
+        # ``value * std + mean`` per channel before clamping and quantizing
+        # to uint8.
         for name, values in (
             ("pixel_mean", (0.485, 0.456, 0.406)),
             ("pixel_std", (0.229, 0.224, 0.225)),

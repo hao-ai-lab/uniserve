@@ -1,4 +1,11 @@
-"""H3 latent packing and temporal reconstruction capabilities."""
+"""H3 latent unpacking for the video and audio decoders.
+
+The denoiser publishes each modality's final latent in its packed order:
+video rows tile-major, as ``packing.build_packing`` lays them out, and audio
+rows channel-major, all frames of the first stereo channel before the
+second. The decoders here convert a window of that latent into the native
+VAE input layout.
+"""
 
 from __future__ import annotations
 
@@ -48,6 +55,8 @@ class VideoDecoder(BaseVideoDecoder):
         height = self.frame_size.height // self.config.spatial_compression
         width = self.frame_size.width // self.config.spatial_compression
         channels = self.config.latent_channels
+        # One seven-latent-frame window: the NCTHW decoder input and the
+        # raster patch rows gathered for it.
         return {
             "video_input": BufferConfig(
                 (1, channels, 7, height, width), torch.float32
@@ -87,6 +96,9 @@ class VideoDecoder(BaseVideoDecoder):
             raise ValueError(
                 "video raster-order indices have incompatible shape or dtype"
             )
+        # The video tile order does not depend on the prompt, so any text
+        # length yields the same permutation. The argsort maps each raster
+        # row to its position among the packed video rows.
         packed = build_packing(
             num_text_tokens=64,
             num_frames=num_frames,
@@ -113,9 +125,10 @@ class VideoDecoder(BaseVideoDecoder):
                 f"video decoder requires complete final latent tokens "
                 f"with shape {shape}"
             )
-        # Each 17-frame unit consumes a 7-latent-frame VAE window: 5 new
-        # frames beyond the previous unit plus the 2-frame temporal overlap
-        # behind them.
+        # Unit k decodes latent frames [5k, 5k + 7): five frames that advance
+        # the timeline and two trailing frames that the next unit's window
+        # also reads. Gathering the window's raster rows from the packed
+        # latent yields them in raster order.
         unit = frames.start // 17
         start = unit * 5 * tokens_per_frame
         indices = constants["video_raster_order"][

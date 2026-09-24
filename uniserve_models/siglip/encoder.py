@@ -1,4 +1,13 @@
-"""SigLIP-NaViT image transformer composition and patch coordinates."""
+"""SigLIP-NaViT image transformer composition and patch coordinates.
+
+``Encoder`` packs the patches of several images of different grid sizes into
+one ``[total_patches, patch_features]`` sequence. Each image attends only to
+its own patches through non-causal varlen attention, and each patch adds the
+learned position of its ``(row, column)`` in a fixed square table; grids
+smaller than the table select a subset of positions without interpolation.
+Patch rows use the order ``uniserve.nn.functional.patchify`` produces: pixel
+row, pixel column, then channel within each patch.
+"""
 
 from __future__ import annotations
 
@@ -39,7 +48,9 @@ class Attention(nn.Module):
         self, patches: torch.Tensor, attention: VarlenInput
     ) -> torch.Tensor:
         projections = self.qkv(patches)
-        # [total_patches, heads, head_dim]
+
+        # [total_patches, heads, head_dim], with the heads this rank holds
+        # under tensor-parallel head partitioning.
         query, key, value = (
             projections[name].reshape(
                 patches.shape[0], -1, self.attention.head_dim
@@ -80,12 +91,7 @@ class TransformerLayer(nn.Module):
 
 
 class Encoder(nn.Module):
-    """Encode canonical HWC patch rows with separate attention per image.
-
-    grids supplies one (height, width) pair per image. grid_shapes supplies
-    the corresponding host dimensions without reading device values. NCHW
-    pixels may also be supplied with those same coordinates.
-    """
+    """Encode canonical HWC patch rows with separate attention per image."""
 
     def __init__(self, config: Config):
         super().__init__()
@@ -115,13 +121,40 @@ class Encoder(nn.Module):
         grids: torch.Tensor,
         grid_shapes: tuple[tuple[int, int], ...],
     ) -> torch.Tensor:
+        """Encode the packed patches of one or more images.
+
+        Args:
+            pixels: ``[total_patches, num_channels * patch_size**2]`` patch
+                rows with images concatenated in order, or
+                ``[images, channels, height, width]`` pixels of same-sized
+                images, which are patchified here.
+            grids: ``[images, 2]`` int32 or int64 tensor of each image's
+                ``(height, width)`` in patches, on the encoder's device.
+            grid_shapes: The same ``(height, width)`` pairs as host integers,
+                so patch counts and kernel shapes are known without reading
+                device values.
+
+        Returns:
+            ``[total_patches, hidden_size]`` features after the final
+            layernorm, in input patch order.
+
+        Raises:
+            ValueError: If the patch rows are not ``[sum of grid areas,
+                num_channels * patch_size**2]``, ``grids`` is not an
+                ``[images, 2]`` int32 or int64 tensor, or a grid side lies
+                outside ``1..image_size // patch_size``. ``patchify`` also
+                raises for NCHW pixels whose sides the patch size does not
+                divide.
+        """
         if pixels.ndim == 4:
             pixels = patchify(
                 pixels, patch_size=self.config.patch_size
             ).flatten(0, 1)
 
         # pixels: [total_patches, channels * patch_size**2] after flattening;
-        # every image grid must fit the fixed learned position table.
+        # every image grid must fit the fixed learned position table. The
+        # checks compare shapes and host values only; ``grids`` values are
+        # trusted to agree with ``grid_shapes``.
         counts = tuple(height * width for height, width in grid_shapes)
         side = self.config.image_size // self.config.patch_size
         if (
@@ -141,6 +174,8 @@ class Encoder(nn.Module):
             grids, total=sum(counts)
         )
         positions = rows * side + columns
+
+        # Callers may stage pixels in another dtype; embed in the weight dtype.
         features = self.patch_embedding(
             pixels.to(self.patch_embedding.weight.dtype)
         )
@@ -148,6 +183,7 @@ class Encoder(nn.Module):
 
         # Varlen attention needs each image's patch count on device and their
         # prefix-sum offsets, while the host copy drives kernel launch shapes.
+        # Queries and keys share the same lengths, and no image is causal.
         values = grids.prod(dim=1).to(torch.int32)
         offsets = torch.cat(
             (values.new_zeros(1), values.cumsum(0, dtype=torch.int32))

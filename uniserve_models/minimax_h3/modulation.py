@@ -17,6 +17,10 @@ class TimestepEmbedding(nn.Module):
     H3 trains one shared pair of linear maps. Both named modality projections
     retain that same module and parameter identity; the coordinates differ.
     These FP32 products feed SiLU before the BF16 modulation projections.
+
+    No resident module holds this embedding: checkpoint loading builds it
+    transiently to precompute the transformer's per-step modulation products
+    for the fixed ladder, then releases it.
     """
 
     def __init__(self, config: TransformerConfig):

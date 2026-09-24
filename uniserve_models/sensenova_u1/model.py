@@ -27,9 +27,14 @@ from .transformer import Transformer
 class Model(nn.Module):
     """Compose text, denoising, and vision over one shared MoT backbone.
 
-    The text LM and the image denoiser share the same transformer; the vision
-    encoder feeds NEO patch features into it, and the image decoder unfolds
-    predicted patches back into RGB pixels.
+    The text LM and the image denoiser share the same transformer instance:
+    text calls run through its ``text`` experts and denoising through its
+    ``flow`` experts, over one attention K/V cache. The vision encoder turns
+    input images into NEO patch features that the worker prefills into the
+    text model as token embeddings, and the image decoder unfolds the
+    denoiser's pixel-space patch rows back into RGB images. The denoiser owns
+    a second ``vision.Encoder`` with separate checkpoint weights for its own
+    image input.
     """
 
     def __init__(self, config: Config):
@@ -63,6 +68,11 @@ class Model(nn.Module):
 
 
 def entry_points(config: Config):
+    """Declare the model's single IPC component and its callable methods.
+
+    Token embedding runs on the first pipeline stage and logits on the last;
+    the vision encoder and image decoder join no communication group.
+    """
     return MappingProxyType(
         {
             DEFAULT_COMPONENT: ComponentEntry(

@@ -1,4 +1,12 @@
-"""Qwen3 numerical models and checkpoint definitions."""
+"""Qwen3 numerical models and checkpoint definitions.
+
+``uniserve_models.loading`` selects this package for ``Qwen3ForCausalLM`` and
+``Qwen3MoeForCausalLM`` checkpoints and reads the names exported here as its
+model package contract: configuration normalization, the model class, its
+entry points, checkpoint sources and mappings, and precision presets. The
+MiniMax H3 text encoder also reuses ``Config``, ``Transformer`` and
+``weights.parameter_sources``.
+"""
 
 from .config import Config, config_sources, read_config
 from .model import Model, entry_points
@@ -10,6 +18,8 @@ from .weights import (
     precisions,
 )
 
+# Qwen3 is text-only: the loading contract reads ``None`` as no image
+# preprocessing and no flow prompt.
 image_processor = None
 flow_prompt = None
 

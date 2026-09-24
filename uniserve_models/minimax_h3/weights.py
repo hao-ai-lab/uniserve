@@ -1,4 +1,13 @@
-"""H3 checkpoint assignments and fixed-ladder modulation preparation."""
+"""H3 checkpoint assignments and fixed-ladder modulation preparation.
+
+An H3 checkpoint is a diffusers pipeline directory; ``checkpoint_sources``
+names its four weight subdirectories. ``checkpoint_mappings`` returns a
+``weights.ModuleMapping`` for each component module. The loader fails on a
+checkpoint tensor that no assignment, derived constant, or ``nonresident``
+entry accounts for, so each mapping enumerates the tensors it intentionally
+leaves unloaded from a meta-device instance of the native diffusers or
+transformers model (``_transformer_names`` and its siblings).
+"""
 
 from __future__ import annotations
 
@@ -33,6 +42,10 @@ checkpoint_sources = (
 
 @cache
 def _transformer_names(config: TransformerConfig) -> frozenset[str]:
+    # The native diffusers model has no ``to_gate_compress`` projection, but
+    # the checkpoint stores one per block for the attention projection's
+    # ``gate`` branch. Listing it lets the nonresident sets of other pipeline
+    # stages and of the conditioner mapping account for it.
     from diffusers.models.transformers.transformer_minimax_h3 import (
         MiniMaxH3Transformer3DModel,
     )
@@ -56,6 +69,9 @@ def _transformer_names(config: TransformerConfig) -> frozenset[str]:
 def _text_names(config) -> frozenset[str]:
     from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
 
+    # Only tensor names matter here. The vision depth and deepstack indexes
+    # determine the vision tower's tensor names and match the H3 checkpoint's
+    # text_encoder config, so every vision tensor is declared nonresident.
     native_config = Qwen3VLConfig(
         text_config={
             source: getattr(config, target)
@@ -91,7 +107,16 @@ def _audio_names(config) -> frozenset[str]:
 
 
 def _resident_layers(model):
-    """Keep checkpoint layers and endpoint heads at their mathematical PP stage."""  # noqa: E501
+    """Keep checkpoint layers and endpoint heads at their mathematical PP stage.
+
+    Mutates ``model``: of ``L`` layers, stage ``r`` of ``P`` keeps the
+    contiguous layers ``[L * r // P, L * (r + 1) // P)`` under their global
+    keys, only the first stage keeps the latent input heads, and only the
+    last keeps the output norm and heads. Returns the pipeline group.
+
+    Raises:
+        ValueError: The pipeline has more stages than transformer layers.
+    """  # noqa: E501
     pipeline = model.mesh.get_group("pp" if "pp" in model.mesh.axes else ())
     if pipeline.size > model.config.num_hidden_layers:
         raise ValueError(
@@ -110,7 +135,16 @@ def _resident_layers(model):
 
 
 def transformer_assignments(model, reader):
-    """Map independent attention branches and value-first SwiGLU source rows."""
+    """Map independent attention branches and value-first SwiGLU source rows.
+
+    Yields one assignment per resident parameter whose checkpoint source
+    exists. An absent source leaves its parameter unassigned, which the
+    loader reports as missing.
+
+    Raises:
+        ValueError: A layer parameter lies outside the norm, attention and
+            mlp submodules.
+    """
     available = frozenset(reader.names())
     for name, parameter in model.named_parameters():
         branch = None
@@ -154,7 +188,7 @@ def transformer_assignments(model, reader):
         value = reader.get(source)
 
         # SwiGLU branches share one fused checkpoint tensor with value rows
-        # first.
+        # first: the ``up`` branch reads the leading half, ``gate`` the rest.
         region = None
         if branch is not None:
             width = value.shape[0] // 2
@@ -167,6 +201,14 @@ def transformer_assignments(model, reader):
 
 @torch.inference_mode()
 def _prepare_modulation(model, diffusion, reader):
+    """Precompute the resident layers' modulation products for the ladder.
+
+    Runs as the transformer mapping's post-load hook, after the resident
+    parameters are materialized. Evaluates the checkpoint's FP32 timestep
+    embedding and SiLU at every evaluated rung, projects the result through
+    each resident layer's ``adaln_proj`` and, on the last stage, ``norm_out``
+    in BF16, and stores the products on ``model.modulation``.
+    """
     # These temporary learned projections belong to loading. Only their fixed
     # step products remain with the numerical transformer after this function.
     device = next(model.parameters()).device
@@ -184,6 +226,9 @@ def _prepare_modulation(model, diffusion, reader):
                 field,
                 nn.Parameter(value, requires_grad=False),
             )
+    # The clean endpoint closes each schedule but is never evaluated, so the
+    # step count equals the ladder length the transformer was built with.
+    # ``activated`` is [steps, 2 timesteps (video, audio), time_dim].
     ladder = schedules(diffusion, device=device)
     activated = torch.stack(
         [
@@ -223,7 +268,13 @@ def _prepare_modulation(model, diffusion, reader):
 
 
 def transformer_component(model, diffusion):
-    """Declare resident transformer matrices and streamed modulation sources."""
+    """Declare resident transformer matrices and streamed modulation sources.
+
+    Prunes ``model`` to this pipeline stage first (see ``_resident_layers``).
+    Declares nonresident the conditioner's tensors, other stages' layers and
+    heads, and the timestep and modulation projections that only the
+    post-load hook reads.
+    """
     _resident_layers(model)
     all_names = _transformer_names(model.config)
     nonresident = set()
@@ -264,6 +315,9 @@ def transformer_component(model, diffusion):
 
 
 def _text_component(model):
+    # The text encoder checkpoint is a Qwen3-VL model whose language model
+    # lives under ``model.language_model.``; the resident Qwen3 backbone
+    # loads from there and every other native tensor is nonresident.
     names = {
         "network." + target.removeprefix("backbone."): source.replace(
             "model.", "model.language_model.", 1
@@ -292,7 +346,12 @@ def _text_component(model):
 
 
 def checkpoint_mappings(model) -> tuple[weights.ModuleMapping, ...]:
-    """Account for every native source using the complete model architecture."""
+    """Account for every native source using the complete model architecture.
+
+    Builds the mappings for the pipeline stage bound on the denoiser's
+    transformer mesh, pruning that transformer to its resident layers and
+    setting ``denoiser.conditioner`` to None on every stage after the first.
+    """
     denoiser = model.denoiser
     transformer = transformer_component(
         denoiser.transformer, denoiser.diffusion
@@ -325,6 +384,8 @@ def checkpoint_mappings(model) -> tuple[weights.ModuleMapping, ...]:
     else:
         denoiser.conditioner = None
     components.append(_text_component(model.text_encoder))
+
+    # Only the decoder halves of both VAEs are resident.
     video, audio = model.video_decoder.decoder, model.audio_decoder.decoder
     components.extend(
         (

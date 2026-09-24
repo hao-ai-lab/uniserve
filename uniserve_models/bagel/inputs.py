@@ -18,6 +18,13 @@ class DenoiserInput(NumericalDenoiserInput[image.Config]):
     Each positions tensor includes both marker rows. Its spatial coordinates
     on interior rows index the learned latent grid; marker spatial coordinates
     are unused. Temporal coordinates apply to every row through shared RoPE.
+
+    Attributes:
+        positions: One [3, sequence length] coordinate tensor per image.
+        sequence_lengths: Tokens per image: its latent patch rows plus the two
+            markers.
+        attention: Attention metadata over the images' sequences, packed in
+            batch order.
     """
 
     positions: tuple[torch.Tensor, ...]
@@ -40,6 +47,8 @@ class DenoiserInput(NumericalDenoiserInput[image.Config]):
             raise ValueError(
                 "BAGEL positions require three axes and two framing markers"
             )
+        # Query lengths are compared through their optional host mirror only,
+        # so validation never reads device lengths.
         if (
             not isinstance(self.attention, DenseInput)
             and self.attention.queries.host is not None

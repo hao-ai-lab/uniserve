@@ -45,6 +45,9 @@ def entry_points(config: Config) -> Mapping[str, ComponentEntry]:
             "text_encoder": ComponentEntry(
                 "text_encoder", (EntryPoint("encode", groups=("tp",)),)
             ),
+            # The conditioner runs on the first pipeline stage only, the stage
+            # whose ``Denoiser.forward`` scatters refined text into the packed
+            # token rows.
             "denoiser": ComponentEntry(
                 "denoiser",
                 (

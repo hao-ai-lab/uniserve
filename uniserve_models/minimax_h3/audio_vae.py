@@ -1,4 +1,10 @@
-"""Checkpoint-exact resident MiniMax H3 audio decoder."""
+"""Checkpoint-exact resident MiniMax H3 audio decoder.
+
+Only the decoder half of the checkpoint's audio VAE is resident: a 1x1
+input convolution followed by the BigVGAN network from ``diffusers``. The
+two stereo channels are decoded as a batch of two mono timelines.
+``receptive_field`` bounds the latent context a windowed decode needs.
+"""
 
 from __future__ import annotations
 
@@ -71,7 +77,12 @@ def receptive_field(config: Config) -> int:
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    """Native audio network and channel normalization."""
+    """Native audio network and channel normalization.
+
+    The product of ``encoder_rates`` is the number of output samples per
+    latent frame (``AudioDecoder.latent_rate``); the encoder itself is not
+    loaded.
+    """
 
     encoder_dim: int = 64
     encoder_rates: tuple[int, ...] = (2, 4, 4, 5, 5)
@@ -281,6 +292,8 @@ class Model(LatentDecoder):
                     module.register_parameter(
                         name, nn.Parameter(value, requires_grad=False)
                     )
+        # [stereo, channels, frames]: each stereo channel is one batch row
+        # of a variable-length latent timeline.
         super().__init__(
             decoder,
             latent_shape=(2, config.latent_channels, None),

@@ -1,4 +1,11 @@
-"""SenseNova U1 numerical models and checkpoint definitions."""
+"""SenseNova U1 numerical models and checkpoint definitions.
+
+``uniserve_models.loading`` selects this package for ``NEOChatModel``
+checkpoints and reads the names exported here as its model package contract:
+configuration normalization, the model class, its entry points, checkpoint
+sources and mappings, precision presets, and the caller-side image processor
+and flow prompt.
+"""
 
 from .config import Config, TransformerConfig, config_sources, read_config
 from .denoiser import Denoiser

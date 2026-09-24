@@ -1,4 +1,9 @@
-"""SenseNova's adaptive flow head and convolutional image reconstruction."""
+"""SenseNova's adaptive flow head and convolutional image reconstruction.
+
+The denoiser's backbone produces one hidden row per image token. The modules
+here turn those rows into a clean-image prediction in canonical patch rows and
+convert it into the flow-matching velocity the Euler solver consumes.
+"""
 
 import math
 from dataclasses import dataclass
@@ -14,6 +19,18 @@ from uniserve.nn.timestep import TimestepEmbedding
 
 @dataclass(frozen=True)
 class HeadConfig:
+    """Dimensions of the MLP velocity heads.
+
+    Attributes:
+        hidden_size: Residual width of the deep adaptive ``Head``, or the
+            hidden width of the shallow two-layer MLP.
+        num_layers: Checkpoint head depth. Without ``use_pixel_head``, more
+            than two selects ``Head`` with this many residual blocks;
+            otherwise ``Denoiser`` builds the shallow MLP.
+        mlp_ratio: Expansion of each residual block's MLP; only ``Head``
+            reads it.
+    """
+
     hidden_size: int
     num_layers: int
     mlp_ratio: float
@@ -38,6 +55,18 @@ class HeadConfig:
 
 @dataclass(frozen=True)
 class Config:
+    """Velocity head selection and initial-noise scaling.
+
+    Attributes:
+        head: MLP head dimensions, unused when ``use_pixel_head`` is set.
+        use_pixel_head: Whether the convolutional ``Decoder`` replaces the
+            MLP heads.
+        add_noise_scale_embedding: Whether the denoiser adds an embedding of
+            each image's noise scale to its token inputs.
+        noise: Resolution-dependent scale of the initial normal draw, and
+            the input of the optional noise-scale embedding.
+    """
+
     head: HeadConfig
     use_pixel_head: bool
     add_noise_scale_embedding: bool
@@ -93,7 +122,13 @@ class _Output(nn.Module):
 
 
 class Head(nn.Module):
-    """Predict clean patch values using the checkpoint's adaptive time network."""  # noqa: E501
+    """Predict clean patch values using the checkpoint's adaptive time network.
+
+    Maps ``[tokens, input_size]`` rows and ``[tokens]`` timesteps to
+    ``[tokens, output_size]``. The head embeds the timestep with its own
+    ``TimestepEmbedding``, separate from the one the denoiser adds to the
+    backbone input, and uses it to modulate every block.
+    """  # noqa: E501
 
     def __init__(
         self, config: HeadConfig, *, input_size: int, output_size: int
@@ -118,7 +153,14 @@ class Head(nn.Module):
 
 
 class Decoder(nn.Module):
-    """Reconstruct image pixels with three channel-to-spatial rearrangements."""
+    """Reconstruct image pixels with three channel-to-spatial rearrangements.
+
+    Maps ``[1, input_size, rows, columns]`` token features to
+    ``[1, out_channels, rows * 4 * final_upscale, columns * 4 *
+    final_upscale]`` pixels: two 2x pixel shuffles around a convolution, then
+    a convolution to ``out_channels * final_upscale**2`` channels and a final
+    ``final_upscale`` shuffle.
+    """
 
     def __init__(
         self,
@@ -154,10 +196,11 @@ class Decoder(nn.Module):
 class Velocity(nn.Module):
     """Convert clean image predictions into velocity in canonical patch order.
 
-    Conditioning pixels are the complete noisy image [1, 3, height, width].
-    The predictor can be an adaptive Head, a shallow ordinary MLP, or Identity
-    followed by the convolutional Decoder. The endpoint denominator is bounded
-    by the checkpoint's 0.02 clean-fraction interval.
+    ``patches.pixels`` is the complete noisy image ``[1, 3, height, width]``
+    that the velocity starts from. The predictor can be an adaptive Head, a
+    shallow ordinary MLP, or Identity followed by the convolutional Decoder.
+    The velocity is ``(prediction - sample) / (1 - t)`` with ``1 - t`` clamped
+    to at least 0.02, the reference implementation's default endpoint epsilon.
     """
 
     def __init__(self, head: nn.Module, decoder: nn.Module, *, patch_size: int):
@@ -181,6 +224,8 @@ class Velocity(nn.Module):
 
         # hidden is [rows*columns, text_hidden]; predictions are per-patch
         # clean values in the same canonical patch order as the sample below.
+        # The pixel decoder needs the token grid as an NCHW map and returns
+        # full-resolution pixels; the MLP heads emit patch rows directly.
         if isinstance(self.decoder, Decoder):
             spatial = (
                 self.head(hidden)
@@ -201,6 +246,10 @@ class Velocity(nn.Module):
             prediction = self.decoder(prediction)
 
         sample = patchify(pixels, patch_size=self.patch_size)[0]
-        # A one-dimensional FP32 time retains the checkpoint's FP32 velocity
-        # promotion after the BF16 clean-sample subtraction.
+        # Schedules hold FP32 timesteps. A zero-dimensional float tensor does
+        # not raise the result dtype of a dimensioned float operand, so the
+        # one-dimensional view makes the division return FP32 even when the
+        # difference is BF16. FP32 is the declared ``prediction_dtype``, the
+        # dtype of the buffers in which the other pipeline stages receive the
+        # broadcast prediction.
         return (prediction - sample) / (1 - timestep.reshape(1)).clamp_min(0.02)

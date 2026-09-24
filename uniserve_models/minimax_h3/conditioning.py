@@ -1,4 +1,11 @@
-"""Dense text refinement for H3's multimodal token stream."""
+"""Dense text refinement for H3's multimodal token stream.
+
+The ``Conditioner`` projects the text encoder's Qwen hidden states to the
+denoiser width and refines each prompt with dense bidirectional attention.
+It runs once per request through the denoiser's ``conditioner.encode``
+entry; the worker retains the result and supplies it to every denoising
+step as ``DenoiserInput.text_features``.
+"""
 
 from __future__ import annotations
 
@@ -28,6 +35,8 @@ class RefinerBlock(nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.head_dim = config.head_dim
+        # Pre-attention, pre-MLP, query and key norms (checkpoint norm1,
+        # norm2, attn.norm_q and attn.norm_k).
         self.norms = nn.ModuleList(
             (
                 RMSNorm(config.hidden_size, config.norm_eps),

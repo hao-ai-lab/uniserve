@@ -1,4 +1,12 @@
-"""Deterministic text, vision and image module composition."""
+"""Deterministic text, vision and image module composition.
+
+Every capability computes a closed-form result, so outputs are exactly
+predictable. Text features are a lossless digit encoding of each token ID
+and the head maps each ID to a fixed successor (see ``_Head``). The single
+backbone layer passes features through and writes zero scalar K/V. Vision
+features are per-patch pixel means, the latent encoder's latents are the
+pixels themselves cast to BF16 and patchified, and the denoiser predicts zero.
+"""
 
 from __future__ import annotations
 
@@ -33,12 +41,14 @@ STUB_IMG_START_TOKEN_ID = 151670
 
 _VOCAB_SIZE = STUB_IMG_START_TOKEN_ID + 1
 
+# Three token-ID digits plus a constant digit; see ``_Embedding``.
 _HIDDEN_SIZE = 4
 
 
 class _Embedding(nn.Module):
     """Represent token IDs exactly using three base-128 BF16 digits."""
 
+    # ``TransformerDecoder`` reads these as its hidden and vocabulary sizes.
     embedding_dim = _HIDDEN_SIZE
     num_embeddings = _VOCAB_SIZE
 
@@ -49,8 +59,10 @@ class _Embedding(nn.Module):
         )
 
     def forward(self, tokens):
-        # Three base-128 digits recover the ID losslessly below 128**3, plus a
-        # constant bias digit, so the head can invert features back to tokens.
+        # [tokens] -> [tokens, 4]. Three base-128 digits recover the ID
+        # losslessly below 128**3, and every digit there is an integer below
+        # 128, which BF16 represents exactly. A constant fourth digit fills
+        # the hidden width. ``_Head`` inverts the digits back to the ID.
         return (
             torch.stack(
                 (
@@ -91,6 +103,7 @@ class _Head(nn.Module):
         targets = torch.where(tokens == 1007, STUB_EOS_TOKEN_ID, targets)
 
         # ±16 logits make argmax sampling pick the cycle's successor token.
+        # ``hidden`` is [rows, hidden], so logits are [rows, vocab].
         logits = hidden.new_full((*tokens.shape, _VOCAB_SIZE), -16.0)
         return logits.scatter_(1, targets.reshape(-1, 1), 16.0)
 
@@ -100,6 +113,10 @@ class _Layer(nn.Module):
 
     def __init__(self):
         super().__init__()
+
+        # The layer's only parameter: ``TransformerDecoder.cache_config``
+        # takes the cache dtype from a layer's first parameter, so this
+        # scalar makes the K/V cache BF16.
         self.scale = nn.Parameter(
             torch.zeros((), dtype=torch.bfloat16), requires_grad=False
         )
@@ -116,6 +133,9 @@ class _Layer(nn.Module):
             self.attention.update_cache(
                 values, values, indices=attention.write_indices
             )
+
+        # A zero residual keeps the decoder's final ``norm(hidden +
+        # residual)`` equal to the embedding digits ``_Head`` decodes.
         return hidden, torch.zeros_like(
             hidden
         ) if residual is None else residual
@@ -129,6 +149,8 @@ class _Vision(nn.Module):
         self.patch_size = patch_size
 
     def forward(self, pixels, grids, grid_shapes):
+        # Patch rows, or NCHW pixels patchified here, reduce to
+        # [total_patches, _HIDDEN_SIZE].
         patches = (
             patchify(pixels, patch_size=self.patch_size)
             if pixels.ndim == 4
@@ -142,7 +164,12 @@ class _Vision(nn.Module):
 
 
 class _Scale(nn.Module):
-    """Identity pixel scaling through a unit weight, for the latent decoder."""
+    """Identity pixel scaling through a unit weight, for the latent decoder.
+
+    ``PatchAutoencoder`` casts its inputs to the dtype of the encoder's or
+    decoder's first parameter, so the unit weight makes the codec run in
+    BF16.
+    """
 
     def __init__(self):
         super().__init__()
