@@ -1,9 +1,20 @@
 //! Engine-loop construction, event parking, and owner-thread execution.
+//!
+//! Construction clamps the requested scheduler configuration and model
+//! generation limits to the capacities the loaded workers report, then builds
+//! the single-owner `Scheduler`. `Scheduler::run` is the owner-thread loop:
+//! drain commands, take one nonblocking scheduling step, and park in the
+//! executor only when the step made no progress.
 
 use super::*;
 use uniserve_worker_ipc::{ForwardMode, MediaCall};
 
 /// Intersects model requirements with capacities actually loaded by the worker.
+///
+/// A generation feature survives only when every call kind it needs is in the
+/// aggregate `supported_calls`; numeric limits are clamped to the reported
+/// latent, batch-token, encoder-entry, buffer-pool, and encoder-cache
+/// capacities.
 fn resolve_generation_limits(
     mut limits: uniserve_core::GenerationLimits,
     info: &WorkerInfo,
@@ -28,14 +39,18 @@ fn resolve_generation_limits(
         available.insert(uniserve_core::GenerationFeatures::IMAGE_GENERATION);
     }
     limits.features &= available;
+
     limits.max_latent_units = limits.max_latent_units.min(info.latent_capacity_units());
     let latent_bound = limits.max_latent_units.min(u64::from(u32::MAX)) as u32;
     limits.max_vae_grid_tokens = limits.max_vae_grid_tokens.min(latent_bound);
     limits.max_vit_grid_tokens = limits.max_vit_grid_tokens.min(info.max_batch_tokens);
+    // One encoder product must fit both an encoder-cache entry and the buffer
+    // pool.
     let feature_bytes = info.encoder_entry_bytes.min(info.buffer_pool_bytes);
     limits.max_latent_feature_bytes = limits.max_latent_feature_bytes.min(feature_bytes);
     limits.max_vision_feature_bytes = limits.max_vision_feature_bytes.min(feature_bytes);
     limits.encoder_cache_entries = limits.encoder_cache_entries.min(info.encoder_cache_entries);
+    // Encoder caching requires a buffer pool.
     if info.buffer_pool_bytes == 0 {
         limits.encoder_cache_entries = 0;
     }
@@ -91,8 +106,9 @@ impl Scheduler {
     ) -> anyhow::Result<Self> {
         let info = executor.info().runtime_info()?;
 
-        // Capability families are mutually ordered from diffusion-only through
-        // unified multimodal support to autoregressive-only execution.
+        // Latent preparation without text decode is diffusion-only; otherwise
+        // any denoising, vision-encoding, or latent-encoding capability makes
+        // the runtime unified multimodal; everything else is autoregressive.
         let calls = &info.supported_calls;
         let family = if calls.contains(&CallKind::Media(MediaCall::LatentPreparation))
             && !calls.contains(&CallKind::Forward(ForwardMode::Decode))
@@ -119,6 +135,8 @@ impl Scheduler {
         config: SchedulerConfig,
         family: RuntimeFamily,
     ) -> anyhow::Result<Self> {
+        // Unified runtimes start from unbounded limits; `with_model_limits`
+        // clamps them to the worker-reported capacities.
         let generation_limits = match family {
             RuntimeFamily::Umm => unbounded_umm_generation_limits(),
             RuntimeFamily::Ar | RuntimeFamily::Diffusion => uniserve_core::GenerationLimits {
@@ -188,7 +206,10 @@ impl Scheduler {
 
         config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
 
-        // Unified runtimes reserve one physical slot for the image flow request.
+        // KV runtimes with denoising keep one request slot outside
+        // `max_num_seqs`. A running request's multi-branch guidance prefix
+        // (`Scheduler::ensure_flow_prefix`) allocates its own slot from the
+        // same request pool. `set_max_num_seqs` applies the same reserve.
         let flow_slot_reserve = usize::from(
             info.uses_kv()
                 && info
@@ -223,7 +244,6 @@ impl Scheduler {
 
         // Runtime state remains single-owner; executors receive immutable batch
         // inputs assembled from these queues and request records.
-
         Ok(Self {
             executor,
             inflight: inflight::Inflight::new(),
@@ -289,6 +309,7 @@ impl Scheduler {
             cache.set_hash_algo(algo);
         }
     }
+
     /// Configures the per-step token budget.
     pub fn set_token_budget(&mut self, tokens: usize) {
         self.config.max_num_batched_tokens = tokens.max(1);
@@ -300,6 +321,8 @@ impl Scheduler {
     }
 
     /// Sets the resident sequence limit within the worker slot capacity.
+    ///
+    /// Keeps the flow-prefix slot reserve applied at construction.
     pub fn set_max_num_seqs(&mut self, n: usize) {
         let flow_slot_reserve = usize::from(
             self.info.uses_kv()
@@ -316,6 +339,7 @@ impl Scheduler {
             .max(1);
         self.config.max_num_seqs = n.clamp(1, capacity);
     }
+
     /// Caps waiting and terminal-output-retained request state.
     pub fn set_max_num_waiting(&mut self, n: usize) {
         self.config.max_num_waiting = n.clamp(1, MAX_NUM_WAITING);
@@ -351,7 +375,7 @@ impl Scheduler {
         self.running_media.keys().copied().collect()
     }
 
-    /// Takes the media state.
+    /// Removes and returns a media request's state.
     pub(super) fn take_media_state(&mut self, id: RequestId) -> Option<MediaFlowState> {
         self.running_media.remove(&id)
     }
@@ -367,6 +391,10 @@ impl Scheduler {
     }
 
     /// All drivers consume the same command ingress before scheduling work.
+    ///
+    /// Applies every queued command without blocking. Returns `true` when the
+    /// engine must stop: a `Shutdown` command arrived or every sender has
+    /// disconnected.
     pub(super) fn drain_commands(&mut self, commands: &Receiver<Command>) -> bool {
         loop {
             match commands.try_recv() {
@@ -383,8 +411,10 @@ impl Scheduler {
 
     /// Runs the owner-thread control loop, blocking only when fully idle.
     ///
-    /// Returns `true` if the engine died
-    /// (executor/worker failure) rather than shutting down gracefully.
+    /// Returns `true` if the engine died (executor or worker failure) rather
+    /// than shutting down on a `Shutdown` command or command-channel
+    /// disconnect. Either way, every queued or running request is finished with
+    /// `Aborted` and the executor is closed before returning.
     pub fn run(mut self, rx: Receiver<Command>) -> bool {
         loop {
             if self.drain_commands(&rx) {
@@ -411,9 +441,9 @@ impl Scheduler {
                 }
             }
         }
-        // Graceful shutdown: report Aborted to everything still queued or
-        // running before tearing the executor down (staged drain happened at
-        // the HTTP layer; nothing in flight should just see a closed channel).
+        // Finish everything still queued or running with `Aborted` before
+        // closing the executor, so a consumer whose channel has room receives
+        // a terminal event rather than only a closed channel.
         self.abort_all_requests();
         let _ = self.executor.close();
         false
@@ -421,7 +451,12 @@ impl Scheduler {
 
     /// Parks until a result, command, worker death, CPU continuation, or output-capacity wake.
     ///
-    /// The timeout is solely a liveness deadline.
+    /// Waits in `Executor::poll` and applies at most one returned result.
+    /// Commands and consumer reads fire the engine's `CommandWaker`. A real
+    /// waker, such as `WorkerExecutor::command_waker`, ends the poll early.
+    /// With the no-op waker, a command waits for the executor's own wake
+    /// sources or the timeout. The timeout (`IDLE_LIVENESS_POLL`) is solely a
+    /// liveness deadline.
     pub(super) fn park_for_progress(&mut self) {
         let _span = tracing::trace_span!("scheduler.park").entered();
         match self.executor.poll(IDLE_LIVENESS_POLL) {

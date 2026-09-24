@@ -1,4 +1,17 @@
 //! Model-profile selection and load-time serving capabilities.
+//!
+//! The server identifies the served model family from the checkpoint itself:
+//! the `model_type` of its root architecture config (see
+//! `ResolvedModelFiles::config_path`) or, for a diffusers pipeline, the
+//! `_class_name` of its root index (see [`assets::pipeline_index`]). The
+//! result is one [`ModelConfig`], built at startup by `ModelConfig::load` in
+//! `serving::model`. Engine startup reads it, and `InputProcessor::new` then
+//! binds the worker's capabilities onto it before request preprocessing and
+//! discovery share it immutably.
+//!
+//! Submodules own checkpoint asset resolution ([`assets`]), the multimodal
+//! family profiles ([`omni`]), streaming reasoning and tool-call parsers
+//! ([`reasoning`], [`tools`]), and the tokenizer ([`tokenizer`]).
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -37,6 +50,10 @@ pub enum ModelDescription {
 
 impl ModelDescription {
     /// Every served model family.
+    ///
+    /// `from_model_type` and `from_pipeline_class` search only this list, so a
+    /// variant missing from it compiles but is never selected from checkpoint
+    /// metadata.
     const ALL: [Self; 4] = [Self::Qwen3, Self::SenseNova, Self::Bagel, Self::MiniMaxH3];
 
     /// Returns the stable profile identifier.
@@ -71,9 +88,9 @@ impl ModelDescription {
 
     /// Resolves the served profile from a checkpoint's `model_type` field.
     ///
-    /// The repository configuration is the only source of model identity, so a
-    /// checkpoint UniServe does not implement is rejected here rather than
-    /// mismatching a separately supplied name.
+    /// The checkpoint configuration is the only source of model identity.
+    /// `None` means UniServe serves no family with this `model_type` from a
+    /// root configuration; pipeline families never match here.
     pub fn from_model_type(model_type: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
@@ -91,7 +108,8 @@ impl ModelDescription {
 impl std::str::FromStr for ModelDescription {
     type Err = ModelDescriptionParseError;
 
-    /// Parses the value from its string representation.
+    /// Parses a profile identifier as returned by [`ModelDescription::id`],
+    /// also accepting the hyphenated spelling `minimax-h3`.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "qwen3" => Ok(Self::Qwen3),
@@ -121,7 +139,8 @@ pub struct SamplingDefaults {
     pub min_p: Option<f32>,
     /// Default multiplicative penalty for repeated tokens.
     pub repetition_penalty: Option<f32>,
-    /// Checkpoint ceiling on generated token count.
+    /// Default generation length from `max_new_tokens`, used only when the
+    /// request omits `max_tokens`; an explicit request value replaces it.
     pub max_output_tokens: Option<u32>,
 }
 
@@ -139,6 +158,9 @@ pub enum ModelParameters {
         /// Maximum requested duration in seconds, before frame alignment.
         max_video_seconds: f64,
         /// Fixed number of denoising predictions in the checkpoint contract.
+        ///
+        /// [`ModelConfig::from_pipeline`] leaves it zero; `InputProcessor::new`
+        /// binds the count the worker advertises in its startup handshake.
         num_inference_steps: u32,
     },
 }
@@ -153,8 +175,17 @@ pub struct ModelConfig {
     /// Checkpoint defaults applied only to omitted request fields.
     pub sampling_defaults: SamplingDefaults,
     /// Combined input/output token ceiling from metadata and configuration.
+    ///
+    /// `InputProcessor::new` replaces it with
+    /// `WorkerCapabilities::max_model_tokens`, which `build_state` in the crate
+    /// root computes as the smaller of this value and the started engine's
+    /// `max_model_len`.
     pub max_model_tokens: Option<u32>,
-    /// Canonical tokenizer EOS, placed first when starting the engine.
+    /// Tokenizer-config `eos_token` resolved through the vocabulary.
+    ///
+    /// `special_token_ids` in the crate root places it first in the engine's
+    /// EOS list unless the profile's `GenerationControls` carry a nonzero
+    /// `eos`, which takes that place instead.
     pub primary_eos_token_id: Option<u32>,
     /// Complete EOS set resolved from tokenizer and generation metadata.
     pub eos_token_ids: BTreeSet<u32>,
@@ -162,6 +193,17 @@ pub struct ModelConfig {
 
 impl ModelConfig {
     /// Resolves vocabulary, checkpoint defaults, and model-specific settings once.
+    ///
+    /// The family comes from the `model_type` of `files.config_path`; a
+    /// configured `max_model_tokens` takes precedence over the checkpoint's
+    /// `max_position_embeddings`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a present metadata file cannot be read or parsed, when
+    /// `model_type` is missing or names no family served from a root
+    /// configuration, or when a multimodal profile cannot resolve its control
+    /// tokens from `tokenizer`.
     pub fn from_files(
         model_id: &str,
         files: &ResolvedModelFiles,
@@ -180,10 +222,12 @@ impl ModelConfig {
                     actual: actual_model_type.to_owned(),
                 }
             })?;
+
         let generation_config = load_generation_config(files.generation_config_path.as_deref())?;
         let tokenizer_config = load_tokenizer_config(files.tokenizer_config_path.as_deref())?;
         let (primary_eos_token_id, eos_token_ids) =
             stop_token_ids(&tokenizer_config, &generation_config, tokenizer);
+
         let parameters = match description {
             ModelDescription::Qwen3 => ModelParameters::Qwen3,
             ModelDescription::SenseNova => {
@@ -198,6 +242,7 @@ impl ModelConfig {
                 });
             }
         };
+
         Ok(Self {
             served_name: model_id.to_owned(),
             parameters,
@@ -210,10 +255,16 @@ impl ModelConfig {
 
     /// Resolves a family that ships as a diffusers pipeline.
     ///
-    /// A pipeline checkpoint has no root generation or tokenizer metadata, and
-    /// its denoising step count belongs to the loaded numerical plan, which the
+    /// A pipeline checkpoint has no root generation or tokenizer metadata, so
+    /// the result carries no sampling defaults and no EOS tokens. Its
+    /// denoising step count belongs to the loaded numerical plan, which the
     /// worker handshake binds. `max_model_tokens` overrides the family's prompt
     /// bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`assets::Error::UnsupportedPipeline`] for a family that does
+    /// not ship as a pipeline.
     pub fn from_pipeline(
         model_id: &str,
         description: ModelDescription,
@@ -235,6 +286,7 @@ impl ModelConfig {
                 });
             }
         };
+
         Ok(Self {
             served_name: model_id.to_owned(),
             parameters,
@@ -269,6 +321,11 @@ fn generation_defaults(config: &GenerationConfig) -> SamplingDefaults {
 }
 
 /// Combines tokenizer and generation metadata into one canonical termination policy.
+///
+/// Returns the tokenizer-config `eos_token` as the primary id and the union of
+/// the generation-config `eos_token_id` values with that primary. An
+/// `eos_token` absent from the vocabulary yields no primary rather than an
+/// error.
 fn stop_token_ids(
     tokenizer_config: &HfTokenizerConfig,
     generation_config: &GenerationConfig,
@@ -316,6 +373,9 @@ mod tests {
         "</answer>",
     ];
 
+    /// Writes a minimal checkpoint for `model_type`: a character-level BPE
+    /// tokenizer over ASCII plus [`SPECIAL_TOKENS`], and root, tokenizer, and
+    /// generation configs. Dropping the returned directory deletes the files.
     fn configured_files(model_type: &str) -> (tempfile::TempDir, ResolvedModelFiles) {
         let directory = tempdir().expect("create model directory");
         let mut vocab = Vocab::from_iter([("<unk>".to_string(), 0_u32)]);
@@ -338,6 +398,7 @@ mod tests {
         tokenizer
             .save(&tokenizer_path, false)
             .expect("save tokenizer");
+
         let config_path = directory.path().join("config.json");
         fs::write(
             &config_path,
@@ -355,6 +416,7 @@ mod tests {
             r#"{"eos_token_id":2,"temperature":0.6,"top_p":0.95,"top_k":20,"max_new_tokens":512}"#,
         )
         .expect("write generation config");
+
         let files = ResolvedModelFiles {
             tokenizer_path,
             tokenizer_config_path: Some(tokenizer_config_path),
@@ -469,6 +531,9 @@ mod tests {
         let rendered_negative = tokenizer.decode(&negative, false).unwrap();
         assert!(rendered_negative.starts_with("<|im_start|>system\nYou are an image generation"));
         assert!(rendered_negative.ends_with("<|im_start|>assistant\n<img>"));
+
+        // 2048x1152 is already 32-aligned and inside the pixel bounds, so it
+        // yields a 64x36 grid; generated-image feedback adds one marker token.
         let ingest = profile
             .image_encoders_for_dimensions(2048, 1152, 1)
             .unwrap();
@@ -508,6 +573,9 @@ mod tests {
         let rendered = tokenizer.decode(&prompt, false).unwrap();
         assert!(rendered.starts_with("<|im_start|>You should first think"));
         assert!(rendered.ends_with("<|im_start|>assistant\n"));
+
+        // VAE: 1024x512 at stride 16 is a 64x32 grid. ViT: the VAE canvas is
+        // resized to 980x490 at stride 14, a 70x35 grid. Both add two markers.
         let ingest = profile.image_encoders_for_dimensions(1024, 512, 1).unwrap();
         assert_eq!(
             ingest

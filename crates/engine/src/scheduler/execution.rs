@@ -1,8 +1,30 @@
 //! Batch submission, completion application, and allocation reclamation.
 //!
-//! The loop keeps executor progress non-blocking until work is outstanding, then
-//! parks with a bounded liveness deadline. Completion application validates
-//! request and call identities before mutating runtime state.
+//! This part of the scheduler sits between request state and the executor:
+//!
+//! - Refill and dispatch: `refill_executor` admits requests, asks the
+//!   generation assembler (`assemble`) and the video media planner
+//!   (`prepare_media_batches`) for batches while a rank queue has room, and
+//!   `dispatch_submissions` hands them to the executor in order per worker.
+//! - Video media scheduling: a video request is a fixed graph of media calls
+//!   (`consuming_calls`, `ready_calls`). Calls occupy device lanes and, for
+//!   encoding and muxing, host lanes, tracked by the lane ledger, and
+//!   `plan_media_call` builds one call with its products, buffer bindings and
+//!   latent pages.
+//! - Successor projection: queries such as `projected_coordinates`,
+//!   `pending_successor_code` and `can_queue_successor` project a token
+//!   request's accepted state through its in-flight calls, so the batching
+//!   path can queue a successor before its predecessor's result returns.
+//! - Result reconciliation: `apply_result` validates every returned call
+//!   identity against the in-flight window before any completion is applied,
+//!   stages completions, and applies them in request-local dependency order.
+//! - Failure reconciliation: `on_executor_error` retires only the work a
+//!   `WorkerFailure` invalidates. Any other executor error, and a worker
+//!   failure classified as a control-plane invariant violation, is
+//!   engine-fatal.
+//!
+//! `Scheduler::run` drives these in production; `Scheduler::step` is a
+//! single-tick driver for tests and examples.
 
 use super::*;
 use uniserve_worker_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode};
@@ -11,6 +33,11 @@ impl Scheduler {
     /// Dispatches queued work while preserving order at every shared destination.
     /// The caller retains blocked destinations for the whole scheduling tick, so
     /// assembling more work cannot repeatedly retry an unavailable worker.
+    ///
+    /// Each queued batch is tried once per invocation; a batch that cannot be
+    /// submitted goes back to the end of the queue. Returns whether any batch
+    /// was submitted, or `true` after a terminal submission failure, which is
+    /// handed to `on_executor_error` and stops dispatching.
     fn dispatch_submissions(&mut self, blocked_workers: &mut HashSet<crate::WorkerId>) -> bool {
         let mut progressed = false;
         let pending_count = self.inflight.pending_submissions.len();
@@ -67,7 +94,13 @@ impl Scheduler {
             self.storage.latent_pool.free(allocation);
         }
     }
+
     /// Advances scheduler and executor work, blocking only for an outstanding result.
+    ///
+    /// Drains `commands` first; a shutdown command or a disconnected channel
+    /// aborts every request, closes the executor and returns `false`. When the
+    /// nonblocking tick makes no progress while batches are in flight, this
+    /// waits a bounded time for one result.
     ///
     /// Returns whether the loop made progress or handled an executor outcome.
     pub fn step(&mut self, commands: &Receiver<Command>) -> bool {
@@ -96,12 +129,13 @@ impl Scheduler {
     }
 
     /// Advances one nonblocking schedule-ahead tick for the owner-thread reactor. It
-    /// drains ready results, reaps cancellations, and fills available executor
-    /// slots, but leaves any blocking result wait to `run`.
+    /// flushes output journals, resolves at most one ready result, reaps
+    /// cancellations, and fills available executor slots, but leaves any
+    /// blocking result wait to `run`.
     pub(super) fn step_nonblocking(&mut self) -> bool {
         let _span = tracing::trace_span!("scheduler.step").entered();
         let mut progressed = self.flush_output_journals();
-        // 1. Resolve one completed batch. Refilling immediately after one
+        // Resolve one batch result. Refilling immediately after one
         // completion preserves an occupied execution slot when multiple
         // responses become ready together at queue depth greater than one.
         // The owner loop returns here without parking while progress is being
@@ -118,9 +152,17 @@ impl Scheduler {
         progressed
     }
 
-    /// Drains ready work, admits requests, and fills every available executor slot.
+    /// Dispatches queued batches, reaps cancellations, admits requests, and
+    /// fills every available executor slot.
+    ///
+    /// Returns whether it queued or submitted a batch or handled a submission
+    /// failure. Stops early once the engine-fatal latch is set.
     pub(super) fn refill_executor(&mut self) -> bool {
         let mut progressed = false;
+        // Drop residency for requests that are no longer running or retiring.
+        // A retiring request keeps its entries because
+        // `Placement::batch_workers` finds the destinations of its `Finish`
+        // and `Free` commands through them.
         self.placement.affinity.retain(|(request, _), _| {
             let id = request.request_id;
             self.running.contains_key(&id)
@@ -134,17 +176,16 @@ impl Scheduler {
             return progressed;
         }
 
-        // 2. reap cancellations before assembling.
+        // Reap cancellations before assembling.
         self.reap_cancellations();
 
-        // 3. Admit request/resource residency even
-        // while every execution slot is occupied. This lets the next batch see
-        // the complete resident cohort instead of admitting only when a slot
-        // happens to open.
+        // Admit request and resource residency even while every execution slot
+        // is occupied. This lets the next batch see the complete resident
+        // cohort instead of admitting only when a slot happens to open.
         self.admit();
         self.admit_media();
 
-        // 4. submit as many batches as the rank queues admit.
+        // Submit as many batches as the rank queues admit.
         loop {
             self.admit();
             self.admit_media();
@@ -162,6 +203,9 @@ impl Scheduler {
                 return progressed;
             }
         }
+
+        // Lifecycle commands that no scheduling pass carried go out in
+        // command-only batches while nothing else awaits submission.
         while self.inflight.pending_submissions.is_empty()
             && !self.inflight.pending_commands.is_empty()
             && self.a_rank_queue_admits()
@@ -185,9 +229,13 @@ impl Scheduler {
         progressed
     }
 
-    /// Selects the batches of one pass under the shared queue budget and
-    /// existing family fairness. A pass yields one batch per `(kind,
-    /// component)` it selected, each a single numerical call.
+    /// Selects the batches of one pass, alternating between video media work
+    /// and generation work. A pass yields one batch per `(kind, component)` it
+    /// selected, each a single numerical call.
+    ///
+    /// `prefer_media` is set after a generation pass yields batches and
+    /// cleared after a media pass does; either kind runs when the other has
+    /// nothing to schedule.
     fn schedule_batches(&mut self) -> Vec<ExecutionBatch> {
         if self.prefer_media {
             let batches = self.prepare_media_batches();
@@ -211,7 +259,14 @@ impl Scheduler {
         batches
     }
 
-    /// Allocates a request-scoped product reference for a terminal media result.
+    /// Allocates the completion product of a state-advancing media call that
+    /// declares no outputs.
+    ///
+    /// `plan_media_call` requests one for latent preparation and every
+    /// denoising step but the last; the request's next state-advancing call
+    /// names it as its `predicate` while this call is still in flight. The
+    /// generation counter is shared with the products the generation path
+    /// registers.
     ///
     /// Fails, leaving the generation counter unchanged, once product
     /// generations are exhausted.
@@ -241,8 +296,9 @@ impl Scheduler {
 /// text encoding feeds latent preparation, which opens the denoising ladder;
 /// each step feeds the next and the last feeds both decoders; a decoder's
 /// media units feed their encoder, whose encoded unit rows feed the muxer,
-/// which also assembles the encoded audio. The producing rank is told which
-/// ranks read its products from this, because it cannot know on its own.
+/// which also assembles the encoded audio. `WorkerGroup::consumer_slots`
+/// uses it to tell a producing rank which ranks read its products, because
+/// the rank cannot know on its own.
 pub(crate) fn consuming_calls(media_call: MediaCall) -> Option<&'static [MediaCall]> {
     Some(match media_call {
         MediaCall::TextEncoding => &[MediaCall::LatentPreparation],
@@ -264,10 +320,15 @@ pub(crate) fn consuming_calls(media_call: MediaCall) -> Option<&'static [MediaCa
 
 /// The lanes one media call occupies while it is in flight.
 ///
-/// A component lane measured in media units carries `units`; every other
-/// component lane is exclusive and admits one request at a time. `host_ranks`
-/// names the host lanes the call places a task on, one slot on each.
+/// A component lane measured in media units carries `units`; a demand with
+/// zero `units` holds its component lane exclusively, one request at a time.
+/// `host_ranks` names the host lanes the call places tasks on.
 struct LaneDemand {
+    /// The worker and component whose device lane the call occupies, taken
+    /// from the request's placement (`Placement::affinity`). Admission places
+    /// a media request on a worker for every media component, so a request's
+    /// first call is checked against its lane too. `None` when no component
+    /// serves the call or the request holds no placement for it.
     component: Option<(crate::WorkerId, String)>,
     units: u32,
     /// Host lanes this call occupies, each named by its worker and rank with
@@ -277,9 +338,14 @@ struct LaneDemand {
 }
 
 /// Lane occupancy across the media calls in flight.
+///
+/// `lane_occupancy` rebuilds it from the in-flight calls at the start of each
+/// media pass, and the pass charges each call it selects.
 #[derive(Default)]
 struct LaneLedger {
+    /// The request holding each exclusive component lane.
     exclusive: HashMap<(crate::WorkerId, String), RequestId>,
+    /// Media units in flight on each unit-measured component lane.
     units: HashMap<(crate::WorkerId, String), u32>,
     /// A host rank owns one host lane, so occupancy is counted per rank of
     /// each worker.
@@ -288,6 +354,9 @@ struct LaneLedger {
 
 impl LaneLedger {
     /// Returns whether one request's call fits the lanes it occupies.
+    ///
+    /// Every host rank must have room for the call's tasks. An exclusive
+    /// component lane admits further calls of the request already holding it.
     fn admits(&self, demand: &LaneDemand, request: RequestId, scheduler: &Scheduler) -> bool {
         if demand.host_ranks.iter().any(|(worker, rank, tasks)| {
             let capacity = scheduler.host_lane_capacity(worker);
@@ -344,15 +413,23 @@ impl Scheduler {
         rounds
     }
 
-    /// Lists every call of one request whose inputs are produced.
+    /// Lists every call of one request that can be scheduled now.
     ///
     /// A request is a set of calls with data dependencies, so a tick offers all
     /// of them and the lane ledger decides which ones fit. At most one call of
     /// each kind is ready at once: the cursors this returns against advance as
     /// calls are scheduled, so a unit group only becomes ready once its
     /// predecessor is submitted.
+    ///
+    /// Latent preparation, the denoising steps and the two decoders become
+    /// ready once their predecessor is scheduled; they name their inputs by
+    /// product reference and do not wait here for the producer to complete.
+    /// Video and audio encoding wait until the call producing their input has
+    /// completed, and muxing waits for completed encode rounds.
     fn ready_calls(&self, state: &MediaFlowState) -> Vec<MediaCall> {
         let sampling = state.request.sampling;
+        // A product is produced once its producing call has left the
+        // request's in-flight calls.
         let produced = |product: &TensorRef| {
             !self
                 .inflight
@@ -364,6 +441,10 @@ impl Scheduler {
                         .any(|call| call.call.call_id == product.producer_call_id)
                 })
         };
+
+        // Text encoding, latent preparation and the denoising steps are
+        // sequential: each is scheduled in full before any later call is
+        // offered.
         if !state.text_encoding_scheduled {
             return vec![MediaCall::TextEncoding];
         }
@@ -426,9 +507,13 @@ impl Scheduler {
         )
     }
 
-    /// Returns the raster of the video the denoiser's samples decode to, as the
-    /// video decoder declares its media unit output: units, frames, height,
-    /// width and channels.
+    /// Returns the `(height, width)` raster of the video the denoiser's samples
+    /// decode to.
+    ///
+    /// Reads dimensions 2 and 3 of the first declared output of the component
+    /// serving video decoding. The worker declares that product as RGB media
+    /// units (`decoded_units_layout`): units, frames, height, width and
+    /// channels. An extent that is missing or not static reads as zero.
     fn video_raster(&self) -> (u32, u32) {
         let component = self.media_component(MediaCall::VideoDecoding);
         let dims = self
@@ -454,6 +539,11 @@ impl Scheduler {
     /// run of consecutive pages after its sentinel page, so the worker's
     /// advertised pool and slot count name the pages of `slot`. The raster is
     /// the video the samples decode to.
+    ///
+    /// Page zero is the sentinel and request slots are numbered from one
+    /// (`RequestPool::new`), so slot `s` owns the
+    /// `(latent_pages - 1) / request_slots` pages that start at
+    /// `1 + (s - 1) * pages`.
     ///
     /// Returns `None` when `worker` is not a loaded worker.
     fn sample_placement(&self, worker: &crate::WorkerId, slot: u32) -> Option<LatentPlacement> {
@@ -481,10 +571,14 @@ impl Scheduler {
 
     /// Returns how many media units one call of this kind covers at once.
     ///
-    /// A distributed component reconstructs one media unit per rank per round,
-    /// so its rank count is the width of a round. Returns `None` when the
-    /// request's owner of `component` is not loaded or its width exceeds the
-    /// decode range.
+    /// A distributed component reconstructs `units_per_rank` media units on
+    /// each of its ranks per round; any other component counts one unit per
+    /// rank. The worker is the request's owner of `component` when it has
+    /// one, otherwise the first candidate that can execute `work`.
+    ///
+    /// Returns `None` when no such worker is loaded, when its bound component
+    /// has no binding on that worker, or when the width does not fit in
+    /// `u32`.
     fn component_width(&self, request: RequestKey, work: CallKind, component: &str) -> Option<u32> {
         let owner = self
             .placement
@@ -511,6 +605,9 @@ impl Scheduler {
     /// A component that distributes its work measures its lane in the units its
     /// ranks reconstruct together; every other component's lane is exclusive
     /// and admits one request at a time.
+    ///
+    /// Returns `None` for an exclusive lane, and when `worker` is not loaded
+    /// or holds no binding named `component`.
     fn device_lane_units(&self, worker: &crate::WorkerId, component: &str) -> Option<u32> {
         self.executor
             .info()
@@ -530,6 +627,10 @@ impl Scheduler {
     }
 
     /// Returns the lanes one media call occupies and how much of each.
+    ///
+    /// Only decoding calls on a unit-measured lane charge media units; every
+    /// other placed call holds its component lane exclusively. Encoding and
+    /// muxing calls also place tasks on host lanes.
     fn lane_demand(&self, request: RequestKey, media_call: MediaCall, units: u32) -> LaneDemand {
         let component = self.media_component(media_call);
         let placed_component = component.as_ref().and_then(|component| {
@@ -569,6 +670,11 @@ impl Scheduler {
     /// A distributed component's round runs on as many of its ranks as it has
     /// media units, each rank taking one task per unit it encodes; any other
     /// component runs one task on each of its ranks.
+    ///
+    /// The worker is the request's owner of the component, or the first
+    /// loaded worker holding it before the request is placed. Returns no
+    /// lanes when `component` is `None` or that worker is not loaded or does
+    /// not hold the component.
     fn host_lane_ranks(
         &self,
         request: RequestKey,
@@ -654,6 +760,12 @@ impl Scheduler {
     }
 
     /// Returns whether the rank group that owns one call can accept a batch.
+    ///
+    /// Returns `false` when no component serves `media_call` or
+    /// `Placement::component_target` selects no worker. Residency narrows
+    /// that choice: a request already placed on the component is checked only
+    /// against its owning worker's queue, and one resident on a candidate
+    /// worker for another component only against that worker's queue.
     fn call_has_queue_capacity(&self, request: RequestKey, media_call: MediaCall) -> bool {
         self.info
             .media_components
@@ -672,9 +784,11 @@ impl Scheduler {
 
     /// Returns the media units one scheduled call of this kind would occupy.
     ///
-    /// A decode round covers one media unit on each rank of its component, so
-    /// it occupies that component's whole lane unless the track has fewer
-    /// units left than the component has ranks.
+    /// A video decode round occupies its component's whole lane
+    /// (`device_lane_units`) unless the track has fewer units left; an audio
+    /// decode round always claims the whole lane. The lane width counts as
+    /// one when the component has no unit-measured lane or the request is not
+    /// yet placed on it.
     fn call_units(&self, state: &MediaFlowState, media_call: MediaCall) -> u32 {
         let width = || {
             self.media_component(media_call)
@@ -707,6 +821,13 @@ impl Scheduler {
     /// Selection checked the request's readiness for `media_call`, so an error
     /// names the readiness invariant that no longer holds. A request's first
     /// call also queues its worker admission onto `admissions`.
+    ///
+    /// Planning advances the request's scheduling cursors, selects the worker
+    /// (recording the request's residency there), binds every product to its
+    /// reserved buffer on that worker, and registers the call as in flight.
+    /// The cursors advance before the worker is selected, so an error can
+    /// leave the request partially planned; `prepare_media_batches` latches
+    /// engine-fatal on any error.
     fn plan_media_call(
         &mut self,
         id: RequestId,
@@ -719,6 +840,7 @@ impl Scheduler {
         let state = self.media_state(id).ok_or("a media candidate is running")?;
         let request_key = state.admission.request_key;
         let stateful = work.advances_state();
+
         // A video request advances its ladder one step per call.
         let step = self.scheduled_steps(id, &state.denoising);
         let last_step = media_call == MediaCall::Denoising && state.denoising.ends(step, 1);
@@ -756,6 +878,10 @@ impl Scheduler {
             }),
             _ => None,
         };
+
+        // A state-advancing call is predicated on its predecessor's completion
+        // product when the predecessor declares one and is still in flight;
+        // otherwise the call carries no predicate.
         let predicate = if stateful {
             self.inflight
                 .pending_calls
@@ -770,6 +896,7 @@ impl Scheduler {
         } else {
             None
         };
+
         let inputs = match media_call {
             MediaCall::LatentPreparation => vec![
                 state
@@ -802,6 +929,10 @@ impl Scheduler {
                 .collect(),
             _ => Vec::new(),
         };
+
+        // Declare the call's products against the request's reservations.
+        // `output_starts` holds each product's first media unit within its
+        // reservation.
         let mut outputs = Vec::new();
         let mut output_starts = Vec::new();
         if media_call == MediaCall::TextEncoding
@@ -843,6 +974,7 @@ impl Scheduler {
                 output_starts.push(start);
             }
         }
+
         // The step interval of a call that advances the trajectory; its
         // pages follow from the worker the call is placed on.
         let interval = stateful.then_some(if media_call == MediaCall::Denoising {
@@ -855,6 +987,7 @@ impl Scheduler {
         } else {
             None
         };
+
         let mut call = Call {
             consumer_slots: Vec::new(),
             token_input: None,
@@ -891,6 +1024,10 @@ impl Scheduler {
             predicate,
             rng: None,
         };
+
+        // Record what this call schedules: the admission it carries, the
+        // reservation slice each product binds to, and the cursors that
+        // `ready_calls` reads.
         let state = self
             .media_state_mut(id)
             .ok_or("a media candidate is running")?;
@@ -961,6 +1098,10 @@ impl Scheduler {
         if last_step {
             state.latents = call.outputs.clone();
         }
+
+        // Place the call, recording the request's residency on the selected
+        // worker, then bind each distinct input and output buffer to its
+        // reserved span in that worker's address space.
         let (worker, selected_component) = self
             .placement
             .select_worker(self.executor.as_ref(), &self.info, &call)
@@ -980,6 +1121,9 @@ impl Scheduler {
                     .bind(product, *start, &worker)
             })
             .collect();
+
+        // Request slots are allocated per worker, so the slot and the latent
+        // pages it owns are those of the selected worker.
         let request_pool_idx = self
             .media_state(id)
             .ok_or("a selected media request is running")?
@@ -1000,6 +1144,7 @@ impl Scheduler {
             }
             None => None,
         };
+
         let placement = RequestPlacement {
             worker,
             request_pool_idx: Some(request_pool_idx),
@@ -1021,19 +1166,27 @@ impl Scheduler {
         Ok((call, placement))
     }
 
-    /// Select eligible media requests and prepare their bounded computation inputs. Independent
-    /// audio and video branches carry Tensor edges, without a state predecessor.
+    /// Selects the ready calls of running video requests and builds one
+    /// media pass: one batch per selected call kind, followed by a
+    /// command-only batch for any lifecycle commands the pass takes.
+    ///
+    /// Independent audio and video branches are linked by tensor inputs, not
+    /// by a state predecessor. Returns no batches when nothing fits, and when
+    /// planning finds a broken invariant, which latches engine-fatal.
     pub(super) fn prepare_media_batches(&mut self) -> Vec<ExecutionBatch> {
-        // Every resident request offers the complete set of calls whose inputs
-        // are produced, in arrival order, and each one is dispatched when the
-        // lanes it occupies have free capacity. There is no per-kind rule and
-        // no cap on how many calls of one request are in flight.
+        // Every resident request, in `running_order`, offers each call
+        // `ready_calls` lists, and a call is selected when the lanes it
+        // occupies have free capacity and its worker's queue can accept a
+        // batch. No per-request cap applies beyond the lanes and rank queues.
         let mut ledger = self.lane_occupancy();
         let mut candidates = Vec::new();
         for id in self.running_order.clone() {
             let Some(state) = self.media_state(id) else {
                 continue;
             };
+            // A request offers nothing further while the call carrying its
+            // worker admission is in flight; `process_diffusion_result` marks
+            // it registered on that call's valid result.
             if state.terminal_intent.is_terminal()
                 || state.admission_state == WorkerRegistration::InFlight
             {
@@ -1059,13 +1212,16 @@ impl Scheduler {
         }
 
         let submit_at = Instant::now();
+        // The pass also takes the queued commands of its candidate requests
+        // and every queued `Finish`, except those `take_commands` defers.
         let candidate_requests = candidates.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
         let commands = self.take_commands(|command| {
             candidate_requests.contains(&command.request_key().request_id)
                 || matches!(command, BatchCommand::Finish { .. })
         });
+
         // One batch per media call: a batch is one numerical call on one component,
-        // so a rank receives it as a single homogeneous group. Calls keep the
+        // so a rank receives it as a single homogeneous group. Batches keep the
         // order in which their first call was selected.
         let mut call_order = Vec::new();
         let mut call_batches: HashMap<MediaCall, (u64, Vec<(Call, RequestPlacement)>)> =
@@ -1076,6 +1232,8 @@ impl Scheduler {
                 call_order.push(*media_call);
             }
         }
+
+        // A call's index within its batch is the request index of its call id.
         let mut admissions = Vec::new();
         for (id, media_call) in candidates.into_iter() {
             let Some((batch_id, calls)) = call_batches.get_mut(&media_call) else {
@@ -1100,9 +1258,8 @@ impl Scheduler {
             }
         }
 
-        // A request's admission travels with the first call that uses it, and
-        // the round's retirements travel with the last batch so no earlier call
-        // loses the state it still reads.
+        // A request's admission travels with the batch of the first call that
+        // uses it.
         let mut starts: HashMap<MediaCall, Vec<BatchCommand>> = HashMap::new();
         for request in admissions {
             let owner = call_order.iter().copied().find(|media_call| {
@@ -1119,6 +1276,7 @@ impl Scheduler {
                 request: Box::new(request),
             });
         }
+
         let mut batches = Vec::with_capacity(call_order.len() + 1);
         for media_call in call_order {
             let Some((batch_id, calls)) = call_batches.remove(&media_call) else {
@@ -1130,6 +1288,7 @@ impl Scheduler {
             self.inflight.register_pending_batch(&batch, submit_at);
             batches.push(batch);
         }
+
         // Retirement is its own batch, submitted after the calls of this pass.
         // Its result is the retirement acknowledgement, so no call's result
         // waits for storage the round no longer needs.
@@ -1146,7 +1305,9 @@ impl Scheduler {
         batches
     }
 
-    /// Publishes cache state and drained cache events to scheduler counters.
+    /// Publishes request, in-flight batch, KV-cache and encoder-cache gauges
+    /// to scheduler counters, and discards the block pool's queued cache
+    /// events.
     pub(super) fn publish_cache_stats(&mut self) {
         self.stats
             .general
@@ -1164,8 +1325,9 @@ impl Scheduler {
             .general
             .in_flight
             .store(self.inflight.pending_batches.len(), Ordering::Relaxed);
-        // drain the manager's event ring so it doesn't grow unbounded; the
-        // counters below already aggregate it, but draining bounds queued reports.
+        // Nothing else reads the block pool's bounded event ring, so it is
+        // drained and discarded here. The counters below come from the pool's
+        // own statistics, not from the events.
         if let Some(kv) = self.storage.cache.as_ref() {
             let _ = kv.block_pool.drain_events();
             self.stats
@@ -1213,6 +1375,10 @@ impl Scheduler {
     }
 
     /// Returns whether a flow prefix can be scheduled now.
+    ///
+    /// Returns `false` only while the request holds a flow prefix that no
+    /// successful denoising completion has finalized and a denoising call is
+    /// in flight.
     pub(super) fn flow_prefix_is_schedulable(&self, id: RequestId) -> bool {
         let prefix_is_pending = self
             .running
@@ -1352,7 +1518,9 @@ impl Scheduler {
         Some((index, images))
     }
 
-    /// Cache conditioning is the latest admitted publication or the accepted request base.
+    /// Returns the KV buffer the request's next call is conditioned on: the
+    /// `kv_output` of its latest in-flight call that publishes one, otherwise
+    /// the accepted `image_conditioning` of the running request.
     pub(super) fn kv_conditioning(&self, id: RequestId) -> Option<uniserve_worker_ipc::BufferId> {
         self.inflight
             .pending_calls
@@ -1365,7 +1533,11 @@ impl Scheduler {
             })
     }
 
-    /// A successor refers to the producer's registered output generation directly.
+    /// Returns the product `select` picks from the request's most recently
+    /// submitted in-flight call that has one.
+    ///
+    /// A successor refers to the producer's registered output generation
+    /// directly, before the producer completes.
     pub(super) fn pending_output(
         &self,
         id: RequestId,
@@ -1379,7 +1551,7 @@ impl Scheduler {
             .find_map(|pending| select(&pending.call))
     }
 
-    /// Select the next computation from the last pending input, or from accepted
+    /// Selects the next computation from the last pending input, or from accepted
     /// request progress when no computation remains. No request state is replayed.
     pub(super) fn next_generation_phase(&self, id: RequestId) -> Option<Phase> {
         let state = self.running.get(&id)?;
@@ -1446,14 +1618,20 @@ impl Scheduler {
         })
     }
 
-    /// Returns the latest accepted state call identity.
+    /// Returns the latest accepted state call identity, or `None` when the
+    /// request is not running or its current epoch is not yet registered
+    /// with its workers.
     pub(super) fn state_predecessor(&self, id: RequestId) -> Option<CallId> {
         let state = self.running.get(&id)?;
         state.worker_registered.then_some(())?;
         Some(state.last_state_call_id)
     }
 
-    /// Returns the call that precedes the next state advancement.
+    /// Returns the call that precedes the next state advancement: the latest
+    /// in-flight state-advancing call, otherwise `state_predecessor`.
+    ///
+    /// Returns `None` when the request has no call in flight, and when it
+    /// falls back to a `state_predecessor` that is `None`.
     pub(super) fn execution_predecessor(&self, id: RequestId) -> Option<CallId> {
         let call = self
             .inflight
@@ -1472,6 +1650,13 @@ impl Scheduler {
     }
 
     /// Applies completed worker commands to scheduler-owned allocation state.
+    ///
+    /// A `Free` returns its buffer's allocation to the buffer pool when a
+    /// pending free, the live request of the same epoch, or its retiring
+    /// record still holds it. A `Finish` releases everything its request
+    /// parked in `retiring_requests`; a `Finish` that matches no retiring
+    /// request of the same epoch latches engine-fatal. `Start` commands are
+    /// ignored.
     pub(super) fn acknowledge_commands(&mut self, commands: &[BatchCommand]) {
         for command in commands {
             if let BatchCommand::Free { buffer } = command {
@@ -1560,6 +1745,9 @@ impl Scheduler {
             return false;
         };
 
+        // A KV publication is never queued behind an unresolved call, and a
+        // request with a `RoundCloseThenSuffix` image trigger queues no
+        // successor at all.
         if target == CallKind::Transfer(TransferMode::KvPublish) {
             return false;
         }
@@ -1599,6 +1787,9 @@ impl Scheduler {
             {
                 return false;
             }
+            // Ordinary pipelining needs the whole prompt submitted and every
+            // context image ingested, and counts each in-flight call as one
+            // token toward `max_und_tokens`.
             return self
                 .num_scheduled_prompt_tokens(id)
                 .is_some_and(|count| count as usize >= state.req.prompt_token_ids.len())
@@ -1615,7 +1806,15 @@ impl Scheduler {
                 .is_some_and(|variant| variant == target)
     }
 
-    /// Determine the next pipelined computation from its submitted predecessor.
+    /// Determines the next pipelined computation from its submitted predecessor.
+    ///
+    /// Returns `None`, among other cases, when the request is not running or
+    /// has no call in flight, has not yet submitted its whole prompt or
+    /// ingested every context image, cannot chain from its last in-flight
+    /// call (an image decode whose request does not feed the device image
+    /// product back, or a completed feedback round whose request does not
+    /// sample a feedback continuation), or projects to an encode or ingest
+    /// phase.
     pub(super) fn pending_successor_code(&self, id: RequestId) -> Option<CallKind> {
         if !self.inflight.has_pending_calls(id) {
             return None;
@@ -1669,19 +1868,16 @@ impl Scheduler {
     pub(super) fn device_token_relay_eligible(state: &RequestState) -> bool {
         // A successor may consume the parent's device-selected point before host
         // observation whenever its own sampling state is device-representable
-        // from registered coordinates and device products alone. Greedy and
-        // stochastic selection (temperature, top-k, top-p, min-p, typical),
-        // penalties folded from a device-resident committed count base plus
-        // per-call deltas, requested logprobs, the minimum-token floor and
-        // force-finish flag (staged at the successor's exact projected point),
-        // static allowed-token, logit-bias, and single-token bad-word masks,
-        // positional forced tokens, and device finish predicates (EOS and
-        // stop-token ids) all qualify. Stop strings also qualify: the request
-        // samples device-continuously and registers bounded provisional
-        // descendants; a matched stop suppresses output beyond the accepted
-        // prefix and closes the physical request after its readers drain. Only
-        // multi-token bad-word automata keep the request host-paced, because
-        // their next mask depends on the not-yet-observed suffix.
+        // from registered coordinates and device products alone. Two request
+        // shapes keep the request host-paced:
+        // - An image-generating request whose image branch opens on anything
+        //   but one direct token. Only a direct trigger is among the device
+        //   finish tokens (`finish_token_ids`).
+        // - Multi-token bad words, because their next mask depends on the
+        //   not-yet-observed suffix.
+        // Stop strings do not keep a request host-paced: the frontend decoder
+        // matches them after resolution, and the scheduler tracks its pending
+        // decisions in `decoder_boundaries`.
         let sampling = &state.req.sampling;
         (!state.req.generates_images()
             || state.req.image_generation.trigger.direct_token().is_some())
@@ -1730,6 +1926,11 @@ impl Scheduler {
     }
 
     /// Returns whether output capacity can cover every unresolved token-producing call.
+    ///
+    /// The request's event journal must hold, besides `OUTPUT_TERMINAL_RESERVE`
+    /// events kept for its terminal output, the `call_output_bound` of every
+    /// in-flight call plus the `next_output_bound` of the next one. Returns
+    /// `false` for a request that is not running or whose journal is closed.
     pub(super) fn output_window_ready(&self, id: RequestId) -> bool {
         let Some(state) = self.running.get(&id) else {
             return false;
@@ -1752,7 +1953,11 @@ impl Scheduler {
             >= self.next_output_bound(id)
     }
 
-    /// Returns the output-size bound for the next call.
+    /// Returns the output-size bound, in events, for the next call.
+    ///
+    /// Mirrors the per-kind counts of `call_output_bound`, which charges a
+    /// call once it is in flight, for the kinds `peek_next_call_variant`
+    /// predicts; a denoising call is budgeted at `denoise_step_burst` steps.
     pub(super) fn next_output_bound(&self, id: RequestId) -> usize {
         match self.peek_next_call_variant(id) {
             Some(
@@ -1766,7 +1971,14 @@ impl Scheduler {
         }
     }
 
-    /// Retains submitted inputs and charges their domain and transfer credits.
+    /// Retains a submitted call and its inputs as in flight for its request,
+    /// and charges one credit to its metrics domain.
+    ///
+    /// Calls queue per request in the order they are registered, and
+    /// `Inflight::take_ready_completions` releases the completion of any call
+    /// other than an independent media call only from the front of that
+    /// queue. Transfer capacity is charged separately, by
+    /// `reserve_generation_resources`.
     pub(super) fn register_inflight(&mut self, call: Call, input: InflightInput, queue_us: u64) {
         let request_id = call.request_key.request_id;
         let domain = self.stats.domains.get(call.code);
@@ -1781,7 +1993,7 @@ impl Scheduler {
             .push_back(InflightCall { call, input });
     }
 
-    /// Records the domain backpressure.
+    /// Counts one backpressure event against the metrics domain of `computation`.
     pub(super) fn record_domain_backpressure(&self, computation: uniserve_worker_ipc::CallKind) {
         self.stats
             .domains
@@ -1805,7 +2017,8 @@ impl Scheduler {
         );
     }
 
-    /// Records the domain completion.
+    /// Counts one returned call, and a predicated or failed status, against
+    /// the metrics domain of `computation`.
     pub(super) fn record_domain_completion(
         &self,
         computation: uniserve_worker_ipc::CallKind,
@@ -1824,7 +2037,11 @@ impl Scheduler {
         }
     }
 
-    /// Reclaims the domain credit.
+    /// Returns the credit a leaving call holds in its metrics domain, counting
+    /// the call as failed when `failed` is set.
+    ///
+    /// A reclaim with no active credit is logged as an accounting defect and
+    /// changes no counter.
     pub(super) fn reclaim_domain_credit(
         &self,
         computation: uniserve_worker_ipc::CallKind,
@@ -1843,7 +2060,10 @@ impl Scheduler {
         }
     }
 
-    /// Fails the inflight domain credits.
+    /// Reclaims the domain credit of every in-flight call as failed.
+    ///
+    /// Callers invoke it before `Inflight::clear_failed_calls` drops the
+    /// calls whose credits it returns.
     pub(super) fn fail_inflight_domain_credits(&self) {
         for inflight in self.inflight.pending_calls.values().flatten() {
             self.reclaim_domain_credit(inflight.call.code, true);
@@ -1851,6 +2071,12 @@ impl Scheduler {
     }
 
     /// Holds one validated completion until earlier calls for the request are applied.
+    ///
+    /// A completion that names no in-flight call of the request, or repeats
+    /// one already staged, is dropped and fails its request: a media request
+    /// records a failure intent, a running token request finishes with an
+    /// error. `apply_result` releases staged completions in dependency order
+    /// through `Inflight::take_ready_completions`.
     pub(super) fn stage_completion(
         &mut self,
         mut record: uniserve_worker_ipc::RequestOutput,
@@ -1877,6 +2103,10 @@ impl Scheduler {
             }
             return;
         }
+
+        // Output storage the executor could not claim fails the call rather
+        // than dropping its completion, so request-local ordering still sees
+        // the call return.
         let media = match media {
             Ok(media) => media,
             Err(message) => {
@@ -1891,6 +2121,7 @@ impl Scheduler {
                 None
             }
         };
+
         let arrival_seq = self.inflight.next_arrival();
         self.inflight
             .pending_completions
@@ -1906,7 +2137,18 @@ impl Scheduler {
             );
     }
 
-    /// Validate a media call result and advance only its completed request fields.
+    /// Validates a video media call result and advances only the request
+    /// fields that call completes.
+    ///
+    /// A result is valid when it succeeded, names the submitted call, carries
+    /// an artifact exactly when it is the final muxing call, and, for a
+    /// denoising step, completes its interval. The first valid result marks
+    /// the request registered with its workers. An invalid result records a
+    /// failure intent instead of advancing anything. A valid result of a
+    /// request that has not already failed frees the products the call
+    /// consumed. Once no call of the request remains in flight, a terminal
+    /// intent, a closed output or a muxed artifact retires the request
+    /// through `finish_media`.
     pub(super) fn process_diffusion_result(
         &mut self,
         call: Call,
@@ -1921,6 +2163,7 @@ impl Scheduler {
         };
         let mut consumed_products = Vec::new();
         let already_failed = matches!(state.terminal_intent, TerminalIntent::Failure(_));
+
         // Only the final muxing call, the one that carries no media units,
         // returns the artifact; every other call returns none.
         let media_output_valid = if call.code == CallKind::Media(MediaCall::Muxing) {
@@ -1943,6 +2186,8 @@ impl Scheduler {
         {
             state.admission_state = WorkerRegistration::Registered;
         }
+
+        // A request that already failed only drains its remaining calls.
         if !already_failed {
             if !valid {
                 if let Some(state) = self.media_state_mut(id) {
@@ -1991,6 +2236,7 @@ impl Scheduler {
                     }
                     _ => {}
                 }
+
                 let phase = match call.code {
                     CallKind::Media(MediaCall::TextEncoding) => "preparing",
                     CallKind::Media(MediaCall::LatentPreparation)
@@ -2032,6 +2278,9 @@ impl Scheduler {
             );
         }
 
+        // Retire the request only once none of its calls remain in flight. A
+        // failure outranks a finish, which outranks a closed output; a muxed
+        // request completes with its artifact.
         let terminal = self.media_state(id).and_then(|state| {
             if self.inflight.has_pending_calls(id) {
                 return None;
@@ -2058,6 +2307,11 @@ impl Scheduler {
     }
 
     /// Emits terminal media output and releases all request-owned resources.
+    ///
+    /// A request whose admission was never placed in a batch frees its
+    /// allocations at once. Otherwise a `Finish` command is queued and the
+    /// allocations wait in `retiring_requests` until `acknowledge_commands`
+    /// sees that command complete.
     pub(super) fn finish_media(&mut self, id: RequestId, event: DiffusionTerminal) {
         let Some(mut state) = self.take_media_state(id) else {
             return;
@@ -2088,6 +2342,9 @@ impl Scheduler {
             }
         }
         self.output.retire(id, state.output);
+
+        // No worker holds state for a request whose admission was never
+        // placed in a batch, so there is nothing to retire remotely.
         if state.admission_state == WorkerRegistration::Unsubmitted {
             if let Err(unknown) = state.allocations.free(&mut self.storage) {
                 self.invariant_broken(&unknown.to_string());
@@ -2112,7 +2369,13 @@ impl Scheduler {
         );
     }
 
-    /// Resolves the front in-flight call for `id` by the worker's echoed `call_id`.
+    /// Removes the in-flight call a worker result names, releasing its
+    /// transfer reservation and its domain credit.
+    ///
+    /// The call must be at the front of its request's queue, unless it is an
+    /// independent media call (media input that does not advance state).
+    /// Returns `None` for any other call, an unknown call, or a call id with
+    /// batch zero.
     pub(super) fn pop_inflight(
         &mut self,
         request_key: RequestKey,
@@ -2123,7 +2386,13 @@ impl Scheduler {
         Some((inflight.call, inflight.input))
     }
 
-    /// Revoke completed buffer identities while retaining allocations until release acknowledgement.
+    /// Revokes completed buffer identities while retaining allocations until
+    /// release acknowledgement.
+    ///
+    /// Queues one `Free` command per distinct buffer. The allocation of a
+    /// buffer tracked in `encoder_buffers` moves to `pending_buffer_frees`
+    /// until `acknowledge_commands` sees its `Free` complete; a buffer already
+    /// pending there is an accounting defect that latches engine-fatal.
     pub(super) fn free_buffers(
         &mut self,
         buffers: impl IntoIterator<Item = uniserve_worker_ipc::BufferId>,
@@ -2146,8 +2415,13 @@ impl Scheduler {
         }
     }
 
-    /// Preserve unrelated requests after a reconciled Worker failure. Unclassified
+    /// Preserves unrelated requests after a reconciled Worker failure. Unclassified
     /// executor errors and control-plane invariant violations remain fatal.
+    ///
+    /// A `WorkerFailure` is reconciled by `fail_after_worker_failure`; the
+    /// worker codes `SchedulerBug` and `InvariantViolation` also latch
+    /// engine-fatal. Any other error latches engine-fatal and fails every
+    /// in-flight call.
     pub(super) fn on_executor_error(&mut self, error: anyhow::Error) {
         if let Some(failure) = error.downcast_ref::<WorkerFailure>() {
             let execution = failure.execution.as_ref();
@@ -2169,10 +2443,24 @@ impl Scheduler {
     }
 
     /// Reconciles one physical batch result with logical calls, state, and ownership.
+    ///
+    /// Stages, in order:
+    /// 1. Validate: every returned call identity must be expected by its
+    ///    pending batch exactly once, and a batch reported done must have
+    ///    returned every call. Any violation latches engine-fatal and fails
+    ///    every running request (`fail_all_running`) before any completion is
+    ///    applied.
+    /// 2. Account: fold domain and batch timing; on the batch's final result,
+    ///    settle its lifecycle command receipts.
+    /// 3. Stage and apply: hold each completion until
+    ///    `Inflight::take_ready_completions` releases it in request-local
+    ///    dependency order, then reclaim resources and resolve the public
+    ///    effects in lifecycle priority and arrival order.
     pub(super) fn apply_result(&mut self, report: BatchResult) {
         let result_batch_id = report.batch_id;
-        // Aggregate timings by the stable public metric groups. Multiple concrete
-        // calls in one group count as one returned run, as do multiple requests.
+        // Aggregate timings by the stable public metric groups, one slot per
+        // `ExecutionDomainStats::groups` entry. Multiple concrete calls in one
+        // group count as one returned batch, as do multiple requests.
         let mut returned_groups: [Option<TimingCounters>; 3] = [None; 3];
         let mut invalid_result = false;
 
@@ -2222,6 +2510,7 @@ impl Scheduler {
                 invalid_result = true;
                 continue;
             };
+            // A group's batch timing is the maximum of each phase over its calls.
             let component = returned_groups[super::stats::ExecutionDomainStats::index(computation)]
                 .get_or_insert(TimingCounters::default());
             component.queued_us = component.queued_us.max(record.timing_counters.queued_us);
@@ -2284,6 +2573,11 @@ impl Scheduler {
             .into_iter()
             .fold(pending.worker_exec_us, u64::saturating_add);
         let batch_roundtrip_us = pending.started.elapsed().as_micros() as u64;
+        // A partial result leaves the batch owned. The final one releases it
+        // and settles its command receipts: the recorded commands exclude
+        // admissions (`Inflight::register_pending_batch`), matching how
+        // `command_index` counts. A failed `Finish` or `Free` keeps its
+        // physical ownership and is queued again.
         let worker_us = if batch_complete {
             let pending = owned.remove();
             for (index, command) in pending.commands.into_iter().enumerate() {
@@ -2333,7 +2627,10 @@ impl Scheduler {
         }
 
         // Staging decouples executor arrival order from request-local dependency
-        // order. Only a ready prefix is removed by `take_ready` below.
+        // order. `take_ready_completions` releases only completions whose call
+        // is at the front of its request's queue, or independent media calls
+        // whose input producers have resolved; applying one can make others
+        // ready, so the loop repeats until none are.
         for result in report.results {
             self.stage_completion(result.output, result.media);
         }
@@ -2376,6 +2673,8 @@ impl Scheduler {
                     InflightInput::Generation { image_kv, latent } => (image_kv, latent),
                 };
 
+                // A request already finishing with an error discards the
+                // result's products.
                 if self
                     .inflight
                     .pending_finishes
@@ -2387,6 +2686,10 @@ impl Scheduler {
                     continue;
                 }
 
+                // A descendant submitted before its chain was invalidated is
+                // discarded: `num_kv_blocks_sent` drops by its `max_kv_pages`
+                // bound, its products are freed, and the chain stays marked
+                // while later descendants remain in flight.
                 let discard_invalidated_descendant = self
                     .running
                     .get(&id)
@@ -2460,6 +2763,9 @@ impl Scheduler {
                     }
                 }
 
+                // A request with a terminal intent or a deferred finish takes no
+                // further semantic effect; an image decode still releases the
+                // request latent it closes.
                 let semantic_blocked = self
                     .running
                     .get(&id)
@@ -2495,6 +2801,9 @@ impl Scheduler {
                 } else {
                     None
                 };
+                // The resolved token product stays available as the next
+                // decode's device input (`can_reuse_resolved_token_product`)
+                // only when no call of the request is still in flight.
                 let retain_device_token = !self.inflight.has_pending_calls(id);
                 if let Some(state) = self.running.get_mut(&id)
                     && advanced
@@ -2550,6 +2859,9 @@ impl Scheduler {
                     .running
                     .get(&id)
                     .map_or(0, |state| state.output.tokens_sent);
+                // A predicated call was skipped because its device predicate
+                // was false, so it is rolled back like an invalidated
+                // descendant and marks any later descendants invalidated.
                 if record.status == CallStatus::Predicated {
                     let has_unresolved_descendants = self.inflight.has_pending_calls(id);
                     if let Some(state) = self.running.get_mut(&id) {
@@ -2584,8 +2896,12 @@ impl Scheduler {
                         | CallKind::Forward(ForwardMode::Decode)
                         | CallKind::Forward(ForwardMode::Verify)
                 );
-                // Reserve output space before resolving a terminal token: finishing
-                // must wait for the decoder's stop-string decision on that batch.
+                // With stop strings, push a placeholder decoder boundary before
+                // resolving, so a non-error finish reached while resolving
+                // waits for the frontend decoder's stop-string decision on this
+                // call's tokens (see `finish_after_inflight`). Afterwards the
+                // placeholder becomes the end of the tokens this call
+                // published, or is removed when it published none.
                 let awaiting_decoder = token_call
                     && match self.running.get_mut(&id) {
                         Some(state) if !state.req.stop_strings.is_empty() => {
@@ -2624,7 +2940,6 @@ impl Scheduler {
         add_worker_forward_map(&self.stats.worker.forward_mode_tokens, &stats.mode_tokens);
         add_worker_forward_map(&self.stats.worker.forward_mode_us, &stats.mode_us);
         add_worker_forward_map(&self.stats.worker.forward_component_us, &stats.component_us);
-        // Fold worker forward stats maps into scheduler stats.
         add_worker_forward_map(
             &self.stats.worker.attention_backend_counts,
             &stats.attention_backend_counts,
@@ -2739,6 +3054,10 @@ impl Scheduler {
     }
 
     /// Fails every submitted call while preserving requests that can be rescheduled.
+    ///
+    /// Every request owning an in-flight call fails with `msg`; requests with
+    /// no call in flight stay queued or running. The lifecycle commands of
+    /// the dropped batches are acknowledged as if they had completed.
     pub(super) fn fail_all_inflight(&mut self, msg: &str) {
         self.inflight.pending_submissions.clear();
         self.fail_inflight_domain_credits();
@@ -2762,12 +3081,25 @@ impl Scheduler {
     }
 
     /// Reconciles failed work without resetting allocations owned by live consumers.
+    ///
+    /// Only the request epochs `loss` names fail, together with requests whose
+    /// queued work targets an invalidated worker incarnation or reads an
+    /// invalidated buffer; every other request continues. A retired call that
+    /// has no pending record latches engine-fatal and stops reconciliation.
     fn fail_after_worker_failure(&mut self, loss: &WorkerFailure) {
+        // Blocks published from an invalidated worker incarnation leave
+        // prefix-cache lookup; pages still referenced keep their owners.
         if let Some(cache) = &self.storage.cache {
             for endpoint in &loss.endpoints {
                 cache.block_pool.invalidate_source(endpoint);
             }
         }
+
+        // Close the affected set over work not yet submitted: a queued call
+        // is affected when it reads an invalidated buffer, or is placed on
+        // the failed worker and the failure invalidated incarnations, and the
+        // outputs of an affected request's queued calls are invalidated in
+        // turn. Repeat until neither set grows.
         let mut requests = loss.requests.iter().copied().collect::<HashSet<_>>();
         let mut buffers = loss.buffers.iter().cloned().collect::<HashSet<_>>();
         loop {
@@ -2788,8 +3120,16 @@ impl Scheduler {
                 break;
             }
         }
+
+        // Encoder-cache entries backed by invalidated buffers leave lookup;
+        // those no consumer still pins are freed.
         let reclaimable = self.storage.encoder_cache.invalidate_buffers(&buffers);
         self.free_buffers(reclaimable.into_iter().map(|product| product.buffer_id()));
+
+        // Strip affected requests' calls and admissions from queued batches
+        // and retire them together with the calls the failure named. A batch
+        // left empty is forgotten; the rest stay queued with their command
+        // receipts kept in step with the commands they still carry.
         let mut retired = loss.retired.clone();
         let mut pending = VecDeque::new();
         for mut batch in std::mem::take(&mut self.inflight.pending_submissions) {
@@ -2829,12 +3169,20 @@ impl Scheduler {
                 self.inflight.pending_submissions.push_back(batch);
             }
         }
+
+        // An affected request's queued `Finish` and `Free` commands still
+        // retire its worker state; only its admissions are dropped.
         self.inflight.pending_commands.retain_mut(|command| {
             if !requests.contains(&command.request_key()) {
                 return true;
             }
             !matches!(command, BatchCommand::Start { .. })
         });
+
+        // Fail each affected request that is still on the named epoch: a media
+        // request records a failure intent; a token request emits an error
+        // unless an error finish is already pending, and defers an error
+        // finish until its in-flight calls drain.
         let engine_id = self.engine_id;
         for request in requests {
             let id = request.request_id;
@@ -2868,8 +3216,10 @@ impl Scheduler {
                     },
                 );
             }
-            // A successful later completion may already be waiting behind the now
-            // abandoned call. It owns real completion evidence and can drain.
+            // A later completion may already be staged behind a call the
+            // failure retired. With that call gone it reaches the front of the
+            // queue, so it drains here: its call is removed and its products
+            // are freed without applying the result.
             while let Some(call_id) = self
                 .inflight
                 .pending_calls
@@ -2914,6 +3264,12 @@ impl Scheduler {
     }
 
     /// Fails every queued and running request and releases scheduler-owned resources.
+    ///
+    /// Covers queued media submissions and every running media and token
+    /// request. Queued token requests in `waiting` are not touched: every
+    /// caller latches engine-fatal first, and `run` then stops and calls
+    /// `abort_all_requests`. The dropped batches' lifecycle commands are
+    /// discarded without acknowledgement.
     pub(super) fn fail_all_running(&mut self, message: &str) {
         self.inflight.pending_submissions.clear();
         self.fail_inflight_domain_credits();

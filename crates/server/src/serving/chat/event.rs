@@ -1,4 +1,12 @@
-//! Structured assistant messages and incremental chat events.
+//! Structured assistant message content.
+//!
+//! These types describe assistant output in both directions. The block
+//! assembler in `output::structured` publishes finished text and reasoning
+//! blocks in `RequestOutput::OutputBlockEnd`, and the non-streaming Chat
+//! Completions response collects finished blocks and tool calls into an
+//! [`AssistantMessage`]. Chat requests carry prior assistant turns as
+//! `ChatMessage::Assistant` for the template renderer. The incremental events
+//! produced while parsing live in `output::processor`.
 
 use std::ops::Deref;
 
@@ -11,7 +19,8 @@ pub struct AssistantToolCall {
     pub id: String,
     /// Function name selected by the model.
     pub name: String,
-    /// Serialized function arguments.
+    /// Function arguments as JSON text. `HfChatRenderer` parses this string
+    /// when rendering assistant history and rejects invalid JSON.
     pub arguments: String,
 }
 
@@ -63,6 +72,8 @@ impl AssistantContentBlock {
 
     /// Returns this block with leading and trailing whitespace trimmed from all text
     /// fields and tool call arguments, or `None` if the resulting text would be empty.
+    ///
+    /// Tool-call blocks are always kept, even with empty arguments.
     pub fn trim(mut self) -> Option<Self> {
         match &mut self {
             Self::Text { text } | Self::Reasoning { text } => {
@@ -91,7 +102,7 @@ pub struct AssistantMessage {
 impl Deref for AssistantMessage {
     type Target = [AssistantContentBlock];
 
-    /// Returns shared access to the wrapped value.
+    /// Exposes the ordered content blocks as a slice.
     fn deref(&self) -> &Self::Target {
         &self.content
     }
@@ -109,7 +120,8 @@ impl AssistantMessage {
             .collect()
     }
 
-    /// Concatenates all extracted reasoning blocks, if any.
+    /// Concatenates all extracted reasoning blocks, or returns `None` when the
+    /// concatenation is empty.
     pub fn reasoning(&self) -> Option<String> {
         Some(
             self.content

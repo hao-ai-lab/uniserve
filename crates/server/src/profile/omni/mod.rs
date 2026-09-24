@@ -1,4 +1,14 @@
 //! Shared contracts and model-specific profiles for multimodal generation.
+//!
+//! The SenseNova and Bagel profiles fix each family's control tokens, prompt
+//! framing, output filters, image-generation defaults, and runtime limit
+//! ceilings. They also predict the KV tokens an input or generated image
+//! occupies from its pixel dimensions, and the request carries that count as
+//! an exact `ImageEncoderInput::num_kv_tokens`. The predictions replicate the
+//! worker's image resize arithmetic in
+//! `uniserve_worker/model_executor/image_inputs.py` and must stay in step with
+//! it: the engine scheduler rejects a worker result whose KV length differs
+//! from the declared count (`image_kv_mismatch`).
 
 pub mod bagel;
 pub mod resolution;
@@ -20,9 +30,11 @@ pub(super) const fn model_dtype_bytes(dtype: uniserve_core::ModelDtype) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Model-token controls for switching between understanding and generation.
 pub struct GenerationControls {
-    /// Beginning-of-sequence token identifier.
+    /// Beginning-of-sequence token identifier; both profiles use the ChatML
+    /// `<|im_start|>` marker.
     pub bos: u32,
-    /// End-of-sequence token identifier.
+    /// End-of-sequence token identifier; both profiles use the ChatML
+    /// `<|im_end|>` marker.
     pub eos: u32,
     /// Token identifier that opens generated image content.
     pub start_of_image: u32,
@@ -72,6 +84,9 @@ pub struct DelimitedTextPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Model-selected filters applied to generated assistant text.
+///
+/// `SenseNovaOutputProcessor` in `serving::omni::output` applies the SenseNova
+/// profile's policy.
 pub struct OutputFilterPolicy {
     /// Optional section whose contents are exposed as reasoning.
     pub reasoning: Option<DelimitedTextPolicy>,
@@ -79,7 +94,10 @@ pub struct OutputFilterPolicy {
     pub visible_wrappers: Vec<DelimitedTextPolicy>,
 }
 
-/// Resolves a required special-token string from tokenizer metadata.
+/// Looks up a required control token in the tokenizer vocabulary.
+///
+/// Returns the token id together with its text; `role` only labels the error
+/// for a token the vocabulary lacks.
 pub(super) fn required_token(
     tokenizer: &HuggingFaceTokenizer,
     token: &str,
@@ -95,7 +113,7 @@ pub(super) fn required_token(
         })
 }
 
-/// Resolves the unique token identifier for a required token string.
+/// Looks up a required control token and returns only its id.
 pub(super) fn required_token_id(
     tokenizer: &HuggingFaceTokenizer,
     token: &str,
@@ -113,6 +131,10 @@ pub(super) fn encode(
 }
 
 /// Renders a minimal ChatML prompt with an open assistant turn.
+///
+/// `assistant_suffix` is appended verbatim after `<|im_start|>assistant\n`,
+/// so it primes the first generated tokens. Text is inserted without
+/// escaping.
 pub(super) fn chatml(system: Option<&str>, user: &str, assistant_suffix: &str) -> String {
     let mut output = String::new();
     if let Some(system) = system {
@@ -128,6 +150,12 @@ pub(super) fn chatml(system: Option<&str>, user: &str, assistant_suffix: &str) -
 }
 
 /// Computes visual token count after stride-aligned resizing.
+///
+/// `transforms` holds `(max_side, min_side, stride, max_pixels)` resize
+/// policies applied in order, each to the previous result; the worker
+/// likewise resizes onto the VAE canvas before a tower's own resize. The final
+/// dimensions must be multiples of `token_stride`; the count is the resulting
+/// grid area plus `marker_tokens`.
 pub(super) fn stride_resize_tokens(
     width: u32,
     height: u32,
@@ -150,6 +178,9 @@ pub(super) fn stride_resize_tokens(
 }
 
 /// Computes visual token count under pixel-area and aspect-ratio bounds.
+///
+/// Dimensions are resized by [`pixel_bound_resize`]; the count is the grid
+/// area at `token_stride` plus `marker_tokens`.
 pub(super) fn pixel_bound_tokens(
     width: u32,
     height: u32,
@@ -185,6 +216,12 @@ fn dimensions_to_tokens(
 }
 
 /// Resizes dimensions within side and pixel limits while preserving stride alignment.
+///
+/// Must produce the same shape as the worker's `_stride_image_shape`. The
+/// first scale shrinks the longer side to `max_side` (never enlarging) unless
+/// the shorter side would fall below `min_side`, which then wins. After
+/// rounding to `stride` multiples, the result is rescaled once if its area
+/// exceeds `max_pixels` and once more if its longer side exceeds `max_side`.
 fn stride_resize(
     width: u32,
     height: u32,
@@ -214,6 +251,9 @@ fn stride_resize(
 }
 
 /// Scales both dimensions and rounds them to positive stride multiples.
+///
+/// Each rounding is half-to-even, the tie rule of Python's `round`, which the
+/// worker's `_stride_shape` uses.
 fn scale_to_stride(width: u32, height: u32, scale: f64, stride: u32) -> (u32, u32) {
     let scale_one = |value: u32| {
         let scaled = (f64::from(value) * scale).round_ties_even();
@@ -224,6 +264,10 @@ fn scale_to_stride(width: u32, height: u32, scale: f64, stride: u32) -> (u32, u3
 }
 
 /// Resizes dimensions to factor-aligned values within configured pixel-area bounds.
+///
+/// Must produce the same shape as the worker's `_bounded_grid_shape`,
+/// including its aspect-ratio limit of 200 and half-to-even rounding. Returns
+/// `(width, height)`.
 fn pixel_bound_resize(
     width: u32,
     height: u32,
@@ -242,6 +286,7 @@ fn pixel_bound_resize(
             "input image aspect ratio must not exceed 200",
         ));
     }
+
     let round_factor = |value: u32| {
         factor.max(
             ((f64::from(value) / f64::from(factor)).round_ties_even() as u32)
@@ -251,6 +296,9 @@ fn pixel_bound_resize(
     let mut resized_h = round_factor(height);
     let mut resized_w = round_factor(width);
     let pixels = u64::from(resized_h).saturating_mul(u64::from(resized_w));
+    // Outside the area bounds, rescale the original dimensions by the square
+    // root of the area ratio, flooring when shrinking and ceiling when
+    // growing, as the worker's `_bounded_grid_shape` does.
     if pixels > max_pixels {
         let beta = (f64::from(height) * f64::from(width) / max_pixels as f64).sqrt();
         resized_h = factor.max(

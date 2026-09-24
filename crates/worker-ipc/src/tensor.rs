@@ -1,4 +1,20 @@
 //! Tensor identities, bounded representations, and physical transfers.
+//!
+//! The engine's scheduler declares a cross-call tensor product as a
+//! [`TensorRef`]: a request-scoped identity plus a [`DType`] and a
+//! [`ShapeBound`] that fix the product's maximum size before its producing call
+//! runs. A producing worker reports the product as a [`TensorPublication`],
+//! whose [`TransferHandle`] carries the actual logical shape
+//! ([`TensorTransfer`]) and one [`Locator`] per shard or replica, each naming
+//! the [`TransferTransport`] a consumer opens. A published KV extent travels as
+//! a [`KvTransfer`] identified by a [`BufferId`] alone.
+//!
+//! The validators here are the wire contract: the codec runs them, through
+//! `Batch::validate` and `BatchOutput::validate`, whenever it encodes or
+//! decodes a batch or a batch result. The Python worker's
+//! `uniserve_worker.protocol` package reimplements these checks and the
+//! descriptor size estimate bounded by [`MAX_TRANSFER_HANDLE_BYTES`], so the
+//! two sides must change together.
 
 use super::*;
 
@@ -25,7 +41,7 @@ pub enum DType {
 }
 
 impl DType {
-    /// Physical tensor storage width, including signed 16-bit PCM values.
+    /// Storage width of one element in bytes.
     pub fn element_bytes(self) -> u64 {
         tensor_dtype(self).1
     }
@@ -47,6 +63,7 @@ pub enum DimBound {
 /// A shape that is host-static except for at most one device-actual axis, which
 /// carries a fixed maximum. A single device-actual axis without static axes
 /// denotes flat capacity; its actual tensor rank is published with the transfer.
+/// An empty bound (the default) admits exactly one element.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct ShapeBound {
     /// Ordered tensor dimension bounds.
@@ -54,7 +71,7 @@ pub struct ShapeBound {
 }
 
 impl ShapeBound {
-    /// Validates rank and positive dimension bounds.
+    /// Rejects more than one device-actual dimension and any zero extent.
     pub fn validate(&self) -> ValidationResult<()> {
         let device_dims = self
             .dims
@@ -75,7 +92,8 @@ impl ShapeBound {
         Ok(())
     }
 
-    /// Returns the maximum number of elements represented by this shape.
+    /// Returns the maximum number of elements represented by this shape,
+    /// saturating at `u64::MAX`; an empty bound yields one.
     pub fn max_elements(&self) -> u64 {
         self.dims.iter().fold(1_u64, |elements, dim| {
             elements.saturating_mul(u64::from(match dim {
@@ -105,6 +123,10 @@ pub struct TensorRef {
 }
 
 /// Stable identity for one cross-call buffer, independent of its physical representation.
+///
+/// A [`TensorRef`] projects to one through [`TensorRef::buffer_id`]; a KV
+/// publication carries one directly. The engine routes buffers and frees them
+/// (`BatchCommand::Free`) by this identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BufferId {
     /// Request that owns the buffer.
@@ -145,7 +167,9 @@ impl TensorRef {
         self.shape_bound.validate()
     }
 
-    /// Returns the maximum encoded byte size allowed by the shape and dtype.
+    /// Returns the maximum storage size in bytes: the bound's maximum element
+    /// count times the element width, saturating. `Batch::validate` requires
+    /// each buffer output's allocation to be at least this large.
     pub fn max_bytes(&self) -> u64 {
         self.shape_bound
             .max_elements()
@@ -171,35 +195,50 @@ pub enum TransferTransport {
         /// Shared-storage object name.
         name: String,
     },
-    /// CUDA publication whose granted reader receives a physical-allocation descriptor.
+    /// CUDA VMM publication of device storage, which a consumer maps by
+    /// importing the producer's allocation handle and viewing its spans.
     CudaVmm {
         /// Publishing worker endpoint.
         endpoint: String,
-        /// Stable publication identity.
+        /// Stable publication identity: exactly 32 bytes long (the producer
+        /// uses a hex UUID). It also keys the producer's descriptor grant
+        /// when `allocation_handle` is a process descriptor.
         publication_id: String,
         /// Exported allocation size in bytes.
         storage_size_bytes: u64,
-        /// Byte offsets of ordered first-axis spans within one allocation.
+        /// Byte offsets of ordered first-axis spans within one allocation, one
+        /// per span; each must lie below `storage_size_bytes`.
         storage_offsets_bytes: Vec<u64>,
-        /// First-axis lengths of consecutive runs of equally sized physical spans.
+        /// First-axis lengths of consecutive runs of equally sized physical
+        /// spans. Expanded by `span_counts`, they sum to the locator's first
+        /// extent.
         span_lengths: Vec<u64>,
         /// Number of spans in each length run; trailing geometry and strides are shared.
         span_counts: Vec<u32>,
-        /// Tensor stride in elements.
+        /// Non-negative element strides shared by every span view, one per
+        /// locator axis.
         tensor_stride: Vec<i64>,
-        /// Opaque CUDA event handle signaling publication readiness.
+        /// Opaque 64-byte CUDA IPC event handle signaling publication
+        /// readiness, or empty. It is empty when any of the producing rank's
+        /// consumers is on another host, where an event handle does not
+        /// reach; the producer then synchronizes its stream before publishing.
         #[serde(with = "serde_bytes")]
         ready_event_handle: Vec<u8>,
         /// The producing rank's shareable allocation handle, of the type its
-        /// device was probed for. A fabric handle is importable from another
-        /// host, so it travels here rather than through a descriptor grant
-        /// that only reaches the producer's own host.
+        /// device was probed for: a 64-byte fabric handle or a 4-byte process
+        /// descriptor. A fabric handle is importable from another host, so it
+        /// travels here rather than through a descriptor grant that only
+        /// reaches the producer's own host. A descriptor names an open file
+        /// of the producing process, so a consumer receives the usable one
+        /// over the producer's grant socket, keyed by `publication_id`.
         #[serde(with = "serde_bytes")]
         allocation_handle: Vec<u8>,
         /// Byte offset of this publication's acknowledgment header inside the
         /// exported allocation. A consumer writes its own slot's word there
         /// once its reads retire, which is how a product retires across hosts.
-        /// Negative when the publication carries no header.
+        /// Negative when the publication carries no header, which is the case
+        /// for storage exported where it lies rather than copied into the
+        /// producer's device pool.
         acknowledgment_offset: i64,
     },
     /// A host product carried on the rank channel's data path.
@@ -226,32 +265,49 @@ pub struct Locator {
     pub source: WorkerEndpoint,
     /// Transport-specific publication descriptor.
     pub transport: TransferTransport,
-    /// Tensor payload size in bytes.
+    /// Payload size in bytes of this shard or replica.
     pub nbytes: u64,
-    /// Stable tensor data-type name.
+    /// Stable tensor data-type name: the torch dtype name without its
+    /// `torch.` prefix, such as `float32`.
     pub dtype: String,
-    /// Tensor extents in logical order.
+    /// Extents of this shard or replica in logical axis order.
     pub shape: Vec<u64>,
-    /// Logical element offset of this shard within its tensor.
+    /// Per-axis element index at which this shard or replica starts within
+    /// the logical tensor; it has one entry per axis of `shape`.
     pub offset: Vec<u64>,
     /// Device containing the published tensor.
     pub device: String,
 }
 
 /// Actual logical tensor shape and immutable shard or replica locations.
+///
+/// Each locator covers the box `[offset, offset + shape)` of the logical
+/// tensor. Replicas may overlap, and a descriptor built from some ranks'
+/// reports may leave regions uncovered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TensorTransfer {
+    /// Actual logical extents of the whole tensor.
     pub shape: Vec<u64>,
+    /// Shards and replicas that hold the tensor's bytes.
     pub locations: Vec<Locator>,
 }
 
 impl TensorTransfer {
     /// Returns whether the available shard/replica boxes cover the complete logical tensor.
     /// Partial rank reports are valid descriptors, so completeness is a separate question.
+    ///
+    /// Returns false for a descriptor that fails [`Self::validate`], including
+    /// one without locations. The engine's worker executor calls this after
+    /// dropping the locators of lost ranks to decide which buffers are lost.
     pub fn has_complete_coverage(&self) -> bool {
         if self.validate().is_err() {
             return false;
         }
+
+        // Box subtraction: `uncovered` holds disjoint half-open boxes
+        // `(start, end)` not yet covered by any locator. Each locator splits
+        // every box it intersects into at most two slabs per axis outside the
+        // intersection, and the intersection itself is discarded.
         let mut uncovered = vec![(vec![0; self.shape.len()], self.shape.clone())];
         for location in &self.locations {
             let mut remaining = Vec::new();
@@ -271,6 +327,9 @@ impl TensorTransfer {
                     remaining.push((start, end));
                     continue;
                 }
+                // Peel off the part of the box below and above the
+                // intersection on each axis in turn; after the last axis the
+                // middle box equals the intersection and is dropped.
                 let (mut middle_start, mut middle_end) = (start, end);
                 for axis in 0..self.shape.len() {
                     if middle_start[axis] < lower[axis] {
@@ -295,7 +354,14 @@ impl TensorTransfer {
         false
     }
 
-    /// Validates physical coverage and returns the logical, replica-independent byte size.
+    /// Validates every locator against the logical shape and returns the
+    /// logical, replica-independent byte size.
+    ///
+    /// Each locator's box must lie within `shape`, and all locators must share
+    /// one dtype name and one element width. The width is inferred from the
+    /// first locator's `nbytes` rather than from its dtype name; callers that
+    /// know the expected dtype, such as `validate_transfer_handle`, check it.
+    /// Coverage is not required; see [`Self::has_complete_coverage`].
     pub fn validate(&self) -> ValidationResult<u64> {
         ensure_valid!(
             !self.shape.is_empty() && self.shape.iter().all(|&n| n > 0),
@@ -336,6 +402,7 @@ impl TensorTransfer {
     }
 }
 
+/// Checked product of the extents; an empty shape yields one.
 fn tensor_elements(shape: &[u64]) -> ValidationResult<u64> {
     shape.iter().try_fold(1u64, |count, &extent| {
         count
@@ -345,9 +412,25 @@ fn tensor_elements(shape: &[u64]) -> ValidationResult<u64> {
 }
 
 /// A published KV extent and the physical tensors needed to install its suffix.
+///
+/// The publication is incremental: the destination already holds `base`, when
+/// set, up to `base_extent` tokens, and the tensors carry only the tokens in
+/// `[base_extent, published_extent)`. With `T = published_extent -
+/// base_extent` tokens, the tensors use this layout, whose shape relations
+/// [`KvTransfer::validate`] checks:
+///
+/// - keys and values: `[T, layers, kv heads, head dim]`, one dtype shared by
+///   both (`float16`, `bfloat16`, `float32`, `float64`, or `float8_e4m3fn`);
+/// - with `float8_e4m3fn` only, a third `float32` scale tensor
+///   `[pages, 2, layers, head groups]`, where `pages` counts the source pages
+///   the suffix touches (the first one holds `base_extent`), the second axis
+///   selects K or V, and the kv-head count is a multiple of `head groups`.
+///
+/// An unchanged extent (`published_extent == base_extent`) carries no tensors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvTransfer {
-    /// Published KV tensors.
+    /// Published KV tensors: keys, values, and scales when the storage is
+    /// quantized, in that order.
     pub tensors: Vec<TensorTransfer>,
     /// Published buffer identity represented by the publication.
     pub source: BufferId,
@@ -363,12 +446,16 @@ pub struct KvTransfer {
     pub group_id: u32,
     /// Compute precision used when reading quantized source pages.
     pub compute_dtype: String,
-    /// Tokens per source page, including the boundary scale interpretation.
+    /// Tokens per source page. With quantized storage it also determines how
+    /// many scale rows the suffix spans.
     pub page_size: u32,
 }
 
 impl KvTransfer {
     /// Validate source/base identities and raw K/V/scale geometry, including rank shards.
+    ///
+    /// Also bounds the descriptor by [`MAX_TRANSFER_HANDLE_BYTES`] as
+    /// estimated by [`KvTransfer::encoded_size_bound`].
     pub fn validate(&self) -> ValidationResult<()> {
         let Self {
             tensors,
@@ -432,6 +519,9 @@ impl KvTransfer {
                 "KV transfer scale presence disagrees with its storage"
             );
             if quantized {
+                // Scale rows cover whole source pages, starting at the page
+                // that holds `base_extent`, so a partially filled boundary page
+                // contributes its already installed tokens to the count.
                 let scales = &tensors[2];
                 let tokens =
                     u64::from(base_extent % page_size) + u64::from(published_extent - base_extent);
@@ -461,6 +551,8 @@ impl KvTransfer {
     }
 
     /// Conservative wire size, including every shard and replica locator.
+    /// The Python worker's `KvTransfer.encoded_size_bound` computes a
+    /// parallel estimate.
     pub fn encoded_size_bound(&self) -> usize {
         transfer_encoded_size(&self.tensors)
             .saturating_add(self.destination.len())
@@ -468,6 +560,11 @@ impl KvTransfer {
     }
 
     /// Merge reports for one immutable publication without exposing a partial update.
+    ///
+    /// The engine merges reports that carry locators for the same `source`,
+    /// such as per-rank reports of one call, this way. Every publication field
+    /// except the locators must agree, and the merged result must pass
+    /// [`KvTransfer::validate`]; on any error `self` is left unchanged.
     pub fn merge_locations(&mut self, other: &Self) -> ValidationResult<()> {
         ensure_valid!(
             self.source == other.source
@@ -491,8 +588,11 @@ impl KvTransfer {
 /// Encoding represented by a reusable image-feature publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FeatureKind {
+    /// Vision-encoder features, consumed through a call's `vision_input`.
     #[serde(rename = "vision_feature")]
     Vision,
+    /// Latent image features, consumed through a call's
+    /// `latent_feature_input`.
     #[serde(rename = "latent_feature")]
     Latent,
 }
@@ -500,7 +600,8 @@ pub enum FeatureKind {
 /// Closed cross-pool transfer algebra.
 ///
 /// Each variant carries the metadata required to install its product family on
-/// a destination worker.
+/// a destination worker. Every variant carries exactly one tensor, which
+/// [`TransferHandle::tensors`] exposes as a slice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum TransferHandle {
@@ -543,6 +644,10 @@ pub enum TransferHandle {
 
 impl TransferHandle {
     /// Mutable tensor descriptors for endpoint binding and rank-location invalidation.
+    ///
+    /// The engine uses it to drop locators, such as those of lost ranks or
+    /// those a destination's transfer edges cannot carry. Mutations through
+    /// this view are not revalidated here.
     pub fn tensors_mut(&mut self) -> &mut [TensorTransfer] {
         match self {
             Self::Encoder { tensor, .. }
@@ -571,6 +676,14 @@ impl TransferHandle {
     }
 }
 
+/// Conservative estimate of a descriptor's encoded size, used to enforce
+/// [`MAX_TRANSFER_HANDLE_BYTES`].
+///
+/// The integer constants are per-record overhead allowances rather than exact
+/// FlatBuffers sizes; only string and list lengths are measured. The Python
+/// worker checks its own estimate, `_tensor_transfers_size`, when it commits a
+/// call's outputs; a Python estimate below this one lets the worker emit a
+/// descriptor that this side rejects.
 fn transfer_encoded_size(tensors: &[TensorTransfer]) -> usize {
     let mut size = 512usize;
     for tensor in tensors {
@@ -622,6 +735,12 @@ fn transfer_encoded_size(tensors: &[TensorTransfer]) -> usize {
     size
 }
 
+/// Appends `source`'s locators to the matching tensors of `destination`,
+/// skipping exact duplicates.
+///
+/// Tensors pair by position and must agree on logical byte size, shape, and
+/// dtype name. On error `destination` may be partially updated, so callers
+/// merge into a clone and commit only on success.
 fn merge_tensor_locations(
     destination: &mut [TensorTransfer],
     source: &[TensorTransfer],
@@ -631,6 +750,8 @@ fn merge_tensor_locations(
         "locations disagree on tensor count"
     );
     for (destination, source) in destination.iter_mut().zip(source) {
+        // `validate` rejects an empty locator list, so the first-locator
+        // indexing below cannot panic.
         ensure_valid!(
             destination.validate()? == source.validate()?
                 && destination.shape == source.shape
@@ -657,6 +778,12 @@ pub struct TensorPublication {
 
 impl TensorPublication {
     /// Adds locations of the same immutable logical value without changing its metadata.
+    ///
+    /// The engine merges reports of one product, such as per-rank reports,
+    /// this way. The product identities and the variant's semantic metadata
+    /// must match, and the merged publication must stay within
+    /// [`MAX_TRANSFER_HANDLE_BYTES`] and pass [`TensorPublication::validate`];
+    /// on any error `self` is left unchanged.
     pub fn merge_locations(&mut self, other: &Self) -> ValidationResult<()> {
         ensure_valid!(
             self.product == other.product,
@@ -735,7 +862,10 @@ impl TensorPublication {
     }
 }
 
-/// Maximum serialized size accepted for an external transfer handle.
+/// Maximum estimated encoded size in bytes of one transfer descriptor, as
+/// computed by `TransferHandle::encoded_size_bound` and
+/// `KvTransfer::encoded_size_bound`. The Python worker's
+/// `uniserve_worker.protocol.transfer` module defines the same value.
 pub const MAX_TRANSFER_HANDLE_BYTES: usize = 64 * 1024;
 
 impl Locator {
@@ -809,6 +939,7 @@ impl Locator {
                         // publishing instead.
                         && (ready_event_handle.len() == 64
                             || ready_event_handle.is_empty())
+                        // A process descriptor is 4 bytes, a fabric handle 64.
                         && matches!(allocation_handle.len(), 4 | 64)
                         && tensor_stride.iter().all(|stride| *stride >= 0),
                     "CUDA VMM transfer handle is incomplete"
@@ -835,6 +966,11 @@ impl Locator {
 }
 
 /// Validates a transfer handle against its declared product.
+///
+/// Checks the variant's semantic metadata, then the tensor's locators, dtype,
+/// and actual shape against `product`, then the logical byte size against the
+/// product's byte bound, and finally the descriptor size estimate against
+/// [`MAX_TRANSFER_HANDLE_BYTES`].
 fn validate_transfer_handle(product: &TensorRef, handle: &TransferHandle) -> ValidationResult<()> {
     // Product-family metadata must agree before inspecting physical locators.
     match handle {
@@ -855,6 +991,8 @@ fn validate_transfer_handle(product: &TensorRef, handle: &TransferHandle) -> Val
             value_range,
             ..
         } => ensure_valid!(
+            // Height and width are both positive for an image, or both zero
+            // for a non-image tensor, which then carries no value range.
             (*height == 0) == (*width == 0) && (*height > 0 || value_range.is_empty()),
             "device-product transfer geometry is incomplete"
         ),
@@ -869,8 +1007,9 @@ fn validate_transfer_handle(product: &TensorRef, handle: &TransferHandle) -> Val
         ),
     }
 
-    // Validate each locator and bound their combined payload by the declared
-    // maximum product shape.
+    // Every variant carries one tensor. Its locators must be valid, their
+    // dtype name and element width must match the product's dtype, and the
+    // actual shape must fit the product's shape bound.
     {
         let tensor = &handle.tensors()[0];
         let (dtype, element_bytes) = tensor_dtype(product.dtype);
@@ -883,8 +1022,10 @@ fn validate_transfer_handle(product: &TensorRef, handle: &TransferHandle) -> Val
         let bounds = &product.shape_bound.dims;
         let shape_matches = match bounds.as_slice() {
             [] => tensor_elements(&tensor.shape)? == 1,
-            // A single dynamic extent describes flat capacity, including
-            // encoder features and images whose actual rank is published later.
+            // A single device-actual extent describes flat capacity, such as
+            // encoder features, latents, and feedback images, which the
+            // engine's planner bounds by bytes; the transfer publishes the
+            // actual rank, and only its element count is bounded.
             [DimBound::Device { max }] => tensor_elements(&tensor.shape)? <= u64::from(*max),
             _ => {
                 tensor.shape.len() == bounds.len()
@@ -903,6 +1044,8 @@ fn validate_transfer_handle(product: &TensorRef, handle: &TransferHandle) -> Val
             "transfer tensor shape disagrees with its product"
         );
     }
+
+    // Logical byte sizes count each replicated region once.
     let mut total_bytes = 0_u64;
     for tensor in handle.tensors() {
         total_bytes = total_bytes.saturating_add(tensor.validate()?);
@@ -922,7 +1065,9 @@ fn validate_transfer_handle(product: &TensorRef, handle: &TransferHandle) -> Val
     Ok(())
 }
 
-/// Scalar storage representation used by both allocation and transfer validation.
+/// Transport dtype name and element width in bytes of a declared dtype, used
+/// by both allocation and transfer validation. The names match the Python
+/// worker's `dtype_name`, which strips the `torch.` prefix.
 fn tensor_dtype(dtype: DType) -> (&'static str, u64) {
     match dtype {
         DType::U8 => ("uint8", 1),

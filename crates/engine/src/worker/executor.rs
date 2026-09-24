@@ -1,7 +1,23 @@
 //! Submission of explicitly targeted calls to WorkerGroup instances.
 //!
-//! Each destination has independent bounded capacity. Ready work may bypass
-//! unrelated blocked requests while preserving a request's command order.
+//! `WorkerExecutor` is the `Executor` the scheduler drives over a set of
+//! `WorkerGroup`s. It splits each logical `ExecutionBatch` into one
+//! `WorkerSubmission` per target worker, delivers each request's `Start` with
+//! its first call on a worker and every other lifecycle command to the workers
+//! that hold what it releases, and joins the workers' reports back into
+//! `BatchResult`s: call completions are published as they arrive, command
+//! receipts once every worker has finished the batch.
+//!
+//! Each destination has independent bounded capacity. Every worker has its own
+//! FIFO of submissions whose head waits until the products it depends on are
+//! published. A blocked queue does not hold back other workers, and each
+//! worker receives its batches, and therefore a request's commands, in
+//! submission order.
+//!
+//! The executor also holds the head's copy of every cross-worker product
+//! publication until the scheduler frees the buffer or its request finishes
+//! without retaining it, and on a `WorkerFailure` computes the calls,
+//! requests, and buffers the failure invalidates.
 
 use crate::executor::WorkerResult;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -21,19 +37,34 @@ use uniserve_worker_ipc::{
 
 /// One worker's outstanding submission; returned calls leave this record.
 struct PendingWorker {
+    /// Whether the `WorkerGroup` accepted the submission and still owes its
+    /// report. False while the submission waits in
+    /// `WorkerExecutor::worker_submissions`, and cleared by failure
+    /// reconciliation when the group will send no report.
     submitted: bool,
+    /// Calls whose completion this worker has not yet returned, with the
+    /// computation code the completion must carry.
     calls: HashMap<(RequestKey, uniserve_worker_ipc::CallId), uniserve_worker_ipc::CallKind>,
 }
 
 /// Dispatch and receipts for one scheduler batch.
 struct PendingBatch {
+    /// Workers, by index into `WorkerExecutor::workers`, that have not yet
+    /// finished their part of the batch. The batch is terminal when empty.
     workers: HashMap<usize, PendingWorker>,
+    /// The batch's lifecycle commands without `Start` admissions, so a
+    /// position here is a `CommandResult::command_index`.
     commands: Vec<BatchCommand>,
+    /// Outcomes other than `Applied`, keyed by position in `commands`.
     command_outcomes: HashMap<u32, CommandOutcome>,
 }
 
 impl PendingBatch {
-    /// A failed release keeps ownership even when another endpoint retires it.
+    /// Records `outcome` for every command that targets one of `requests`.
+    ///
+    /// The first recorded outcome is kept, except that `Failed` replaces any
+    /// other: a failed release keeps ownership even when another endpoint
+    /// retires it.
     fn set_command_outcome(&mut self, requests: &HashSet<RequestKey>, outcome: CommandOutcome) {
         for (index, command) in self.commands.iter().enumerate() {
             if requests.contains(&command.request_key()) {
@@ -46,9 +77,16 @@ impl PendingBatch {
     }
 }
 
+/// One worker's part of a logical batch, queued until it can be dispatched.
 #[derive(Clone)]
 struct WorkerSubmission {
+    /// The calls routed to this worker, with its commands and the external
+    /// publications it reads.
     batch: ExecutionBatch,
+    /// Products this worker reads that another worker, or a component of this
+    /// worker that does not share the reader's storage, produces. The
+    /// submission stays at its queue head until each has a publication in
+    /// `transfer_products` or `kv_transfers`.
     dependencies: Vec<BufferId>,
 }
 
@@ -58,7 +96,8 @@ impl WorkerSubmission {
     /// A batch carries one computation to one component, so a worker receives
     /// it once, under one identity, and answers it once. Product inputs the
     /// worker does not yet hold travel as dependencies and hold the submission
-    /// in its queue until they resolve.
+    /// in its queue until they resolve. Inputs, KV inputs, and dependencies
+    /// that none of `calls` reads are dropped.
     fn build(
         batch_id: u64,
         calls: Vec<(Call, RequestPlacement)>,
@@ -91,6 +130,7 @@ impl WorkerSubmission {
     }
 }
 
+/// The worker and component whose call produces a buffer.
 #[derive(Clone)]
 struct BufferRoute {
     worker_index: usize,
@@ -98,25 +138,54 @@ struct BufferRoute {
 }
 
 /// Dispatch targeted calls and track their independently completed results.
+///
+/// Worker indices used throughout are positions in `workers`.
 pub struct WorkerExecutor {
+    /// Worker identity to its index in `workers`.
     routing: HashMap<WorkerId, usize>,
     workers: Vec<(WorkerId, WorkerGroup)>,
     executor_info: ExecutorInfo,
+    /// Sum of the workers' queue depths; `submit` refuses a batch with
+    /// `WouldBlock` while this many logical batches are pending.
     depth: usize,
+    /// Command-channel wake, polled beside the workers' progress descriptors.
     command_wake: crate::handle::WakeSignal,
+    /// Logical batches that have not yet published their terminal result.
     pending: BTreeMap<u64, PendingBatch>,
+    /// Results `poll` returns in order.
     ready: VecDeque<BatchResult>,
+    /// Admission descriptor of every started request until its `Finish`
+    /// completes; a worker receives it as a `Start` with the request's first
+    /// call there.
     admissions: HashMap<RequestKey, NewRequest>,
+    /// (worker, request) pairs whose `Start` the worker has accepted.
     admitted_workers: HashSet<(usize, RequestKey)>,
+    /// Producing worker and component of each output buffer of a submitted
+    /// call, until the buffer is freed or its request finishes without
+    /// retaining it.
     buffer_routes: HashMap<BufferId, BufferRoute>,
     /// Persistent buffer addresses are local to a physical Worker address space.
     buffer_allocations: HashMap<(usize, BufferId), BufferAllocation>,
+    /// Every worker that produces or reads a buffer: the targets of its `Free`.
     buffer_workers: HashMap<BufferId, HashSet<usize>>,
+    /// Tensor publications returned by producing workers, merged across the
+    /// ranks that publish parts of one product. A `channel` locator carries
+    /// the product's bytes, which the head therefore holds until the buffer
+    /// is freed or its request finishes without retaining it.
     transfer_products: HashMap<BufferId, TensorPublication>,
+    /// KV publications returned by producing workers.
     kv_transfers: HashMap<BufferId, KvTransfer>,
+    /// Per-worker FIFO of submissions the `WorkerGroup` has not yet accepted.
     worker_submissions: Vec<VecDeque<WorkerSubmission>>,
+    /// Last collective sequence each worker accepted. It must strictly
+    /// increase per worker: a multi-rank worker treats a batch with calls
+    /// whose sequence does not advance as a fatal invariant violation.
     worker_collective_seqs: Vec<u64>,
+    /// A command wake was drained; the next `poll` returns `Ok(None)` so the
+    /// scheduler reads its commands before waiting again.
     command_wake_pending: bool,
+    /// A failure reconciled inside `submit`. `submit` refuses further batches
+    /// with `WouldBlock` until `poll` returns it.
     pending_failure: Option<WorkerFailure>,
     closed: bool,
 }
@@ -124,15 +193,18 @@ pub struct WorkerExecutor {
 /// Returns, for each worker that decodes video, the encoder replicas that
 /// keep every media unit it decodes on the host that decoded it.
 ///
-/// A decoded media unit is a host product of tens of megabytes that its
-/// encoder reads in place from shared storage, which is named in one host's
-/// namespace. A round deals its units to each component's ranks in order,
-/// `units_per_rank` consecutive positions each, so position `p` is decoded by
-/// the decoder's rank `p / per_decoder` and encoded by the encoder's rank
-/// `p / per_encoder`. A pairing is admissible when the encoder covers a whole
-/// round and those two ranks share a host at every position. Requests are
-/// routed only to admissible pairings, and a decoding worker without one is
-/// refused at startup, naming the unit and the hosts it would cross.
+/// A decoded media unit is a host product that its encoder reads in place
+/// from shared storage, which is named in one host's namespace. A round deals
+/// its units to each component's ranks in order, `units_per_rank` consecutive
+/// positions each, so position `p` is decoded by the decoder's rank
+/// `p / per_decoder` and encoded by the encoder's rank `p / per_encoder`. A
+/// pairing is admissible when the encoder covers a whole round and those two
+/// ranks share a host at every position. Requests are routed only to
+/// admissible pairings, and a decoding worker without one is refused at
+/// startup, naming the unit and the hosts it would cross.
+///
+/// Returns an empty map when the routing lacks a video decoding or a video
+/// encoding component.
 pub(crate) fn video_unit_encoders(
     routing: &std::collections::BTreeMap<uniserve_worker_ipc::MediaCall, String>,
     placements: &[(
@@ -174,6 +246,8 @@ pub(crate) fn video_unit_encoders(
                 ));
                 continue;
             }
+            // `coverage >= round_units` keeps `position / per_encoder` within
+            // the encoder's ranks.
             let crossing = (0..round_units).find_map(|position| {
                 let decoding_rank = decoder_config.ranks[position / per_decoder];
                 let encoding_rank = encoder_config.ranks[position / per_encoder];
@@ -210,6 +284,18 @@ pub(crate) fn video_unit_encoders(
 }
 
 impl WorkerExecutor {
+    /// Binds launched worker groups into one executor.
+    ///
+    /// Fails when the command wake cannot be created, `workers` is empty, a
+    /// worker identity repeats or disagrees with its loaded instance, a group
+    /// was initialized with transfer bindings other than `transfer`, a worker
+    /// reports invalid capabilities, the workers loaded different models or
+    /// checkpoints or expose different outputs for a replicated component, the
+    /// media routing or video encoder pairing is refused, a transfer edge names
+    /// an unbound worker or rank, repeats a physical rank pair, or uses a
+    /// mechanism an endpoint did not initialize or that cannot serve the edge's
+    /// endpoints, or no runtime capacity view can be derived from the workers.
+    /// As a side effect every group learns the deployment-wide media routing.
     pub fn try_new(
         mut workers: Vec<(WorkerId, WorkerGroup)>,
         transfer: TransferConfig,
@@ -259,6 +345,10 @@ impl WorkerExecutor {
         for (_, worker) in &mut workers {
             worker.set_media_routing(media_routing.clone());
         }
+
+        // Every edge expands to the physical (source rank, destination rank)
+        // pairs it names; an omitted rank names all ranks of its worker. A
+        // pair may be bound by only one edge.
         let mut physical_edges = HashSet::new();
         for edge in &transfer.edges {
             anyhow::ensure!(
@@ -304,8 +394,8 @@ impl WorkerExecutor {
                         "physical transfer edge has conflicting bindings"
                     );
                     // An edge carries device products on one mechanism and
-                    // host products on another; each decides for itself how
-                    // far it reaches.
+                    // host products on another; both endpoints must have
+                    // initialized each one.
                     for mechanism in edge.mechanisms() {
                         let backend = mechanism.as_str();
                         anyhow::ensure!(
@@ -370,7 +460,10 @@ impl WorkerExecutor {
                 }
             }
         }
+        // The derived runtime view is discarded; the call only refuses
+        // workers from which it cannot be derived.
         executor_info.runtime_info()?;
+
         let depth = workers
             .iter()
             .map(|worker| worker.1.info().queue_depth.max(1) as usize)
@@ -404,6 +497,8 @@ impl WorkerExecutor {
         self.executor_info.workers[index].1 = self.workers[index].1.info().clone();
     }
 
+    /// The command wake descriptor followed by every worker's progress
+    /// descriptors, for `park_descriptors`.
     fn progress_fds(&self) -> Vec<libc::pollfd> {
         std::iter::once(libc::pollfd {
             fd: self.command_wake.descriptor(),
@@ -419,6 +514,18 @@ impl WorkerExecutor {
     }
 
     /// Reconciles abandoned work and its dependents while retaining live physical owners.
+    ///
+    /// A failure is one of two kinds. With endpoints it is a loss: the
+    /// `WorkerGroup` terminated its ranks and holds none of its resident
+    /// requests, buffers, or publications. Without endpoints the group is
+    /// intact and only the named calls or batch failed.
+    ///
+    /// Returns the failure extended to everything it invalidates: `requests`
+    /// and `buffers` include the dependents found here, and `retired` lists
+    /// every pending call that will now never complete, each removed from its
+    /// pending batch. Batches left with no pending worker publish an empty
+    /// terminal result. An error that is not a `WorkerFailure` is returned
+    /// unchanged.
     fn reconcile_worker_failure(&mut self, error: anyhow::Error) -> anyhow::Result<WorkerFailure> {
         let mut loss = error.downcast::<WorkerFailure>()?;
         let index = *self
@@ -429,6 +536,9 @@ impl WorkerExecutor {
         if lost {
             self.refresh_worker(index);
         }
+
+        // Without a loss, an execution error names the batch that failed on
+        // this worker; only a batch already submitted here can have failed.
         let failed_run = (!lost)
             .then(|| loss.execution.as_ref().and_then(|error| error.batch_id))
             .flatten()
@@ -447,6 +557,10 @@ impl WorkerExecutor {
             .collect::<HashSet<_>>();
         let mut requests = loss.requests.iter().copied().collect::<HashSet<_>>();
         let mut buffers = loss.buffers.iter().cloned().collect::<HashSet<_>>();
+
+        // A lost incarnation's locations are gone. A publication that no longer
+        // covers its whole value is invalid; one that other ranks or workers
+        // still cover in full stays usable.
         if lost {
             for (buffer, payload) in &mut self.transfer_products {
                 let handle = &mut payload.value;
@@ -477,6 +591,9 @@ impl WorkerExecutor {
                 }
             }
         }
+
+        // Buffers produced on the lost worker that were never published are
+        // gone with it, and a failed call's outputs will never be produced.
         for (buffer, route) in &self.buffer_routes {
             if (lost
                 && route.worker_index == index
@@ -487,6 +604,8 @@ impl WorkerExecutor {
                 buffers.insert(*buffer);
             }
         }
+        // On a loss, every request with a call still pending on the worker is
+        // affected.
         if lost {
             for pending in self.pending.values() {
                 if let Some(worker) = pending.workers.get(&index) {
@@ -494,8 +613,11 @@ impl WorkerExecutor {
                 }
             }
         }
-        // Abandoning an unstarted producer also invalidates its future buffers.
-        // Already running work on another instance keeps its real completion path.
+
+        // Propagate to a fixed point. A call reading an invalid buffer taints
+        // its request. Abandoning an unstarted producer also invalidates its
+        // future buffers. Already running work on another instance keeps its
+        // real completion path, so an in-flight call only taints its request.
         loop {
             let before = (requests.len(), buffers.len());
             for (_, worker) in &self.workers {
@@ -519,6 +641,11 @@ impl WorkerExecutor {
                 break;
             }
         }
+
+        // Remove the tainted requests' calls, and the dependencies no remaining
+        // call reads, from every queued submission. A lost worker's queued
+        // commands are dropped too, since the state they act on is gone. A
+        // submission left empty is discarded.
         for (worker_index, queue) in self.worker_submissions.iter_mut().enumerate() {
             let mut active = VecDeque::new();
             for mut submission in queue.drain(..) {
@@ -544,6 +671,12 @@ impl WorkerExecutor {
             }
             *queue = active;
         }
+
+        // Retire this worker's outstanding calls in every batch on a loss, or in
+        // the failed batch only. The group sends no report for such a batch, so
+        // the entry stops awaiting one. Commands of tainted requests are
+        // marked `Retired`, and in the failed batch the reported requests'
+        // commands are marked `Failed`.
         for (batch_id, pending_batch) in &mut self.pending {
             if let Some(worker) = pending_batch.workers.get_mut(&index)
                 && (lost || (worker.submitted && failed_run == Some(*batch_id)))
@@ -564,6 +697,9 @@ impl WorkerExecutor {
                 pending.set_command_outcome(&failed_requests, CommandOutcome::Failed);
             }
         }
+
+        // Remove every retired call from its pending batch. Each must still be
+        // pending on some worker, or the bookkeeping has diverged.
         loss.retired.clear();
         for (batch_id, request, call) in retired {
             let pending_batch = self
@@ -577,6 +713,9 @@ impl WorkerExecutor {
             anyhow::ensure!(removed, "abandoned call is not pending");
             loss.retired.push((batch_id, request, call));
         }
+
+        // A lost worker holds no admissions or allocations: a later call on it
+        // sends its request's `Start` again, and no `Free` targets it.
         if lost {
             self.admitted_workers.retain(|(worker, _)| *worker != index);
             self.buffer_allocations
@@ -585,6 +724,9 @@ impl WorkerExecutor {
                 workers.remove(&index);
             }
         }
+
+        // Drop workers with nothing left to report, then complete the batches
+        // that no worker still owes a result.
         for (batch_id, pending) in &mut self.pending {
             pending.workers.retain(|worker_index, worker| {
                 worker.submitted
@@ -606,7 +748,6 @@ impl WorkerExecutor {
                     done: true,
                     results: Vec::new(),
                     products: Vec::new(),
-
                     worker_exec_us: None,
                     forward_stats: None,
                 })?;
@@ -617,7 +758,11 @@ impl WorkerExecutor {
         Ok(loss)
     }
 
-    /// Returns the command workers eligible for cache admission.
+    /// Records the admission descriptor of each request a batch starts.
+    ///
+    /// Fails when a request is admitted again, before its `Finish` completes,
+    /// with a descriptor that differs from the recorded one; descriptors
+    /// recorded earlier in the same call stay recorded.
     fn cache_admissions(&mut self, admissions: &[NewRequest]) -> anyhow::Result<()> {
         for admission in admissions {
             if let Some(existing) = self.admissions.get(&admission.request_key) {
@@ -634,7 +779,13 @@ impl WorkerExecutor {
         Ok(())
     }
 
-    /// Partitions new-request admissions by the workers used by their first calls.
+    /// Returns the `Start` descriptors `worker_index` needs before `calls`.
+    ///
+    /// One descriptor per request in `calls` that the worker has not yet
+    /// accepted a `Start` for, carrying the placement's worker-local request
+    /// row when it names one and the admission's canonical row otherwise.
+    /// Fails when a request has no recorded admission or its calls name
+    /// different rows.
     fn admissions_for(
         &self,
         worker_index: usize,
@@ -704,6 +855,9 @@ impl WorkerExecutor {
     }
 
     /// Routes buffer release to its storage owners and request closure to every physical owner.
+    ///
+    /// Returns sorted worker indices. `Start` has no target of its own: a
+    /// worker receives it with the request's first call (`admissions_for`).
     fn command_workers(&self, command: &BatchCommand) -> Vec<usize> {
         match command {
             BatchCommand::Start { .. } => Vec::new(),
@@ -723,6 +877,11 @@ impl WorkerExecutor {
     /// Keep resident references direct when producer and consumer execute in
     /// the same address spaces. Different multi-rank components require published
     /// layouts, including when both components belong to this WorkerGroup.
+    ///
+    /// The caller has established that both run on the producer's worker.
+    /// Returns true for the producing component itself, or for two components
+    /// on the same single rank; false otherwise, including when either
+    /// component is not loaded on the worker.
     fn shares_product_storage(&self, producer: &BufferRoute, consumer_entry: &str) -> bool {
         let entries = &self.workers[producer.worker_index].1.info().components;
         let source = entries
@@ -744,6 +903,17 @@ impl WorkerExecutor {
     }
 
     /// Submits or queues one worker-local batch while preserving collective order.
+    ///
+    /// Prepends the `Start` of every request among its calls that the worker
+    /// has not yet admitted, attaches the publications of the submission's
+    /// dependencies, which the caller has checked are published, and lowers
+    /// the batch to the wire. Returns `Ok(false)` when the group refuses it
+    /// with `WouldBlock` (not ready, or no free slot); nothing is recorded and
+    /// the caller requeues the submission. `Ok(true)` records the submission,
+    /// its collective sequence, and the admissions it carried. Errors come
+    /// from resolving admissions, from building or validating the wire batch,
+    /// or from the group; a group that replaced its ranks reports a
+    /// `WorkerFailure`.
     fn submit_worker(
         &mut self,
         worker_index: usize,
@@ -787,6 +957,9 @@ impl WorkerExecutor {
             })?;
             inputs.push(payload.clone());
         }
+
+        // The sequence is committed only once the group accepts the batch, so
+        // a `WouldBlock` retry carries the same value.
         let collective_seq = self.worker_collective_seqs[worker_index]
             .checked_add(1)
             .context("collective sequence space exhausted")?;
@@ -798,6 +971,8 @@ impl WorkerExecutor {
             kv_inputs,
         }
         .into_protocol(collective_seq)?;
+
+        // A transferred persistent input needs its destination-local span.
         for dependency in &submission.dependencies {
             if !self.transfer_products.contains_key(dependency)
                 || !wire
@@ -809,8 +984,8 @@ impl WorkerExecutor {
                 continue;
             }
             // A routed destination may reserve a different address from its
-            // producer. Shared-address layouts omit that override and keep the
-            // producer's allocation, which is the established single-pool path.
+            // producer, and that allocation takes precedence. Without one the
+            // producer's allocation is used.
             let params = self
                 .buffer_allocations
                 .get(&(worker_index, *dependency))
@@ -835,6 +1010,9 @@ impl WorkerExecutor {
             }
         }
         wire.validate()?;
+
+        // Drop every location whose source endpoint is not the current
+        // incarnation of a bound rank.
         let tensors = wire
             .input_products
             .iter_mut()
@@ -917,12 +1095,18 @@ impl WorkerExecutor {
     }
 
     /// Advances worker command execution until no immediate progress remains.
+    ///
+    /// Latches a command wake, dispatches ready submissions, drains every
+    /// worker's available reports without blocking, and dispatches again for
+    /// the dependencies those reports published.
     fn pump(&mut self) -> anyhow::Result<()> {
         self.command_wake_pending |= self.command_wake.drain()?;
         self.dispatch_ready()?;
         for worker_index in 0..self.workers.len() {
             loop {
                 let polled = self.workers[worker_index].1.poll_batch(Duration::ZERO);
+                // Taken before the poll error propagates, so a recovery or
+                // close made while polling reaches `executor_info` either way.
                 if self.workers[worker_index].1.take_readiness_change() {
                     self.refresh_worker(worker_index);
                 }
@@ -937,6 +1121,13 @@ impl WorkerExecutor {
     }
 
     /// Routes a worker result into its worker aggregate and publishes transferable products.
+    ///
+    /// Validates the report against the worker's pending calls, stores the
+    /// product and KV publications it returns, and publishes its completions.
+    /// When some calls failed, the report, failed completions included, is
+    /// still published and the method then returns a `WorkerFailure` naming
+    /// the failed calls' requests and the buffers those calls would have
+    /// produced.
     fn route_result(&mut self, worker_index: usize, report: WorkerResult) -> anyhow::Result<()> {
         let mut report = report;
         let failed_calls = report
@@ -976,6 +1167,9 @@ impl WorkerExecutor {
             .filter(|product| failed_calls.contains(&(product.owner, product.producer_call_id)))
             .cloned()
             .collect();
+
+        // Every completion must answer a distinct call still pending on this
+        // worker, and a terminal report must answer all of them.
         let batch_id = report.batch_id;
         {
             let pending_batch = self
@@ -1008,6 +1202,9 @@ impl WorkerExecutor {
                 "worker {worker_index} ended batch {batch_id} before every call completed"
             );
         }
+
+        // Store returned publications. Each must come from its buffer's
+        // producing worker; a later report for the same buffer adds locations.
         for product in report.products.drain(..) {
             let route = self
                 .buffer_routes
@@ -1050,6 +1247,7 @@ impl WorkerExecutor {
                     .insert(publication.source, publication.clone());
             }
         }
+
         // Keep outstanding identities available to recovery until all returned
         // publications have passed their owner and layout checks.
         let pending = self
@@ -1090,6 +1288,13 @@ impl WorkerExecutor {
     }
 
     /// Publishes ready calls immediately; only lifecycle receipts wait for all workers.
+    ///
+    /// The batch is terminal once no worker remains in its pending record;
+    /// callers remove workers from it as they finish. A terminal result
+    /// carries a receipt for every lifecycle command other than `Start`, with
+    /// its recorded outcome or `Applied`, and applies the executor's own
+    /// retirement bookkeeping for each command that did not fail. A result is
+    /// queued for `poll` when it carries completions or is terminal.
     fn publish_result(&mut self, report: WorkerResult) -> anyhow::Result<()> {
         let batch_id = report.batch_id;
         let std::collections::btree_map::Entry::Occupied(entry) = self.pending.entry(batch_id)
@@ -1109,6 +1314,8 @@ impl WorkerExecutor {
         if done {
             let pending = entry.remove();
             for (index, command) in pending.commands.into_iter().enumerate() {
+                // A failed command keeps physical ownership, so what it would
+                // release stays indexed until a later release succeeds.
                 if pending.command_outcomes.get(&(index as u32)) == Some(&CommandOutcome::Failed) {
                     continue;
                 }
@@ -1166,6 +1373,7 @@ impl WorkerExecutor {
 
 impl Executor for WorkerExecutor {
     fn has_capacity(&self, worker: &WorkerId) -> bool {
+        // Submissions already queued for the worker claim its free group slots.
         self.routing.get(worker).is_some_and(|&index| {
             self.workers[index].1.available_slots() > self.worker_submissions[index].len()
         })
@@ -1176,6 +1384,7 @@ impl Executor for WorkerExecutor {
             .into_iter()
             .all(|index| self.has_capacity(&self.workers[index].0))
     }
+
     fn is_ready(&self, worker: &WorkerId) -> bool {
         self.routing
             .get(worker)
@@ -1188,6 +1397,17 @@ impl Executor for WorkerExecutor {
     }
 
     /// Partitions a logical batch across owning workers and registers aggregate completion state.
+    ///
+    /// Returns `WouldBlock` while a reconciled failure awaits `poll`, while
+    /// `depth` logical batches are pending, or when a target worker has no
+    /// free slot. A `WorkerFailure` raised while dispatching is reconciled and
+    /// held for the next `poll`, and the batch counts as submitted: its fate
+    /// arrives through that failure and the batch's results. A reconciliation
+    /// error is returned as `Failed`. Any other error while partitioning or
+    /// dispatching drops the batch's pending record, but state registered
+    /// before the error, such as the admissions it carries, the routes,
+    /// holders, and allocations of its calls, and submissions already queued,
+    /// is not rolled back.
     fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
         if self.closed {
             return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
@@ -1231,6 +1451,7 @@ impl Executor for WorkerExecutor {
             .map_err(ExecutorSubmitError::Failed)?;
 
         let submit_result = (|| -> anyhow::Result<()> {
+            // Each per-worker vector is indexed by worker index.
             let mut worker_ops = (0..self.workers.len())
                 .map(|_| Vec::new())
                 .collect::<Vec<Vec<(Call, RequestPlacement)>>>();
@@ -1244,6 +1465,10 @@ impl Executor for WorkerExecutor {
                 .collect::<Vec<Vec<BufferId>>>();
             let mut call_routes = HashMap::with_capacity(batch.requests.len());
             let mut input_routes = HashMap::new();
+
+            // Route each call to its worker, check the worker can run it, and
+            // register the producer and holders of its outputs and the
+            // worker-local buffer allocations its placement names.
             for (call, placement) in &batch.requests {
                 let variant = call.code;
                 let call_worker =
@@ -1283,7 +1508,8 @@ impl Executor for WorkerExecutor {
                         self.buffer_routes.insert(output, route);
                     }
                     // Every physical product needs release routing, including
-                    // paged latents/KV and request-relay values without an arena params.
+                    // paged latents, KV, and request-relay values that have no
+                    // buffer allocation.
                     self.buffer_workers
                         .entry(output)
                         .or_default()
@@ -1318,6 +1544,8 @@ impl Executor for WorkerExecutor {
                         .insert(call_worker);
                 }
             }
+
+            // External publications go to every worker with a call reading them.
             for payload in &batch.input_transfers {
                 let worker_indices =
                     input_routes
@@ -1340,6 +1568,10 @@ impl Executor for WorkerExecutor {
                     worker_kv_inputs[worker_index].push(publication.clone());
                 }
             }
+
+            // Resolve every input: supplied externally, read in place from a
+            // producer sharing the reader's storage, or a dependency the
+            // worker's submission waits on until its producer publishes it.
             for (call, _) in &batch.requests {
                 let consumer_worker = call_routes[&(call.request_key, call.call_id)];
                 for input in call.input_buffers() {
@@ -1385,6 +1617,8 @@ impl Executor for WorkerExecutor {
                 worker_ops[worker].push((call, placement));
             }
 
+            // `Start` reaches a worker with the request's first call there;
+            // other commands go to every worker holding what they release.
             let mut worker_commands = (0..self.workers.len())
                 .map(|_| Vec::new())
                 .collect::<Vec<Vec<BatchCommand>>>();
@@ -1414,6 +1648,8 @@ impl Executor for WorkerExecutor {
                 }
             }
 
+            // Queue one submission per worker that has calls or commands, and
+            // register the batch before dispatching any of them.
             let mut pending_workers = HashMap::new();
             for (worker_index, (((calls, commands), input_products), dependencies)) in worker_ops
                 .into_iter()
@@ -1464,6 +1700,9 @@ impl Executor for WorkerExecutor {
                 },
             );
             self.dispatch_ready()?;
+
+            // A batch with no worker part, such as one whose commands have no
+            // remaining holder, completes at once.
             if self
                 .pending
                 .get(&batch_id)
@@ -1474,11 +1713,15 @@ impl Executor for WorkerExecutor {
                     done: true,
                     results: Vec::new(),
                     products: Vec::new(),
-
                     worker_exec_us: None,
                     forward_stats: None,
                 })?;
             }
+
+            // A freed buffer loses its producer route and publications now, so
+            // a later call that reads it is refused unless its batch supplies
+            // a publication. Its holders and allocations stay indexed until the
+            // `Free` completes, and remain if the release fails.
             for command in &batch.commands {
                 if let BatchCommand::Free { buffer } = command {
                     self.transfer_products
@@ -1507,6 +1750,12 @@ impl Executor for WorkerExecutor {
     }
 
     /// Drives worker progress and returns the next completed logical batch.
+    ///
+    /// A failure held by `submit` is returned first. A drained command wake
+    /// makes the call return `Ok(None)` at once, before or after waiting, so
+    /// the scheduler can read its commands. A worker failure found while
+    /// pumping is reconciled and returned as a `WorkerFailure`; any other
+    /// error is returned unchanged.
     fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
         if let Some(loss) = self.pending_failure.take() {
             return Err(loss.into());
@@ -1536,7 +1785,10 @@ impl Executor for WorkerExecutor {
         Ok(self.ready.pop_front())
     }
 
-    /// Closes the component and releases its resources.
+    /// Closes every worker group and refuses later submissions.
+    ///
+    /// Every group is closed even when an earlier one fails; the first error
+    /// is returned.
     fn close(&mut self) -> anyhow::Result<()> {
         self.closed = true;
         let mut first_error = None;
@@ -1656,6 +1908,10 @@ mod placement_tests {
 
     #[test]
     fn a_shared_producer_names_every_possible_replica_reader() {
+        // A text encoder on its own worker feeds latent preparation on two
+        // denoiser replicas. Both replicas serve the consuming component, so
+        // the producer names the reading rank of each; only the replica a
+        // request selects claims its slot.
         use crate::executor::TransferConfig;
         use crate::worker::instance::media_consumer_slots;
 
@@ -1779,9 +2035,9 @@ mod placement_tests {
 
     #[test]
     fn every_shipped_deployment_encodes_its_units_on_their_host() {
-        // The deployment files in `configs/` must pass the placement checks
-        // the engine applies at startup, including the pairing of every
-        // decoding worker with an encoder on its host.
+        // Every `minimax-h3-*.json` deployment file in `configs/` must pass
+        // the placement checks the engine applies at startup, including the
+        // pairing of every decoding worker with an encoder on its host.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
         let mut checked = 0;
         for entry in std::fs::read_dir(&root).expect("the deployment directory exists") {

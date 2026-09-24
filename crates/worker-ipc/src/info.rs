@@ -1,21 +1,31 @@
 //! Worker identity, supported calls, and startup capacity handshake.
+//!
+//! A rank answers the engine's `Info` request with a [`WorkerInfo`]. The engine
+//! validates it, checks it against the launch configuration, and requires a
+//! replacement rank to report an identical description apart from its
+//! endpoint. The executor then derives the capacity view the scheduler plans
+//! against from the descriptions of all workers (`ExecutorInfo::runtime_info`).
 
 use super::*;
 
 /// Fixed physical KV-cache geometry exposed by a worker that executes AR work.
+///
+/// `num_layers` and `num_kv_heads` describe this rank's share of the model's
+/// logical cache; `total_layers`, `total_kv_heads` and the two offsets place
+/// that share within it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvCacheInfo {
     /// Tokens stored in each physical KV page.
     pub block_size: u32,
     /// Total physical pages in the request KV pool.
     pub num_blocks: u32,
-    /// Transformer layers represented in the cache.
+    /// Transformer layers stored by this rank.
     pub num_layers: u32,
     /// Transformer layers in the complete logical cache.
     pub total_layers: u32,
     /// First logical layer stored by this rank.
     pub layer_offset: u32,
-    /// KV heads stored per layer.
+    /// KV heads this rank stores per layer.
     pub num_kv_heads: u32,
     /// Logical model KV heads across all tensor-parallel members.
     pub total_kv_heads: u32,
@@ -23,7 +33,9 @@ pub struct KvCacheInfo {
     pub kv_head_offset: u32,
     /// Elements stored per KV head.
     pub head_dim: u32,
-    /// Storage consumed by one token across all layers.
+    /// Physical bytes one token occupies on this rank across its stored layers
+    /// and heads, including per-page metadata (initialization flags and, with
+    /// FP8, scales) amortized over the page and rounded up.
     pub bytes_per_token: u64,
     /// Positional attention groups partitioning the physical pages.
     pub groups: Vec<KvCacheGroup>,
@@ -34,6 +46,12 @@ pub struct KvCacheInfo {
 impl KvCacheInfo {
     /// Bound one token's logical publication independently of the producing TP size.
     /// A partial-page suffix may carry a complete scale for every head group.
+    ///
+    /// Unlike `bytes_per_token`, which covers this rank's share, this covers
+    /// the published key and value tensors over `total_layers` and
+    /// `total_kv_heads`. With FP8 it also reserves one FP32 scale for each key
+    /// and value head, layer and token. The scheduler multiplies it by the
+    /// published length to bound a KV-publish transfer.
     pub fn publication_bytes_per_token(&self) -> u64 {
         let width = match self.dtype {
             KvCacheDtype::Float16 | KvCacheDtype::BFloat16 => 2,
@@ -41,17 +59,27 @@ impl KvCacheInfo {
             KvCacheDtype::Float8E4m3Fn => 1,
         };
         let head_bytes = u64::from(self.head_dim) * width;
+
+        // FP8 scales are FP32.
         let scale_bytes = if self.dtype == KvCacheDtype::Float8E4m3Fn {
             4
         } else {
             0
         };
+
+        // Key and value tensors.
         (2 * u64::from(self.total_layers))
             .saturating_mul(u64::from(self.total_kv_heads))
             .saturating_mul(head_bytes + scale_bytes)
     }
 
     /// Validates positive geometry and a complete non-overlapping group partition.
+    ///
+    /// Groups carry page counts rather than page ranges, so the partition check
+    /// requires each count to be positive and the counts to sum to
+    /// `num_blocks`.
+    /// `bytes_per_token` is required to be positive but is not recomputed
+    /// from the other fields.
     pub fn validate(&self) -> ValidationResult<()> {
         // Establish the physical dimensions before summing the group partition.
         ensure_valid!(
@@ -85,9 +113,12 @@ impl KvCacheInfo {
         Ok(())
     }
 }
+
 /// One component's finalized configuration shared by all worker descriptions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComponentInfo {
+    /// Component name; `WorkerInfo::validate` requires it to be non-empty and
+    /// unique within one worker.
     pub name: String,
     #[serde(flatten)]
     pub config: uniserve_core::ComponentConfig,
@@ -99,8 +130,13 @@ pub struct ComponentInfo {
 /// A computation's bounded tensor result, before request and storage binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputInfo {
+    /// Result name; `OutputInfo::validate` requires it to be non-empty and
+    /// `WorkerInfo::validate` unique within its component.
     pub name: String,
+    /// Element type of the result tensor.
     pub dtype: DType,
+    /// Upper bound on the result's shape, used to size storage before the
+    /// actual shape is known.
     pub shape_bound: ShapeBound,
 }
 
@@ -148,6 +184,11 @@ impl WorkerEndpoint {
 const STUB_MODEL_PREFIX: &str = "uniserve_models.stub";
 
 /// Post-load worker geometry, limits, supported work, and model identity.
+///
+/// [`WorkerInfo::validate`] checks only internal consistency. The engine's
+/// `RankProcess::finish_startup` additionally checks the description against
+/// the launch: `queue_depth`, rank and world size, component configuration,
+/// and non-empty resolved numerical settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerInfo {
     /// Loaded model identity.
@@ -172,9 +213,10 @@ pub struct WorkerInfo {
     pub fabric_handles: bool,
     /// Number of physical members in this Worker.
     pub world_size: u32,
-    /// Resolved compute dtype and attention selection, compared per rank on restart.
+    /// Resolved compute dtype, compared per rank on restart.
     #[serde(default)]
     pub model_dtype: String,
+    /// Resolved attention selection, compared per rank on restart.
     #[serde(default)]
     pub attention_backend: String,
     /// Numerical weight storage formats present on this rank.
@@ -193,7 +235,8 @@ pub struct WorkerInfo {
     pub components: Vec<ComponentInfo>,
     /// Call families accepted by the worker.
     pub supported_calls: Vec<CallKind>,
-    /// Maximum unresolved physical runs.
+    /// Maximum unresolved physical runs. It must equal the depth the engine
+    /// launched the rank with and connects its channel with.
     pub queue_depth: u32,
     /// Maximum calls in one run.
     pub max_batch_calls: u32,
@@ -205,7 +248,8 @@ pub struct WorkerInfo {
     pub kv_cache: Option<KvCacheInfo>,
     /// Model-defined units stored in one latent page.
     pub latent_page_units: u32,
-    /// Physical latent pages including the reserved sentinel page.
+    /// Physical latent pages including the reserved sentinel page, which
+    /// [`WorkerInfo::latent_capacity_units`] excludes.
     pub latent_pages: u32,
     /// Persistent buffer-pool capacity in bytes.
     pub buffer_pool_bytes: u64,
@@ -216,6 +260,7 @@ pub struct WorkerInfo {
     /// Maximum unresolved calls per request.
     pub max_unresolved_calls: u32,
     /// Concurrent host-lane tasks this rank's bounded host executor admits.
+    /// The scheduler treats zero as one.
     #[serde(default)]
     pub host_lane_capacity: u32,
 }
@@ -249,6 +294,7 @@ impl WorkerInfo {
 
     /// Validates worker identity, capacity, call, and rank invariants.
     pub fn validate(&self) -> ValidationResult<()> {
+        // Identity and physical transfer capabilities.
         self.endpoint.validate()?;
         ensure_valid!(
             !self.device.is_empty()
@@ -265,6 +311,9 @@ impl WorkerInfo {
             self.world_size > 0 && self.endpoint.rank < self.world_size,
             "worker process rank is outside its world"
         );
+
+        // Components: unique names and outputs, membership within the world,
+        // and parallel degrees consistent with membership.
         let mut names = HashSet::new();
         for component in &self.components {
             ensure_valid!(
@@ -304,6 +353,9 @@ impl WorkerInfo {
                 params.units_per_rank > 0 && params.units_per_rank <= u32::MAX as usize,
                 "component unit capacity is outside protocol range"
             );
+            // A distributed component spreads independent units over its member
+            // ranks without model parallelism, so its degree is one; otherwise
+            // every member rank is one position in the parallel degrees.
             ensure_valid!(
                 if params.distribution.is_some() {
                     degree == 1
@@ -313,6 +365,7 @@ impl WorkerInfo {
                 "component membership disagrees with parallel degrees"
             );
         }
+
         // Capability and scheduling limits must describe a usable worker.
         ensure_valid!(
             !self.supported_calls.is_empty(),
@@ -327,11 +380,12 @@ impl WorkerInfo {
                 == self.supported_calls.len(),
             "worker info repeats a call kind"
         );
-        // A worker names the component serving each media call it implements. Every
-        // named call must be one it advertises and a component it holds. The
-        // video graph may span workers, a model worker decoding and a host
-        // worker encoding and muxing, so its completeness and its diffusion
-        // step count are the executor's checks over every worker.
+        // A worker names the component serving each media call it implements.
+        // Here every named call must be one it advertises, with a non-empty
+        // component name. The video graph may span workers, a model worker
+        // decoding and a host worker encoding and muxing, so its completeness
+        // and its diffusion step count are the executor's checks over every
+        // worker.
         ensure_valid!(
             self.media_components.iter().all(|(call, component)| {
                 !component.is_empty() && self.supported_calls.contains(&CallKind::Media(*call))
@@ -346,6 +400,7 @@ impl WorkerInfo {
             "worker info declare a zero scheduling bound"
         );
         ensure_valid!(self.queue_depth > 0, "worker queue depth must be positive");
+
         // Advertised call families require their corresponding pools.
         let requires_kv = self.supported_calls.iter().any(|variant| {
             matches!(
@@ -362,6 +417,8 @@ impl WorkerInfo {
         if let Some(kv_cache) = &self.kv_cache {
             kv_cache.validate()?;
         }
+        // Latent capacity is either absent or at least one usable page beyond
+        // the sentinel.
         let has_latent_capacity = self.latent_page_units > 0 || self.latent_pages > 0;
         if has_latent_capacity {
             ensure_valid!(
@@ -369,6 +426,7 @@ impl WorkerInfo {
                 "worker info declare incomplete latent pool capacity"
             );
         }
+
         // Model identity remains mandatory independently of enabled resources.
         ensure_valid!(!self.model_name.is_empty(), "worker model name is empty");
         // Only the stub model has no checkpoint behind it; a served checkpoint

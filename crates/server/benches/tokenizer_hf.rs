@@ -1,5 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Encoding and decoding throughput benchmarks for Hugging Face tokenizers.
+//!
+//! The fixture resolves `tokenizer.json` for `MODEL_ID` from the Hugging Face
+//! cache configured by the environment and downloads it through `hf-hub` when
+//! it is absent, so a cold cache needs network access. Encoding throughput is
+//! reported in input bytes and decoding throughput in token IDs.
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use hf_hub::api::sync::ApiBuilder;
@@ -9,6 +14,7 @@ const MODEL_ID: &str = "Qwen/Qwen3.5-0.8B";
 const SAMPLE_TEXT: &str =
     "<|im_start|>user\nSummarize this request.\n<|im_end|>\n<|im_start|>assistant\n";
 
+/// Loaded tokenizer plus a sample text and its encoding.
 struct BenchFixture {
     tokenizer: HuggingFaceTokenizer,
     text: String,

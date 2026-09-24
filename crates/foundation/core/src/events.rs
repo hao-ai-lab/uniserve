@@ -1,4 +1,10 @@
 //! Requests and lifecycle events exchanged across the public engine boundary.
+//!
+//! The server submits each engine request as a [`Request`], choosing the
+//! variant from the engine's [`RuntimeFamily`], and receives that request's
+//! [`EngineCoreOutput`] events in order. `Finished`, `Rejected`, and `Error`
+//! are terminal: the engine's `EventRx` marks the request finished when it
+//! receives one of them.
 
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +52,8 @@ pub struct TokenLogprob {
     pub token_id: u32,
     /// Natural-log probability assigned to the token.
     pub logprob: f32,
-    /// Zero-based probability rank at the position.
+    /// One-based competition rank at the position; tied log probabilities
+    /// share a rank.
     pub rank: u32,
 }
 
@@ -62,9 +69,9 @@ pub struct PositionLogprobs {
 pub enum EngineCoreOutput {
     /// Reports scheduler admission timing.
     Scheduled {
-        /// Unix timestamp when the request entered the queue.
+        /// Time the request entered the queue, in seconds since the Unix epoch.
         queued_at: f64,
-        /// Unix timestamp when the request was admitted.
+        /// Time the request was admitted, in seconds since the Unix epoch.
         scheduled_at: f64,
     },
     /// Publishes one generated text token.
@@ -87,6 +94,9 @@ pub enum EngineCoreOutput {
         positions: Vec<PositionLogprobs>,
     },
     /// Opens the lifecycle of one generated image.
+    ///
+    /// The engine emits it together with the image's first committed
+    /// denoising step, before that step's `ImageStep`.
     ImageBegin {
         /// Request-local image identity.
         image_id: u32,
@@ -97,7 +107,8 @@ pub enum EngineCoreOutput {
         /// Configured denoising step count.
         steps: u16,
     },
-    /// Reports one committed diffusion step.
+    /// Reports one committed diffusion step. Each committed step is reported
+    /// once, in increasing order.
     ImageStep {
         /// Request-local image identity.
         image_id: u32,
@@ -105,11 +116,18 @@ pub enum EngineCoreOutput {
         step: u16,
     },
     /// Marks the transition from denoising to image materialization.
+    ///
+    /// The engine emits it when the image-decoding call returns, before the
+    /// image's `ImageDone`.
     ImageCommit {
         /// Request-local image identity.
         image_id: u32,
     },
     /// Publishes a materialized PNG image.
+    ///
+    /// The engine reads `height`, `width`, and `bytes` from the validated PNG
+    /// payload; a payload that fails validation finishes the request with
+    /// [`FinishReason::Error`] instead.
     ImageDone {
         /// Request-local image identity.
         image_id: u32,
@@ -123,8 +141,14 @@ pub enum EngineCoreOutput {
         pixels_png_b64: String,
     },
     /// Reports actual media computation progress committed by the engine.
+    ///
+    /// The engine emits it for diffusion media requests after each valid media
+    /// call result, until the request fails. While delivery is backed up, a
+    /// newer progress event replaces an undelivered one that is still the most
+    /// recently queued event.
     MediaProgress {
-        /// Current numerical or output phase.
+        /// Current numerical or output phase: `preparing`, `denoising`,
+        /// `decoding`, or `finalizing`.
         phase: String,
         /// Number of completed denoising steps.
         completed_steps: u32,
@@ -132,6 +156,9 @@ pub enum EngineCoreOutput {
     /// Publishes a transport-backed media artifact.
     Artifact(ArtifactEvent),
     /// Generated media could not be acquired from its published storage.
+    ///
+    /// Not terminal by itself: the engine also fails the call whose output
+    /// could not be acquired.
     ArtifactUnavailable {
         /// Storage error presented to the artifact consumer.
         message: String,
@@ -239,7 +266,11 @@ pub struct DiffusionRequest {
 }
 
 impl DiffusionRequest {
-    /// Validates prompt presence and all positive geometry constraints.
+    /// Checks that the prompt is nonempty, that the frame, media-unit, and
+    /// step counts are positive, and that the prompt token count fits in `u32`.
+    ///
+    /// The engine's media admission rejects a failing request with
+    /// `RejectionKind::Invalid`.
     pub fn validate(&self) -> Result<(), DiffusionRequestError> {
         if self.prompt_token_ids.is_empty() {
             return Err(DiffusionRequestError::EmptyPromptTokens);
@@ -263,7 +294,8 @@ pub enum DiffusionRequestError {
     /// The tokenized prompt contains no tokens.
     #[error("media prompt tokens must not be empty")]
     EmptyPromptTokens,
-    /// A diffusion bound is zero or exceeds the protocol width.
+    /// A frame, media-unit, or step count is zero, or the prompt token count
+    /// exceeds `u32::MAX`.
     #[error("diffusion parameters are invalid")]
     InvalidSampling,
 }

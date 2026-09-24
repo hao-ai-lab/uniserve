@@ -1,4 +1,12 @@
 //! In-process engine construction, submission, and lifecycle management.
+//!
+//! A request passes through the client in two steps. `register_request`
+//! reserves an engine `RequestId` for an external identifier before
+//! preprocessing, so duplicates are refused early and control commands can
+//! reach a request that is still being prepared. `submit_generation` or
+//! `submit_media` then claims that registration and hands the request to the
+//! engine; the returned `EventRx` releases the claim when its stream ends or
+//! it is dropped.
 
 use std::sync::Arc;
 
@@ -7,6 +15,9 @@ use uniserve_core::{GenerationLimits, ModelDtype, Request, RequestId, RuntimeFam
 use uniserve_engine::{EngineCore, EngineHandle, EventRx, Executor};
 
 /// In-process engine client owned by the server layer.
+///
+/// Construction spawns a Tokio task, so every constructor must be called
+/// within a Tokio runtime.
 pub struct EngineClient {
     core: Arc<EngineCore>,
     pub(crate) requests: Arc<super::requests::RequestRegistry>,
@@ -54,6 +65,11 @@ impl EngineClient {
     }
 
     /// Wraps an initialized engine core with request tracking and periodic statistics export.
+    ///
+    /// The export task publishes one scheduler-stats snapshot per second as
+    /// engine `0`, matching `engine_count`. It holds only a weak reference to
+    /// the core, so it does not keep the engine alive and exits on the first
+    /// tick after the client is dropped.
     fn from_core(core: EngineCore) -> Result<Self> {
         let core = Arc::new(core);
 
@@ -64,6 +80,8 @@ impl EngineClient {
             let model_name = core.model_name().to_string();
             let guard = Arc::downgrade(&core);
             tokio::spawn(async move {
+                // The reporter turns cumulative scheduler counters into
+                // per-snapshot increments, so one instance lives across ticks.
                 let mut reporter = uniserve_engine::SchedulerStatsReporter::default();
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -108,7 +126,7 @@ impl EngineClient {
         self.core.generation_limits()
     }
 
-    /// Fixed media prediction count advertised by the loaded model.
+    /// Returns the fixed media prediction count advertised by the loaded model.
     pub fn denoise_steps(&self) -> u32 {
         self.core.info().denoise_steps()
     }
@@ -135,6 +153,10 @@ impl EngineClient {
 
     /// Reserves a unique request ID before preprocessing. The caller must submit
     /// the returned ID or complete its decoded-response lifecycle on failure.
+    ///
+    /// Returns `Error::DuplicateRequestId` when a live request already holds
+    /// `external_request_id`. With `output_identity`, the registration also
+    /// carries per-request lifecycle statistics.
     pub fn register_request(
         &self,
         external_request_id: String,
@@ -153,6 +175,18 @@ impl EngineClient {
     }
 
     /// Submits the owned tokenized request under its previously reserved identity.
+    ///
+    /// # Errors
+    ///
+    /// - `Error::UnknownRequestId` or `Error::DuplicateRequestId` when the
+    ///   registration cannot be claimed (see `RequestRegistry::claim_submission`).
+    /// - `Error::ClientClosed` when the runtime family is `Diffusion`.
+    /// - `Error::Submit` when the engine refuses the request.
+    ///
+    /// Every error after a successful claim releases the claim again through
+    /// `RequestRegistry::release_engine`, which keeps a registration that
+    /// carries lifecycle statistics for the caller to complete and removes one
+    /// that does not.
     pub async fn submit_generation(
         &self,
         external_request_id: String,
@@ -174,6 +208,9 @@ impl EngineClient {
             self.requests.release_engine(&external_request_id, rid);
             Error::from(error)
         })?;
+        // Once the event stream ends or the receiver is dropped, the registry
+        // forgets the engine side of the record, so a later control command no
+        // longer reaches the engine.
         let requests = Arc::clone(&self.requests);
         scheduler_rx.set_on_finish(move || {
             requests.release_engine(&external_request_id, rid);
@@ -182,6 +219,9 @@ impl EngineClient {
     }
 
     /// Submits one terminal media request and returns its event receiver.
+    ///
+    /// Fails like `submit_generation`, except that `Error::ClientClosed` is
+    /// returned when the runtime family is not `Diffusion`.
     pub async fn submit_media(
         &self,
         external_request_id: String,
@@ -210,6 +250,16 @@ impl EngineClient {
     }
 
     /// Aborts each supplied external request identifier.
+    ///
+    /// Through `RequestRegistry::mark_control`, a registered request that
+    /// carries lifecycle statistics moves to `Aborting`, which overrides a
+    /// pending cancellation; one without statistics whose registration is not
+    /// claimed is removed, so its later submission fails with
+    /// `Error::UnknownRequestId`.
+    /// The abort reaches the engine (`EngineHandle::abort`) only while a
+    /// submission holds the registration's claim, from `claim_submission`
+    /// until `release_engine`. Unknown identifiers are ignored, and the call
+    /// always returns `Ok`.
     pub async fn abort<I, S>(&self, ids: I) -> Result<()>
     where
         I: IntoIterator<Item = S>,
@@ -228,6 +278,12 @@ impl EngineClient {
     }
 
     /// Cancels each supplied request at its consumed output prefix.
+    ///
+    /// Registry handling matches `abort`, except that a request with lifecycle
+    /// statistics moves to `Cancelling` and keeps a pending `Aborting`. The
+    /// cancellation reaches the engine (`EngineHandle::cancel`) under the same
+    /// claim condition. Unknown identifiers are ignored, and the call always
+    /// returns `Ok`.
     pub async fn cancel<I, S>(&self, ids: I) -> Result<()>
     where
         I: IntoIterator<Item = S>,
@@ -245,7 +301,10 @@ impl EngineClient {
         Ok(())
     }
 
-    /// Requests graceful shutdown and joins the engine owner thread.
+    /// Requests graceful shutdown and joins the engine's scheduler thread.
+    ///
+    /// The join blocks the calling thread until the scheduler has torn down
+    /// its executor. Repeated calls are harmless.
     pub async fn shutdown(&self) -> Result<()> {
         self.core.shutdown();
         Ok(())

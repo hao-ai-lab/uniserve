@@ -1,7 +1,11 @@
 //! Foundational request values, identifiers, clocks, and sampling primitives.
 //!
 //! The crate contains transport-independent contracts shared by the server,
-//! scheduler, worker protocol, and simulation runtime.
+//! scheduler, worker protocol, and simulation runtime. This root module holds
+//! request and call identities, wall-clock and monotonic clocks, dtype wire
+//! names, [`SamplingParams`] and [`ImageParams`] with their request
+//! validation, KV-cache descriptors, and the [`CommandWaker`] that interrupts
+//! an engine waiting for commands.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod parallel;
@@ -42,6 +46,11 @@ pub use generation::{
 pub use sampling::{SampleOutput, score_token_logprobs, try_apply_sampling_counts};
 
 /// Thread-safe notification used to wake an engine after command enqueue.
+///
+/// Callers run `wake` on their own thread: `EngineHandle` right after it
+/// enqueues a command, and `EventRx` after it consumes an output event and
+/// frees channel capacity. The engine's implementations (the `WakeSignal`
+/// socket write and the simulator's progress channel send) do not block.
 pub trait Wake: Send + Sync {
     /// Signals the waiting engine owner.
     fn wake(&self);
@@ -122,7 +131,10 @@ pub fn now_unix_secs_u64() -> u64 {
 
 /// Returns process-local monotonic time in fractional seconds from a stable epoch.
 ///
-/// Differences between values remain valid across wall-clock adjustments.
+/// The epoch is fixed by the first call to this function or
+/// [`now_monotonic_us`] in the process, so values are not comparable across
+/// processes. Differences between values remain valid across wall-clock
+/// adjustments.
 pub fn now_monotonic_secs() -> f64 {
     EPOCH.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
@@ -134,9 +146,15 @@ pub fn now_monotonic_us() -> u64 {
     EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64
 }
 
+/// Process-wide origin shared by the monotonic clocks, set on first use.
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
-/// Logical KV block id.
+/// Index of a physical page in the paged KV cache.
+///
+/// The engine's KV block pool allocates these, and block tables map a
+/// sequence's logical blocks onto them; worker calls name them as page ids.
+/// The worker treats page zero as its padding sentinel, so the pool never
+/// allocates it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct BlockId(pub u32);
 
@@ -152,7 +170,9 @@ pub struct RequestId(pub u64);
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
 )]
 pub struct CallId {
+    /// Scheduler batch the call was selected into.
     pub batch_id: u64,
+    /// Ordinal of the call within that batch at selection time.
     pub request_index: u32,
 }
 
@@ -289,11 +309,20 @@ pub struct KvCacheDtypeParseError(String);
 
 /// Text sampling parameters.
 ///
-/// Worker-side math (temperature, top_k, top_p, min_p, penalties, logit_bias)
-/// operates on the logits tensor inside the worker; control-flow floors
-/// (`min_tokens`, `ignore_eos`) are enforced on the host. Fields are scalars or
-/// small id/weight lists — never tensors — so they can cross the worker boundary
-/// without carrying device state.
+/// Worker-side math (temperature, top_k, top_p, min_p, typical_p, penalties,
+/// logit_bias, allowed and forced tokens) operates on the logits tensor inside
+/// the worker, and the engine simulator applies the same math through
+/// [`sampling::try_apply_sampling_counts`]. The engine scheduler enforces the
+/// control-flow fields on the host: `min_tokens` and `bad_words_ids` become
+/// per-step suppression masks, and `ignore_eos` decides whether a sampled EOS
+/// finishes the request. Fields are scalars or small id/weight lists — never
+/// tensors — so they can cross the worker boundary without carrying device
+/// state.
+///
+/// The worker receives these fields through the worker IPC codec's flatbuffer
+/// `SamplingParams` table, the PyO3 `_uniserve_ipc` extension's conversion,
+/// and the Python `uniserve.sampling.SamplingParams`; a new field needs all
+/// of them, plus the worker's mapping codec in `uniserve_worker.protocol.call`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SamplingParams {
     /// Softmax temperature; zero selects greedy decoding.
@@ -302,7 +331,9 @@ pub struct SamplingParams {
     pub top_k: u32,
     /// Cumulative probability mass retained by nucleus sampling.
     pub top_p: f32,
-    /// Whether EOS tokens remain eligible after the minimum-token floor.
+    /// Whether a sampled EOS token leaves the request running instead of
+    /// finishing it. EOS stays eligible for sampling either way once the
+    /// minimum-token floor is met.
     pub ignore_eos: bool,
     /// Optional deterministic random seed.
     pub seed: Option<u64>,
@@ -429,6 +460,13 @@ impl SamplingParams {
     }
 
     /// Validates sampling math inputs before they reach a worker or simulator.
+    ///
+    /// Callers include the server's sampling lowering,
+    /// `GenerationRequest::validate`, and the worker IPC
+    /// `NewRequest::validate`. It checks finiteness, the numeric domain of
+    /// each transform, and that token constraints are non-empty. It does not
+    /// check token ids against a vocabulary or bound `top_k`, `min_tokens`, or
+    /// the logprob counts.
     pub fn validate(&self) -> Result<(), SamplingParamsError> {
         // Reject non-finite scalar math inputs before applying their individual
         // range constraints.
@@ -494,8 +532,10 @@ impl SamplingParams {
 impl Default for SamplingParams {
     /// Defaults direct construction to greedy sampling.
     ///
-    /// Request lowering assigns `1.0` when an API caller omits temperature, so
-    /// the zero value applies only when code constructs these parameters directly.
+    /// Server request lowering does not inherit this temperature: text
+    /// requests start from the checkpoint's sampling defaults (temperature
+    /// `1.0` when it declares none), omni requests start from fixed profile
+    /// defaults, and both then apply the caller's explicit values.
     fn default() -> Self {
         Self {
             temperature: 0.0,
@@ -563,6 +603,10 @@ pub struct ImageParams {
 
 impl ImageParams {
     /// Returns the classifier-free-guidance branch count implied by both axes.
+    ///
+    /// A scale of `1.0` (within a relative tolerance) disables its axis. The
+    /// count is one conditional branch plus one per active axis, so it lies in
+    /// `1..=3`.
     pub fn cfg_branch_count(&self) -> u8 {
         let text_off = scale_approx(self.cfg_text_scale, 1.0);
         let image_off = scale_approx(self.cfg_img_scale, 1.0);
@@ -592,6 +636,7 @@ fn default_retain_images() -> bool {
 }
 
 /// Validation failure returned by [`ImageParams::validate`].
+///
 /// Each variant names the offending field and the bound it violated so the
 /// caller can report a precise input error before scheduling diffusion work.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -717,8 +762,7 @@ pub struct CfgRenormParseError(String);
 impl ImageParams {
     /// Upper bound on diffusion steps.
     pub const MAX_STEPS: u16 = 1000;
-    /// Pixel-dimension bounds. `height`/`width` must be non-zero, within
-    /// `[MIN_DIM, MAX_DIM]`, and a multiple of `DIM_MULTIPLE`.
+    /// Minimum supported image dimension in pixels.
     pub const MIN_DIM: u32 = 16;
     /// Maximum supported image dimension in pixels.
     pub const MAX_DIM: u32 = 4096;
@@ -730,6 +774,11 @@ impl ImageParams {
     pub const MAX_IMAGES: u16 = 256;
 
     /// Validates diffusion parameters before they reach the worker.
+    ///
+    /// Callers include `GenerationRequest::validate` and the worker IPC
+    /// `NewRequest::validate`. `height` and `width` must each be non-zero,
+    /// within `MIN_DIM..=MAX_DIM`, and a multiple of `DIM_MULTIPLE`. The
+    /// first violation found is returned.
     pub fn validate(&self) -> Result<(), ImageParamsError> {
         // Bound discrete work before validating shape- and guidance-dependent
         // values.
@@ -849,11 +898,9 @@ pub struct CfgParams {
     pub interval: (f32, f32),
 }
 
-/// Physical layout of a page-first key/value cache buffer.
+/// Dimensions of a paged key/value cache and the byte sizes they imply.
 ///
-/// Elements are addressed by `base + block_id * page_stride + layer * layer_stride`.
-/// The descriptor supports admission and sizing without transferring ownership
-/// of the backing buffer.
+/// The descriptor holds counts only and owns no backing buffer.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct KvLayout {
     /// Number of physical KV pages.
@@ -887,6 +934,7 @@ impl KvLayout {
 }
 
 /// Attention kind for a KV-cache group.
+///
 /// A model with mixed attention (e.g. full + sliding-window) maps to multiple
 /// groups, each with its own physical page subspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -895,8 +943,9 @@ pub enum KvGroupKind {
     /// Full attention: every block is retained for the request's lifetime.
     #[default]
     Full,
-    /// Sliding-window attention with `sink` always-kept prefix tokens;
-    /// blocks outside the window are eviction candidates once they fall out of range.
+    /// Sliding-window attention over the most recent `window` tokens plus
+    /// `sink` always-kept prefix tokens. The engine's page allocation treats
+    /// this group like a full-attention group.
     SlidingWindow {
         /// Number of recent tokens retained for attention.
         window: u32,
@@ -917,12 +966,14 @@ pub struct KvCacheGroup {
 
 /// Algorithm used to derive prefix-cache block keys.
 ///
-/// FNV-1a provides a seeded non-cryptographic mixer, while SHA-256 provides a
-/// cryptographic digest truncated to the cache's 64-bit key space.
+/// The engine's `block_hash` chains each page's key through its parent's key
+/// with either algorithm. FNV-1a is a non-cryptographic hash, while SHA-256
+/// is a cryptographic digest truncated to the cache's 64-bit key space. Both
+/// keys can collide, so a prefix hit also compares the page's tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HashAlgo {
-    /// Seeded 64-bit FNV-1a hashing.
+    /// 64-bit FNV-1a hashing.
     #[default]
     Fnv1a,
     /// SHA-256 truncated to the cache's 64-bit key space.
@@ -933,7 +984,8 @@ pub enum HashAlgo {
 mod tests {
     use super::*;
 
-    /// Core default temperature is intentionally greedy (0.0).
+    /// Direct construction stays greedy; request lowering, not this default,
+    /// supplies the API temperature.
     #[test]
     fn sampling_default_is_greedy() {
         let sp = SamplingParams::default();

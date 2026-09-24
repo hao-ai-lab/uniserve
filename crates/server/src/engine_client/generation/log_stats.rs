@@ -1,4 +1,12 @@
-//! Periodic logging and metric publication for generation throughput.
+//! Periodic logging of generation throughput and scheduler occupancy.
+//!
+//! The logger only reads the process-wide `METRICS` registry and updates no
+//! metric value, although resolving its handles creates any of its series
+//! that do not exist yet. Scheduler gauges and prefix-cache counters are
+//! written by the engine client's scheduler-stats export task
+//! (`EngineClient::from_core` through
+//! `engine_client::metrics::record_scheduler_stats`).
+//! `ServingRuntime::new` starts the logger when `Config::log_stats` is set.
 
 use std::fmt::Write;
 use std::time::{Duration, Instant};
@@ -9,6 +17,8 @@ use uniserve_observability::{
     EngineLabels, F64Gauge, METRICS, PromptTokenSourceLabels, U64Counter, U64Gauge,
 };
 
+/// Period between log lines. Throughput is averaged over the measured time
+/// between samples, which can exceed this period when a tick is delayed.
 const LOG_STATS_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Cached, cloned metric handles for one engine. Each clone shares the same
@@ -27,8 +37,8 @@ struct EngineMetrics {
     kv_cache_usage: F64Gauge,
 }
 
-/// Accumulated snapshot values from the last logging interval, used to compute
-/// deltas.
+/// Cumulative counter values summed across engines at one sample, used to
+/// compute per-interval deltas.
 struct CounterSnapshot {
     prompt_tokens: u64,
     generation_tokens: u64,
@@ -41,13 +51,17 @@ struct CounterSnapshot {
 /// Spawns a background task that logs throughput and scheduler state at a fixed
 /// interval. When idle (both current and previous throughputs are zero), logs
 /// at DEBUG level. When load drops to zero, emits one final INFO-level line
-/// before going quiet.
+/// before going quiet. Dropping the logger aborts the task.
 pub(crate) struct StatsLogger {
     _task: AbortOnDropHandle<()>,
 }
 
 impl StatsLogger {
-    /// Starts the background stats logging task.
+    /// Starts the background stats logging task for engines
+    /// `0..engine_count`.
+    ///
+    /// Must be called within a Tokio runtime, since it spawns onto the current
+    /// one.
     pub(crate) fn start(model_name: String, engine_count: usize) -> Self {
         let task = AbortOnDropHandle::new(tokio::spawn(async move {
             run_stats_logger(model_name, engine_count).await;
@@ -56,7 +70,8 @@ impl StatsLogger {
     }
 }
 
-/// Resolves and clone all metric handles once so the hot path is lock-free.
+/// Resolves and clones all metric handles once, so each interval reads the
+/// atomics without locking the metric families.
 fn resolve_engine_metrics(model_name: &str, engine_count: usize) -> Vec<EngineMetrics> {
     let m = &METRICS;
     (0..engine_count as u32)
@@ -71,8 +86,8 @@ fn resolve_engine_metrics(model_name: &str, engine_count: usize) -> Vec<EngineMe
                 source: "local_compute",
             };
             EngineMetrics {
-                // Prompt throughput counts local computation and excludes cached
-                // or transferred tokens.
+                // Prompt throughput reads only the `local_compute` source series;
+                // prompt tokens recorded under any other source do not count.
                 prompt_tokens_computed: m.request.prompt_tokens_by_source.get_or_create_owned(&pt),
                 generation_tokens: m.request.generation_tokens.get_or_create_owned(&el),
                 prefix_cache_queries: m.scheduler.prefix_cache_queries.get_or_create_owned(&el),
@@ -86,6 +101,8 @@ fn resolve_engine_metrics(model_name: &str, engine_count: usize) -> Vec<EngineMe
 }
 
 /// Samples cumulative engine metrics and periodically logs interval throughput and occupancy.
+///
+/// Runs until its task is aborted.
 async fn run_stats_logger(model_name: String, engine_count: usize) {
     let engines = resolve_engine_metrics(&model_name, engine_count);
 
@@ -117,7 +134,8 @@ async fn run_stats_logger(model_name: String, engine_count: usize) {
         let generation_throughput =
             curr.generation_tokens.wrapping_sub(prev.generation_tokens) as f64 / elapsed;
 
-        // Idle = both current and previous throughputs are zero.
+        // Idle = both current and previous throughputs are zero, so the first
+        // zero interval after load still logs at INFO.
         let is_idle = prompt_throughput == 0.0
             && generation_throughput == 0.0
             && last_prompt_throughput == 0.0
@@ -185,6 +203,9 @@ fn read_counters(engines: &[EngineMetrics]) -> CounterSnapshot {
 }
 
 /// Reads the current scheduler gauge values, aggregated across engines.
+///
+/// Running and waiting counts are summed; KV cache usage is the mean of the
+/// per-engine usage fractions (0.0 to 1.0), or 0.0 with no engines.
 fn read_scheduler_gauges(engines: &[EngineMetrics]) -> (u64, u64, f64) {
     let mut num_running = 0u64;
     let mut num_waiting = 0u64;

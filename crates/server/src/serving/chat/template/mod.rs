@@ -1,7 +1,9 @@
-//! Chat template renderer contracts and implementations.
+//! Chat template loading options and renderer implementations.
+//!
+//! The only renderer is the Hugging Face Jinja renderer in `renderer::hf`.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-/// Model-specific chat-template renderer implementations.
+/// Chat-template renderer implementations.
 pub mod renderer;
 
 pub use renderer::hf::{ChatTemplateContentFormatOption, HfChatRenderer};
@@ -20,7 +22,9 @@ use serde_json::Value;
 pub struct ChatTemplateLoadOptions {
     /// Message-content representation expected by the template.
     pub chat_template_content_format: ChatTemplateContentFormatOption,
-    /// Optional template source that overrides tokenizer metadata.
+    /// Optional template that overrides the model's own template: either a
+    /// path to a template file (JSON when its extension is `.json`, Jinja
+    /// otherwise) or inline Jinja source.
     pub chat_template: Option<String>,
     /// Default keyword arguments supplied to every template render.
     pub default_chat_template_kwargs: HashMap<String, Value>,

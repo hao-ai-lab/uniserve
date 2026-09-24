@@ -1,8 +1,18 @@
 //! In-process scheduling, storage management, worker execution, and request control.
 //!
-//! The crate owns the engine thread and exports request handles, configuration,
-//! execution backends, and statistics. The `testing` feature additionally
-//! exports a GPU-free simulated executor for control-plane tests.
+//! The crate sits between the HTTP frontend (`uniserve-server`) and the
+//! Python worker processes. `EngineCore` (`core`) launches the worker
+//! processes, or takes a supplied executor, and runs the `Scheduler` on its
+//! owner thread. Frontends submit and control requests through a cloneable
+//! `EngineHandle` (`handle`) and receive each request's events on its
+//! `EventRx`. On the owner thread, the `Scheduler` (`scheduler`) admits
+//! requests, assigns KV pages (`kv`) and other worker storage (`storage`),
+//! and submits calls through the `Executor` trait (`executor`);
+//! `WorkerExecutor` (`worker`) splits each batch into per-worker submissions
+//! to the worker processes.
+//!
+//! The `testing` feature additionally exports `SimExecutor`, `SimEngine`, and
+//! `BatchEvent` (`sim`), a GPU-free executor for scheduler and frontend tests.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod core;
@@ -12,7 +22,8 @@ mod kv;
 mod scheduler;
 #[cfg(feature = "testing")]
 mod sim;
-/// Scheduler-owned allocation and worker-params primitives.
+/// Scheduler-owned allocation of worker storage; only its `OutOfStorage`
+/// error is public.
 pub mod storage;
 mod worker;
 

@@ -2,11 +2,24 @@
 //!
 //! Events accumulate in request-local journals when the bounded consumer channel
 //! is full, preserving order without blocking the engine owner thread.
+//!
+//! This module also owns the semantic resolution of completed calls
+//! (`Scheduler::resolve`): it turns accepted worker results into public events
+//! and the request's next generation phase, and it owns the termination of
+//! running token requests (`Scheduler::finish_with`), which releases scheduler
+//! resources and publishes the terminal `Finished` event.
+//! `RequestState::process_generation_result` has already applied a call's
+//! accepted progress (cursors, encoder indices, denoising steps, phase) by the
+//! time `resolve` runs.
 
 use super::*;
 use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 
-/// Flushes journaled public events into the output channel.
+/// Flushes journaled public events into the output channel in order.
+///
+/// Returns `true` only when the receiver has closed, in which case the journal
+/// is discarded. Returns `false` when the journal drained completely or when
+/// the channel filled again, leaving the remainder journaled.
 fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<EngineCoreOutput>) -> bool {
     while let Some(event) = journal.pop_front() {
         match event_tx.send(event) {
@@ -27,17 +40,30 @@ fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<EngineCoreOut
 /// EngineCoreOutput journal and usage counters for one request.
 pub(super) struct RequestOutput {
     pub(super) events: EventJournal,
+    /// `TextToken` events accepted into the ordered output.
     pub(super) tokens_sent: usize,
+    /// Text-token count the frontend decoder has acknowledged.
+    ///
+    /// `Scheduler::acknowledge_output` treats an acknowledgement that exceeds
+    /// `tokens_sent` or moves backwards as an error finish; `mark_stopped` and
+    /// cancellation apply the same upper bound.
     pub(super) tokens_acked: usize,
-    /// Prompt score positions already consumed and delivered to the caller.
+    /// Prompt score positions received from worker completions.
     pub(super) prompt_logprobs_processed: usize,
+    /// Prompt score positions published as `PromptLogprobs` events.
     pub(super) prompt_logprobs_emitted: usize,
-    /// Ends of token batches awaiting a stop-string decoder decision.
+    /// Ends of the tokens each resolved token-producing call published,
+    /// awaiting a stop-string decoder decision, as `tokens_sent` values in
+    /// publication order. Populated only for requests with stop strings;
+    /// `usize::MAX` marks the call being resolved. `can_schedule_next`
+    /// refuses another call while the queue holds `max_unresolved_calls`
+    /// entries; acknowledgements drain it, and a non-error finish waits until
+    /// it is empty.
     pub(super) decoder_boundaries: VecDeque<usize>,
 }
 
 impl RequestOutput {
-    /// Creates an output journal with the requested capacity.
+    /// Creates empty output accounting that publishes through `event_tx`.
     pub(super) fn new(event_tx: EventTx) -> Self {
         Self {
             events: EventJournal::new(event_tx),
@@ -52,6 +78,12 @@ impl RequestOutput {
 
 /// Ordered publication shared by token and media requests. Progress can be
 /// coalesced while terminal events retain their place until the caller reads.
+///
+/// The journal holds at most `OUTPUT_JOURNAL_CAPACITY` events beyond what the
+/// bounded channel holds, and `enqueue` panics if that bound is exceeded. For
+/// token requests the scheduler stays within it by scheduling a call only when
+/// `Scheduler::output_window_ready` finds room for the worst-case output of
+/// every in-flight call and the next one, plus a terminal reserve.
 pub(super) struct EventJournal {
     pub(super) event_tx: EventTx,
     journal: VecDeque<EngineCoreOutput>,
@@ -65,34 +97,45 @@ impl EventJournal {
         }
     }
 
-    /// Returns whether the journal is closed.
+    /// Returns whether the request's event receiver has closed.
     pub(super) fn is_closed(&self) -> bool {
         self.event_tx.is_closed()
     }
 
-    /// Returns the number of events the journal can accept.
+    /// Returns the number of events the journal can accept: free channel slots
+    /// plus the journal's remaining headroom.
     pub(super) fn available_capacity(&self) -> usize {
         self.event_tx
             .capacity()
             .saturating_add(OUTPUT_JOURNAL_CAPACITY.saturating_sub(self.journal.len()))
     }
 
-    /// Flushes pending journal entries.
+    /// Flushes pending journal entries; returns `true` when the receiver closed.
     fn flush(&mut self) -> bool {
         flush_public_journal(&self.event_tx, &mut self.journal)
     }
 
     /// Delivers an event or journals it in order when the public channel is full.
+    ///
+    /// Returns `true` when the event was delivered, journaled, or coalesced, and
+    /// `false` when the receiver has closed and the event was dropped.
     pub(super) fn enqueue(&mut self, event: EngineCoreOutput) -> bool {
         if self.flush() {
             return false;
         }
+
+        // A journaled progress event that has not been delivered is superseded
+        // by the newer one; coalescing only replaces the journal tail, so no
+        // other event loses its place.
         if matches!(event, EngineCoreOutput::MediaProgress { .. })
             && let Some(last @ EngineCoreOutput::MediaProgress { .. }) = self.journal.back_mut()
         {
             *last = event;
             return true;
         }
+
+        // Send directly only when nothing is journaled; otherwise the event
+        // would overtake earlier ones.
         if self.journal.is_empty() {
             match self.event_tx.send(event) {
                 Ok(()) => {
@@ -114,24 +157,34 @@ impl EventJournal {
 
 #[derive(Default)]
 /// Non-blocking event publisher with request-local ordered buffering.
+///
+/// Holds the journals of finished token and media requests whose remaining
+/// events, including the terminal one, have not yet fit into their channels,
+/// so request state can retire while its output drains under backpressure.
 pub(crate) struct OutputSender {
     retired: HashMap<RequestId, EventJournal>,
 }
 
 impl OutputSender {
     /// Returns the number of retired requests still awaiting output delivery.
+    ///
+    /// Admission counts these toward `max_num_waiting`, so undelivered
+    /// terminal output applies backpressure to new submissions.
     pub(super) fn retained_len(&self) -> usize {
         self.retired.len()
     }
 
     /// Retains pending events after computational state has retired.
+    ///
+    /// A journal with nothing pending is dropped immediately.
     pub(super) fn retire(&mut self, id: RequestId, output: EventJournal) {
         if !output.journal.is_empty() {
             self.retired.insert(id, output);
         }
     }
 
-    /// Flushes journal entries that are safe to retire.
+    /// Flushes retired journals, dropping each once it drains or its receiver
+    /// closes. Returns whether any journal changed length.
     pub(super) fn flush_retired(&mut self) -> bool {
         let mut progressed = false;
         self.retired.retain(|_, output| {
@@ -146,12 +199,21 @@ impl OutputSender {
 
 impl Scheduler {
     /// Publishes committed autoregressive tokens and advances text-generation state.
+    ///
+    /// Tokens are applied in order and resolution stops at the first token that
+    /// finishes the request, opens an image branch, or is a round-close token.
+    /// The sampled log probability and top candidates belong to the last
+    /// committed token only.
     pub(super) fn resolve_decode_text(
         &mut self,
         id: RequestId,
         mut record: uniserve_worker_ipc::RequestOutput,
     ) {
         self.activate_request_tables(id);
+
+        // A round-close token committed alone by the previous decode became
+        // this decode's input; its completion now decides the round with that
+        // token and ignores the tokens this call committed.
         if self
             .running
             .get(&id)
@@ -167,7 +229,9 @@ impl Scheduler {
             }
             return self.close_context_round(id, close_token);
         }
+
         let burst_result = record.committed_tokens.len() > 1;
+        // A completion without committed tokens resolves as the first EOS token.
         let tokens = if record.committed_tokens.is_empty() {
             vec![self.ctrl.eos[0]]
         } else {
@@ -183,6 +247,10 @@ impl Scheduler {
                     .round_close_token_ids()
                     .contains(&tok)
             });
+            // A round-close token inside a multi-token commit decides the round
+            // immediately. A single committed close token is deferred: it
+            // becomes the next decode's input and `round_closing` makes that
+            // decode's completion decide the round.
             if is_round_close {
                 if let Some(st) = self.running.get_mut(&id) {
                     st.num_generated_tokens += 1;
@@ -207,6 +275,8 @@ impl Scheduler {
                     st.req.image.max_images as usize,
                 )
             };
+            // A direct trigger token opens the image branch without being
+            // published as text.
             let direct_trigger = self
                 .running
                 .get(&id)
@@ -224,6 +294,9 @@ impl Scheduler {
                 st.phase = Phase::DecodeUnd;
                 st.round_token_ids.push(tok);
             }
+
+            // A trigger sequence matched against `generated_token_ids` opens the
+            // branch after its last token has been recorded there.
             if can_open_gen_branch
                 && images_done < max_images
                 && self
@@ -239,10 +312,17 @@ impl Scheduler {
 
     /// Applies one completed call to its request and emits observable output.
     ///
-    /// Each phase applies its accepted progress so a worker completion cannot advance
-    /// a request through an unrelated generation stage. The caller resolves only a
-    /// running request, and every path that finishes it returns; a request that is
-    /// no longer running has nothing left to update, so resolution stops there.
+    /// `RequestState::process_generation_result` has already applied the call's
+    /// accepted progress, so the cursors, encoder indices, denoising step count,
+    /// and phase read here reflect this completion. Resolution adds the
+    /// remaining effects for the call's kind, such as stop conditions,
+    /// image-branch triggers, prefix- and encoder-cache publication, feedback
+    /// state, and public events. `media`
+    /// carries the base64 PNG artifact of an image-decoding completion.
+    ///
+    /// The caller resolves only a running request, and every path that
+    /// finishes it returns; a request that is no longer running has nothing
+    /// left to update, so resolution stops there.
     pub(super) fn resolve(
         &mut self,
         id: RequestId,
@@ -272,7 +352,13 @@ impl Scheduler {
                     consumes_image_features(&call),
                     is_feedback_computation(&call),
                 ) {
+                    // A prefill with neither image features nor a token output
+                    // is the `CloseKv` write. It publishes nothing, and
+                    // `process_generation_result` has already moved the request
+                    // to `PublishKv`.
                     (false, _) if !is_prompt_extend(&call) => return,
+                    // Input-image state ingest. The encoder index wraps to zero
+                    // once the image's last encoder output has been ingested.
                     (true, false) => {
                         let is_final_step = self
                             .running
@@ -282,6 +368,8 @@ impl Scheduler {
                             self.free_transient_products(id);
                         }
 
+                        // Ingesting the last image of a fully consumed prompt
+                        // starts understanding decode from BOS.
                         if is_final_step
                             && self.running.get(&id).is_some_and(|st| {
                                 st.num_ingested_images >= st.req.multimodal_inputs.images.len()
@@ -298,6 +386,9 @@ impl Scheduler {
                         }
                         return;
                     }
+                    // Generated-image feedback ingest. Only the last feedback
+                    // encoder's completion counts the image and chooses how
+                    // text decode resumes.
                     (true, true) => {
                         let is_final_step = self
                             .running
@@ -319,6 +410,10 @@ impl Scheduler {
                             st.round_token_ids.clear();
                         }
 
+                        // Without a sampled continuation, the configured
+                        // `feedback_next_token` is the next decode input, and
+                        // its absence is an error; with one, this call's
+                        // sampled token is resolved like any decoded token.
                         if !sample_continuation {
                             let Some(next_token) = self.feedback_next_token(id) else {
                                 return self.finish(id, FinishReason::Error);
@@ -383,8 +478,8 @@ impl Scheduler {
                     _ => {}
                 }
 
-                // Partial prefill remains in ingest until every text and multimodal
-                // position has been consumed.
+                // Prompt extension. Partial prefill remains in ingest until every
+                // text and multimodal position has been consumed.
                 let Some(st) = self.running.get(&id) else {
                     return;
                 };
@@ -410,6 +505,8 @@ impl Scheduler {
                 let (starts_gen_after_context, can_open_gen_branch) =
                     (st.starts_gen_after_context(), st.can_open_gen_branch());
 
+                // Prompt scoring covers every prompt position after the first;
+                // a complete prompt with unscored positions is an error.
                 if self.running.get(&id).is_some_and(|state| {
                     state.req.sampling.prompt_logprobs_requested()
                         && state.output.prompt_logprobs_emitted
@@ -477,7 +574,8 @@ impl Scheduler {
                 let (images_done, max_images) =
                     (st.num_generated_images, st.req.image.max_images as usize);
 
-                // An inline image trigger consumes the remaining branch budget.
+                // A direct trigger token opens the image branch without being
+                // published as text.
                 let direct_trigger = self
                     .running
                     .get(&id)
@@ -514,7 +612,10 @@ impl Scheduler {
             }
             CallKind::Media(MediaCall::Denoising) => {
                 // Publish every newly committed step exactly once, including steps
-                // coalesced into a single worker completion.
+                // coalesced into a single worker completion. `bounds.max_tokens`
+                // is the call's step count, so subtracting it from the reported
+                // total gives the steps completed before this call. Step
+                // numbers saturate at `u16::MAX` to fit the event fields.
                 let Some(st) = self.running.get(&id) else {
                     return;
                 };
@@ -592,6 +693,8 @@ impl Scheduler {
                         return self.finish(id, FinishReason::Error);
                     };
 
+                    // The configured feedback source must exist: the decoder's
+                    // device image product or the published PNG artifact.
                     let source_product = call.image_output.clone();
 
                     if feedback_source == uniserve_core::FeedbackSource::DeviceProduct
@@ -619,6 +722,8 @@ impl Scheduler {
                         }
                     }
                 } else {
+                    // A request that does not continue after its image commit
+                    // ends with this image.
                     if let Some(st) = self.running.get_mut(&id) {
                         st.num_generated_images += 1;
                         st.text_tokens_since_image = 0;
@@ -629,6 +734,9 @@ impl Scheduler {
             CallKind::Media(MediaCall::VisionEncoding)
             | CallKind::Media(MediaCall::LatentEncoding) => {
                 match is_feedback_computation(&call) {
+                    // Input-image encoding: the product feeds the next state
+                    // ingest and, when the request writes the encoder cache,
+                    // becomes a shared cache entry.
                     false => {
                         let encoder_cache_key = self.running.get(&id).and_then(|state| {
                             let image = state
@@ -654,6 +762,10 @@ impl Scheduler {
                         // Cache ownership transfers the backing allocation out of the
                         // request; uncached products remain request-local transients.
                         let selected_product = if let Some(cache_key) = encoder_cache_key {
+                            // Insertion may return an evicted entry or, when a
+                            // concurrent miss already stored this key, this
+                            // call's redundant product; either is freed once
+                            // the request's product is selected.
                             if let Some(freed) = self
                                 .storage
                                 .encoder_cache
@@ -665,6 +777,8 @@ impl Scheduler {
                             let stored = self.storage.encoder_cache.peek_product(cache_key)
                                 == Some(feature.clone());
 
+                            // Only a product the cache now holds moves its
+                            // buffer from the request to encoder retention.
                             if stored {
                                 let allocation = self.running.get_mut(&id).and_then(|state| {
                                     state.allocations_mut()?.take_buffer(feature.buffer_id())
@@ -688,6 +802,8 @@ impl Scheduler {
                                 }
                             }
 
+                            // The request pins the resident entry, which may be an
+                            // earlier equivalent product rather than this call's.
                             let Some(product) = self.storage.encoder_cache.acquire(cache_key)
                             else {
                                 return self.finish(id, FinishReason::Error);
@@ -717,6 +833,8 @@ impl Scheduler {
                             );
                         }
                     }
+                    // Feedback encoding: the product is request-local and
+                    // released once feedback ingest completes.
                     true => {
                         let Some(feature) = call.encoder_output.clone() else {
                             return self.finish(id, FinishReason::Error);
@@ -730,6 +848,8 @@ impl Scheduler {
                     }
                 }
             }
+            // These calls publish nothing and change no state here. `Decode`
+            // returned above and appears only for exhaustiveness.
             CallKind::Media(MediaCall::TextEncoding)
             | CallKind::Forward(ForwardMode::Decode)
             | CallKind::Forward(ForwardMode::Verify)
@@ -741,7 +861,12 @@ impl Scheduler {
         }
     }
 
-    /// Deduplicates overlapping prompt scores and emits only newly resolved positions.
+    /// Publishes one completion's prompt scores as a `PromptLogprobs` event.
+    ///
+    /// Every received position counts toward `prompt_logprobs_processed`.
+    /// Positions beyond the prompt's scorable range (every prompt position
+    /// after the first) are dropped, and nothing is published when no position
+    /// remains.
     pub(super) fn resolve_prompt_logprobs(
         &mut self,
         id: RequestId,
@@ -773,7 +898,8 @@ impl Scheduler {
         );
     }
 
-    /// Releases the transient products.
+    /// Frees the request's transient products: uncached input-image encoder
+    /// outputs, feedback encoder outputs, and the device feedback source.
     pub(super) fn free_transient_products(&mut self, id: RequestId) {
         let products = self
             .running
@@ -783,7 +909,15 @@ impl Scheduler {
         self.free_buffers(products.into_iter().map(|product| product.buffer_id()));
     }
 
-    /// Records the gen trigger for replay.
+    /// Appends the direct trigger token to `generated_token_ids` for a request
+    /// that continues after its image commit, when `num_generated_tokens`
+    /// counts more tokens than that list records and the list does not
+    /// already end with the trigger.
+    ///
+    /// A direct trigger opens the image branch without passing through
+    /// `emit_text`. This keeps the trigger in the accepted history that
+    /// bad-word masks (`build_token_masks`) and generated-trigger matching
+    /// read.
     pub(super) fn record_gen_trigger_for_replay(&mut self, id: RequestId) {
         let Some(start) = self
             .running
@@ -802,6 +936,12 @@ impl Scheduler {
     }
 
     /// Converts a worst-case KV reservation into concrete generation-branch capacity.
+    ///
+    /// Succeeds, clearing `image_reservation_pending`, when the request reserves
+    /// its worst-case envelope and the first block table already holds at least
+    /// `max_reserved_kv_blocks` blocks. Otherwise finishes the request with
+    /// `FinishReason::Error` and returns `false`; a request that is not running
+    /// also returns `false`.
     pub(super) fn promote_gen_branch_reservation(&mut self, id: RequestId) -> bool {
         let Some((required_blocks, reserves_envelope)) = self
             .running
@@ -825,7 +965,13 @@ impl Scheduler {
         true
     }
 
-    /// Begins the image.
+    /// Opens the next image-generation branch.
+    ///
+    /// Moves the request to `Phase::CloseKv` under a new `image_id` and checks
+    /// its KV reservation, which can finish the request with an error. When
+    /// calls of the request are still in flight, its speculative chain is
+    /// marked invalidated: those results are discarded on arrival, and nothing
+    /// new is scheduled for the request until they drain.
     pub(super) fn begin_image(&mut self, id: RequestId) {
         self.record_gen_trigger_for_replay(id);
         let has_unresolved_descendants = self.inflight.has_pending_calls(id);
@@ -841,7 +987,11 @@ impl Scheduler {
         self.promote_gen_branch_reservation(id);
     }
 
-    /// Flushes the output journals.
+    /// Flushes the journals of running token and media requests and of retired
+    /// requests. Returns whether any journal changed length.
+    ///
+    /// A running request whose receiver has closed is marked for cancellation
+    /// through its terminal intent; it retires once its in-flight calls drain.
     pub(super) fn flush_output_journals(&mut self) -> bool {
         let mut progressed = false;
         for (events, intent) in self
@@ -865,6 +1015,9 @@ impl Scheduler {
     }
 
     /// Returns whether the request accepted an event into its ordered output.
+    ///
+    /// Returns `false` for a request that is not running. A closed receiver
+    /// also returns `false` and marks the request for cancellation.
     pub(super) fn emit(&mut self, id: RequestId, event: EngineCoreOutput) -> bool {
         let Some(state) = self.running.get_mut(&id) else {
             return false;
@@ -876,7 +1029,12 @@ impl Scheduler {
         accepted
     }
 
-    /// Emits a text token and advance output accounting.
+    /// Records an accepted text token and publishes it when the request emits text.
+    ///
+    /// A running request always records the token in `generated_token_ids`.
+    /// Returns `true` when the token is visible text, even if a closed receiver
+    /// dropped it, and `false` when the request is not running or does not emit
+    /// text. `tokens_sent` advances only when the event was accepted.
     pub(super) fn emit_text(&mut self, id: RequestId, tok: u32, logprob: Option<f32>) -> bool {
         let Some(st) = self.running.get_mut(&id) else {
             return false;
@@ -914,7 +1072,8 @@ impl Scheduler {
         }
     }
 
-    /// Emits the terminal stop token.
+    /// Publishes a matched stop token only when the request includes stop tokens
+    /// in its output.
     pub(super) fn emit_terminal_stop_token(
         &mut self,
         id: RequestId,
@@ -932,6 +1091,14 @@ impl Scheduler {
     }
 
     /// Resolves stop conditions for one understanding token and emits it when appropriate.
+    ///
+    /// The caller has already counted the token in `num_generated_tokens`.
+    /// A stop-token match takes precedence and publishes the token only with
+    /// `include_stop_token`. A request that finishes on EOS or the token limit
+    /// publishes the token unless it is an EOS token; an EOS token that does
+    /// not finish the request (under the floor or with `ignore_eos`) is
+    /// published as text. Returns `true` when the caller must stop resolving:
+    /// the request finished, has a deferred finish, or is no longer running.
     pub(super) fn emit_or_finish_und_token(
         &mut self,
         id: RequestId,
@@ -943,8 +1110,9 @@ impl Scheduler {
         let Some(state) = self.running.get(&id) else {
             return true;
         };
-        // `tokens_emitted` already counts the token being resolved, so the floor
-        // is cleared only once at least `min_tokens` tokens have been emitted.
+        // `num_generated_tokens` already counts the token being resolved, so
+        // stop tokens and EOS are honored only once at least `min_tokens`
+        // tokens precede it. The token limit applies regardless of the floor.
         let generated = state.num_generated_tokens;
         let under_floor = generated <= state.req.sampling.min_tokens;
         let stop_hit = !under_floor && state.req.stop_token_ids.contains(&token_id);
@@ -994,6 +1162,11 @@ impl Scheduler {
     }
 
     /// Defers terminal cleanup until in-flight work and decoder decisions are drained.
+    ///
+    /// Finishes immediately when nothing is outstanding; an error finish does
+    /// not wait for stop-string decoder decisions. Otherwise records a
+    /// `PendingFinish` that `finish_pending_if_idle` applies later. The first
+    /// recorded reason is kept, except that an error replaces it.
     pub(super) fn finish_after_inflight(
         &mut self,
         id: RequestId,
@@ -1038,6 +1211,12 @@ impl Scheduler {
     }
 
     /// Publishes terminal accounting and releases every resource owned by one request.
+    ///
+    /// Applies to token requests in `running`; media requests terminate
+    /// through `finish_media`. For a request that is not running, this only
+    /// clears a pending finish. Allocations of a request registered with its
+    /// workers move to `retiring_requests` until the queued `Finish` command
+    /// is acknowledged; an unregistered request's allocations are freed here.
     pub(super) fn finish_with(
         &mut self,
         id: RequestId,
@@ -1136,6 +1315,7 @@ impl Scheduler {
 
             // A full event channel transfers ownership to the retired-output
             // queue, which drains the terminal event under normal backpressure.
+            // A closed receiver drops the terminal event with the journal.
             let terminal = EngineCoreOutput::Finished {
                 reason,
                 stop_reason,
@@ -1162,7 +1342,12 @@ impl Scheduler {
     }
 }
 
-/// Caches the prompt blocks.
+/// Publishes the request's full prompt blocks to the prefix cache, attributed
+/// to the worker endpoint `source` that holds their KV.
+///
+/// `prefix_cached` records a successful publish, including the no-op when
+/// prefix caching is disabled or the request does not write the cache, and
+/// later calls return early; a failed publish leaves it unset.
 fn cache_prompt_blocks(
     coordinator: &KvCacheCoordinator,
     state: &mut RequestState,

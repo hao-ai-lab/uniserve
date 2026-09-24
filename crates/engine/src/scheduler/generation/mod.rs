@@ -1,8 +1,21 @@
 //! Generation lifecycle state and worker-call planning.
 //!
 //! A request advances through context ingestion, understanding decode, image
-//! generation, optional feedback, and terminal publication. Every planned
-//! output is named by request epoch, producer call, point, and generation.
+//! generation, optional feedback, and terminal publication
+//! ([`GenerationPhase`]). [`RequestState`] holds the accepted progress of one
+//! admitted token request.
+//!
+//! Each `plan_*` builder returns one call whose identities are placeholders
+//! and whose `Bounds` come from `finish_plan`; `register_call` then stamps the
+//! request key and assigns product generations. Every planned output is named
+//! by request key (which includes the request epoch), producer call, output
+//! index, and generation.
+//!
+//! On completion, `validate_generation_result` checks a worker result against
+//! the submitted call and the request's limits, and
+//! `RequestState::process_generation_result` applies its accepted progress.
+//! Token semantics (stop conditions, image-branch triggers, public events)
+//! are resolved afterwards in `output`.
 
 use super::{EncoderCachePin, FlowPrefixState, Phase, RequestAllocations, TerminalIntent};
 use crate::kv::BlockTable;
@@ -20,10 +33,13 @@ use uniserve_worker_ipc::{
 
 use crate::scheduler::image_artifact::png_artifact_dims_b64;
 
-/// Builds an unstamped product reference for a planned call output. The
-/// owning `request_key` and `producer_call_id` are placeholder until
-/// [`register_call`] stamps the real identity. The shape
-/// bound is empty (it carries identity, not a device geometry).
+/// Builds an unstamped product reference for a planned call output.
+///
+/// The owning `request_key` and `producer_call_id` are placeholders until
+/// [`register_call`] stamps the real identity, and generation zero marks the
+/// product for a fresh generation there. The shape bound is empty: it carries
+/// identity, not a device geometry. `output_index` must be unique among the
+/// call's outputs, including `kv_output`; `Call::validate` rejects repeats.
 fn output_tensor(output_index: u16, dtype: DType) -> TensorRef {
     TensorRef {
         request_key: RequestKey::new(0, RequestId(0), 0),
@@ -42,7 +58,11 @@ fn bounded_tensor(output_index: u16, dtype: DType, shape_bound: ShapeBound) -> T
     product
 }
 
-/// Computes a bounded element count for a dynamic dimension.
+/// Converts a byte bound into a one-dimensional, device-sized element bound of
+/// `dtype`, rounding up.
+///
+/// Fails with `ProductBoundTooLarge` when the element count exceeds
+/// `u32::MAX` and with `MissingProductBound` when it is zero.
 fn dynamic_element_bound(bytes: u64, dtype: DType) -> Result<ShapeBound, PlanningError> {
     let elements = bytes.div_ceil(dtype.element_bytes());
     let max = u32::try_from(elements).map_err(|_| PlanningError::ProductBoundTooLarge { bytes })?;
@@ -54,7 +74,12 @@ fn dynamic_element_bound(bytes: u64, dtype: DType) -> Result<ShapeBound, Plannin
     })
 }
 
-/// Computes the encoded size bound for a PNG artifact.
+/// Computes the base64 length bound for a generated PNG artifact.
+///
+/// The raw size counts three bytes per pixel plus one byte per row. The bound
+/// doubles it, adds 1 MiB, and applies base64's expansion of three bytes to
+/// four characters. It reaches the worker as part of `max_completion_bytes`,
+/// and `validate_generation_result` rejects a larger artifact.
 fn png_base64_bound(width: u32, height: u32) -> Result<u64, PlanningError> {
     let raw = u64::from(height)
         .checked_mul(u64::from(width).saturating_mul(3).saturating_add(1))
@@ -66,9 +91,20 @@ fn png_base64_bound(width: u32, height: u32) -> Result<u64, PlanningError> {
     Ok(png.div_ceil(3).saturating_mul(4))
 }
 
+/// Serialized size of one ranked logprob entry (`TokenLogprob` in the IPC
+/// schema).
 const RANKED_LOGPROB_BYTES: u64 = 12;
 
 /// Computes the maximum serialized log-probability payload required by a request.
+///
+/// Returns `None` when neither generated nor prompt logprobs are requested.
+/// Each reported row costs 4 bytes plus `RANKED_LOGPROB_BYTES` per entry; a
+/// row's entries are its own token, the requested top-k candidates
+/// (`n_logprobs` or `n_prompt_logprobs`), and the distinct ids of
+/// `logprob_token_ids`. A call reports at most one generated row and
+/// `prompt_positions` prompt rows. The worker
+/// (`uniserve_worker.execution.commit`) costs its actual payload the same way
+/// and rejects one above `max_completion_bytes`.
 fn logprob_result_bytes(
     sampling: &SamplingParams,
     prompt_positions: u32,
@@ -119,20 +155,38 @@ fn logprob_result_bytes(
 }
 
 /// Lifecycle phase for a canonical generation request.
+///
+/// `RequestState::phase` records the accepted phase. Scheduling projects the
+/// phase of the next call from it and the calls still in flight
+/// (`Scheduler::next_generation_phase`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GenerationPhase {
     /// Encode staged input images before continuing text prefill.
     Encode,
+    /// Write the current input image's encoder feature into KV.
     IngestState,
+    /// Prefill prompt tokens.
     Prefill,
+    /// Decode understanding (text) tokens.
     DecodeUnd,
+    /// Write the pending token (`RequestState::next_token`) into KV without
+    /// sampling, before an image branch publishes the KV.
     CloseKv,
+    /// Publish the visible KV range as diffusion conditioning.
     PublishKv,
+    /// Prepare the initial latent of the image.
     PrepareGen,
+    /// Run the image's denoising steps.
     DenoiseGen,
+    /// Decode the final latent into the image. Never stored in
+    /// `RequestState::phase`: `Scheduler::next_generation_phase` projects it
+    /// once every denoising step is scheduled, while the accepted phase stays
+    /// `DenoiseGen`.
     CommitGen,
+    /// Encode the generated image with the next feedback encoder.
     FeedbackEncode,
+    /// Write the feedback encoder's feature into KV.
     FeedbackState,
 }
 
@@ -144,6 +198,9 @@ pub(super) fn consumes_image_features(call: &Call) -> bool {
 
 /// Feedback encoders and KV writes produce a predicate for their device successor.
 /// Input-image encoding has no such successor until its host result is accepted.
+///
+/// `plan_encode` and `plan_image_extend` declare `completion_output` only for
+/// feedback, which is what separates the feedback variants here.
 pub(super) fn is_feedback_computation(call: &Call) -> bool {
     (matches!(
         call.code,
@@ -162,6 +219,20 @@ pub(super) fn is_prompt_extend(call: &Call) -> bool {
 impl RequestState {
     /// Applies one validated computation in request order. Pending identities are
     /// consumed once before this update; inactive successors never reach it.
+    ///
+    /// Updates the request's cursors, KV extents, encoder indices, denoising
+    /// progress, and phase for the call kind. The completion loop in
+    /// `execution` calls this, after removing the call from the in-flight
+    /// queue, only for a `CallStatus::Ok` result that
+    /// `validate_generation_result` accepted, on a request of the call's epoch
+    /// whose chain is not invalidated and that has no terminal intent or
+    /// deferred finish. Phase changes that depend on token values (entering
+    /// `CloseKv`, ending a text round) belong to `output`.
+    ///
+    /// Returns an error, before changing any state, for a call id with batch
+    /// zero, a latent call without a latent product, or a denoising result
+    /// that has no submitted interval or that `Denoising::accept` rejects. The
+    /// caller then finishes the request with an error.
     pub(crate) fn process_generation_result(
         &mut self,
         call: &Call,
@@ -174,11 +245,13 @@ impl RequestState {
         if record.status == CallStatus::Predicated {
             return Ok(());
         }
+
         if matches!(call.code, CallKind::Forward(_)) {
             // A forward reports the extent it initialized, which a verifier
             // leaves above the prefix it accepted.
             self.kv_computed_len = record.kv_computed_len;
         }
+
         match call.code {
             CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => {
                 let count = call.input_token_ids.len().min(u32::MAX as usize) as u32;
@@ -188,6 +261,9 @@ impl RequestState {
                 self.kv_visible_len = self.kv_visible_len.saturating_add(count);
             }
             CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
+                // The worker reports the KV extent the feature write reached.
+                // Logical positions advance by the image's position count once,
+                // after its last encoder.
                 self.kv_visible_len = record.kv_visible_len;
                 if is_feedback_computation(call) {
                     self.feedback_encoder_index = self.feedback_encoder_index.saturating_add(1);
@@ -221,12 +297,16 @@ impl RequestState {
                     }
                 }
             }
+            // A prefill that neither extends the prompt nor reads a feature is
+            // the `CloseKv` write, after which the KV is published.
             CallKind::Forward(ForwardMode::Prefill) => {
                 self.kv_visible_len = record.kv_visible_len;
                 self.phase = GenerationPhase::PublishKv;
                 self.replayable = false;
             }
             CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
+                // A result that commits no token still consumes one position;
+                // `output` resolves it as the primary EOS.
                 let count = record.committed_tokens.len().max(1).min(u32::MAX as usize) as u32;
                 self.logical_position = self.logical_position.saturating_add(count);
                 self.kv_visible_len = self.kv_visible_len.saturating_add(count);
@@ -299,9 +379,9 @@ fn encoder_output(
     ))
 }
 
-/// Builds one immutable image-latent generation. The output remains addressed by its
-/// exact call identity and logical generation until the scheduler releases
-/// it after all registered readers have fenced.
+/// Builds one immutable image-latent generation. The output remains addressed
+/// by its exact call identity and logical generation until the scheduler frees
+/// it; a denoising or image-decoding completion frees the latent it consumed.
 fn latent_output(output_index: u16, bytes: u64, dtype: DType) -> Result<TensorRef, PlanningError> {
     Ok(bounded_tensor(
         output_index,
@@ -311,6 +391,10 @@ fn latent_output(output_index: u16, bytes: u64, dtype: DType) -> Result<TensorRe
 }
 
 /// Builds the actual computation before assigning storage and execution identities.
+///
+/// Every optional input and output is unset, the call id and the request
+/// key's engine id and epoch are zero placeholders, and the bound is one
+/// token; the `plan_*` builders fill in the rest.
 fn computation(request: &GenerationRequest, code: CallKind) -> Call {
     Call {
         consumer_slots: Vec::new(),
@@ -347,7 +431,10 @@ fn computation(request: &GenerationRequest, code: CallKind) -> Call {
     }
 }
 
-/// Plans a prompt slice using its physical KV prefix and logical sampling end.
+/// Plans a prefill of prompt tokens `start..end` with a sampled-token output.
+///
+/// The RNG coordinate is `end`, the exclusive prompt end. Fails with
+/// `InvalidPromptRange` for an empty range or one past the prompt.
 pub(super) fn plan_prompt(
     request: &GenerationRequest,
     start: u32,
@@ -375,6 +462,9 @@ pub(super) fn plan_prompt(
         semantic_index_base: u64::from(end),
         draw_layout: DrawLayout::TargetSampling,
     });
+    // Prompt position zero reports no logprob, so a chunk starting there
+    // covers one position fewer; `validate_generation_result` recovers the
+    // same offset from the call's RNG coordinate.
     let prompt_positions = if request.sampling.prompt_logprobs_requested() {
         end.saturating_sub(start)
             .saturating_sub(u32::from(start == 0))
@@ -385,6 +475,11 @@ pub(super) fn plan_prompt(
 }
 
 /// Plans a sampled continuation; relay inputs leave host token values empty.
+///
+/// With `spec_token_ids` drafts the call is a verify that carries the drafts
+/// as its input tokens and may commit up to one token more than their count.
+/// Otherwise it is a decode whose input is `input_token`, or nothing when
+/// `relay_input` continues from the predecessor's device-resident token.
 pub(super) fn plan_decode(
     request: &GenerationRequest,
     logical_position: u32,
@@ -421,6 +516,11 @@ pub(super) fn plan_decode(
 }
 
 /// Plans a feature write, retaining an exact token count only when the encoder supplies one.
+///
+/// The call is a prefill that reads `feature` and may write up to the
+/// encoder's `kv_token_capacity` KV tokens. `feedback` declares the completion
+/// predicate that feedback writes report. `sample_continuation` declares a
+/// sampled-token output, drawn at `sampling_index` when one is given.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan_image_extend(
     limits: &uniserve_core::GenerationLimits,
@@ -458,6 +558,11 @@ pub(super) fn plan_image_extend(
 }
 
 /// Encodes host image bytes or an existing device image into a feature tensor.
+///
+/// A device `source` takes precedence over `image_base64`. Fails with
+/// `FeedbackDisabled` for a feedback encode on a request without image
+/// feedback or a feedback source, and with `MissingImageInput` for an
+/// input-image encode that has neither bytes nor a source.
 pub(super) fn plan_encode(
     limits: &uniserve_core::GenerationLimits,
     request: &GenerationRequest,
@@ -504,6 +609,10 @@ pub(super) fn plan_close_kv(
 }
 
 /// Declares the physically visible KV range as a transferable input to diffusion.
+///
+/// The transfer bound, `kv_bytes_per_token * physical_kv_len`, also makes the
+/// call hold one of the scheduler's transfer reservations. Fails with
+/// `MissingProductBound` when either factor is zero.
 pub(super) fn plan_kv_publish(
     kv_bytes_per_token: u64,
     request: &GenerationRequest,
@@ -517,6 +626,8 @@ pub(super) fn plan_kv_publish(
     call.bounds.max_transfer_bytes = kv_bytes_per_token
         .checked_mul(u64::from(physical_kv_len))
         .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
+    // Owner and producer are the placeholders from `computation`;
+    // `register_call` stamps them.
     call.kv_output = Some(BufferId {
         owner: call.request_key,
         producer_call_id: call.call_id,
@@ -595,6 +706,11 @@ pub(super) fn plan_diffusion_finalize(
 }
 
 /// Derives storage bounds directly from the computation's actual inputs and outputs.
+///
+/// `max_latent_bytes` is the largest encoder, latent, or image output.
+/// `max_completion_bytes` covers the logprob payload of a token-producing call
+/// plus, for image decoding, the base64 PNG. `max_kv_pages` starts at zero;
+/// `Scheduler::plan_computation` sets it for forward calls.
 fn finish_plan(
     request: &GenerationRequest,
     mut call: Call,
@@ -680,6 +796,12 @@ pub(crate) enum PlanningError {
 
 /// Assigns final identities to the selected computation and its allocated outputs.
 /// Identity exhaustion is checked before changing the shared generation counter.
+///
+/// The caller must already have set `call.call_id` to the call's batch and
+/// row. Every output with generation zero, `kv_output` first and then the
+/// tensor outputs in `Call::tensor_outputs` order, receives the next value of
+/// the engine-wide counter; generations are nonzero and fit in `u32`. On
+/// error nothing is changed, and the caller treats it as engine-fatal.
 pub(super) fn register_call(
     call: &mut Call,
     request_key: RequestKey,
@@ -726,6 +848,13 @@ pub(super) fn register_call(
 }
 
 /// Validates a result against submitted inputs and immutable request limits.
+///
+/// `image_kv` and `latent` are the inputs frozen when the call was submitted
+/// (`InflightInput::Generation`); `media` is the artifact payload delivered
+/// with the result. A predicated result is valid only when the call carried a
+/// predicate and the result reports no tokens and no products. Returns the
+/// first violation found; the caller finishes the request with an error on
+/// any `Err`.
 pub(crate) fn validate_generation_result(
     call: &Call,
     image_kv: Option<(u32, Option<u32>)>,
@@ -735,6 +864,8 @@ pub(crate) fn validate_generation_result(
     media: Option<&uniserve_core::SharedMedia>,
 ) -> Result<(), GenerationResultError> {
     let request = &state.req;
+
+    // Identity and status.
     if record.request_key != call.request_key {
         return Err(GenerationResultError::Identity {
             detail: "request_mismatch",
@@ -756,12 +887,15 @@ pub(crate) fn validate_generation_result(
         }
         return Ok(());
     }
+
     let call_variant = call.code;
     if record.status != CallStatus::Ok {
         return Err(GenerationResultError::Status {
             detail: "call_failed",
         });
     }
+
+    // Denoising must end exactly at the end of its submitted interval.
     if call.code == CallKind::Media(MediaCall::Denoising) {
         let interval = latent.ok_or(GenerationResultError::Progress {
             detail: "denoise_input_step_missing",
@@ -772,6 +906,9 @@ pub(crate) fn validate_generation_result(
             });
         }
     }
+
+    // The worker reports one generation per tensor output, in
+    // `Call::tensor_outputs` order.
     if !record
         .product_generations
         .iter()
@@ -782,8 +919,9 @@ pub(crate) fn validate_generation_result(
             detail: "tensor_generation_mismatch",
         });
     }
-    // Read the PNG header to check the requested dimensions. Full image
-    // decoding belongs to the image consumer, outside result processing.
+
+    // Read the PNG header to check the requested dimensions. The output path
+    // (`image_done_event`) decodes the full image later.
     let image_png = media.and_then(|value| std::str::from_utf8(value.as_bytes()).ok());
     if call_variant == CallKind::Media(MediaCall::ImageDecoding) {
         if media.is_some_and(|value| value.len() as u64 > call.bounds.max_completion_bytes) {
@@ -803,6 +941,10 @@ pub(crate) fn validate_generation_result(
             });
         }
     }
+
+    // A feature write must reach exactly `start + tokens` when the encoder
+    // declared an exact token count, and otherwise stay within the call's
+    // token capacity above `start`.
     if consumes_image_features(call) {
         let (start, num_kv_tokens) = image_kv.ok_or(GenerationResultError::Progress {
             detail: "image_kv_input_missing",
@@ -817,6 +959,8 @@ pub(crate) fn validate_generation_result(
             });
         }
     }
+
+    // Sampled tokens: presence, verified-draft prefix, count, and allowed set.
     let sampled_tokens = record.committed_tokens.as_slice();
     let produces_token = call.token_output.is_some();
     let allowed_tokens = call
@@ -834,6 +978,9 @@ pub(crate) fn validate_generation_result(
             detail: "missing_sampled_token",
         });
     }
+    // A verify commits its accepted drafts plus the target's own token, except
+    // that a finish token among the drafts ends the commit there without an
+    // extra token.
     if call_variant == CallKind::Forward(ForwardMode::Verify) {
         let drafts = call.input_token_ids.as_slice();
         let listed = record.committed_tokens.as_slice();
@@ -876,6 +1023,11 @@ pub(crate) fn validate_generation_result(
             detail: "sampled_token_outside_allowed_set",
         });
     }
+
+    // Generated logprobs are expected exactly when a forward call samples a
+    // token and the request asked for them; the first candidate must be the
+    // last committed token, and candidates need nonzero ranks, finite values,
+    // and distinct ids.
     let sampled_token = sampled_tokens.last().copied();
     let generated_candidates = record.top_logprobs.as_slice();
     match (
@@ -919,8 +1071,12 @@ pub(crate) fn validate_generation_result(
         }
         (false, _, true) | (true, None, true) => {}
     }
-    // Prefill's sampling coordinate is its exclusive prompt-token end, so
-    // the first input can be identified even while a cancelled request drains.
+
+    // Prompt logprobs cover every input token of a prompt-extending prefill
+    // except prompt position zero. A prefill's RNG coordinate is its exclusive
+    // prompt end (`plan_prompt`), so a coordinate equal to the input length
+    // marks the chunk starting at position zero; this reads only the call,
+    // not request progress, which cancellation may have stopped.
     let prompt_tokens = (is_prompt_extend(call) && request.sampling.prompt_logprobs_requested())
         .then(|| {
             &call.input_token_ids[usize::from(
@@ -996,10 +1152,17 @@ pub(crate) enum GenerationResultError {
 /// Engine-owned state for one admitted request.
 pub(crate) struct RequestState {
     pub req: GenerationRequest,
+    /// Sorted device finish tokens (see `finish_token_ids` in the scheduler
+    /// module).
     pub(crate) finish_token_ids: Vec<u32>,
-    /// The cached sequence mappings. Each table owns its physical page
+    /// Storage the request holds, installed at admission: its request-pool
+    /// slot and per-group KV block tables, plus the latent pages and buffer
+    /// spans its calls reserve later. Each table owns its physical page
     /// references and therefore has exactly the request's lifetime.
     pub(super) allocations: Option<RequestAllocations>,
+    /// Negative-prompt KV prefix for multi-branch guidance, allocated for the
+    /// first denoising call and freed once every denoising step completes or
+    /// the request finishes.
     pub(super) flow_prefix: Option<FlowPrefixState>,
     /// Admission generation used to reject results from prior request lifetimes.
     pub(crate) request_epoch: u64,
@@ -1012,32 +1175,51 @@ pub(crate) struct RequestState {
     /// the last host-observed execution result.
     pub(crate) speculative_chain_invalidated: bool,
     pub(super) output: super::output::RequestOutput,
-    /// Current accepted computation stage; scheduling does not advance it.
+    /// Current accepted computation stage. Completion processing and output
+    /// resolution advance it; scheduling changes it only on an encoder-cache
+    /// hit, which moves the request to `IngestState` without a call.
     pub(super) phase: Phase,
     /// Prompt token range already accepted by the worker.
     pub(super) num_computed_prompt_tokens: u32,
+    /// Context images whose every encoder feature has been written into KV.
     pub(super) num_ingested_images: usize,
+    /// Next encoder of the current context image.
     pub(super) image_encoder_index: usize,
+    /// Encoder feature of the current context image awaiting its KV write.
     pub(super) input_image_features: Option<TensorRef>,
+    /// A single committed round-close token was deferred: it is the next
+    /// decode's input, and that decode's completion decides the round.
     pub(super) round_closing: bool,
-    /// Model position and accepted physical KV length differ for image inputs.
+    /// Model position of the accepted sequence. Tokens advance it by one and
+    /// an image by its position count, so it differs from `kv_visible_len`
+    /// when image inputs are present.
     pub(super) logical_position: u32,
+    /// Accepted KV length visible to attention, in tokens.
     pub(super) kv_visible_len: u32,
     /// Accepted tokens whose KV is initialized. A verifier initializes its
     /// rejected drafts, so this exceeds the visible extent until the next
     /// forward makes exactly what it initializes visible.
     pub(super) kv_computed_len: u32,
+    /// Committed token the next decode or `CloseKv` write continues from.
     pub(super) next_token: u32,
     pub(super) num_generated_tokens: usize,
+    /// Current image branch; `Scheduler::begin_image` increments it, so the
+    /// first image is 1.
     pub(super) image_id: u32,
     pub(super) num_generated_images: usize,
+    /// Set when an image branch opens and cleared once
+    /// `Scheduler::promote_gen_branch_reservation` confirms its KV capacity.
     pub(super) image_reservation_pending: bool,
     /// Solver progress of the current image's latent trajectory.
     pub(super) denoising: super::Denoising,
     /// Exact generations retained for conditioning, denoising, and feedback.
     pub(super) image_conditioning: Option<uniserve_worker_ipc::BufferId>,
+    /// Next feedback encoder of the generated image.
     pub(super) feedback_encoder_index: usize,
+    /// Device image product of the last image decode, when feedback reads
+    /// the device product.
     pub(super) feedback_source: Option<TensorRef>,
+    /// Feedback encoder feature awaiting its KV write.
     pub(super) feedback_features: Option<TensorRef>,
     /// Whether the current epoch is registered with its execution workers.
     pub(super) worker_registered: bool,
@@ -1045,9 +1227,14 @@ pub(crate) struct RequestState {
     pub(super) num_kv_blocks_sent: usize,
     /// Whether admission reserves the complete multimodal KV requirement.
     pub(super) reserve_worstcase: bool,
+    /// Worst-case KV block count computed at submission; reserved only when
+    /// `reserve_worstcase` is set.
     pub(super) max_reserved_kv_blocks: usize,
     /// Per-group prefix hashes retained for publishing reusable input blocks.
     pub(super) prefix_block_hashes: Vec<Vec<u64>>,
+    /// Whether prompt-block publication to the prefix cache has succeeded,
+    /// including as a no-op when prefix caching is disabled or the request
+    /// does not write the cache.
     pub(super) prefix_cached: bool,
     /// Accepted text and control tokens used by penalties and trigger matching.
     pub(super) generated_token_ids: Vec<u32>,
@@ -1058,8 +1245,14 @@ pub(crate) struct RequestState {
     pub(super) feedback_image_b64: Option<String>,
     /// False after a completed computation creates state unavailable from the input.
     pub(super) replayable: bool,
+    /// Encoder-cache entries this request holds; released when the request
+    /// finishes.
     pub(super) encoder_cache_pins: Vec<EncoderCachePin>,
+    /// Request-local encoder outputs and feedback sources outside the encoder
+    /// cache, freed by `Scheduler::free_transient_products` or when the
+    /// request finishes.
     pub(super) transient_encoder_products: Vec<TensorRef>,
+    /// Unix time, in seconds, at which the request state was created.
     pub queued_at: f64,
     pub(crate) terminal_intent: TerminalIntent,
 }

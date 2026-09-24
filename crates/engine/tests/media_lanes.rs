@@ -33,7 +33,8 @@ const PROMPT: [u32; 3] = [11, 12, 13];
 /// Declares one loaded component with the outputs it produces.
 ///
 /// A distributed component reconstructs one media unit per rank per round
-/// and keeps the local parallel degree a temporal-unit distribution requires.
+/// (`units_per_rank` of one) and keeps the default parallel config, whose
+/// world size of one is what a temporal-unit distribution requires.
 fn component(
     name: &str,
     ranks: Vec<usize>,
@@ -95,6 +96,8 @@ fn media_units(name: &str, units: u32) -> OutputInfo {
 /// muxer encodes audio and assembles the artifact.
 fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
     let mut sim = SimEngine::new();
+    // A deep executor queue keeps queue capacity from bounding which calls
+    // are in flight together, leaving that to the lane rules under test.
     sim.set_queue_depth(64);
     sim.set_results_on_wait(true);
 
@@ -104,8 +107,8 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
         .map(|call| CallKind::Media(*call))
         .collect();
     info.num_inference_steps = STEPS;
-    // The denoiser's latent pool gives every request slot two pages of
-    // samples after its sentinel page.
+    // The denoiser's latent pool holds the reserved sentinel page plus two
+    // pages of samples per request slot.
     info.latent_page_units = 256;
     info.latent_pages = 2 * info.request_slots + 1;
     info.world_size = decoder_ranks as u32;
@@ -172,7 +175,8 @@ fn video_request(id: u64, video_units: u32) -> Request {
 struct ObservedCall {
     request: RequestId,
     call: MediaCall,
-    /// Media units the call covers: its decode range, or one without one.
+    /// Media units the call covers: its decode range's `max_units`, or one
+    /// when the call carries no decode range.
     units: u32,
 }
 
@@ -267,6 +271,10 @@ impl Served {
     }
 }
 
+/// A consumer that reads nothing until the request has already finished still
+/// receives the artifact followed by the completed terminal event. Events that
+/// do not fit the stream's bounded channel wait in the scheduler's per-request
+/// output journal until the consumer drains the channel.
 #[test]
 fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
     let mut executor = SimExecutor::new(video_worker(1, 1));
@@ -288,8 +296,12 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
         }))
         .unwrap();
     let engine = thread::spawn(move || scheduler.run(commands));
+
     // Let the entire workload finish while the caller retains an unread stream.
-    // The public executor boundary distinguishes completion from a stalled lane.
+    // `Scheduler::finish_media` enqueues the terminal event on the request's
+    // output before it queues the request's `Finish` lifecycle command, so a
+    // submitted `Finish` at the executor boundary shows the request has ended.
+    // A stalled lane instead exhausts the deadline and fails `recv_timeout`.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let event = boundary
@@ -304,6 +316,10 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
             break;
         }
     }
+
+    // Only now drain the stream, until its terminal event. The engine keeps
+    // running meanwhile, so it can flush journaled events into the channel as
+    // reads free room.
     let mut events = Vec::new();
     while Instant::now() < deadline {
         if let Ok(event) = stream.try_recv() {
@@ -317,7 +333,10 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
         }
     }
     handle.shutdown();
+    // `Scheduler::run` returns `true` only when the engine died rather than
+    // shut down.
     assert!(!engine.join().unwrap());
+
     Served {
         submissions: Vec::new(),
         outcomes: HashMap::from([(RequestId(90), events)]),
@@ -404,6 +423,9 @@ fn serve_bounded(sim: SimEngine, requests: Vec<Request>, max_num_waiting: Option
     );
 
     // The executor is gone with the scheduler, so the record is complete.
+    // Replaying it attaches to each media submission the calls of earlier
+    // media submissions not yet resolved when it was accepted; batches without
+    // media calls are left out of the record.
     let mut in_flight: Vec<(u64, Vec<ObservedCall>)> = Vec::new();
     let mut submissions = Vec::new();
     for event in boundary.iter() {
@@ -554,7 +576,9 @@ fn a_host_lane_admits_no_more_tasks_than_its_rank_advertises() {
         served.assert_completed(request);
 
         // Every host task of this worker lands on rank 0's host lane, whose
-        // occupancy never exceeds the advertised capacity.
+        // occupancy never exceeds the advertised capacity. With one rank and
+        // one media unit, each host call places exactly one task, so counting
+        // calls counts the lane's tasks.
         let mut peak = 0;
         for submission in &served.submissions {
             let submitted = submission

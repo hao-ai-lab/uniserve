@@ -1,4 +1,16 @@
 //! WorkerGroup process configuration, IPC execution, rank aggregation, and recovery.
+//!
+//! The engine drives GPU and host work through Python worker processes. A
+//! `WorkerGroup` (in `instance`) is one worker's cooperating ranks: it projects
+//! each submitted `Batch` onto the ranks whose components own its calls, joins
+//! their agreeing results into `WorkerResult`s, and replaces the whole group
+//! when a rank is lost. `WorkerExecutor` (in `executor`) submits explicitly
+//! targeted work to the groups of a deployment. `process` owns one rank's
+//! process and IPC channel, `registration` the addresses ranks rendezvous and
+//! report their endpoints at, `launcher` the per-host launchers that start
+//! ranks placed on other hosts, `checkpoint` the checkpoint identity every
+//! rank is checked against, and `death_watch` the Linux watcher that fires a
+//! rank channel's death wake when a rank process this engine spawned exits.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod checkpoint;
@@ -18,6 +30,9 @@ use process::{PendingRank, RankProcess};
 #[derive(Debug, thiserror::Error)]
 pub enum BatchSubmitError {
     /// Returns the unaccepted physical submission when the instance has no capacity.
+    ///
+    /// The batch is handed back unchanged so the caller can resubmit it
+    /// later; nothing was recorded or sent for it.
     #[error("worker run queue is full")]
     WouldBlock(Box<uniserve_worker_ipc::Batch>),
     /// Reports a terminal transport or execution failure.
@@ -35,9 +50,9 @@ pub struct WorkerProcessArgs {
     /// Model identifier or local model path.
     pub model: String,
     /// Identity of the checkpoint at `model`, derived by the head when the
-    /// model is a local directory and left unset otherwise. Every rank
-    /// verifies the checkpoint it loads against it and reports what it
-    /// loaded; a launch fills it once before any rank starts.
+    /// model is a local directory of a non-stub launch and left unset
+    /// otherwise. Every rank verifies the checkpoint it loads against it and
+    /// reports what it loaded; a launch fills it once before any rank starts.
     pub checkpoint_identity: Option<String>,
     /// Ordered physical members of this WorkerGroup instance.
     pub ranks: Vec<crate::WorkerRank>,
@@ -62,7 +77,7 @@ pub struct WorkerProcessArgs {
     /// rather than a constant.
     pub launcher_timeout: std::time::Duration,
     /// Launch the worker without model weights, using its deterministic test
-    /// model. Only the engine's own IPC and process tests set this; the serving
+    /// model. Only the engine's own tests and examples set this; the serving
     /// command line cannot request it.
     pub stub: bool,
     /// Maximum number of physical runs concurrently in flight per rank.
@@ -106,7 +121,7 @@ pub struct WorkerProcessArgs {
     pub mesh: Option<String>,
     /// Optional process-world communication backend.
     pub distributed_backend: Option<String>,
-    /// configuration-static execution lane descriptors.
+    /// Configuration-static execution lane descriptors.
     pub lanes: Vec<LaneConfig>,
     /// Module graph coverage policy: off, auto, or full.
     pub graph_policy: String,
@@ -143,6 +158,13 @@ pub struct WorkerProcessArgs {
 }
 
 /// Parks until one descriptor becomes readable or `timeout` expires.
+///
+/// Returning `Ok` does not say which happened or which descriptor fired;
+/// callers re-poll their channels afterwards. An empty `fds` is a bounded
+/// sleep: nothing in the engine unparks the waiting thread. Wake events are
+/// the ones each `pollfd` requests, plus the error and hangup conditions poll
+/// always reports. Fails on a poll error other than an interrupt, and on
+/// every call with descriptors on targets other than Linux.
 pub(crate) fn park_descriptors(
     fds: &[libc::pollfd],
     timeout: std::time::Duration,
@@ -154,6 +176,9 @@ pub(crate) fn park_descriptors(
     #[cfg(target_os = "linux")]
     {
         let mut pollfds = fds.to_vec();
+        // The millisecond timeout rounds a sub-millisecond remainder up, so a
+        // nonzero wait never becomes a zero-timeout poll that spins, and is
+        // capped at the largest value poll accepts.
         let timeout_ms = timeout
             .as_millis()
             .saturating_add(u128::from(
@@ -173,6 +198,8 @@ pub(crate) fn park_descriptors(
             if result >= 0 {
                 return Ok(());
             }
+            // An interrupted poll retries with the full timeout rather than
+            // the remainder, so a signal can extend the wait.
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::Interrupted {
                 return Err(error.into());

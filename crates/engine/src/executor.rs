@@ -2,7 +2,18 @@
 //!
 //! The scheduler submits logical calls through [`Executor`]. Physical
 //! executors lower those calls into worker protocol batches while retaining
-//! the request and product identities needed to correlate completions.
+//! the request and product identities needed to correlate completions. The
+//! implementations are `WorkerExecutor` (`crate::worker::executor`), which
+//! drives worker processes, and `SimExecutor` (`crate::sim`).
+//!
+//! Besides the trait, this module owns the values that cross that boundary:
+//! [`ExecutorInfo`], which merges the pools' reported capabilities into the
+//! single capacity view the scheduler plans against; the result types a poll
+//! returns; and [`TransferConfig`], the directed transfer edges between worker
+//! ranks and the placement they resolve against, from which the head derives
+//! each rank's launch descriptor fields (transfer mechanisms, acknowledgment
+//! slot, same-host slots, and whether products cross hosts) and the consumer
+//! slots stated on each producing call.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub use uniserve_core::{ComponentConfig, ComponentDistribution, ParallelConfig, SequenceParallel};
@@ -32,6 +43,10 @@ pub struct ExecutorInfo {
     /// For each worker that decodes video, the encoder replicas whose rank
     /// dealing keeps every media unit on the host that decoded it. A decoder
     /// absent from the map places no host constraint on its encoder.
+    ///
+    /// `WorkerExecutor::try_new` fills this from the placement; `single` and
+    /// `from_workers` leave it empty. Scheduler admission restricts a video
+    /// encoding call's candidates to the set of the worker chosen to decode.
     pub video_encoders: BTreeMap<WorkerId, BTreeSet<WorkerId>>,
 }
 
@@ -45,6 +60,11 @@ impl ExecutorInfo {
     }
 
     /// Validates and constructs capability information for multiple pools.
+    ///
+    /// Fails when `pools` is empty, repeats a pool id, contains a record that
+    /// fails `WorkerInfo::validate`, mixes models or checkpoint identities, or
+    /// holds replicas of one component that expose different numerical
+    /// outputs.
     pub fn from_workers(pools: Vec<(WorkerId, WorkerInfo)>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !pools.is_empty(),
@@ -86,6 +106,8 @@ impl ExecutorInfo {
     /// component, which several workers may replicate, and a deployment that
     /// muxes serves the whole video graph between its workers.
     pub fn media_routing(&self) -> anyhow::Result<BTreeMap<MediaCall, String>> {
+        // The first worker seen serving a call is kept only to name it if
+        // another worker routes that call to a different component.
         let mut routing: BTreeMap<MediaCall, (String, &WorkerId)> = BTreeMap::new();
         for (id, info) in &self.workers {
             for (call, component) in &info.media_components {
@@ -135,6 +157,28 @@ impl ExecutorInfo {
     /// Derives the runtime's immutable capacity view from concrete pools.
     /// The returned value is not part of executor identity and is never
     /// reported as a physical worker.
+    ///
+    /// A single pool's record is returned unchanged. With several pools, the
+    /// record is cloned from the first pool that serves a KV forward call (or
+    /// the first pool when none does), so fields the merge does not set, such
+    /// as the model identity and endpoint, come from that pool. Call support and
+    /// media routing are unions, queue depth is a sum, and most batch, slot,
+    /// and storage limits take the smallest nonzero value any pool reports.
+    /// The exceptions are the KV cache, whose layout the KV pools must share
+    /// and whose block count is their smallest and per-token footprint their
+    /// largest; request slots of a deployment that muxes video,
+    /// the narrowest per-component sum of replica slots; and the diffusion
+    /// step count and latent page geometry, taken from the first denoising
+    /// pool and zero without one.
+    ///
+    /// # Errors
+    ///
+    /// Fails when there are no pools. With several pools, it also fails when
+    /// media routing conflicts or is incomplete, when a deployment that muxes
+    /// video reports no diffusion step count, when denoising pools disagree on the
+    /// step count, when KV pools disagree on cache layout or a routed KV pool
+    /// has no cache, when summed capacities overflow `u32`, or when the merged
+    /// record fails `WorkerInfo::validate`.
     pub fn runtime_info(&self) -> anyhow::Result<WorkerInfo> {
         anyhow::ensure!(
             !self.workers.is_empty(),
@@ -145,7 +189,10 @@ impl ExecutorInfo {
         }
 
         // Route-specific capacities contribute only when a pool implements the
-        // corresponding call family.
+        // corresponding call family. `routed` picks the first such pool, and
+        // `kv_indices` holds the index of the first pool serving each KV
+        // forward mode (prefill, decode, verify), deduplicated and in pool
+        // order.
         let routed = |variant: CallKind| {
             self.workers
                 .iter()
@@ -167,6 +214,7 @@ impl ExecutorInfo {
         kv_indices.sort_unstable();
         kv_indices.dedup();
 
+        // Fields not merged below keep the seed pool's values.
         let seed_index = kv_indices.first().copied().unwrap_or(0);
         let mut merged = self.workers[seed_index].1.clone();
         merged.media_components = self.media_routing()?;
@@ -189,7 +237,8 @@ impl ExecutorInfo {
             "workers disagree on diffusion steps"
         );
         // Every KV stage must agree on layout. Capacity is the narrowest pool
-        // because a request may traverse all routed KV stages.
+        // because a request may traverse all routed KV stages, and the
+        // per-token footprint is the largest any of them reports.
         if let Some(first_index) = kv_indices.first().copied() {
             let first = &self.workers[first_index].1;
             let first_kv = first
@@ -233,7 +282,10 @@ impl ExecutorInfo {
             merged.kv_cache = None;
         }
 
-        // Aggregate global limits conservatively across all physical pools.
+        // A call is supported when any pool serves it. Each pool contributes
+        // its own queue depth, counted as at least one. Unless noted at the
+        // field, the remaining limits take the smallest nonzero value, and are
+        // zero only when every pool reports zero.
         merged.supported_calls = CallKind::ALL
             .into_iter()
             .filter(|variant| routed(*variant).is_some())
@@ -261,7 +313,9 @@ impl ExecutorInfo {
         merged.request_slots = if merged.media_components.contains_key(&MediaCall::Muxing) {
             // A replicated media route owns an independent request-row bank in
             // every WorkerGroup. End-to-end concurrency is the narrowest sum
-            // of replica capacities among the graph's components.
+            // of replica capacities among the graph's components. Each
+            // component is keyed to the first call it serves; its replicas are
+            // the pools that support that call and bind the component.
             let mut components = BTreeMap::new();
             for (call, component) in &merged.media_components {
                 components.entry(component.as_str()).or_insert(*call);
@@ -301,6 +355,7 @@ impl ExecutorInfo {
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
+        // Latent page geometry is the denoising pool's, zero without one.
         let flow = routed(CallKind::Media(MediaCall::Denoising));
         merged.latent_page_units = flow.map_or(0, |info| info.latent_page_units);
         merged.latent_pages = flow.map_or(0, |info| info.latent_pages);
@@ -325,6 +380,7 @@ impl ExecutorInfo {
             .filter(|capacity| *capacity > 0)
             .min()
             .unwrap_or(0);
+
         merged.validate()?;
         Ok(merged)
     }
@@ -348,13 +404,18 @@ pub struct WorkerResult {
     pub results: Vec<CallResult>,
     /// Tensor publications remain owned by the executor's transfer consumers.
     pub products: Vec<TensorPublication>,
+    /// Worker-reported execution duration in microseconds, when reported.
     pub worker_exec_us: Option<u64>,
+    /// Model-forward statistics, when reported.
     pub forward_stats: Option<uniserve_worker_ipc::ForwardStats>,
 }
 
 impl WorkerResult {
     /// Claims all media before any fallible correlation or aggregation step.
     /// Acquisition failure belongs to the call; independent results remain usable.
+    ///
+    /// The returned value always sets `done`; `WorkerGroup::try_join`, which
+    /// joins rank reports, decides `done` for the joined result itself.
     pub(crate) fn receive(report: BatchOutput) -> Self {
         let results = report
             .completions
@@ -388,8 +449,14 @@ impl WorkerResult {
 /// Distinguishes applied control from physical retirement and unacknowledged failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandOutcome {
+    /// Every target pool acknowledged the command.
     Applied,
+    /// The targeted request was tainted by a worker failure, so the command
+    /// settles without an acknowledgment. The scheduler treats it as settled,
+    /// like `Applied`.
     Retired,
+    /// The command was not acknowledged and its physical ownership remains;
+    /// the scheduler queues a failed `Finish` or `Free` again.
     Failed,
 }
 
@@ -411,7 +478,7 @@ pub struct BatchResult {
     pub batch_id: u64,
     /// Call completions this join reports as ready.
     pub results: Vec<CallResult>,
-    /// Control commands acknowledged by all target pools.
+    /// Receipts for the batch's lifecycle commands; empty unless `done`.
     pub command_results: Vec<CommandResult>,
     /// Whether this join completes the batch.
     pub done: bool,
@@ -421,7 +488,15 @@ pub struct BatchResult {
     pub forward_stats: Vec<uniserve_worker_ipc::ForwardStats>,
 }
 
-/// Resolves and validates one logical completion against its submitted call.
+/// Converts one physical result into the scheduler-facing [`BatchResult`].
+///
+/// `done` comes from the caller, not from `report.done`. A terminal result
+/// carries one `Applied` receipt per lifecycle command in `commands`,
+/// numbered with `Start` admissions skipped, so `commands` may be given with
+/// or without them; callers that track other outcomes overwrite the receipts.
+/// A partial result carries no receipts. `report.products` is not carried
+/// into the result: publications stay with the executor, and
+/// `WorkerExecutor` records them before converting.
 pub(crate) fn logical_result(
     report: WorkerResult,
     done: bool,
@@ -479,6 +554,9 @@ pub struct WorkerId(pub String);
 
 impl WorkerId {
     /// Validates and constructs a stable pool identifier.
+    ///
+    /// An identifier is nonempty ASCII alphanumerics, `-`, and `_`. Only this
+    /// constructor checks that; the public field admits any string.
     pub fn new(value: impl Into<String>) -> anyhow::Result<Self> {
         let value = value.into();
         if value.is_empty()
@@ -589,7 +667,8 @@ impl TransferEdge {
     }
 }
 
-/// Per-edge local data-plane transfer selection (`--transfer`).
+/// Per-edge data-plane transfer selection (`--transfer`) and the placement it
+/// is resolved against.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferConfig {
     /// Explicit directed transfer edges.
@@ -610,17 +689,24 @@ pub struct TransferConfig {
 }
 
 impl TransferConfig {
-    /// Binds missing intra-Worker edges from the configured physical endpoints.
+    /// Records the placement's rank counts and hosts, and binds a default edge
+    /// for every ordered pair of ranks, within and across workers, that no
+    /// configured edge covers.
     ///
     /// Each rank is a separate process. Its self-edge uses local storage for
     /// both locations. Between two ranks, device products move over CUDA VMM
     /// where both hold a CUDA device, which reaches another host where both
     /// devices export a fabric handle; host products move over shared storage
     /// on one host and over the rank channel across hosts, because a
-    /// shared-storage segment is named in one host's namespace. Explicit bindings take
-    /// precedence. Initialized endpoint and backend capabilities are validated
-    /// before the executor accepts work, and an edge that would have to cross
-    /// hosts without fabric handles is refused by name.
+    /// shared-storage segment is named in one host's namespace. Explicit
+    /// bindings take precedence. `WorkerExecutor::try_new` validates each
+    /// edge against the initialized endpoints and backends before the
+    /// executor accepts work, and refuses by name an edge that would have to
+    /// cross hosts without fabric handles.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `WorkerConfig::validate_all` rejects `workers`.
     pub fn with_worker_defaults(mut self, workers: &[crate::WorkerConfig]) -> anyhow::Result<Self> {
         crate::WorkerConfig::validate_all(workers)?;
         for worker in workers {
@@ -688,6 +774,12 @@ impl TransferConfig {
 
     /// Resolve only mechanisms incident to one physical rank, with local access
     /// available for products that stay in its own address space.
+    ///
+    /// Returns `(transfer, publish)`: `transfer` is every mechanism on an edge
+    /// the rank produces or consumes on, plus `Local`; `publish` is the
+    /// mechanisms on edges the rank produces on, or only `Local` when it
+    /// produces on none. The launch descriptor carries them as
+    /// `transfer_backends` and `publish_backends`.
     pub fn rank_backends(
         &self,
         worker: &str,
@@ -719,16 +811,14 @@ impl TransferConfig {
         (backends, publications)
     }
 
-    /// Counts the ranks that read one rank's device products.
+    /// Returns the instance-wide acknowledgment slot of one rank.
     ///
-    /// A product's consumers are the destinations of the edges leaving its
-    /// producing rank, which is what component membership resolves to, and
-    /// they are fixed when the placement is. A producing rank cannot derive
-    /// this: it knows which component it belongs to, not which component reads
-    /// what it publishes, and a product is consumed in a later batch than the
-    /// one that produced it. So the head states it at launch.
-    ///
-    /// A rank omitted from an edge names every rank of that worker.
+    /// Each published chunk or segment carries one acknowledgment word per
+    /// instance rank. A consumer claims the word at its own slot when it
+    /// begins reading and acknowledges it once its reads are done, so the
+    /// producer can tell a consumer still reading from one that has finished
+    /// or never began. Slots are dense across the instance. A worker absent
+    /// from `worker_ranks` yields a slot past every placed worker's run.
     pub fn acknowledgment_slot(&self, worker: &str, rank: u32) -> u32 {
         // Workers are keyed in a BTreeMap, so their order is the same in every
         // process that derives a slot. Each worker owns a contiguous run of
@@ -772,15 +862,17 @@ impl TransferConfig {
 
     /// Whether any rank that reads this rank's products is on another host.
     ///
-    /// A product retires when every consumer has written its word in the
-    /// chunk's header, so the producer needs the consumers' identities and not
-    /// merely their number. A rank cannot derive either this or that: the
-    /// mapping lives in the transfer edges, which only the head holds.
+    /// The consumers are the destinations of the edges leaving this rank,
+    /// excluding the rank itself. The answer is `true` when this rank or any
+    /// consumer has no recorded host, because a shared host cannot then be
+    /// established. A rank cannot derive this itself: the mapping lives in the
+    /// transfer edges and the placement, which only the head holds.
+    ///
+    /// Readiness is a producer synchronize only where it has to be. Within a
+    /// host an interprocess event carries it at no cost to the producing
+    /// stream, and stalling the producer for a consumer that could have waited
+    /// on the device is a bubble the placement does not require.
     pub fn products_cross_hosts(&self, worker: &str, rank: u32) -> bool {
-        // Readiness is a producer synchronize only where it has to be. Within
-        // a host an interprocess event carries it at no cost to the producing
-        // stream, and stalling the producer for a consumer that could have
-        // waited on the device is a bubble the placement does not require.
         let host = |name: &str, rank: u32| -> Option<&String> {
             self.worker_hosts
                 .get(name)
@@ -816,7 +908,20 @@ impl TransferConfig {
         false
     }
 
-    /// Acknowledgment slots of the ranks that read this rank's device products.
+    /// Acknowledgment slots of the ranks that read this rank's products.
+    ///
+    /// A retired product's chunk or segment is released only once no named
+    /// consumer's word shows it still reading, so the producer needs the
+    /// consumers' identities and not merely their number. The consumers are the
+    /// destinations of the edges leaving this rank, fixed when the placement
+    /// is; an edge that omits the destination rank names every rank of that
+    /// worker. A producing rank cannot derive them: it knows which component
+    /// it belongs to, not which component reads what it publishes, and a
+    /// product is consumed in a later batch than the one that produced it.
+    /// `WorkerGroup::consumer_slots` uses this for calls outside the video
+    /// graph and states the slots on each producing call.
+    ///
+    /// The result is sorted and excludes this rank's own slot.
     pub fn product_consumers(&self, worker: &str, rank: u32) -> Vec<u32> {
         let mut slots = std::collections::BTreeSet::new();
         for edge in &self.edges {
@@ -851,6 +956,17 @@ impl TransferConfig {
     }
 
     /// Select explicitly bound locations for a rank before admitting device work.
+    ///
+    /// Each input tensor keeps only the published locations that reach
+    /// `destination`: a location survives when the first edge matching its
+    /// source and `destination` carries the mechanism it was published on, or,
+    /// with no matching edge, when it is a local location on `destination`
+    /// itself. `WorkerGroup` calls this for each rank's projected batch.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a tensor is left with no location. Filtering is not rolled
+    /// back: tensors examined up to that one keep their filtered locations.
     pub(crate) fn bind_inputs(
         &self,
         products: &mut [uniserve_worker_ipc::TensorPublication],
@@ -910,7 +1026,16 @@ impl TransferConfig {
     ///
     /// `mechanisms` names the edge's device mechanism, its host mechanism, or
     /// both joined by `+` with the device mechanism first, as in
-    /// `cuda_vmm+shm`. `local` serves both locations.
+    /// `cuda_vmm+shm`. `local` serves both locations. Entries are separated by
+    /// commas, and an omitted rank covers every rank of that worker.
+    ///
+    /// The result holds no placement: `with_worker_defaults` fills
+    /// `worker_ranks` and `worker_hosts` and binds the edges left unnamed.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a malformed entry, an invalid worker id or rank, an unknown
+    /// or conflicting mechanism, or an edge that overlaps an earlier one.
     pub fn parse(s: &str) -> Result<Self, TransferConfigError> {
         let mut edges = Vec::new();
 
@@ -945,6 +1070,8 @@ impl TransferConfig {
             let (dst, destination_rank) = endpoint(dst)?;
             let (device, host) = Self::parse_mechanisms(backend.trim())?;
 
+            // Two edges between the same workers overlap when their ranks
+            // can name one pair; an omitted rank overlaps every rank.
             if edges.iter().any(|existing: &TransferEdge| {
                 existing.source_worker == src
                     && existing.destination_worker == dst
@@ -1079,10 +1206,15 @@ pub struct WorkerFailure {
 }
 
 /// The asynchronous, pipelined boundary the scheduler drives.
+///
+/// One submitted batch may come back from `poll` as several
+/// [`BatchResult`]s: each carries completions not reported by an earlier one,
+/// and the last has `done` set and carries the lifecycle command receipts.
+/// A failure may instead surface as an error from `poll`.
 pub trait Executor: Send {
     /// Returns the executor's concrete pool capabilities.
     fn info(&self) -> &ExecutorInfo;
-    /// Whether the complete instance is ready to accept execution.
+    /// Whether `worker`'s complete instance is ready to accept execution.
     fn is_ready(&self, worker: &WorkerId) -> bool;
     /// Whether this instance has an unclaimed destination submission slot.
     fn has_capacity(&self, worker: &WorkerId) -> bool;
@@ -1158,6 +1290,8 @@ mod tests {
 
     #[test]
     fn replicated_media_routes_add_independent_request_capacity() -> anyhow::Result<()> {
+        // Each pool serves the whole video graph, so every component's
+        // replica capacity is the sum over both pools.
         let info = ExecutorInfo::from_workers(vec![
             media_replica("replica-0", 2),
             media_replica("replica-1", 3),

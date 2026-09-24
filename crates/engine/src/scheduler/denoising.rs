@@ -17,9 +17,14 @@ use uniserve_worker_ipc::{CallId, LatentParams, MediaCall, RequestKey, TensorRef
 pub(crate) struct LatentPlacement {
     /// Pages the request owns in its worker's latent pool.
     pub(crate) page_table: Vec<u32>,
-    /// Latent rows the trajectory occupies in those pages.
+    /// Latent units the trajectory occupies in those pages, in the
+    /// model-defined unit the worker sizes pages by (`latent_page_units`).
     pub(crate) latent_units: u32,
+    /// Raster height: the requested image height in pixels for image
+    /// generation, the extent `Scheduler::video_raster` reads from the video
+    /// decoder's declared output for video.
     pub(crate) height: u32,
+    /// Raster width, from the same source as `height`.
     pub(crate) width: u32,
 }
 
@@ -93,6 +98,8 @@ impl Denoising {
     /// Returns the next interval, as its start and step count, of at most
     /// `burst` steps once `scheduled` steps are submitted, or `None` when
     /// every step is.
+    ///
+    /// A `burst` of zero still yields one-step intervals.
     pub(crate) fn next(&self, scheduled: u32, burst: u32) -> Option<(u32, u32)> {
         let remaining = self.steps.saturating_sub(scheduled);
         (remaining > 0).then(|| (scheduled, burst.max(1).min(remaining)))
@@ -140,7 +147,8 @@ impl Denoising {
     /// Accepts a completed denoising call and its successor latent.
     ///
     /// Returns `false`, leaving progress unchanged, when the worker's accepted
-    /// step count is not the end of the call's interval.
+    /// step count is not the end of the call's interval or exceeds the
+    /// schedule. A `None` latent keeps the previously accepted product.
     pub(crate) fn accept(
         &mut self,
         interval: &LatentParams,

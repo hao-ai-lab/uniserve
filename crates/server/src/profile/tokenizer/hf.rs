@@ -12,9 +12,14 @@ use crate::profile::tokenizer::Result;
 use crate::profile::tokenizer::byte_level_decode::decode_byte_level as decode_tokens_byte_level;
 use crate::profile::tokenizer::incremental::IncrementalDecoder;
 
-/// Returns whether a tokenizer decoder is exclusively byte-level.
+/// Returns whether a tokenizer decoder consists of exactly one `ByteLevel`
+/// step, possibly nested inside `Sequence` steps.
+///
+/// The match is exhaustive over `fastokens::decoders::Decoder`, so a
+/// `fastokens` upgrade that adds decoder kinds fails to compile here until each
+/// new kind is classified for the byte-level fast path.
 fn is_byte_level_only(decoder: &FastokensDecoder) -> bool {
-    /// Returns the count byte level.
+    /// Counts `ByteLevel` steps across nested decoder sequences.
     fn count_byte_level(decoder: &FastokensDecoder) -> usize {
         match decoder {
             FastokensDecoder::ByteLevel(_) => 1,
@@ -23,7 +28,14 @@ fn is_byte_level_only(decoder: &FastokensDecoder) -> bool {
     }
     count_byte_level(decoder) == 1
 }
-/// Decodes tokens with the byte-level fast tokenizer path.
+
+/// Decodes token IDs by looking up each vocabulary piece and unescaping the
+/// pieces with `decode_byte_level`.
+///
+/// For known IDs the result matches `fastokens` decoding with the same
+/// byte-level decoder. Unlike `fastokens`, which silently drops IDs missing
+/// from the vocabulary, this path fails with a tokenizer error naming the
+/// unknown ID.
 fn decode_fastokens_byte_level(
     tokenizer: &FastokensTokenizer,
     token_ids: &[u32],
@@ -41,19 +53,29 @@ fn decode_fastokens_byte_level(
     Ok(decode_tokens_byte_level(tokens))
 }
 
-/// Load-bound tokenizer for the configured Hugging Face tokenizer.json format.
+/// Tokenizer loaded from a Hugging Face `tokenizer.json` file.
+///
+/// One instance is shared through `DynTokenizer` by every request of a
+/// resolved model; all methods take `&self`.
 pub struct HuggingFaceTokenizer {
     tokenizer: Box<FastokensTokenizer>,
+    /// Whether the decoder is a single `ByteLevel` step, which routes `decode`
+    /// through `decode_fastokens_byte_level`.
     byte_level: bool,
+    /// IDs of added tokens flagged `special`, sorted and deduplicated for the
+    /// binary search in `is_special_id`.
     special_token_ids: Arc<[u32]>,
 }
 
 impl HuggingFaceTokenizer {
     /// Loads tokenizer data and derives special-token lookup tables.
+    ///
+    /// Returns a tokenizer error when `fastokens` cannot load `path`.
     pub fn new(path: &Path) -> Result<Self> {
         info!(path = %path.display(), "loading configured Hugging Face tokenizer");
         let tokenizer = FastokensTokenizer::from_file(path)
             .map_err(|error| tokenizer_error!("failed to load tokenizer: {}", error.as_report()))?;
+
         let mut special_token_ids: Vec<u32> = tokenizer
             .added_tokens()
             .into_iter()
@@ -64,12 +86,14 @@ impl HuggingFaceTokenizer {
         special_token_ids.sort_unstable();
         special_token_ids.dedup();
         let byte_level = tokenizer.decoder().is_some_and(is_byte_level_only);
+
         Ok(Self {
             tokenizer: Box::new(tokenizer),
             byte_level,
             special_token_ids: Arc::from(special_token_ids),
         })
     }
+
     /// Encodes one prompt string into token IDs.
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         self.tokenizer
@@ -78,6 +102,11 @@ impl HuggingFaceTokenizer {
     }
 
     /// Decodes token identifiers with optional special-token filtering.
+    ///
+    /// A tokenizer whose decoder is a single byte-level step decodes through
+    /// `decode_fastokens_byte_level` and fails on an ID outside the
+    /// vocabulary. Any other tokenizer decodes through `fastokens`, which skips
+    /// such IDs and fails only when its decoder does.
     pub fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String> {
         if self.byte_level {
             decode_fastokens_byte_level(&self.tokenizer, token_ids, skip_special_tokens)
@@ -104,6 +133,10 @@ impl HuggingFaceTokenizer {
     }
 
     /// Creates a stateful incremental decoder primed with the given prompt tokens.
+    ///
+    /// `min_bytes_to_buffer` is the number of trailing output bytes that
+    /// `IncrementalDecoder::next_chunk` withholds; the serving output stages
+    /// pass the stop-string holdback computed by `stop_string_holdback_bytes`.
     pub fn create_decode_stream(
         &self,
         prompt_token_ids: &[u32],
@@ -168,6 +201,8 @@ mod tests {
         let (_directory, path) = save_tokenizer(&tokenizer);
         let configured = HuggingFaceTokenizer::new(&path).expect("load configured tokenizer");
 
+        // The tiny BPE tokenizer has no decoder, so this decodes through
+        // `fastokens` rather than the byte-level fast path.
         let encoded = configured.encode("hello", false).expect("encode text");
         assert_eq!(configured.decode(&encoded, false).unwrap(), "hello");
         let special_id = configured
@@ -222,6 +257,11 @@ mod tests {
         (directory, configured, provider)
     }
 
+    /// The byte-level fast path must reproduce `fastokens` decoding for known
+    /// IDs, with and without special-token skipping. The cases cover the
+    /// empty input, `Ġ` (an escaped space), the special `<|endoftext|>` at
+    /// several positions, and `｜`, which lies outside GPT-2's byte alphabet and
+    /// passes through unchanged.
     #[test]
     fn configured_byte_level_decode_matches_provider() {
         let (_directory, configured, provider) = byte_level_tokenizers();

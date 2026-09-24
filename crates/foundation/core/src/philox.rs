@@ -4,6 +4,12 @@
 //! uniforms. This addressing makes a draw independent of batching, execution
 //! depth, completion order, and replay.
 //!
+//! The engine simulator draws through this module; the model worker draws
+//! through `uniserve.nn.rng`, which implements the same mapping in Python. The
+//! two must stay bit-identical in the key fold, counter layout, round
+//! function, and uniform conversion, or simulated and real sampling diverge
+//! for the same seed.
+//!
 //! Layout:
 //!
 //! - key = a `splitmix` fold of `(session_seed, engine_id, request_id,
@@ -98,7 +104,9 @@ pub fn sampling_uniform(
     draw_index: u64,
 ) -> f32 {
     // The counter layout gives each token, processor stage, and draw index an
-    // independent address without relying on mutable generator state.
+    // independent address without relying on mutable generator state. The
+    // token index keeps all 64 bits across two words; the stage and draw
+    // index are truncated to their low 32 bits.
     let counter = [
         semantic_token_index as u32,
         (semantic_token_index >> 32) as u32,

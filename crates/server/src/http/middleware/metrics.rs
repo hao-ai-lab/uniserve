@@ -10,12 +10,16 @@ use axum::middleware::Next;
 use axum::response::Response;
 use uniserve_observability::{HttpHandlerLabels, HttpRequestLabels, METRICS};
 
-/// Endpoints that will be excluded from HTTP metrics tracking.
-///
+/// Operational endpoints excluded from HTTP metrics, matched against the route
+/// template (`MatchedPath`).
 const EXCLUDED_HANDLERS: &[&str] = &["/metrics", "/health", "/version"];
 
 /// Records API-server HTTP metrics with Python-compatible
 /// (`PrometheusFastApiInstrumentator` style) family names and labels.
+///
+/// The `handler` label is the matched route template, or `"none"` when no route
+/// matched. The `status` label is the status class of the response head, so a
+/// stream that fails after its head was sent still counts under that class.
 pub(crate) async fn track_http_metrics(req: Request, next: Next) -> Response {
     // Resolve the handler from a borrowed `&str` first so excluded requests
     // (the bypass path) never allocate the method/handler strings.

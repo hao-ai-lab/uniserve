@@ -2,11 +2,25 @@
 //!
 //! Each pass selects a compatible execution lane, applies sequence and token
 //! budgets, and emits at most one planned call per eligible request.
+//!
+//! This is the generation path: token requests in `running`, including the
+//! image-generation and feedback phases of unified multimodal requests.
+//! `Scheduler::schedule_batches` alternates it with the video media path.
+//! A pass plans each request's next call from its accepted state plus the
+//! calls still in flight (`scheduled_token_lengths`,
+//! `num_scheduled_denoise_steps`), so a successor can be planned before its
+//! predecessor resolves. Each planned call then reserves its storage, is
+//! registered as in flight, and joins the pass's batch for its `CallKind`:
+//! one batch per computation, each a single numerical call on one component.
+//!
+//! The lane (`BatchKind`) only separates prefill from decode. `BatchKind::Media`
+//! calls are eligible in every pass, and a pass with no lane applies no filter.
 
 use super::*;
 use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 
-/// Computes the target decode capacity for a scheduling round.
+/// Returns the KV capacity, in tokens, that must be allocated before a decode
+/// that writes position `pos` and `spec_len` further positions.
 fn decode_capacity_target(pos: usize, spec_len: usize) -> usize {
     pos.saturating_add(1).saturating_add(spec_len)
 }
@@ -16,6 +30,9 @@ impl Scheduler {
     ///
     /// Each request contributes at most one call, prefill chunks consume only
     /// the remaining token budget, and first dispatch carries typed admission.
+    ///
+    /// Returns the pass's batches, empty when nothing can be scheduled or call
+    /// preparation failed; most preparation failures latch engine-fatal.
     pub(super) fn assemble(&mut self) -> Vec<ExecutionBatch> {
         let ids = self.assembly_order();
         let lane = self.select_batch_kind(&ids);
@@ -29,6 +46,11 @@ impl Scheduler {
     }
 
     /// Charges actual token work, including each denoising step and CFG branch.
+    ///
+    /// A denoising call costs its latent units times its guidance branches
+    /// times its step count, which it declares as `bounds.max_tokens`; it
+    /// costs nothing once its request has left `running`. A verify call costs
+    /// its input tokens plus one, and every other call its `max_tokens` bound.
     fn computation_token_cost(&self, call: &Call) -> usize {
         match call.code {
             CallKind::Media(MediaCall::Denoising) => {
@@ -46,6 +68,20 @@ impl Scheduler {
     }
 
     /// Reserves persistent buffers, latent pages, and transfer capacity for one computation.
+    ///
+    /// Returns the call's output buffer spans, in `Call::buffer_outputs`
+    /// order, or `None` when the call cannot run now: the flow prefix of a
+    /// denoising call cannot be allocated, transfer capacity is exhausted,
+    /// the request is not running, `Placement::worker_target` finds no worker,
+    /// a buffer or latent-page allocation fails, or (after latching
+    /// engine-fatal) the request holds no allocations.
+    ///
+    /// Buffer spans reserved before a failure are returned to the pool, but a
+    /// failure is not free of side effects: a flow prefix already allocated
+    /// stays with the request, and a failed buffer allocation evicts one
+    /// unpinned encoder-cache product, if any, and queues a `Free` for its
+    /// buffer. Only a successful reservation counts against the transfer
+    /// capacity.
     fn reserve_generation_resources(&mut self, call: &Call) -> Option<Vec<BufferSpan>> {
         let id = call.request_key.request_id;
         if call.code == CallKind::Media(MediaCall::Denoising) && !self.ensure_flow_prefix(id) {
@@ -61,6 +97,7 @@ impl Scheduler {
             .map(|state| RequestKey::new(self.engine_id, id, state.request_epoch))?;
         self.placement
             .worker_target(self.executor.as_ref(), &self.info, request_key, call.code)?;
+
         let mut buffer_allocations = Vec::new();
         for bytes in call.buffer_outputs().map(TensorRef::max_bytes) {
             let allocation = match self.storage.buffer_pool.allocate(request_key, bytes, 256) {
@@ -69,6 +106,8 @@ impl Scheduler {
                     for allocation in buffer_allocations {
                         self.storage.buffer_pool.free(allocation);
                     }
+                    // The evicted product's span returns to the pool only
+                    // when workers acknowledge the queued `Free` command.
                     if let Some(product) = self.storage.encoder_cache.evict_one() {
                         self.free_buffers([product.buffer_id()]);
                     }
@@ -77,6 +116,11 @@ impl Scheduler {
             };
             buffer_allocations.push(allocation);
         }
+
+        // Latent pages are reserved only when the worker advertises a paged
+        // latent pool (`worker_tracks_image_latent`). They grow in place
+        // across the trajectory's calls; a failed grow leaves the existing
+        // pages allocated.
         if matches!(
             call.code,
             CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
@@ -111,6 +155,7 @@ impl Scheduler {
                 return None;
             }
         }
+
         if uses_transfer {
             self.inflight.num_pending_transfers += 1;
         }
@@ -118,6 +163,11 @@ impl Scheduler {
     }
 
     /// Selects compatible call kinds within one lane's token and sequence budgets.
+    ///
+    /// Walks `ids` in assembly order until `max_batch` calls are selected or
+    /// the token budget is spent. Every selected call is registered in flight
+    /// before this returns. A failed call preparation returns no batches; most
+    /// such failures latch engine-fatal first.
     pub(super) fn assemble_batch(
         &mut self,
         ids: &[RequestId],
@@ -165,7 +215,10 @@ impl Scheduler {
             let next_type = self.peek_next_call_variant(id);
             // A decode pass may co-schedule text prefill rows. They are
             // dispatched as their own batch, so the two call kinds remain
-            // separate numerical calls.
+            // separate numerical calls. Only replayable text requests without
+            // prompt logprobs qualify. The lane check rejects only a prefill
+            // call in a decode pass or the reverse; `BatchKind::Media` calls
+            // pass.
             let mut mixed_prefill = false;
             if let (Some(target), Some(call_variant)) = (lane, next_type)
                 && {
@@ -203,12 +256,17 @@ impl Scheduler {
             };
             if let Some(mut call) = self.next_generation_computation(id, call_budget) {
                 let planned_us = uniserve_core::now_monotonic_us();
+
+                // The budget is charged before storage is reserved, so a call
+                // that finds no storage still consumes its share of the pass.
                 if mixed_prefill {
                     mixed_left = mixed_left.saturating_sub(self.computation_token_cost(&call));
                 }
                 budget = budget.saturating_sub(self.computation_token_cost(&call));
                 let Some(reserved_buffers) = self.reserve_generation_resources(&call) else {
                     self.record_domain_backpressure(call.code);
+                    // Planning a forward advanced `num_kv_blocks_sent` past its
+                    // fresh pages; roll it back so the next plan declares them.
                     if let Some(state) = self.running.get_mut(&id) {
                         state.num_kv_blocks_sent = state
                             .num_kv_blocks_sent
@@ -220,6 +278,9 @@ impl Scheduler {
                     );
                     continue;
                 };
+
+                // Identify the call by its batch and row, and stamp the
+                // coordinates projected through the request's in-flight calls.
                 let code = call.code;
                 let batch = code_batches.entry(code).or_insert_with(|| {
                     code_order.push(code);
@@ -240,6 +301,9 @@ impl Scheduler {
                     return Vec::new();
                 };
                 call.coordinates = coordinates;
+
+                // A request's first call carries its `Start` admission in the
+                // same batch.
                 let finish_token_ids = self
                     .running
                     .get(&id)
@@ -287,7 +351,7 @@ impl Scheduler {
                     batch,
                 );
                 if prepared.is_none() {
-                    // Preparation marks the scheduler fatal before it fails.
+                    // Most preparation failures latch engine-fatal first.
                     return Vec::new();
                 }
                 selected += 1;
@@ -302,12 +366,14 @@ impl Scheduler {
             return Vec::new();
         };
 
-        // Prompt commands remain disjoint from earlier state writers. The
-        // round's retirements travel with its last batch so no earlier call
-        // loses the state it still reads. They do not travel in a batch of
-        // their own: a rank's queue depth bounds submissions, not round trips,
-        // so a command-only batch costs the round a queue slot and halves how
-        // many rounds a depth-two rank can hold in flight.
+        // A prefill-only pass takes only the queued commands of its own
+        // requests plus `Finish` commands; other requests' `Free` commands
+        // wait for a later batch. The round's retirements travel with its last
+        // batch so no earlier call loses the state it still reads. They do not
+        // travel in a batch of their own: a rank's queue depth bounds
+        // submissions, not round trips, so a command-only batch costs the
+        // round a queue slot and halves how many rounds a depth-two rank can
+        // hold in flight.
         let prompt_only = code_order
             .iter()
             .all(|code| batch_kind(*code) == BatchKind::Prefill);
@@ -339,6 +405,13 @@ impl Scheduler {
     }
 
     /// Chooses the highest-priority execution lane that has schedulable work.
+    ///
+    /// Prefill wins while fewer than `PREFILL_WINDOW_CREDITS` batches carrying
+    /// `BatchKind::Prefill` calls await their results; past that, ready decode
+    /// work takes the pass, and prefill runs only when no decode is ready.
+    /// `BatchKind::Media` readiness never selects a lane: with only such work
+    /// ready this returns `None`, and `assemble_batch` then applies no lane
+    /// filter.
     pub(super) fn select_batch_kind(&self, ids: &[RequestId]) -> Option<BatchKind> {
         let mut projected_decode_ready = false;
         let mut committed_decode_ready = false;
@@ -392,7 +465,8 @@ impl Scheduler {
         }
     }
 
-    /// Returns the stable order key for batch assembly.
+    /// Returns running requests in batch-assembly order: by
+    /// `assembly_priority`, then by admission order within a priority.
     pub(super) fn assembly_order(&self) -> Vec<RequestId> {
         let mut ids: Vec<(usize, RequestId)> = self
             .running_order
@@ -404,7 +478,13 @@ impl Scheduler {
         ids.into_iter().map(|(_, id)| id).collect()
     }
 
-    /// Returns the scheduling priority used during batch assembly.
+    /// Returns the scheduling priority used during batch assembly; lower
+    /// values are assembled first.
+    ///
+    /// Context ingestion (encoders and prefill) comes first; then token decode
+    /// and verification, image decoding, and KV installation; then denoising
+    /// and the video and audio media calls; and last latent preparation,
+    /// tensor transfers, KV publication, and requests with no next call.
     pub(super) fn assembly_priority(&self, id: RequestId) -> u8 {
         match self.peek_next_call_variant(id) {
             Some(
@@ -437,6 +517,12 @@ impl Scheduler {
     }
 
     /// Determines the next call kind without mutating request or resource state.
+    ///
+    /// A call chained onto the request's in-flight calls takes precedence.
+    /// Otherwise an input image anchored at the scheduled prompt cursor is
+    /// encoded before more text, and the request's phase decides. Returns
+    /// `None` when the request is not running, waits on its image-branch
+    /// reservation, or has no call to issue.
     pub(super) fn peek_next_call_variant(&self, id: RequestId) -> Option<CallKind> {
         let st = self.running.get(&id)?;
         if st.image_reservation_pending {
@@ -492,6 +578,17 @@ impl Scheduler {
     }
 
     /// Registers one selected computation with its allocated physical inputs and outputs.
+    ///
+    /// Sets the call's device predicate, derives its KV, forward-row, and
+    /// latent inputs from the lengths its in-flight predecessors project,
+    /// mints product identities, moves `reserved_buffers` into the request's
+    /// allocations, selects the executing worker, registers the call in
+    /// flight, and appends it with its `RequestPlacement` to `batch`.
+    /// `admitted` marks a call whose batch carries the request's `Start`, so
+    /// its complete KV tables are sent.
+    ///
+    /// Returns `None` when a scheduler invariant fails, including an unsafe
+    /// projected successor; most such paths latch engine-fatal first.
     fn prepare_generation_call(
         &mut self,
         mut call: Call,
@@ -526,9 +623,11 @@ impl Scheduler {
 
         let request_key = RequestKey::new(self.engine_id, request_id, request_epoch);
         // A device successor consumes the token or completion tensor of
-        // either its in-flight predecessor or the latest resolved call.
-        // The first call and host-observed transitions use the latest
-        // accepted call identity.
+        // either its in-flight predecessor or the latest resolved call as its
+        // predicate: a decode follows the predecessor's sampled token, any
+        // other successor its completion product. The first call and
+        // host-observed transitions use the latest accepted call identity and
+        // carry no predicate.
         let projected_successor = self.inflight.has_pending_calls(request_id);
         let reusable_device_token =
             if !projected_successor && self.can_reuse_resolved_token_product(request_id) {
@@ -575,10 +674,12 @@ impl Scheduler {
         };
 
         call.predicate = predicate;
-        // KV descriptors include complete tables only on admission or growth;
-        // fresh-page lists identify storage the worker must initialize now.
+
         // Freeze physical inputs before registering this computation as pending.
         // Accepted progress may stop on cancellation while these inputs still drain.
+        // `visible` is the KV length after the in-flight predecessors; `input`
+        // counts the tokens this call appends. Publication, latent preparation,
+        // and denoising only read the request's KV.
         let (_, visible) = self.scheduled_token_lengths(request_id)?;
         let kv_lengths = match call.code {
             CallKind::Forward(ForwardMode::Prefill) => Some(KvLengths {
@@ -599,6 +700,9 @@ impl Scheduler {
             | CallKind::Media(MediaCall::Denoising) => Some(KvLengths { visible, input: 0 }),
             _ => None,
         };
+        // Latent preparation opens the trajectory at step zero, a denoising
+        // call starts after the steps already scheduled, and image decoding
+        // sits at the end of the schedule.
         let start_step = match call.code {
             CallKind::Media(MediaCall::LatentPreparation) => Some(0),
             CallKind::Media(MediaCall::Denoising) => self.num_scheduled_denoise_steps(request_id),
@@ -608,6 +712,9 @@ impl Scheduler {
                 .map(|state| u32::from(state.req.image.steps)),
             _ => None,
         };
+        // An image-feature extension declares the KV tokens of the encoder
+        // that produced its feature: the scheduled feedback encoder, or the
+        // current input image's encoder.
         let num_image_kv_tokens = if consumes_image_features(&call) {
             let state = self.running.get(&request_id)?;
             let encoder = if is_feedback_computation(&call) {
@@ -628,6 +735,9 @@ impl Scheduler {
         } else {
             None
         };
+
+        // `max_kv_pages` counts the pages the first group's table gained since
+        // the previous dispatch (`plan_computation`).
         let new_page_count = call.bounds.max_kv_pages as usize;
         let mut call_block_tables = Vec::new();
         let mut call_new_cache_pages = Vec::new();
@@ -648,6 +758,12 @@ impl Scheduler {
                 self.invariant_broken("a registered token request is admitted with a KV cache");
                 return None;
             };
+            // KV descriptors include complete tables only on admission or
+            // growth; fresh-page lists identify storage the worker must
+            // initialize now. On admission every page is fresh except the
+            // group-0 pages already holding the computed prompt prefix
+            // (`num_computed_prompt_tokens`); on growth each group's last
+            // `new_page_count` pages are.
             let table_changed = admitted || new_page_count > 0;
             for group_id in 0..cache.block_pool.num_groups() {
                 let page_ids = tables
@@ -689,6 +805,8 @@ impl Scheduler {
                     });
                 }
             }
+            // One forward row per call that appends KV: it attends to the
+            // visible prefix plus its input and persists the input in KV.
             if lengths.input > 0 {
                 call_forward.push(
                     0,
@@ -700,6 +818,8 @@ impl Scheduler {
             }
         }
 
+        // Assign the call's final product identities from the scheduler-wide
+        // generation counter; exhausting it fails every running request.
         if let Err(error) =
             generation::register_call(&mut call, request_key, &mut self.next_product_generation)
         {
@@ -757,8 +877,15 @@ impl Scheduler {
             });
         }
 
-        // Diffusion rows include the positive branch and any negative CFG
-        // branch, each bound to its own request-state row.
+        // A denoising call adds one query row per guidance branch; its query
+        // is the latent grid plus the commit marker tokens and writes no KV.
+        // Branch 0 attends to the request's own conditioning KV. Every other
+        // branch attends to the flow prefix (the negative-prompt KV in its own
+        // request row) when the request holds one, and to the request's own
+        // KV otherwise. Until a denoising call completes successfully and
+        // finalizes the prefix, the call also prefills a non-empty negative
+        // prompt into it; the prefix's tables are resent until then and
+        // whenever the prefix has gained pages.
         if call.code == CallKind::Media(MediaCall::Denoising) {
             let Some(KvLengths {
                 visible: conditioning_tokens,
@@ -881,6 +1008,7 @@ impl Scheduler {
             ));
         }
 
+        // Worker selection records the request's residency on that worker.
         let Some((worker, entry)) =
             self.placement
                 .select_worker(self.executor.as_ref(), &self.info, &call)
@@ -921,6 +1049,8 @@ impl Scheduler {
                 buffers: call_buffers,
             },
         ));
+        // The resolved token product serves only the first call after its
+        // resolution; later calls chain from the in-flight one.
         if let Some(st) = self.running.get_mut(&request_id) {
             st.latest_token = None;
         }
@@ -933,6 +1063,7 @@ impl Scheduler {
         mut batch: ExecutionBatch,
         submit_at: Instant,
     ) -> ExecutionBatch {
+        // Command-only batches from `refill_executor` arrive with id zero.
         if batch.id == 0 {
             batch.id = self.inflight.next_batch_id();
         }
@@ -989,7 +1120,9 @@ impl Scheduler {
         }
     }
 
-    /// Builds the generation trigger after prefill.
+    /// Returns whether the prompt itself matches the image-generation trigger
+    /// and the request can open an image branch; `false` for a request that
+    /// is not running.
     pub(super) fn prefilled_gen_trigger(&self, id: RequestId) -> bool {
         let Some(st) = self.running.get(&id) else {
             return false;
@@ -1002,7 +1135,11 @@ impl Scheduler {
                 .matches_generated(&st.req.prompt_token_ids)
     }
 
-    /// Ensures the request capacity.
+    /// Grows the request's KV tables to hold `total_tokens` tokens.
+    ///
+    /// Returns `false` when the request is not running, the cache cannot grow,
+    /// or (after latching engine-fatal) a running request lacks its
+    /// allocations or the KV cache.
     pub(super) fn ensure_request_capacity(&mut self, id: RequestId, total_tokens: usize) -> bool {
         let Some(state) = self.running.get_mut(&id) else {
             return false;
@@ -1035,6 +1172,14 @@ impl Scheduler {
     }
 
     /// Builds a computation and records the KV pages owned by its next dispatch.
+    ///
+    /// For a forward call, sets `bounds.max_kv_pages` to the pages the first
+    /// group's table gained since the last dispatch and advances
+    /// `num_kv_blocks_sent`; a caller that drops the call must roll that back.
+    ///
+    /// Returns `None` when the request is not running, when planning fails
+    /// (the request is then finished with `Error`), or, after latching
+    /// engine-fatal, when a forward's request holds no KV tables.
     pub(super) fn plan_computation(
         &mut self,
         id: RequestId,
@@ -1077,6 +1222,11 @@ impl Scheduler {
     }
 
     /// Selects the next computation using accepted state and pending input ranges.
+    ///
+    /// Prompt text and input images still to ingest go through
+    /// `next_context_computation`; otherwise the request's next phase decides.
+    /// Returns `None` when nothing can be planned now, including when the KV
+    /// capacity a call needs or the image-branch reservation is unavailable.
     pub(super) fn next_generation_computation(
         &mut self,
         id: RequestId,
@@ -1457,6 +1607,10 @@ impl Scheduler {
     /// counts unresolved predecessors, so minimum-token and image limits apply
     /// at the successor's position without observing device results. Penalties
     /// remain owned by the worker's accepted-token state.
+    ///
+    /// `completing_images` counts image completions the planned call itself
+    /// finishes, which the final feedback step does. Returns `None` when the
+    /// request is not running or nothing needs constraining.
     pub(super) fn build_token_masks(
         &self,
         id: RequestId,

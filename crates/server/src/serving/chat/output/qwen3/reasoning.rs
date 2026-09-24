@@ -1,4 +1,9 @@
 //! Converts decoded Qwen3 text into reasoning-aware assistant deltas.
+//!
+//! This is the first chat output stage. It maps decoded-text events onto
+//! [`AssistantEvent`]s: text becomes `Reasoning` or `Text` deltas, token
+//! metadata becomes `SampleDelta`, and the terminal update becomes `Done`.
+//! Without a parser, all text is forwarded as `Text`.
 
 use crate::serving::text::output::DecodedTextEvent;
 use asynk_strim_attr::{TryYielder, try_stream};
@@ -9,6 +14,7 @@ use crate::serving::chat::AssistantBlockKind;
 use crate::serving::chat::output::processor::AssistantEvent;
 use crate::serving::chat::{Error, Result};
 
+/// Reasoning-stage state; a `None` parser disables reasoning parsing.
 struct ReasoningState {
     parser: Option<Qwen3ReasoningParser>,
 }
@@ -34,6 +40,10 @@ impl ReasoningState {
     }
 
     /// Initializes reasoning state from the prompt token sequence.
+    ///
+    /// A `<think>` or `</think>` token in the prompt suffix after the last
+    /// other special token decides whether generation starts inside a
+    /// reasoning section; without one, generation starts outside it.
     fn initialize(&mut self, prompt_token_ids: &[u32]) {
         let Some(parser) = self.parser.as_mut() else {
             return;
@@ -41,7 +51,7 @@ impl ReasoningState {
         parser.initialize(prompt_token_ids);
     }
 
-    /// Finishes incremental output processing.
+    /// Flushes text the parser held back as a possible partial delimiter.
     fn finish(&mut self) -> Vec<AssistantEvent> {
         let Some(parser) = self.parser.as_mut() else {
             return Vec::new();
@@ -59,7 +69,8 @@ fn push_text_delta(events: &mut Vec<AssistantEvent>, kind: AssistantBlockKind, d
     }
 }
 
-/// Pushes the reasoning delta.
+/// Appends the non-empty reasoning and visible parts of `delta`, reasoning
+/// first.
 fn push_reasoning_delta(events: &mut Vec<AssistantEvent>, delta: ReasoningDelta) {
     if let Some(reasoning) = delta.reasoning {
         push_text_delta(events, AssistantBlockKind::Reasoning, reasoning);
@@ -102,6 +113,8 @@ pub async fn reasoning_event_stream(
                 logprobs,
                 finished,
             } => {
+                // Parsed text precedes the token metadata of the same update,
+                // and any flushed text precedes `Done`.
                 for next in state.process_delta(delta) {
                     y.yield_ok(next).await;
                 }

@@ -1,4 +1,10 @@
 //! OpenAI-compatible error categories and HTTP response conversion.
+//!
+//! [`ApiError`] is the error vocabulary of the OpenAI surface. Each variant
+//! fixes an HTTP status ([`ApiError::status_code`]) and an OpenAI error body
+//! with a stable `type` and `code` ([`ApiError::to_error_response`]).
+//! Serving-layer failures enter through [`serve_error_to_api`] and engine
+//! admission rejections through [`ApiError::rejected`].
 
 use axum::Json;
 use axum::http::StatusCode;
@@ -24,7 +30,9 @@ pub enum ApiError {
         /// Requested model name.
         model: String,
     },
-    /// An internal conversion invariant failed.
+    /// The server could not produce a result, for example because an
+    /// internal invariant, model resolution, the engine, or output processing
+    /// failed, or because generation ended without a usable output.
     ServerError {
         /// Human-readable internal failure.
         message: String,
@@ -34,7 +42,9 @@ pub enum ApiError {
         /// Parser failure message.
         message: String,
     },
-    /// A valid control call conflicts with the current runtime state.
+    /// A valid call conflicts with the current runtime state, for example a
+    /// request for the content of a video job that has none (queued, running,
+    /// or failed).
     Conflict {
         /// Human-readable conflict description.
         message: String,
@@ -87,6 +97,10 @@ impl ApiError {
     }
 
     /// Maps an engine admission rejection to its caller-facing category.
+    ///
+    /// `Invalid` becomes a 400 invalid request that fails the same way on
+    /// retry; `Overloaded` becomes a 503 that the same request may pass once
+    /// the engine's waiting queue drains.
     pub fn rejected(kind: uniserve_core::RejectionKind, message: impl Into<String>) -> Self {
         match kind {
             uniserve_core::RejectionKind::Invalid => Self::invalid_request(message, None),
@@ -161,6 +175,10 @@ impl IntoResponse for ApiError {
 }
 
 /// Maps one canonical serving error into the OpenAI error vocabulary.
+///
+/// Unsupported output counts or features, context limits, duplicate request
+/// IDs, and tokenization failures become invalid requests; model-resolution,
+/// engine, and output-processing failures become server errors.
 pub fn serve_error_to_api(error: ServeError) -> ApiError {
     match error {
         ServeError::UnsupportedOutputCount { requested, .. } => ApiError::invalid_request(
@@ -184,6 +202,11 @@ pub fn serve_error_to_api(error: ServeError) -> ApiError {
     }
 }
 
+/// Returns early with an [`ApiError::InvalidRequest`] built from a format
+/// string, optionally tagged with `param = <&'static str>`.
+///
+/// The expansion is a `return` statement, so it is usable only inside a
+/// function whose error type is [`ApiError`].
 macro_rules! bail_invalid_request {
     (param = $param:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {
         {
@@ -205,6 +228,8 @@ macro_rules! bail_invalid_request {
 
 pub(crate) use bail_invalid_request;
 
+/// Builds (without returning) an [`ApiError::ServerError`] from a format
+/// string.
 macro_rules! server_error {
     ($fmt:literal $(, $arg:expr)* $(,)?) => {
         $crate::openai::error::ApiError::server_error(format!($fmt $(, $arg)*))

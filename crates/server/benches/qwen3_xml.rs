@@ -1,5 +1,15 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Throughput benchmarks for incremental Qwen XML tool-call parsing.
+//!
+//! Each fixture is split into fixed-size character chunks and streamed
+//! through `Qwen3XmlToolParser` incrementally, as the Qwen3 chat output stage
+//! feeds assistant text. Throughput is reported in input bytes. The bench
+//! target requires the `test-util` feature for the shared parser fixtures in
+//! `profile::tools::test_utils`.
+//!
+//! The expected-output checks inside each iteration are `debug_assert`s: they
+//! run only in builds with debug assertions and are compiled out of the
+//! release-profile build that `cargo bench` times.
 
 use std::time::Duration;
 
@@ -10,6 +20,7 @@ use uniserve_server::profile::tools::{Qwen3XmlToolParser, Tool};
 mod utils;
 use utils::feed_parser;
 
+/// Unicode scalar values per streamed chunk.
 const CHUNK_CHARS: usize = 7;
 const LONG_NORMAL_TEXT_REPEATS: usize = 2048;
 
@@ -51,6 +62,8 @@ fn run_stream_group(
     group.measurement_time(Duration::from_secs(2));
     group.throughput(Throughput::Bytes(text.len() as u64));
 
+    // One parser serves every iteration; this relies on `finish`, called at
+    // the end of each stream by `collect_stream`, resetting parser state.
     group.bench_function("native_reuse_parser", |b| {
         let mut parser = native_parser(tools);
         b.iter(|| {
@@ -61,6 +74,8 @@ fn run_stream_group(
         })
     });
 
+    // Each iteration parses with a freshly constructed parser. Construction
+    // runs in the untimed `iter_batched` setup closure.
     group.bench_function("native_create_parser", |b| {
         b.iter_batched(
             || native_parser(tools),

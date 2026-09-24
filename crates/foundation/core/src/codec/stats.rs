@@ -1,4 +1,12 @@
 //! Serializable scheduler, cache, and worker performance snapshots.
+//!
+//! The engine's `SchedulerStatsReporter` builds one [`SchedulerStats`] per
+//! reporting interval from its cumulative scheduler counters, and the server's
+//! `record_scheduler_stats` publishes it as Prometheus metrics: interval deltas
+//! are added to counters, while gauges and lifetime values are set. Each
+//! field's documentation says which kind it is when that is not an interval
+//! delta. [`ForwardStats`] also travels from workers to the engine in batch
+//! results that report it.
 
 use std::collections::BTreeMap;
 
@@ -16,6 +24,9 @@ pub struct BaseCacheStats {
 }
 
 /// Prefix-cache counters, where query fields count tokens.
+///
+/// The engine's `SchedulerStatsReporter` fills only `base.queries` and
+/// `base.hits`; it reports the request and preemption counters as zero.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PrefixCacheStats {
     /// Embedded base cache counters.
@@ -53,7 +64,17 @@ pub struct PrefillStats {
 
 /// Worker-local forward/kernel counters folded into scheduler stats.
 ///
-/// Values are per-update deltas when carried in [`SchedulerStats`].
+/// In a worker batch result (`BatchOutput::forward_stats` in the worker
+/// protocol) the values cover the work reported in that result, and the engine
+/// scheduler adds them into its cumulative `WorkerStats` counters. Values are
+/// per-update deltas when carried in [`SchedulerStats`].
+///
+/// The same counters are mirrored elsewhere, including the `ForwardStats`
+/// table of the worker flatbuffers schema, the worker-ipc codec, the Python
+/// extension's `forward_stats_from_py`, the Python worker's `ForwardStats`,
+/// the engine's `WorkerStats` and `SchedulerStatsReporter`, and the server's
+/// `record_scheduler_stats`. A field added here also needs an entry in
+/// [`ForwardStats::is_empty`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ForwardStats {
     /// Forward executions grouped by runtime mode.
@@ -150,9 +171,11 @@ pub struct ForwardStats {
 
 impl ForwardStats {
     /// Returns whether every worker counter and breakdown is empty or zero.
+    ///
+    /// The engine reports an interval's worker counters as `None` when their
+    /// delta is empty, so a field missing from this check is dropped from any
+    /// interval in which only that field changed.
     pub fn is_empty(&self) -> bool {
-        // Map-backed breakdowns and scalar counters form one aggregate delta;
-        // any populated component makes the snapshot observable.
         self.mode_counts.is_empty()
             && self.mode_tokens.is_empty()
             && self.mode_us.is_empty()
@@ -188,10 +211,15 @@ impl ForwardStats {
 
 /// Per-domain scheduler accounting for one stats update.
 ///
-/// Call, run, pressure, reclaim, and time fields are interval
-/// deltas. Credit fields are gauges. Device and co-residency time describe the
-/// full interval visible to the named domain; values from co-resident domains
-/// therefore must not be summed to estimate aggregate GPU busy time.
+/// The engine aggregates call kinds into the `prefill`, `decode`, and `flow`
+/// domains. `active_credits` is a gauge and `peak_credits` a lifetime maximum;
+/// every other count and time field is an interval delta. The worker-reported
+/// time fields (`launch_us`, `device_us`, `completion_us`) add, once per batch
+/// result report that contains calls of the domain, the maximum over those
+/// calls of each `TimingCounters` field they draw on. Batches of different
+/// domains can execute concurrently on separate worker execution lanes, so
+/// time fields must not be summed across domains to estimate aggregate GPU
+/// busy time.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainSchedulerStats {
     /// Stable execution-domain name.
@@ -199,40 +227,45 @@ pub struct DomainSchedulerStats {
     /// Credits currently occupied by in-flight work.
     #[serde(default)]
     pub active_credits: u64,
-    /// Highest active-credit count in the interval.
+    /// Highest active-credit count since the scheduler started.
     #[serde(default)]
     pub peak_credits: u64,
     /// Calls launched in the interval.
     #[serde(default)]
     pub launched_calls: u64,
-    /// Calls completed in the interval.
+    /// Call results in the interval, including predicated and error results.
     #[serde(default)]
     pub completed_calls: u64,
     /// Calls skipped by a false predicate.
     #[serde(default)]
     pub predicated_calls: u64,
-    /// Calls completed with an error.
+    /// Calls that returned an error status or whose credit was reclaimed
+    /// after an execution failure.
     #[serde(default)]
     pub error_calls: u64,
     /// Submission attempts rejected by executor backpressure.
     #[serde(default)]
     pub backpressure_events: u64,
-    /// Scheduling credits returned after completion.
+    /// Scheduling credits returned on completion or execution failure.
     #[serde(default)]
     pub reclaimed_credits: u64,
-    /// Batches completed in the interval.
+    /// Batch result reports in the interval that contained calls of this
+    /// domain.
     #[serde(default)]
     pub completed_batches: u64,
-    /// Time spent queued before launch, in microseconds.
+    /// Scheduler time from planning a call to registering it in flight, in
+    /// microseconds. Calls of diffusion media requests contribute zero.
     #[serde(default)]
     pub queue_us: u64,
-    /// Host launch overhead in microseconds.
+    /// Worker-reported wait before execution (`TimingCounters::queued_us`),
+    /// in microseconds.
     #[serde(default)]
     pub launch_us: u64,
     /// Device execution time in microseconds.
     #[serde(default)]
     pub device_us: u64,
-    /// Host completion processing time in microseconds.
+    /// Worker completion copy plus host processing time
+    /// (`TimingCounters::copy_us` and `host_us`), in microseconds.
     #[serde(default)]
     pub completion_us: u64,
 }
@@ -240,31 +273,38 @@ pub struct DomainSchedulerStats {
 /// Serializable scheduler snapshot for one reporting interval.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerStats {
-    /// Number of requests in model execution batches.
+    /// Running token and media requests (gauge).
     pub num_running_reqs: u64,
-    /// Length of the "waiting" request queue.
+    /// Token and media requests waiting for admission (gauge).
     pub num_waiting_reqs: u64,
-    /// Internal DP load-balancing step counter.
+    /// Generation and command-only batches the scheduler has finalized since
+    /// it started (a lifetime value, not a delta). Batches built by the media
+    /// scheduling pass for diffusion media requests, including its retirement
+    /// batch, are not counted.
     pub step_counter: u64,
-    /// Internal DP load-balancing wave number.
+    /// Data-parallel wave number. The engine tracks no waves and reports zero.
     pub current_wave: u64,
-    /// KV-cache usage. `1.0` means 100% usage.
+    /// Fraction of usable KV blocks not free (gauge). `1.0` means 100% usage.
     pub kv_cache_usage: f64,
     /// Requests admitted since the previous stats snapshot.
     #[serde(default)]
     pub num_admitted_reqs: u64,
-    /// Average queue wait for requests admitted since the previous snapshot.
+    /// Average queue wait for requests admitted since the previous snapshot,
+    /// in microseconds; zero when none was admitted.
     #[serde(default)]
     pub avg_queue_wait_us: u64,
-    /// Total queue wait for requests admitted since the previous snapshot.
+    /// Total queue wait for requests admitted since the previous snapshot, in
+    /// microseconds.
     #[serde(default)]
     pub queue_wait_us_total: u64,
-    /// Maximum queue wait observed by the scheduler so far.
+    /// Maximum queue wait observed by the scheduler so far, in microseconds
+    /// (a lifetime value, not a delta).
     #[serde(default)]
     pub max_queue_wait_us: u64,
-    /// Local prefix cache statistics.
+    /// Local prefix-cache query and hit deltas, in tokens.
     pub prefix_cache_stats: PrefixCacheStats,
-    /// Worker-local forward/kernel counters since the previous stats snapshot.
+    /// Worker-local forward/kernel counters since the previous stats snapshot,
+    /// or `None` when none of them changed.
     #[serde(default)]
     pub worker_forward_stats: Option<ForwardStats>,
     /// Worker-reported execution time accumulated in the interval, in microseconds.
@@ -273,10 +313,11 @@ pub struct SchedulerStats {
     /// Host-observed submit-to-result time accumulated in the interval, in microseconds.
     #[serde(default)]
     pub batch_roundtrip_us: u64,
-    /// Resolved batch count used to normalize interval latency totals.
+    /// Completed batches represented by `worker_exec_us` and
+    /// `batch_roundtrip_us` in this interval.
     #[serde(default)]
     pub batch_count: u64,
-    /// Exact prefill, decode, and flow accounting for this update.
+    /// Per-domain accounting, in `prefill`, `decode`, `flow` order.
     #[serde(default)]
     pub domain_stats: Vec<DomainSchedulerStats>,
 }

@@ -3,17 +3,26 @@
 use crate::openai::ChatCompletionRequest;
 
 /// Public response metadata retained by HTTP response construction.
+///
+/// The chat-completions route handler builds this before calling
+/// `ServingRuntime::generate_chat`, which takes the request by value, and
+/// passes the fields to `collect_chat_completion` or
+/// `chat_completion_chunk_stream`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatResponseContext {
     /// OpenAI-compatible response identifier.
     pub request_id: String,
     /// Model name reported in response objects.
     pub response_model: String,
-    /// Whether streaming responses include a terminal usage chunk.
+    /// Whether streaming responses include a terminal usage chunk
+    /// (`stream_options.include_usage`). Non-streaming responses always
+    /// carry usage.
     pub include_usage: bool,
     /// Whether generated-token logprobs were requested.
     pub requested_logprobs: bool,
-    /// Whether prompt-token logprobs were requested.
+    /// Whether prompt-token logprobs were requested. Only non-streaming
+    /// responses carry them; `validate_request_compat` rejects a streamed
+    /// request that asks for a positive or `-1` count.
     pub include_prompt_logprobs: bool,
     /// Whether parsed reasoning is exposed in responses.
     pub include_reasoning: bool,

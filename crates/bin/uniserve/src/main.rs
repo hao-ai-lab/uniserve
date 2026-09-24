@@ -1,5 +1,10 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 //! UniServe command-line entry point and process lifecycle orchestration.
+//!
+//! `main` parses the command line, installs tracing, and builds the Tokio
+//! runtime; `async_main` hands the resolved configuration to
+//! `uniserve_server::serve` together with a cancellation token that fires on
+//! Ctrl-C or SIGTERM.
 
 mod cli;
 mod logging;
@@ -22,6 +27,9 @@ const TOKIO_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 /// Caps the default number of Tokio worker threads when `TOKIO_WORKER_THREADS` is unset.
 ///
 /// The cap bounds scheduling overhead on machines with many logical CPUs.
+/// Returns `None`, leaving the choice to Tokio's builder, when the variable
+/// is set (the builder reads it itself) or when the available parallelism
+/// cannot be queried.
 fn tokio_worker_threads() -> Option<usize> {
     if env::var_os(TOKIO_WORKER_THREADS_ENV).is_some() {
         return None;
@@ -44,6 +52,10 @@ fn tokio_worker_threads() -> Option<usize> {
 }
 
 /// Returns a cancellation token triggered by Ctrl-C or SIGTERM.
+///
+/// Must be called from within a Tokio runtime, since it spawns the listening
+/// task. A handler that fails to install is logged and never fires, leaving
+/// the other signal able to cancel the token.
 fn shutdown_signal() -> CancellationToken {
     let token = CancellationToken::new();
     let shutdown = token.clone();
@@ -106,8 +118,10 @@ async fn async_main(cli: Cli) -> Result<()> {
             args.runtime
                 .served_model_name
                 .get_or_insert_with(|| args.runtime.model.clone());
-            // The model states which components it owns and how each one
-            // partitions; this process places its ranks across the hosts.
+            // Resolved here only for the log line; `to_uniserve_config` builds
+            // the same settings for the server. Without `--workers`, the
+            // deployment is one component over every rank, blocked across the
+            // rank hosts.
             let settings = args.runtime.engine_settings();
             info!(model = %args.runtime.model,
                 workers = ?settings.workers, resident_requests = settings.max_num_seqs,

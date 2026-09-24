@@ -15,11 +15,15 @@ pub struct Qwen3ReasoningParser {
 
 impl Qwen3ReasoningParser {
     /// Creates a Qwen3 parser backed by the shared delimited state machine.
+    ///
+    /// Fails when the tokenizer lacks `<think>` or `</think>` as single
+    /// tokens.
     pub fn new(tokenizer: DynTokenizer) -> Result<Self> {
         Ok(Self {
             inner: DelimitedReasoningParser::new(tokenizer, "<think>", "</think>", false)?,
         })
     }
+
     /// Initializes delimiter state from the rendered prompt suffix.
     pub fn initialize(&mut self, prompt_token_ids: &[u32]) {
         self.inner.initialize(prompt_token_ids);

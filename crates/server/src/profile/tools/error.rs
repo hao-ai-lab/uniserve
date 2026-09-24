@@ -7,6 +7,10 @@ use thiserror_ext::Macro;
 pub type Result<T> = std::result::Result<T, ToolParserError>;
 
 /// Errors produced while creating or running tool parsers.
+///
+/// The `Macro` derive generates the format-style `parsing_failed!`
+/// constructor; `profile::tools` imports this module with `#[macro_use]` so its
+/// submodules can call it.
 #[derive(Debug, Error, Macro)]
 #[thiserror_ext(macro(path = "crate::profile::tools::error"))]
 pub enum ToolParserError {

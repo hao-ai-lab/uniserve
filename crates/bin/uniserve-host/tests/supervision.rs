@@ -1,4 +1,9 @@
 //! Host supervision through its public command stream and real child processes.
+//!
+//! Each test binds a TCP listener that stands in for the head, starts the
+//! built `uniserve-host` binary against it, and exchanges the launcher's
+//! newline-delimited JSON messages: instructions to the launcher, and its
+//! presentation, reservation replies, and rank exit reports back.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -6,6 +11,8 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+/// Kills and reaps the launcher process when a test ends, including when it
+/// panics.
 struct Launcher(Child);
 
 impl Drop for Launcher {
@@ -15,6 +22,9 @@ impl Drop for Launcher {
     }
 }
 
+/// Reads one newline-terminated JSON message from the launcher, panicking if
+/// the read fails, including on the socket's read timeout, or if the line is
+/// not JSON, as at end of stream.
 fn receive(reader: &mut BufReader<TcpStream>) -> serde_json::Value {
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
@@ -22,6 +32,10 @@ fn receive(reader: &mut BufReader<TcpStream>) -> serde_json::Value {
 }
 
 /// Starts a launcher against a head bound here and reads its presentation.
+///
+/// Returns the launcher guard, the head's end of the connection for sending
+/// instructions, and a reader over a clone of it for receiving messages. The
+/// read timeout is set on the socket, so the clone shares it.
 fn start_launcher() -> (Launcher, TcpStream, BufReader<TcpStream>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let launcher = Launcher(
@@ -50,6 +64,8 @@ fn groups_reserve_distinct_ports_and_exits_arrive_without_another_instruction() 
     let (_launcher, mut stream, mut reader) = start_launcher();
 
     // A partial instruction must survive the supervisor's child-exit polling.
+    // The pause outlasts the read timeout `supervise` sets on the head
+    // connection, so the partial line spans more than one poll.
     stream.write_all(b"{\"reserve\":").unwrap();
     std::thread::sleep(Duration::from_millis(300));
     stream.write_all(b"{\"worker_id\":\"first\"}}\n").unwrap();
@@ -74,6 +90,9 @@ fn groups_reserve_distinct_ports_and_exits_arrive_without_another_instruction() 
         }})
     )
     .unwrap();
+
+    // No further instruction is sent: the report must come from the
+    // launcher's own polling of its ranks.
     let exit = receive(&mut reader);
     assert_eq!(exit["worker_id"], "first");
     assert_eq!(exit["rank"], 0);
@@ -119,6 +138,9 @@ fn the_first_rank_serves_its_store_on_the_reserved_port() {
     )
     .unwrap();
 
+    // The reserved socket is already listening, so this connection waits in
+    // its backlog until the rank starts and accepts it; the generous read
+    // timeout covers the interpreter's startup.
     let peer = TcpStream::connect(("127.0.0.1", port)).unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();

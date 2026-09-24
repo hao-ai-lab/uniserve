@@ -11,6 +11,13 @@
 //! A launcher's connection is its liveness signal in both directions. Closing
 //! it terminates that host's ranks, which is how an instance stops a host it
 //! can no longer reach without adding a heartbeat.
+//!
+//! The connection carries newline-delimited JSON in both directions. The
+//! launcher sends its `Presentation` once, then reports: a `RankExit` for each
+//! rank it still supervises that exits, which excludes ranks a `Stop` ended,
+//! and a `{worker_id, port}` reply to each `Reserve`. The head sends
+//! `Instruction`s. The launcher side is the `uniserve-host` binary, whose
+//! instruction and report types must stay field-compatible with these.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -69,17 +76,31 @@ pub(crate) fn lock(
 }
 
 /// Everything a launcher needs to start one rank.
+///
+/// Serialized as the body of a `spawn` instruction, so the field names are
+/// the wire contract with the launcher.
 #[derive(Serialize)]
 pub(crate) struct RemoteLaunch<'a> {
     pub rank: u32,
     pub worker_id: &'a str,
     pub world_size: u32,
     pub python: &'a str,
+    /// The launch descriptor the rank reads, as the head derived it for a
+    /// local spawn. The launcher adds the inherited store socket's number to
+    /// the first rank's copy, which only it knows.
     pub descriptor: &'a serde_json::Value,
+    /// The variables the head's spawn command for this rank sets; one the
+    /// command removes is sent with an empty value.
     pub environment: HashMap<String, String>,
 }
 
 /// One connected launcher.
+///
+/// `reader` wraps a clone of `stream`'s socket. Reports are read only through
+/// `reader`, so its buffer and `pending` stay coherent, and instructions are
+/// written only through `stream`. Blocking mode and read timeouts belong to
+/// the socket, so setting them on `stream` also governs reads through
+/// `reader`.
 struct Launcher {
     stream: TcpStream,
     reader: BufReader<TcpStream>,
@@ -184,7 +205,10 @@ impl LauncherRegistry {
     /// Waits until every named host has presented a launcher.
     ///
     /// A host that never presents fails the launch by name rather than leaving
-    /// the instance waiting for ranks that were never started.
+    /// the instance waiting for ranks that were never started. Only this
+    /// function accepts connections, so a launcher that connects after the
+    /// last awaited host presented is never read. A presentation that cannot
+    /// be read or decoded fails the wait.
     pub(crate) fn await_hosts(
         &mut self,
         hosts: &[String],
@@ -271,6 +295,7 @@ impl LauncherRegistry {
             .get_mut(host)
             .with_context(|| format!("no launcher presented host {host}"))?;
         let address = launcher.stream.peer_addr()?.ip();
+
         writeln!(
             launcher.stream,
             "{}",
@@ -279,6 +304,9 @@ impl LauncherRegistry {
         launcher
             .stream
             .set_read_timeout(Some(Duration::from_secs(10)))?;
+        // The launcher may report rank exits before it answers; those are
+        // kept for their groups and the read continues until the reply. The
+        // closure lets the read deadline be cleared on every exit path.
         let reservation = (|| {
             loop {
                 let read = launcher.reader.read_until(b'\n', &mut launcher.pending)?;
@@ -330,6 +358,13 @@ impl LauncherRegistry {
 
     /// Takes every exit of one worker group's ranks its launchers have
     /// reported, keeping the other groups' exits for their own owners.
+    ///
+    /// The drain is best effort and never blocks: it reads whatever each
+    /// connection holds, keeps a partial line in `pending` for the next call,
+    /// discards lines that do not decode as a `RankExit`, and moves on from a
+    /// launcher whose socket cannot be switched to nonblocking mode or at its
+    /// first read error or end of stream. A closed launcher connection is
+    /// therefore not reported here.
     pub(crate) fn drain_exits(&mut self, worker_id: &str) -> Vec<(String, RankExit)> {
         for (host, launcher) in self.hosts.iter_mut() {
             if launcher.stream.set_nonblocking(true).is_err() {
@@ -355,6 +390,10 @@ impl LauncherRegistry {
 
     /// Stops one worker group's ranks on every launcher, ahead of relaunching
     /// the group; the launchers stay connected for the other groups.
+    ///
+    /// The group's exits already collected are discarded. The launcher drops
+    /// the stopped ranks from its supervision before terminating them, so a
+    /// rank still running at the stop is not reported as an exit.
     pub(crate) fn stop_worker(&mut self, worker_id: &str) -> anyhow::Result<()> {
         let line = serde_json::to_string(&Instruction::Stop { worker_id })
             .context("encoding a worker stop")?;

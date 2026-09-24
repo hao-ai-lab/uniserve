@@ -1,4 +1,8 @@
 //! Public OpenAI-compatible wire schemas.
+//!
+//! The submodules are private; their public types are re-exported here and
+//! again from `crate::openai`, so callers outside `crate::openai` name them
+//! as `crate::openai::Type`.
 
 mod chat_completions;
 mod common;

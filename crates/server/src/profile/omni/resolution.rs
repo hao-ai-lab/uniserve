@@ -67,7 +67,8 @@ impl ResolutionName {
 impl std::str::FromStr for ResolutionName {
     type Err = ResolutionError;
 
-    /// Parses the value from its string representation.
+    /// Parses a wire name as returned by [`ResolutionName::as_str`], also
+    /// accepting the lowercase spelling `1.5k`.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "1:1" => Ok(Self::Square),
@@ -102,15 +103,20 @@ pub struct ResolutionBucket {
 /// Bucket set and default canvas used for resolution selection.
 pub struct ResolutionPolicy {
     /// Resolution selected when the request provides no dimensions or name.
+    ///
+    /// [`resolve_resolution`] reads only its `name` and looks that name up in
+    /// `buckets`, so a bucket of the same name must exist; that bucket's
+    /// dimensions are the ones returned.
     pub default: ResolutionBucket,
-    /// Named resolutions accepted by the profile.
+    /// Named resolutions accepted by the profile; also the only explicit
+    /// dimensions accepted when `allow_custom` is false.
     pub buckets: Vec<ResolutionBucket>,
     /// Whether arbitrary positive pixel dimensions are accepted.
     pub allow_custom: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Selected output dimensions and their stable bucket name.
+/// Selected output dimensions.
 pub struct ResolvedResolution {
     /// Selected output width in pixels.
     pub width: u32,
@@ -119,6 +125,12 @@ pub struct ResolvedResolution {
 }
 
 /// Resolves explicit dimensions or a named bucket under `policy`.
+///
+/// Explicit dimensions take precedence: when either `width` or `height` is
+/// given, `requested` is ignored, both must be present and positive, and they
+/// must match a bucket exactly unless the policy allows custom dimensions.
+/// Otherwise the named bucket, or the policy default, must exist in
+/// `buckets`.
 pub fn resolve_resolution(
     policy: &ResolutionPolicy,
     requested: Option<ResolutionName>,
@@ -196,6 +208,8 @@ mod tests {
         }
     }
 
+    /// A fixed policy accepts its bucket by name or by exact dimensions and
+    /// rejects others; a custom policy accepts any positive dimensions.
     #[test]
     fn configured_dimensions() {
         let fixed = policy(false);

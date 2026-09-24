@@ -1,4 +1,15 @@
 //! Incremental conversion from engine events to decoded text events.
+//!
+//! [`decoded_text_event_stream`] consumes one request's `EventRx`, checks the
+//! engine event protocol, detokenizes generated tokens with the tokenizer's
+//! `IncrementalDecoder`, decodes requested logprobs, and matches stop strings.
+//! `serving::assembly` feeds its output to the chat output processor.
+//!
+//! The decoder also drives the engine's output acknowledgement. When the
+//! request has stop strings, `EventRx` does not acknowledge tokens on receipt;
+//! this module acknowledges each token only after checking that it completes
+//! no stop string, and on a match stops generation at the consumed token
+//! count with `EventRx::cancel_at_consumed_prefix`.
 
 use std::sync::Arc;
 
@@ -29,7 +40,8 @@ pub struct TextDecodeOptions {
 }
 
 impl Default for TextDecodeOptions {
-    /// Returns the default value.
+    /// Skips special tokens, excludes a matched stop string from output, and
+    /// configures no stop strings or minimum length.
     fn default() -> Self {
         Self {
             skip_special_tokens: true,
@@ -46,8 +58,15 @@ pub struct Finished {
     /// Number of prompt tokens submitted to the engine.
     pub prompt_token_count: usize,
     /// Total number of generated tokens.
+    ///
+    /// Taken from the engine's `completion_tokens` when the engine finishes
+    /// the request and from the decoder's own count when a stop string ends
+    /// the stream.
     pub output_token_count: usize,
     /// Number of generated tokens consumed by internal protocol sections.
+    ///
+    /// Computed as the engine's `completion_tokens` minus the text tokens this
+    /// decoder consumed; zero when a stop string ends the stream.
     pub internal_token_count: usize,
     /// Terminal condition and optional concrete stop cause.
     pub finish_reason: FinishReason,
@@ -62,12 +81,21 @@ pub enum DecodedTextEvent {
         prompt_token_ids: Arc<[u32]>,
         /// Per-position prompt log probabilities, when requested.
         prompt_logprobs: Option<DecodedPromptLogprobs>,
-        /// Monotonic timestamp at which the request entered the serving queue.
+        /// Unix timestamp in seconds at which the request entered the engine
+        /// queue.
         queued_at: Option<f64>,
-        /// Monotonic timestamp at which engine execution began.
+        /// Unix timestamp in seconds at which the engine scheduler admitted
+        /// the request.
         scheduled_at: Option<f64>,
     },
     /// Newly decoded text and token metadata.
+    ///
+    /// With intermediate output enabled, each non-terminal update covers one
+    /// generated token (its text may be empty while the decoder holds bytes
+    /// back). The terminal update carries the flushed remainder of the text
+    /// and, when a stop string ended the stream, the matching token. Without
+    /// intermediate output, a single terminal update carries the complete
+    /// text, token IDs, and logprobs.
     TextDelta {
         /// Newly visible decoded text.
         delta: String,
@@ -80,26 +108,44 @@ pub enum DecodedTextEvent {
     },
 }
 
+/// Result of decoding one generated token.
 struct ArDecode {
+    /// Newly visible text; empty unless intermediate output is enabled and no
+    /// stop string matched.
     delta: String,
+    /// Matched stop string and the byte offset of its start in
+    /// `IncrementalDecoder::output`.
     stop: Option<(String, usize)>,
 }
 
+/// Per-request decoding state for [`decoded_text_event_stream`].
 struct DecodeState<'a> {
     decoder: IncrementalDecoder<'a>,
+    /// Decode options; matched stop strings are removed from `stop_strings`.
     options: TextDecodeOptions,
+    /// Prompt logprob positions received so far.
     prompt_positions: Vec<PositionLogprobs>,
     queued_at: Option<f64>,
     scheduled_at: Option<f64>,
+    /// Whether `DecodedTextEvent::Start` has been yielded.
     started: bool,
+    /// Generated token awaiting its `TokenLogprobs` event when generated
+    /// logprobs are requested.
     pending_token: Option<u32>,
+    /// Generated text tokens consumed by the decoder.
     output_token_count: usize,
+    /// Token IDs and logprobs held for the single terminal update when
+    /// intermediate output is disabled.
     accumulated_token_ids: Vec<u32>,
     accumulated_logprobs: Option<DecodedLogprobs>,
 }
 
 impl DecodeState<'_> {
     /// Emits start metadata once scheduling and any requested prompt scores are complete.
+    ///
+    /// Idempotent: does nothing after `Start` has been yielded or while a
+    /// prerequisite is missing. The `TextToken` and `Finished` handlers check
+    /// `started` afterwards to reject output that arrives too early.
     async fn emit_start_if_ready(
         &mut self,
         request_id: &str,
@@ -137,6 +183,13 @@ impl DecodeState<'_> {
     }
 
     /// Decodes one committed token, applies stop-string holdback, and emits terminal metadata.
+    ///
+    /// Returns `true` when the token completed a stop string. In that case the
+    /// engine has been told to stop at this token, the decoder has been
+    /// flushed and truncated at the match, and the terminal `TextDelta` has
+    /// been yielded, so the caller must end the stream. Otherwise the token is
+    /// acknowledged to the engine and, with intermediate output, yielded as
+    /// its own `TextDelta`.
     #[allow(clippy::too_many_arguments)]
     async fn consume_token(
         &mut self,
@@ -171,6 +224,8 @@ impl DecodeState<'_> {
             }
         }
         if let Some((stop_string, offset)) = decoded.stop {
+            // Stop generation at exactly the tokens received so far, which
+            // include this one.
             raw_stream.cancel_at_consumed_prefix(
                 crate::engine_client::StreamCancelCause::StopStringMatched,
             );
@@ -179,6 +234,8 @@ impl DecodeState<'_> {
             } else {
                 offset
             });
+            // `last_chunk` is the not-yet-emitted remainder of the truncated
+            // text; `text` is the complete truncated output.
             let (last_chunk, text) = self.decoder.flush(truncate_to)?;
             let (delta, token_ids, logprobs) = if intermediate {
                 (
@@ -225,6 +282,10 @@ impl DecodeState<'_> {
 }
 
 /// Advances incremental decoding and returns only bytes newly made visible by this token.
+///
+/// Stop strings are checked only from token number `min_tokens + 1` onward
+/// (`output_token_count` counts the tokens before this one). A matched stop
+/// string is removed from `options.stop_strings`.
 fn decode_one_token(
     decoder: &mut IncrementalDecoder<'_>,
     token_id: u32,
@@ -253,6 +314,22 @@ fn decode_one_token(
 }
 
 /// Decodes one canonical generation event stream into text-runtime events.
+///
+/// On success the stream yields exactly one `DecodedTextEvent::Start`, then
+/// `TextDelta` updates, the last of which carries `finished`. `intermediate`
+/// selects one update per generated token instead of a single accumulated
+/// terminal update. When `generated_logprobs_requested` is set, every
+/// `TextToken` must be followed by a `TokenLogprobs` event for the same token
+/// whose first candidate is that token.
+///
+/// # Errors
+///
+/// Fails with [`Error::EmptyPromptTokenIds`] for an empty prompt,
+/// [`Error::Rejected`] when the engine rejects the request,
+/// [`Error::MalformedOutput`] when engine events violate the protocol or the
+/// engine reports an error or an unavailable artifact,
+/// [`Error::StreamClosedBeforeTerminalOutput`] when the channel closes without
+/// a terminal event, and a tokenizer error when decoding fails.
 #[allow(clippy::too_many_arguments)]
 #[try_stream]
 pub async fn decoded_text_event_stream(
@@ -279,6 +356,8 @@ pub async fn decoded_text_event_stream(
         decode_options.skip_special_tokens,
         stop_string_holdback_bytes(&decode_options),
     );
+    // The first prompt token has no left context to score, so prompt logprobs
+    // cover every position after it (see `DecodedPromptLogprobs`).
     let expected_prompt_positions = prompt_token_count.saturating_sub(1);
     let mut state = DecodeState {
         decoder,
@@ -393,6 +472,7 @@ pub async fn decoded_text_event_stream(
                         message: "engine returned token logprobs without a pending token"
                             .to_string(),
                     })?;
+                // The event protocol lists the sampled token as the first candidate.
                 if pending != id || candidates.first().is_none_or(|entry| entry.token_id != id) {
                     return Err(Error::MalformedOutput {
                         request_id: request_id.clone(),
@@ -443,6 +523,8 @@ pub async fn decoded_text_event_stream(
                 }
                 let finish_reason = FinishReason::with_stop_reason(reason, stop_reason);
 
+                // Release the decoder's holdback untruncated: a stop-string
+                // match would have ended the stream in `consume_token`.
                 let (last_chunk, text) = state.decoder.flush(None)?;
                 let full_text = tracing::enabled!(Level::TRACE).then(|| text.clone());
                 let (delta, token_ids, logprobs) = if intermediate {
@@ -512,6 +594,11 @@ pub async fn decoded_text_event_stream(
 }
 
 /// Returns the suffix byte count retained to detect cross-chunk stop strings.
+///
+/// Holding back one byte less than the longest stop string keeps any partial
+/// match out of emitted text until the next token confirms or rules it out.
+/// No holdback is needed when matched stop strings stay in the output. The
+/// result is passed to the decoder as its `min_bytes_to_buffer`.
 pub(crate) fn stop_string_holdback_bytes(options: &TextDecodeOptions) -> usize {
     if options.include_stop_str_in_output {
         return 0;
@@ -524,7 +611,14 @@ pub(crate) fn stop_string_holdback_bytes(options: &TextDecodeOptions) -> usize {
         .saturating_sub(1)
 }
 
-/// Returns the earliest configured stop string ending at the current suffix.
+/// Returns the first configured stop string that matches newly decoded text.
+///
+/// Only matches that include at least one of the last `new_bytes` bytes of
+/// `output` are considered, so earlier text is not rescanned and nothing
+/// matches when `new_bytes` is zero. Stop strings are tried in `stops` order;
+/// the first one that matches wins, at its last occurrence in the searched
+/// range. Returns the stop string's index in `stops` and the byte offset of
+/// the match start in `output`.
 pub(crate) fn matches_stop_string(
     stops: &[String],
     output: &str,

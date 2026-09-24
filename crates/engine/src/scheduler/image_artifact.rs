@@ -1,4 +1,9 @@
 //! Validation and metadata extraction for PNG artifacts returned by workers.
+//!
+//! Workers deliver a generated image as a base64-encoded PNG. Result
+//! validation (`generation::validate_generation_result`) reads only the IHDR
+//! header to check the requested dimensions; the output path
+//! (`image_done_event`) decodes the whole image once before publishing it.
 
 use std::io::Cursor;
 
@@ -9,15 +14,24 @@ use base64::Engine as _;
 pub(crate) struct PngInfo {
     pub(crate) height: u32,
     pub(crate) width: u32,
+    /// Size of the decoded PNG file in bytes, not of its base64 text.
     pub(crate) bytes: u64,
 }
 
-/// Parses image dimensions from a base64 PNG's IHDR header, decoding only the
-/// base64 prefix. The response path validates artifact dimensions per
-/// final image call; decoding the entire multi-megabyte frame there costs hundreds
-/// of milliseconds per image, while the header carries the dimensions in the
-/// first 24 bytes.
+/// Parses `(height, width)` from a base64 PNG's IHDR header, decoding only
+/// the base64 prefix.
+///
+/// Result validation checks artifact dimensions for every image-decoding call;
+/// decoding a multi-megabyte frame there is far more expensive than reading
+/// the header, which carries the dimensions in its first 24 bytes. The frame
+/// itself is not checked. Returns `None` when the prefix is not valid base64,
+/// is shorter than the header, lacks the PNG signature, does not start with
+/// an IHDR chunk, or declares a zero dimension.
 pub(crate) fn png_artifact_dims_b64(pixels_png_b64: &str) -> Option<(u32, u32)> {
+    // Signature (8 bytes), chunk length (4), `IHDR` (4), width (4), and height
+    // (4) fill the first 24 bytes; 44 base64 characters decode to 33 bytes.
+    // Rounding down to a multiple of four keeps the prefix on a base64 group
+    // boundary so it decodes without padding.
     let prefix = &pixels_png_b64.as_bytes()[..pixels_png_b64.len().min(44) & !3];
     let head = base64::engine::general_purpose::STANDARD
         .decode(prefix)
@@ -31,6 +45,12 @@ pub(crate) fn png_artifact_dims_b64(pixels_png_b64: &str) -> Option<(u32, u32)> 
 }
 
 /// Verifies PNG framing and declared metadata, then returns response metadata.
+///
+/// Fully decodes the first frame. `expected_hw`, when set, is the required
+/// `(height, width)`. Returns `None` when the payload is not valid base64, the
+/// PNG header cannot be read, a dimension is zero, the dimensions differ from
+/// `expected_hw`, the output buffer size cannot be computed, the frame fails
+/// to decode, or the decoded frame's dimensions differ from the header's.
 pub(crate) fn validate_png_artifact(
     pixels_png_b64: &str,
     expected_hw: Option<(u32, u32)>,

@@ -1,4 +1,13 @@
 //! Incremental assistant block assembly into the public request output.
+//!
+//! `assemble_chat_event_stream` feeds parsed assistant events into
+//! [`OutputProcessor`], which frames them as public events: text and reasoning
+//! become `OutputBlockStart`, deltas, and `OutputBlockEnd`; tool calls become
+//! `ToolCallStart`, `ToolCallArgumentsDelta`, and `ToolCallEnd`. Two index
+//! spaces are in use. Content-block indices count every closed block, tool
+//! calls included, so they give the block's position among all assistant
+//! content blocks. Tool-call indices are ordinals among tool calls only; the
+//! Chat Completions stream publishes them as the tool-call `index`.
 
 use crate::serving::RequestOutput;
 use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, Error, Result};
@@ -28,11 +37,13 @@ struct OpenToolCall {
 
 /// Per-stream block assembly state.
 ///
-/// The processor maintains at most one open text block and one open tool call,
-/// and appends deltas to them until the semantic kind changes or the stream
-/// terminates.
+/// At most one block, text-like or tool call, is open at a time: a text delta
+/// closes an open tool call, a change of text kind closes the open text block,
+/// and a tool-call start closes whichever block is open. Deltas append to the
+/// open block until it closes or the stream terminates.
 pub(crate) struct OutputProcessor {
-    /// Number of blocks already delivered to the output consumer.
+    /// Number of closed blocks, text-like and tool calls alike. The next
+    /// opened text block takes this value as its content-block index.
     num_completed_blocks: usize,
     /// Currently open text or reasoning block, if any.
     open_text_block: Option<OpenTextBlock>,
@@ -54,6 +65,8 @@ impl OutputProcessor {
     }
 
     /// Converts one parsed text delta into zero or more structured chat events.
+    ///
+    /// Any open tool call is closed first, even when `delta` is empty.
     pub(crate) fn process_text_delta(
         &mut self,
         kind: AssistantBlockKind,
@@ -84,6 +97,10 @@ impl OutputProcessor {
     }
 
     /// Appends one incremental tool-call arguments delta.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::ToolCallStreamInvariant` when no tool call is open.
     pub(crate) fn push_tool_call_arguments(&mut self, delta: String) -> Result<Vec<RequestOutput>> {
         let mut events = Vec::new();
         let Some(open_tool_call) = self.open_tool_call.as_mut() else {
@@ -107,8 +124,8 @@ impl OutputProcessor {
         events
     }
 
-    /// Appends one semantic text delta to the current block, or open a new block
-    /// when the semantic kind changes.
+    /// Appends one semantic text delta to the current block, or opens a new
+    /// block when the semantic kind changes. Empty deltas are ignored.
     fn push_text_delta(
         &mut self,
         kind: AssistantBlockKind,
@@ -181,6 +198,8 @@ impl OutputProcessor {
     }
 }
 
+/// Emits the public delta event for one text or reasoning chunk.
+///
 /// Text and reasoning are distinct public deltas; block indices are carried
 /// by the opening and closing events.
 fn push_delta(events: &mut Vec<RequestOutput>, kind: AssistantBlockKind, text: String) {

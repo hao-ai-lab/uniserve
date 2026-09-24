@@ -1,4 +1,10 @@
 //! Request-ID validation, generation, propagation, and response headers.
+//!
+//! This middleware only decides the `X-Request-Id` response header. The ID a
+//! handler uses to identify the request to the serving runtime is resolved
+//! separately by `crate::http::utils::resolve_request_id`, which accepts a
+//! wider character set, so a client ID can be used as the runtime ID while the
+//! response header carries a generated one.
 
 use axum::extract::Request;
 use axum::http::HeaderValue;
@@ -9,22 +15,27 @@ use uuid::Uuid;
 
 const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
-/// Maximum length of a client-supplied request id we are willing to echo back.
+/// Maximum length of a client-supplied request id that is echoed back.
 ///
 /// A generated `uuid4` simple form is 32 chars; legitimate correlation ids are
-/// short. Capping the length bounds how much attacker-controlled data we
-/// reflect into the response and downstream logs.
+/// short. Capping the length bounds how much attacker-controlled data is
+/// reflected into the response and downstream logs.
 const MAX_REQUEST_ID_LEN: usize = 128;
 
 /// Echoes the request's `X-Request-Id` on the response, or generates a fresh
 /// `uuid4` hex if the request did not provide a usable one.
 ///
-/// The incoming value is attacker-controlled, so we only echo it when it is a
-/// short, non-empty token of safe visible-ASCII characters (`A-Za-z0-9` plus
-/// the separators `-`, `_`, `.`). Anything outside that — empty, over-long, or
-/// containing opaque/non-visible bytes that a `HeaderValue` is otherwise
-/// permitted to hold — is discarded in favour of a freshly generated id rather
-/// than reflected unvalidated.
+/// `routes::build_router` installs this layer only when
+/// `AppState::enable_request_id_headers` is set. The incoming value is
+/// attacker-controlled, so it is echoed only when it is a short, non-empty
+/// token of safe visible-ASCII characters (`A-Za-z0-9` plus the separators
+/// `-`, `_`, `.`). Anything outside that — empty, over-long, or containing
+/// opaque/non-visible bytes that a `HeaderValue` is otherwise permitted to
+/// hold — is discarded in favor of a freshly generated id rather than
+/// reflected unvalidated.
+///
+/// The generated id is not shared with the generation handlers, which resolve
+/// their own request id from the same header.
 pub(crate) async fn set_request_id_header(req: Request, next: Next) -> Response {
     let incoming = req
         .headers()
@@ -48,6 +59,9 @@ fn is_safe_request_id(value: &HeaderValue) -> bool {
 }
 
 /// Generates a fresh `uuid4` hex request id.
+///
+/// The simple form is 32 lowercase hex digits, which is always a valid header
+/// value, so the all-zero fallback is not expected to be reached.
 fn generate_request_id() -> HeaderValue {
     HeaderValue::from_str(&Uuid::new_v4().simple().to_string())
         .unwrap_or_else(|_| HeaderValue::from_static("00000000000000000000000000000000"))

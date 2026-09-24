@@ -1,4 +1,22 @@
 //! Process-wide Prometheus registry and UniServe metric families.
+//!
+//! [`METRICS`] is the one registry the server exports. Each submodule defines
+//! one group of families, listed here with the server component that updates
+//! it:
+//!
+//! - `api_server`: the HTTP metrics middleware (`track_http_metrics`), when
+//!   each response body finishes or is dropped.
+//! - `scheduler`: the engine client's scheduler-stats export task
+//!   (`record_scheduler_stats`), from periodic `SchedulerStats` snapshots.
+//! - `serving`: the `/metrics` scrape handler, which calls
+//!   `ServingMetrics::set_request_states` just before rendering.
+//! - `request`: registered and exported; the server's `StatsLogger` reads its
+//!   prompt and generation token counters.
+//!
+//! Every metric field is a `prometheus-client` handle whose clones share their
+//! underlying state, so updates through a field reach the clone held by the
+//! registry. Registration names are base names; `prometheus-client` appends
+//! `_total` to counters when encoding.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -26,8 +44,6 @@ pub use scheduler::{
 };
 pub use serving::{ServingMetrics, ServingRequestLabels};
 
-// `prometheus-client` appends `_total` while encoding counters, so registration
-// names use the base metric name.
 /// Unsigned Prometheus counter used by metric families.
 pub type U64Counter = Counter<u64, AtomicU64>;
 /// Unsigned Prometheus gauge used by metric families.
@@ -35,9 +51,13 @@ pub type U64Gauge = Gauge<u64, AtomicU64>;
 /// Floating-point Prometheus gauge used by metric families.
 pub type F64Gauge = Gauge<f64, AtomicU64>;
 /// Histogram family keyed by engine identity.
+///
+/// The `fn() -> Histogram` constructor lets each family choose its bucket
+/// layout through `Family::new_with_constructor`; every series created for a
+/// new label set uses that layout.
 pub(crate) type HistogramFamily = Family<EngineLabels, Histogram, fn() -> Histogram>;
 
-/// Shared Prometheus registry for frontend metrics.
+/// Prometheus registry together with handles to every UniServe metric family.
 pub struct Metrics {
     registry: Registry,
     /// Scheduler, cache, and worker execution metric families.
@@ -68,8 +88,11 @@ impl Metrics {
         }
     }
 
-    /// Renders the current metrics registry into Prometheus/OpenMetrics text
-    /// format.
+    /// Renders the current metrics registry into OpenMetrics text format.
+    ///
+    /// # Errors
+    ///
+    /// Returns the formatter error raised while encoding the registry.
     pub fn render(&self) -> Result<String, fmt::Error> {
         let mut output = String::new();
         encode(&mut output, &self.registry)?;
@@ -89,5 +112,5 @@ impl Default for Metrics {
     }
 }
 
-/// Process-global metrics registry shared by the frontend crates.
+/// Process-global metrics registry, written and rendered by the server crate.
 pub static METRICS: LazyLock<Metrics> = LazyLock::new(Metrics::new);

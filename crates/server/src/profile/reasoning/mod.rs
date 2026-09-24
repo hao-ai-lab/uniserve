@@ -1,6 +1,14 @@
 //! Streaming reasoning parsers and semantic deltas.
+//!
+//! A parser splits a stream of decoded text deltas into reasoning text and
+//! visible content by matching delimiter text such as `<think>` and
+//! `</think>`. [`DelimitedReasoningParser`] implements the state machine;
+//! [`Qwen3ReasoningParser`] configures it for Qwen3 chat output, and the
+//! multimodal output filter in `serving::omni::output` configures it from a
+//! profile's `OutputFilterPolicy`.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 mod delimited;
 mod qwen3;
 
@@ -13,6 +21,9 @@ pub use self::qwen3::Qwen3ReasoningParser;
 pub type Result<T> = std::result::Result<T, ReasoningError>;
 
 /// One parsed streaming delta split into reasoning and visible content.
+///
+/// The push methods ignore empty text, so a field they populate always holds
+/// non-empty text.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReasoningDelta {
     /// Incremental hidden reasoning text.

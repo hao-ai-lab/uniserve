@@ -1,8 +1,18 @@
 //! Load-time model resolution and model-owned request tokenization.
 //!
-//! [`InputProcessor`] binds tokenizer assets, generation policy, geometry, and
+//! `ModelConfig::load` resolves checkpoint facts, the tokenizer, and the chat renderer at
+//! startup: a diffusers pipeline index selects a video model (which has no renderer), and
+//! otherwise the root `config.json` selects a token-generating model. [`InputProcessor::new`]
+//! then binds the capabilities the connected worker advertises ([`WorkerCapabilities`]) and
+//! the result is shared immutably by the serving runtime.
+//!
+//! [`InputProcessor`] binds tokenizer assets, generation limits, sampling policy, and
 //! output processing. [`InputProcessor::preprocess_text_request`] produces a [`GenerationRequest`]
-//! and the [`ResponseOptions`] retained by the frontend.
+//! and the [`ResponseOptions`] retained by the frontend. The chat and image entry points in the
+//! sibling `preprocessing` module route through the same `InputProcessor::preprocess_generation`,
+//! which delegates SenseNova and Bagel inputs to the sibling `omni` module; `omni` reads the
+//! `pub(super)` fields.
+//! [`InputProcessor::preprocess_video_request`] produces a `DiffusionRequest` for MiniMax H3.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -121,6 +131,9 @@ pub enum ServedSamplingControl {
 
 impl ServedSamplingControl {
     /// Sampling controls supported by token-generating model profiles.
+    ///
+    /// `EngineClient::served_sampling_controls` advertises this full set when the worker
+    /// supports token sampling and no controls otherwise.
     pub const ALL: [Self; 16] = [
         Self::Greedy,
         Self::Temperature,
@@ -141,7 +154,8 @@ impl ServedSamplingControl {
     ];
 }
 
-/// Exact public route declaration for one load-bound model.
+/// Exact public route declaration for one load-bound model, built by
+/// [`InputProcessor::support`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSupport {
     /// Public endpoints served by the model.
@@ -158,10 +172,16 @@ pub struct ModelSupport {
 
 /// Owns the tokenizer and template resources used to produce final engine inputs.
 /// Runtime capabilities are fixed at construction, before this value is shared.
+///
+/// Preprocessing methods are synchronous and CPU-bound; `ServingRuntime` runs its request
+/// preprocessing on the blocking pool.
 pub struct InputProcessor {
     pub(super) config: ModelConfig,
     pub(super) tokenizer: DynTokenizer,
+    // `None` only for a video model; `InputProcessor::new` rejects a missing renderer for
+    // every other model.
     pub(super) renderer: Option<HfChatRenderer>,
+    // Worker-advertised generation features and resource limits.
     pub(super) limits: GenerationLimits,
     sampling_controls: Vec<ServedSamplingControl>,
     parse_reasoning: bool,
@@ -206,6 +226,11 @@ pub enum ModelResolutionError {
 
 impl ModelConfig {
     /// Loads model facts and the tokenizer/template resources needed by preprocessing.
+    ///
+    /// Returns the renderer as `None` for a diffusers pipeline. The returned
+    /// `max_model_tokens` is always set: the configured `max_model_len`, else, for a root
+    /// configuration, its `max_position_embeddings` or `EngineSettings::DEFAULT_MAX_MODEL_LEN`,
+    /// and for a pipeline the model's default prompt limit.
     pub(crate) async fn load(
         config: &crate::Config,
     ) -> std::result::Result<(Self, DynTokenizer, Option<HfChatRenderer>), ModelResolutionError>
@@ -239,6 +264,7 @@ impl ModelConfig {
             )?;
             return Ok((model, tokenizer, None));
         }
+
         let files = ResolvedModelFiles::new(&config.model).await?;
         let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path)?);
         let mut model = Self::from_files(
@@ -270,6 +296,9 @@ impl ModelConfig {
     }
 
     /// Model's effective startup context ceiling.
+    ///
+    /// `InputProcessor::new` replaces the stored value with `WorkerCapabilities::max_model_tokens`,
+    /// so after binding this returns the served limit.
     pub(crate) fn max_model_tokens(&self) -> u32 {
         self.max_model_tokens
             .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN)
@@ -352,6 +381,19 @@ pub struct WorkerCapabilities {
 
 impl InputProcessor {
     /// Binds model resources to verified worker capabilities without rebuilding model data.
+    ///
+    /// Replaces the model's context ceiling with `worker.max_model_tokens` and, for MiniMax H3,
+    /// its denoise-step count with `worker.denoise_steps`; `denoise_steps` is ignored for other
+    /// models.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ServeError::ModelResolution` with:
+    /// - `MissingFeature` when the worker limits do not cover the features the configured
+    ///   model needs;
+    /// - `MissingTemplate` when a token-generating model has no chat renderer;
+    /// - `MediaContract` when the model is MiniMax H3 and the worker advertises zero denoise
+    ///   steps.
     pub fn new(
         mut config: ModelConfig,
         tokenizer: DynTokenizer,
@@ -365,6 +407,7 @@ impl InputProcessor {
             max_model_tokens,
             denoise_steps,
         } = worker;
+
         let needs = match &config.parameters {
             ModelParameters::Qwen3 => GenerationFeatures::UNDERSTANDING,
             ModelParameters::SenseNova(profile) => {
@@ -376,6 +419,7 @@ impl InputProcessor {
             ModelParameters::MiniMaxH3 { .. } => GenerationFeatures::empty(),
         };
         validate_runtime_features(&config, &limits, needs)?;
+
         if !matches!(config.parameters, ModelParameters::MiniMaxH3 { .. }) && renderer.is_none() {
             return Err(ServeError::ModelResolution(
                 ModelResolutionError::MissingTemplate,
@@ -399,6 +443,7 @@ impl InputProcessor {
             }
             *num_inference_steps = denoise_steps;
         }
+
         Ok(Self {
             config,
             tokenizer,
@@ -420,6 +465,10 @@ impl InputProcessor {
     }
 
     /// Public duration, geometry and prompt limits from the serving description.
+    ///
+    /// Returns `Value::Null` for a model that serves no video; the Dynamo worker uses that to
+    /// refuse a non-MiniMax H3 checkpoint. The 22-frame minimum, 24 fps, and default duration
+    /// (the lesser of 5 seconds and the configured maximum) match `video_sampling`.
     pub fn video_capabilities(&self) -> serde_json::Value {
         match &self.config.parameters {
             ModelParameters::MiniMaxH3 {
@@ -446,6 +495,9 @@ impl InputProcessor {
 
     /// Validates the video API request, tokenizes its prompt, and prepares the
     /// checkpoint frame and media unit counts for direct engine submission.
+    ///
+    /// The returned request carries a placeholder `RequestId(0)`; the caller must replace it
+    /// with the identifier reserved by `EngineClient::register_request` before submission.
     pub fn preprocess_video_request(
         &self,
         request_id: &crate::serving::ServeRequestId,
@@ -500,6 +552,15 @@ impl InputProcessor {
     }
 
     /// Resolves the advertised duration default and the model's frame alignment.
+    ///
+    /// Returns the effective duration in seconds and the diffusion sampling parameters. The
+    /// asynchronous video route calls this directly to learn the duration before submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the model serves no video, or when the duration is not finite,
+    /// not positive, above the configured maximum, not representable as a frame count, or
+    /// resolves to fewer than 22 frames.
     pub fn video_sampling(
         &self,
         request_id: &crate::serving::ServeRequestId,
@@ -531,6 +592,8 @@ impl InputProcessor {
                 )),
             }));
         }
+        // Frames are counted at 24 fps. The upper bound leaves room for the at most 16 frames
+        // `align_num_frames` adds.
         let raw_frames = (seconds * 24.0).round();
         if raw_frames < 1.0 || raw_frames > f64::from(u32::MAX - 16) {
             return Err(crate::openai::serve_error_to_api(ServeError::Tokenize {
@@ -587,8 +650,10 @@ impl InputProcessor {
         )
     }
 
-    /// Returns the route limits exposed by model discovery and enforced by
-    /// request admission.
+    /// Declares the endpoints, modalities, features, and sampling controls this model serves.
+    ///
+    /// Within the server, `validate_generation_features` consults its `features` to refuse
+    /// tool-calling and reasoning requests when the model does not declare those features.
     pub fn support(&self) -> ModelSupport {
         if matches!(self.config.parameters, ModelParameters::MiniMaxH3 { .. }) {
             return ModelSupport {
@@ -636,6 +701,10 @@ impl InputProcessor {
     }
 
     /// Validates the prompt and requested modalities against the loaded model.
+    ///
+    /// Every refusal is `ServeError::UnsupportedFeature`. The final check asks the worker
+    /// limits to cover the features this request reaches; for SenseNova and Bagel these
+    /// depend on the selected modalities and on whether the request carries an input image.
     fn validate_generation_features(
         &self,
         request_id: &crate::serving::ServeRequestId,
@@ -658,6 +727,8 @@ impl InputProcessor {
         }
         let declared = self.support();
         if let PromptInput::Chat(chat) = prompt {
+            // Tool definitions, prior assistant tool calls, and tool responses all require a
+            // model that parses tool calls.
             let uses_tools = !chat.tools.is_empty()
                 || chat.messages.iter().any(|message| match message {
                     crate::serving::chat::ChatMessage::Developer { tools, .. } => {
@@ -700,6 +771,9 @@ impl InputProcessor {
     }
 
     /// Preprocesses a programmatic text prompt without a chat-template conversion.
+    ///
+    /// The returned request carries a placeholder engine identifier (see
+    /// `InputProcessor::preprocess_generation`).
     pub fn preprocess_text_request(
         &self,
         request: TextPromptRequest,
@@ -743,6 +817,16 @@ impl InputProcessor {
     }
 
     /// Tokenizes model input and resolves its final engine and output requirements.
+    ///
+    /// The returned `GenerationRequest::request_id` is a placeholder derived from the external
+    /// identifier. `EngineClient::submit_generation` accepts only the identifier reserved by
+    /// `EngineClient::register_request`, so the caller must replace it before submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ServeError::UnsupportedFeature` from feature validation and
+    /// `ServeError::Tokenize` for every failure during tokenization, validation, and resource
+    /// sizing.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn preprocess_generation(
         &self,
@@ -763,6 +847,7 @@ impl InputProcessor {
             || matches!(&prompt, PromptInput::Chat(chat) if chat.has_multimodal());
         self.validate_generation_features(&request_id, &prompt, has_input_image, modalities)?;
         let constraint = crate::serving::omni::generation_constraint(modalities);
+
         let mut generation = GenerationRequest {
             request_id: RequestId(stable_hash(request_id.as_ref())),
             prompt_token_ids: Vec::new(),
@@ -770,6 +855,7 @@ impl InputProcessor {
             multimodal_inputs: Default::default(),
             constraint,
             sampling: SamplingParams {
+                // An image-generation seed takes precedence over the text sampling seed.
                 seed: image_gen
                     .as_ref()
                     .and_then(|image| image.seed)
@@ -794,6 +880,7 @@ impl InputProcessor {
 
         // Each model fills its actual computation inputs in the same request.
         // No partially prepared request is exposed to the submission boundary.
+        // The closure gathers every `TokenizeError` so it maps once to `ServeError::Tokenize`.
         let (output_processor, max_kv_tokens, image_latent_units) =
             (|| -> std::result::Result<_, crate::serving::TokenizeError> {
                 let output_processor = match &self.config.parameters {
@@ -878,13 +965,21 @@ impl InputProcessor {
     }
 }
 
-/// Fast H3 reconstructs frame counts congruent to five modulo seventeen.
-/// The caller checks that adding at most sixteen frames cannot overflow.
+/// Rounds a frame count up to the next value of the form `5 + 17k`.
+///
+/// The worker-side MiniMax H3 model decodes such a video as `k` media units of 17 frames plus
+/// a final 5-frame tail, and rejects any other count. The result is 5 for inputs up to 5, which
+/// `video_sampling` rejects as shorter than the 22-frame minimum. The caller checks that
+/// adding at most sixteen frames cannot overflow.
 fn align_num_frames(num_frames: u32) -> u32 {
     num_frames + (22 - num_frames % 17) % 17
 }
 
 /// Returns the multimodal resources required by the active profile.
+///
+/// Used at load time: evaluates `GenerationConstraint::Default` (both understanding and
+/// generation branches enabled) with every configured image encoder. Per-request checks use
+/// `omni_required_features`.
 fn configured_omni_needs(
     policy: &ImageGenerationConfig,
     image_encoders: &[uniserve_core::ImageEncoderInput],
@@ -895,7 +990,8 @@ fn configured_omni_needs(
     )
 }
 
-/// Validates the runtime features.
+/// Refuses to bind a model whose required features the worker limits do not cover,
+/// reporting the uncovered features as `ModelResolutionError::MissingFeature`.
 fn validate_runtime_features(
     config: &ModelConfig,
     limits: &GenerationLimits,
@@ -910,6 +1006,9 @@ fn validate_runtime_features(
 }
 
 /// Returns the runtime features required for multimodal serving.
+///
+/// The profile's context image encoders count only when the request carries an input image;
+/// `ImageGenerationConfig::required_features` adds feedback encoders independently of it.
 fn omni_required_features(
     policy: &ImageGenerationConfig,
     image_encoders: &[uniserve_core::ImageEncoderInput],
@@ -947,8 +1046,6 @@ impl InputProcessor {
             PromptInput::Chat(mut chat_request) => {
                 chat_request.decode_options = decode.clone();
                 chat_request.validate()?;
-                // Build the processor once to apply parser-driven request
-                // adjustments (e.g. disabling special-token skipping).
                 let processor = Qwen3ChatOutputProcessor::new(
                     &mut chat_request,
                     std::sync::Arc::clone(&self.tokenizer),
@@ -974,7 +1071,8 @@ impl InputProcessor {
         generation.stop_token_ids = stop_token_ids;
         generation.max_und_tokens = max_tokens as usize;
         generation.include_stop_token = decode.include_stop_str_in_output;
-        // Prompt logprobs require computation for every prompt token.
+        // Prompt logprobs require computation for every prompt token, which a prefix-cache
+        // read would skip.
         generation.cache.read &= !generation.sampling.prompt_logprobs_requested();
         decode.skip_special_tokens = skip_special_tokens;
         Ok(output_processor)
@@ -997,6 +1095,8 @@ impl InputProcessor {
         )?;
         let min_tokens = sampling.min_tokens.unwrap_or(0);
 
+        // Unless the request ignores EOS, the checkpoint's EOS ids other than the primary one
+        // become explicit stop tokens.
         let mut stop_token_ids = stop.stop_token_ids.clone();
         if !sampling.ignore_eos {
             for token_id in self
@@ -1028,7 +1128,9 @@ impl InputProcessor {
         };
         super::sampling::apply_sampling(&self.tokenizer, sampling, stop, &mut core)?;
 
-        // Logprob feature gate.
+        // Logprob requests need `Logprobs` among the served sampling controls, which
+        // `EngineClient::served_sampling_controls` includes only when the worker supports
+        // token sampling.
         if (stop.logprobs.is_some() || stop.prompt_logprobs.is_some())
             && !self
                 .sampling_controls
@@ -1041,7 +1143,10 @@ impl InputProcessor {
     }
 }
 
-/// Computes a deterministic identifier for a preprocessed request.
+/// Computes a deterministic identifier for a preprocessed request (64-bit FNV-1a).
+///
+/// The value is a placeholder: `ServingRuntime` replaces it with the engine-reserved
+/// identifier before submission.
 fn stable_hash(value: &str) -> u64 {
     value
         .as_bytes()

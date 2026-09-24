@@ -1,13 +1,33 @@
 //! Assembly of engine events into public serving events.
 //!
-//! The assembler applies model-selected output processing, tracks usage, and
-//! emits exactly one terminal result for each accepted request.
+//! `submit_and_stream` in the parent module selects one of three assemblers
+//! for each submitted request:
+//!
+//! - [`assemble_chat_event_stream`] serves generation requests whose output
+//!   policy is `OutputProcessorPolicy::Qwen3`, which Qwen3 models select for
+//!   chat prompts. It pulls decoded text from `decoded_text_event_stream`, runs
+//!   it through the request's `Qwen3ChatOutputProcessor` (reasoning and
+//!   tool-call parsing), and turns the resulting assistant events into
+//!   content-block and tool-call events.
+//! - [`assemble_event_stream`] serves every other generation policy (raw text
+//!   and SenseNova filtering). It decodes engine events itself, applies stop
+//!   strings, and forwards the image lifecycle of image-generating models.
+//! - [`assemble_media_event_stream`] serves diffusion media requests.
+//!
+//! Every assembler tracks usage and timings and ends its stream with exactly
+//! one terminal item: a terminal `RequestOutput` (`Finished`, `Cancelled`,
+//! `Aborted`, `Failed`, or `Rejected`), or a `ServeError::OutputProcessing`
+//! error when output processing fails, for example because engine output
+//! violates the event protocol. Elapsed times are microseconds since
+//! `EventContext::started`. The queue wait is the difference of the engine's
+//! `Scheduled` Unix timestamps, converted to microseconds and clamped at zero.
 
 use super::chat::output::AssistantEvent;
 use super::chat::output::structured::OutputProcessor;
 use super::*;
 
-/// Runtime output sink built from the model-supplied [`OutputProcessorPolicy`].
+/// Runtime output sink built from the model-supplied [`OutputProcessorPolicy`]
+/// for [`assemble_event_stream`].
 enum OutputSink {
     /// Raw visible text.
     Raw,
@@ -16,6 +36,14 @@ enum OutputSink {
 }
 
 /// Constructs the model-selected semantic output processor for one request.
+///
+/// `OutputProcessorPolicy::Qwen3` never reaches this function: the dispatch in
+/// `submit_and_stream` routes it to [`assemble_chat_event_stream`] instead.
+///
+/// # Errors
+///
+/// Returns `ServeError::OutputProcessing` when `SenseNovaOutputProcessor::new`
+/// cannot build the profile's reasoning parser.
 fn build_output_sink(
     request_id: &ServeRequestId,
     policy: OutputProcessorPolicy,
@@ -40,20 +68,31 @@ fn build_output_sink(
     }
 }
 
+/// Request identity and timing borrowed by the emit helpers.
 struct EmitContext<'a> {
     request_id: &'a ServeRequestId,
     event: &'a EventContext,
     started: &'a Instant,
 }
 
+/// Per-request usage counters folded into the final `Usage` event.
 struct TerminalAccounting {
+    /// Scheduler queue wait derived from the engine's `Scheduled` timestamps.
     queue_us: Option<u64>,
+    /// Visible-output latency, recorded on non-empty text or reasoning
+    /// deltas, tool-call starts, image begins, and media artifacts.
     first_visible_output_us: Option<u64>,
     image_count: u32,
     image_steps: u32,
 }
 
 /// Applies text filtering and emits visible, reasoning, and terminal updates in order.
+///
+/// Reasoning text is yielded before the visible `TextDelta` produced by the
+/// same update. A `TextDelta` is yielded whenever it carries visible text,
+/// token IDs, or logprobs, or when `finished` is set, so a terminal update
+/// always produces one even if its text is empty. Returns `finished` unchanged
+/// for the caller to pass to [`emit_terminal`].
 #[allow(clippy::too_many_arguments)]
 async fn emit_text_update(
     context: &EmitContext<'_>,
@@ -99,6 +138,13 @@ async fn emit_text_update(
 }
 
 /// Emits final usage followed by exactly one terminal serving event.
+///
+/// The terminal kind follows `done.finish_reason`: `Cancelled` and `Aborted`
+/// map to the events of the same name, `Error` maps to `Failed`, and every
+/// other reason maps to `Finished`. Visible output tokens are the generated
+/// tokens minus the internal tokens, and token counts saturate at `u32::MAX`.
+/// The engine's `Rejected`, `Error`, and `ArtifactUnavailable` events bypass
+/// this function, so no `Usage` event precedes the terminal item they produce.
 async fn emit_terminal(
     context: &EmitContext<'_>,
     accounting: TerminalAccounting,
@@ -157,6 +203,16 @@ async fn emit_terminal(
 
 #[try_stream]
 /// Applies chat output processing and assembles public serving events.
+///
+/// Emits `Accepted` and `Scheduled` from the start metadata before any output
+/// (the decoder publishes its start only after the engine's `Scheduled`
+/// event), then content-block, tool-call, and sample events, then `Usage` and
+/// one terminal event. An engine rejection surfaced by the decoder becomes a
+/// `Rejected` terminal event. Any other decoder or processor failure
+/// (including an engine error or unavailable-artifact event, which the
+/// decoder reports as malformed output), a duplicate or missing start, or a
+/// stream that closes before `Done` ends the stream with
+/// `ServeError::OutputProcessing`.
 pub(super) async fn assemble_chat_event_stream(
     assembly: StreamInput,
     processor: Qwen3ChatOutputProcessor,
@@ -175,7 +231,10 @@ pub(super) async fn assemble_chat_event_stream(
     } = assembly;
 
     // Decode raw engine events first, then apply the model-selected structured
-    // chat processor before exposing any public event.
+    // chat processor before exposing any public event. The `true` argument
+    // selects per-token decoded deltas rather than one accumulated delta at the
+    // end, and the decoder owns stop-string matching and engine
+    // acknowledgement on this path.
     let started = event_context.started;
     let emit_context = EmitContext {
         request_id: &request_id,
@@ -202,6 +261,8 @@ pub(super) async fn assemble_chat_event_stream(
     let mut queue_us = None;
     let mut first_visible_output_us = None;
     while let Some(next) = output.next().await {
+        // Engine rejection travels through the decoder as an error; it is a
+        // terminal outcome rather than an output-processing failure.
         let next = match next {
             Err(crate::serving::chat::Error::Text(crate::serving::text::Error::Rejected {
                 kind,
@@ -280,6 +341,10 @@ pub(super) async fn assemble_chat_event_stream(
         let events = match event {
             AssistantEvent::Start { .. } => unreachable!("start metadata handled above"),
             AssistantEvent::TextDelta { kind, delta } => Ok(blocks.process_text_delta(kind, delta)),
+            // Token IDs and logprobs travel separately from parsed text, as a
+            // `TextDelta` with empty text. The decoder attaches the ID of each
+            // generated token; it is dropped here unless the response
+            // requested token IDs.
             AssistantEvent::SampleDelta {
                 logprobs,
                 mut token_ids,
@@ -303,6 +368,9 @@ pub(super) async fn assemble_chat_event_stream(
                 internal_token_count,
                 finish_reason,
             } => {
+                // Close any open block or tool call before usage and the
+                // terminal event. The decoder rejects image events, so the
+                // image counts are zero.
                 for event in blocks.finish() {
                     y.yield_ok(event).await;
                 }
@@ -351,20 +419,35 @@ pub(super) async fn assemble_chat_event_stream(
     })
 }
 
+/// Protocol and accounting state of one [`assemble_event_stream`] request.
 struct RawAssemblerState {
     first_visible_output_us: Option<u64>,
     queue_us: Option<u64>,
+    /// `TextToken` events consumed so far. It gates stop-string matching on
+    /// `min_tokens`, and the engine's completion count minus this value is
+    /// reported as internal tokens.
     emitted_output_tokens: u32,
     image_count: u32,
     image_steps: u32,
+    /// Prompt logprob positions accumulated until all `prompt_len - 1` scored
+    /// positions arrive; the first prompt token has no score.
     prompt_positions: Vec<uniserve_core::PositionLogprobs>,
+    /// Whether `Accepted` has been emitted.
     accepted: bool,
+    /// `(queued_at, scheduled_at)` Unix timestamps in seconds from a
+    /// `Scheduled` event that arrived before `Accepted`.
     pending_scheduled: Option<(f64, f64)>,
+    /// Token awaiting its `TokenLogprobs` event when generated logprobs are
+    /// requested. While set, a further `TextToken`, an image event, or
+    /// `Finished` is a protocol violation.
     pending_token: Option<u32>,
+    /// `ImageCommit` and `ImageDone` events held until the next consumed text
+    /// token, terminal event, or end of the engine stream.
     pending_image_events: Vec<RequestOutput>,
     sink: OutputSink,
 }
 
+/// Borrowed per-request resources needed to consume one generated token.
 struct RawTokenEmitContext<'a, 'tokenizer> {
     emit: &'a EmitContext<'a>,
     prompt_token_ids: &'a [u32],
@@ -408,14 +491,15 @@ impl RawAssemblerState {
         }
     }
 
-    /// Flushes the pending images.
+    /// Yields the held `ImageCommit` and `ImageDone` events in arrival order.
     async fn flush_pending_images(&mut self, y: &mut TryYielder<RequestOutput, ServeError>) {
         for event in self.pending_image_events.drain(..) {
             y.yield_ok(event).await;
         }
     }
 
-    /// Ensures the output ready.
+    /// Rejects an image event or `Finished` that arrives before `Accepted` or
+    /// while a generated token still awaits its logprobs.
     fn ensure_output_ready(
         &self,
         request_id: &ServeRequestId,
@@ -432,6 +516,11 @@ impl RawAssemblerState {
     }
 
     /// Decodes one committed token while enforcing stop strings and output ordering.
+    ///
+    /// Returns `Ok(true)` when the token completes a stop string; the terminal
+    /// `Usage` and `Finished` events have then been emitted and the caller must
+    /// end the stream. Returns `Ok(false)` for an ordinary token. Every error
+    /// is a `ServeError::OutputProcessing`.
     async fn consume_token(
         &mut self,
         id: u32,
@@ -614,6 +703,9 @@ pub(super) async fn assemble_event_stream(
         sink,
     };
 
+    // When matched stop strings are excluded from the output, the decoder holds
+    // back enough trailing bytes to truncate a stop string that spans token
+    // boundaries before any of its bytes are emitted.
     let mut decoder = tokenizer.create_decode_stream(
         &prompt_token_ids,
         decode_options.skip_special_tokens,
@@ -621,6 +713,10 @@ pub(super) async fn assemble_event_stream(
     );
 
     // Acceptance waits for prompt scores when the public response promises them.
+    // `Accepted` is emitted here unless prompt logprobs are requested for a
+    // prompt with scored positions; the `PromptLogprobs` arm then emits it once
+    // every scored position has arrived. A one-token prompt has no scored
+    // positions, so its prompt logprobs carry only the first token.
     if !prompt_logprobs_requested || expected_prompt_positions == 0 {
         let prompt_logprobs = if prompt_logprobs_requested {
             let first_token_id = prompt_token_ids.first().copied().ok_or_else(|| {
@@ -752,6 +848,8 @@ pub(super) async fn assemble_event_stream(
                         "engine returned token logprobs without a pending token",
                     )
                 })?;
+
+                // The ranked candidates must lead with the sampled token.
                 if pending != id || candidates.first().is_none_or(|entry| entry.token_id != id) {
                     return Err(malformed_output(
                         request_id.clone(),
@@ -818,8 +916,9 @@ pub(super) async fn assemble_event_stream(
             EngineCoreOutput::ImageCommit { image_id } => {
                 state.ensure_output_ready(&request_id, "image-commit event")?;
 
-                // Commit and payload publication remain adjacent even when text
-                // decoding interleaves with the engine's image lifecycle.
+                // Commit and done events are held and published before the
+                // next consumed text token or the terminal event, whereas
+                // image begin and step events are published immediately.
                 state.pending_image_events.push(RequestOutput::ImageCommit {
                     image_id: image_id.to_string(),
                     elapsed_us: started.elapsed().as_micros() as u64,
@@ -863,6 +962,9 @@ pub(super) async fn assemble_event_stream(
                             source: OutputProcessingError::Tokenizer(error),
                         })?;
                 let finish_detail = generation_finish_detail(&reason).to_string();
+
+                // Generated tokens the engine counted in `completion_tokens` but
+                // never delivered as `TextToken` events count as internal tokens.
                 let finished = crate::serving::text::Finished {
                     prompt_token_count: prompt_tokens,
                     output_token_count: completion_tokens,
@@ -925,6 +1027,8 @@ pub(super) async fn assemble_event_stream(
                 .await;
                 return Ok(());
             }
+            // Artifacts and media progress belong to diffusion media requests,
+            // which `assemble_media_event_stream` serves.
             EngineCoreOutput::Artifact(_) | EngineCoreOutput::MediaProgress { .. } => {
                 return Err(malformed_output(
                     request_id,
@@ -942,7 +1046,7 @@ pub(super) async fn assemble_event_stream(
     ))
 }
 
-/// Returns structured finish details from a generation event.
+/// Returns the `finish_detail` label published for a generation finish reason.
 fn generation_finish_detail(reason: &uniserve_core::FinishReason) -> &'static str {
     match reason {
         uniserve_core::FinishReason::Completed => "completed",
@@ -959,6 +1063,12 @@ fn generation_finish_detail(reason: &uniserve_core::FinishReason) -> &'static st
 
 #[try_stream]
 /// Converts diffusion events through the common serving lifecycle and terminal semantics.
+///
+/// `Accepted` is emitted immediately with the prompt token count but without
+/// prompt token IDs or logprobs. Only scheduling, media progress, artifact, and
+/// terminal engine events are valid; any other event ends the stream with
+/// `ServeError::OutputProcessing`. The terminal `Usage` reports no output
+/// tokens, and `Finished` carries no `finish_detail`.
 pub(super) async fn assemble_media_event_stream(
     request_id: ServeRequestId,
     context: EventContext,

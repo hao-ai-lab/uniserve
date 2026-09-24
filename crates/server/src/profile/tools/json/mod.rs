@@ -1,4 +1,18 @@
 //! Incremental parser for JSON tool calls enclosed by text markers.
+//!
+//! The parser is a three-mode state machine over a buffered stream:
+//!
+//! - `Text` emits plain text up to the start marker and holds back a trailing
+//!   partial marker. The start marker followed by the configured marker
+//!   whitespace switches to `Header`.
+//! - `Header` parses `{"<name key>": "<name>", "<arguments key>":` with
+//!   optional JSON whitespace, emits the call's first delta (name, empty
+//!   arguments), and switches to `Arguments`.
+//! - `Arguments` streams the raw arguments object lexically as argument
+//!   deltas. After the object closes, it expects the wrapper's `}` immediately,
+//!   then the marker whitespace and end marker, and returns to `Text`.
+//!
+//! Any other header shape, such as reordered or extra keys, is a parse error.
 
 pub use qwen::Qwen3XmlToolParser;
 
@@ -20,27 +34,31 @@ type JsonToolInput<'i> = Partial<&'i str>;
 
 /// Upper bound on the per-stream parser buffer, in bytes.
 ///
-/// While inside an unclosed tool-call header or JSON arguments object the
-/// buffer retains every byte that has not yet formed a complete event. A stream
-/// that opens a marker and then never closes it (e.g. an endless function name
-/// string or an unbalanced `{`) would otherwise grow the buffer without bound.
-/// Capping it converts that into a bounded parse error instead of unbounded
-/// memory growth. The limit is generous relative to any realistic tool call.
+/// The buffer retains every byte that has not yet formed a complete event.
+/// Argument bytes leave it as soon as they arrive, but input that cannot yet
+/// complete an event, such as an unterminated tool-call header (for example an
+/// endless function-name string), keeps accumulating. Exceeding the cap fails
+/// `parse_into` with a parse error instead of growing memory without bound.
 const MAX_BUFFER_BYTES: usize = 1 << 20;
 
+/// Marker and key vocabulary of one marker-wrapped JSON tool-call format.
 #[derive(Debug, Clone, Copy)]
 struct JsonToolCallConfig {
+    /// Name used in parse error messages.
     parser_name: &'static str,
     start_marker: &'static str,
     end_marker: &'static str,
+    /// Exact text required after `start_marker` and before `end_marker`. It is
+    /// matched literally, not as optional whitespace.
     marker_whitespace: &'static str,
+    /// JSON key of the function name, which must be the header's first key.
     name_key: &'static str,
-    /// Candidate JSON keys naming the arguments payload, tried in order.
-    /// Most parsers use a single key like `["arguments"]`, but some accept
-    /// multiple (e.g. InternLM2 accepts `parameters` or `arguments`).
+    /// Candidate JSON keys naming the arguments payload, which must follow the
+    /// name. The header accepts any one of them.
     arguments_key: &'static [&'static str],
 }
 
+/// Parser mode; see the module documentation for the transitions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum JsonToolCallMode {
     Text,
@@ -48,6 +66,11 @@ enum JsonToolCallMode {
     Arguments { json_scan: JsonObjectScanState },
 }
 
+/// One parsed unit of the buffered stream.
+///
+/// `len` fields count bytes at the head of the parser buffer that
+/// `JsonToolCallParser::apply_event` copies into the output before the buffer
+/// drains them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum JsonToolCallEvent {
     Text { len: usize },
@@ -61,9 +84,14 @@ enum JsonToolCallEvent {
 #[derive(Debug)]
 struct JsonToolCallParser {
     config: JsonToolCallConfig,
+    /// Input not yet consumed by a complete event.
     buffer: String,
     mode: JsonToolCallMode,
+    /// Tool index that argument deltas extend; set by a header, cleared by the
+    /// end marker.
     active_tool_index: Option<usize>,
+    /// Number of tool calls started since the last reset; also the next
+    /// call's `tool_index`.
     emitted_tool_count: usize,
 }
 
@@ -80,10 +108,15 @@ impl JsonToolCallParser {
     }
 
     /// Advances incremental parsing and appends every complete event to `output`.
+    ///
+    /// On error, events parsed before the failure stay in `output` and the
+    /// buffer keeps the input that no completed event consumed.
     fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()> {
         self.buffer.push_str(chunk);
         let config = self.config;
 
+        // An event's bytes are applied before they are drained, because text and
+        // argument events copy their payload out of the buffer head.
         while let Some((event, consumed_len)) = parse_buffered_event(&self.buffer, |input| {
             parse_next_json_tool_call_event(input, &mut self.mode, config)
         })? {
@@ -106,6 +139,11 @@ impl JsonToolCallParser {
     }
 
     /// Finalizes buffered input or rejects an incomplete tool call.
+    ///
+    /// In text mode the buffer, including any held-back partial marker, becomes
+    /// plain text and the parser resets. While a tool call is open (from its
+    /// start marker until its end marker is parsed) this fails and leaves the
+    /// parser state unchanged.
     fn finish(&mut self) -> Result<ToolParserOutput> {
         let mut output = ToolParserOutput::default();
         match &self.mode {
@@ -166,7 +204,9 @@ impl JsonToolCallParser {
         Ok(())
     }
 
-    /// Resets the incremental parser state.
+    /// Resets the incremental parser state and returns the unconsumed buffer.
+    ///
+    /// Tool indices restart at 0 afterwards.
     fn reset(&mut self) -> String {
         self.mode = JsonToolCallMode::Text;
         self.active_tool_index = None;
@@ -257,15 +297,14 @@ fn json_key(input: &mut JsonToolInput<'_>, key: &'static str) -> ModalResult<()>
 
 /// Parses a JSON object key accepting any of `candidates`.
 ///
-/// The full quoted key is consumed and compared against the candidate list,
-/// so this works correctly under partial input regardless of key lengths.
+/// The full quoted key is parsed with `json_str` and then compared against the
+/// candidate list, so partial input stays `Incomplete` until the closing quote
+/// is buffered, whatever the candidates' lengths.
 ///
 /// On mismatch, each candidate is attached as its own `Expected` context so the
-/// error enumerates every valid key ("expected `a`, expected `b`"). Because
-/// `StrContextValue::StringLiteral` carries a single `&'static str`, the
-/// contexts are added in a loop over `candidates` rather than through chained
-/// `.context(...)` calls, which keeps the diagnostics complete for any number
-/// of candidates.
+/// error enumerates every valid key ("expected `a`, expected `b`").
+/// `StrContextValue::StringLiteral` carries a single `&'static str`, so the
+/// contexts are folded over `candidates` rather than chained with `.context`.
 fn json_arguments_key(
     input: &mut JsonToolInput<'_>,
     candidates: &'static [&'static str],
@@ -311,7 +350,9 @@ fn argument_delta_event(
     take_json_object(input, json_scan).map(|len| JsonToolCallEvent::Arguments { len })
 }
 
-/// Parses a marker-wrapped JSON tool-call close marker.
+/// Parses the wrapper object's `}` and the end marker after the arguments.
+///
+/// No whitespace is accepted between the arguments object and this `}`.
 fn tool_call_close_event(
     input: &mut JsonToolInput<'_>,
     config: JsonToolCallConfig,

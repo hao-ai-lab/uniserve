@@ -1,6 +1,11 @@
-//! Jinja environment construction and chat-template content-shape detection.
+//! Chat-template source loading, Jinja environment construction, and
+//! compiled-template rendering.
 //!
-//! Tokenizer metadata supplies special tokens and the configured template text.
+//! [`load_chat_template`] and [`resolve_chat_template`] turn template files
+//! and configured values into template source. `CompiledChatTemplate` pairs
+//! one compiled MiniJinja environment with the content format resolved for it
+//! (detection lives in `format`), and `TemplateContext` is the set of global
+//! variables a render sees.
 
 use std::collections::HashMap;
 use std::fs;
@@ -22,14 +27,24 @@ use crate::serving::chat::template::renderer::hf::{TemplateMessage, TemplateTool
 type Result<T> = std::result::Result<T, TemplateError>;
 
 /// Builds a pre-configured environment with the given template string.
+///
+/// The template is registered as `"chat"` and compiled immediately, so syntax
+/// errors are returned here.
 fn build_environment(template: String) -> Result<Environment<'static>> {
     let mut env = Environment::new();
 
+    // Hugging Face chat templates are written for Jinja environments with
+    // `trim_blocks` and `lstrip_blocks` enabled; their whitespace output
+    // depends on both.
     env.set_trim_blocks(true);
     env.set_lstrip_blocks(true);
 
     env.add_template_owned("chat".to_owned(), template)?;
 
+    // Python string and dict methods (`startswith`, `items`, ...) resolve
+    // through pycompat. `TemplateMap` defers every method call to this
+    // callback. The `tojson` registration replaces MiniJinja's built-in filter
+    // with the Python `json.dumps`-compatible one.
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_filter("tojson", hf_tojson_filter);
 
@@ -39,6 +54,11 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
 #[serde_with::skip_serializing_none]
 #[derive(Default, Serialize)]
 /// Values installed into the Jinja environment for one render.
+///
+/// Serializes as one flat map in field order: the flattened special tokens and
+/// template kwargs become top-level variables, `None` fields are omitted (so
+/// templates see them as undefined), and on a key collision the later entry
+/// wins.
 pub(super) struct TemplateContext<'a> {
     pub(super) messages: &'a [TemplateMessage],
     pub(super) add_generation_prompt: bool,
@@ -49,12 +69,25 @@ pub(super) struct TemplateContext<'a> {
     pub(super) special_tokens: Option<&'a HfSpecialTokens>,
     #[serde(flatten)]
     pub(super) template_kwargs: Option<&'a HashMap<String, serde_json::Value>>,
-    // By putting top-level `reasoning_effort` after `template_kwargs`, this overrides any
-    // `reasoning_effort` value that might be present there.
+    // Declared after `template_kwargs` so that a request's `reasoning_effort`
+    // overrides a default kwarg of the same name; when the request sets none,
+    // the field is omitted and the kwarg stays visible.
     pub(super) reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Loads chat template from a file (`.jinja` or `.json` containing Jinja).
+///
+/// A `.json` file must hold either a JSON string or an object with a string
+/// `chat_template` field; its template is returned verbatim. Any other file is
+/// read as Jinja source, trimmed, and has each literal backslash-`n` sequence
+/// replaced with a newline, which also rewrites a `\n` that the template
+/// meant literally. Never returns `Ok(None)`.
+///
+/// # Errors
+///
+/// Returns `TemplateError::ReadTemplateFile`, `ParseTemplateJson`, or
+/// `InvalidTemplateJson` when the file cannot be read or its JSON form is
+/// invalid.
 pub fn load_chat_template(template_path: &Path) -> Result<Option<String>> {
     let content = fs::read_to_string(template_path).map_err(TemplateError::ReadTemplateFile)?;
 
@@ -82,6 +115,11 @@ pub fn load_chat_template(template_path: &Path) -> Result<Option<String>> {
 }
 
 /// Resolves a configured chat template value into a template string.
+///
+/// An existing path is loaded with [`load_chat_template`]. Otherwise a value
+/// containing `{`, `}`, or a newline is taken as inline Jinja source, used
+/// as-is; anything else is treated as a mistyped path and rejected with
+/// `TemplateError::MissingTemplatePath`.
 pub fn resolve_chat_template(chat_template: &str) -> Result<String> {
     let path = Path::new(chat_template);
     if path.exists() {
@@ -96,10 +134,11 @@ pub fn resolve_chat_template(chat_template: &str) -> Result<String> {
     Err(TemplateError::MissingTemplatePath)
 }
 
-/// One compiled chat template with its Jinja environment and detected content
+/// One compiled chat template with its Jinja environment and resolved content
 /// format.
 pub(super) struct CompiledChatTemplate {
-    /// Cached, fully-configured environment for one compiled template.
+    /// Fully configured environment holding the template under the name
+    /// `"chat"`.
     env: Environment<'static>,
     content_format: ChatTemplateContentFormat,
 }
@@ -122,8 +161,8 @@ impl CompiledChatTemplate {
         })
     }
 
-    /// Applies the compiled template to the given context and return the rendered
-    /// prompt.
+    /// Applies the compiled template to the given context and returns the
+    /// rendered prompt.
     pub(super) fn apply(&self, ctx: TemplateContext<'_>) -> Result<String> {
         let tmpl = self.env.get_template("chat")?;
         tmpl.render(ctx).map_err(TemplateError::from)

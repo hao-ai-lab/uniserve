@@ -1,4 +1,10 @@
 //! Chat rendering, parsing, and output-processing errors.
+//!
+//! Request validation, template rendering, and the Qwen3 output-processing
+//! stages all report this one error type. `assemble_chat_event_stream` wraps
+//! output-time errors in `ServeError::OutputProcessing`, except an engine
+//! rejection carried in [`Error::Text`], which it turns into a `Rejected`
+//! serving event.
 
 use thiserror::Error;
 
@@ -16,13 +22,16 @@ pub enum Error {
     /// Prompt rendering requires a template but no template is configured.
     #[error("chat template is required but none was configured")]
     MissingChatTemplate,
-    /// The configured chat template cannot be compiled or rendered.
+    /// The chat template cannot be loaded, compiled, or rendered, or assistant
+    /// history cannot be converted into template values (for example, tool-call
+    /// arguments that are not valid JSON).
     #[error("chat template error: {0}")]
     ChatTemplate(String),
     /// The selected renderer cannot represent multimodal content.
     #[error("multimodal input is not supported by this chat renderer")]
     UnsupportedMultimodalRenderer,
-    /// A message contains a multimodal content kind unsupported by the renderer.
+    /// Multimodal content reached a text-only conversion or a renderer
+    /// configured without multimodal support.
     #[error("unsupported multimodal content: {0}")]
     UnsupportedMultimodalContent(&'static str),
     /// Multimodal content cannot be converted into model inputs.
@@ -56,7 +65,9 @@ pub enum Error {
         /// Identifier of the incomplete request.
         request_id: String,
     },
-    /// Incremental tool-call events violate the assembler state contract.
+    /// Incremental tool-call events violate the assembler state contract:
+    /// arguments arrive with no open tool call, or for a tool index other than
+    /// the open one.
     #[error("tool call stream state is inconsistent: {message}")]
     ToolCallStreamInvariant {
         /// Description of the violated stream invariant.
@@ -65,7 +76,8 @@ pub enum Error {
     /// Model profile assets cannot be loaded or validated.
     #[error(transparent)]
     ModelAssets(#[from] crate::profile::assets::Error),
-    /// Text tokenization or decoding fails.
+    /// The text layer fails, for example in detokenization or engine output
+    /// validation, or reports an engine rejection.
     #[error(transparent)]
     Text(#[from] crate::serving::text::Error),
 }

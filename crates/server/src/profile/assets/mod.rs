@@ -1,6 +1,13 @@
 //! Model asset discovery and tokenizer metadata loading.
+//!
+//! [`model_files`] locates checkpoint files in a local directory, the local
+//! Hugging Face Hub cache, or the Hub itself; [`pipeline_index`] reads the
+//! root index that identifies a diffusers pipeline checkpoint; [`config`]
+//! deserializes the JSON metadata that profile resolution in the parent
+//! module consumes. Every failure is reported as this module's [`Error`].
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod config;
 pub mod error;
 pub mod model_files;

@@ -16,19 +16,25 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use serde::Deserialize;
 
-/// Deadline for the whole group's reports, measured from the first spawn.
+/// Deadline for the whole group's reports, measured from the start of
+/// `RankRegistry::collect`, which runs after every rank of the group has been
+/// launched.
 ///
 /// A rank reports as soon as its channel endpoint exists, which is before it
-/// loads any weights, so this only has to cover interpreter and library import.
+/// builds its model, so this covers process start and imports rather than
+/// weight loading.
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(300);
 /// Interval between accept attempts while no rank has connected.
 const ACCEPT_INTERVAL: Duration = Duration::from_millis(20);
 /// Deadline for one accepted connection to deliver its report line.
 const REPORT_READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// The channel mechanism a rank on the head's host offers.
+// The two channel mechanisms a rank may report; `collect` refuses any other.
 use uniserve_worker_ipc::{SHARED_STORAGE_CHANNEL, SOCKET_CHANNEL};
 
 /// One rank's report of the channel endpoint the engine connects to.
+///
+/// `register_endpoint` in `uniserve_worker.bootstrap.launch` writes it as one
+/// JSON line with these field names.
 #[derive(Debug, Deserialize)]
 pub(crate) struct RankReport {
     /// Worker identity the rank was launched under.
@@ -47,20 +53,22 @@ pub(crate) struct Rendezvous {
     pub address: String,
     /// The bound, listening socket the group's first rank serves the store
     /// on, held by the process that spawns that rank until it hands the
-    /// socket over. None when the first rank runs on another host, whose
-    /// launcher holds that host's reservation.
+    /// socket over. `None` when the first rank runs on another host, whose
+    /// launcher holds that host's reservation, and once the socket has been
+    /// taken for the spawn.
     pub listener: Option<TcpListener>,
 }
 
 /// Reserves the address a worker group's ranks rendezvous at.
 ///
 /// The collective store is a TCP store so ranks on different hosts can reach
-/// it; an instance on one host reserves a loopback address and keeps the
-/// semantics it had over a shared directory, and one spanning hosts reserves
-/// an address those hosts can route to. The head binds the socket and the
-/// group's first rank, which it spawns, inherits it and serves the store on
-/// it. The port therefore stays bound from this reservation until that rank
-/// exits: nothing else on the host can take it while the rank starts.
+/// it; an instance on one host reserves a loopback address, and one spanning
+/// hosts reserves an address those hosts can route to (see `interface`).
+/// The head calls this when the group's first rank runs on its own host: it
+/// binds the socket here, and that rank, which it spawns, inherits the socket
+/// and serves the store on it. The port therefore stays bound from this
+/// reservation until that rank exits, so no other process on the host can
+/// take it between the reservation and the rank's start.
 pub(crate) fn reserve_rendezvous(head: Option<IpAddr>) -> anyhow::Result<Rendezvous> {
     let (bind, advertise) = interface(head);
     let listener = TcpListener::bind(SocketAddr::from((bind, 0)))
@@ -80,8 +88,9 @@ pub(crate) fn reserve_rendezvous(head: Option<IpAddr>) -> anyhow::Result<Rendezv
 /// `head` is an address of this host that the other hosts route to, and none
 /// when every rank runs here. A loopback address reaches only the host that
 /// binds it, so an instance spanning hosts binds every interface and names
-/// itself by that routable address; a bound wildcard would name no interface
-/// and a placement identity need not resolve elsewhere.
+/// itself by that routable address rather than by the wildcard, which names
+/// no interface, or by the placement's host identity, which need not resolve
+/// on other hosts.
 fn interface(head: Option<IpAddr>) -> (Ipv4Addr, String) {
     match head {
         Some(address) => (Ipv4Addr::UNSPECIFIED, address.to_string()),
@@ -129,6 +138,13 @@ impl RankRegistry {
     /// `alive` is consulted whenever no report is waiting, so a rank that dies
     /// before reporting fails the launch by name instead of consuming the
     /// deadline, while a report already queued is still read.
+    ///
+    /// Any bad connection fails the whole collection rather than being
+    /// skipped. Failures include an error from `alive`, the deadline passing
+    /// with ranks unreported (named in the error), an accept or read failure
+    /// (including a read exceeding `REPORT_READ_TIMEOUT`), a malformed report,
+    /// and a report naming another worker, an unsupported transport, a rank
+    /// outside `0..expected`, or a rank that already reported.
     pub(crate) fn collect(
         &self,
         worker_id: &str,
@@ -164,7 +180,9 @@ impl RankRegistry {
                 Err(error) => return Err(error).context("accepting a rank registration"),
             };
             // A report is one JSON line; the connection carries nothing else
-            // and closes once the head has it.
+            // and closes once the head has it. The listener is non-blocking,
+            // but the accepted stream is read blocking, each read bounded by
+            // `REPORT_READ_TIMEOUT`, and no other rank is accepted meanwhile.
             stream
                 .set_nonblocking(false)
                 .context("reading a rank registration")?;
@@ -175,6 +193,7 @@ impl RankRegistry {
             BufReader::new(stream)
                 .read_line(&mut line)
                 .context("reading a rank registration")?;
+
             let report: RankReport = serde_json::from_str(line.trim())
                 .with_context(|| format!("parsing the rank registration {line:?}"))?;
             anyhow::ensure!(
@@ -200,6 +219,7 @@ impl RankRegistry {
                 "rank {} is outside this worker",
                 report.rank
             );
+
             match reports.entry(rank) {
                 Entry::Vacant(slot) => {
                     slot.insert(report);

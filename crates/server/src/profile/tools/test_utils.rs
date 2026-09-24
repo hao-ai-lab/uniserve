@@ -5,7 +5,8 @@ use serde_json::json;
 use super::{Qwen3XmlToolParser, ToolParserOutput};
 use crate::profile::tools::Tool;
 
-/// Builds a reusable set of function tools for parser unit tests.
+/// Builds a reusable set of function tools for parser unit tests and
+/// benchmarks.
 pub fn test_tools() -> Vec<Tool> {
     vec![
         Tool {
@@ -83,14 +84,14 @@ pub fn test_tools() -> Vec<Tool> {
     ]
 }
 
-/// Push chunks through a streaming parser and coalesce its tool-call deltas.
+/// Push chunks through a streaming parser, finish it, and coalesce its
+/// tool-call deltas.
 ///
 /// Panics if there are any parsing errors along the way.
 #[allow(
     clippy::unwrap_used,
     reason = "this assertion helper intentionally panics on parser failures"
 )]
-/// Feeds all chunks into a parser and combines their incremental outputs.
 pub fn collect_stream(parser: &mut Qwen3XmlToolParser, chunks: &[&str]) -> ToolParserOutput {
     let mut output = ToolParserOutput::default();
     for chunk in chunks {

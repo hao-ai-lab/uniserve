@@ -1,4 +1,11 @@
 //! HTTP router construction, listener binding, middleware, and shutdown.
+//!
+//! This is the server crate's HTTP frontend: [`serve`] builds the shared
+//! `AppState` (serving runtime, engine client, video jobs), binds the
+//! configured TCP, Unix-domain, or inherited listener, and runs the axum
+//! router from `routes::build_router` until shutdown. Route handlers translate
+//! OpenAI-compatible requests into serving-runtime calls; the runtime and the
+//! engine own tokenization, scheduling, and generation.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod listener;
@@ -22,6 +29,21 @@ pub use crate::openai::ApiError;
 pub use routes::build_router;
 
 /// Runs the configured HTTP server until the shutdown token is cancelled.
+///
+/// Shutdown has one budget of `config.shutdown_timeout`, measured from
+/// cancellation: axum first drains open connections gracefully, and the server
+/// is aborted if the deadline passes first. `AppState::shutdown` then cancels
+/// the detached video jobs and waits, against the same deadline, for every
+/// other reference to the state to drop before shutting down the serving
+/// runtime; it skips that runtime shutdown if the deadline passes first. A
+/// zero timeout aborts the server immediately.
+///
+/// # Errors
+///
+/// Returns an error when the configuration is invalid, building the state
+/// fails, the listener cannot be bound or report its address, the server
+/// fails, or runtime shutdown fails. Cancellation before the state is built
+/// returns `Ok(())` without binding a listener.
 pub async fn serve(config: Config, shutdown: CancellationToken) -> Result<()> {
     config
         .validate()
@@ -40,6 +62,9 @@ pub async fn serve(config: Config, shutdown: CancellationToken) -> Result<()> {
 
     info!(%bind_address, %model, "starting HTTP server");
 
+    // Only TCP connections take `TCP_NODELAY`; Unix-domain streams (the
+    // `Either::Right` side) are left unchanged. A failure is traced and the
+    // connection is served without the option.
     let listener = listener.tap_io(|io| {
         if let Either::Left(tcp_stream) = io
             && let Err(error) = tcp_stream.set_nodelay(true)
@@ -48,6 +73,8 @@ pub async fn serve(config: Config, shutdown: CancellationToken) -> Result<()> {
         }
     });
 
+    // The watcher publishes the shutdown deadline once cancellation arrives and
+    // fires `force_shutdown` when it expires, bounding the graceful drain.
     let force_shutdown = CancellationToken::new();
     let shutdown_deadline = Arc::new(OnceLock::new());
     tokio::spawn({
@@ -76,6 +103,9 @@ pub async fn serve(config: Config, shutdown: CancellationToken) -> Result<()> {
         }
     }
 
+    // The graceful shutdown and the watcher wake on the same token, so the
+    // server can finish draining before the watcher has published the
+    // deadline; the fallback then measures the budget from the current time.
     let shutdown_deadline = shutdown_deadline
         .get()
         .copied()

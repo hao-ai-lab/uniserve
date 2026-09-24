@@ -15,6 +15,11 @@ use uniserve_server::serving::chat::{
 };
 use uniserve_server::serving::text::{DecodedTextEvent, FinishReason, Finished};
 
+/// Builds a tokenizer whose only special tokens are the reasoning delimiters
+/// that `Qwen3ReasoningParser` requires and the `<|im_end|>` turn delimiter.
+///
+/// The tokenizer is loaded into memory, so the temporary directory holding
+/// its JSON file can be dropped on return.
 fn qwen_tokenizer() -> Result<DynTokenizer, Box<dyn std::error::Error + Send + Sync>> {
     let model = BPE::builder()
         .vocab_and_merges([("<unk>".to_string(), 0), ("a".to_string(), 1)], Vec::new())
@@ -32,6 +37,9 @@ fn qwen_tokenizer() -> Result<DynTokenizer, Box<dyn std::error::Error + Send + S
     Ok(Arc::new(HuggingFaceTokenizer::new(&path)?))
 }
 
+/// A single decoded delta containing a reasoning block, text, and two XML tool
+/// calls separates into reasoning deltas, visible text with the tool-call
+/// markup removed, and one call per `<tool_call>` block in order.
 #[tokio::test]
 async fn qwen3_processor_emits_reasoning_text_and_tool_calls()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -51,7 +59,13 @@ async fn qwen3_processor_emits_reasoning_text_and_tool_calls()
         strict: None,
     }];
     request.tool_choice = ChatToolChoice::Auto;
+    // Tool parsing requires `Auto` with declared tools; the final argument
+    // enables reasoning parsing.
     let processor = Qwen3ChatOutputProcessor::new(&mut request, tokenizer, true)?;
+
+    // The prompt ends with `<|im_end|>` and has no reasoning delimiter after
+    // it, so generation starts outside a reasoning section and the `<think>`
+    // in the output opens one.
     let decoded = stream::iter([
         Ok(DecodedTextEvent::Start {
             queued_at: None,
@@ -82,6 +96,7 @@ async fn qwen3_processor_emits_reasoning_text_and_tool_calls()
             }),
         }),
     ]);
+
     let output = processor.parse(decoded);
     futures::pin_mut!(output);
     let mut text = String::new();
@@ -118,6 +133,7 @@ async fn qwen3_processor_emits_reasoning_text_and_tool_calls()
             _ => {}
         }
     }
+
     assert!(finished);
     assert_eq!(reasoning, "hidden");
     assert_eq!(text, "beforebetweenafter");
@@ -132,13 +148,15 @@ async fn qwen3_processor_emits_reasoning_text_and_tool_calls()
 }
 
 /// With reasoning parsing disabled, `<think>` delimiters stream verbatim as
-/// assistant content instead of opening a reasoning block.
+/// assistant content instead of opening a reasoning block, including when the
+/// delimiters arrive in separate deltas.
 #[tokio::test]
 async fn disabled_reasoning_parsing_streams_delimiters_as_content()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tokenizer = qwen_tokenizer()?;
     let mut request = ChatRequest::for_test();
     let processor = Qwen3ChatOutputProcessor::new(&mut request, tokenizer, false)?;
+
     let decoded = stream::iter([
         Ok(DecodedTextEvent::Start {
             queued_at: None,
@@ -164,6 +182,7 @@ async fn disabled_reasoning_parsing_streams_delimiters_as_content()
             }),
         }),
     ]);
+
     let output = processor.parse(decoded);
     futures::pin_mut!(output);
     let mut text = String::new();
@@ -186,6 +205,7 @@ async fn disabled_reasoning_parsing_streams_delimiters_as_content()
             _ => {}
         }
     }
+
     assert!(finished);
     assert_eq!(text, "<think>hi</think>after");
     Ok(())

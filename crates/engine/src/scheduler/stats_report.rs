@@ -2,6 +2,12 @@
 //!
 //! [`SchedulerStatsReporter`] retains cumulative baselines and reports interval
 //! deltas without resetting counters observed by other readers.
+//!
+//! A snapshot mixes two kinds of fields: interval deltas (admissions, queue
+//! wait totals, prefix-cache queries and hits, batch timing, domain call and
+//! time counters, worker forward counters) and point-in-time or lifetime
+//! values (running and waiting requests, the step counter, KV usage, maximum
+//! queue wait, active and peak domain credits).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -12,6 +18,7 @@ use uniserve_core::codec::stats::{
     BaseCacheStats, DomainSchedulerStats, ForwardStats, PrefixCacheStats,
 };
 
+/// Plain-value copy of one domain's `DomainStats` counters.
 #[derive(Clone, Copy, Debug, Default)]
 struct DomainCumulative {
     active_credits: u64,
@@ -38,10 +45,11 @@ pub struct SchedulerStatsReporter {
     last_queue_wait_count: u64,
     last_queue_wait_us_total: u64,
     last_worker_forward_stats: ForwardStats,
-    // cumulative batch-timing counters, delta'd into per-update sums.
+    // Batch-timing baselines for per-update sums.
     last_worker_exec_us_total: u64,
     last_batch_roundtrip_us_total: u64,
     last_batch_timing_count: u64,
+    // Indexed in the prefill, decode, flow order used by `domain_stats`.
     last_domains: [DomainCumulative; 3],
 }
 
@@ -50,6 +58,10 @@ impl SchedulerStatsReporter {
     ///
     /// `block_size` converts block-granular prefix-cache query counts into the
     /// token-granular counts the snapshot shape documents.
+    ///
+    /// Advances the reporter's baselines, so each counter increment appears in
+    /// exactly one snapshot. The first snapshot reports everything counted
+    /// since the scheduler started.
     pub fn snapshot(&mut self, stats: &SchedulerStats, block_size: u32) -> stats::SchedulerStats {
         let num_blocks = stats.kv_cache.num_blocks.load(Ordering::Relaxed);
         let free_blocks = stats.kv_cache.free_blocks.load(Ordering::Relaxed);
@@ -77,7 +89,7 @@ impl SchedulerStatsReporter {
             .checked_div(delta_queue_wait_count)
             .unwrap_or(0);
 
-        // per-update deltas of the directly-measured batch timing.
+        // Per-update deltas of the directly measured batch timing.
         let worker_exec_us_total = stats.timing.worker_exec_us_total.load(Ordering::Relaxed);
         let batch_roundtrip_us_total = stats
             .timing
@@ -93,6 +105,8 @@ impl SchedulerStatsReporter {
         self.last_batch_roundtrip_us_total = batch_roundtrip_us_total;
         self.last_batch_timing_count = batch_timing_count;
 
+        // The scheduler tracks no DP waves, prefix-cache request counts, or
+        // preemptions, so those fields are reported as zero.
         stats::SchedulerStats {
             num_running_reqs: stats.general.running.load(Ordering::Relaxed) as u64,
             num_waiting_reqs: stats.general.pending.load(Ordering::Relaxed) as u64,
@@ -106,6 +120,8 @@ impl SchedulerStatsReporter {
             prefix_cache_stats: PrefixCacheStats {
                 base: BaseCacheStats {
                     requests: 0,
+                    // Queries count blocks and hits count tokens; scaling queries
+                    // by the block size puts both in tokens.
                     queries: delta_queries * block_size as u64,
                     hits: delta_hit_tokens,
                 },
@@ -121,6 +137,9 @@ impl SchedulerStatsReporter {
     }
 
     /// Converts cumulative per-domain counters into interval deltas.
+    ///
+    /// Credit counts are reported as current values: `active_credits` is the
+    /// present count and `peak_credits` the lifetime maximum.
     fn domain_stats(&mut self, stats: &SchedulerStats) -> Vec<DomainSchedulerStats> {
         let domains = [
             ("prefill", &stats.domains.prefill),
@@ -166,7 +185,8 @@ impl SchedulerStatsReporter {
             .collect()
     }
 
-    /// Returns cumulative worker-forward statistics.
+    /// Returns worker forward counters accumulated since the previous snapshot,
+    /// or `None` when nothing changed.
     fn worker_forward_stats(&mut self, stats: &SchedulerStats) -> Option<ForwardStats> {
         let current = worker_forward_stats_snapshot(stats);
         let delta = delta_worker_forward_stats(&current, &self.last_worker_forward_stats);
@@ -175,7 +195,7 @@ impl SchedulerStatsReporter {
     }
 }
 
-/// Returns cumulative statistics for a scheduling domain.
+/// Loads one domain's cumulative counters.
 fn domain_cumulative(stats: &crate::scheduler::DomainStats) -> DomainCumulative {
     DomainCumulative {
         active_credits: stats.active_credits.load(Ordering::Relaxed) as u64,
@@ -194,7 +214,12 @@ fn domain_cumulative(stats: &crate::scheduler::DomainStats) -> DomainCumulative 
     }
 }
 
-/// Captures a coherent value snapshot of worker forward-pass counters.
+/// Copies the cumulative worker forward-pass counters into plain values.
+///
+/// Each map and counter is read separately while the scheduler may be merging
+/// a new report, so the copy can reflect part of one report. Because every
+/// counter only grows, the remainder appears in the next interval's delta.
+/// A poisoned lock is read anyway.
 fn worker_forward_stats_snapshot(stats: &SchedulerStats) -> ForwardStats {
     let path_counts = stats
         .worker
@@ -226,8 +251,6 @@ fn worker_forward_stats_snapshot(stats: &SchedulerStats) -> ForwardStats {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    // surface the two maps the worker computes (attention backend /
-    // cuda-graph runtime mode) so they reach the snapshot stats and Prometheus.
     let attention_backend_counts = stats
         .worker
         .attention_backend_counts
@@ -333,7 +356,6 @@ fn delta_worker_forward_stats(current: &ForwardStats, previous: &ForwardStats) -
             .attention_launches
             .saturating_sub(previous.attention_launches),
         attention_us: current.attention_us.saturating_sub(previous.attention_us),
-        // Map counters are exported as interval deltas alongside scalar counters.
         attention_backend_counts: delta_map(
             &current.attention_backend_counts,
             &previous.attention_backend_counts,
@@ -413,6 +435,9 @@ fn delta_worker_forward_stats(current: &ForwardStats, previous: &ForwardStats) -
 }
 
 /// Computes per-key deltas between cumulative snapshots.
+///
+/// Keys whose count did not grow are omitted, so an idle interval yields an
+/// empty map and `ForwardStats::is_empty` can detect it.
 fn delta_map(
     current: &BTreeMap<String, u64>,
     previous: &BTreeMap<String, u64>,
@@ -430,6 +455,10 @@ fn delta_map(
 mod tests {
     use super::*;
 
+    /// The first snapshot reports every counter as a delta from zero and
+    /// derives KV usage and average queue wait. A second snapshot over
+    /// unchanged counters reports zero deltas and no worker stats, while the
+    /// lifetime maximum queue wait persists.
     #[test]
     fn snapshot_reports_deltas_and_usage() {
         let stats = SchedulerStats::default();
@@ -476,6 +505,7 @@ mod tests {
 
         let mut reporter = SchedulerStatsReporter::default();
         let snapshot = reporter.snapshot(&stats, 256);
+
         assert_eq!(snapshot.num_running_reqs, 3);
         assert_eq!(snapshot.num_waiting_reqs, 2);
         assert!((snapshot.kv_cache_usage - 0.25).abs() < 1e-9);
@@ -524,11 +554,12 @@ mod tests {
 
         let mut reporter = SchedulerStatsReporter::default();
         let snapshot = reporter.snapshot(&stats, 256);
+
         assert_eq!(snapshot.worker_exec_us, 1_200);
         assert_eq!(snapshot.batch_roundtrip_us, 1_500);
         assert_eq!(snapshot.batch_count, 3);
 
-        // Counters unchanged -> zero deltas on the next snapshot.
+        // Unchanged counters yield zero deltas on the next snapshot.
         let second_snapshot = reporter.snapshot(&stats, 256);
         assert_eq!(second_snapshot.worker_exec_us, 0);
         assert_eq!(second_snapshot.batch_roundtrip_us, 0);
@@ -553,12 +584,13 @@ mod tests {
 
         let mut reporter = SchedulerStatsReporter::default();
         let snapshot = reporter.snapshot(&stats, 256);
+
         let worker = snapshot.worker_forward_stats.expect("worker stats present");
         assert_eq!(worker.attention_backend_counts.get("flashinfer"), Some(&9));
         assert_eq!(worker.cuda_graph_runtime_mode_counts.get("graph"), Some(&5));
 
-        // Second snapshot with unchanged counters reports zero deltas (so both
-        // maps are part of the delta/is_empty bookkeeping, not always-present).
+        // Unchanged maps produce no delta, so the second snapshot omits worker
+        // stats entirely.
         let second_snapshot = reporter.snapshot(&stats, 256);
         assert!(second_snapshot.worker_forward_stats.is_none());
     }

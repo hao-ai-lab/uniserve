@@ -1,4 +1,10 @@
 //! Atomic counters and gauges shared with the scheduler statistics reporter.
+//!
+//! The `Scheduler` is the only writer. Readers, chiefly
+//! `SchedulerStatsReporter` sampling on a server task, load fields
+//! independently with relaxed ordering, so a read is not a consistent
+//! snapshot across fields. Cumulative counters only grow, which lets readers
+//! compute interval deltas.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -7,15 +13,20 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 /// General loop counters that do not belong to a more specific group.
 #[derive(Default)]
 pub struct GeneralStats {
-    /// Largest number of calls observed in one submitted batch.
+    /// Largest number of calls observed in one batch finalized by
+    /// `Scheduler::finish_generation_batch`.
     pub peak_calls: AtomicUsize,
-    /// Number of scheduler loop iterations completed.
+    /// Cumulative batches finalized by `Scheduler::finish_generation_batch`,
+    /// including command-only batches. Batches built by
+    /// `prepare_media_batches` for media requests are not counted.
     pub steps: AtomicU64,
-    /// Current number of admitted, nonterminal requests.
+    /// Current number of running token and media requests.
     pub running: AtomicUsize,
-    /// Current number of requests waiting for admission.
+    /// Current number of token and media requests waiting for admission.
     pub pending: AtomicUsize,
-    /// Current number of submitted calls awaiting completion.
+    /// Current number of batches registered in flight, from planning until
+    /// their final result or a worker failure that empties them, including
+    /// batches still awaiting submission.
     pub in_flight: AtomicUsize,
 }
 
@@ -24,7 +35,8 @@ pub struct GeneralStats {
 pub struct KvCacheStats {
     /// Physical KV blocks currently available for allocation.
     pub free_blocks: AtomicUsize,
-    /// Total physical KV blocks managed by the scheduler.
+    /// Usable physical KV blocks managed by the scheduler, set once at
+    /// construction.
     pub num_blocks: AtomicUsize,
     /// Cumulative KV blocks evicted from the prefix cache.
     pub blocks_evicted: AtomicU64,
@@ -34,12 +46,14 @@ pub struct KvCacheStats {
     pub cached_blocks: AtomicUsize,
 }
 
-/// Prefix-cache hit-rate counters.
+/// Prefix-cache hit-rate counters, recorded by `acquire_cached_prefix` when
+/// admission commits a token request.
 #[derive(Default)]
 pub struct PrefixStats {
-    /// Cumulative prefix-cache lookups.
+    /// Cumulative prompt blocks eligible for prefix reuse. The last block of
+    /// a block-aligned prompt is excluded because it is never reused.
     pub queries: AtomicU64,
-    /// Cumulative prefix-cache lookups that matched at least one block.
+    /// Cumulative prompt blocks matched in the prefix cache.
     pub hits: AtomicU64,
     /// Cumulative prompt tokens reused from matched prefix blocks.
     pub hit_tokens: AtomicU64,
@@ -59,7 +73,8 @@ pub struct EncoderStats {
 /// Batch-timing and queueing/admission latency counters.
 #[derive(Default)]
 pub struct TimingStats {
-    /// Most recent worker-reported batch execution time, in microseconds.
+    /// Worker-reported execution time of the most recently completed batch, in
+    /// microseconds.
     pub last_worker_exec_us: AtomicU64,
     /// Cumulative worker execution time, in microseconds.
     pub worker_exec_us_total: AtomicU64,
@@ -75,51 +90,66 @@ pub struct TimingStats {
     pub queue_wait_us_max: AtomicU64,
 }
 
-/// Cumulative accounting for one physical execution domain.
+/// Cumulative accounting for one public metric domain.
+///
+/// Each call holds one credit from its in-flight registration until its result
+/// is reconciled or its execution fails. The per-batch timing fields add, once
+/// per batch result report that contains calls of this domain, the maximum of
+/// each worker-reported `TimingCounters` field over those calls; a batch
+/// returned in several partial reports contributes once per report.
 #[derive(Default)]
 pub struct DomainStats {
     /// Credits currently held by in-flight calls.
     pub active_credits: AtomicUsize,
-    /// Maximum number of concurrently held credits.
+    /// Maximum number of concurrently held credits since construction.
     pub peak_credits: AtomicUsize,
     /// Cumulative calls submitted to the domain.
     pub launched_calls: AtomicU64,
-    /// Cumulative calls completed by the domain.
+    /// Cumulative call results, including predicated and error results.
     pub completed_calls: AtomicU64,
     /// Cumulative calls skipped by a false predicate.
     pub predicated_calls: AtomicU64,
-    /// Cumulative calls completed with an error.
+    /// Cumulative calls that returned an error status or whose credit was
+    /// reclaimed after an execution failure.
     pub error_calls: AtomicU64,
     /// Cumulative submissions rejected by executor backpressure.
     pub backpressure_events: AtomicU64,
-    /// Cumulative credits recovered after terminal execution failure.
+    /// Cumulative credits returned, on normal completion or execution failure.
     pub reclaimed_credits: AtomicU64,
-    /// Cumulative batches completed in the domain.
+    /// Cumulative batch result reports that contained calls of this domain.
     pub completed_batches: AtomicU64,
-    /// Cumulative worker queue time, in microseconds.
+    /// Cumulative scheduler time from planning a call to registering it in
+    /// flight, in microseconds. Calls of media requests, planned by
+    /// `plan_media_call`, contribute zero.
     pub queue_us: AtomicU64,
-    /// Cumulative worker launch time, in microseconds.
+    /// Cumulative worker-reported wait before execution
+    /// (`TimingCounters::queued_us`), in microseconds.
     pub launch_us: AtomicU64,
     /// Cumulative device execution time, in microseconds.
     pub device_us: AtomicU64,
-    /// Cumulative completion processing time, in microseconds.
+    /// Cumulative worker completion copy and host processing time
+    /// (`copy_us + host_us`), in microseconds.
     pub completion_us: AtomicU64,
 }
 
 /// Domain-indexed scheduler accounting shared with the stats reporter.
 #[derive(Default)]
 pub struct ExecutionDomainStats {
-    /// Counters for prefill and encoder execution.
+    /// Counters for prefill, text/vision/latent encoding, and transfer calls.
     pub prefill: DomainStats,
-    /// Counters for autoregressive decode execution.
+    /// Counters for autoregressive decode and speculative verification.
     pub decode: DomainStats,
-    /// Counters for diffusion flow execution.
+    /// Counters for every other media call: latent preparation, denoising,
+    /// decoding, media encoding, and muxing.
     pub flow: DomainStats,
 }
 
 impl ExecutionDomainStats {
     /// Public metrics aggregate concrete call kinds into three stable labels.
     /// This index is used only for counters, never for execution or lane routing.
+    ///
+    /// The returned index addresses the array from `groups`, so the two must
+    /// keep the same order.
     pub(super) const fn index(computation: uniserve_worker_ipc::CallKind) -> usize {
         use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
         match computation {
@@ -214,7 +244,10 @@ pub struct WorkerStats {
     pub spec_verify_path_counts: Mutex<BTreeMap<String, u64>>,
 }
 
-/// Live scheduler stats, shared with the frontend for `/stats` observability.
+/// Live scheduler stats, shared by `Arc` from `Scheduler::stats_handle`.
+///
+/// The server samples them periodically through `SchedulerStatsReporter` and
+/// records each snapshot into its Prometheus metrics.
 #[derive(Default)]
 pub struct SchedulerStats {
     /// General scheduler loop and queue counters.

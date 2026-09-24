@@ -1,4 +1,8 @@
-//! Token decoding and ranking for generated and prompt logprobs.
+//! Token decoding for generated and prompt logprobs.
+//!
+//! Converts the engine's token-ID candidates (`uniserve_core::PositionLogprobs`)
+//! into decoded candidate strings. Ranks and log probabilities are passed
+//! through unchanged from the engine.
 
 use crate::profile::tokenizer::HuggingFaceTokenizer;
 use itertools::Itertools as _;
@@ -13,17 +17,25 @@ pub struct DecodedTokenLogprob {
     /// Original vocabulary token ID for this candidate.
     pub token_id: u32,
     /// Best-effort decoded token string for this candidate.
+    ///
+    /// The token is decoded in isolation, so the string can differ from the
+    /// token's contribution to the fully decoded text.
     pub token: String,
     /// Log probability of this token candidate.
     pub logprob: f32,
-    /// Vocabulary rank of this token candidate.
+    /// One-based competition rank of this candidate at its position; tied log
+    /// probabilities share a rank.
     pub rank: u32,
 }
 
 /// One position's decoded token candidates and their logprobs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecodedPositionLogprobs {
-    /// Candidate tokens for this position.
+    /// Candidate tokens for this position, in engine order.
+    ///
+    /// For a generated position the first entry is the sampled token; the
+    /// stream consumers in `serving::text::output` and `serving::assembly`
+    /// reject engine output that violates this.
     pub entries: Vec<DecodedTokenLogprob>,
 }
 
@@ -51,11 +63,10 @@ pub struct DecodedPromptLogprobs {
     pub scored_positions: Vec<DecodedPositionLogprobs>,
 }
 
-/// Decodes generated-token logprobs from the raw `llm` token-ID shape into the
-/// text-layer decoded-token representation.
+/// Decodes generated-token logprobs from the engine's token-ID candidates into
+/// the text-layer decoded-token representation.
 ///
-/// Each returned position corresponds to one generated token position from the
-/// same `llm` update.
+/// Each returned position corresponds to one input position, in order.
 pub(crate) fn decode_logprobs(
     tokenizer: &HuggingFaceTokenizer,
     positions: &[PositionLogprobs],
@@ -69,11 +80,16 @@ pub(crate) fn decode_logprobs(
     })
 }
 
-/// Decodes prompt logprobs from the raw `llm` token-ID shape into the text-layer
-/// decoded-token representation.
+/// Decodes prompt logprobs from the engine's token-ID candidates into the
+/// text-layer decoded-token representation.
 ///
 /// The first prompt token is stored separately because scored positions begin
 /// with the token predicted after it.
+///
+/// # Errors
+///
+/// Returns [`Error::EmptyPromptTokenIds`] for an empty prompt and a tokenizer
+/// error when a token cannot be decoded.
 pub(crate) fn decode_prompt_logprobs(
     request_id: &str,
     tokenizer: &HuggingFaceTokenizer,
@@ -102,8 +118,7 @@ pub(crate) fn decode_prompt_logprobs(
 /// Decodes one token position's raw candidate set into decoded token strings
 /// plus logprob metadata.
 ///
-/// This decodes every candidate token ID independently through the active text
-/// backend.
+/// Every candidate token ID is decoded independently with the tokenizer.
 fn decode_position_logprobs(
     tokenizer: &HuggingFaceTokenizer,
     position: &PositionLogprobs,
@@ -132,6 +147,9 @@ mod tests {
     use uniserve_core::{PositionLogprobs, TokenLogprob};
 
     use super::*;
+
+    // The configured test tokenizer maps each printable ASCII character to the
+    // token ID equal to its code point, so `b'a' as u32` decodes to "a".
 
     #[test]
     fn decode_logprobs_decodes_every_candidate_token() {

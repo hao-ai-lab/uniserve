@@ -19,12 +19,19 @@ use crate::AppState;
 use crate::http::routes::openai::utils::validated_json::ValidatedJson;
 use crate::http::utils::{resolve_request_id, unix_timestamp};
 
-/// Validates one chat completion request and run it through the serving runtime.
+/// Validates one chat completion request and runs it through the serving runtime.
+///
+/// Returns an SSE stream when `stream` is set and one JSON completion
+/// otherwise. Errors from submission, and from collection in the non-streaming
+/// case, become `ApiError` responses; errors after an SSE stream has started
+/// are reported inside the stream.
 pub(crate) async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
+    // `body` moves into the runtime below, so every option that shapes the
+    // response is captured first. Responses report the served model name.
     let stream = body.stream;
     let request_id = format!("chatcmpl-{}", resolve_request_id(&headers));
     let response =
@@ -35,6 +42,7 @@ pub(crate) async fn chat_completions(
         engine_request_id = tracing::field::Empty,
     );
 
+    // One timestamp for the whole response, shared by every streamed chunk.
     let created = unix_timestamp();
     let log_request = state.enable_log_requests();
 

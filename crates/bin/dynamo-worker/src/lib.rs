@@ -6,6 +6,15 @@
 //! This reference integration embeds UniServe's Rust scheduler and engine in
 //! the Dynamo worker process. The preferred production boundary remains the
 //! native HTTP sidecar, which does not couple either project's dependencies.
+//!
+//! The Dynamo frontend forwards each `/v1/videos` request to
+//! `RawEngine::generate`, nesting unknown client fields under `extra_args`.
+//! `prepare_request` checks it against the fixed FastH3 contract and refuses
+//! any control FastH3 does not implement rather than ignoring it. The request
+//! then enters `ServingRuntime::generate_video`, the lifecycle the HTTP
+//! `/v1/videos` route uses, and a successful request yields one terminal
+//! response object carrying the single MP4 artifact.
+//! UniServe's own HTTP listener is never started.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -36,6 +45,10 @@ use uniserve_server::{
     serving::{FinishStatus, RequestOutput, ServeRequestId},
 };
 
+// The fixed FastH3 request and output contract. The frame rate, size and
+// minimum frame count duplicate the MiniMax H3 values the server reports from
+// `InputProcessor::video_capabilities`; `build_state` checks the step count
+// against the started engine.
 const H3_FPS: u32 = 24;
 const H3_WIDTH: u32 = 1344;
 const H3_HEIGHT: u32 = 768;
@@ -73,6 +86,8 @@ struct Args {
     #[arg(long, default_value = "localhost")]
     host_identity: String,
 
+    // These options mirror the `uniserve serve` flags of the same names and
+    // feed the engine configuration `build_state` assembles.
     #[arg(long, default_value_t = 16_384, value_parser = clap::value_parser!(u32).range(1..))]
     max_model_len: u32,
 
@@ -99,6 +114,7 @@ fn read_workers(path: &str) -> Result<Box<[WorkerConfig]>, String> {
     Ok(workers.into_boxed_slice())
 }
 
+/// Parses a command-line value that must be a JSON object.
 fn parse_json_object(raw: &str) -> Result<Value, String> {
     let value: Value = serde_json::from_str(raw).map_err(|error| error.to_string())?;
     value
@@ -107,13 +123,27 @@ fn parse_json_object(raw: &str) -> Result<Value, String> {
         .ok_or_else(|| "expected a JSON object".to_string())
 }
 
+/// Dynamo `RawEngine` serving FastH3 video generation from an in-process
+/// UniServe engine.
 pub struct DynamoFastH3Engine {
     args: Args,
+    /// The UniServe serving state, set once by `start`. Every other trait
+    /// method reads it and treats an unset state as not started.
     state: OnceCell<Arc<AppState>>,
+    /// Cancelled by `cleanup`; every in-flight `generate` stream then aborts
+    /// its UniServe request and ends without a response.
     cancel: CancellationToken,
 }
 
 impl DynamoFastH3Engine {
+    /// Parses the process command line into an unstarted engine and the
+    /// Dynamo worker registration that advertises it as a `videos` endpoint.
+    ///
+    /// Clap exits the process on a malformed command line, including an
+    /// unreadable or invalid `--workers` deployment file. Settings this
+    /// worker cannot honor (disaggregation, encoder routing, RL routes, a
+    /// non-finite or non-positive video length, a zero request limit) return
+    /// an invalid-argument error. No rank starts until `RawEngine::start`.
     pub fn from_args() -> Result<(Self, DynamoWorkerConfig), DynamoError> {
         Self::try_from_args(<Args as Parser>::parse())
     }
@@ -168,6 +198,15 @@ impl DynamoFastH3Engine {
         ))
     }
 
+    /// Starts UniServe's engine and worker ranks for the configured FastH3
+    /// checkpoint and returns the serving state.
+    ///
+    /// Fails with an invalid argument when the checkpoint's pipeline index
+    /// cannot be resolved or does not name MiniMax H3, when the configuration
+    /// does not validate, or when the started model reports no video
+    /// capabilities or a denoising step count other than `H3_DENOISE_STEPS`;
+    /// it fails with an engine error when UniServe cannot start. The two
+    /// refusals after startup shut the engine down before returning.
     async fn build_state(&self) -> Result<Arc<AppState>, DynamoError> {
         // A MiniMax H3 checkpoint names its pipeline class in a root index in
         // place of config.json; refuse anything else before a rank starts.
@@ -191,6 +230,9 @@ impl DynamoFastH3Engine {
             ..WorkerProcessArgs::default()
         };
 
+        // Only `uniserve_server::http` binds `listener_mode`, and this worker
+        // never serves UniServe's HTTP API; a loopback ephemeral address
+        // satisfies `Config::validate`.
         let config = Config {
             engine: EngineSettings {
                 max_batch: DEFAULT_MAX_BATCH,
@@ -245,6 +287,8 @@ impl DynamoFastH3Engine {
 #[async_trait]
 impl RawEngine for DynamoFastH3Engine {
     async fn start(&self, _worker_id: u64) -> Result<EngineConfig, DynamoError> {
+        // The check refuses a second start before it launches ranks; `set`
+        // refuses the second of two starts that raced past it.
         if self.state.initialized() {
             return Err(engine_error("UniServe engine already started"));
         }
@@ -276,7 +320,10 @@ impl RawEngine for DynamoFastH3Engine {
             &self.args.served_model_name,
             self.args.max_video_seconds,
         )?;
+        // The Dynamo context id is the UniServe request id, so `abort` can name
+        // the same request from its own context.
         let request_id = ServeRequestId::new(ctx.id().to_string());
+
         // The serving runtime owns the request lifecycle the HTTP video route
         // uses: identity registration, prompt preprocessing, submission and
         // terminal accounting.
@@ -289,10 +336,16 @@ impl RawEngine for DynamoFastH3Engine {
         let served_model_name = self.args.served_model_name.clone();
         let response_format = prepared.response_format;
 
+        // Unless stopped, the stream yields exactly one item: the response
+        // object, or the error that ended the request. A Dynamo stop or
+        // `cleanup` instead aborts the UniServe request and ends the stream
+        // without an item; abort failures are ignored.
         Ok(Box::pin(async_stream::stream! {
             let started_at = Instant::now();
             let mut artifact = None;
             loop {
+                // `biased` polls the stop and shutdown signals first, so they
+                // take precedence over an event that is ready at the same time.
                 let event = tokio::select! {
                     biased;
                     _ = ctx.stopped() => {
@@ -325,6 +378,8 @@ impl RawEngine for DynamoFastH3Engine {
                         yield Err(engine_error(message));
                         return;
                     }
+                    // Lifecycle, usage and progress events have no place in
+                    // the single non-streaming response.
                     Some(Ok(
                         RequestOutput::Accepted { .. }
                         | RequestOutput::Usage { .. }
@@ -388,6 +443,12 @@ impl RawEngine for DynamoFastH3Engine {
     }
 }
 
+/// The request body Dynamo's frontend forwards: the fields of its
+/// `NvCreateVideoRequest` as dispatched to a worker.
+///
+/// Unknown fields are refused. The frontend moves unknown top-level client
+/// fields under `extra_args["media_passthrough"]`, and `prepare_request`
+/// requires `extra_args` to be empty.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DynamoVideoRequest {
@@ -421,6 +482,9 @@ enum ResponseFormat {
     B64Json,
 }
 
+/// Dynamo's `nvext` video extensions. `prepare_request` accepts only the
+/// fields FastH3 can honor: `seed` at any non-negative value, and `fps`,
+/// `num_frames` and `num_inference_steps` only at the values FastH3 runs with.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VideoNvExt {
@@ -450,6 +514,13 @@ struct PreparedRequest {
     response_format: ResponseFormat,
 }
 
+/// Maps a Dynamo video request onto UniServe's `VideoGenerationRequest`.
+///
+/// Omitted fields default to 5 seconds, seed 0 and a `url` response.
+/// `nvext.num_frames` is only checked against the aligned frame count of
+/// `seconds`; UniServe derives the frame count from `seconds` again in
+/// `InputProcessor::video_sampling`. Every refusal is an invalid-argument
+/// error.
 fn prepare_request(
     value: Value,
     served_model_name: &str,
@@ -494,6 +565,7 @@ fn prepare_request(
         return Err(invalid_argument("extra video fields are not supported"));
     }
 
+    // `seconds` is an integer in Dynamo's API, so it is always finite here.
     let seconds = request.seconds.map(f64::from).unwrap_or(5.0);
     if seconds <= 0.0 || seconds > max_video_seconds {
         return Err(invalid_argument(format!(
@@ -523,6 +595,7 @@ fn prepare_request(
             "nvext.num_inference_steps must be {H3_DENOISE_STEPS}"
         )));
     }
+    // Dynamo's seed is signed and UniServe's unsigned.
     let seed = match nvext.seed {
         Some(seed) if seed < 0 => return Err(invalid_argument("nvext.seed must not be negative")),
         Some(seed) => seed as u64,
@@ -539,8 +612,18 @@ fn prepare_request(
     })
 }
 
+/// Returns the FastH3 frame count for `seconds`: the 24 fps frame count
+/// rounded up to the next value of the form `5 + 17k`.
+///
+/// Refuses a duration whose frame count is not representable or aligns below
+/// `H3_MIN_FRAMES`.
+///
+/// This mirrors the server's `align_num_frames` and the bounds
+/// `InputProcessor::video_sampling` applies around it, so a `num_frames` this
+/// accepts is the count UniServe generates.
 fn aligned_frame_count(seconds: f64) -> Result<u32, DynamoError> {
     let raw = (seconds * f64::from(H3_FPS)).round();
+    // Alignment adds at most 16 frames, which the upper bound leaves room for.
     if !raw.is_finite() || raw < 1.0 || raw > f64::from(u32::MAX - 16) {
         return Err(invalid_argument(
             "seconds cannot be represented as FastH3 frames",
@@ -548,6 +631,7 @@ fn aligned_frame_count(seconds: f64) -> Result<u32, DynamoError> {
     }
     let raw = raw as u32;
     let frames = raw + (H3_MIN_FRAMES - raw % 17) % 17;
+    // Only raw counts up to 5 align below the minimum, to 5.
     if frames < H3_MIN_FRAMES {
         return Err(invalid_argument(
             "seconds is shorter than supported geometry",
@@ -565,6 +649,12 @@ fn reject_present<T>(field: &str, value: Option<&T>) -> Result<(), DynamoError> 
     }
 }
 
+/// Builds the terminal response body in the shape of Dynamo's
+/// `NvVideosResponse`.
+///
+/// The MP4 is embedded in the response: `Url` returns it as a `data:` URL and
+/// `B64Json` as bare base64. `fps` and `audio_sample_rate` report the fixed
+/// FastH3 contract, not values read from the artifact.
 fn video_response(
     id: &str,
     model: &str,
@@ -595,6 +685,7 @@ fn video_response(
     })
 }
 
+/// Registration metadata Dynamo copies into the model's runtime config.
 fn runtime_data(max_video_seconds: f64) -> HashMap<String, Value> {
     BTreeMap::from([
         ("backend".to_string(), json!("uniserve-inprocess")),
@@ -608,6 +699,8 @@ fn runtime_data(max_video_seconds: f64) -> HashMap<String, Value> {
     .collect()
 }
 
+/// Maps a UniServe API error to Dynamo's error type: a 4xx status becomes an
+/// invalid argument and any other status an unknown backend error.
 fn api_error(error: uniserve_server::openai::ApiError) -> DynamoError {
     let kind = if error.status_code().is_client_error() {
         BackendError::InvalidArgument
@@ -657,6 +750,8 @@ mod tests {
         assert!(matches!(prepared.response_format, ResponseFormat::B64Json));
     }
 
+    // Each request carries one field or value FastH3 does not support. With
+    // the default 5 seconds, `num_frames` must be 124, so 120 is refused.
     #[test]
     fn unsupported_control_is_rejected() {
         for request in [

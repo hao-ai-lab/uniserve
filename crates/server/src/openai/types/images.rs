@@ -5,19 +5,26 @@ use validator::Validate;
 
 use super::common::Normalizable;
 
-/// Configured OpenAI-compatible image-generation request.
+/// Configured OpenAI-compatible image-generation request for
+/// `/v1/images/generations`.
+///
+/// Serde enforces the field set and types. The value checks (non-blank
+/// prompt, `n == 1`, served model name, positive `steps`, well-formed `size`)
+/// run in `InputProcessor::preprocess_image_request` when the request is
+/// lowered.
 #[derive(Debug, Clone, Deserialize, PartialEq, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct ImageGenerationRequest {
     /// Text prompt describing the requested image.
     pub prompt: String,
-    /// Served model name, or the configuration default when omitted.
+    /// Served model name; the served-model check is skipped when omitted.
     #[serde(default)]
     pub model: Option<String>,
-    /// Number of images to generate.
+    /// Number of images to generate; lowering accepts only `1`.
     #[serde(default = "default_image_count")]
     pub n: u16,
-    /// Named output resolution.
+    /// Output size as `WIDTHxHEIGHT` in pixels. When omitted, the profile's
+    /// resolution policy chooses both dimensions.
     #[serde(default)]
     pub size: Option<String>,
     /// Number of denoising steps per image.
@@ -58,7 +65,7 @@ const fn default_image_count() -> u16 {
 pub struct ImageGenerationResponse {
     /// Response creation timestamp in Unix seconds.
     pub created: u64,
-    /// Generated images in request order.
+    /// Generated images in the order their `ImageDone` events arrived.
     pub data: Vec<GeneratedImageData>,
 }
 

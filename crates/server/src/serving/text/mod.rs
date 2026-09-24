@@ -18,9 +18,15 @@ pub use crate::profile::tokenizer;
 
 /// Resolves the effective `max_tokens` for generation.
 ///
-/// Takes the minimum of all available limits (user, generation-config default,
-/// and `max_model_len - prompt_len`), falling back to `u32::MAX` when nothing is
-/// known so the engine can apply its own context-window limit.
+/// The request's `user_max_tokens` replaces `default_max_tokens` when set, and
+/// when `max_model_len` is known the result is capped by the remaining
+/// context, `max_model_len - prompt_len`. Returns `u32::MAX` when no limit is
+/// known.
+///
+/// # Errors
+///
+/// Returns [`Error::PromptTooLong`] when `max_model_len` is set and
+/// `prompt_len >= max_model_len`.
 pub fn resolve_max_tokens(
     user_max_tokens: Option<u32>,
     default_max_tokens: Option<u32>,

@@ -1,4 +1,10 @@
 //! Prometheus publication of engine-reported scheduler statistics.
+//!
+//! `EngineClient` (in `in_process`) runs a once-per-second task that asks the
+//! engine's `SchedulerStatsReporter` for a `SchedulerStats` snapshot and
+//! passes it to [`record_scheduler_stats`] as engine `0`. The reporter already
+//! turns cumulative scheduler counters into per-interval increments; this
+//! module only maps fields onto the `SchedulerMetrics` families.
 
 use uniserve_observability::{
     EngineBackendLabels, EngineComponentLabels, EngineDomainKindLabels, EngineDomainLabels,
@@ -11,6 +17,12 @@ const WAITING_REASON_CAPACITY: &str = "capacity";
 
 /// Records the scheduler-stats-backed metrics for one engine at one point in
 /// time.
+///
+/// Interval-delta fields of `stats` are added to Prometheus counters, while
+/// point-in-time values (running and waiting requests, KV usage, active
+/// credits) and lifetime maxima (`max_queue_wait_us`, `peak_credits`) are set
+/// on gauges. `stats` must therefore be an interval snapshot: passing a
+/// cumulative one, or the same snapshot twice, double-counts every counter.
 pub fn record_scheduler_stats(
     metrics: &SchedulerMetrics,
     model_name: impl Into<String>,
@@ -23,7 +35,7 @@ pub fn record_scheduler_stats(
         engine,
     };
 
-    // Scheduler state gauges.
+    // Request-level scheduler state, admissions, and queue wait.
     metrics
         .scheduler_running
         .get_or_create(&labels)
@@ -32,6 +44,9 @@ pub fn record_scheduler_stats(
         .scheduler_waiting
         .get_or_create(&labels)
         .set(stats.num_waiting_reqs);
+    // `SchedulerStats` carries no per-reason breakdown, so every waiting
+    // request is published under the `capacity` reason and this family equals
+    // `scheduler_waiting`.
     metrics
         .scheduler_waiting_by_reason
         .get_or_create(&WaitingReasonLabels {
@@ -56,6 +71,9 @@ pub fn record_scheduler_stats(
         .scheduler_queue_wait_max_us
         .get_or_create(&labels)
         .set(stats.max_queue_wait_us);
+
+    // Per-execution-domain accounting: credit gauges, then call, pressure,
+    // and phase-time counters keyed by the domain name.
     for domain in &stats.domain_stats {
         let domain_labels = EngineDomainLabels {
             model_name: model_name.clone(),
@@ -116,7 +134,7 @@ pub fn record_scheduler_stats(
         }
     }
 
-    // Prefix-cache counters, including the connector-backed external cache path.
+    // Prefix-cache query and hit counters, both in tokens.
     metrics
         .prefix_cache_queries
         .get_or_create(&labels)
@@ -126,7 +144,9 @@ pub fn record_scheduler_stats(
         .get_or_create(&labels)
         .inc_by(stats.prefix_cache_stats.base.hits);
 
-    // Worker-local forward/kernel counters.
+    // Worker-local forward/kernel counters. The reporter sends `None` when no
+    // worker counter changed in the interval, and then none of these families
+    // is touched.
     if let Some(worker_stats) = &stats.worker_forward_stats {
         for (mode, count) in &worker_stats.mode_counts {
             metrics
@@ -168,8 +188,6 @@ pub fn record_scheduler_stats(
                 })
                 .inc_by(*us);
         }
-        // the two maps the scheduler folds all
-        // the way through to Prometheus.
         for (backend, count) in &worker_stats.attention_backend_counts {
             metrics
                 .worker_attention_backend_counts
@@ -294,9 +312,9 @@ pub fn record_scheduler_stats(
         }
     }
 
-    // Worker and round-trip latency remain cumulative integer microseconds to
-    // preserve precision. Dashboards convert these counters to seconds when
-    // combining them with per-request second-valued histograms.
+    // Worker execution and host-observed round-trip time, in integer
+    // microseconds; `batch_timing_count` counts the completed batches they
+    // cover and is the denominator for per-batch averages.
     metrics
         .worker_exec_us
         .get_or_create(&labels)
@@ -317,6 +335,8 @@ mod tests {
     use uniserve_core::codec::stats::DomainSchedulerStats;
     use uniserve_observability::Metrics;
 
+    // Per-domain scheduler statistics reach the rendered exposition under
+    // their `domain` label, with call and phase-time breakdowns under `kind`.
     #[test]
     fn domain_accounting_reaches_openmetrics() {
         let metrics = Metrics::new();
@@ -339,8 +359,10 @@ mod tests {
             }],
             ..Default::default()
         };
+
         record_scheduler_stats(&metrics.scheduler, "model", 0, &stats);
         let rendered = metrics.render().expect("metrics render");
+
         assert!(rendered.lines().any(|line| {
             line.starts_with("uniserve:scheduler_domain_active_credits")
                 && line.contains("domain=\"decode\"")

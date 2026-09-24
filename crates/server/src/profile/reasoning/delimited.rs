@@ -1,13 +1,26 @@
 //! Incremental parser for reasoning enclosed by configured text delimiters.
+//!
+//! Delimiters are matched as text in the decoded stream, so text that may be
+//! the start of a delimiter split across deltas is held back until later text
+//! completes or rules it out, or the stream ends. Each delimiter must also be
+//! a single vocabulary token, whose id `initialize` looks for in the prompt to
+//! choose the initial region.
 
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 
 use super::{ReasoningDelta, ReasoningError, Result};
 
 /// Shared incremental state machine for configured tag-delimited reasoning.
+///
+/// One instance serves one generation stream: optionally call
+/// [`DelimitedReasoningParser::initialize`] with the prompt, then
+/// [`DelimitedReasoningParser::push`] for each decoded delta, then
+/// [`DelimitedReasoningParser::finish`] once at end of stream.
 pub struct DelimitedReasoningParser {
     tokenizer: DynTokenizer,
     current_in_reasoning: bool,
+    /// Trailing text that may be the start of a delimiter, held until a later
+    /// delta disambiguates it or `finish` flushes it.
     buffer: String,
     start_token: String,
     end_token: String,
@@ -19,9 +32,14 @@ pub struct DelimitedReasoningParser {
 impl DelimitedReasoningParser {
     /// Creates one delimited parser state machine.
     ///
-    /// `default_in_reasoning` is only used when prompt initialization sees no
-    /// reasoning boundary token at all. If the prompt contains either the
-    /// start or end delimiter, that prompt boundary always wins.
+    /// `default_in_reasoning` is the initial region when `initialize` finds no
+    /// delimiter token after the prompt's last other special token, and also
+    /// when `initialize` is never called.
+    ///
+    /// # Errors
+    ///
+    /// Fails when either delimiter is empty or is not a single token in the
+    /// tokenizer vocabulary.
     pub fn new(
         tokenizer: DynTokenizer,
         start_token: impl Into<String>,
@@ -62,6 +80,12 @@ impl DelimitedReasoningParser {
     }
 
     /// Initializes parser state from the prompt token IDs.
+    ///
+    /// The last delimiter token in the prompt decides where generation starts
+    /// when no other special token follows it: with `<think>` delimiters, a
+    /// prompt ending in `<think>` starts inside reasoning and one ending in
+    /// `</think>` starts in visible content. Otherwise the parser starts in the
+    /// `default_in_reasoning` region.
     pub fn initialize(&mut self, prompt_token_ids: &[u32]) {
         self.current_in_reasoning = last_reasoning_boundary(
             prompt_token_ids,
@@ -72,10 +96,15 @@ impl DelimitedReasoningParser {
         .unwrap_or(self.default_in_reasoning);
     }
 
-    /// Parses one decoded text delta and return its reasoning/content split.
+    /// Parses one decoded text delta and returns its reasoning/content split.
+    ///
+    /// Text that could begin a delimiter stays buffered, so the returned
+    /// delta may be empty.
     pub fn push(&mut self, delta: &str) -> ReasoningDelta {
         self.buffer.push_str(delta);
 
+        // Keep only the possible partial delimiter in the buffer and parse
+        // everything before it.
         let partial_suffix_len = self.partial_suffix_len(&self.buffer);
         let stable_len = self.buffer.len() - partial_suffix_len;
         let pending_suffix = self.buffer.split_off(stable_len);
@@ -85,6 +114,9 @@ impl DelimitedReasoningParser {
     }
 
     /// Flushes any buffered partial delimiter suffix at end of stream.
+    ///
+    /// The unfinished delimiter text is emitted as ordinary text of the
+    /// current region.
     pub fn finish(&mut self) -> ReasoningDelta {
         let stable_text = std::mem::take(&mut self.buffer);
         self.parse_stable_text(&stable_text)
@@ -122,10 +154,9 @@ impl DelimitedReasoningParser {
     ///
     /// A trailing suffix can only be a *strict* prefix of a delimiter when it
     /// is shorter than that delimiter, so only the final
-    /// `max(start_token, end_token)` bytes of `text` can ever match. We scan
-    /// just that trailing window instead of every char boundary in `text`,
-    /// keeping the cost per delta bounded by the delimiter length rather than
-    /// the accumulated buffer length.
+    /// `max(start_token, end_token)` bytes of `text` can ever match. Scanning
+    /// just that trailing window keeps the cost bounded by the delimiter
+    /// length rather than the length of `text`.
     fn partial_suffix_len(&self, text: &str) -> usize {
         let max_token_len = self.start_token.len().max(self.end_token.len());
         // Suffixes at least `max_token_len` bytes long cannot be a strict
@@ -153,6 +184,11 @@ impl DelimitedReasoningParser {
 }
 
 /// Determines the reasoning state implied by the last prompt boundary, if any.
+///
+/// Scans backwards from the end of the prompt. The first delimiter found
+/// decides: the start delimiter means inside reasoning, the end delimiter
+/// means outside. Reaching any other special token first, or the start of the
+/// prompt, yields `None`.
 fn last_reasoning_boundary(
     prompt_token_ids: &[u32],
     start_token_id: u32,

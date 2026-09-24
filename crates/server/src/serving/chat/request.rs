@@ -1,4 +1,9 @@
 //! Internal chat messages, content parts, tools, and render options.
+//!
+//! The Chat Completions preprocessing converts API requests into these types.
+//! `HfChatRenderer` renders a [`ChatRequest`] into the prompt, and
+//! `Qwen3ChatOutputProcessor` reads its tool configuration to decide whether
+//! generated text is parsed for tool calls.
 
 pub use crate::profile::tools::Tool;
 use crate::serving::text::TextDecodeOptions;
@@ -8,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::serving::chat::error::{Error, Result};
 use crate::serving::chat::event::{AssistantContentBlock, AssistantMessage};
 
-/// Role label for one text-only chat message.
+/// Role of one chat message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatRole {
@@ -24,7 +29,7 @@ pub enum ChatRole {
     ToolResponse,
 }
 
-/// One text-only chat content part in OpenAI-style block format.
+/// One chat content part in OpenAI-style block format.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -40,7 +45,7 @@ pub enum ChatContentPart {
         image_url: String,
         /// Requested image-detail policy.
         detail: Option<ImageDetail>,
-        /// Optional stable image identity used for request-local reuse.
+        /// Optional caller-provided image identity from the API request.
         uuid: Option<String>,
     },
 }
@@ -83,9 +88,10 @@ impl ChatContentPart {
     }
 }
 
-/// Text-only chat content.
+/// Chat message content.
 ///
-/// This supports either a simple string or an OpenAI-style list of text blocks.
+/// This is either a simple string or an OpenAI-style list of content parts,
+/// which may include images.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ChatContent {
@@ -96,7 +102,8 @@ pub enum ChatContent {
 }
 
 impl ChatContent {
-    /// Flattens text-only content or returns an error for multimodal parts.
+    /// Concatenates text parts without separators, or returns
+    /// `Error::UnsupportedMultimodalContent` if any part is an image.
     pub fn try_flatten_to_text(&self) -> Result<String> {
         Ok(match self {
             Self::Text(text) => text.clone(),
@@ -147,7 +154,6 @@ impl From<Vec<ChatContentPart>> for ChatContent {
 }
 
 /// One chat message.
-///
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum ChatMessage {
@@ -328,6 +334,9 @@ pub enum GenerationPromptMode {
 }
 
 /// Semantic effort level for reasoning models.
+///
+/// The value reaches the model only through the chat template, which receives
+/// it as `reasoning_effort`; its effect depends on that template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
@@ -392,12 +401,19 @@ impl ChatOptions {
 }
 
 /// Tool-choice semantics supported by `chat`.
+///
+/// The `Default` value is `None`, whereas the Chat Completions preprocessing
+/// maps an absent `tool_choice` to `Auto`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatToolChoice {
-    /// Allows the model to choose between text and tool calls.
+    /// Allows the model to choose between text and tool calls. Tools are
+    /// passed to the chat template and tool calls parsed only when
+    /// `ChatRequest::tools` is non-empty.
     Auto,
-    /// Prevents the model from emitting tool calls.
+    /// Withholds the request's `tools` from the chat template and disables
+    /// tool-call parsing. Message-local tools on developer messages are still
+    /// passed to the template.
     #[default]
     None,
 }
@@ -431,6 +447,10 @@ impl ChatRequest {
     }
 
     /// Validates basic request invariants before rendering.
+    ///
+    /// Returns `Error::EmptyMessages` for an empty history, and
+    /// `Error::ContinueFinalAssistantWithoutFinalAssistant` when continuation
+    /// mode is selected but the last message is not from the assistant.
     pub fn validate(&self) -> Result<()> {
         if self.messages.is_empty() {
             return Err(Error::EmptyMessages);
@@ -457,14 +477,18 @@ impl ChatRequest {
 
     /// Returns true if this request should enable tool parsing based on the tool
     /// choice and tool list.
+    ///
+    /// `HfChatRenderer` passes the request's `tools` to the template only when
+    /// this holds, and `Qwen3ChatOutputProcessor::new` applies the same
+    /// condition to decide whether to parse tool calls.
     pub fn tool_parsing_enabled(&self) -> bool {
         matches!(self.tool_choice, ChatToolChoice::Auto) && !self.tools.is_empty()
     }
 }
 
 impl ChatRole {
-    /// Returns the chat-template role string used by the current text-only chat
-    /// backend.
+    /// Returns the snake_case role label, matching this enum's serde
+    /// representation.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::System => "system",

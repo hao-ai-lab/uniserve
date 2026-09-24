@@ -1,7 +1,11 @@
 //! Demonstrates concurrent text and image requests through the simulated engine.
 //!
 //! The example exercises scheduling and lifecycle events without requiring a
-//! model worker or GPU.
+//! model worker or GPU. Three text-only and two image-only requests share one
+//! scheduler thread over `SimExecutor`; the run passes when every request
+//! finishes within the deadline, each text request emits at least one text
+//! token, and each image request emits at least one image. The process exits
+//! with status 1 on failure.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -21,6 +25,9 @@ fn main() {
     let ctrl = SpecialTokenIds::default();
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
     let sched = Scheduler::new(executor, ctrl, 32).unwrap();
+
+    // The scheduler runs on its own thread; this thread submits through the
+    // handle and drains each request's event receiver, as a server would.
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(cmd_tx);
     let jh = thread::spawn(move || sched.run(cmd_rx));
@@ -50,6 +57,8 @@ fn main() {
             ..Default::default()
         };
         let cache = Default::default();
+        // These limits only check the request locally before submission; the
+        // scheduler resolves its limits separately against the executor.
         let limits = GenerationLimits {
             features: uniserve_core::GenerationFeatures::UNDERSTANDING
                 | uniserve_core::GenerationFeatures::IMAGE_GENERATION,
@@ -96,7 +105,9 @@ fn main() {
         rxs.insert(id, ("image".to_string(), rx));
     }
 
-    // collect until every request is Finished
+    // Poll every event receiver until each request has reported `Finished`
+    // once, or the deadline passes. After the kind label, the tuple counts
+    // text tokens and images and records whether `Finished` was seen.
     let mut done = 0usize;
     let total = rxs.len();
     let mut counts: HashMap<RequestId, (String, usize, usize, bool)> = HashMap::new();

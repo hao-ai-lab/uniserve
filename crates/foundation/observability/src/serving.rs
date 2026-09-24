@@ -1,4 +1,10 @@
 //! Serving-runtime request lifecycle metrics.
+//!
+//! The server's OpenMetrics route copies the serving runtime's lifecycle
+//! snapshot into these gauges on every scrape (`set_request_states`), just
+//! before rendering. Every state is a gauge whose value each scrape overwrites
+//! from that snapshot: `active` is a current count, while every other state
+//! the server exports is a cumulative total.
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
@@ -13,7 +19,8 @@ pub struct ServingRequestLabels {
     pub model_name: String,
     /// Model description identity.
     pub description: String,
-    /// Request lifecycle state.
+    /// Request lifecycle state name, as supplied by the caller of
+    /// `ServingMetrics::set_request_states`.
     pub state: &'static str,
 }
 
@@ -29,6 +36,9 @@ pub struct ServingMetrics {
 
 impl ServingMetrics {
     /// Sets every supplied lifecycle-state gauge for a model description.
+    ///
+    /// Each `(state, value)` pair overwrites one series; states absent from
+    /// `states` keep whatever value an earlier call set.
     pub fn set_request_states(
         &self,
         model_name: &str,

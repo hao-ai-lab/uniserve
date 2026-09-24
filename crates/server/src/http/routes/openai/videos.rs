@@ -1,7 +1,22 @@
-//! HTTP handler for synchronous OpenAI-compatible video generation.
+//! HTTP handlers for OpenAI-compatible video generation.
 //!
-//! Completed video bytes retain the engine-owned immutable mapping for each
-//! active response and retained video job.
+//! Two submission routes share the request extractor `VideoBody`:
+//!
+//! - `POST /v1/videos/sync` (`videos_sync`) waits for generation and responds
+//!   with the video bytes.
+//! - `POST /v1/videos` (`videos_create`) returns a job record at once and
+//!   drives generation in a detached task. `GET /v1/videos`,
+//!   `GET`/`DELETE /v1/videos/{id}`, and `GET /v1/videos/{id}/content` list,
+//!   read, delete (cancelling a running job), and download jobs held in
+//!   `crate::video_jobs::VideoJobs`.
+//!
+//! `GET /v1/capabilities` (`capabilities`) reports the model's video limits
+//! and the job-store bounds.
+//!
+//! Completed video bytes arrive as `ArtifactEvent::media`, the read-only
+//! shared-memory mapping (`SharedMedia`) the engine claims from the worker's
+//! publication. Responses and retained jobs hold that mapping by `Arc`, and
+//! `media_body` streams from it without gathering the video into one buffer.
 
 use std::sync::Arc;
 
@@ -21,6 +36,13 @@ use crate::http::utils::resolve_request_id;
 use crate::openai::ApiError;
 
 /// Validates and streams one completed video artifact synchronously.
+///
+/// Responds with the artifact bytes, its content type, and a `Server-Timing`
+/// `generation` entry in milliseconds from handler entry (after body
+/// extraction) until the runtime reported completion. Submission errors,
+/// stream errors, and engine rejections map through `ApiError` (`400` or `503`
+/// for a rejection); a failed or non-`Stop` finish, an unexpected event, a
+/// closed stream, or a missing artifact is a `500`.
 pub(crate) async fn videos_sync(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -37,6 +59,9 @@ pub(crate) async fn videos_sync(
 
     // The synchronous endpoint consumes lifecycle events until the runtime
     // confirms completion and supplies exactly one artifact descriptor.
+    // Acceptance, usage, scheduling, and progress events are ignored; any other
+    // event, including `Cancelled` and `Aborted`, is answered as an
+    // incompatible runtime event.
     let mut artifact = None;
     loop {
         let event = match stream.next().await.transpose() {
@@ -104,7 +129,17 @@ pub(crate) async fn videos_sync(
         })
 }
 
-/// JSON and multipart share the same strict typed request and capability validation.
+/// Video request extractor accepting `application/json` or
+/// `multipart/form-data`.
+///
+/// Both content types deserialize into the same `VideoGenerationRequest`, whose
+/// `deny_unknown_fields` rejects unknown JSON fields. The multipart path admits
+/// only the text fields `model`, `prompt`, `seconds`, and `seed`, rejects file
+/// parts and repeated fields, and parses `seconds` and `seed` as numbers before
+/// deserializing. Every rejection is `400 Bad Request` except an unsupported
+/// content type, which is `415 Unsupported Media Type`. Semantic checks (served
+/// model, prompt, duration) happen later, in `InputProcessor::video_sampling`
+/// and `InputProcessor::preprocess_video_request`.
 pub(crate) struct VideoBody(pub VideoGenerationRequest);
 
 impl<S: Send + Sync> axum::extract::FromRequest<S> for VideoBody {
@@ -125,6 +160,9 @@ impl<S: Send + Sync> axum::extract::FromRequest<S> for VideoBody {
                 .map_err(|error| {
                     ApiError::invalid_request(error.to_string(), None).into_response()
                 })?;
+            // Multipart values are all text, so the accepted fields are
+            // assembled into a JSON object with numeric `seconds` and `seed`
+            // and deserialized exactly like a JSON body.
             let mut fields = serde_json::Map::new();
             while let Some(field) = multipart.next_field().await.map_err(|error| {
                 ApiError::invalid_request(error.to_string(), None).into_response()
@@ -190,12 +228,22 @@ impl<S: Send + Sync> axum::extract::FromRequest<S> for VideoBody {
     }
 }
 
+/// Creates an asynchronous video job and returns its `queued` record.
+///
+/// Duration and sampling are resolved before submission and fill the record's
+/// `seconds`, `actual_seconds`, and `total_steps`. A full job store answers
+/// `429 Too Many Requests`; resolution and submission errors map through
+/// `ApiError`. Once the record is inserted, a detached task consumes
+/// the runtime stream and publishes progress and the final result through
+/// `VideoJobs`, so the job continues after the HTTP response is sent or
+/// dropped.
 pub(crate) async fn videos_create(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     VideoBody(body): VideoBody,
 ) -> Response {
     use crate::video_jobs::{VideoFailure, VideoJob, timestamp};
+
     let base_id = resolve_request_id(&headers);
     let request_id = crate::serving::ServeRequestId::new(format!("vid-{base_id}"));
     let (requested_seconds, sampling) =
@@ -207,6 +255,7 @@ pub(crate) async fn videos_create(
             Ok(options) => options,
             Err(error) => return error.into_response(),
         };
+
     // Job capacity is claimed before submission, so a request refused for it
     // never reaches the engine. The slot is released if this handler is
     // dropped before the job record owns it.
@@ -214,6 +263,7 @@ pub(crate) async fn videos_create(
         Ok(slot) => slot,
         Err(message) => return job_capacity_exceeded(message),
     };
+
     let mut stream = match state
         .runtime()
         .generate_video(request_id.clone(), body)
@@ -222,6 +272,7 @@ pub(crate) async fn videos_create(
         Ok(stream) => stream,
         Err(error) => return error.into_response(),
     };
+
     // Public IDs are server-generated; caller request-ID headers cannot collide with retained jobs.
     let id = format!("video_{}", uuid::Uuid::new_v4().simple());
     let record = VideoJob {
@@ -232,6 +283,8 @@ pub(crate) async fn videos_create(
         completed_at: None,
         expires_at: None,
         seconds: requested_seconds,
+        // 24 fps is the rate `InputProcessor::video_sampling` counts frames at
+        // and `video_capabilities` advertises; the three must agree.
         actual_seconds: f64::from(sampling.num_frames) / 24.0,
         status: "queued",
         phase: "queued".to_owned(),
@@ -243,12 +296,24 @@ pub(crate) async fn videos_create(
         Ok(token) => token,
         Err(message) => return job_capacity_exceeded(message),
     };
-    // No await separates reservation and detachment. Dropping this HTTP response cannot abort the job.
+
+    // No await separates `insert` from `tokio::spawn`, so every inserted record
+    // has a task driving it. The task owns the stream, the job's
+    // `JobReservation` (and with it the job slot), and an `Arc<AppState>`: the
+    // slot stays occupied while either the record or the task exists, so a
+    // deleted job holds it until the task ends, and `AppState::shutdown` waits
+    // for the task.
     tokio::spawn(async move {
         let result = async {
             let mut artifact = None;
             let mut cancelled = false;
             loop {
+                // Cancellation (from `VideoJobs::delete` or `cancel_all`) is
+                // forwarded to the runtime once. The token stays cancelled, so
+                // the `cancelled` flag disables the branch afterwards and the
+                // loop keeps draining the stream until its terminal event. A
+                // failed runtime cancel ends the task with
+                // `cancellation_failed` instead.
                 let event = tokio::select! {
                     event = stream.next() => event,
                     _ = cancellation.cancelled(), if !cancelled => {
@@ -259,6 +324,8 @@ pub(crate) async fn videos_create(
                 };
                 let event = event.transpose().map_err(|error| VideoFailure { code: "generation_failed", message: error.to_string() })?;
                 match event {
+                    // Scheduling is reported as the `encoding` phase; later
+                    // phases arrive as `MediaProgress`.
                     Some(RequestOutput::Scheduled { .. }) => {
                         state.videos.progress(&id, "encoding", 0)
                     }
@@ -284,6 +351,8 @@ pub(crate) async fn videos_create(
                             message: format!("generation ended: {reason:?}"),
                         });
                     }
+                    // Splits rejections by kind as `ApiError::rejected` does
+                    // for the synchronous route (`400` or `503`).
                     Some(RequestOutput::Rejected { kind, message, .. }) => {
                         let code = match kind {
                             RejectionKind::Invalid => "invalid_request",
@@ -314,11 +383,17 @@ pub(crate) async fn videos_create(
             }
         }
         .await;
+
+        // `finish` fails a successful result whose bytes do not fit the
+        // remaining retained-byte budget, and discards the result if the
+        // record was deleted.
         state.videos.finish(&id, result);
     });
+
     (StatusCode::OK, axum::Json(record)).into_response()
 }
 
+/// Builds the `429 Too Many Requests` response for a job-store refusal.
 fn job_capacity_exceeded(message: &str) -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
@@ -329,6 +404,8 @@ fn job_capacity_exceeded(message: &str) -> Response {
         .into_response()
 }
 
+/// Builds the `404 Not Found` response for an unknown job id. Expired jobs are
+/// removed from `VideoJobs`, so they answer the same way.
 fn missing_video() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -339,6 +416,8 @@ fn missing_video() -> Response {
         .into_response()
 }
 
+/// Lists every retained job, newest first. The list is returned whole (at most
+/// `MAX_VIDEO_JOBS` records), so `has_more` is always `false`.
 pub(crate) async fn videos_list(State(state): State<Arc<AppState>>) -> Response {
     axum::Json(
         serde_json::json!({"object": "list", "data": state.videos.list(), "has_more": false}),
@@ -357,6 +436,10 @@ pub(crate) async fn videos_get(
         .unwrap_or_else(missing_video)
 }
 
+/// Removes a job record and cancels its generation if it is still running.
+///
+/// The response does not wait for the cancellation to drain; the job slot is
+/// released once the detached generation task has also ended.
 pub(crate) async fn videos_delete(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -369,6 +452,13 @@ pub(crate) async fn videos_delete(
     }
 }
 
+/// Streams a completed job's video as `video/mp4`.
+///
+/// Answers `409 Conflict` for a job without content (queued, running, or
+/// failed) and `404 Not Found` for an unknown id. The response body holds the
+/// `RetainedMedia`, so the mapping and its share of the retained-byte budget
+/// stay reserved until the download ends, even if the job is deleted or
+/// expires meanwhile.
 pub(crate) async fn videos_content(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -391,7 +481,11 @@ pub(crate) async fn videos_content(
         .into_response()
 }
 
-/// Retains the immutable mapping while yielding bounded, independently owned body chunks.
+/// Streams `media` as a body of copied chunks of at most 64 KiB.
+///
+/// The stream state owns the `Arc`, so the backing mapping, and for
+/// `RetainedMedia` its retained-byte permit, lives until the body completes or
+/// is dropped.
 fn media_body<M: AsRef<[u8]> + Send + Sync + 'static>(media: Arc<M>) -> Body {
     let chunks = futures::stream::try_unfold((media, 0_usize), |(media, offset)| async move {
         let bytes = media.as_ref().as_ref();
@@ -406,6 +500,9 @@ fn media_body<M: AsRef<[u8]> + Send + Sync + 'static>(media: Arc<M>) -> Body {
     Body::from_stream(chunks)
 }
 
+/// Reports the served model, its video limits
+/// (`InputProcessor::video_capabilities`, `null` for a model without video),
+/// and the job-store bounds from `crate::video_jobs`.
 pub(crate) async fn capabilities(State(state): State<Arc<AppState>>) -> Response {
     let mut value = serde_json::json!({"model": state.served_model_name()});
     value["video"] = state.runtime().model().video_capabilities();
@@ -433,8 +530,10 @@ mod tests {
             .unwrap();
         let multipart = axum::extract::Request::builder().header(header::CONTENT_TYPE, "multipart/form-data; boundary=clip")
             .body(Body::from("--clip\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nFastH3\r\n--clip\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nA river\r\n--clip\r\nContent-Disposition: form-data; name=\"seconds\"\r\n\r\n5.5\r\n--clip\r\nContent-Disposition: form-data; name=\"seed\"\r\n\r\n42\r\n--clip--\r\n")).unwrap();
+
         let left = VideoBody::from_request(json, &()).await.unwrap().0;
         let right = VideoBody::from_request(multipart, &()).await.unwrap().0;
+
         assert_eq!(left, right);
         assert_eq!(left.seconds, Some(5.5));
         assert_eq!(left.seed, 42);
@@ -442,6 +541,8 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_conditioning_is_rejected_in_both_formats() {
+        // The JSON body is refused by the request schema's unknown-field check,
+        // the multipart body by the field allowlist and file-part check.
         let json = axum::extract::Request::builder()
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
@@ -450,6 +551,7 @@ mod tests {
             .unwrap();
         let multipart = axum::extract::Request::builder().header(header::CONTENT_TYPE, "multipart/form-data; boundary=clip")
             .body(Body::from("--clip\r\nContent-Disposition: form-data; name=\"input_reference\"; filename=\"image.png\"\r\n\r\nimage\r\n--clip--\r\n")).unwrap();
+
         for request in [json, multipart] {
             let response = match VideoBody::from_request(request, &()).await {
                 Ok(_) => panic!("conditioning was accepted"),

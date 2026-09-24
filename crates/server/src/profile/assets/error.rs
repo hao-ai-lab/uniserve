@@ -24,7 +24,8 @@ pub enum Error {
         source: serde_json::Error,
     },
     #[error("model `{model}` is missing required asset `{file}`")]
-    /// A required model file cannot be resolved locally or remotely.
+    /// A required model file is absent from a local model directory or from a
+    /// remote repository's file listing.
     MissingFile {
         /// Model identifier or local directory.
         model: String,
@@ -38,9 +39,11 @@ pub enum Error {
         field: &'static str,
     },
     #[error("unsupported diffusers pipeline {class_name}")]
-    /// A pipeline index declares a pipeline class UniServe does not serve.
+    /// A pipeline index declares a pipeline class UniServe does not serve, or
+    /// a family that has no pipeline form is resolved as a pipeline.
     UnsupportedPipeline {
-        /// Pipeline class declared by the checkpoint's root index.
+        /// Pipeline class declared by the checkpoint's root index, or the
+        /// family id when `ModelConfig::from_pipeline` rejects the family.
         class_name: String,
     },
     #[error("unsupported model type {actual}")]
@@ -50,7 +53,8 @@ pub enum Error {
         actual: String,
     },
     #[error("failed to resolve remote model `{model}`: {message}")]
-    /// Hugging Face Hub model resolution failed.
+    /// Building the Hub client, fetching repository metadata, or downloading a
+    /// file failed.
     Remote {
         /// Remote model identifier.
         model: String,

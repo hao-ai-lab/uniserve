@@ -1,4 +1,12 @@
 //! Chat API validation, message normalization, and model preprocessing.
+//!
+//! Lowers the OpenAI wire requests in `crate::openai` (chat completions and
+//! image generation) into the serving layer's closed input types, then hands
+//! them to `InputProcessor::preprocess_generation`, which tokenizes the prompt
+//! and resolves the final `GenerationRequest`. Wire-level checks that need the
+//! served configuration run here; model-specific validation happens during
+//! preprocessing. Serving errors are mapped back to `ApiError` with
+//! `serve_error_to_api`.
 
 use crate::profile::tools;
 use crate::serving::chat::{
@@ -21,6 +29,17 @@ use crate::openai::{
 
 impl crate::serving::InputProcessor {
     /// Validates and tokenizes a chat API request into its final engine input.
+    ///
+    /// The returned request carries a placeholder engine identifier that the
+    /// caller must replace before submission (see
+    /// `InputProcessor::preprocess_generation`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an `ApiError` when route validation (served model name,
+    /// `prompt_logprobs` bounds and streaming compatibility) or message and
+    /// control conversion fails, and the mapped serving error when
+    /// preprocessing fails.
     pub fn preprocess_chat_request(
         &self,
         request_id: ServeRequestId,
@@ -41,6 +60,7 @@ impl crate::serving::InputProcessor {
         let prompt_logprobs = request.prompt_logprobs;
         let include_prompt_logprobs = prompt_logprobs.is_some();
         let return_token_ids = request.return_token_ids.unwrap_or(false);
+        // Logprobs imply token IDs, so the richest requested detail wins.
         let output = if requested_logprobs || include_prompt_logprobs {
             OutputDetail::Logprobs
         } else if return_token_ids {
@@ -118,6 +138,9 @@ impl crate::serving::InputProcessor {
 }
 
 /// Converts requested response modalities into the serving selection.
+///
+/// An empty list selects both text and image output, like an explicit request
+/// for both.
 fn convert_modalities(modalities: &[ChatModality]) -> ModalitySelection {
     match (
         modalities.contains(&ChatModality::Text),
@@ -129,7 +152,12 @@ fn convert_modalities(modalities: &[ChatModality]) -> ModalitySelection {
     }
 }
 
-/// Converts the image config.
+/// Maps chat `image_config` fields onto serving image controls.
+///
+/// Wire names differ from the serving names: `guidance_scale` and
+/// `image_guidance_scale` are the text and image CFG scales, `cfg_norm` is the
+/// renormalization type, and `num_images` is `max_images`. Per-image prompts
+/// and image retention have no chat wire field and keep their defaults.
 fn convert_image_config(config: &ChatImageConfig) -> ImageGenControls {
     ImageGenControls {
         resolution: config.resolution,
@@ -149,7 +177,7 @@ fn convert_image_config(config: &ChatImageConfig) -> ImageGenControls {
     }
 }
 
-/// Converts the reasoning effort.
+/// Maps the wire reasoning effort onto the serving enum variant of the same name.
 fn convert_reasoning_effort(value: ReasoningEffort) -> ServingReasoningEffort {
     match value {
         ReasoningEffort::None => ServingReasoningEffort::None,
@@ -163,6 +191,14 @@ fn convert_reasoning_effort(value: ReasoningEffort) -> ServingReasoningEffort {
 }
 
 /// Converts one wire chat message into the serving layer's structured message model.
+///
+/// Assistant content becomes ordered blocks: non-empty reasoning first, then
+/// text content, then tool calls.
+///
+/// # Errors
+///
+/// Rejects an assistant message with no reasoning, content, or tool calls, an
+/// assistant message with image content, and a non-function tool call.
 fn convert_message(message: ChatMessage) -> Result<ServingChatMessage, ApiError> {
     match message {
         ChatMessage::System { content, .. } => {
@@ -225,7 +261,7 @@ fn convert_content(content: MessageContent) -> Result<ChatContent, ApiError> {
     }
 }
 
-/// Converts the assistant content.
+/// Converts assistant message content into text blocks, rejecting image parts.
 fn convert_assistant_content(
     content: MessageContent,
 ) -> Result<Vec<AssistantContentBlock>, ApiError> {
@@ -244,6 +280,8 @@ fn convert_assistant_content(
 }
 
 /// Validates and converts assistant function calls into structured content blocks.
+///
+/// Missing arguments become the empty JSON object `{}`.
 fn convert_assistant_tool_calls(
     tool_calls: Vec<ToolCall>,
 ) -> Result<Vec<AssistantContentBlock>, ApiError> {
@@ -282,13 +320,13 @@ fn convert_tools(tools: Option<Vec<Tool>>) -> Result<Vec<tools::Tool>, ApiError>
         .collect()
 }
 
-/// Converts the message tools.
+/// Converts developer-message tools, mapping an absent or empty list to `None`.
 fn convert_message_tools(tools: Option<Vec<Tool>>) -> Result<Option<Vec<tools::Tool>>, ApiError> {
     let tools = convert_tools(tools)?;
     Ok((!tools.is_empty()).then_some(tools))
 }
 
-/// Converts the tool choice.
+/// Converts the tool choice; an absent choice means `auto`.
 fn convert_tool_choice(tool_choice: Option<ToolChoice>) -> ChatToolChoice {
     match tool_choice.map(|choice| choice.0) {
         None | Some(ToolChoiceValue::Auto) => ChatToolChoice::Auto,
@@ -298,6 +336,17 @@ fn convert_tool_choice(tool_choice: Option<ToolChoice>) -> ChatToolChoice {
 
 impl crate::serving::InputProcessor {
     /// Validates and tokenizes an image API request into its final engine input.
+    ///
+    /// The request is served as an image-only generation of exactly one image
+    /// with the default shared cache policy and default text sampling. As with
+    /// [`Self::preprocess_chat_request`], the returned engine identifier is a
+    /// placeholder.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty or whitespace-only prompt, `n != 1`, a model name
+    /// other than the served one, `steps == 0`, and a malformed `size`;
+    /// preprocessing failures are mapped from the serving error.
     pub fn preprocess_image_request(
         &self,
         request_id: ServeRequestId,
@@ -330,6 +379,8 @@ impl crate::serving::InputProcessor {
                 Some("steps"),
             ));
         }
+        // An absent size leaves both dimensions to the profile's resolution
+        // policy.
         let (width, height) = request
             .size
             .as_deref()

@@ -1,7 +1,19 @@
 //! Hugging Face Jinja chat-template renderer.
 //!
-//! The renderer loads tokenizer metadata, detects the expected message-content
-//! shape, and renders messages and tools into a tokenizable prompt.
+//! `ModelConfig::load` builds one [`HfChatRenderer`] from the checkpoint files
+//! and the server's template options for every model except a diffusers
+//! pipeline. For each chat prompt, `InputProcessor::preprocess_qwen3_input` or
+//! the omni chat preprocessors (`render_sensenova_chat`, `render_bagel_chat`)
+//! call [`HfChatRenderer::render`] and tokenize the rendered prompt (the omni
+//! paths first resolve their image placeholders in it).
+//!
+//! Rendering converts each `ChatMessage` into a `TemplateMessage`, the
+//! OpenAI-compatible JSON shape that Hugging Face templates inspect: assistant
+//! messages split into visible `content`, `reasoning_content`, and
+//! `tool_calls`, and message content takes the shape selected by
+//! `ChatTemplateContentFormat` (configured, or detected in `format` under
+//! `Auto`). Request tools reach the template only when
+//! `ChatRequest::tool_parsing_enabled` holds.
 
 use std::collections::HashMap;
 
@@ -34,15 +46,27 @@ pub use template::{load_chat_template, resolve_chat_template};
 pub use self::format::ChatTemplateContentFormatOption;
 
 #[derive(Debug, Clone)]
-/// Rendered image allocations and hashes aligned with prompt content.
+/// Image rendering settings for a renderer that accepts `image_url` parts.
+///
+/// Without this value, rendering fails with
+/// `Error::UnsupportedMultimodalContent` on any `image_url` part. Production
+/// loading passes `None`: the omni preprocessors replace each chat image with
+/// a text placeholder (`replace_chat_images`) before rendering, so image parts
+/// never reach the renderer there.
 pub struct MultimodalRenderInfo {
-    /// Template token inserted at each rendered image position.
+    /// Text substituted for each image part when content is flattened to a
+    /// string. With list-shaped content, image parts become `{"type": "image"}`
+    /// items and this token is unused.
     pub placeholder_token: String,
 }
 
-/// Hugging Face chat-template renderer backed by the local Jinja chat-template
-/// state.
+/// Hugging Face chat-template renderer for one served model.
+///
+/// Holds at most one compiled template together with the default template
+/// kwargs and tokenizer special tokens installed into every render.
 pub struct HfChatRenderer {
+    // `None` when the model provides no template; `render` then fails with
+    // `Error::MissingChatTemplate`.
     default_template: Option<CompiledChatTemplate>,
     default_template_kwargs: HashMap<String, JsonValue>,
     special_tokens: Option<HfSpecialTokens>,
@@ -50,7 +74,12 @@ pub struct HfChatRenderer {
 }
 
 impl HfChatRenderer {
-    /// Creates a renderer from the given template string.
+    /// Creates a renderer from an optional template source.
+    ///
+    /// Resolves the content format (detecting it from the template under
+    /// `Auto`) and compiles the template eagerly, so syntax errors surface
+    /// here as `Error::ChatTemplate` rather than on the first request. A
+    /// `None` template yields a renderer whose `render` always fails.
     pub fn new(
         template: Option<String>,
         default_template_kwargs: HashMap<String, JsonValue>,
@@ -75,13 +104,27 @@ impl HfChatRenderer {
         self
     }
 
-    /// Attaches ordered multimodal params metadata to the renderer.
+    /// Attaches image rendering settings; with `None`, any `image_url` part
+    /// fails rendering.
     pub fn with_multimodal(mut self, multimodal: Option<MultimodalRenderInfo>) -> Self {
         self.multimodal = multimodal;
         self
     }
 
     /// Creates a renderer from the given model files and loading options.
+    ///
+    /// Template precedence, highest first: `options.chat_template` (a file
+    /// path or inline Jinja, see `resolve_chat_template`), then a non-blank
+    /// standalone template file (`files.chat_template_path`), then the
+    /// `chat_template` entry of `tokenizer_config.json`. Special tokens always
+    /// come from the tokenizer config; when it defines none, templates see
+    /// them as undefined.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the tokenizer config cannot be loaded, a configured or
+    /// standalone template cannot be read or resolved, or the selected
+    /// template does not compile.
     pub fn load(
         files: &ResolvedModelFiles,
         options: ChatTemplateLoadOptions,
@@ -102,8 +145,8 @@ impl HfChatRenderer {
             );
             info!("using configured chat template override");
         } else if let Some(chat_template_path) = files.chat_template_path.as_deref() {
-            // If independent chat template file(s) exist and contain non-empty content,
-            // they take priority over template entries in the tokenizer config
+            // A standalone template file overrides the tokenizer config entry
+            // only when its content is non-blank.
             let file_template = load_chat_template(chat_template_path)
                 .map_err(|error| Error::ChatTemplate(error.to_report_string()))?;
 
@@ -130,8 +173,14 @@ impl HfChatRenderer {
         .with_multimodal(multimodal))
     }
 
-    /// Renders one chat request into the text prompt submitted to the configured
-    /// model description.
+    /// Renders one chat request into prompt text for the model tokenizer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::MissingChatTemplate` when the renderer has no template,
+    /// `Error::UnsupportedMultimodalContent` for an `image_url` part without
+    /// [`MultimodalRenderInfo`], and `Error::ChatTemplate` when assistant tool
+    /// arguments are not valid JSON or the template fails to render.
     pub fn render(&self, request: &ChatRequest) -> Result<String> {
         let template = self
             .default_template
@@ -186,7 +235,9 @@ impl HfChatRenderer {
 }
 
 /// Chat message in the JSON shape expected by Jinja chat templates.
-// This template shape intentionally owns the fields Jinja may inspect.
+///
+/// `None` fields are omitted rather than serialized as null, so templates can
+/// test them with `is defined`.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Serialize)]
 struct TemplateMessage {
@@ -195,6 +246,8 @@ struct TemplateMessage {
     // Developer-role messages may provide message-local tools in the same shape
     // as top-level request tools.
     tools: Option<Vec<TemplateTool>>,
+    // Assistant reasoning, kept apart from `content` so each template decides
+    // whether to replay it.
     reasoning_content: Option<String>,
     // Function-call-capable templates commonly expect assistant tool calls
     // under this OpenAI-compatible field name.
@@ -203,7 +256,8 @@ struct TemplateMessage {
     tool_call_id: Option<String>,
 }
 
-/// Chat content in the two shapes HF templates commonly expect.
+/// Chat content in the two shapes HF templates commonly expect: a plain string
+/// or an OpenAI-style list of typed parts.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum TemplateContent {
@@ -325,6 +379,8 @@ fn to_template_tool_calls(
 ) -> Result<Option<Vec<TemplateToolCall>>> {
     let mut tool_calls = Vec::new();
 
+    // Arguments reach the template as a parsed JSON value rather than JSON
+    // text, so templates can index or iterate them (`arguments.items()`).
     for tool_call in content.tool_calls() {
         let arguments = serde_json::from_str(&tool_call.arguments).map_err(|error| {
             Error::ChatTemplate(format!(
@@ -348,7 +404,10 @@ fn to_template_tool_calls(
     Ok((!tool_calls.is_empty()).then_some(tool_calls))
 }
 
-/// Converts message content according to the template's detected representation.
+/// Converts message content according to the template's resolved representation.
+///
+/// Under `Preserve`, plain text stays a string and part lists stay lists, so
+/// templates that branch on `content is string` see the caller's shape.
 fn to_template_content(
     content: &ChatContent,
     content_format: ChatTemplateContentFormat,
@@ -383,7 +442,8 @@ fn to_template_openai_content(
                 ChatContentPart::Text { text } => {
                     Ok(TemplateContentPart::Text { text: text.clone() })
                 }
-                // All multimodal contents are normalized to `{ "type": <modality> }`.
+                // Image parts reach the template as `{"type": "image"}`; the
+                // image payload itself is not exposed to the template.
                 ChatContentPart::ImageUrl { .. } => {
                     multimodal.ok_or(Error::UnsupportedMultimodalContent("image_url"))?;
                     Ok(TemplateContentPart::Image)
@@ -449,6 +509,7 @@ mod tests {
     };
 
     const QWEN3_0_6B_TEMPLATE: &str = include_str!("../../../../../../tests/templates/qwen3.jinja");
+
     fn sample_request(messages: Vec<ChatMessage>) -> ChatRequest {
         ChatRequest {
             messages,
@@ -511,6 +572,9 @@ mod tests {
 
     #[test]
     fn auto_content_format_preserves_mixed_system_and_user_shapes() {
+        // The template both loops over content items and tests `content is
+        // string`, so `Auto` selects `Preserve`: the system string still
+        // supports `+` concatenation while the user parts stay a list.
         let request = sample_request(vec![
             ChatMessage::system("policy"),
             ChatMessage::user(vec![
@@ -611,6 +675,8 @@ mod tests {
 
     #[test]
     fn chat_template_keeps_string_text_for_openai_detected_templates() {
+        // The template tests `content is string` without looping over content
+        // items, so `Auto` selects `String` and plain text arrives as a string.
         let request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
 
         let rendered = render(
@@ -838,6 +904,9 @@ mod tests {
 
     #[test]
     fn qwen3_template_respects_forced_openai_content_format() {
+        // The Qwen3 template emits content only when it is a string. A forced
+        // `OpenAi` format still wins over detection, so the part list renders
+        // as empty user content.
         let request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
 
         let rendered = HfChatRenderer::new(
@@ -937,6 +1006,9 @@ mod tests {
 
     #[test]
     fn chat_template_tool_call_argument_items_method_is_not_shadowed_by_field() {
+        // An `items` key in tool arguments must not shadow the dict `items()`
+        // method (see `TemplateMap`), and iteration follows the key order of
+        // the arguments JSON.
         let request = sample_request(vec![ChatMessage::assistant_blocks(vec![
             AssistantContentBlock::ToolCall(crate::serving::chat::template::AssistantToolCall {
                 id: "call_1".to_string(),

@@ -1,4 +1,8 @@
 //! MiniJinja object wrappers that preserve JSON map order and value semantics.
+//!
+//! The renderer converts tool parameter schemas and assistant tool-call
+//! arguments into [`TemplateValue`]s so that their JSON objects behave like
+//! Python dicts inside Hugging Face templates.
 
 use std::sync::Arc;
 
@@ -10,6 +14,11 @@ use serde_json::Value as JsonValue;
 
 /// A wrapper around `minijinja::Value` that can be constructed with `to_template_value` and used
 /// as a value in the chat template.
+///
+/// It serializes transparently as the wrapped value. When MiniJinja itself
+/// serializes the render context, `minijinja::Value`'s `Serialize` impl passes
+/// the value through by handle, so its `TemplateMap` objects reach the template
+/// intact instead of being rebuilt as MiniJinja's default map.
 #[derive(Debug, Serialize)]
 #[serde(transparent)]
 pub(super) struct TemplateValue(minijinja::Value);
@@ -36,11 +45,10 @@ pub(super) fn to_template_value(value: JsonValue) -> TemplateValue {
 /// A custom map type that always returns `UnknownMethod` for method calls, so that pycompat can
 /// always handle dict methods through the unknown-method callback.
 ///
-/// Use `IndexMap` to preserve the original key order when iterating.
+/// Uses `IndexMap` to preserve the original key order when iterating.
 ///
 /// MiniJinja's default map can resolve a same-named field before Python dict methods. HF templates
 /// commonly call `dict.items`, which would fail if the map had an `items` field.
-/// See issue: https://github.com/mitsuhiko/minijinja/issues/903
 #[derive(Debug)]
 struct TemplateMap(IndexMap<String, minijinja::Value>);
 
@@ -50,7 +58,7 @@ impl Object for TemplateMap {
         ObjectRepr::Map
     }
 
-    /// Returns an indexed child value.
+    /// Looks up a string key; any other key type is absent.
     fn get_value(self: &Arc<Self>, key: &minijinja::Value) -> Option<minijinja::Value> {
         self.0.get(key.as_str()?).cloned()
     }
@@ -60,7 +68,7 @@ impl Object for TemplateMap {
         self.0.get(key).cloned()
     }
 
-    /// Returns an iterator over the value.
+    /// Enumerates the keys in insertion order, as Python dict iteration does.
     fn enumerate(self: &Arc<Self>) -> Enumerator {
         self.mapped_rev_enumerator(|this| {
             Box::new(
@@ -76,15 +84,14 @@ impl Object for TemplateMap {
         Some(self.0.len())
     }
 
-    /// Returns the result of invoking a supported template method.
+    /// Rejects every method call as `UnknownMethod`, so the environment's
+    /// pycompat unknown-method callback handles dict methods such as `items`.
     fn call_method(
         self: &Arc<Self>,
         _state: &State<'_, '_>,
         _method: &str,
         _args: &[minijinja::Value],
     ) -> std::result::Result<minijinja::Value, TemplateError> {
-        // Always return `UnknownMethod` for method calls,
-        // so that pycompat can handle dict methods through the unknown-method callback.
         Err(TemplateError::from(TemplateErrorKind::UnknownMethod))
     }
 }

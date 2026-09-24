@@ -1,16 +1,26 @@
-//! Python bindings for the worker-side shared-storage IPC endpoint.
+//! Python bindings for a rank's end of its worker channel.
+//!
+//! The `_uniserve_ipc` extension module exposes `Server`, which owns the
+//! rank's `RankServer` (iceoryx2 shared storage for a rank on the head's
+//! host, a TCP socket for a rank elsewhere); `StreamSignal`, which turns CUDA
+//! stream completion into a readable eventfd; `service_name`; and the
+//! `atomic_store_u32` / `atomic_load_u32` accessors for shared-storage segment
+//! header words. The hand-written stub `uniserve_worker/_uniserve_ipc.pyi`
+//! describes the same Python surface and must stay consistent with it.
 //!
 //! # Boundary conversions
 //!
 //! Each request crosses two boundaries:
 //!
-//! 1. iceoryx2 carries FlatBuffers frames through shared storage;
+//! 1. The transport carries FlatBuffers frames, which `Frame::decode_request`
+//!    verifies and validates before any Python object exists;
 //! 2. The Rust↔Python FFI boundary, crossed once on the inbound path
 //!    ([`PyServer::recv`] / [`PyServer::try_recv`]) and once on the outbound
 //!    path ([`PyServer::respond`]).
 //!
-//! Submit and result frames use typed conversion; administrative frames use the
-//! schema-derived serde representation.
+//! Submit requests and result and error responses use the typed conversions
+//! in `convert`; info and close requests and info and ok responses use the
+//! schema-derived serde representation (`pythonize` / `depythonize`).
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -32,11 +42,16 @@ use uniserve_worker_ipc::{RequestKind, WorkerRequest, WorkerResponse};
 #[pyclass(name = "Server")]
 /// Python-facing owner of one worker-side IPC endpoint.
 struct PyServer {
-    /// Endpoint held outside the mutex while a blocking call releases the GIL.
+    /// Endpoint and completion wake. A call that releases the GIL takes the
+    /// endpoint out (`take_endpoint`) and restores it afterwards
+    /// (`replace_endpoint`), so the mutex is never held across a transport
+    /// call and a concurrent endpoint call fails instead of waiting.
     inner: Mutex<ServerState>,
 }
 
-/// The endpoint may be borrowed by a call; both fields are empty after close.
+/// Server lifecycle, encoded in which fields are set: both while open and
+/// idle, only `completion_wake` while a GIL-free call holds the endpoint, and
+/// neither after close. `completion_wake` is therefore the closed flag.
 struct ServerState {
     endpoint: Option<RankServer>,
     /// Wake source used by CPU, transfer, and device completion callbacks.
@@ -47,7 +62,8 @@ struct ServerState {
 struct StreamSignalState {
     /// Selector-compatible descriptor owned by this state.
     fd: i32,
-    /// One-shot scheduling guard for the CUDA callback.
+    /// One-shot scheduling guard for the CUDA callback, reset when CUDA
+    /// rejects the callback so the signal can be scheduled again.
     scheduled: AtomicBool,
 }
 
@@ -86,6 +102,10 @@ struct CudaRuntime {
 static CUDA_RUNTIME: OnceLock<Result<CudaRuntime, String>> = OnceLock::new();
 
 /// Loads the CUDA runtime once and returns its host-callback entry point.
+///
+/// The extension does not link the CUDA runtime; it resolves
+/// `cudaLaunchHostFunc` on first use. The outcome, including a failure, is
+/// cached for the life of the process.
 fn cuda_runtime() -> Result<&'static CudaRuntime, String> {
     CUDA_RUNTIME
         .get_or_init(|| {
@@ -102,6 +122,8 @@ fn cuda_runtime() -> Result<&'static CudaRuntime, String> {
                         continue;
                     }
                 };
+                // A runtime that loads but lacks the symbol fails here without
+                // trying the remaining sonames.
                 // SAFETY: `cudaLaunchHostFunc` has the signature declared by the
                 // CUDA runtime API and the library stays live in the result.
                 let launch_host_func = unsafe {
@@ -123,6 +145,12 @@ fn cuda_runtime() -> Result<&'static CudaRuntime, String> {
 }
 
 /// Signals worker completion after preceding CUDA stream work finishes.
+///
+/// CUDA runs host functions on an internal thread. A host function must not
+/// call CUDA APIs, and acquiring the GIL there can deadlock against a Python
+/// thread that holds the GIL while calling CUDA. This callback and
+/// `stream_signal_callback` do neither: they only signal a waiting host
+/// thread.
 unsafe extern "C" fn completion_callback(user_data: *mut c_void) {
     // SAFETY: `schedule_completion_wake` passes ownership of exactly one boxed
     // `Wake` to CUDA, which invokes this callback exactly once.
@@ -192,8 +220,10 @@ impl PyStreamSignal {
             .scheduled
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| py_runtime("CUDA stream signal was scheduled more than once"))?;
-        // Transfer an Arc to CUDA so the eventfd remains alive until callback.
+
         let runtime = cuda_runtime().map_err(py_runtime)?;
+        // Transfer an Arc to CUDA so the eventfd remains alive until the
+        // callback runs, even if this Python object is dropped first.
         let user_data = Box::into_raw(Box::new(Arc::clone(&self.state))).cast::<c_void>();
         // SAFETY: `stream` is a native CUDA stream address supplied by PyTorch;
         // the boxed Arc remains owned by CUDA until the callback runs.
@@ -300,6 +330,8 @@ impl PyServer {
     ///
     /// A shared-storage endpoint is the service it was given; a socket endpoint
     /// is the address its bind produced, which the caller could not know.
+    /// Raises `RuntimeError` while another call holds the endpoint and after
+    /// close.
     fn endpoint(&self, service: &str) -> PyResult<String> {
         let state = self
             .inner
@@ -353,7 +385,9 @@ impl PyServer {
             (endpoint, result)
         });
 
-        // Restore endpoint ownership before surfacing transport or decode errors.
+        // Restore endpoint ownership before surfacing transport, decode, or
+        // validation errors, so a failed receive does not leave the endpoint
+        // taken.
         self.replace_endpoint(endpoint)?;
         let req =
             result.map_err(|err| py_runtime(format!("failed to receive IPC request: {err:#}")))?;
@@ -413,14 +447,18 @@ impl PyServer {
 
     /// Converts and publishes one response for the active request.
     fn respond(&self, py: Python<'_>, response: &Bound<'_, PyAny>) -> PyResult<()> {
-        // Per-step result reports use the typed extractor. Every other response
-        // kind is decoded by the schema-derived converter.
+        // Result and error responses use the typed extractor, which also
+        // rejects a non-mapping response; info and ok responses fall back to
+        // the schema-derived converter. Conversion finishes before the
+        // endpoint is taken, so a malformed response leaves it untouched.
         let resp: WorkerResponse = match convert::try_completion_response_from_py(response)? {
             Some(resp) => resp,
             None => depythonize(response)
                 .map_err(|err| PyErr::new::<PyValueError, _>(format!("invalid response: {err}")))?,
         };
         // Publish without the GIL while retaining exclusive endpoint ownership.
+        // Encoding validates info and result payloads, so a response that
+        // converts but violates the protocol surfaces as `RuntimeError`.
         let mut endpoint = self.take_endpoint()?;
         let (endpoint, result) = py.detach(move || {
             let result = endpoint.respond(&resp);
@@ -471,7 +509,8 @@ impl PyServer {
         Ok(())
     }
 
-    /// Borrows a wake source independently of a pending receive call.
+    /// Clones the completion wake without taking the endpoint, so `wake` and
+    /// `wake_on_stream` work while another thread holds the endpoint.
     fn completion_wake(&self) -> PyResult<Wake> {
         let state = self
             .inner
@@ -522,8 +561,9 @@ fn buffer_word(buffer: &PyBuffer<u8>, offset: usize) -> PyResult<*mut u32> {
 }
 
 #[pyfunction]
-/// Stores `value` at `offset` with release ordering, after every earlier
-/// write into any storage this process made.
+/// Stores `value` at `offset` with release ordering: every write the calling
+/// thread made before the store, to any storage, is visible to a process
+/// whose `atomic_load_u32` observes `value`.
 fn atomic_store_u32(buffer: PyBuffer<u8>, offset: usize, value: u32) -> PyResult<()> {
     let word = buffer_word(&buffer, offset)?;
     // SAFETY: `buffer_word` checked alignment and bounds; the buffer stays

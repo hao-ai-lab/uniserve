@@ -1,4 +1,36 @@
 //! FlatBuffers encoding and verified decoding for worker protocol messages.
+//!
+//! This module is the boundary where [`WorkerRequest`] and [`WorkerResponse`]
+//! cross between owned Rust values and the FlatBuffers tables generated from
+//! `schema/worker.fbs`. Senders encode frame payloads with [`encode_request`]
+//! and [`encode_response`]: the `iceoryx` client and server, the `socket`
+//! client, and the socket arm of `RankServer::respond` in `channel`. Received
+//! payloads on either transport are decoded by `Frame::decode_request` and
+//! `Frame::decode_response`, which call [`decode_request`] and
+//! [`decode_response`]. The `worker-ipc-py` extension reaches the codec
+//! through those transports.
+//!
+//! Table construction lives in the `encode` submodule, which reaches the
+//! `*_to_fb` discriminant mappers defined here beside their `*_from_fb`
+//! inverses through `use super::*`. Its builders are infallible, so the
+//! encode functions fail only in validation.
+//!
+//! Decoding has three layers:
+//!
+//! 1. `flatbuffers::root` verifies the buffer structurally (offsets, bounds,
+//!    UTF-8) before any field is read.
+//! 2. The `*_from_table` and `*_from_fb` functions copy fields into owned
+//!    values and report missing required fields, unknown discriminants, and
+//!    illegal field combinations as [`CodecError::Invalid`].
+//! 3. The domain `validate` methods (`Call`, `Batch`, `BatchOutput`,
+//!    `WorkerInfo`, and others) check semantic invariants, reported as
+//!    [`CodecError::Validation`]. Decoders run many of them as values are
+//!    assembled, and aggregate validators such as `Batch::validate` run the
+//!    nested ones again.
+//!
+//! [`encode_request`] validates a submitted batch and [`encode_response`]
+//! validates info and result payloads before building the frame, so those
+//! payloads are checked by both sender and receiver.
 
 use std::collections::BTreeMap;
 
@@ -26,7 +58,9 @@ pub type CodecResult<T> = std::result::Result<T, CodecError>;
 /// FlatBuffers construction, verification, and protocol validation failures.
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
-    /// Encoded data is absent, malformed, or fails FlatBuffers verification.
+    /// Structural decoding failed: for example, the buffer fails FlatBuffers
+    /// verification, or a field is missing, cannot be parsed, carries an
+    /// unknown discriminant, or appears in an illegal combination.
     #[error("worker codec error: {0}")]
     Invalid(String),
     /// Decoded data violates a semantic worker-protocol invariant.
@@ -43,7 +77,8 @@ impl CodecError {
 
 /// Extension methods for attaching protocol context to fallible extraction.
 trait CodecContext<T> {
-    /// Replaces a missing value or source error with fixed codec context.
+    /// Converts a missing value or source error into [`CodecError::Invalid`]
+    /// carrying `message`; a source error's text is appended after it.
     fn context(self, message: &str) -> CodecResult<T>;
 
     /// Adds lazily constructed codec context to a missing value or source error.
@@ -88,6 +123,10 @@ where
     }
 }
 
+// `codec_bail!` returns `Err(CodecError::Invalid)` from the innermost
+// enclosing function or closure, so inside a `map` closure it produces that
+// closure's `Err`, which the caller propagates. Both macros are textually
+// scoped: the `encode` submodule, declared above them, cannot use them.
 macro_rules! codec_bail {
     ($($arg:tt)*) => {
         return Err(CodecError::invalid(format!($($arg)*)))
@@ -102,7 +141,11 @@ macro_rules! codec_ensure {
     };
 }
 
-/// Encodes a validated worker request as a FlatBuffers frame.
+/// Validates a worker request and encodes it as a FlatBuffers payload.
+///
+/// Only a `Submit` request carries a payload to validate; `Batch::validate`
+/// failures return [`CodecError::Validation`]. The returned bytes are the
+/// frame payload without the transport `Header`.
 pub fn encode_request(request: &WorkerRequest) -> CodecResult<Vec<u8>> {
     if let Some(batch) = request.batch() {
         batch.validate()?;
@@ -113,13 +156,24 @@ pub fn encode_request(request: &WorkerRequest) -> CodecResult<Vec<u8>> {
     Ok(builder.finished_data().to_vec())
 }
 
-/// Verifies and decodes a worker request frame.
+/// Verifies and decodes a worker request payload.
+///
+/// Returns [`CodecError::Invalid`] for structural failures, for example when
+/// the buffer fails FlatBuffers verification, a required field is missing or
+/// unparsable, a discriminant is unknown, or fields appear in an illegal
+/// combination (such as a payload on an `Info` or `Close` request), and
+/// [`CodecError::Validation`] when the decoded batch violates a protocol
+/// invariant.
 pub fn decode_request(bytes: &[u8]) -> CodecResult<WorkerRequest> {
     let root = fbs::root_as_worker_request(bytes).context("invalid WorkerRequest flatbuffer")?;
     request_from_table(root)
 }
 
-/// Encodes a validated worker response as a FlatBuffers frame.
+/// Validates a worker response and encodes it as a FlatBuffers payload.
+///
+/// `Info` and `Result` payloads run `WorkerInfo::validate` and
+/// `BatchOutput::validate`; `Ok` and `Error` responses are encoded without
+/// validation.
 pub fn encode_response(response: &WorkerResponse) -> CodecResult<Vec<u8>> {
     match response {
         WorkerResponse::Info { info, .. } => info.validate()?,
@@ -132,7 +186,13 @@ pub fn encode_response(response: &WorkerResponse) -> CodecResult<Vec<u8>> {
     Ok(builder.finished_data().to_vec())
 }
 
-/// Verifies and decodes a worker response frame.
+/// Verifies and decodes a worker response payload.
+///
+/// Structural failures return [`CodecError::Invalid`] as in
+/// [`decode_request`], and an info or batch output that violates a protocol
+/// invariant returns [`CodecError::Validation`]. Each response kind must carry
+/// the fields it requires and none that it forbids (see
+/// `response_from_table`).
 pub fn decode_response(bytes: &[u8]) -> CodecResult<WorkerResponse> {
     let root = flatbuffers::root::<fbs::WorkerResponse>(bytes)
         .context("invalid WorkerResponse flatbuffer")?;
@@ -243,15 +303,18 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
     })
 }
 
-/// Decodes an owned run and validates all nested call and params contracts.
+/// Decodes a submitted batch and validates it with `Batch::validate`.
+///
+/// Absent vectors decode as empty. Calls, admissions, commands, tensor
+/// references, and publications are also validated individually as they are
+/// decoded.
 fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
-    // Preserve wire order for calls, controls, and products because later
-    // validation and execution interpret those collections positionally.
+    // Every collection keeps its wire order: `ForwardBatch::call_indices`
+    // are positions in `calls`, and `commands` are an ordered sequence.
     let run = Batch {
         batch_id: run.batch_id(),
         collective_seq: run.collective_seq(),
 
-        // Decode executable graph records in their submitted order.
         calls: run
             .calls()
             .map(|items| {
@@ -263,7 +326,9 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
             .transpose()?
             .unwrap_or_default(),
 
-        // Decode scheduler-owned KV params metadata.
+        // Scheduler-owned KV page tables and the columnar forward rows. The
+        // `ForwardBatch` columns are parallel arrays; `ForwardBatch::validate`
+        // checks that their lengths agree.
         block_tables: run
             .block_tables()
             .map(|items| items.iter().map(block_table_from_table).collect())
@@ -295,7 +360,7 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
                 .unwrap_or_default(),
         },
 
-        // Decode diffusion and persistent-buffer params metadata.
+        // Scheduler-owned latent, decode, and persistent-buffer allocations.
         latent_params: run
             .latent_params()
             .map(|items| {
@@ -360,12 +425,14 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
             .unwrap_or_default(),
     };
 
-    // Validate the assembled graph only after every cross-reference is owned.
+    // Cross-collection references (call ids, buffers, products) can only be
+    // checked once the whole batch is decoded.
     run.validate()?;
     Ok(run)
 }
 
-/// Decodes one request admission and validates its selected model family.
+/// Decodes one request admission and validates it with `NewRequest::validate`,
+/// which also runs the sampling and image parameter checks.
 fn admission_from_table(admission: fbs::NewRequest<'_>) -> CodecResult<NewRequest> {
     let admission = NewRequest {
         request_key: request_key_from_table(admission.request_key(), "admission.request_key")?,
@@ -405,7 +472,8 @@ fn ar_params_from_table(admission: fbs::ArRequestParams<'_>) -> CodecResult<ArRe
     })
 }
 
-/// Decodes diffusion admission parameters and their resolved media geometry.
+/// Decodes diffusion admission parameters; `NewRequest::validate` checks the
+/// frame, unit, and step counts.
 fn diffusion_params_from_table(
     admission: fbs::DiffusionSamplingParams<'_>,
 ) -> CodecResult<DiffusionSamplingParams> {
@@ -444,7 +512,8 @@ fn cache_page_allocation_from_table(
     }
 }
 
-/// Decodes a latent-page params bound to a request call.
+/// Decodes the denoising-step range and optional latent pages for one call
+/// that addresses a latent trajectory.
 fn latent_params_from_table(params: fbs::LatentParams<'_>) -> CodecResult<LatentParams> {
     Ok(LatentParams {
         request_key: request_key_from_table(params.request_key(), "latent params.request_key")?,
@@ -461,7 +530,7 @@ fn latent_params_from_table(params: fbs::LatentParams<'_>) -> CodecResult<Latent
     })
 }
 
-/// Decodes a diffusion decoder params bound to a request call.
+/// Decodes the unit range for one video or audio decoding or encoding call.
 fn decode_range_from_table(params: fbs::DecodeRange<'_>) -> CodecResult<DecodeRange> {
     Ok(DecodeRange {
         request_key: request_key_from_table(params.request_key(), "decode params.request_key")?,
@@ -472,6 +541,9 @@ fn decode_range_from_table(params: fbs::DecodeRange<'_>) -> CodecResult<DecodeRa
 }
 
 /// Decodes a persistent-buffer byte span and validates its buffer identity.
+///
+/// The span itself is checked later by `BufferAllocation::validate` through
+/// `Batch::validate`.
 fn buffer_allocation_from_table(
     params: fbs::BufferAllocation<'_>,
 ) -> CodecResult<BufferAllocation> {
@@ -486,8 +558,10 @@ fn buffer_allocation_from_table(
     })
 }
 
-/// Reads the coordinates a call states. Every call states them, so absence is a
-/// malformed frame rather than an origin default.
+/// Reads the coordinates a call states.
+///
+/// Every call states them, so absence is a malformed frame rather than the
+/// all-zero `CallCoordinates::default()`.
 fn coordinates_from_table(table: Option<fbs::CallCoordinates<'_>>) -> CodecResult<CallCoordinates> {
     let value = table.context("call.coordinates")?;
     Ok(CallCoordinates {
@@ -498,7 +572,11 @@ fn coordinates_from_table(table: Option<fbs::CallCoordinates<'_>>) -> CodecResul
     })
 }
 
-/// Decodes one computation and its component binding.
+/// Decodes one call and validates the invariants it carries on its own with
+/// `Call::validate`.
+///
+/// Relationships to other calls and to the batch's allocation tables are
+/// checked afterwards by `Batch::validate`.
 fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
     let call = Call {
         request_key: request_key_from_table(call.request_key(), "call.request_key")?,
@@ -516,7 +594,9 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
             .map(|slots| slots.iter().collect())
             .unwrap_or_default(),
         sampling_state: call.sampling_state().map(|state| SamplingState {
-            // A missing whitelist and an empty whitelist have different semantics.
+            // Absent means no whitelist; a present empty list represents an
+            // invalid all-masked distribution. The distinction must survive
+            // decoding.
             allowed_token_ids: state.allowed_token_ids().map(|ids| ids.iter().collect()),
             suppressed_token_ids: state
                 .suppressed_token_ids()
@@ -594,7 +674,8 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
     Ok(call)
 }
 
-/// Decodes one control-command union and validates its request constraints.
+/// Decodes one control-command union and validates it with
+/// `BatchCommand::validate`.
 fn command_from_table(envelope: fbs::BatchCommandEnvelope<'_>) -> CodecResult<BatchCommand> {
     // The FlatBuffers discriminator selects the only payload table permitted
     // to contribute command fields.
@@ -659,6 +740,11 @@ fn request_key_from_table(
 }
 
 /// Reconstructs shape bounds from extents and the single dynamic-axis marker.
+///
+/// `dynamic_axis` is `-1` (the schema default) when every axis is static;
+/// otherwise it indexes the one `DimBound::Device` axis, whose extent is that
+/// axis's maximum. An out-of-range marker is a malformed frame; zero extents
+/// are left to `ShapeBound::validate`.
 fn shape_bound_from_parts(
     extents: Option<flatbuffers::Vector<'_, u32>>,
     dynamic_axis: i32,
@@ -700,7 +786,7 @@ fn tensor_ref_from_table(reference: fbs::TensorRef<'_>) -> CodecResult<TensorRef
     Ok(tensor)
 }
 
-/// Decodes deterministic random coordinates and validates their draw layout.
+/// Decodes deterministic random coordinates, rejecting an unknown draw layout.
 fn rng_from_table(rng: fbs::Rng<'_>) -> CodecResult<Rng> {
     Ok(Rng {
         seed: rng.seed(),
@@ -709,10 +795,11 @@ fn rng_from_table(rng: fbs::Rng<'_>) -> CodecResult<Rng> {
     })
 }
 
-/// Decodes a run result, preserving report order, then validates the aggregate.
+/// Decodes a batch output, preserving report order, then validates it with
+/// `BatchOutput::validate`.
 fn run_result_from_table(report: fbs::BatchOutput<'_>) -> CodecResult<BatchOutput> {
-    // Completions and products are independent ordered streams whose identities
-    // are reconciled by `BatchOutput::validate` after both are materialized.
+    // Completions and products are independent ordered streams;
+    // `BatchOutput::validate` checks both once they are decoded.
     let report = BatchOutput {
         batch_id: report.batch_id(),
         completions: report
@@ -742,7 +829,7 @@ fn run_result_from_table(report: fbs::BatchOutput<'_>) -> CodecResult<BatchOutpu
     Ok(report)
 }
 
-/// Decodes a model output and validates its status-dependent result data.
+/// Decodes one call completion and validates it with `RequestOutput::validate`.
 fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<RequestOutput> {
     let finish_flags = record
         .finish_flags()
@@ -862,7 +949,11 @@ fn error_call_from_table(call: fbs::ErrorCallIdentity<'_>) -> CodecResult<ErrorC
     })
 }
 
-/// Decodes worker capabilities and validates the advertised resource geometry.
+/// Decodes worker capabilities and validates them with `WorkerInfo::validate`.
+///
+/// Absent `model_dtype`, `attention_backend`, and `checkpoint_identity` decode
+/// as empty strings, and absent optional vectors as empty. A media call bound
+/// more than once is a malformed frame.
 fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
     let info = WorkerInfo {
         model_name: required_str(info.model_name(), "info.model_name")?,
@@ -969,7 +1060,12 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
     Ok(info)
 }
 
-/// Decodes sampling parameters and rejects non-finite or out-of-range values.
+/// Decodes sampling parameters without range checks.
+///
+/// Only a `min_tokens` value that does not fit `usize` is rejected here;
+/// `SamplingParams::validate`, run by `NewRequest::validate` from
+/// `admission_from_table`, rejects non-finite values and values outside each
+/// sampling transform's domain.
 fn sampling_from_table(sampling: fbs::SamplingParams<'_>) -> CodecResult<SamplingParams> {
     let sampling = SamplingParams {
         // Scalar sampling controls map directly from the verified table.
@@ -1028,7 +1124,11 @@ fn sampling_from_table(sampling: fbs::SamplingParams<'_>) -> CodecResult<Samplin
     Ok(sampling)
 }
 
-/// Decodes image-generation parameters and rejects non-finite controls.
+/// Decodes image-generation parameters, parsing the CFG renormalization type.
+///
+/// Non-finite and out-of-range controls are rejected by
+/// `ImageParams::validate`, run by `NewRequest::validate` from
+/// `admission_from_table`.
 fn image_from_table(image: fbs::ImageParams<'_>) -> CodecResult<uniserve_core::ImageParams> {
     Ok(uniserve_core::ImageParams {
         steps: image.steps(),
@@ -1115,7 +1215,8 @@ fn map_from_table(
         .unwrap_or_default()
 }
 
-/// Decodes full-attention or sliding-window KV group geometry.
+/// Decodes one KV cache group: its block count and full-attention or
+/// sliding-window kind. `window` and `sink` are read only for sliding windows.
 fn kv_group_from_table(group: fbs::KvGroup<'_>) -> CodecResult<KvCacheGroup> {
     let kind = if group.kind() == fbs::KvGroupKind::Full {
         KvGroupKind::Full
@@ -1165,7 +1266,7 @@ where
         .with_context(|| format!("{label} is invalid"))
 }
 
-/// Decodes a logical computation identity without depending on physical run numbering.
+/// Decodes a required call identity from its inline wire struct.
 fn computation_id_from_fb(id: Option<&fbs::CallId>) -> CodecResult<CallId> {
     let id = id.context("computation identity is missing")?;
     Ok(CallId::new(id.batch_id(), id.request_index()))
@@ -1184,6 +1285,10 @@ fn buffer_id_from_table(buffer: fbs::BufferId<'_>) -> CodecResult<BufferId> {
 }
 
 /// Flattens shape bounds into extents and a single dynamic-axis marker.
+///
+/// The marker is `-1` when every axis is static. Only one device axis is
+/// representable: with several, the last one wins. `ShapeBound::validate`
+/// rejects such shapes.
 fn shape_bound_to_parts(shape: &ShapeBound) -> (Vec<u32>, i32) {
     let mut dynamic_axis = -1;
     let extents = shape
@@ -1201,7 +1306,8 @@ fn shape_bound_to_parts(shape: &ShapeBound) -> (Vec<u32>, i32) {
     (extents, dynamic_axis)
 }
 
-/// Converts the completion fields into their wire table.
+/// Copies a wire token-logprob entry (top or prompt logprob) into its owned
+/// value.
 fn token_logprob_from_fb(entry: &fbs::TokenLogprob) -> TokenLogprob {
     TokenLogprob {
         token_id: entry.token_id(),
@@ -1237,6 +1343,9 @@ fn kv_cache_from_table(config: fbs::KVCacheInfo<'_>) -> CodecResult<KvCacheInfo>
     })
 }
 
+/// Decodes how a component spreads independent units over its ranks; wire
+/// `Local` maps to `None`, which runs the component as one model-parallel
+/// group.
 fn distribution_from_fb(
     value: fbs::ComponentDistribution,
 ) -> CodecResult<Option<uniserve_core::ComponentDistribution>> {
@@ -1249,6 +1358,12 @@ fn distribution_from_fb(
     }
 }
 
+/// Decodes a component's parallel degrees and sequence-parallel strategy.
+///
+/// The strategy is a FlatBuffers union: every variant except
+/// `LocalSequence` requires its payload table. Wire `GatherSequence` maps to
+/// `SequenceParallel::Allgather`. `WorkerInfo::validate` checks the degrees
+/// against component membership.
 fn parallel_from_fb(config: fbs::ParallelConfig<'_>) -> CodecResult<uniserve_core::ParallelConfig> {
     use uniserve_core::SequenceParallel;
     let sequence_parallel = match config.sequence_parallel_type() {
@@ -1354,7 +1469,8 @@ fn transfer_mode_from_fb(value: fbs::TransferMode) -> CodecResult<TransferMode> 
     })
 }
 
-/// Encodes exactly one computation in the inline wire classification.
+/// Encodes a call kind into the inline `CallKind` struct, setting exactly one
+/// of its three tags and leaving the others at `None`.
 fn computation_to_fb(value: CallKind) -> fbs::CallKind {
     let mut encoded = fbs::CallKind::default();
     match value {
@@ -1365,7 +1481,11 @@ fn computation_to_fb(value: CallKind) -> fbs::CallKind {
     encoded
 }
 
-/// Reject missing, conflicting, and unknown tags at the transport boundary.
+/// Decodes the inline `CallKind` struct.
+///
+/// The struct carries three independent tags whose `None` value means unset.
+/// A frame with zero or several set tags, or with an unknown value in the set
+/// tag, is malformed.
 fn computation_from_fb(value: &fbs::CallKind) -> CodecResult<CallKind> {
     let present = u8::from(value.forward_mode() != fbs::ForwardMode::None)
         + u8::from(value.media() != fbs::MediaCall::None)
@@ -1387,7 +1507,7 @@ fn computation_from_fb(value: &fbs::CallKind) -> CodecResult<CallKind> {
 /// Decodes transport-specific storage coordinates and common tensor metadata.
 fn transfer_locator_from_table(value: fbs::Locator<'_>) -> CodecResult<Locator> {
     // The transport discriminant determines which coordinate fields are
-    // required; unrelated fields are deliberately ignored.
+    // required; fields belonging to other transports are not read.
     let transport = if value.transport() == fbs::TransferTransportKind::Local {
         TransferTransport::Local {
             endpoint: value
@@ -1484,6 +1604,8 @@ fn transfer_locator_from_table(value: fbs::Locator<'_>) -> CodecResult<Locator> 
     Ok(locator)
 }
 
+/// Decodes one physical tensor's logical shape and locators, then validates it
+/// with `TensorTransfer::validate`, which also validates each `Locator`.
 fn tensor_transfer_from_table(value: fbs::TensorTransfer<'_>) -> CodecResult<TensorTransfer> {
     let tensor = TensorTransfer {
         shape: value
@@ -1658,6 +1780,9 @@ fn request_kind_to_fb(kind: RequestKind) -> fbs::ReqKind {
 }
 
 /// Resolves a FlatBuffers request discriminant against the complete supported set.
+///
+/// Inverting `request_kind_to_fb` over `RequestKind::ALL` keeps the two
+/// directions in agreement without a second hand-written table.
 fn request_kind_from_fb(kind: fbs::ReqKind) -> CodecResult<RequestKind> {
     for candidate in RequestKind::ALL {
         if request_kind_to_fb(candidate) == kind {
@@ -1697,6 +1822,12 @@ fn response_kind_from_fb(kind: fbs::RespKind) -> CodecResult<ResponseKind> {
     }
 }
 
+/// Decodes a KV publication descriptor.
+///
+/// Its buffer identities and tensor transfers are validated as they are
+/// decoded; the descriptor as a whole is validated by its container:
+/// `Batch::validate` for `kv_inputs` and `RequestOutput::validate` for a
+/// completion's `kv_output`.
 fn kv_transfer_from_table(transfer: fbs::KvTransfer<'_>) -> CodecResult<KvTransfer> {
     Ok(KvTransfer {
         tensors: transfer

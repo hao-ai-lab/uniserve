@@ -1,7 +1,9 @@
 //! Listener abstraction for TCP, Unix-domain, and inherited sockets.
 //!
-//! [`HttpListener`] presents a single accept interface to Axum while preserving
-//! the address and shutdown behavior of each transport.
+//! [`Listener`] presents a single accept interface to Axum over either a TCP or
+//! a Unix-domain listener, obtained according to `HttpListenerMode`.
+//! `crate::http::serve` binds it, logs its inherent `local_addr` string, and
+//! wraps it with `tap_io` to enable `TCP_NODELAY` on TCP connections only.
 
 use std::io::Result;
 use std::net::TcpListener as StdTcpListener;
@@ -26,7 +28,8 @@ impl Listener {
     /// Binds or adopts the listener described by the frontend configuration.
     ///
     /// For inherited sockets, the concrete listener kind is detected from the
-    /// socket family of the supplied file descriptor.
+    /// socket family of the supplied file descriptor. `BindUnix` fails when a
+    /// file already exists at the socket path.
     pub(crate) async fn bind(mode: &HttpListenerMode) -> Result<Self> {
         match mode {
             HttpListenerMode::BindTcp { host, port } => {
@@ -49,7 +52,13 @@ impl Listener {
         }
     }
 
-    /// Adopts a validated inherited stream socket and prepares it for asynchronous accepts.
+    /// Adopts an inherited stream socket and prepares it for asynchronous accepts.
+    ///
+    /// The descriptor must be a bound stream socket; it need not be listening
+    /// yet. Returns `EBADF` for a negative descriptor, and the underlying error
+    /// when the descriptor is not open or when `listen`, `set_nonblocking`,
+    /// the address lookup, or Tokio registration fails. Once the descriptor is
+    /// adopted, any later failure closes it.
     fn from_inherited_fd(fd: i32) -> Result<Self> {
         // Validate the raw integer before taking ownership of it. `OwnedFd` assumes
         // the fd is open and will `close(2)` it on drop, so handing it a negative or
@@ -68,12 +77,14 @@ impl Listener {
         let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let socket = Socket::from(owned_fd);
 
-        // The Python supervisor pre-binds the socket to reserve the endpoint early, but
-        // Rust is responsible for transitioning inherited stream sockets into
-        // the listening state before accepting connections.
+        // The supplier may hand over a socket that is only bound, so this side
+        // puts it into the listening state. Tokio's `from_std` requires the
+        // socket to be non-blocking already.
         socket.listen(libc::SOMAXCONN)?;
         socket.set_nonblocking(true)?;
 
+        // Any non-Unix family is treated as TCP. `into_raw_fd` releases the
+        // `Socket`'s ownership, so the std listener becomes the only owner.
         if socket.local_addr()?.is_unix() {
             let std_listener = unsafe { StdUnixListener::from_raw_fd(socket.into_raw_fd()) };
             Ok(Self::Unix(UnixListener::from_std(std_listener)?))
@@ -84,12 +95,17 @@ impl Listener {
     }
 }
 
-/// Allow the unified listener to plug directly into `axum::serve(...)`.
+/// Allows the unified listener to plug directly into `axum::serve(...)`.
 impl axum::serve::Listener for Listener {
     type Addr = Either<std::net::SocketAddr, tokio::net::unix::SocketAddr>;
     type Io = Either<TcpStream, UnixStream>;
 
     /// Accepts the next incoming connection.
+    ///
+    /// Each arm resolves to Axum's `Listener::accept` for the Tokio listener
+    /// rather than Tokio's fallible inherent `accept`. Axum retries accept
+    /// errors internally (logging and pausing on errors other than
+    /// per-connection ones), so this future resolves only with a connection.
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         match self {
             Self::Tcp(listener) => {
@@ -123,6 +139,9 @@ mod tests {
     use super::Listener;
     use crate::HttpListenerMode;
 
+    // The inherited sockets in the family-detection tests are bound but not
+    // yet listening; `Listener::bind` must start listening on them and detect
+    // their family.
     #[tokio::test(flavor = "current_thread")]
     async fn inherited_fd_detects_tcp_listener_without_uds_hint() {
         let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();

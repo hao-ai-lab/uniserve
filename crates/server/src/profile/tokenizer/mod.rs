@@ -1,5 +1,12 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 //! Tokenizer abstraction, Hugging Face implementation, and incremental decoding.
+//!
+//! `HuggingFaceTokenizer` loads a model's `tokenizer.json` through `fastokens`
+//! and serves both directions of the text path: `serving::model`,
+//! `serving::omni`, and the `profile::omni` prompt builders encode prompts
+//! into token IDs (`serving::sampling` also encodes bad words), and the output
+//! stages in `serving::text::output` and `serving::assembly` turn generated
+//! IDs back into streamed text through `IncrementalDecoder`.
 
 use std::sync::Arc;
 

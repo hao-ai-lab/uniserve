@@ -1,10 +1,26 @@
 //! Request identities, call descriptors, admissions, and execution batches.
+//!
+//! These are the semantic types of the scheduler-to-worker protocol,
+//! independent of wire framing. The engine lowers each scheduled batch into a
+//! [`Batch`] (`ExecutionBatch::into_protocol`, which validates it), projects
+//! it onto the calls each rank owns (`rank_projection`, which narrows forward
+//! rows with `ForwardBatch::select` and sets each call's `consumer_slots`),
+//! and [`crate::codec`] encodes it as FlatBuffers. A rank answers with one
+//! [`BatchOutput`] of per-call [`RequestOutput`] completions. The Python
+//! worker mirrors these types in the `identity`, `call`, `batch`, and `output`
+//! modules of `uniserve_worker.protocol`.
+//!
+//! Types with invariants carry a `validate` method. [`Batch::validate`]
+//! reaches each nested one and adds the checks that span calls. The
+//! `ensure_valid!` and `invalid_message!` macros come from the crate root.
 
 use super::*;
 
-/// `(engine_id, request_id, request_epoch)`. The epoch advances whenever an admitted
-/// identity is reused, so no call or product reference aliases across
-/// requests or epochs.
+/// `(engine_id, request_id, request_epoch)`.
+///
+/// The scheduler stamps each admission with the next value of its epoch
+/// counter, so a reused request identifier yields a distinct key and no call
+/// or product reference aliases across requests or epochs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequestKey {
     /// Engine instance that allocates request identifiers.
@@ -37,6 +53,11 @@ pub enum ForwardMode {
 }
 
 impl ForwardMode {
+    /// Every mode in declaration order.
+    ///
+    /// `worker-ipc-py` builds its Python enum table from this array and
+    /// indexes it with `mode as usize`, so the order must match the
+    /// declaration order.
     pub const ALL: [Self; 3] = [Self::Prefill, Self::Decode, Self::Verify];
 
     pub const fn as_str(self) -> &'static str {
@@ -67,6 +88,10 @@ pub enum MediaCall {
 }
 
 impl MediaCall {
+    /// Every media call in declaration order.
+    ///
+    /// `worker-ipc-py` indexes a Python enum table built from this array with
+    /// `call as usize`, so the order must match the declaration order.
     pub const ALL: [Self; 11] = [
         Self::VisionEncoding,
         Self::LatentEncoding,
@@ -100,6 +125,8 @@ impl MediaCall {
 
 impl MediaCall {
     /// Fixed calls needed to produce video and audio.
+    ///
+    /// Mirrored by `VIDEO_CALLS` in `uniserve_worker.protocol.call`.
     pub const VIDEO: [Self; 8] = [
         Self::TextEncoding,
         Self::LatentPreparation,
@@ -123,6 +150,10 @@ pub enum TransferMode {
 }
 
 impl TransferMode {
+    /// Every transfer mode in declaration order.
+    ///
+    /// `worker-ipc-py` indexes a Python enum table built from this array with
+    /// `mode as usize`, so the order must match the declaration order.
     pub const ALL: [Self; 3] = [Self::Tensor, Self::KvPublish, Self::KvInstall];
 
     pub const fn as_str(self) -> &'static str {
@@ -136,6 +167,10 @@ impl TransferMode {
 
 /// Exactly one computation classification. The sum preserves the distinct
 /// forward, media, and storage contracts without parallel opcode metadata.
+///
+/// Serde represents a kind by its inner enum's snake_case name alone
+/// (`untagged`), which round-trips only while the names of [`ForwardMode`],
+/// [`MediaCall`], and [`TransferMode`] stay disjoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CallKind {
@@ -257,6 +292,10 @@ pub struct AttentionBackendParseError(String);
 
 impl CallKind {
     /// Computations accepted as individual scheduled request items.
+    ///
+    /// Mirrored, in the same order, by `CALL_KINDS` in
+    /// `uniserve_worker.protocol.call`; the worker's reports list supported
+    /// calls in this order.
     pub const ALL: [Self; 17] = [
         Self::Forward(ForwardMode::Prefill),
         Self::Forward(ForwardMode::Decode),
@@ -277,6 +316,11 @@ impl CallKind {
         Self::Transfer(TransferMode::KvInstall),
     ];
 
+    /// Returns whether a call of this kind advances its request's state.
+    ///
+    /// The worker mirrors this set in `uniserve_worker.protocol.call`; its
+    /// `RequestPool` uses it to choose the call a request's next call follows
+    /// and the `Ok` results that move the request's `state_call_id`.
     pub const fn advances_state(self) -> bool {
         matches!(
             self,
@@ -294,11 +338,16 @@ impl CallKind {
 }
 
 /// Hard resource maxima the scheduler reserves before a call runs.
+///
+/// [`Call::validate`] checks `max_tokens` against `input_token_ids` and
+/// `max_latent_bytes` against encoder, latent, and image outputs;
+/// [`Batch::validate`] checks `max_transfer_bytes` against installed KV
+/// inputs. Neither checks `max_kv_pages` or `max_completion_bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Bounds {
     /// Maximum tokens the call may process or produce.
     pub max_tokens: u32,
-    /// Maximum paged-KV blocks the call may consume.
+    /// Maximum paged-KV pages the call may consume.
     pub max_kv_pages: u32,
     /// Maximum latent storage in bytes.
     pub max_latent_bytes: u64,
@@ -334,12 +383,14 @@ pub struct Rng {
 
 /// Branch-local token processor inputs for one sampling call.
 ///
-/// Token ids in every field are strictly increasing. `allowed_token_ids`
-/// distinguishes no whitelist (`None`) from a present empty whitelist, which
-/// deterministically represents an invalid all-masked distribution. Penalty
-/// token counts are not carried here: they are a device-resident committed base
-/// plus bounded per-call deltas folded after sampling accepts tokens, so no host
-/// token history participates in a successor's sampling input.
+/// Token ids in every field are strictly increasing: [`Call::validate`]
+/// rejects any other order, and [`Self::canonicalize`] produces it.
+/// `allowed_token_ids` distinguishes no whitelist (`None`) from a present empty
+/// whitelist, which deterministically represents an invalid all-masked
+/// distribution. Penalty token counts are not carried here: they are a
+/// device-resident committed base plus bounded per-call deltas folded after
+/// sampling accepts tokens, so no host token history participates in a
+/// successor's sampling input.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SamplingState {
     /// Optional whitelist of token identifiers eligible for sampling.
@@ -406,7 +457,8 @@ pub const DEFAULT_COMPONENT: &str = "model";
 pub struct Call {
     /// Request that owns the call.
     pub request_key: RequestKey,
-    /// Logical batch and selection ordinal of the completed computation.
+    /// Logical batch and selection ordinal, preserved when the batch is
+    /// projected onto a rank.
     pub call_id: CallId,
     /// Coordinates this call executes at, so a rank does not derive them.
     pub coordinates: CallCoordinates,
@@ -430,7 +482,8 @@ pub struct Call {
     pub consumer_slots: Vec<u32>,
     /// Source token scalar transported between components.
     pub token_input: Option<TensorRef>,
-    /// Sampled token and continuation bit in one I64 scalar.
+    /// Sampled token and continuation bit in one I64 scalar. The worker packs
+    /// it with `tagged_token_values` in `uniserve_worker.sampling.sampler`.
     pub token_output: Option<TensorRef>,
     /// Vision features consumed by multimodal forward.
     pub vision_input: Option<TensorRef>,
@@ -450,7 +503,8 @@ pub struct Call {
     pub completion_output: Option<TensorRef>,
     /// Boolean device decision that selects an image transition.
     pub transition_output: Option<TensorRef>,
-    /// Device predicate that enables execution.
+    /// Device predicate that enables execution: a U8 flag or a packed I64
+    /// continuation scalar. A false predicate yields [`CallStatus::Predicated`].
     pub predicate: Option<TensorRef>,
     /// Deterministic sampling coordinates.
     pub rng: Option<Rng>,
@@ -470,6 +524,9 @@ pub struct Call {
 
 impl Call {
     /// Tensor dependencies in the computation signature, excluding its predicate.
+    ///
+    /// Includes `token_input` and `latent_input`, which [`Self::buffer_inputs`]
+    /// omits.
     pub fn tensor_inputs(&self) -> impl Iterator<Item = &TensorRef> {
         self.inputs
             .iter()
@@ -481,6 +538,9 @@ impl Call {
     }
 
     /// All tensor declarations owned by this computation.
+    ///
+    /// Includes the device scalars (token, completion, transition) and
+    /// `latent_output`, which [`Self::buffer_outputs`] omits.
     pub fn tensor_outputs(&self) -> impl Iterator<Item = &TensorRef> {
         self.outputs
             .iter()
@@ -514,6 +574,10 @@ impl Call {
     }
 
     /// Tensor outputs backed by scheduler-allocated persistent buffers.
+    ///
+    /// [`Batch::validate`] requires a [`BufferAllocation`] large enough for each
+    /// of these. Latent trajectories are addressed through [`LatentParams`]
+    /// instead.
     pub fn buffer_outputs(&self) -> impl Iterator<Item = &TensorRef> {
         self.outputs
             .iter()
@@ -540,9 +604,17 @@ impl Call {
     pub const fn advances_state(&self) -> bool {
         self.code.advances_state()
     }
-    /// Validates family-specific products, bounds, predicates, and RNG state.
+
+    /// Validates the invariants one call carries on its own.
+    ///
+    /// Checks identity, component, coordinates, the token bound, canonical
+    /// sampling-state sets, the encoded-image source, KV publication
+    /// identities, product ownership, generations, output indices, dtypes and
+    /// byte bounds, cross-request inputs, and the predicate. `rng` is not
+    /// checked. Relationships to other calls and to the batch's allocation
+    /// tables belong to [`Batch::validate`].
     pub fn validate(&self) -> ValidationResult<()> {
-        // Establish call identity, family, request, and declared capacity.
+        // Establish call identity, component, coordinates, and token capacity.
         ensure_valid!(self.call_id.batch_id > 0, "call id must be positive");
         ensure_valid!(
             !self.component.is_empty(),
@@ -584,7 +656,8 @@ impl Call {
         }
 
         // Every output must be uniquely owned by this producer and fit the
-        // resource class reserved for the call.
+        // resource class reserved for the call. The KV output shares the
+        // output-index space with the tensor outputs.
         let mut output_indices = HashSet::with_capacity(self.outputs.len());
         let publishes_kv = matches!(
             self.code,
@@ -673,7 +746,8 @@ impl Call {
             );
         }
 
-        // Only encoder features can be shared across requests.
+        // Only encoder features (vision and latent-feature inputs) can be
+        // shared across requests.
         for input in self.tensor_inputs() {
             input.validate()?;
             ensure_valid!(
@@ -786,8 +860,8 @@ pub struct MediaOutput {
     pub bytes: u64,
 }
 
-/// The fixed-layout record a worker emits once for every call, after its
-/// copy event is query-ready and its pinned fields are validated on the host.
+/// The completion record a worker emits once for every call, after its copy
+/// event is query-ready and its pinned fields are validated on the host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestOutput {
     /// Request completed by the call.
@@ -892,6 +966,7 @@ pub enum BatchCommand {
     },
     /// Close an exact request epoch after admitted work and physical readers finish.
     Finish {
+        /// Exact request epoch to close.
         request_key: RequestKey,
         /// Products that remain readable under independent ownership until Free.
         retained_buffers: Vec<BufferId>,
@@ -913,7 +988,11 @@ impl BatchCommand {
         }
     }
 
-    /// Returns the stable discriminant used to order command variants.
+    /// Returns a discriminant that distinguishes command variants.
+    ///
+    /// [`Batch::validate`] uses it in the identity that detects repeated
+    /// commands. `_command_variant_index` in `uniserve_worker.protocol.batch`
+    /// returns the same values.
     pub const fn variant_index(&self) -> u8 {
         match self {
             Self::Start { .. } => 0,
@@ -988,6 +1067,9 @@ pub struct NewRequest {
 
 impl NewRequest {
     /// Constructs static autoregressive or multimodal admission state.
+    ///
+    /// Checks only the request-pool index and that `ar` or `image` is present;
+    /// it does not run [`Self::validate`] on the family parameters.
     pub fn new(
         request_key: RequestKey,
         request_pool_idx: u32,
@@ -1010,7 +1092,7 @@ impl NewRequest {
         Ok(admission)
     }
 
-    /// Constructs static terminal media admission state.
+    /// Constructs static terminal media admission state and validates it.
     pub fn new_media(
         request_key: RequestKey,
         request_pool_idx: u32,
@@ -1132,6 +1214,10 @@ impl CachePageAllocation {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardBatch {
     /// Physical call index for each row; logical computation IDs remain unchanged.
+    ///
+    /// [`Batch`] flattens this struct; the serialized key matches the
+    /// `forward_call_indices` field of the worker schema and of the Python
+    /// worker's `Batch`.
     #[serde(rename = "forward_call_indices")]
     pub call_indices: Vec<u32>,
     /// Scheduler-owned request slots, including alternative CFG prefixes.
@@ -1188,6 +1274,10 @@ impl ForwardBatch {
     }
 
     /// Select a rank's calls and map their forward rows to the local call array.
+    ///
+    /// `calls` lists the batch-level call indices the rank owns, in the order
+    /// of its projected call array. Rows of other calls are dropped, and each
+    /// kept row's call index becomes its position in `calls`.
     pub fn select(&self, calls: &[usize]) -> Self {
         let mut selected = Self::default();
         for (row, index) in self.call_indices.iter().enumerate() {
@@ -1321,7 +1411,8 @@ pub struct BufferAllocation {
 }
 
 impl BufferAllocation {
-    /// Validates aligned non-empty buffer params.
+    /// Validates the buffer identity and a non-empty span whose end does not
+    /// overflow `u64`.
     pub fn validate(self) -> ValidationResult<()> {
         self.buffer.validate()?;
         ensure_valid!(self.bytes > 0, "buffer params byte extent must be positive");
@@ -1368,6 +1459,9 @@ pub struct Batch {
 
 impl Batch {
     /// Constructs a run with admissions and calls using default metadata.
+    ///
+    /// `collective_seq` is `batch_id`, or one when `batch_id` is zero;
+    /// [`Self::validate`] requires it to be positive.
     pub fn new(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>) -> Self {
         Self {
             batch_id,
@@ -1420,7 +1514,13 @@ impl Batch {
         self
     }
 
-    /// Validates identities, families, allocations, products, and commands.
+    /// Validates identities, call kinds, allocations, products, and commands.
+    ///
+    /// Runs every nested `validate`, including [`Call::validate`] for each
+    /// call, and checks what spans calls, including one call per request, one
+    /// kind and component per batch, allocation tables that match the calls
+    /// addressing them, non-overlapping latent pages and buffer spans, and
+    /// input products and KV inputs that some call declares.
     pub fn validate(&self) -> ValidationResult<()> {
         // Establish the run envelope before validating relationships within it.
         ensure_valid!(
@@ -1542,7 +1642,8 @@ impl Batch {
             );
         }
 
-        // Decode params is restricted to calls that materialize media.
+        // Decode ranges belong exactly to video and audio decoding and encoding
+        // calls: each such call has one, and no other call does.
         let mut decode_ids = HashSet::with_capacity(self.decode_ranges.len());
         for params in &self.decode_ranges {
             params.validate()?;
@@ -1598,7 +1699,9 @@ impl Batch {
             );
         }
 
-        // Persistent buffers use non-overlapping spans and cover every declared output.
+        // Persistent buffers use non-overlapping half-open spans and cover every
+        // declared output. `BufferAllocation::validate` has already rejected
+        // an overflowing span end, so the addition below cannot wrap.
         let mut buffer_ids = HashSet::with_capacity(self.buffer_allocations.len());
         let mut buffer_spans = self
             .buffer_allocations
@@ -1679,8 +1782,8 @@ impl Batch {
             }
         }
 
-        // Product payloads must be declared, uniquely supplied, and represented
-        // according to whether their storage crosses a call boundary.
+        // Each input product payload must be valid, declared as an input or
+        // predicate by some call, and supplied at most once.
         for payload in &self.input_products {
             payload.validate()?;
         }
@@ -1703,6 +1806,8 @@ impl Batch {
             payload.validate()?;
         }
 
+        // Each imported KV publication feeds exactly one installation call and
+        // fits that call's transfer-byte bound.
         let mut kv_sources = HashSet::new();
         for publication in &self.kv_inputs {
             publication.validate()?;

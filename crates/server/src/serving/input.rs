@@ -1,8 +1,14 @@
 //! Typed serving inputs before and after model-owned tokenization.
 //!
-//! [`TextPromptRequest`] accepts programmatic text prompts and optional input images.
-//! [`ResponseOptions`] retains the frontend output requirements and
-//! output policy.
+//! [`PromptInput`] and the control structs ([`SamplingConfig`], [`StopConfig`],
+//! [`ImageGenControls`], [`DecodeControls`]) are the protocol-neutral request
+//! vocabulary. `serving::preprocessing` lowers the OpenAI wire requests into
+//! them, and [`TextPromptRequest`] bundles the control structs with a
+//! programmatic text prompt and optional input images.
+//! `InputProcessor::preprocess_generation` consumes them and splits each
+//! request into a `GenerationRequest`, which moves into the engine, and a
+//! [`ResponseOptions`], which the frontend keeps to assemble the response
+//! stream.
 
 use std::collections::HashMap;
 
@@ -10,11 +16,15 @@ use crate::serving::text::TextDecodeOptions;
 use crate::serving::text::tokenizer::DynTokenizer;
 use crate::serving::{CacheAccounting, ResourceAccounting, ServeRequestId};
 
-/// One supported public input image. Model-specific params is resolved by
-/// [`crate::serving::model::InputProcessor::preprocess_text_request`].
+/// One top-level input image of a [`TextPromptRequest`].
+///
+/// The omni preprocessors decode it and compute its prompt position; models
+/// without image input reject it during feature validation. Chat images arrive
+/// separately as `image_url` parts inside the chat messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageInput {
-    /// Base64-encoded image payload.
+    /// Standard base64 encoding of the image file bytes, without a `data:` URL
+    /// prefix.
     pub b64: String,
 }
 
@@ -24,7 +34,8 @@ pub struct ImageInput {
 pub enum PromptInput {
     /// Plain text prompt.
     Text(String),
-    /// Conversation, rendering options, and tools consumed by the chat renderer.
+    /// Conversation, rendering options, and tools consumed by the chat
+    /// renderer (`HfChatRenderer`).
     Chat(crate::serving::chat::ChatRequest),
 }
 
@@ -53,7 +64,7 @@ impl ModalitySelection {
 }
 
 impl Default for ModalitySelection {
-    /// Returns the default value.
+    /// Returns [`ModalitySelection::Text`].
     fn default() -> Self {
         Self::Text
     }
@@ -71,7 +82,8 @@ pub struct SamplingConfig {
     pub top_k: Option<u32>,
     /// Minimum token probability relative to the most likely candidate.
     pub min_p: Option<f32>,
-    /// Optional deterministic sampler seed.
+    /// Optional deterministic sampler seed. For SenseNova and Bagel requests,
+    /// `ImageGenControls::seed` takes precedence when both are set.
     pub seed: Option<i64>,
     /// Maximum number of generated tokens.
     pub max_tokens: Option<u32>,
@@ -133,7 +145,9 @@ pub struct ImageGenControls {
     pub cfg_renorm_min: Option<f32>,
     /// Diffusion timestep shift.
     pub timestep_shift: Option<f32>,
-    /// Optional deterministic image-sampling seed.
+    /// Optional deterministic seed. For SenseNova and Bagel requests it
+    /// replaces `SamplingConfig::seed` as the sampler seed; Qwen3
+    /// preprocessing resolves its seed from `SamplingConfig::seed` alone.
     pub seed: Option<u64>,
     /// Maximum number of generated images.
     pub max_images: Option<u16>,
@@ -165,7 +179,7 @@ pub struct DecodeControls {
 }
 
 impl Default for DecodeControls {
-    /// Returns the default value.
+    /// Skips special tokens and omits the matched stop string.
     fn default() -> Self {
         Self {
             skip_special_tokens: true,
@@ -195,8 +209,11 @@ pub struct TextPromptRequest {
     /// Image-generation controls when image output is requested.
     pub image_gen: Option<ImageGenControls>,
     /// Optional cache namespace isolating otherwise identical requests.
+    /// Combined with `cache_salt` into the engine cache isolation key by
+    /// `cache_isolation_key`; with both absent, the request uses the shared
+    /// cache partition.
     pub cache_namespace: Option<String>,
-    /// Optional caller-provided value mixed into the cache key.
+    /// Optional caller-provided value mixed into the cache isolation key.
     pub cache_salt: Option<String>,
     /// Whether existing prefix and encoder cache entries are ignored.
     pub bypass_cache_read: bool,
@@ -233,14 +250,20 @@ impl TextPromptRequest {
     }
 }
 
-/// Model-supplied committed-event processor selection, built inside
-/// [`crate::serving::model::InputProcessor::preprocess_text_request`].
+/// Model-supplied committed-event processor selection, built by the per-model
+/// preprocessing that `InputProcessor::preprocess_generation` dispatches to.
+///
+/// `submit_and_stream` selects the response assembler (see
+/// `serving::assembly`) from this value.
 pub enum OutputProcessorPolicy {
     /// Raw visible text.
     None,
-    /// Qwen3 chat reasoning + tool parsing over decoded text. The flag
-    /// selects whether `<think>` delimiters are parsed into reasoning blocks
-    /// or streamed verbatim as content.
+    /// Qwen3 chat reasoning and tool-call parsing over decoded text, selected
+    /// for Qwen3 chat prompts (Qwen3 text prompts use `None`). The processor
+    /// parses `<think>` reasoning only when the server's `reasoning_parsing`
+    /// setting is on, and otherwise passes that text through as visible
+    /// text; it parses tool calls only when
+    /// `ChatRequest::tool_parsing_enabled` holds.
     Qwen3(crate::serving::chat::Qwen3ChatOutputProcessor),
     /// SenseNova reasoning and visible-answer filtering over committed text.
     SenseNova(crate::profile::omni::OutputFilterPolicy),
@@ -262,7 +285,9 @@ pub struct ResponseOptions {
     pub request_id: ServeRequestId,
     /// The model-bound tokenizer that owns decoding for this request.
     pub tokenizer: DynTokenizer,
-    /// Prompt token identifiers submitted to the engine.
+    /// Copy of the prompt token identifiers submitted to the engine, kept
+    /// because detokenization needs the prompt after the generation request
+    /// has moved into the engine.
     pub prompt_token_ids: Vec<u32>,
     /// Incremental detokenization behavior.
     pub decode: TextDecodeOptions,

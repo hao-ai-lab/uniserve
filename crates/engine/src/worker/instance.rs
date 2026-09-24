@@ -1,4 +1,24 @@
 //! Physical worker fan-out, completion agreement, and process recovery.
+//!
+//! A `WorkerGroup` presents one worker's cooperating ranks to `WorkerExecutor`
+//! as a single submission queue of `depth` physical runs. `submit_batch` uses
+//! `rank_projection` to cut each `Batch` into per-rank projections under the
+//! same batch identifier, each holding the calls that rank's components
+//! execute and every command of the batch, and sends each projection through
+//! that rank's `RankProcess`. Returned rank results wait in per-rank buffers
+//! until every rank planned for a set of calls has reported them; `try_join`
+//! then merges those reports into one `WorkerResult` published by the calls'
+//! output owner, the first rank of their component. An execution error that
+//! every failing rank reports identically, while no succeeding rank holds an
+//! unjoined call, retires only its batch unless it is fatal, is coded as a
+//! scheduler bug or invariant violation, or failed a batch carrying a `Free`
+//! command (`join_rank_errors`); rank loss, protocol violations, and every
+//! other error replace the whole rank group (`recover_workers`) and
+//! invalidate every request resident on it.
+//!
+//! The module also launches groups: `spawn_all` starts every group's ranks,
+//! locally or through the host launchers in `launcher`, before any group
+//! waits for its ranks' endpoint reports and startup capabilities.
 
 use crate::executor::{CallResult, WorkerResult};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
@@ -15,12 +35,17 @@ use uniserve_worker_ipc::{Batch, BatchCommand, RequestKey, WorkerInfo};
 use crate::worker::WorkerProcessArgs;
 
 /// Maximum interval without rank progress before an in-flight batch is treated as failed.
+///
+/// Measured from `WorkerGroup::last_progress` and enforced only while a batch
+/// is pending. Expiry is an error that `poll_batch` answers by replacing the
+/// rank group.
 const NEXT_RESULT_DEADLINE: Duration = Duration::from_secs(300);
 
-/// One worker group's spawned ranks and the address they report to.
 /// Every rank of one group, with the launchers that started the remote ones.
 type LaunchedGroup = (Vec<RankProcess>, Option<super::launcher::Launchers>);
 
+/// One worker group's spawned ranks and the registry they report their
+/// endpoints to.
 pub(crate) struct LaunchedRanks {
     registry: RankRegistry,
     ranks: Vec<PendingRank>,
@@ -66,16 +91,17 @@ impl WorkerProcessArgs {
             ),
             _ => None,
         };
-        // A group of cooperating ranks rendezvouses at one TCP address for its
+
+        // A group of several ranks rendezvouses at one TCP address for its
         // entire lifetime, and every rank reports its endpoint to one
-        // registration address. Both are loopback where every rank runs here,
-        // which is what a shared directory gave them; where some rank runs
-        // elsewhere both name a routable host, because a loopback address
-        // reaches only the host that binds it. The first rank serves the
-        // rendezvous store, so the store is placed on that rank's host: this
-        // one, or the host whose launcher reserved a port for it. Whichever
-        // process spawns the first rank holds the bound socket until that
-        // rank inherits it, so the port is never free while the rank starts.
+        // registration address. Both are loopback where every rank runs here;
+        // where some rank runs elsewhere both name a routable host, because a
+        // loopback address reaches only the host that binds it. The first
+        // rank serves the rendezvous store, so the store is placed on that
+        // rank's host: this one, or the host whose launcher reserved a port
+        // for it. Whichever process spawns the first rank holds the bound
+        // socket until that rank inherits it, so the port is never free while
+        // the rank starts.
         let head = match launchers.as_ref() {
             Some(registry) => Some(super::launcher::lock(registry)?.reachable_host()?),
             None => None,
@@ -91,6 +117,7 @@ impl WorkerProcessArgs {
         } else {
             None
         };
+
         // Ranks name their own channel endpoints and report them here; the
         // engine binds each channel from the report rather than choosing the
         // endpoint before the process exists.
@@ -124,6 +151,7 @@ impl WorkerProcessArgs {
                 registry.address(),
             )?);
         }
+
         Ok(LaunchedRanks {
             registry,
             ranks,
@@ -177,21 +205,41 @@ impl WorkerProcessArgs {
     }
 }
 
-/// Cooperative worker processes with one iceoryx2 service per rank.
+/// Cooperative worker processes with one IPC channel per rank.
 pub struct WorkerGroup {
+    /// Rank processes in rank order; empty after `close` or a failed recovery.
     workers: Vec<RankProcess>,
+    /// Results each rank returned, indexed by rank. `take_rank_calls`
+    /// consumes their calls as they are joined, and `finish_batch` drops what
+    /// remains of a retired batch.
     buffers: Vec<VecDeque<WorkerResult>>,
+    /// The group's agreed capabilities: rank 0's report with the group-wide
+    /// product storage and KV byte accounting `from_ranks` derives.
     info: WorkerInfo,
+    /// Physical runs admitted concurrently, from the ranks' queue depth.
     depth: usize,
+    /// The last accepted batch identifier; `submit_batch` refuses a batch
+    /// whose identifier does not exceed it.
     last_batch_id: Option<u64>,
+    /// Time of construction or of the last submission, joined result, or
+    /// group replacement, from which `NEXT_RESULT_DEADLINE` is measured.
     last_progress: Instant,
+    /// Admitted batches not yet retired, by batch identifier.
     pending_batches: BTreeMap<u64, PendingBatch>,
+    /// Launch arguments. Recovery relaunches the group from them, and
+    /// projection and joining read its placement and components.
     process_args: WorkerProcessArgs,
     /// Which component serves each media call across every worker of the
     /// deployment; the executor states it once all workers have reported.
     media_routing: BTreeMap<uniserve_worker_ipc::MediaCall, String>,
+    /// Requests that may hold state on the ranks: added by a submitted call
+    /// or `Start` command, removed when a batch carrying their `Finish`
+    /// command is joined as done. Recovery reports them as lost.
     resident_requests: HashSet<RequestKey>,
+    /// Set by recovery and close; `take_readiness_change` reports and clears it.
     readiness_changed: bool,
+    /// Set by `close` and by a failed recovery. A closed group accepts no
+    /// batch and returns nothing from `poll_batch`.
     closed: bool,
     /// Rank loss is reported after all already-agreed results have been delivered.
     failure: Option<anyhow::Error>,
@@ -202,19 +250,27 @@ pub struct WorkerGroup {
     launchers: Option<super::launcher::Launchers>,
 }
 
+/// A call's identity across request epochs: engine identifier, request
+/// identifier, request epoch, and call identifier, in that order.
 type CallIdentity = (u64, u64, u64, uniserve_worker_ipc::CallId);
 
 /// A physical batch and its participating ranks share one retirement lifetime.
 struct PendingBatch {
+    /// The batch as submitted, before rank projection.
     batch: Batch,
+    /// Calls not yet joined into a published result.
     remaining: BTreeSet<CallIdentity>,
+    /// Every rank that received a projection, by rank.
     ranks: BTreeMap<usize, RankResult>,
 }
 
 /// A participating rank's received prefix, independent of transport fragmentation.
 struct RankResult {
+    /// The calls planned on this rank and whether the rank returned each.
     calls: BTreeMap<CallIdentity, bool>,
+    /// Whether the rank returned its result for the batch.
     complete: bool,
+    /// The execution error the rank reported for the batch, if any.
     error: Option<WorkerExecError>,
 }
 
@@ -302,14 +358,18 @@ pub(crate) fn refuse_checkpoint_mismatch(
 }
 
 impl WorkerGroup {
-    /// Launch every configured rank and expose the instance after capability agreement.
+    /// Launches every configured rank and exposes the instance after capability agreement.
     pub fn spawn(process_args: WorkerProcessArgs) -> anyhow::Result<Self> {
         Self::spawn_all(vec![process_args])?
             .pop()
             .context("WorkerGroup launch produced no instance")
     }
 
-    /// Launch the configured static rank groups and wait for loaded capabilities.
+    /// Launches the configured static rank groups and waits for loaded capabilities.
+    ///
+    /// Groups are returned in argument order. A failure of any group fails the
+    /// whole launch; ranks already spawned are shut down as the values that
+    /// own them, and the launcher registry, drop.
     pub fn spawn_all(mut arguments: Vec<WorkerProcessArgs>) -> anyhow::Result<Vec<Self>> {
         // The head derives each group's checkpoint identity once, before any
         // rank starts; every launch and relaunch descriptor then carries it.
@@ -349,6 +409,15 @@ impl WorkerGroup {
         Ok(workers)
     }
 
+    /// Checks that the ranks' startup reports describe one group and builds it.
+    ///
+    /// Every rank must report valid info naming its launched rank, the group's
+    /// world size and worker identity, and a checkpoint
+    /// `refuse_checkpoint_mismatch` admits, and must agree with rank 0 apart
+    /// from rank-specific fields and numerical settings. The muxer must run on
+    /// the head's host, and the ranks' KV regions must cover every layer's KV
+    /// heads without a gap. Once all checks pass, no rank's startup may be
+    /// cancelled and every rank this process started must still be running.
     fn from_ranks(
         process_args: WorkerProcessArgs,
         mut workers: Vec<RankProcess>,
@@ -358,12 +427,17 @@ impl WorkerGroup {
         let n = workers.len();
         let world_size =
             u32::try_from(n).context("process world size exceeds the IPC representation")?;
+
+        // `info` starts as rank 0's report and becomes the group's; `canonical`
+        // is the reference every rank is compared with, without the numerical
+        // settings ranks may differ in.
         let mut info = workers[0].info().clone();
         let mut canonical = info.clone();
         canonical.model_dtype.clear();
         canonical.attention_backend.clear();
         canonical.weight_formats.clear();
         canonical.activation_formats.clear();
+
         // A rank's product storage follows the components it holds, which an
         // asymmetric placement makes rank-specific: a rank that imports a
         // component's product reserves the whole logical allocation for it,
@@ -378,6 +452,7 @@ impl WorkerGroup {
             .unwrap_or(info.buffer_pool_bytes);
         info.buffer_pool_bytes = product_storage;
         canonical.buffer_pool_bytes = product_storage;
+
         // Checkpoint agreement is checked by name before the generic report
         // comparison, which would otherwise report only that ranks disagree.
         let checkpoints = workers
@@ -389,6 +464,7 @@ impl WorkerGroup {
             &process_args.ranks,
             &checkpoints,
         )?;
+
         for (rank, worker) in workers.iter().enumerate() {
             let rank_info = worker.info();
             rank_info
@@ -405,6 +481,10 @@ impl WorkerGroup {
                 rank_info.endpoint.worker_id == process_args.worker_id,
                 "physical rank {rank} reported another WorkerGroup identity"
             );
+            // Rank-specific fields take the reference's values before the
+            // comparison: the endpoint, device, transfer backends, product
+            // storage, and the rank's KV head offset, layer range, and bytes
+            // per token.
             normalized.endpoint = canonical.endpoint.clone();
             normalized.device = canonical.device.clone();
             normalized.transfer_backends = canonical.transfer_backends.clone();
@@ -416,8 +496,9 @@ impl WorkerGroup {
                 local.num_layers = reference.num_layers;
                 local.bytes_per_token = reference.bytes_per_token;
             }
-            // Placement may give ranks different numerical storage; restart
-            // compatibility below compares each rank with its own predecessor.
+            // Placement may give ranks different numerical storage; replacement
+            // validation (`validate_replacement_info`) compares each rank with
+            // its own predecessor instead.
             normalized.model_dtype.clear();
             normalized.attention_backend.clear();
             normalized.weight_formats.clear();
@@ -427,12 +508,17 @@ impl WorkerGroup {
                 "physical rank {rank} worker info disagree with rank 0"
             );
         }
+
         refuse_muxer_off_head(
             &process_args.host,
             &process_args.ranks,
             &process_args.components,
             &info.media_components,
         )?;
+
+        // Every layer interval between region boundaries must have its KV
+        // heads covered from head 0 to `total_kv_heads` by the regions
+        // spanning it. Overlapping regions are allowed; a gap is not.
         if let Some(cache) = &mut info.kv_cache {
             let regions: Vec<_> = workers
                 .iter()
@@ -482,10 +568,15 @@ impl WorkerGroup {
                 .max()
                 .unwrap_or(cache.bytes_per_token);
         }
+
+        // Startup is over. A rank's death watcher raises the group's shared
+        // startup cancellation; detaching it keeps a later exit from reading
+        // as a cancelled startup on the surviving ranks.
         for worker in &mut workers {
             worker.check_worker("WorkerGroup readiness")?;
             worker.set_startup_cancel(None);
         }
+
         let depth = info.queue_depth.max(1) as usize;
         let buffers = (0..n).map(|_| VecDeque::new()).collect();
         Ok(Self {
@@ -507,6 +598,12 @@ impl WorkerGroup {
     }
 
     /// Drains immediately available rank results into per-rank agreement buffers.
+    ///
+    /// A result that does not match the rank's plan for its batch fails the
+    /// drain. A rank error that `record_rank_error` accepts is recorded for
+    /// `join_rank_errors`; any other is kept as the group's first `failure`
+    /// and ends that rank's drain, so results already buffered can still be
+    /// joined before `poll_batch` reports the failure.
     fn pump_once(&mut self) -> anyhow::Result<()> {
         for rank in 0..self.workers.len() {
             loop {
@@ -569,7 +666,12 @@ impl WorkerGroup {
         Ok(())
     }
 
-    /// Records the rank error.
+    /// Records a rank's execution error against its pending batch.
+    ///
+    /// Fails, without recording, when the error is not a `WorkerExecError`,
+    /// carries no batch identifier, names a batch or rank with no pending
+    /// entry, or differs from an error the rank already reported for that
+    /// batch.
     fn record_rank_error(&mut self, rank: usize, error: &anyhow::Error) -> anyhow::Result<()> {
         let execution = error
             .downcast_ref::<WorkerExecError>()
@@ -604,6 +706,8 @@ impl WorkerGroup {
     /// not the replacement group started; a failed replacement also closes
     /// this group.
     fn recover_workers(&mut self, cause: &anyhow::Error) -> anyhow::Error {
+        // The lost endpoints, resident requests, and reported capabilities
+        // are captured before the ranks and bookkeeping are cleared.
         let endpoints = self
             .workers
             .iter()
@@ -620,6 +724,7 @@ impl WorkerGroup {
         }
         self.workers.clear();
         self.clear_execution();
+
         let recovery = (|| -> anyhow::Result<()> {
             // The group's ranks on other hosts are stopped by their launchers
             // before the group is relaunched through the same registry, which
@@ -647,6 +752,7 @@ impl WorkerGroup {
             self.install_replacement(workers);
             Ok(())
         })();
+
         self.readiness_changed = true;
         let recovery_status = match recovery {
             Ok(()) => "rank group recovered".to_owned(),
@@ -672,6 +778,9 @@ impl WorkerGroup {
 
     /// Installs a capability-compatible replacement rank group and resets rank-local state.
     fn install_replacement(&mut self, workers: Vec<RankProcess>) {
+        // `validate_replacement_info` has required every replacement rank to
+        // match its predecessor apart from the endpoint, so the group's agreed
+        // info keeps everything but rank 0's new endpoint.
         self.info.endpoint = workers[0].info().endpoint.clone();
         self.workers = workers;
         self.last_progress = Instant::now();
@@ -688,6 +797,15 @@ impl WorkerGroup {
     }
 
     /// Joins mutually agreeing rank reports into one logical physical result.
+    ///
+    /// Takes the call set `joinable_report_key` selects from every rank
+    /// planned for it, validates each report against the batch, and merges
+    /// the participants into the output owner's report, which alone carries
+    /// public output and forward statistics. The result is `done` once every
+    /// call is joined and every rank of the batch has completed; the batch is
+    /// then retired. When nothing is joinable, `join_rank_errors` may resolve
+    /// a batch whose ranks reported execution errors, returning its error;
+    /// otherwise the result is `None`.
     fn try_join(&mut self) -> anyhow::Result<Option<WorkerResult>> {
         let Some((batch_id, output_rank, call_ids)) = self.joinable_report_key() else {
             // Preserve successful partial results already agreed by every rank
@@ -700,6 +818,8 @@ impl WorkerGroup {
             .pending_batches
             .get_mut(&batch_id)
             .ok_or_else(|| anyhow::anyhow!("joined batch {batch_id} has no pending batch"))?;
+        // The ranks planned for every selected call take part; the final join,
+        // with an empty call set, takes every rank of the batch.
         let participants = pending
             .ranks
             .iter()
@@ -759,6 +879,18 @@ impl WorkerGroup {
     }
 
     /// Resolves a batch once every rank reports either success or a compatible error.
+    ///
+    /// Only batches with a rank error whose other ranks have all completed or
+    /// failed are resolved, at most one per invocation. When a rank that
+    /// succeeded still holds unjoined calls, the ranks disagree: the batch is
+    /// retired and a plain error returned. Otherwise every error must be
+    /// identical, or a plain error is returned. A fatal error, a
+    /// `SchedulerBug` or `InvariantViolation` code, or a batch carrying a
+    /// `Free` command returns the `WorkerExecError` itself; `poll_batch`
+    /// answers these and the plain errors with recovery. Any other error
+    /// retires the batch and returns a `WorkerFailure` naming its unjoined
+    /// calls and affected requests, which `poll_batch` returns without
+    /// recovery.
     fn join_rank_errors(&mut self) -> anyhow::Result<()> {
         let failing = self
             .pending_batches
@@ -860,6 +992,17 @@ impl WorkerGroup {
     }
 
     /// Join one component's completed work independently of rank and transport framing.
+    ///
+    /// Batches are considered in identifier order. A batch whose calls are
+    /// all joined yields an empty call set once every participating rank has
+    /// completed, owned by its lowest participating rank; that final join
+    /// takes no call and marks the batch done once ranks without a pending
+    /// call, such as ranks that received only commands, have reported.
+    /// Otherwise a pending call's output owner is the first rank of its
+    /// component, and one of the owner's reports yields every call it carries
+    /// that is still pending, belongs to the same component, is planned on
+    /// the same ranks, and has been returned by each of them.
+    /// Returns the batch identifier, the output owner, and the call set.
     fn joinable_report_key(&self) -> Option<(u64, usize, Vec<CallIdentity>)> {
         for (&batch_id, pending_batch) in &self.pending_batches {
             let pending = &pending_batch.remaining;
@@ -916,6 +1059,8 @@ impl WorkerGroup {
         None
     }
 
+    /// Returns the ranks, in rank order, whose projection of the batch plans
+    /// the call.
     fn call_members(&self, batch_id: u64, identity: CallIdentity) -> Vec<usize> {
         self.pending_batches[&batch_id]
             .ranks
@@ -1064,6 +1209,10 @@ fn rank_projection(
             let entry = components
                 .get(&call.component)
                 .with_context(|| format!("unknown component {}", call.component))?;
+            // A distributed component deals a call's decoder units to its ranks
+            // `units_per_rank` at a time, so only the ranks the call's
+            // `max_units` reach take part. `WorkerConfig::validate_members`,
+            // which `spawn_ranks` calls, rejects a zero `units_per_rank`.
             let count = if entry.distribution.is_some() {
                 let range = batch
                     .decode_ranges
@@ -1081,6 +1230,7 @@ fn rank_projection(
             Ok(&entry.ranks[..count])
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+
     let mut batches = Vec::new();
     for rank in 0..rank_count {
         let indices = members
@@ -1104,6 +1254,9 @@ fn rank_projection(
                 call
             })
             .collect();
+        // Forward rows are narrowed to the selected calls, and the batch's
+        // side tables to what those calls use: their request pool slots,
+        // identities, inputs, KV sources, and buffers.
         projection.forward = batch.forward.select(&indices);
         let slots = projection
             .forward
@@ -1168,6 +1321,12 @@ fn rank_projection(
 /// Consume selected calls while retaining the rank results that hold the
 /// rest. A rank result's aggregate statistics are emitted once, when its final
 /// call is consumed; they are never divided or copied.
+///
+/// An empty `identities` visits every result of the batch without taking a
+/// call. `try_join` sets `retain_forward_stats` only when taking from the
+/// output owner. Fails when a selected call is missing or a drained result
+/// keeps a product, and, with `retain_forward_stats`, when the selection
+/// drains more than one result carrying forward statistics.
 fn take_rank_calls(
     buffer: &mut VecDeque<WorkerResult>,
     batch: &Batch,
@@ -1179,7 +1338,6 @@ fn take_rank_calls(
         done: false,
         results: Vec::with_capacity(identities.len()),
         products: Vec::new(),
-
         worker_exec_us: None,
         forward_stats: None,
     };
@@ -1226,6 +1384,9 @@ fn take_rank_calls(
             }
         }
     }
+    // A drained result stays buffered while it carries `worker_exec_us`, which
+    // `try_join` sums per rank once the batch is done; `finish_batch` then
+    // removes it.
     buffer.retain(|report| {
         report.batch_id != batch.batch_id
             || !report.results.is_empty()
@@ -1460,7 +1621,9 @@ fn validate_replacement_info(
 }
 
 impl WorkerGroup {
-    /// Reports whether every rank of this instance is ready to execute.
+    /// Reports whether this instance is open and holds its rank group.
+    ///
+    /// `close` and a failed recovery make it permanently unready.
     pub fn is_ready(&self) -> bool {
         !self.closed && !self.workers.is_empty()
     }
@@ -1474,11 +1637,11 @@ impl WorkerGroup {
         }
     }
 
+    /// Reports and clears whether recovery or close ran since the last call.
     pub(crate) fn take_readiness_change(&mut self) -> bool {
         std::mem::take(&mut self.readiness_changed)
     }
 
-    /// Returns metadata for the physical worker.
     /// Returns each rank's host and whether its device exports a fabric handle.
     ///
     /// A transfer edge crosses hosts when its endpoints report different hosts,
@@ -1494,6 +1657,7 @@ impl WorkerGroup {
             .collect()
     }
 
+    /// Returns the group's agreed worker metadata.
     pub fn info(&self) -> &WorkerInfo {
         &self.info
     }
@@ -1503,7 +1667,7 @@ impl WorkerGroup {
         &self.process_args.transfer
     }
 
-    /// Exposes accepted calls whose required ranks have not returned their result.
+    /// Exposes accepted calls not yet joined into a published result.
     pub(crate) fn inflight_calls(&self) -> impl Iterator<Item = &uniserve_worker_ipc::Call> {
         self.pending_batches.values().flat_map(|pending| {
             pending.batch.calls.iter().filter(|call| {
@@ -1520,6 +1684,13 @@ impl WorkerGroup {
     }
 
     /// Submit each call to its component members and lifetime commands to the rank group.
+    ///
+    /// Returns `WouldBlock` with the batch when the group holds no ranks or
+    /// all `depth` slots are held. A closed group, a batch identifier that does
+    /// not exceed the previous one, an invalid batch, or a failed projection
+    /// or input binding returns `Failed` with no state change. A rank
+    /// submission that fails after the batch is recorded replaces the rank
+    /// group and returns `Failed` with the recovery's `WorkerFailure`.
     pub fn submit_batch(&mut self, batch: Batch) -> Result<(), BatchSubmitError> {
         if self.closed {
             return Err(BatchSubmitError::Failed(anyhow::anyhow!(
@@ -1561,6 +1732,10 @@ impl WorkerGroup {
                 .collect::<anyhow::Result<Vec<_>>>()
         })
         .map_err(BatchSubmitError::Failed)?;
+
+        // The batch's requests are recorded as resident before any rank
+        // receives it, so the recovery that follows a failed rank submission
+        // reports them as lost too.
         let batch_id = batch.batch_id;
         let requests = batch
             .calls()
@@ -1603,8 +1778,13 @@ impl WorkerGroup {
             },
         );
         self.last_progress = Instant::now();
+
         for (rank, batch) in rank_batches {
             if let Err(error) = self.workers[rank].submit_batch(batch) {
+                // The group admitted the batch against the queue depth every
+                // rank was launched with, so a rank that hands it back, for a
+                // full queue or a full socket send queue, fails the group
+                // rather than applying backpressure.
                 let error = match error {
                     BatchSubmitError::WouldBlock(_) => {
                         anyhow::anyhow!(
@@ -1622,6 +1802,14 @@ impl WorkerGroup {
     }
 
     /// Waits for rank progress and returns the next fully agreed physical result.
+    ///
+    /// Returns `None` when `timeout` passes without a joinable result, and at
+    /// once for a closed group. The `WorkerFailure` of an agreed execution
+    /// error that `join_rank_errors` retires with its batch is returned as is
+    /// and the group stays usable. Any other error, including rank loss, a
+    /// protocol violation, an agreed error `join_rank_errors` does not retire,
+    /// and an expired `NEXT_RESULT_DEADLINE`, replaces the rank group and
+    /// returns the recovery's `WorkerFailure`.
     pub fn poll_batch(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
         if self.closed {
             return Ok(None);
@@ -1672,7 +1860,8 @@ impl WorkerGroup {
     }
 
     fn release_closed_resources(&mut self) {
-        // Closed endpoints never trigger serving recovery.
+        // A closed group never triggers recovery: `poll_batch` returns early
+        // and `submit_batch` refuses.
         self.closed = true;
         self.workers.clear();
         self.clear_execution();
