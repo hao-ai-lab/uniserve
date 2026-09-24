@@ -1,4 +1,16 @@
-"""CUDA allocation, mapping, and asynchronous host-storage primitives."""
+"""CUDA allocation, mapping, and asynchronous host-storage primitives.
+
+This package is the Python face of ``csrc/peer_storage.cpp``, a C++
+extension built on the CUDA driver's virtual memory management API and
+compiled on first use with ``torch.utils.cpp_extension.load``. It supplies
+physical allocations whose shareable handles other processes can import,
+the mapping of those handles into tensors, and strided host/device DMA.
+
+The primitives own no transfer policy. Callers such as
+``uniserve.runtime._peer_storage``, ``uniserve_worker.transport.cuda_vmm``
+and ``uniserve_worker.storage.buffer_pool`` decide how handles travel between
+processes, when grants are withdrawn, and when storage retires.
+"""
 
 from functools import lru_cache
 from math import prod
@@ -21,7 +33,11 @@ def _extension():
 
 
 def load() -> None:
-    """Compile or load the cached extension before its first timed use."""
+    """Compile or load the cached extension before its first timed use.
+
+    ``uniserve_worker.transport.cuda_vmm.CudaVmmTransport`` calls this at
+    construction.
+    """
     _extension()
 
 
@@ -40,9 +56,18 @@ def allocate(
 ):
     """Create exactly page-aligned physical storage for one peer's tensor.
 
-    The returned allocation exports a POSIX descriptor and maps an ordered
-    descriptor list into one tensor via ``map_peers``. Descriptor transport,
-    publication, reuse, and retirement belong to the distributed runtime.
+    ``shape`` must be nonempty with positive extents, and its byte size must
+    be an integral multiple of :func:`allocation_granularity`; the extension
+    raises otherwise and does not round up (:func:`empty` does).
+
+    The returned ``PeerAllocation`` exposes ``export_handle()``, the
+    allocation's shareable handle as bytes of this device's probed type (see
+    :func:`exports_fabric_handles`); ``map_local()``, a tensor of ``shape``
+    over its own storage; and ``map_peers(handles)``, which maps an ordered
+    list of handles, one per owner allocating the same shape and dtype, into
+    one tensor whose first dimension is ``shape[0] * len(handles)``. Handle
+    transport, publication, reuse, and retirement belong to the distributed
+    runtime.
     """
     return _extension().PeerAllocation(
         torch.empty(0, dtype=dtype, device=device), list(shape)
@@ -54,10 +79,15 @@ def empty(
 ) -> torch.Tensor:
     """Allocate exportable CUDA storage.
 
-    Physical backing is rounded up to CUDA pages. The tensor owns its
+    Physical backing is rounded up to the device allocation granularity, and
+    the storage's ``nbytes()`` reports the rounded size. The tensor owns its
     allocation and mapping. Its owner must retain it until all local device
     accesses and remote grants have retired. Logical shape and storage size
     remain distinct; views retain the complete physical backing.
+
+    The mapping keeps the originating allocation handle, so
+    :func:`export_handle` succeeds on the returned tensor and its views. An
+    empty shape returns an ordinary tensor with no exportable backing.
     """
     elements = prod(shape)
     if elements == 0:
@@ -66,6 +96,8 @@ def empty(
     page_bytes = allocation_granularity(device)
     nbytes = ((elements * itemsize + page_bytes - 1) // page_bytes) * page_bytes
     owner = allocate((nbytes // itemsize,), dtype=dtype, device=device)
+    # The mapping retains its own handle to the physical allocation, so the
+    # tensor keeps the storage alive after ``owner`` is released.
     storage = owner.map_local()
     return storage[:elements].view(shape)
 
@@ -76,6 +108,10 @@ def exports_fabric_handles(device: int) -> bool:
     A fabric handle crosses hosts inside the fabric domain; a process
     descriptor reaches only the host that created it, so an instance whose
     devices export descriptors cannot place a transfer edge across hosts.
+
+    ``device`` is a CUDA device index, not a ``torch.device``. The extension
+    probes once per device with one minimum-granularity fabric allocation and
+    caches the result for the process.
     """
     return _extension().exports_fabric_handles(device)
 
@@ -88,9 +124,14 @@ def export_handle(tensor: torch.Tensor) -> tuple[bytes, int, int] | None:
     process descriptor otherwise. Both travel as bytes so one publication
     shape carries either.
 
-    Return None for storage without exportable physical backing. The caller
-    retains the source through every reader grant. Other CUDA failures are
-    raised.
+    The capacity is the byte size of the tensor's whole storage and the
+    offset is the byte offset of the tensor's first element within it.
+
+    Return None when the driver rejects the storage base as a virtual memory
+    mapping (``CUDA_ERROR_INVALID_VALUE``) or when its allocation was not
+    created with this device's probed handle type. Raise for an empty or
+    non-CUDA tensor and for other CUDA failures. The caller retains the
+    source through every reader grant.
     """
     return _extension().export_handle(tensor)
 
@@ -99,6 +140,15 @@ def import_handle(
     prototype: torch.Tensor, exported: bytes, allocation_bytes: int
 ) -> torch.Tensor:
     """Map a granted allocation on the prototype device as a flat typed tensor.
+
+    ``exported`` is a handle from :func:`export_handle` or
+    ``PeerAllocation.export_handle`` and ``allocation_bytes`` the byte size
+    of the allocation it names; the result has
+    ``allocation_bytes // prototype.element_size()`` elements of the
+    prototype's dtype, and the caller applies the exported offset. A POSIX
+    descriptor must be open in this process for the duration of the call.
+    The handle's byte length must match this device's probed handle type, so
+    producer and consumer devices must probe the same type.
 
     The returned tensor retains the imported physical handle. Retain its
     mapping until all device reads complete, then release it before
@@ -113,9 +163,20 @@ def copy_host_device(
 ) -> None:
     """Enqueue an exact strided copy between pinned host and CUDA storage.
 
-    The caller owns both views through stream completion. Shape and dtype must
-    agree; this primitive performs no conversion or GPU packing allocation.
-    Destination elements must be disjoint, as validated by the transfer owner.
+    The caller owns both views through stream completion; nothing here
+    records the host tensor with PyTorch's pinned allocator (see
+    :func:`record_host_usage`). Shape and dtype must agree; this primitive
+    performs no conversion or GPU packing allocation. Destination elements
+    must be disjoint; this primitive does not check it (for caller-supplied
+    transfer read destinations,
+    ``uniserve_worker.transport.layout.validate_destination`` does).
+
+    Raises:
+        ValueError: ``stream`` is not on the CUDA view's device, including
+            when neither view is on CUDA.
+        RuntimeError: The views are not one CUDA and one pinned host tensor,
+            disagree in shape or dtype, have a negative stride, or a driver
+            call fails.
     """
     device = source.device if source.is_cuda else destination.device
     if device != stream.device:

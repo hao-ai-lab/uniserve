@@ -5,17 +5,27 @@
 #define BLOCK_SPARSE_VSA_LAUNCH_SM100A_CUH
 
 // Native SM100 block-sparse attention launch with independent Q/K extents.
+//
+// Owns the host side of fmha_context_bf16_gen_kernel: the argument struct,
+// geometry checks, TMA tensor-map encoding, the dynamic shared-memory size
+// and the launch configuration. Two compile-time macros select the block size
+// and tensor layout: VSA_BLK128 (64- or 128-token sparse blocks, defined in
+// the kernel header) and VSA_BHSD (tensor maps addressed by explicit row and
+// head strides, or a fixed contiguous [tokens][heads][dim] layout). The torch
+// binding in attention.cu builds block 64 with VSA_BHSD.
 
 #include "block_sparse_kernel_sm100a.cuh"
 
 namespace VSA_NAMESPACE {
 
+// Device pointers and geometry for one launch. The metadata arrays are read by
+// the kernel only; their values are not validated on the host.
 struct BlockSparseVsaArgs {
   const __nv_bfloat16* q;
   const __nv_bfloat16* k;
   const __nv_bfloat16* v;
   __nv_bfloat16* o;
-  float* lse;                  // [batch, num_heads, seqlen] fp32, or nullptr
+  float* lse;                  // [batch, num_heads, seqlen] fp32 log2 of the softmax normalizer, or nullptr
 
   const int* q2k_idx;              // [batch*num_heads*num_blocks, max_kv] int32
   const int* q2k_num;              // [batch*num_heads*num_blocks] int32
@@ -43,6 +53,8 @@ struct BlockSparseVsaArgs {
 };
 
 // Reject unsupported geometry before constructing tensor maps or launching.
+// An odd num_blocks is accepted: each head's trailing query tile forms a work
+// item with an absent partner (see decode_workitem).
 __host__ inline cudaError_t block_sparse_supported(const BlockSparseVsaArgs& a) {
   if (a.head_dim != HEAD_DIM) return cudaErrorInvalidValue;      // compile-time in the kernel
   if (a.seqlen != a.num_blocks * BLOCK || a.key_seqlen < BLOCK || a.key_seqlen % BLOCK != 0) return cudaErrorInvalidValue;
@@ -66,12 +78,21 @@ __host__ inline cudaError_t launch_block_sparse_sm100a(const BlockSparseVsaArgs&
   const long tq = (long)B * S;
   const int K = a.key_seqlen;
   const long tk = (long)B * K;
+  // One work item is a pair of adjacent BLOCK-row query tiles of one head.
   const int packed_mtiles_per_seq = (num_blocks + 1) / 2;
   const int total_work = B * H * packed_mtiles_per_seq;
   constexpr bool BHSD = VSA_BHSD;
 
+  // Tensor-map dimensions and boxes are listed innermost first; strides are
+  // in bytes (element strides times 2) for dimensions 1 and up. The 128-byte
+  // swizzle limits a box row to 128 bytes, so the 128 channels of a head are
+  // addressed as Q_SUBTILES (or K_SUBTILES) subtiles of SUB_COLS_BF16.
   CUtensorMap tq_, tk_, tv_, to_;
   {
+    // Q and O: [channel in subtile, head (batch * heads with BHSD), row,
+    // subtile]. One box is one head's M_TILE rows with all subtiles. With
+    // BHSD, rows past seqlen of an unpaired trailing tile load as zeros and
+    // are not stored.
     uint64_t gd[4] = { (uint64_t)SUB_COLS_BF16, BHSD ? (uint64_t)((long)B * H) : (uint64_t)H,
                        BHSD ? (uint64_t)S : (uint64_t)tq, (uint64_t)Q_SUBTILES };
     uint64_t gs[3] = { BHSD ? (uint64_t)a.query_head_stride * 2u : (uint64_t)hd * 2u,
@@ -96,6 +117,9 @@ __host__ inline cudaError_t launch_block_sparse_sm100a(const BlockSparseVsaArgs&
       return cudaErrorInvalidValue;
   }
   {
+    // K and V with BHSD: [channel in subtile, key row, subtile, head]; the
+    // contiguous layout folds the head into the subtile index. One box is one
+    // BLOCK-row key block of one subtile (all subtiles in the 128-token build).
     uint64_t gd[4] = { (uint64_t)SUB_COLS_BF16,
                        BHSD ? (uint64_t)K : (uint64_t)tk,
                        BHSD ? (uint64_t)(hd / SUB_COLS_BF16)
@@ -125,6 +149,12 @@ __host__ inline cudaError_t launch_block_sparse_sm100a(const BlockSparseVsaArgs&
                                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
       return cudaErrorInvalidValue;
   }
+  // Mirrors the carve-up at the top of fmha_context_bf16_gen_kernel: two Q
+  // tiles, the K/V ring, two BF16 O staging tiles, the K/V ring mbarriers plus
+  // 22 pipeline mbarriers, the CLC barriers and responses with 16 bytes of
+  // response alignment, the TMEM address slot, the softmax statistics and 256
+  // spare bytes. Adding a barrier or buffer to the kernel without updating
+  // this sum overruns shared memory.
   const size_t smem =
         (size_t)2 * Q_TILE_BYTES + NUM_KV_STAGES * KV_RING_SLOT_BYTES
       + (size_t)2 * M_TILE * HEAD_DIM * sizeof(__nv_bfloat16)
@@ -134,6 +164,10 @@ __host__ inline cudaError_t launch_block_sparse_sm100a(const BlockSparseVsaArgs&
       + (size_t)2 * STAT_REGIONS * STATS * sizeof(float)
       + 256;
 
+  // Optional build knobs. VSA_NAMED_BAR moves the softmax-to-correction alpha
+  // and l signals from mbarriers to named barriers, VSA_THROTTLE delays the
+  // correction warps' acknowledgement of alpha until the O rescale finishes,
+  // and VSA_USE_CLC selects cluster-launch-control scheduling.
 #ifndef VSA_NAMED_BAR
 #define VSA_NAMED_BAR false
 #endif
@@ -152,14 +186,20 @@ __host__ inline cudaError_t launch_block_sparse_sm100a(const BlockSparseVsaArgs&
   cudaError_t e = cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
   if (e != cudaSuccess) return e;
 
+  // Packed divisors (see make_magic) for the per-work-item divisions in
+  // decode_workitem.
   const unsigned long long magic0 = make_magic((unsigned)(H * packed_mtiles_per_seq));
   const unsigned long long magic1 = make_magic((unsigned)H);
   const unsigned long long magic2 = make_magic((unsigned)packed_mtiles_per_seq);
+  // The kernel evaluates exp2, so the softmax scale is folded with log2(e).
   const float scale_log2 = a.sm_scale * (float)M_LOG2E;
 
   int numSM = 0;
   e = cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, 0);
   if (e != cudaSuccess) return e;
+  // With CLC, the grid holds one CTA per work item and running CTAs cancel
+  // unlaunched ones to take over their work items. Without it, a persistent
+  // grid of at most one CTA per SM strides over the work items.
   const int num_ctas = USE_CLC ? total_work : (total_work < numSM ? total_work : numSM);
   dim3 grid(num_ctas, 1, 1), block(N_WARPS * 32, 1, 1);
 

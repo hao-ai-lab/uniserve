@@ -1,6 +1,10 @@
 """SM100a CUDA block-64 attention with independent query and key extents.
 
+The kernel sources live in ``csrc/`` and build as a PyTorch JIT extension.
 The extension compiles on first :func:`load`; support queries never compile.
+``uniserve.runtime.backends.attention.vsa.sm100`` calls :func:`load` while
+preparing its operator and routes complete calls here when
+``vsa_cute.should_use`` declines a shape.
 """
 
 from functools import lru_cache
@@ -27,6 +31,10 @@ def load() -> None:
 
 @lru_cache(maxsize=1)
 def _extension():
+    # One build or cache lookup per process. The explicit -gencode flag pins
+    # the sm_100a target; torch adds no TORCH_CUDA_ARCH_LIST targets when the
+    # CUDA flags already name an architecture. -lcuda links the driver API
+    # that the launcher uses to encode TMA tensor maps.
     from torch.utils.cpp_extension import load as load_extension
 
     source = Path(__file__).parent / "csrc" / "attention.cu"
@@ -68,6 +76,15 @@ def block_sparse_attention(
     tiles]`` and per-key-block valid sizes in ``[0, 64]``; these device values
     are consumed without a host synchronization. Call :func:`load` before
     CUDA capture.
+
+    Only the first ``counts[h, t]`` indices of each query tile are read. The
+    kernel does not range-check metadata values: counts must not exceed the
+    selected width and indices must address existing key blocks. With
+    ``scale * log2(e) <= 1``, keys past a block's valid size never contribute,
+    and a query tile with a zero count or no valid selected key produces zero
+    output; a larger scale can turn fully masked scores into NaN.
+    Every query row is computed, including padded ones. The call launches on
+    the current CUDA stream and writes ``out`` in place.
     """
     _extension().forward(
         query, key, value, out, indices, counts, valid_sizes, float(scale)

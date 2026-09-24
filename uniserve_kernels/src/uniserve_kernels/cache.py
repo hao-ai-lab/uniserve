@@ -2,6 +2,15 @@
 
 Caches store ``[blocks, tokens, heads, dim]`` rows. Writes address physical
 token slots ``block * block_size + token``; ``-1`` skips a token.
+
+These kernels back ``uniserve.cache.paged.paged_kv_write``,
+``uniserve.cache._fp8.rescale_`` and ``uniserve.runtime._block_fill.BlockFill``;
+``uniserve_kernels.attention.paged`` also calls the scatter body from its own
+kernel. The scatter and the fill have eligibility checks
+(``can_run_paged_kv_write``, ``can_fill_blocks``); ``paged_kv_write`` and
+``BlockFill`` in ``uniserve`` take a tensor-operation path when a check fails.
+Every launch selects the device of its tensors, independently of the calling
+thread's current CUDA device.
 """
 
 from __future__ import annotations
@@ -10,6 +19,8 @@ import torch
 
 from uniserve_kernels.triton import launchable, tl, triton
 
+# Elements of one flattened ``heads * dim`` cache row per scatter program.
+# ``uniserve_kernels.attention.paged`` passes the same width as a literal.
 _WRITE_BLOCK = 256
 
 
@@ -33,8 +44,16 @@ if triton is not None:
         block_size: tl.constexpr,
     ):
         """Scatter borrowed key and value rows into physical token slots."""
-        # Grid: (token rows, ceil(row_width / block)). Each program scatters a
-        # block-wide slice of one token's flattened [heads, head_dim] row.
+        # ``num_pages`` and ``page_size`` are the cache's block count and
+        # tokens per block; ``block_size`` is this kernel's tile width
+        # (``_WRITE_BLOCK``), unrelated to the cache block size. Shapes and
+        # source strides are constexpr, so each distinct cache shape or
+        # source stride tuple compiles its own specialization.
+        #
+        # Grid: (token rows, ceil(row_width / block_size)). Each program
+        # scatters a ``block_size``-wide slice of one token's flattened
+        # [heads, head_dim] row. The caches are contiguous, so a slot indexes
+        # a [num_pages * page_size, row_width] view directly.
         row = tl.program_id(0)
         columns = tl.program_id(1) * block_size + tl.arange(0, block_size)
         location = tl.load(slots_ptr + row)
@@ -43,6 +62,9 @@ if triton is not None:
         cache_row = location
         persists = location >= 0
         valid_address = location < num_pages * page_size
+        # Triton compiles device asserts only in debug mode, so both launchers
+        # (``paged_kv_write`` and ``uniserve_kernels.attention.paged``) pass
+        # ``debug=True``.
         tl.device_assert(location >= -1, "paged KV write index below -1")
         tl.device_assert(
             (~persists) | valid_address, "paged KV write index out of bounds"
@@ -67,9 +89,14 @@ if triton is not None:
         v = tl.load(v_src_ptr + v_source_offsets, mask=mask, other=0.0)
         tl.store(k_cache_ptr + cache_offsets, k, mask=mask)
         tl.store(v_cache_ptr + cache_offsets, v, mask=mask)
+        # A ``None`` flag pointer is a compile-time constant, so this branch
+        # disappears when the caller tracks no initialization state.
         if k_initialized_ptr is not None:
-            # Every writing token commits the same true bit, independently of
-            # head width. The block's payload and flag share stream ordering.
+            # Only the first column program of each token row stores flags,
+            # so a row commits its block's flag once regardless of how many
+            # programs span the head width. Rows sharing a block all store the
+            # same true value. Payload and flags are written by one launch, so
+            # later work on the same stream observes both.
             if tl.program_id(1) == 0:
                 block = cache_row // page_size
                 tl.store(
@@ -89,20 +116,27 @@ if triton is not None:
         tile: tl.constexpr,
         compute_dtype: tl.constexpr,
     ):
-        # values: [blocks, width] flattened FP8 codes; scales, flags: [blocks].
+        # values: [blocks, width] contiguous E4M3 codes rewritten in place;
+        # old_scales, new_scales and initialized: [blocks]. One program owns
+        # one block and walks it in ``tile``-element steps.
         block = tl.program_id(0)
         old = tl.load(old_scales + block)
         new = tl.load(new_scales + block)
         active = tl.load(initialized + block) & (new > old)
-        # Untouched and non-growing blocks perform only the metadata reads. A
-        # growing block keeps its old scale until every encoded element is
-        # read.
+
+        # Uninitialized and non-growing blocks perform only the metadata
+        # reads. Scales are never written here: every element of a growing
+        # block decodes with its old scale, and the caller commits the new
+        # scales after this launch.
         if active:
             for start in range(0, width, tile):
                 indices = start + tl.arange(0, tile)
                 value = tl.load(
                     values + block * width + indices, indices < width, other=0.0
                 ).to(tl.float32)
+                # Decode, round through the logical cache dtype, re-encode
+                # against the grown scale and clamp to the E4M3 finite range
+                # (+/-448); the store converts the FP32 result to E4M3.
                 decoded = (value * old).to(compute_dtype).to(tl.float32)
                 encoded = tl.maximum(-448.0, tl.minimum(448.0, decoded / new))
                 tl.store(
@@ -121,15 +155,22 @@ if triton is not None:
         start,
         block: tl.constexpr,
     ):
-        # Grid axis 0 walks the per-field 1024-element tiles of one block,
-        # concatenated across fields; axis 1 indexes blocks along the leading
-        # axis, offset by ``start``. Each tensor is [block, *widths[field]].
+        # Grid axis 0 walks the per-field ``block``-element tiles of one cache
+        # block, concatenated across fields; axis 1 indexes cache blocks along
+        # the leading axis, offset by ``start``. Field ``i`` is a contiguous
+        # tensor of ``widths[i]`` elements per cache block. Widths, values
+        # and tile counts are constexpr; ``start`` is a runtime argument.
         tile = tl.program_id(0)
         page = start + tl.program_id(1)
+        # The unrolled field loop selects the one field whose tile range
+        # contains this program; ``first`` accumulates each field's starting
+        # tile at compile time.
         first: tl.constexpr = 0
         for field in tl.static_range(len(widths)):
             if tile >= first and tile < first + tiles[field]:
                 offsets = (tile - first) * block + tl.arange(0, block)
+                # The cache block index widens to int64 before scaling by the
+                # field width, so offsets past 2**31 elements do not overflow.
                 tl.store(
                     tensors[field]
                     + page.to(tl.int64) * widths[field]
@@ -150,7 +191,9 @@ def can_run_paged_kv_write(
     """Return whether contiguous CUDA caches and slot rows fit the scatter.
 
     Sources are ``[rows, heads, dim]`` views with arbitrary strides and the
-    cache dtype.
+    cache dtype; a write that needs a dtype conversion is ineligible. The
+    check requires autograd to be disabled. Slot values are not inspected
+    here; the kernel asserts their bounds.
     """
     tensors = (k_cache, v_cache, slots, k_source, v_source)
     return (
@@ -180,7 +223,23 @@ def paged_kv_write(
 ) -> None:
     """Scatter source rows into their slots and mark written blocks.
 
-    Device assertions reject slots below ``-1`` or beyond the cache.
+    Launch only after ``can_run_paged_kv_write`` accepts the same tensors.
+
+    Args:
+        k_cache: Contiguous ``[blocks, block_size, heads, dim]`` key cache,
+            written in place.
+        v_cache: Value cache with the key cache's shape and dtype.
+        slots: Contiguous flat int32 or int64 slots, one per source row;
+            ``-1`` skips the row.
+        k_source: ``[rows, heads, dim]`` key rows in the cache dtype, with
+            arbitrary strides.
+        v_source: ``[rows, heads, dim]`` value rows in the cache dtype.
+        initialized: Optional key and value ``[blocks]`` bool flags; every
+            block that receives a row is set to ``True``.
+
+    Device assertions reject slots below ``-1`` or beyond the cache. A failed
+    assertion surfaces asynchronously as a CUDA error rather than a Python
+    exception at this call.
     """
     num_pages, page_size, heads, head_dim = (int(dim) for dim in k_cache.shape)
     row_width = heads * head_dim
@@ -218,6 +277,15 @@ def rescale_fp8_blocks(
 
     Decoded values round through the logical ``dtype`` before re-encoding.
     Scale tensors are read-only; the caller commits new scales afterward.
+
+    Args:
+        values: Contiguous ``[blocks, ...]`` E4M3 codes, rewritten in place
+            for blocks where ``initialized`` is set and ``new > old``.
+        old: ``[blocks]`` resident dequantization scales.
+        new: ``[blocks]`` scales the re-encoded blocks will use.
+        initialized: ``[blocks]`` bool flags; unset blocks are left alone.
+        dtype: Logical cache dtype; float16, bfloat16 or float32. Other
+            dtypes raise ``KeyError`` unless ``values`` is empty.
     """
     width = values[0].numel() if values.shape[0] else 0
     if not width:
@@ -274,8 +342,13 @@ def fill_blocks(
 ) -> None:
     """Fill leading-axis blocks ``[start, stop)`` of every field in one launch.
 
-    ``widths`` holds each field's elements per block.
+    ``widths`` holds each field's elements per block and ``values`` each
+    field's fill value, converted to the field dtype on store. The caller
+    must have passed ``tensors`` to ``can_fill_blocks`` and owns bounds
+    validation of the interval.
     """
+    # The tile count and the kernel's ``block`` argument share the 1024
+    # element tile width.
     tiles = tuple((width + 1023) // 1024 for width in widths)
     with torch.cuda.device(tensors[0].device):
         _fill_kernel[(sum(tiles), stop - start)](

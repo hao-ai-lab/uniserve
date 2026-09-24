@@ -1,4 +1,18 @@
-"""CuTe DSL SM100 block-64 provider for shared video sparse attention."""
+"""CuTe DSL SM100 block-64 provider for shared video sparse attention.
+
+The kernel is ``SparseAttentionSm100`` from ``_vsa_cute_kernel``, a cuDNN
+frontend block-64 kernel with its own correction epilogue. Callers pass
+channel-contiguous ``[rows, heads, 128]`` tensors; this module views them as
+``[1, heads, rows, 128]`` without copying. Among the backends in
+``uniserve.runtime.backends.attention.vsa``, ``cute`` uses it for every call
+and ``sm100`` uses it for row production and for the complete-call shapes
+:func:`should_use` selects.
+
+Each distinct specialization key (see ``_compile_key``) compiles one executor
+on its first call and caches it in ``_EXECUTORS`` for the life of the
+process. :func:`block_sparse_attention` refuses to compile during CUDA graph
+capture, so every key must be exercised once before capture.
+"""
 
 from __future__ import annotations
 
@@ -41,10 +55,10 @@ _SOFTMAX_SCALE = 1.0 / math.sqrt(128)
 
 
 def available(device: torch.device | None = None) -> bool:
-    """Check CuTe kernel compilation support.
+    """Report whether the kernel can compile and run on ``device``.
 
-    Return whether the CuTe kernel can compile for the requested SM100
-    device.
+    Requires the optional CUTLASS DSL, cuDNN frontend and CUDA driver imports
+    and a compute-capability 10.x device. Nothing is compiled.
     """
     if (
         _cute is None
@@ -64,14 +78,21 @@ def import_error() -> BaseException | None:
 
 
 def should_use(*, rows: int, prefix_tiles: int) -> bool:
-    """Select shapes whose measured provider boundary favors CuTe."""
+    """Select shapes whose measured provider boundary favors CuTe.
+
+    ``vsa.sm100`` passes the key row count as ``rows`` and the pattern's
+    dense prefix tile count as ``prefix_tiles``; ``False`` routes the complete
+    call to the native CUDA kernel in ``vsa_native``.
+    """
     return int(rows) <= 65_536 or int(prefix_tiles) <= 64
 
 
 def _dynamic_tensor(tensor: torch.Tensor, assumed_align: int = 16) -> Any:
-    """Wrap a tensor as a CuTe argument.
+    """Wrap a tensor as a CuTe argument with a dynamic layout.
 
-    Wrap a tensor as a CuTe dynamic-layout argument with declared alignment.
+    Shapes and strides stay runtime values, with the last dimension marked as
+    the unit-stride one, so one executor serves every tensor sharing its ABI
+    key. ``assumed_align`` promises the base-pointer alignment in bytes.
     """
     if _from_dlpack is None:
         raise RuntimeError(
@@ -85,10 +106,12 @@ def _dynamic_tensor(tensor: torch.Tensor, assumed_align: int = 16) -> Any:
 
 
 def _tensor_abi_key(tensor: torch.Tensor) -> tuple[object, ...]:
-    """Describe a tensor's kernel ABI.
+    """Describe the layout properties an executor is specialized on.
 
-    Describe a tensor's device, dtype, shape, and stride for kernel
-    specialization.
+    The key holds the dtype, rank, the leading (last) dimension index and its
+    stride, and which dimensions broadcast (stride 0). Shapes and the other
+    strides are runtime values and not part of this key; ``_compile_key``
+    adds the head count separately.
     """
     leading_dim = tensor.ndim - 1
     return (
@@ -112,17 +135,15 @@ def _compile_key(
     lse: torch.Tensor | None,
     allow_empty_blocks: bool,
 ) -> tuple[object, ...]:
-    """Build a CuTe kernel specialization key.
-
-    Build the CuTe kernel specialization key from tensor layouts and
-    stride mode.
-    """
+    """Build the ``_EXECUTORS`` key for one kernel specialization."""
     device_index = query.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
 
-    # The leading entries mirror the static kernel configuration in _compile;
-    # the trailing entries capture each tensor's ABI so layouts respecialize.
+    # The leading entries pin the device, its capability, the head count and
+    # the fixed constructor settings in _compile; the trailing entries capture
+    # each tensor's ABI so layouts respecialize. Keep the fixed settings in
+    # step with _compile.
     return (
         device_index,
         torch.cuda.get_device_capability(query.device),
@@ -168,10 +189,10 @@ def _compile(
     lse: torch.Tensor | None,
     allow_empty_blocks: bool,
 ) -> Callable[..., None]:
-    """Compile a block-sparse CuTe kernel.
+    """Compile a block-sparse executor for one ``_compile_key``.
 
-    Compile and cache the block-sparse CuTe kernel for one concrete
-    tensor shape.
+    The caller caches the result and must not call this during CUDA graph
+    capture.
     """
     if _cute is None or _kernel_type is None:
         raise RuntimeError(
@@ -203,9 +224,12 @@ def _compile(
         _SOFTMAX_SCALE,
         _dynamic_tensor(block_indices),
         _dynamic_tensor(valid_sizes),
+        # Uniform block count; unused because per-tile counts follow.
         0,
         _dynamic_tensor(block_counts),
+        # No key-split offsets: num_splits is 1.
         None,
+        # The stream is an explicit argument of every launch.
         _cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
     )
@@ -221,9 +245,13 @@ def _validate(
     valid_sizes: torch.Tensor,
     lse: torch.Tensor | None,
 ) -> None:
-    """Validate CuTe kernel inputs.
+    """Check tensor ranks, dtypes, shapes, devices, strides and alignment.
 
-    Validate tensor ranks, dtypes, shapes, devices, and block-index bounds.
+    Metadata values are device data and are not inspected: block indices and
+    counts are not range-checked.
+
+    Raises:
+        ValueError: If a tensor violates the kernel's layout contract.
     """
     if key.shape != value.shape or key.shape[1:] != query.shape[1:]:
         raise ValueError(
@@ -256,6 +284,9 @@ def _validate(
         raise ValueError(
             "CuTe sparse attention requires a contiguous head dimension"
         )
+    # Strides in multiples of eight elements keep every row and head start of
+    # the BF16 or FP32 tensors on the 16-byte alignment that _dynamic_tensor
+    # declares.
     if any(
         stride % 8
         for tensor in (query, key, value, output)
@@ -322,6 +353,29 @@ def block_sparse_attention(
     Block IDs address K/V tiles; counts and output address query tiles. Optional
     LSE stores the natural logarithm of each fine-attention normalizer. Empty
     key partitions produce zero output and negative-infinite LSE.
+
+    Args:
+        query: BF16 ``[query rows, heads, 128]``; rows are a multiple of 64.
+        key: BF16 ``[key rows, heads, 128]``; rows are a multiple of 64.
+        value: BF16 tensor with ``key``'s shape.
+        output: Contiguous BF16 or FP32 tensor with ``query``'s shape,
+            written in place.
+        block_indices: int32 ``[heads, query tiles, selected]`` key-block IDs.
+        block_counts: int32 ``[heads, query tiles]`` selected-block counts.
+        valid_sizes: int32 ``[key tiles]`` valid keys per 64-key block.
+        lse: Optional contiguous FP32 ``[heads, query rows]`` output.
+        allow_empty_blocks: Use the specialization that tests each query
+            tile for a zero count; otherwise every tile runs the non-empty
+            path.
+        scale: Softmax scale applied to the scores.
+
+    Returns:
+        A ``[1, heads, query rows, 128]`` view of ``output``.
+
+    Raises:
+        RuntimeError: If the kernel is unavailable, or if an uncompiled
+            specialization is first seen during CUDA graph capture.
+        ValueError: If the tensors violate the layout contract.
     """
     if not available(query.device):
         raise RuntimeError(
@@ -352,6 +406,8 @@ def block_sparse_attention(
             raise RuntimeError(
                 "CuTe sparse video attention stride validation is unavailable"
             )
+        # cuDNN's check reports whether the K/V strides overflow the kernel's
+        # int32 TMA coordinate basis; the answer selects a specialization.
         use_int64_kv_strides = bool(_requires_int64_kv_strides(k_bhsd, v_bhsd))
 
         cache_key = _compile_key(
@@ -403,6 +459,8 @@ def block_sparse_attention(
             0,
             counts.detach(),
             None,
+            # Launch on torch's current stream so the call orders with the
+            # surrounding tensor work and records into an active capture.
             _cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
         )
     return o_bhsd
