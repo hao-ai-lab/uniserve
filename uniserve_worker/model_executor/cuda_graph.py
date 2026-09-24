@@ -1,4 +1,13 @@
-"""Prepared execution resources and fixed CUDA graph inputs."""
+"""Prepared execution resources and fixed CUDA graph inputs.
+
+Numerical inputs are PyTrees of dataclasses, tuples, mappings and tensors.
+This module keys graph variants by an input's structure and tensor layouts
+(``input_signature``), gives captured graphs their own input backing
+(``clone_inputs``), and copies live inputs into that backing before each
+replay (``Inputs``). ``Execution`` is the base of every ``ModelRunner``: it
+owns the prepared ``ExecutionContext``, the graph buckets and the private
+allocation pools charged to the worker's ``GraphStorage``.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +26,12 @@ from uniserve_worker.model_executor.graph_storage import GraphStorage
 
 
 def _register(value):
-    """Teach PyTree about numerical dataclasses on their first encounter."""
+    """Teach PyTree about numerical dataclasses on their first encounter.
+
+    Used as the ``is_leaf`` callback of every flatten and map here, only for
+    its registration side effect: it always returns False, so no node is
+    treated as a leaf by this callback.
+    """
     cls = type(value)
     if cls not in pytree.SUPPORTED_NODES:
         if is_dataclass(value) and not isinstance(value, type):
@@ -50,7 +64,12 @@ def map_tensors(value, transform):
 
 
 def clone_inputs(value):
-    """Clone backing while preserving broadcasts and repeated references."""
+    """Clone backing while preserving broadcasts and repeated references.
+
+    A tensor with zero strides clones only one element along those axes and
+    is expanded again, so the copy keeps the broadcast. A tensor reachable
+    through several paths is cloned once and the clones stay aliased.
+    """
     copies = {}
 
     def clone(tensor):
@@ -66,8 +85,14 @@ def clone_inputs(value):
 
 
 def input_signature(value):
-    """Key an exact numerical bucket by structure, static values and layouts."""
+    """Key an exact numerical bucket by structure, static values and layouts.
+
+    Tensors contribute device, dtype, shape, strides and an alias ordinal, so
+    two inputs match only if they share the same aliasing pattern; non-tensor
+    leaves contribute their values and must be hashable.
+    """
     leaves, spec = pytree.tree_flatten(value, is_leaf=_register)
+    # Tensor identity -> ordinal of its first appearance.
     aliases: dict[int, int] = {}
     return spec, tuple(
         (
@@ -84,7 +109,12 @@ def input_signature(value):
 
 
 class Inputs:
-    """Bind tensor correspondence once; replay visits only these known paths."""
+    """Bind tensor correspondence once; replay visits only these known paths.
+
+    ``value`` is the graph's captured input. Each distinct tensor in it is
+    recorded once with its PyTree key path; ``copy`` reads the tensor at the
+    same path in a live input of the same structure.
+    """
 
     def __init__(self, value):
         self.value = value
@@ -96,6 +126,14 @@ class Inputs:
         self.tensors = tuple(targets.values())
 
     def copy(self, live):
+        """Copy ``live``'s tensors into the captured input tensors.
+
+        Only tensor leaves are read; non-tensor leaves of ``live`` are ignored.
+
+        Raises:
+            ValueError: If a tensor's shape, dtype or device differs from the
+                captured one. Tensors copied before the mismatch stay copied.
+        """
         for path, destination in self.tensors:
             value = pytree.key_get(live, path)
             if (
@@ -104,8 +142,13 @@ class Inputs:
                 or destination.device != value.device
             ):
                 raise ValueError("graph tensor shape or representation changed")
+
+            # Inputs already staged in the graph's own backing need no copy.
             if destination.data_ptr() == value.data_ptr():
                 continue
+
+            # A broadcast destination has one backing element along each
+            # zero-stride axis; copy only that slice of the live value.
             if 0 in destination.stride():
                 slices = tuple(
                     slice(0, 1) if stride == 0 else slice(None)
@@ -125,6 +168,14 @@ class CUDAGraphRunner:
 
     @classmethod
     def capture(cls, context, inputs, call, *, pools, restore=None):
+        """Warm and capture ``call(inputs)`` on ``context``.
+
+        The eager call first warms the kernel specializations that
+        ``CUDAGraph.capture`` requires. ``restore``, when given, returns
+        mutated state to its pre-call contents after the warm call and again
+        after capture, so preparation leaves live state unchanged. ``inputs``
+        become the graph's fixed input backing, retained by the runner.
+        """
         with context.activate():
             try:
                 call(inputs)
@@ -140,6 +191,11 @@ class CUDAGraphRunner:
         return cls(executable, Inputs(inputs))
 
     def replay(self, live=None):
+        """Copy ``live`` into the fixed inputs, when given, and replay.
+
+        Returns the graph's retained output views, which the next replay
+        overwrites.
+        """
         with self.executable.context.activate():
             if live is not None:
                 self.inputs.copy(live)
@@ -149,6 +205,7 @@ class CUDAGraphRunner:
         self.executable.close()
 
 
+# Process-wide recency counter for ``GraphBucket.last_used``.
 _USES = count()
 
 
@@ -175,6 +232,10 @@ class Execution:
     Capability-specific buckets may retain padding or solver staging. All
     variants retire before the context and pools supplying their resources.
     Callers drain external readers before closing this owner.
+
+    ``pools`` maps each CUDA device in ``devices`` to this owner's private
+    ``MemPool``; it is empty when no CUDA device is given, which runners
+    treat as eager-only execution.
     """
 
     def __init__(self, context: ExecutionContext, *, devices=(), storage=None):
@@ -184,6 +245,7 @@ class Execution:
         self.pools = self.storage.reserve(self, devices)
 
     def close_bucket(self, key):
+        """Retire one bucket, first synchronizing the context stream if any."""
         bucket = self.buckets.pop(key, None)
         if bucket is not None:
             if self.context.stream is not None:
@@ -197,6 +259,8 @@ class Execution:
             self.buckets.clear()
 
     def close(self):
+        # Graphs close before the context whose resources they captured; the
+        # pools are released from storage only after both.
         try:
             close_resources(self.close_graphs, self.context.close)
         finally:

@@ -11,6 +11,7 @@ class DecoderRunner(ModelRunner):
     """Decode prepared latent tensors with the capability's workspace views."""
 
     def resources(self):
+        """Context views ``execute_model`` passes to direct decoder calls."""
         if isinstance(self.model, (VideoDecoder, VideoPostprocessor)):
             return {
                 "constants": self.context.constants,

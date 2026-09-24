@@ -1,8 +1,13 @@
-"""Construction boundary for records already validated by the IPC decoder.
+"""Trusted assembly of batches the Rust IPC decoder already validated.
 
-Direct Python callers construct protocol dataclasses or use ``from_mapping``;
-those paths retain their complete descriptor validation. Only decoded Rust IPC
-records may enter the trusted batch factory below.
+The Rust codec in `uniserve_worker_ipc` decodes a submit frame and runs
+`Batch::validate` on it. The PyO3 transport's `batch_to_py`
+(`crates/worker-ipc-py`) then builds every member record through its ordinary
+constructor and passes them to `batch_from_validated`. Python callers that
+build a batch themselves construct `Batch` directly or use
+`Batch.from_mapping`; both run `Batch.validate`, and `from_mapping` also
+validates every call. Only records decoded by the Rust transport may enter the
+factory below.
 """
 
 from __future__ import annotations
@@ -44,10 +49,34 @@ def batch_from_validated(
     """Assemble a validated batch from transport-constructed members.
 
     Called by the Rust IPC transport, which has already decoded and validated
-    every field. Construction therefore bypasses ``Batch.__init__`` so
-    typed leaves are not reparsed and ``__post_init__`` validation is not
-    repeated.
+    every field. Construction therefore bypasses ``Batch.__init__``, so
+    ``Batch.__post_init__`` does not repeat that validation.
+
+    The argument order must match the tuple `batch_to_py` builds, and every
+    `Batch` field must be assigned here: `Batch` uses slots, so reading a
+    field this factory skipped raises ``AttributeError``.
+
+    Args:
+        batch_id: Logical batch identity shared by every call.
+        collective_seq: Sequence number ordering collective communication.
+        calls: Calls in submission order.
+        block_tables: Complete KV page table per request slot and KV group.
+        new_cache_pages: KV pages newly assigned by this batch.
+        forward_inputs: The columnar forward inputs, in this order:
+            ``forward_call_indices``, ``request_pool_indices``,
+            ``seq_lens``, ``query_lens``, ``write_kv``.
+        latent_params: Per-trajectory solver-step ranges and paged latent
+            storage.
+        decode_ranges: Bounded media-unit ranges for media calls.
+        buffer_allocations: Persistent storage slices for call outputs.
+        commands: Ordered lifecycle commands.
+        input_products: Published tensor values feeding declared call inputs.
+        kv_inputs: KV publications installed by this batch's calls.
+
+    Returns:
+        The assembled batch, without `Batch.validate` having run.
     """
+    # `Batch` is frozen, so fields are written through object.__setattr__.
     batch = object.__new__(Batch)
     set_field = object.__setattr__
     set_field(batch, "batch_id", batch_id)

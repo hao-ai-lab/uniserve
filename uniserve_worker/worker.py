@@ -1,4 +1,24 @@
-"""Resource scope and public entry point for one model-backed worker."""
+"""Resource scope and public entry point for one model-backed worker.
+
+`Worker` owns the execution resources of one worker rank, including the
+model runner (`ModelExecutor`), the paged KV cache and block tables of a
+worker with a ``CausalLM``, the latent pool of a denoising worker, the
+request slots (`RequestPool`), the product, buffer and output stores, the
+transports, the host lane, the muxer rank's `MediaMux`, and the process
+groups created by `from_config`.
+
+Both entry paths drive the worker's one `Executor`. The worker process
+(``uniserve_worker.bootstrap.launch``) builds a worker with `from_config`,
+borrows its IPC endpoint with `bind`, and calls `run`, which warms up and
+then runs `Service` on the caller's thread. A Python caller may instead call
+`warmup` and drive batches directly through `submit`, `advance` and `poll`.
+Construction performs no warmup, graph capture or IPC I/O.
+
+`close` releases the owners in dependency order. After a failure on this
+rank it releases only what completes without peers or the device and keeps
+the rest alive until process exit (`retain_until_exit`), so the process must
+exit afterwards.
+"""
 
 from __future__ import annotations
 
@@ -119,7 +139,9 @@ class Worker:
     ) -> None:
         """Release resources on scope exit.
 
-        The scope's error is neither suppressed nor replaced.
+        A scope leaving on an error closes with ``aborted=True`` (see
+        `close`). The scope's error is neither suppressed nor replaced; a
+        cleanup failure is attached to it as a note.
         """
         if exc_value is not None:
             # Native cleanup can itself stall after a device failure. Record
@@ -145,13 +167,20 @@ class Worker:
     def from_config(cls, config: WorkerProcessArgs) -> Self:
         """Build a worker without numerical warmup, graph capture, or IPC I/O.
 
-        Construction failures release all resources acquired here. The
-        returned worker owns those resources until its context exits or the
-        caller closes it.
+        The returned worker owns the process groups and every execution
+        resource until its context exits or the caller closes it.
+
+        A failure after the process groups exist closes them with
+        ``aborted=True``, which retains them until process exit instead of
+        destroying them collectively; `__init__` likewise retains its own
+        partial allocations. The caller must end the process after a
+        construction failure that reaches that point.
         """
+        # The placement is validated against the model's declarations on a
+        # meta-device skeleton, so a placement error surfaces before any
+        # process group exists.
         source, description, declarations = prepare_worker_model(config)
 
-        # Mathematical constraints are checked before physical groups exist.
         try:
             distributed = initialize_process_groups(
                 rank=config.execution.rank,
@@ -184,9 +213,12 @@ class Worker:
                 declarations=declarations,
             )
 
-            # Sampling uses the language model's TP group, independently of
-            # other components' parallel layouts. Backend selection belongs
-            # to the runner.
+            # Sampling broadcasts selected tokens over the `tp` group of the
+            # component holding the `CausalLM`, independently of other
+            # components' parallel layouts. `initialize_components` binds a
+            # `tp` axis for such a component even without tensor-parallel
+            # layers. Without such a component, or on a rank outside it, the
+            # sampling group is None.
             model_mesh = next(
                 (
                     bindings[name].mesh
@@ -200,9 +232,10 @@ class Worker:
                 None if model_mesh is None else model_mesh.get_group("tp")
             )
 
-            # The constructor owns partial execution allocations on failure.
+            # The constructor handles its own partial allocations on failure.
             # On success the worker also takes responsibility for
-            # distributed.close().
+            # `distributed.close()`. `attention` is left unset, so the runner
+            # resolves the backend from the worker configuration.
             return cls(
                 loaded.model,
                 bindings=bindings,
@@ -263,9 +296,15 @@ class Worker:
         """Allocate execution resources for an already-loaded model.
 
         Resolve unspecified attention from worker_config. Construction
-        performs no warmup or IPC I/O, and rolls back partial resource
-        allocations on error. The caller closes the worker or uses its
-        owning context after success.
+        performs no warmup or IPC I/O. Sizing the request capacity and the
+        KV page count can run collectives across the worker's ranks, so
+        every rank must construct its worker together.
+
+        On error, the host lane and the runner are aborted and every other
+        partial allocation is retained until process exit rather than
+        released, since a failed CUDA owner cannot prove that its device
+        accesses ended; the caller must end the process. After success the
+        caller closes the worker or uses its owning context.
         """
         self._closed = False
         self._run_started = False
@@ -274,6 +313,9 @@ class Worker:
         self.ipc_endpoint: WorkerIpcEndpoint | None = None
         self.profiler: WorkerProfiler | None = None
 
+        # `startup` collects each allocated owner's release but is never
+        # unwound: on success `close` takes the owners over, and on failure
+        # they are retained until process exit.
         startup = ExitStack()
 
         try:
@@ -332,12 +374,13 @@ class Worker:
 
             self.attention = runner.attention
 
+            endpoint = WorkerEndpoint.local(worker_id, int(worker_config.rank))
+
             # Measure the remaining grant after the runner binds persistent
             # model inputs and workspaces. Sizing earlier would treat
             # occupied storage as free. Request capacity is the only
-            # configuration resolved after binding.
-            endpoint = WorkerEndpoint.local(worker_id, int(worker_config.rank))
-
+            # configuration resolved after binding; the runner receives the
+            # resolved configuration too.
             worker_config = resolve_request_capacity(
                 model,
                 worker_config,
@@ -367,9 +410,10 @@ class Worker:
                 components=components,
                 checkpoint_identity=checkpoint_identity,
                 attention_backend=runner.attention.name,
-                # The scheduler's page indices are shared across all
-                # resident layer and head regions, including stages with
-                # different storage grants.
+                # The scheduler's page indices address every rank's resident
+                # layer and head regions, including stages with different
+                # storage grants, so a multi-rank token worker's ranks agree
+                # on the minimum KV page count over this group.
                 capacity_group=(
                     process_groups.process_group
                     if process_groups is not None
@@ -377,9 +421,11 @@ class Worker:
                 ),
             )
 
-            # Auxiliary devices have separate grants; primary-device
-            # reservations were already included in the layout's capacity
-            # calculation.
+            # Only the token-worker layout reports fixed device bytes; with a
+            # KV cache, its primary-device bytes were charged against the KV
+            # pool's grant when the layout sized it. This loop checks each
+            # auxiliary CUDA device's own grant, which must hold that
+            # device's fixed bytes plus the default graph allowance.
             for device, fixed_bytes in layout.fixed_device_bytes:
                 if (
                     device == worker_config.device
@@ -413,9 +459,9 @@ class Worker:
             self.block_tables = None
             max_blocks_per_row = 0
 
-            # KV pages and request-to-token tables share group dimensions;
-            # bind them to the model only after attention compatibility has
-            # been established.
+            # A worker with a `CausalLM` owns the paged KV cache and its
+            # per-request block tables, sized by the layout's `KVCacheInfo`.
+            # The runner borrows both through `configure_inputs` below.
             if cache is not None:
                 assert text is not None
                 kv_cache = info.kv_cache
@@ -424,6 +470,7 @@ class Worker:
                         "KV model worker has no KV-cache configuration"
                     )
 
+                # Block-table width: the pages of the longest sequence.
                 max_blocks_per_row = max(
                     1,
                     ceil_div(
@@ -440,6 +487,8 @@ class Worker:
                     group_ranges.append((group_offset, int(group.num_blocks)))
                     group_offset += int(group.num_blocks)
 
+                # An FP8 cache passes each layer an FP8 `Quantizer` in place
+                # of a storage dtype.
                 encoded = kv_cache.dtype == "float8_e4m3fn"
                 self.kv_cache = KVCacheManager(
                     PrefixCache(
@@ -526,6 +575,9 @@ class Worker:
                     self.requests.storage.bank, self.latent_pool
                 )
 
+            # Storage sizing charged the latent pool's planned bytes
+            # (`LatentPoolPlan.capacity_bytes`), so the allocation must
+            # match that plan exactly.
             if (
                 self.latent_pool is not None
                 and self.latent_pool.persistent_bytes != arena.latent_pool_bytes
@@ -550,6 +602,11 @@ class Worker:
             self.device_events = EventPool()
             startup.callback(self.device_events.close)
 
+            # `max_words` bounds a batch's completion lease. Each call takes
+            # `SAMPLING_COMPLETION_FIELDS` (4) int64 words plus its payload
+            # bytes counted at 4 bytes per word; `_completion_words` in
+            # `uniserve_worker.execution.prepare` sizes each lease by the
+            # same rule, so the two change together.
             self.output_pool = OutputPool(
                 capacity=int(queue_depth) * int(info.max_batch_calls),
                 max_words=int(info.max_batch_calls)
@@ -558,6 +615,10 @@ class Worker:
             )
             startup.callback(self.output_pool.close)
 
+            # A rank that backs only the products it produces or consumes has
+            # a physical arena smaller than the engine's logical pool;
+            # `compact` then places bindings first-fit instead of at the
+            # scheduler's offsets.
             self.buffer_pool = BufferPool(
                 byte_capacity=int(layout.physical_buffer_pool_bytes),
                 devices=owner_devices,
@@ -581,7 +642,10 @@ class Worker:
 
             # A rank holding host components is one codec slot: its lane runs
             # one codec task at a time on one thread. Any other rank's host
-            # work is bounded by its arena.
+            # work is bounded by its arena. The lane's capacity must equal the
+            # `host_lane_capacity` advertised to the engine; the
+            # request-tensor layout in `build_worker_layout` applies the same
+            # rule, so the two change together.
             self.codec_slot = holds_host_components(
                 name for name, _ in components
             )
@@ -646,7 +710,9 @@ class Worker:
                     max_inflight=int(queue_depth),
                 )
 
-            # The muxer rank assembles artifacts on its lane.
+            # Only the muxer member that publishes the component's host
+            # products (`WorkerInfo.output_rank`) holds a `MediaMux`; it
+            # assembles each request's container on its host lane.
             muxer = self.runner.bindings.get(MUXER_COMPONENT)
             self.media_mux = (
                 MediaMux(rank=worker_config.rank)
@@ -659,6 +725,10 @@ class Worker:
                 startup.callback(self.media_mux.close)
 
         except BaseException as error:
+            # Releasing partially started owners could wait on device work
+            # or peers and replace this error with a stall, so keep them
+            # alive until process exit. The host lane and the runner take
+            # only their aborted releases, which do not wait.
             try:
                 from uniserve.runtime.resources import retain_until_exit
 
@@ -683,9 +753,11 @@ class Worker:
 
     @property
     def info(self) -> WorkerInfo:
-        """Expose immutable worker info.
+        """Return the immutable description this worker advertises.
 
-        Params, capacity, and model metadata advertised to the scheduler.
+        It carries the endpoint, supported calls, capacity bounds and model
+        metadata that `build_worker_layout` resolved for the engine. It
+        stays readable after `close`.
         """
         return self._layout.info
 
@@ -701,8 +773,20 @@ class Worker:
     def warmup(self) -> None:
         """Prepare numerical execution once without serving requests.
 
-        Successful warmup is retained for run(). The owner must exit the Worker
-        scope if startup fails, just as for a binding or service failure.
+        A numerical worker binds its graph storage budgets, warms and
+        captures its runners, and drives synthetic requests through
+        `warmup_requests`; a codec-slot rank checks that its media codecs
+        load. Startup is then sealed and resident storage is checked
+        against the device grants. Successful warmup is retained, so a later
+        call (including the one in `run`) returns immediately.
+
+        Errors from warmup, capture and the storage checks propagate. The
+        owner must exit the Worker scope if startup fails, just as for a
+        binding or service failure.
+
+        Raises:
+            RuntimeError: The worker is closed, a batch was already
+                submitted, or startup left a request resident.
         """
         self._require_open()
         if self._warmed_up:
@@ -713,10 +797,14 @@ class Worker:
             )
 
         if self.runner.numerical:
-            # KV sizing reserves a graph allowance before allocating pages.
-            # Media workers instead have fixed request banks: their graph
-            # share is the grant left after those banks and all lazy products,
-            # not the token worker's fraction of total device memory.
+            # Bind each CUDA device's graph budget before capture, which
+            # fails when graph residency exceeds it. The budget is the graph
+            # pools' current residency plus this process's remaining grant on
+            # the device, less the device's share of products not yet
+            # resident. A token worker's remaining grant includes the graph
+            # allowance that KV sizing held back; a media worker's graph
+            # share is what its fixed request banks and lazy products leave,
+            # not a fraction of total device memory.
             devices = tuple(
                 dict.fromkeys(
                     (
@@ -758,6 +846,12 @@ class Worker:
         # admission.
         if self.requests.request_ids():
             raise RuntimeError("startup completed with resident requests")
+
+        # Warmup batches advance the executor's batch id and collective
+        # sequence. The executor rejects a non-increasing batch id at
+        # admission and, on a multi-rank worker, a non-increasing collective
+        # sequence at launch, so reset both to accept the engine's first
+        # batch.
         self.executor._last_batch_id = -1
         self.executor._last_collective_seq = -1
         check_startup_storage(
@@ -811,7 +905,9 @@ class Worker:
             actions.append(self.profiler.close)
         actions.append(self.executor.close)
 
-        # Submitted jobs retain their mux sessions until host work has finished.
+        # Discarding mux sessions before the host lane drains is safe: a
+        # session held by a running lane task is closed when that task
+        # releases it (`MuxSession.discard`).
         if self.media_mux is not None:
             actions.append(self.media_mux.close)
         actions.append(self.host_tasks.close)
@@ -885,7 +981,13 @@ class Worker:
     ) -> None:
         """Register callbacks used to wake result polling.
 
-        Covers host and CUDA-stream callbacks.
+        ``wake`` is installed on the host lane, every transport and, on a KV
+        worker, the KV imports (`CacheImports`); they call it from their own
+        threads or callbacks as work completes.
+        ``wake_on_stream`` is installed on the device event pool, which calls
+        it with the handle of a CUDA stream that waits on a producer event.
+        `bind` registers the IPC endpoint's callbacks; passing ``None`` for
+        both unregisters them.
         """
         self._completion_wake = wake
         self.device_events.set_completion_wake(wake_on_stream)
@@ -898,7 +1000,16 @@ class Worker:
             self.kv_cache.imports.set_completion_wake(wake)
 
     def bind(self, endpoint: WorkerIpcEndpoint) -> Self:
-        """Borrow an open IPC endpoint for one synchronous service run."""
+        """Borrow an open IPC endpoint for one synchronous service run.
+
+        Also creates the profiler from the environment and registers the
+        endpoint's wake callbacks. `close` drops the endpoint without closing
+        it; its owner closes it.
+
+        Raises:
+            RuntimeError: The worker is closed or already bound.
+            ValueError: The endpoint is missing or closed.
+        """
         self._require_open()
         if self.service is not None:
             raise RuntimeError("worker already has a bound IPC endpoint")
@@ -911,7 +1022,12 @@ class Worker:
         return self
 
     def run(self) -> None:
-        """Warm up, then run the bound IPC service once in the caller thread."""
+        """Warm up, then run the bound IPC service once in the caller thread.
+
+        Raises:
+            RuntimeError: The worker is closed, has already run, or has no
+                bound endpoint.
+        """
         self._require_open()
         if self._run_started:
             raise RuntimeError("worker can only run once")
@@ -926,8 +1042,11 @@ class Worker:
     ) -> Submission:
         """Accept a batch and return its immutable, single-consumption handle.
 
-        Call advance to progress work and poll to consume the result. A full
+        Call advance to progress work and poll to consume the result. Batch
+        ids must strictly increase from one submission to the next. A full
         queue raises ResourceError without consuming the batch identity.
+        With ``propagate_errors``, a failure recorded during submission is
+        raised after the batch is released instead of at poll.
         """
         return self.executor.submit(batch, propagate_errors=propagate_errors)
 

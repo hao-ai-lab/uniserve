@@ -1,4 +1,21 @@
-"""Validated descriptions of tensor storage published between workers."""
+"""Validated descriptions of tensor storage published between workers.
+
+A producing rank publishes a tensor through one of the transports in
+`uniserve_worker.transport` and reports it as a `Locator`: the publishing
+`WorkerEndpoint`, the view's dtype, shape, and offset within the logical
+tensor, and a transport handle (`LocalTransfer`, `PosixShmTransfer`,
+`CudaVmmTransfer`, or `ChannelTransfer`) that a consumer opens. A
+`TensorTransfer` groups the shard and replica locators of one logical tensor;
+the `TransferValue` variants add product metadata to it, and `KvTransfer`
+carries a published KV extent.
+
+These records mirror the worker-ipc crate's `Locator`, `TensorTransfer`, and
+`KvTransfer`, whose validators the crate's codec runs whenever it encodes or
+decodes a batch or a batch result, so the two sides must change together.
+`Locator.to_mapping` writes, and `Locator.from_mapping` reads, a flattened
+form with a plain ``transport`` string beside the handle's fields; the PyO3
+extension decodes that form rather than the crate's serde representation.
+"""
 
 from __future__ import annotations
 
@@ -21,10 +38,15 @@ from uniserve_worker.protocol.validation import (
     _uints,
 )
 
+#: Upper bound on a transfer descriptor's estimated encoded size, in bytes. It
+#: equals the worker-ipc crate's `MAX_TRANSFER_HANDLE_BYTES`, which the crate's
+#: validators enforce on their own estimate of the same descriptor.
 MAX_TRANSFER_HANDLE_BYTES = 64 * 1024
 
-#: Bytes of a CUDA process descriptor handle, which names an allocation only
-#: within the host that exported it.
+#: Bytes of a POSIX file-descriptor allocation handle. It names an open file of
+#: the exporting process, so a consumer on the same host receives a usable
+#: descriptor through `uniserve_worker.transport.descriptor_grants`, and no
+#: other host can import it.
 DESCRIPTOR_HANDLE_BYTES = 4
 #: Bytes of a CUDA fabric handle, which another host can import.
 FABRIC_HANDLE_BYTES = 64
@@ -32,12 +54,13 @@ FABRIC_HANDLE_BYTES = 64
 
 @dataclass(frozen=True, slots=True)
 class WorkerEndpoint:
-    """A rank incarnation and its actual host address space.
+    """A rank incarnation and the host address space it runs in.
 
-    Worker and rank names survive restarts. Incarnation identifies this
-    loaded rank; address_space identifies its process, independently of
-    Worker grouping. Backend publication addresses and storage generations
-    remain in Locator.
+    `worker_id` and `rank` name the logical position and survive a restart;
+    `incarnation` is fresh for every loaded rank. `address_space` identifies
+    the process, independently of how many Worker instances it hosts, and
+    `node` is the host name. Publication addresses belong to each
+    `Locator`'s transport handle, not to the endpoint.
     """
 
     worker_id: str
@@ -59,9 +82,10 @@ class WorkerEndpoint:
 
     @classmethod
     def local(cls, worker_id: str = "worker", rank: int = 0) -> WorkerEndpoint:
-        """Identify a new rank in this process.
+        """Identify a new rank incarnation in this process.
 
-        Applies after a process fork as well.
+        The address space is the current process's, including in a child
+        created by fork, because `_identify_address_space` reruns after fork.
         """
         import socket
 
@@ -130,9 +154,11 @@ class LocalTransfer:
 
 @dataclass(frozen=True, slots=True)
 class PosixShmTransfer:
-    """Identifies shared-storage storage.
+    """Identifies a POSIX shared-memory segment by name.
 
-    Also identifies the endpoint that grants ready reads.
+    `endpoint` names the producer's publication table (`Publications.name` in
+    `uniserve_worker.transport.endpoint`), which refuses a release carrying
+    another table's name. Readiness travels in the segment header.
     """
 
     endpoint: str
@@ -148,11 +174,20 @@ class PosixShmTransfer:
 
 @dataclass(frozen=True, slots=True)
 class CudaVmmTransfer:
-    """Identify an immutable CUDA allocation and its reader-lease endpoint.
+    """Identify an immutable CUDA allocation and the spans of one view in it.
 
-    Byte offsets locate ordered first-axis spans sharing the tensor strides.
-    Lengths and counts encode consecutive runs of equally sized spans, keeping
-    page maps compact without changing logical coverage or physical ownership.
+    `storage_offsets_bytes` gives, in order, the byte offset of each
+    first-axis span of the view within the exported allocation, which is
+    `storage_size_bytes` long. Every span shares `tensor_stride`, in elements
+    with one entry per axis. `span_lengths` and `span_counts` run-length
+    encode the spans' first-axis lengths: ``span_counts[i]`` consecutive spans
+    each hold ``span_lengths[i]`` rows, keeping page maps compact without
+    changing logical coverage. `Locator.__post_init__` checks that the
+    expanded lengths sum to the view's first extent.
+
+    `endpoint` names the producer's publication table and, for a descriptor
+    handle, its grant socket. `publication_id` is 32 characters (the producer
+    uses ``uuid.uuid4().hex``) and keys that grant.
     """
 
     endpoint: str
@@ -166,12 +201,14 @@ class CudaVmmTransfer:
     # The producing rank's shareable allocation handle, of the type its device
     # was probed for. A fabric handle is importable from another host, so it
     # travels with the publication rather than through a descriptor grant that
-    # only reaches this one.
+    # only reaches this one. A descriptor travels only so a consumer can tell
+    # which kind it is; the usable one comes from the grant.
     allocation_handle: bytes = b""
     # Byte offset of this publication's acknowledgment header inside the
     # exported allocation. A consumer writes its own slot's word there once its
     # reads retire, which retires the chunk without a host-local connection.
-    # Negative when the publication carries no header.
+    # Negative when the publication carries no header, which is the case for
+    # storage exported where it lies rather than copied into the device pool.
     acknowledgment_offset: int = -1
 
     def __post_init__(self) -> None:
@@ -190,11 +227,12 @@ class CudaVmmTransfer:
             )
             or any(length < 1 for length in self.span_lengths)
             or any(stride < 0 for stride in self.tensor_stride)
-            # A publication read only from this host carries the event its
-            # consumers wait on. One read from another host carries no fence,
-            # because none would reach there; its producer drained its stream
-            # before publishing instead. Any other length is not a handle a
-            # consumer could import.
+            # A 64-byte CUDA IPC event handle fences the publication for
+            # consumers on the producer's host. A producing rank with any
+            # consumer on another host publishes no fence, because an event
+            # handle does not reach there; it synchronizes its stream before
+            # publishing instead. Any other length is not a handle a consumer
+            # could import.
             or len(self.ready_event_handle) not in (0, 64)
             # A fabric handle is 64 bytes and a process descriptor is 4; any
             # other length is not a handle this rank can import.
@@ -230,9 +268,15 @@ TransferTransport: TypeAlias = (
 
 @dataclass(frozen=True, slots=True)
 class Locator:
-    """Describes a typed tensor view and its transport-specific handle.
+    """One physical shard or replica of a logical tensor.
 
-    The handle owns the view's storage.
+    `shape` and `offset` place this view as a box inside the owning
+    `TensorTransfer`'s logical shape, in elements with one entry per axis;
+    `nbytes` is the view's size and `dtype` its element type name.
+    `transport` is the handle a consumer opens and `source` the publishing
+    rank. Except for a `ChannelTransfer`, whose payload is the bytes, the
+    publishing rank's transport keeps the storage until the publication
+    retires after the engine releases it.
     """
 
     source: WorkerEndpoint
@@ -245,7 +289,12 @@ class Locator:
 
     @property
     def backend(self) -> str:
-        """Return the mechanism that owns this physical publication."""
+        """Return the name of the transport that owns this publication.
+
+        The names are the `WorkerInfo.transfer_backends` vocabulary and key a
+        rank's transport table. A `PosixShmTransfer` is ``"shm"`` here but
+        ``"posix_shm"`` in the wire mapping.
+        """
         if isinstance(self.transport, LocalTransfer):
             return "local"
         if isinstance(self.transport, PosixShmTransfer):
@@ -257,9 +306,10 @@ class Locator:
         raise invalid_descriptor("tensor locator names an unknown transport")
 
     def __post_init__(self) -> None:
-        """Validate tensor shape and handle kind.
+        """Validate the view's bounds and, for CUDA VMM, its span layout.
 
-        Ensures the handle matches its transport kind.
+        Placement inside the logical tensor is checked by
+        `TensorTransfer.__post_init__`, which sees the logical shape.
         """
         if (
             self.nbytes < 1
@@ -293,10 +343,11 @@ class Locator:
     def from_mapping(
         cls, value: object, where: str = "transfer locator"
     ) -> Locator:
-        """Parse a tensor locator and validate it.
+        """Parse a locator from the flattened mapping `to_mapping` writes.
 
-        Validation covers the transport handle, shape, dtype, and byte
-        bounds.
+        The ``transport`` key selects the handle type (``local``,
+        ``channel``, ``posix_shm``, or ``cuda_vmm``), and the handle's fields
+        sit beside it. Each constructed record validates itself.
         """
         data = _map(value, where)
         kind = _str(data.get("transport"), f"{where}.transport")
@@ -370,10 +421,7 @@ class Locator:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode the tensor shape and transport-specific handle.
-
-        Produces a wire mapping.
-        """
+        """Encode the view and its handle as one flattened wire mapping."""
         output: dict[str, object] = {
             "source": self.source.to_mapping(),
             "nbytes": self.nbytes,
@@ -475,10 +523,12 @@ class TensorTransfer:
 
     @property
     def dtype(self) -> str:
+        """Element type name, shared by every location."""
         return self.locations[0].dtype
 
     @property
     def nbytes(self) -> int:
+        """Bytes of the whole logical tensor, not of any one location."""
         first = self.locations[0]
         return math.prod(self.shape) * (first.nbytes // math.prod(first.shape))
 
@@ -506,9 +556,11 @@ class TensorTransfer:
 
 @dataclass(frozen=True, slots=True)
 class EncoderTransferValue:
-    """Describes the media shape and payload encoding.
+    """Encoder features published for another stage.
 
-    Also describes the transferred encoder features.
+    `height` and `width` are the source image's size in pixels.
+    `payload_kind` is ``"vision_feature"`` or ``"latent_feature"``, the wire
+    names of the worker-ipc crate's `FeatureKind`.
     """
 
     height: int
@@ -519,9 +571,11 @@ class EncoderTransferValue:
 
 @dataclass(frozen=True, slots=True)
 class DeviceProductTransferValue:
-    """Describes the media shape and numeric range.
+    """A device-resident product used by another model stage.
 
-    Also describes the transferred device product.
+    `height` and `width` are in pixels, or zero for a non-image tensor.
+    `value_range` names the semantic numeric range of the values and may be
+    empty.
     """
 
     height: int
@@ -532,9 +586,25 @@ class DeviceProductTransferValue:
 
 @dataclass(frozen=True, slots=True)
 class KvTransfer:
-    """Describes a versioned KV extent and its page locators.
+    """A published KV extent and the physical tensors that install its suffix.
 
-    Also describes the source-to-destination buffer relation.
+    The publication is incremental: the destination already holds `base`,
+    when set, up to `base_extent` tokens, and `tensors` carry only the tokens
+    in ``[base_extent, published_extent)``. With ``T`` those suffix tokens:
+
+    - keys and values are ``[T, layers, kv heads, head dim]`` with one dtype
+      shared by both;
+    - with ``float8_e4m3fn`` storage only, a third ``float32`` scale tensor is
+      ``[pages, 2, layers, head groups]``, where ``pages`` counts the source
+      pages of `page_size` tokens the suffix touches, the second axis selects
+      K or V, and the kv-head count is a multiple of ``head groups``.
+
+    An unchanged extent carries no tensors. `compute_dtype` is the precision
+    used when reading quantized source pages. `__post_init__` does not check
+    the descriptor size bound; the output commit in
+    `uniserve_worker.execution.commit` and `Batch.validate` run
+    `encoded_size_bound`. The worker-ipc crate's `KvTransfer::validate`
+    checks the same relations and the size bound in the crate's codec.
     """
 
     tensors: tuple[TensorTransfer, ...]
@@ -548,10 +618,7 @@ class KvTransfer:
     page_size: int
 
     def __post_init__(self) -> None:
-        """Validate the exact KV source.
-
-        Also validates the installed base and represented extent.
-        """
+        """Validate the extent, base identity, dtypes, and tensor layout."""
         if (
             not self.destination
             or self.base_extent < 0
@@ -615,8 +682,10 @@ class KvTransfer:
 
         if quantized:
             scales = self.tensors[2]
-            # Pages cover the unaligned base tail plus the suffix, and scales
-            # are [pages, K/V, layers, head groups] per source page.
+            # Scale rows cover whole source pages, from the page holding
+            # base_extent through the page holding the last suffix token, so
+            # tokens already installed on a partially filled boundary page
+            # count toward the page total.
             pages = (
                 self.base_extent % self.page_size + suffix + self.page_size - 1
             ) // self.page_size
@@ -648,7 +717,11 @@ class KvTransfer:
     def from_mapping(
         cls, value: object, where: str = "kv_transfer"
     ) -> KvTransfer:
-        """Decode source identity and physical cache representation."""
+        """Decode source identity and physical cache representation.
+
+        Absent ``base_extent``, ``published_extent``, and ``group_id`` decode
+        as zero.
+        """
         data = _map(value, where)
         raw_base = data.get("base")
         return cls(
@@ -696,7 +769,17 @@ class KvTransfer:
         }
 
     def encoded_size_bound(self) -> int:
-        """Bound all page and scale locators and publication metadata."""
+        """Return the estimated descriptor size, enforcing the handle bound.
+
+        The estimate covers every page and scale locator plus the publication
+        metadata, and parallels the worker-ipc crate's
+        `KvTransfer::encoded_size_bound`.
+
+        Raises:
+            WorkerError: `invalid_descriptor` when the estimate exceeds
+                `MAX_TRANSFER_HANDLE_BYTES` or a locator names an unknown
+                transport.
+        """
         size = (
             _tensor_transfers_size(self.tensors)
             + len(self.destination.encode())
@@ -711,9 +794,11 @@ class KvTransfer:
 
 @dataclass(frozen=True, slots=True)
 class LatentTransferValue:
-    """Describes transferred latent storage.
+    """A diffusion trajectory tensor published for another stage.
 
-    Carries a denoising step and media shape.
+    `height` and `width` are the output image's size in pixels,
+    `latent_units` the logical latent allocation units, and `step` the
+    denoising step the tensor represents.
     """
 
     height: int
@@ -733,7 +818,11 @@ def _tensor_transfers_size(tensors: tuple[TensorTransfer, ...]) -> int:
 
     The integer constants are conservative per-record overheads (field names,
     tags, lengths), not exact wire sizes; only string and list lengths are
-    measured from the values themselves.
+    measured from the values themselves. The estimate parallels the
+    worker-ipc crate's `transfer_encoded_size`, which the crate's validators
+    check against the same bound when the codec encodes or decodes a batch
+    or a batch result; an estimate here below the crate's lets the worker
+    commit a descriptor that the codec then rejects.
     """
     locators = tuple(
         location for tensor in tensors for location in tensor.locations

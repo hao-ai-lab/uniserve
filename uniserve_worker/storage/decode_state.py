@@ -1,4 +1,21 @@
-"""Fixed device continuation tensors indexed by scheduler request slot."""
+"""Fixed device continuation tensors indexed by scheduler request slot.
+
+``DecodeState`` keeps, per request-pool slot, the device-resident
+continuation state of token calls: the next input token and its
+continuation predicate, the logical position, the sampling counter that
+mirrors the request's ``rng_counter``, committed penalty counts, and, when
+prompt scoring is requested, the last prompt logits of a prefill chunk.
+Execution stages the values on each ``PendingOutput`` and
+``commit._commit_runtime_states`` applies them when the batch commits; the
+executor resets a slot's rows when a request is admitted to it and when the
+request's storage is released. Input staging (``TokenBuffers``) reads next
+tokens and logical lengths by slot, and token sampling reads the committed
+penalty counts.
+
+The verified KV length column is borrowed: the worker passes
+``BlockTables.verified_lengths`` as ``valid_cache_lengths``, so batched
+decode advances the same tensor the block tables expose.
+"""
 
 from __future__ import annotations
 
@@ -29,9 +46,29 @@ class DecodeState:
         logits_dtype: torch.dtype = torch.float32,
         valid_cache_lengths: torch.Tensor | None = None,
     ) -> None:
-        """Allocate request-indexed continuation tensors and prewarm update.
+        """Allocate request-indexed continuation tensors.
 
-        kernels.
+        On a CUDA device where Triton kernels are launchable, both update
+        kernels are launched once here, on the sentinel row and with an empty
+        batch, so later launches reuse their compiled form.
+
+        Args:
+            request_pool_size: Number of real request slots; tensors get one
+                extra leading row for the slot ``0`` sentinel.
+            vocab_size: Width of the penalty-count and prompt-logit rows.
+            continuation_width: Token slots per row in
+                ``future_input_tokens``. Token publication writes only column
+                ``0``; a reset fills the whole row.
+            device: Device of every tensor.
+            logits_dtype: Floating dtype of ``prompt_logits``.
+            valid_cache_lengths: Optional borrowed ``int32`` column of shape
+                ``[request_pool_size + 1]`` on ``device``; a zeroed column is
+                allocated when absent.
+
+        Raises:
+            ValueError: When a dimension is not positive, ``logits_dtype`` is
+                not floating point, or ``valid_cache_lengths`` has another
+                shape, dtype or device.
         """
         if request_pool_size < 1 or vocab_size < 1 or continuation_width < 1:
             raise ValueError("runtime-state dimensions must be positive")
@@ -71,6 +108,11 @@ class DecodeState:
         tensors = TensorBuffers.allocate(
             buffer_configs, device=self.device
         ).view(buffer_configs)
+
+        # Initial values match what a row reset with omitted columns writes:
+        # continuation tokens are 1, and counts, predicates and coordinates
+        # are 0. ``prompt_logits`` stays uninitialized until prompt scoring
+        # of a prefill publishes into its row.
         for name, value in {
             "logical_lengths": 0,
             "sampling_positions": 0,
@@ -92,7 +134,8 @@ class DecodeState:
         self._ones_int64 = tensors["_ones_int64"]
 
         # Prepare the same capacity-bounded kernel used by live publications.
-        # A zero count leaves all request rows unchanged.
+        # A zero count leaves all request rows unchanged, and the row reset
+        # rewrites the sentinel with its initial values.
         if (
             kernels.triton is not None
             and self.device.type == "cuda"
@@ -123,7 +166,17 @@ class DecodeState:
         continuation_width: int,
         logits_dtype: torch.dtype,
     ) -> dict[str, BufferConfig]:
-        """Describe continuation storage; its owner tracks verified lengths."""
+        """Describe the tensors this state allocates, keyed by attribute name.
+
+        ``valid_cache_lengths`` is not included: ``__init__`` either borrows
+        it from its owner or allocates it separately. Startup sizing
+        (``bootstrap.report``) calls this without an instance and counts the
+        verified-length column under ``BlockTables.buffers``.
+
+        Raises:
+            ValueError: When a dimension is not positive or ``logits_dtype``
+                is not floating point.
+        """
         if min(request_pool_size, vocab_size, continuation_width) < 1:
             raise ValueError("runtime-state dimensions must be positive")
         if not logits_dtype.is_floating_point:
@@ -131,6 +184,9 @@ class DecodeState:
                 "runtime prompt-logit dtype must be floating point"
             )
         rows = request_pool_size + 1
+        # Request-indexed tensors have ``rows`` leading rows; the unit
+        # increments used by the non-Triton decode advance are sized to the
+        # largest batch, one entry per real slot.
         return {
             "logical_lengths": BufferConfig((rows,), torch.int32),
             "sampling_positions": BufferConfig((rows,), torch.int64),
@@ -152,12 +208,24 @@ class DecodeState:
         logical_lengths: torch.Tensor | Sequence[int] | None = None,
         sampling_positions: torch.Tensor | Sequence[int] | None = None,
     ) -> None:
-        """Initialize selected request rows with validated cache length.
+        """Reinitialize selected request rows.
 
-        and sampling state.
+        Continuation tokens become 1, penalty counts and predicates are
+        cleared, and the cache length, logical length and sampling position
+        take the supplied per-row values, or 0 when a column is omitted.
+
+        Raises:
+            ValueError: When an index is outside ``1..request_pool_size`` or
+                repeated, or a supplied column does not have one value per
+                index. Device-tensor indices are not checked on the host;
+                on a CUDA state ``torch._assert_async`` checks them and fails
+                asynchronously on the device.
         """
-        # Host fast path: fully CPU-resident columns reset their rows directly,
-        # without building device index tensors.
+        # Host fast path: with host indices and host columns on a CUDA device,
+        # each row is reset directly (one fused launch per row when Triton is
+        # launchable) without building device index tensors. A device column
+        # makes ``_host_reset_column`` return None and falls through to the
+        # indexed path.
         if (
             not isinstance(request_pool_indices, torch.Tensor)
             and self.device.type == "cuda"
@@ -192,17 +260,22 @@ class DecodeState:
         self._copy_or_zero(self.sampling_positions, indices, sampling_positions)
 
     def set_cache_length(self, slot: int, length: int | torch.Tensor) -> None:
-        """Update the borrowed verified-KV column in execution submission.
+        """Set one slot's verified KV length.
 
-        order.
+        The write is enqueued on the current stream, so it is ordered with
+        the execution work submitted around it. A tensor ``length``
+        contributes its first element through a tensor copy, so a device
+        value is never synchronized to the host.
         """
         self._validate_host_indices((slot,))
         self._copy_scalar(self.valid_cache_lengths[slot : slot + 1], length)
 
     def set_prompt_logits(self, slot: int, logits: torch.Tensor) -> None:
-        """Publish prompt logits into stable request storage before successors.
+        """Copy one slot's last prompt logits into its ``prompt_logits`` row.
 
-        use it.
+        Prompt scoring of the request's next prefill chunk
+        (``token.prompt_logprob_details``) reads this row to score that
+        chunk's first token.
         """
         self._validate_host_indices((slot,))
         self.prompt_logits[slot].copy_(
@@ -222,12 +295,37 @@ class DecodeState:
         logical_position: int | torch.Tensor | None = None,
         sampling_position: int | torch.Tensor | None = None,
     ) -> None:
-        """Commit selected tokens, continuation coordinates.
+        """Commit selected tokens, continuation coordinates and penalty counts.
 
-        and occurrence counts. Batched decode advances the existing
-        device coordinates by one. Prefill and verification supply
-        their actual coordinates for a single slot.
-        The token's high continuation bit is never stored as a token ID.
+        With ``device_slots``, a batched decode advances the logical length,
+        sampling position and verified cache length of every slot by one.
+        Without it, prefill and verification supply their actual logical and
+        sampling coordinates for exactly one slot; their cache length is set
+        separately through ``set_cache_length``. The continuation bit
+        (``TOKEN_CONTINUATION_BIT``) is never stored as part of a token ID.
+
+        Args:
+            slots: Host request slots, one per sampled row.
+            tokens: Selected token per row.
+            predicates: Continuation predicate per row.
+            valid: Per-row validity; with ``active``, gates penalty counting.
+            active: Per-row activity.
+            penalty_bases: Per row, the ``penalty_counts`` row to accumulate
+                into, or None to skip counting for that row (for example,
+                a request without penalties).
+            device_slots: ``slots`` as an ``int64`` tensor on this state's
+                device; selects the batched decode path.
+            logical_position: Explicit logical length for the single slot.
+            sampling_position: Explicit sampling position for the single
+                slot.
+
+        Raises:
+            ValueError: When slots are out of range or repeated,
+                ``penalty_bases`` (or, with ``device_slots``, ``tokens`` and
+                ``predicates``) do not align with ``slots``, ``device_slots``
+                is not an aligned ``int64`` tensor on this device, or the
+                arguments form neither one non-empty batched decode nor one
+                complete explicit row.
         """
         indices = tuple(int(slot) for slot in slots)
         self._validate_host_indices(indices)
@@ -272,6 +370,7 @@ class DecodeState:
                 self.sampling_positions[slot : slot + 1], sampling_position
             )
             penalty_tokens = future_token
+
         # Occurrence counts grow only for tokens that are valid and active.
         for index, counts in enumerate(penalty_bases):
             if counts is None:
@@ -303,9 +402,11 @@ class DecodeState:
         tokens: torch.Tensor,
         predicates: torch.Tensor,
     ) -> None:
-        """Commit device-selected decode transitions into request-indexed.
+        """Commit device-selected decode transitions for several slots.
 
-        continuation tensors.
+        Each slot's first continuation token and predicate are replaced and
+        its logical length, sampling position and verified cache length grow
+        by one.
         """
         host = tuple(int(value) for value in request_pool_indices)
         self._validate_host_indices(host)
@@ -349,7 +450,8 @@ class DecodeState:
             )
             return
 
-        # Fallback without Triton: the same scatter updates via index ops.
+        # Fallback without launchable Triton: the same scatter updates via
+        # index ops, using the preallocated unit increments.
         self.future_input_tokens[:, 0].index_copy_(
             0,
             indices,
@@ -365,9 +467,12 @@ class DecodeState:
         self.valid_cache_lengths.index_add_(0, indices, ones_i32)
 
     def _indices(self, values: torch.Tensor | Sequence[int]) -> torch.Tensor:
-        """Normalize host or device row indices onto the runtime-state.
+        """Normalize host or device row indices onto the runtime-state device.
 
-        device.
+        Host sequences and CPU tensors are validated synchronously. On a
+        CUDA state device, tensor indices are also checked with
+        ``torch._assert_async``, which reports a violation as a device
+        assertion instead of raising here.
         """
         if isinstance(values, torch.Tensor):
             source = values.reshape(-1)
@@ -397,10 +502,7 @@ class DecodeState:
         return torch.tensor(host, dtype=torch.long, device=self.device)
 
     def _validate_host_indices(self, values: tuple[int, ...]) -> None:
-        """Validate host reset indices are unique and within runtime row.
-
-        bounds.
-        """
+        """Require unique host indices within ``1..request_pool_size``."""
         if any(value < 1 or value > self.request_pool_size for value in values):
             raise ValueError(
                 "request-pool index is outside runtime-state capacity"
@@ -415,9 +517,13 @@ class DecodeState:
         values: torch.Tensor | Sequence[int] | None,
         count: int,
     ) -> tuple[int, ...] | None:
-        """Normalize an optional host reset column to the requested row.
+        """Normalize an optional host reset column to ``count`` integers.
 
-        count.
+        Returns zeros for an omitted column and None for a device tensor,
+        which the caller handles on the indexed path.
+
+        Raises:
+            ValueError: When the column does not hold ``count`` values.
         """
         if values is None:
             return (0,) * count
@@ -440,11 +546,9 @@ class DecodeState:
         logical_length: int,
         sampling_position: int,
     ) -> None:
-        """Reset one device row through the fused kernel or tensor fallback.
-
-        path.
-        """
+        """Reset one device row through the fused kernel or tensor fallback."""
         if kernels.triton is not None and launchable(self.device):
+            # One program per block of the wider of the two row-wide spans.
             block_size = 256
             span = max(self.continuation_width, self.vocab_size)
             kernels._reset_row_kernel[(kernels.triton.cdiv(span, block_size),)](
@@ -477,9 +581,10 @@ class DecodeState:
         indices: torch.Tensor,
         values: torch.Tensor | Sequence[int] | None,
     ) -> None:
-        """Scatter supplied values into indexed rows or clear those rows when.
+        """Scatter supplied values into indexed rows, or zero them if absent.
 
-        absent.
+        Raises:
+            ValueError: When ``values`` does not hold one value per index.
         """
         if values is None:
             target.index_fill_(0, indices, 0)

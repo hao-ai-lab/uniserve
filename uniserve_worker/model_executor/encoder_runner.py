@@ -25,7 +25,21 @@ class EncoderRunner(ModelRunner):
 
     @torch.inference_mode()
     def prepare_tokens(self, tokens, *, capacity):
-        """Copy a flat token sequence while retaining its host source fence."""
+        """Copy a flat token sequence into the runner's device token buffer.
+
+        The first call allocates a ``capacity``-long int64 device buffer and a
+        two-deep ring of host sources; later calls reuse both, so every call
+        must pass the same ``capacity``. The copy is issued on the
+        current stream and, on CUDA, fenced so its host source is not
+        refilled before the copy completes.
+
+        Returns:
+            A [1, len(tokens)] view of the device buffer, which the next call
+            overwrites.
+
+        Raises:
+            InputError: If ``tokens`` is empty or longer than ``capacity``.
+        """
         if not 1 <= len(tokens) <= capacity:
             raise InputError("text encoder input exceeds its token capacity")
         if self._tokens is None or self._host is None:

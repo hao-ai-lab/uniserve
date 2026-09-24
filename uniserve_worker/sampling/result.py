@@ -1,6 +1,13 @@
-"""Numerical sampling inputs and GPU output views shared by eager and graph.
+"""Device output views of worker token sampling.
 
-execution.
+``SamplerOutput`` holds one sampled batch's selections, produced either by
+``uniserve_worker.sampling.sampler`` or by graph-replayed greedy decode in
+``uniserve_worker.model_executor.graph_inputs``. ``SamplerRow`` addresses one
+call within it. Output capture (``uniserve_worker.execution.output``) copies
+a batch's shared ``completion`` and ``logprobs`` columns once; commit
+(``uniserve_worker.execution.commit``) and ``uniserve_worker.execution.token``
+gather per-call columns through ``sample_columns`` without splitting them per
+row.
 """
 
 from __future__ import annotations
@@ -11,11 +18,16 @@ from typing import Literal, TypeAlias
 
 import torch
 
-# Completion storage packs four columns per row: valid, active, token, accepted.
+# The completion column packs four field sections, each one row per call:
+# [valid | active | token | accepted] (``sampling_columns`` in
+# ``uniserve_worker.sampling.sampler``). ``_SAMPLING_FIELDS_PER_CALL`` in
+# ``uniserve_worker.execution.output`` must equal this value.
 SAMPLING_COMPLETION_FIELDS = 4
 
 # Tagged token relays set bit 31 to flag continuation; the low 31 bits carry
-# the token id, which bounds the vocabulary usable by device-side decisions.
+# the token id, which bounds the vocabulary usable by device-side decisions
+# (``sample`` rejects a larger vocabulary). Relay values are non-negative
+# int64, so ``value >= TOKEN_CONTINUATION_BIT`` tests the flag.
 TOKEN_CONTINUATION_BIT = 1 << 31
 TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
 
@@ -34,13 +46,30 @@ LogprobValues: TypeAlias = tuple[
 
 @dataclass(frozen=True, slots=True)
 class SamplerOutput:
-    """Numerical selections with shared completion storage and optional logprob.
-
-    columns.
+    """Numerical selections with shared completion storage and logprobs.
 
     Row selections retain this complete batch so device and host publication
     can consume its columns without splitting and reconstructing tensor views.
     No request state, storage owner, or host completion is carried here.
+
+    Attributes:
+        tokens: Selected token id per call.
+        valid: Whether each call's filtered distribution was usable; under
+            speculation, whether every consumed candidate row was.
+        active: Each call's resolved device predicate.
+        finish: Whether each call finishes; false for an invalid or
+            inactive call.
+        continuation: ``valid & active & ~finish`` per call.
+        tagged_tokens: ``tokens`` with ``TOKEN_CONTINUATION_BIT`` set where
+            ``continuation`` holds; the int64 value relayed to dependents.
+        completion: The packed ``SAMPLING_COMPLETION_FIELDS`` column.
+        accepted_draft_count: Accepted draft tokens per call.
+        accepted_token_count: Tokens the call emits: accepted drafts plus a
+            correction or bonus token unless an accepted draft finished it.
+            Both counts are set only by the general sampler path, the one
+            that handles speculative verification.
+        logprobs: Packed logprob column and layout for the calls that
+            request logprobs, or None when none do.
     """
 
     tokens: torch.Tensor
@@ -61,18 +90,20 @@ class SamplerOutput:
         request_pool_index: torch.Tensor | None = None,
         transition: torch.Tensor | None = None,
     ) -> SamplerRow:
-        """Associate one selection with its input slot and optional transition.
+        """Associate one selection with its request slot and transition.
 
-        payload.
+        Raises:
+            IndexError: ``index`` is outside the batch.
         """
         if not 0 <= index < self.tokens.numel():
             raise IndexError("sampling row is outside the batch")
         return SamplerRow(self, index, request_pool_index, transition)
 
     def clone(self) -> SamplerOutput:
-        """Copy numerical outputs before reusable graph storage is.
+        """Copy numerical outputs out of reusable graph storage.
 
-        overwritten.
+        Tensors are detached and cloned so a later replay that overwrites the
+        borrowed storage does not change this output.
         """
 
         def copy(value: torch.Tensor | None) -> torch.Tensor | None:
@@ -144,17 +175,21 @@ SampleColumn = Literal[
 def sample_columns(
     rows: Sequence[SamplerRow], names: tuple[SampleColumn, ...]
 ) -> tuple[torch.Tensor, ...]:
-    """Read aligned columns in call order.
-
-    retaining contiguous batch spans.
+    """Read aligned columns in call order, retaining contiguous batch spans.
 
     A batch may select reordered rows or combine independent sampling
     batches. Only those discontinuities require concatenation; no
     storage-address inspection or per-row tensor construction is needed for a
-    contiguous span.
+    contiguous span, and a span covering a whole batch uses that batch's
+    column tensor without slicing.
+
+    Raises:
+        ValueError: ``rows`` is empty.
     """
     if not rows:
         raise ValueError("sampling columns require at least one row")
+
+    # Coalesce consecutive rows of one batch into [start, end) spans.
     spans: list[tuple[SamplerOutput, int, int]] = []
     batch = rows[0].batch
     start = rows[0].index

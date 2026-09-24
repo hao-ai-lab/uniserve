@@ -1,4 +1,23 @@
-"""Scheduler-to-worker execution records and their validation."""
+"""Scheduler-to-worker execution records and their validation.
+
+A `Batch` is one numerical call on one component together with everything a
+rank needs to run it: the per-request `Call` descriptors, the lifecycle
+commands (`Start`, `Finish`, `Free`) applied with it, the KV page tables and
+latent, decode, and persistent-buffer allocations the scheduler chose, and
+host-supplied input tensors (`TensorPublication`). The records mirror the
+Rust `Batch` in `uniserve_worker_ipc`, whose `Batch::validate` is the
+authoritative check; `Batch.validate` here re-implements part of it.
+
+Records reach Python on two paths. The PyO3 transport (`crates/worker-ipc-py`)
+decodes and validates a frame in Rust, builds each member record through its
+constructor, and assembles the `Batch` with
+`construction.batch_from_validated`, which skips `Batch.validate`. It calls
+`BlockTable`, `CachePageAllocation`, `Start`, `Finish`, and `Free`
+positionally, so their field order is part of that contract, and the other
+records by keyword, so their field names are. Python callers build a `Batch`
+through its constructor or `Batch.from_mapping`, both of which run
+`Batch.validate`.
+"""
 
 from __future__ import annotations
 
@@ -46,11 +65,14 @@ class Start:
 
 @dataclass(frozen=True, slots=True)
 class Finish:
-    """Close a lineage while preserving retained persistent allocations.
+    """Closes one request epoch, keeping the buffers it names as retained.
 
-    The retained allocations are explicit. Retained buffers are owned outside
-    the request and remain readable until Free; request slots, KV state, and
-    unretained products retire after readers finish.
+    The worker retires the request's state and storage and revokes its
+    unretained exports once their readers finish (`Executor` handles this
+    in ``_release_commands`` and ``_retire_commands``). Each buffer in
+    ``retained_buffers`` stays readable until a `Free` command names it.
+    `__post_init__` requires every retained buffer to be owned by
+    ``request_key`` and listed once.
     """
 
     request_key: identity.RequestKey
@@ -63,6 +85,7 @@ class Finish:
 def _validate_retained_buffers(
     request: identity.RequestKey, retained: tuple[identity.BufferId, ...]
 ) -> None:
+    """Require each retained buffer to be owned by ``request``, listed once."""
     if any(buffer.owner != request for buffer in retained):
         raise invalid_descriptor("retained buffer belongs to another request")
     if len(set(retained)) != len(retained):
@@ -85,7 +108,11 @@ BatchCommand: TypeAlias = Start | Finish | Free
 
 
 def _command_variant_index(command: BatchCommand) -> int:
-    """Return the stable wire-union variant index for a lifecycle command."""
+    """Return the variant discriminant used in a command's identity.
+
+    `Batch.validate` keys repeated-command detection on it. The values match
+    the Rust `BatchCommand::variant_index`.
+    """
     if isinstance(command, Start):
         return 0
     if isinstance(command, Finish):
@@ -97,7 +124,13 @@ def command_from_mapping(
     value: object,
     where: str = "batch command",
 ) -> BatchCommand:
-    """Parse a tagged start, finish, or free lifecycle command."""
+    """Parse a ``{"kind": ..., "value": ...}`` lifecycle command.
+
+    Raises:
+        WorkerError: From `invalid_descriptor` when the value is not a
+            tagged mapping, its kind is not ``start``, ``finish``, or
+            ``free``, or its payload is invalid.
+    """
     kind, payload = _tagged(value, where)
     data = _map(payload, f"{where}.value")
     if kind == "start":
@@ -154,23 +187,27 @@ def command_to_mapping(command: BatchCommand) -> dict[str, object]:
 
 @dataclass(frozen=True, slots=True)
 class GenerationParams:
-    """Sampling policy and token controls for autoregressive execution."""
+    """Sampling policy and token controls for autoregressive execution.
+
+    Serialized under the ``ar`` key of a `NewRequest` mapping.
+    """
 
     sampling: sampling.SamplingParams = field(
         default_factory=sampling.SamplingParams
     )
-    # Tokens suppressed from generation.
+    # Tokenized negative prompt, used as negative-conditioning input.
     negative_token_ids: tuple[int, ...] = ()
     # Stop tokens; must be strictly ascending (canonical form, no duplicates).
     finish_token_ids: tuple[int, ...] = ()
-    # Accepted prefix length at admission (tokens already computed, e.g.
-    # cache reuse).
+    # Prompt tokens already computed at admission; the engine sets it from a
+    # prefix-cache hit, and `RequestPool.start` begins the request with this
+    # many tokens visible and computed.
     initial_position: int = 0
 
     def __post_init__(self) -> None:
-        """Validate prompt, generation limit, and draft tokens.
+        """Require a nonnegative initial position and canonical stop tokens.
 
-        Also validates the sampling policy.
+        `SamplingParams` checks its own invariants when constructed.
         """
         _nonnegative(self.initial_position, "autoregressive initial position")
         if any(
@@ -191,7 +228,7 @@ class GenerationParams:
     ) -> GenerationParams:
         """Parse sampling policy, token controls, and initial position.
 
-        Parses parameters for autoregressive work.
+        Absent fields take their defaults.
         """
         data = _map(value, where)
         return cls(
@@ -211,10 +248,7 @@ class GenerationParams:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Serialize autoregressive sampling and token controls.
-
-        Produces the admission wire mapping.
-        """
+        """Serialize autoregressive sampling and token controls."""
         return {
             "sampling": call._sampling_params_to_mapping(self.sampling),
             "negative_token_ids": list(self.negative_token_ids),
@@ -225,10 +259,16 @@ class GenerationParams:
 
 @dataclass(frozen=True, slots=True)
 class DiffusionParams:
-    """Effective diffusion bounds and seed resolved by model preprocessing."""
+    """Effective diffusion bounds and seed resolved by model preprocessing.
 
+    Mirrors the Rust `DiffusionSamplingParams`.
+    """
+
+    # Output frames after model-specific alignment.
     num_frames: int
+    # Video media units the decoder reconstructs, independent of rank count.
     video_units: int
+    # Denoising steps in the trajectory.
     num_inference_steps: int
     # Deterministic noise seed; nonnegative.
     seed: int
@@ -267,15 +307,18 @@ class DiffusionParams:
 
 @dataclass(frozen=True, slots=True)
 class NewRequest:
-    """Binds one request key to its execution-family parameters.
+    """Binds one request key to its slot and execution-family parameters.
 
-    The families are autoregressive, multimodal, and diffusion.
+    The families are autoregressive (``generation``), image (``image``), and
+    diffusion (``diffusion``). An image-generating request carries both
+    ``generation`` and ``image``.
     """
 
     request_key: identity.RequestKey
-    # 1-based request-pool slot; index 0 is reserved.
+    # Scheduler-assigned request-pool slot; slot 0 is reserved and rejected.
     request_pool_idx: int
-    # Exactly one of the three runtime-family parameter sets must be present.
+    # At least one family parameter set must be present. ``generation`` is
+    # keyed ``ar`` on the wire.
     generation: GenerationParams | None = None
     image: call.ImageParams | None = None
     diffusion: DiffusionParams | None = None
@@ -283,9 +326,10 @@ class NewRequest:
     prompt_token_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        """Require a valid request slot and family parameters.
+        """Require a positive slot and at least one family parameter set.
 
-        Also requires diffusion prompt tokens.
+        Diffusion requests also need non-empty prompt tokens. Each family's
+        own parameters are validated by its record.
         """
         if self.diffusion is not None and not self.prompt_token_ids:
             raise invalid_descriptor(
@@ -306,9 +350,9 @@ class NewRequest:
     def from_mapping(
         cls, value: object, where: str = "admission"
     ) -> NewRequest:
-        """Parse a request slot.
+        """Parse a request's identity, slot, prompt, and family parameters.
 
-        Also parses its optional execution-family parameter sets.
+        A family key that is absent or null leaves that family unset.
         """
         data = _map(value, where)
         image_data = data.get("image")
@@ -346,10 +390,7 @@ class NewRequest:
         return admission
 
     def to_mapping(self) -> dict[str, object]:
-        """Serialize request identity, slot, and family parameters.
-
-        Produces the admission wire mapping.
-        """
+        """Serialize request identity, slot, and family parameters."""
         return {
             "request_key": self.request_key.to_mapping(),
             "request_pool_idx": self.request_pool_idx,
@@ -366,24 +407,20 @@ class NewRequest:
 
 @dataclass(frozen=True, slots=True)
 class BlockTable:
-    """Maps a request and KV group to its ordered physical pages.
+    """The complete KV page table of one request slot and KV cache group."""
 
-    Also maps to the allocated token extent.
-    """
-
-    # 1-based request-pool slot.
+    # Request-pool slot owning the table; slot 0 is rejected.
     request_pool_idx: int
+    # KV cache group addressed by the table.
     group_id: int
-    # Ordered 1-based physical page identifiers; unique within the table.
+    # Physical page identifiers in logical order; unique, page 0 rejected.
     page_ids: tuple[int, ...]
-    # Tokens covered by this table; zero only when no pages are installed.
+    # Token capacity the installed pages cover; zero when ``page_ids`` is
+    # empty.
     allocated_tokens: int
 
     def __post_init__(self) -> None:
-        """Validate request/group identity and ordered pages.
-
-        Also validates the allocated token extent.
-        """
+        """Validate the slot, pages, and token capacity."""
         if (
             self.request_pool_idx < 1
             or self.group_id < 0
@@ -428,19 +465,20 @@ class BlockTable:
 
 @dataclass(frozen=True, slots=True)
 class CachePageAllocation:
-    """Declares newly assigned physical pages for a request KV group."""
+    """Physical KV pages newly assigned to a request slot and KV group.
 
-    # 1-based request-pool slot.
+    The pages are a subset of the batch's `BlockTable` for the same slot and
+    group; the Rust `Batch::validate` checks this, `Batch.validate` does not.
+    """
+
+    # Request-pool slot receiving the pages; slot 0 is rejected.
     request_pool_idx: int
     group_id: int
-    # Newly assigned 1-based physical pages; non-empty and unique.
+    # Newly assigned physical pages; non-empty, unique, page 0 rejected.
     page_ids: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        """Validate newly assigned page identifiers.
-
-        Also validates request/group ownership.
-        """
+        """Validate the slot, group, and newly assigned pages."""
         if (
             self.request_pool_idx < 1
             or self.group_id < 0
@@ -456,10 +494,7 @@ class CachePageAllocation:
         value: object,
         where: str = "cache-page allocation",
     ) -> CachePageAllocation:
-        """Parse newly assigned physical KV pages.
-
-        Parses pages for one request and cache group.
-        """
+        """Parse newly assigned KV pages for one slot and cache group."""
         data = _map(value, where)
 
         def uint_field(name: str) -> int:
@@ -491,9 +526,14 @@ def _validate_forward_inputs(
     query_lens: tuple[int, ...],
     write_kv: tuple[bool, ...],
 ) -> None:
-    """Validate aligned model inputs.
+    """Validate the columnar forward inputs before lanes index them.
 
-    Validation happens before lane preparation indexes their columns.
+    Every column must have one entry per row, each call index must address
+    a call of the batch, no row may use slot 0, and each row needs a
+    positive query length no longer than its sequence length.
+
+    Raises:
+        WorkerError: From `invalid_descriptor` on the first violated rule.
     """
     rows = len(call_indices)
     if any(
@@ -515,29 +555,37 @@ def _validate_forward_inputs(
 
 @dataclass(frozen=True, slots=True)
 class LatentParams:
-    """Solver-step range and optional paged storage.
+    """Solver-step range and optional paged storage of one trajectory.
 
-    Applies to one request trajectory.
+    For a paged trajectory, `LatentPool` records the pages, units, and raster
+    when the trajectory's slot is initialized and checks later calls against
+    them.
     """
 
     request_key: identity.RequestKey
     call_id: identity.CallId
-    # 1-based physical pages backing paged latent storage; empty iff
-    # latent_units is zero.
+    # `LatentPool` pages in logical order; unique, page 0 rejected. Empty
+    # exactly when ``latent_units`` is zero, which means the trajectory lives
+    # in request-owned tensors instead of the pool.
     page_table: tuple[int, ...]
-    # Number of latent units (trajectory rows); zero iff page_table is empty.
+    # Latent rows stored in ``page_table``; a `LatentPool` page holds
+    # ``page_units`` rows.
     latent_units: int
-    # Raster shape of each latent frame.
+    # Output height and width in pixels.
     height: int
     width: int
-    # Inclusive solver-step window [start_step, start_step + step_count).
+    # The call runs solver steps [start_step, start_step + step_count).
     start_step: int
     step_count: int
 
     def __post_init__(self) -> None:
-        """Validate the call identity and raster shape.
+        """Validate the call identity, raster, and page-table/unit agreement.
 
-        Also validates page-table/unit consistency.
+        Raises:
+            WorkerError: From `invalid_descriptor` when the call id's batch
+                is not positive, the raster is empty, ``latent_units`` is
+                negative, or the page table disagrees with the units,
+                repeats a page, or carries page 0.
         """
         if self.call_id.batch_id < 1:
             raise invalid_descriptor("latent params call id must be positive")
@@ -557,10 +605,7 @@ class LatentParams:
     def from_mapping(
         cls, value: object, where: str = "latent params"
     ) -> LatentParams:
-        """Parse request-owned latent pages and raster shape.
-
-        Also parses the solver-step range.
-        """
+        """Parse latent pages, raster shape, and the solver-step range."""
         data = _map(value, where)
         return cls(
             request_key=identity.RequestKey.from_mapping(
@@ -582,7 +627,7 @@ class LatentParams:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Serialize a physical latent trajectory params for lane execution."""
+        """Serialize the trajectory's pages, raster, and step range."""
         return {
             "request_key": self.request_key.to_mapping(),
             "call_id": self.call_id.to_mapping(),
@@ -604,13 +649,17 @@ class MediaTrack(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class DecodeRange:
-    """Selects a bounded temporal range for a concrete media computation."""
+    """Selects a bounded range of media units for one media call.
+
+    The Rust `Batch::validate` requires one for each video or audio decoding
+    or encoding call in a batch.
+    """
 
     request_key: identity.RequestKey
     call_id: identity.CallId
-    # Position (in media units) at which reconstruction resumes.
+    # First media unit assigned to the call.
     cursor: int
-    # Maximum media units this call may emit.
+    # Maximum media units the call may process; positive.
     max_units: int
 
     def __post_init__(self) -> None:
@@ -625,10 +674,7 @@ class DecodeRange:
     def from_mapping(
         cls, value: object, where: str = "decode params"
     ) -> DecodeRange:
-        """Parse the reconstruction cursor and bounded unit count.
-
-        Parses parameters for one call.
-        """
+        """Parse the call's cursor and unit bound."""
         data = _map(value, where)
         return cls(
             request_key=identity.RequestKey.from_mapping(
@@ -642,7 +688,7 @@ class DecodeRange:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Serialize a media reconstruction params for lane execution."""
+        """Serialize the call's cursor and unit bound."""
         return {
             "request_key": self.request_key.to_mapping(),
             "call_id": self.call_id.to_mapping(),
@@ -653,22 +699,17 @@ class DecodeRange:
 
 @dataclass(frozen=True, slots=True)
 class BufferAllocation:
-    """Assigns a product to a bounded slice of persistent storage.
-
-    The storage is scheduler-managed.
-    """
+    """Scheduler-chosen byte span for one persistent cross-call buffer."""
 
     buffer: identity.BufferId
-    # Byte range [offset, offset + bytes) within the buffer; must not
-    # overflow u64.
+    # Half-open byte span [offset, offset + bytes) in a device's
+    # persistent-buffer arena; the end must fit in u64. `BufferPool` binds
+    # the buffer at ``offset`` unless it places buffers compactly.
     offset: int
     bytes: int
 
     def __post_init__(self) -> None:
-        """Validate the persistent-buffer identifier and offset.
-
-        Also validates the bounded shape.
-        """
+        """Require a non-empty span whose end fits in u64."""
         if self.offset < 0 or self.bytes < 1:
             raise invalid_descriptor("buffer params span is invalid")
         if self.offset + self.bytes > (1 << 64) - 1:
@@ -678,10 +719,7 @@ class BufferAllocation:
     def from_mapping(
         cls, value: object, where: str = "buffer params"
     ) -> BufferAllocation:
-        """Parse a bounded byte slice of persistent storage.
-
-        The storage is scheduler-managed.
-        """
+        """Parse a persistent buffer's byte span."""
         data = _map(value, where)
         return cls(
             buffer=identity.BufferId.from_mapping(
@@ -705,9 +743,14 @@ def _validate_buffer_allocations(
     parameters: Sequence[BufferAllocation],
     where: str,
 ) -> None:
-    """Validate persistent-buffer parameters.
+    """Validate persistent-buffer spans against each other and the calls.
 
-    Validation checks producing calls and shape bounds.
+    Buffer ids must be unique and spans must not overlap. Every buffer output
+    of every call needs an allocation of at least its declared
+    ``max_bytes``.
+
+    Raises:
+        WorkerError: From `invalid_descriptor` on the first violated rule.
     """
     by_id: dict[identity.BufferId, BufferAllocation] = {}
     spans: list[tuple[int, int]] = []
@@ -719,6 +762,7 @@ def _validate_buffer_allocations(
         by_id[params.buffer] = params
         spans.append((params.offset, params.offset + params.bytes))
 
+    # Sorted half-open spans overlap only if one ends past the next start.
     spans.sort()
     if any(left[1] > right[0] for left, right in zip(spans, spans[1:])):
         raise invalid_descriptor(f"{where} buffer parameters overlap")
@@ -738,19 +782,30 @@ def _validate_buffer_allocations(
 
 @dataclass(frozen=True, slots=True)
 class Batch:
-    """One numerical call on one component, with every request in it."""
+    """One numerical call on one component, with every request in it.
 
-    # Strictly increasing in each worker's submission order.
+    ``__post_init__`` runs `validate`, so every constructed batch has passed
+    it, except those `construction.batch_from_validated` assembles from
+    frames the Rust decoder validated.
+    """
+
+    # Strictly increasing in each worker's submission order; `Executor.submit`
+    # rejects a batch id that does not exceed every earlier one.
     batch_id: int
-    # Monotonic sequence number ordering collective communication across
-    # workers.
+    # Positive sequence shared by collective participants. When the world
+    # size exceeds one, batches with calls must launch in strictly increasing
+    # order; `Executor` fails the rank fatally otherwise, because its peers
+    # would wait in a collective it never joins.
     collective_seq: int = 1
     calls: tuple[call.Call, ...] = ()
     block_tables: tuple[BlockTable, ...] = ()
     new_cache_pages: tuple[CachePageAllocation, ...] = ()
 
     # Columnar model-forward inputs: one row per forward, all columns the same
-    # length. seq_lens counts total tokens per row, query_lens the new tokens.
+    # length. ``forward_call_indices`` indexes ``calls``; ``seq_lens`` counts
+    # attended tokens (cached prefix plus query) and ``query_lens`` the tokens
+    # the row evaluates; ``write_kv`` says whether the query tokens persist in
+    # the KV cache.
     forward_call_indices: tuple[int, ...] = ()
     request_pool_indices: tuple[int, ...] = ()
     seq_lens: tuple[int, ...] = ()
@@ -765,15 +820,12 @@ class Batch:
     kv_inputs: tuple[transfer.KvTransfer, ...] = ()
 
     def __post_init__(self) -> None:
-        """Validate batch identity and lifecycle-call consistency."""
+        """Run `validate`."""
         self.validate()
 
     @property
     def admissions(self) -> tuple[NewRequest, ...]:
-        """Extract new-request payloads from lifecycle commands.
-
-        Preserves submission order.
-        """
+        """The `NewRequest` of every `Start` command, in command order."""
         return tuple(
             command.request
             for command in self.commands
@@ -781,9 +833,23 @@ class Batch:
         )
 
     def validate(self) -> None:
-        """Enforce batch identity, command ordering, and call counts.
+        """Check the cross-record rules of a batch.
 
-        Also enforces token bounds.
+        The batch carries a call or a command, a positive collective
+        sequence, and valid forward inputs. Its calls belong to
+        ``batch_id``, have unique ids, cover each request at most once, and
+        share one kind and component. Admissions are unique, repeated
+        commands are identical, each input product is declared by a call and
+        supplied once, each KV input has one ``KV_INSTALL`` consumer within
+        its byte bound, and buffer allocations cover the buffer outputs.
+
+        It covers part of the Rust `Batch::validate`. Among other rules, it
+        does not run ``Call.validate``, require unique block tables or
+        cache-page allocations inside their tables, match latent params and
+        decode ranges to the calls, or check latent page overlap.
+
+        Raises:
+            WorkerError: From `invalid_descriptor` on the first violated rule.
         """
         if not self.calls and not self.commands:
             raise invalid_descriptor(
@@ -833,7 +899,8 @@ class Batch:
                 "a submission batch carries a duplicate admission"
             )
 
-        # Lifecycle commands may repeat identically but not conflict.
+        # Lifecycle commands may repeat identically but not conflict. A
+        # command's identity is its request, variant, and freed buffer.
         identities: dict[
             tuple[identity.RequestKey, int, identity.BufferId | None],
             BatchCommand,
@@ -874,8 +941,9 @@ class Batch:
                 )
             supplied_inputs.add(product)
 
-        # Each KV transfer installs into exactly one call and must fit
-        # that call's transfer-byte bound.
+        # Each KV transfer's descriptor must fit the transfer-handle bound and
+        # its source must be unique. It installs into exactly one
+        # ``KV_INSTALL`` call whose transfer-byte bound covers its tensors.
         sources: set[identity.BufferId] = set()
         for publication in self.kv_inputs:
             publication.encoded_size_bound()
@@ -907,9 +975,10 @@ class Batch:
 
     @classmethod
     def from_mapping(cls, value: object) -> Batch:
-        """Parse a scheduler batch and validate it.
+        """Parse a batch mapping and validate it.
 
-        Validation covers all lifecycle commands and physical inputs.
+        Member records are parsed with their own checks, and the batch then
+        runs `validate`.
         """
         data = _map(value, "execute batch")
         batch_id = _uint(data.get("batch_id"), "execute batch.batch_id")
@@ -1031,10 +1100,7 @@ class Batch:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode batch identity and lifecycle commands.
-
-        Also encodes physical lane descriptors.
-        """
+        """Encode the batch with the keys `from_mapping` reads."""
         return {
             "batch_id": self.batch_id,
             "collective_seq": self.collective_seq,
@@ -1067,15 +1133,22 @@ class Batch:
 
 @dataclass(frozen=True, slots=True)
 class TensorPublication:
-    """A tensor identity and the physical metadata needed by its consumer."""
+    """A tensor identity and the physical metadata needed by its consumer.
+
+    Batches carry these as host-supplied ``input_products``, and a rank
+    reports the products it published in its `BatchOutput`.
+    """
 
     product: tensor.TensorRef
     value: transfer.TransferValue
 
     def encoded_size_bound(self) -> int:
-        """Bound the transfer metadata bytes.
+        """Return the estimated encoded size of the tensor's locators.
 
-        Includes every tensor location.
+        Raises:
+            WorkerError: From `invalid_descriptor` when the estimate exceeds
+                ``transfer.MAX_TRANSFER_HANDLE_BYTES`` or a locator names an
+                unknown transport.
         """
         size = transfer._tensor_transfers_size((self.value.tensor,))
         if size > transfer.MAX_TRANSFER_HANDLE_BYTES:
@@ -1086,7 +1159,14 @@ class TensorPublication:
     def from_mapping(
         cls, value: object, where: str = "tensor publication"
     ) -> TensorPublication:
-        """Parse the single generation owner and its typed transfer metadata."""
+        """Parse a tensor identity and its tagged transfer value.
+
+        The value's kind is ``encoder``, ``device_product``, or ``latent``.
+
+        Raises:
+            WorkerError: From `invalid_descriptor` on an unknown kind or an
+                invalid field.
+        """
         data = _map(value, where)
         product = tensor.TensorRef.from_mapping(
             data.get("product"), f"{where}.product"
@@ -1145,10 +1225,7 @@ class TensorPublication:
         return cls(product=product, value=typed)
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode tensor identity once.
-
-        Appears alongside the concrete transfer variant.
-        """
+        """Encode the tensor identity and its kind-tagged transfer value."""
         typed = self.value
         value: dict[str, object] = {
             "height": typed.height,

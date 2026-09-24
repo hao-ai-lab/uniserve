@@ -1,4 +1,19 @@
-"""Call result materialization and domain-specific progress updates."""
+"""Per-call completion records and their materialization into results.
+
+`reserve_outputs` in `uniserve_worker.execution.prepare` calls
+`create_outputs` to create one `PendingOutput` per call of a batch, each bound
+to one row of the batch's pinned `OutputBuffer`. Execution then stages the
+call's domain results into it: sampling captures and speculative
+verification coordinates (`TokenResult`), latent trajectory updates
+(`LatentResult`), host tasks and media (`HostResult`), and the projected
+`RequestProgress`.
+
+After the batch commits, `uniserve_worker.execution.commit` drops the
+borrowed device references with `release_execution_references`. The executor
+polls `ready`, calls `materialize` once to resolve the wire `RequestOutput`,
+and passes `request_result` to `RequestPool.apply_result`. A discarded batch
+calls `abandon` instead. No method here installs request progress itself.
+"""
 
 from __future__ import annotations
 
@@ -42,15 +57,20 @@ __all__ = [
     "PendingOutput",
 ]
 
-# The sampler packs one call's completion column as four consecutive
-# row-major fields: [valid | active | token | accepted], each `count` wide.
-# `valid` marks a usable sampling distribution, `active` the resolved device
-# predicate, `token` the selected token, and `accepted` the speculative
-# acceptance count.
+# The sampler packs one sampled batch's completion column as four consecutive
+# fields, [valid | active | token | accepted], each `count` rows wide
+# (`sampling_columns` in `uniserve_worker.sampling.sampler`). `valid` marks a
+# usable sampling distribution, `active` the resolved device predicate, `token`
+# the selected token, and `accepted` the number of accepted draft tokens (zero
+# without speculation). This must equal `SAMPLING_COMPLETION_FIELDS`, which
+# `reserve_outputs` uses to size completion storage.
 _SAMPLING_FIELDS_PER_CALL: Final[int] = 4
 
 
-# The private exception deliberately follows the error taxonomy.
+# Control-flow signals raised by `sampled_tokens`; `PendingOutput.materialize`
+# maps an invalid distribution to `ErrorCode.INVALID_CALL` and a predicated
+# call to `CallStatus.PREDICATED`. Their names describe the condition instead
+# of ending in "Error".
 class _InvalidSamplingDistribution(RuntimeError):  # noqa: N818
     """Marks a sampling row whose filtered probability mass is unusable."""
 
@@ -67,7 +87,16 @@ def capture_logprobs(
     details: LogprobValues | None,
     output: OutputBuffer,
 ) -> dict[int, tuple[int, int, int]]:
-    """Store one packed score column and return its call row ranges."""
+    """Capture one packed logprob column into completion storage.
+
+    The column's row layout is recorded in `output.logprob_layouts` under the
+    capture span so `OutputBuffer.logprob_values` can decode it after the copy
+    completes.
+
+    Returns:
+        A map from each sampler row index that carries logprobs to its
+        `(offset, count, row)` span; empty when `details` is None.
+    """
     if details is None:
         return {}
     packed, rows, counts, requested_ids, max_count, max_requested = details
@@ -92,6 +121,12 @@ def capture_samples(
 
     Call on the producer stream before sealing the output buffer. Its fence
     protects all sampling and score ranges until their PendingOutput retires.
+
+    Raises:
+        RuntimeError: A completion column is not a whole number of
+            `_SAMPLING_FIELDS_PER_CALL` fields or a row index lies outside
+            it. Errors from `OutputBuffer.capture` also propagate.
+        ValueError: `samples` and `requests` differ in length.
     """
     spans: dict[int, tuple[int, int]] = {}
     details: dict[int, dict[int, tuple[int, int, int]]] = {}
@@ -104,7 +139,9 @@ def capture_samples(
             raise RuntimeError("sampling completion vectors do not align")
 
         # Rows of a shared batch reference one completion column; capture it
-        # on first encounter and hand each request its row span.
+        # on first encounter and hand each request its row span. Columns are
+        # keyed by object identity, which stays unique because `samples`
+        # keeps every column alive for the duration of this loop.
         key = id(metadata)
         span = spans.get(key)
         if span is None:
@@ -121,7 +158,26 @@ def capture_samples(
 
 
 def sampled_tokens(record: PendingOutput) -> tuple[int, ...]:
-    """Resolve validity and acceptance from one captured sampling row."""
+    """Resolve validity and acceptance from one captured sampling row.
+
+    Requires the output buffer's copy to be complete. The whole captured
+    column is read once and cached in `record.token.sampling_values`.
+
+    Returns:
+        `record.token.committed_tokens` when the call captured no sampling
+        row. Otherwise the sampled token alone, or for speculative
+        verification the accepted draft prefix followed by the sampled token.
+        When acceptance reaches `terminal_prefix`, the accepted drafts already
+        end in the terminal token and no sampled token is appended.
+
+    Raises:
+        _PredicatedCall: The row's resolved predicate is inactive. This is
+            checked before validity.
+        _InvalidSamplingDistribution: The row's distribution is invalid.
+        RuntimeError: The record lost its output buffer before the values
+            were cached, or the acceptance count lies outside the draft span.
+            Errors from `OutputBuffer.read_tokens` also propagate.
+    """
     if record.token.sampling_range is None:
         return record.token.committed_tokens
     offset, extent, index = record.token.sampling_range
@@ -159,7 +215,12 @@ def sampled_tokens(record: PendingOutput) -> tuple[int, ...]:
 
 
 def logprob_entries(record: PendingOutput, span: tuple[int, int, int]) -> int:
-    """Return the score entry limit used to validate completion size."""
+    """Return the number of score entries one logprob row can report.
+
+    The count is the sampled entry plus the row's top-k count plus its
+    explicitly requested token ids. `uniserve_worker.execution.commit` uses it
+    to bound the logprob payload against `max_completion_bytes`.
+    """
     if record._buffer is None:
         raise RuntimeError("logprob output lost its pinned range")
     offset, count, index = span
@@ -176,7 +237,11 @@ def create_outputs(
     request_pool_indices: Sequence[int],
     buffer: OutputBuffer,
 ) -> tuple[PendingOutput, ...]:
-    """Bind output rows to validated, admitted requests for one batch."""
+    """Bind output rows to validated, admitted requests for one batch.
+
+    Row `i` of `buffer` belongs to `calls[i]`. Slot and identity validation is
+    done by `RequestPool.bind_calls`, whose errors propagate.
+    """
     bindings = requests.bind_calls(calls, request_pool_indices)
     return tuple(
         PendingOutput(call, request, buffer, index)
@@ -190,7 +255,13 @@ def create_outputs(
 class TokenResult:
     """Sampling captures and numerical token-state updates for one call."""
 
+    # Tokens reported when no sampling row was captured.
     committed_tokens: tuple[int, ...] = ()
+    # Spans are `(offset, count, row)` into the call's `OutputBuffer`: the
+    # capture's element offset and length, and the row within the captured
+    # column (the call's sampler row for `sampling_range` and `logprob_range`,
+    # the scored token's index within its prompt chunk for each
+    # `prompt_logprob_ranges` entry).
     sampling_range: tuple[int, int, int] | None = None
     sampling_values: tuple[int, ...] | None = None
     logprob_range: tuple[int, int, int] | None = None
@@ -207,7 +278,13 @@ class TokenResult:
     runtime_cache_length: int | torch.Tensor | None = None
     runtime_prompt_logits: torch.Tensor | None = None
 
-    # Host verification resolves only acceptance, without retaining logits.
+    # Speculative verification (set when `draft_tokens` is not None). The
+    # device selects the accepted span; host completion resolves only the
+    # accepted count, without retaining logits. The `base_*` fields are the
+    # coordinates before the draft span, to which `PendingOutput.materialize`
+    # adds the accepted token count. `initialized_kv` is the KV extent the
+    # verification forward wrote; rejected drafts stay initialized but beyond
+    # the visible length.
     draft_tokens: tuple[int, ...] | None = None
     terminal_prefix: int | None = None
     base_logical_position: int = 0
@@ -232,6 +309,9 @@ class HostResult:
     """Host tasks and media results following numerical execution."""
 
     tasks: tuple[HostTask, ...] = ()
+    # When set, `PendingOutput.materialize` passes the task results to this
+    # callback (for example to publish deferred product bytes) instead of
+    # interpreting them as media output.
     finish: Callable[[tuple[object, ...]], None] | None = None
     media: MediaOutput | None = None
 
@@ -242,6 +322,11 @@ class PendingOutput:
     The output row and CPU tasks retain their actual storage until materialized
     or abandoned. No request progress is installed by this object: RequestPool
     accepts explicit result updates after materialization.
+
+    Execution code in `uniserve_worker.execution` writes the public fields
+    directly while staging the call. `uniserve_worker.execution.commit` sets
+    `_reports_output` to whether this rank is the component's output rank;
+    only that rank reports scores and publishes host-produced media bytes.
     """
 
     def __init__(
@@ -274,9 +359,12 @@ class PendingOutput:
         self.product_generations: tuple[int, ...] = ()
         self.error_code: ErrorCode | None = None
 
-        # Numerical updates are borrowed until the completed group commits to
-        # DecodeState. Host acceptance continues to use progress and
-        # the completion ranges, independently of these device references.
+        # Exports, store reads and writes, and the predicate are borrowed from
+        # their owning stores until the batch commits or is discarded. On
+        # both paths `uniserve_worker.execution.commit` completes and clears
+        # the reads, then `release_execution_references` drops the rest. Host
+        # acceptance uses only `progress` and the completion ranges,
+        # independently of these device references.
         self.tensor_exports: dict[BufferId, ExportLocations] = {}
         self.cache_exports: dict[BufferId, ExportLocations] = {}
         self.exported_locators: list[Locator] = []
@@ -294,12 +382,16 @@ class PendingOutput:
         self.producer_write: TensorRecord | None = None
 
         self.kv_output: KvTransfer | None = None
+        # When host tasks produce a product's bytes, `products` is empty at
+        # commit; the `host.finish` callback publishes the product once the
+        # tasks complete and sets it here. Its consumer is scheduled only
+        # after this call completes, so the bytes are in place before any
+        # rank can read them.
         self.products: tuple[TensorPublication, ...] = ()
-        # A product whose bytes a host task produces is published with its
-        # batch and filled when the task completes. Its consumer is scheduled
-        # only after this call completes, so the bytes are in place before
-        # any rank can read them.
 
+        # `_row` and `_generation` identify this call's row in the leased
+        # `OutputBuffer`. A generation from an earlier lease of the same
+        # buffer makes `OutputBuffer.observe` raise and `discard` a no-op.
         self._buffer: OutputBuffer | None = buffer
         self._row = int(row)
         self._generation = int(buffer.generation)
@@ -310,13 +402,14 @@ class PendingOutput:
         self.value: RequestOutput | None = None
 
     def release_execution_references(self) -> None:
-        """Drop borrowed views after stores commit/abandon writes and fence.
+        """Drop borrowed device views once their stores own the lifetimes.
 
-        reads.
-
-        Host completion may outlive every product, so retaining the request tail
-        must not keep these numerical allocations alive after their owners free
-        them. The caller completes store handoff before invoking this method.
+        Call only after the stores have committed or abandoned this call's
+        writes and fenced its reads; `uniserve_worker.execution.commit` does
+        so on both the commit and the discard path. Host completion may
+        outlive every product, so this record must not keep these numerical
+        allocations alive after their owners free them. `progress` and the
+        completion ranges are kept for materialization.
         """
         self.writes.clear()
         self.tensor_exports.clear()
@@ -371,6 +464,34 @@ class PendingOutput:
 
         A call that did not run keeps the request's committed coordinates, so
         its completion reports where the request still stands.
+
+        Outcomes other than success:
+
+        - Any exception raised while resolving host task results (including
+          `host.finish` and media publication) or decoding logprobs is
+          logged and reported as `CallStatus.ERROR` with
+          `ErrorCode.COMPUTE_ERROR`.
+        - An inactive sampled predicate (or a call already marked predicated)
+          reports `CallStatus.PREDICATED` at the request's accepted progress.
+        - An invalid sampling distribution reports `CallStatus.ERROR` with
+          `ErrorCode.INVALID_CALL`.
+
+        These suppressed outcomes report no tokens, scores, product
+        generations, finish flags, or KV output; `media_output` is reported
+        whenever it was resolved, whatever the status. For any `PREDICATED` or
+        `ERROR` status, `accepted_progress` stays the request's accepted
+        progress; otherwise it is the resolved projection.
+
+        Side effects: observes this call's `OutputBuffer` row, records
+        `accepted_progress`, releases the buffer and host task references,
+        and caches the result in `value`.
+
+        Raises:
+            RuntimeError: The output is not ready (which includes an
+                abandoned output), or a speculative sampling row disagrees
+                with its draft span or initialized KV extent. Errors from
+                `OutputBuffer.read_tokens`, `OutputBuffer.observe`, and
+                `RequestOutput.validate` also propagate.
         """
         if self.value is not None:
             return self.value
@@ -385,6 +506,9 @@ class PendingOutput:
         suppressed = status is CallStatus.PREDICATED
         if not suppressed:
             try:
+                # A `finish` callback consumes every host task result. Without
+                # one, bytes become a POSIX shared-memory media artifact on the
+                # output rank, and at most one result may be media output.
                 results = tuple(task.result() for task in self.host.tasks)
                 finish, self.host.finish = self.host.finish, None
                 if finish is not None:
@@ -445,6 +569,9 @@ class PendingOutput:
                                 "sampling output has no request progress"
                             )
                         if self.token.draft_tokens is not None:
+                            # Acceptance adds at most one sampled token to the
+                            # drafts and must stay within the KV extent the
+                            # verification forward initialized.
                             accepted = len(tokens)
                             visible = self.token.base_kv_visible + accepted
                             if (
@@ -468,6 +595,9 @@ class PendingOutput:
                                 + accepted,
                                 kv_visible_len=visible,
                             )
+
+        # A predicated call did not run, so it reports the request's accepted
+        # coordinates and carries no error code.
         if status is CallStatus.PREDICATED:
             runtime = accepted_parent
             error_code = None
@@ -523,9 +653,9 @@ class PendingOutput:
             media_output=self.host.media,
             kv_output=None if suppressed else self.kv_output,
         )
-        # Ordinary successful calls accept the immutable projection itself;
-        # failures keep their predecessor and verification uses its resolved
-        # span.
+        # Successful calls accept their projection, resolved above for
+        # speculative verification; predicated and failed calls keep the
+        # request's accepted progress.
         self.accepted_progress = (
             accepted_parent
             if status in (CallStatus.PREDICATED, CallStatus.ERROR)
@@ -549,9 +679,14 @@ class PendingOutput:
         )
 
     def abandon(self) -> None:
-        """Stop result delivery while actual CPU and GPU readers retain their.
+        """Stop result delivery without waiting for in-flight readers.
 
-        buffers.
+        Host tasks not yet submitted are cancelled; submitted ones run to
+        completion. The output row is discarded if it was never observed;
+        when it is the buffer's last row, `OutputBuffer.discard` defers
+        releasing the buffer's events until in-flight copies complete. Every
+        release is attempted and the first failure is raised with later ones
+        noted. Calling it again is a no-op.
         """
         tasks, self.host.tasks = self.host.tasks, ()
         self.host.finish = None

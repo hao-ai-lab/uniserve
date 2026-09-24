@@ -1,6 +1,26 @@
-"""Request page assignment, cache publications, imports, and physical.
+"""Request page assignment, cache publications, imports, and retirement.
 
-retirement.
+``KVCacheManager`` wraps one ``PrefixCache`` of paged MHA K/V state on a
+worker rank and decides when each physical page interval may be rewritten
+or reused. Page allocation belongs to the engine scheduler; this manager
+validates the page ids it assigns and owns the request block tables
+(``BlockTables``) that model calls index. Three kinds of owner retain page
+intervals, each as ``page -> (token offset, token count)``:
+
+- Execution accesses (``CacheAccess``): the pages a model call reads or
+  writes, retained until the batch's completion future succeeds.
+- Publications (``CacheExport``): an immutable token interval exported
+  through transports, retained until the buffer is released and every
+  physical registration has retired.
+- Imports (``CacheImports``): scheduler-assigned destination pages that an
+  import stream fills from a publication.
+
+Writers ask ``write_dependencies`` which futures must resolve first, and
+``require_writable`` and ``require_reusable`` reject writes that still
+overlap a retained interval. The manager also keeps the semantic
+publication directory: the ``KvTransfer`` each buffer identity names and,
+per ``(request, destination)``, the lineage base that the next incremental
+publication or installation must extend.
 """
 
 from __future__ import annotations
@@ -41,6 +61,15 @@ class CacheExport:
     publication covers every layer's K/V for these ranges, so appends outside
     the interval remain independent even when they share its final physical
     page.
+
+    Attributes:
+        buffer: Buffer identity the publication is registered under.
+        ranges: Retained interval per physical page.
+        retirements: One future per physical registration, attached through
+            ``KVCacheManager.retain_publication``.
+        released: Whether semantic ownership has been revoked. The entry
+            leaves the manager only when it is released and every retirement
+            has succeeded.
     """
 
     buffer: BufferId
@@ -51,9 +80,11 @@ class CacheExport:
 
 @dataclass(eq=False, slots=True)
 class CacheAccess:
-    """Physical page intervals retained by one computation's existing.
+    """Physical page intervals retained by one computation's completion.
 
-    completion fence.
+    Every model access that shares one ``completion`` future joins one
+    access; ``requests`` names their request keys and ``ranges`` keeps one
+    interval per page.
     """
 
     completion: Future[None]
@@ -62,7 +93,10 @@ class CacheAccess:
 
 
 class KVCacheManager:
-    """Coordinate request ownership around one numerical cache."""
+    """Coordinate request ownership around one numerical cache.
+
+    Physical page ``0`` is the padding sentinel and is never allocatable.
+    """
 
     def __init__(
         self,
@@ -75,6 +109,27 @@ class KVCacheManager:
         max_blocks_per_request: int | None = None,
         staging_depth: int = 1,
     ) -> None:
+        """Validate the cache backing and create the ownership tables.
+
+        Args:
+            cache: Paged numerical K/V storage; closed by ``close``.
+            info: Advertised page count, page size, head and layer extents.
+            group_ranges: Physical ``(first page, page count)`` per cache
+                group. Defaults to one group covering the whole pool.
+            import_capacity: Maximum copy tasks ``CacheImports`` admits at
+                once.
+            request_pool_size: Request slots of the block tables.
+            max_blocks_per_request: Block-table width; defaults to every
+                non-sentinel page.
+            staging_depth: Depth of the block tables' host staging rings.
+
+        Raises:
+            ValueError: When the backing does not match ``info``, does not
+                hold MHA state, or ``staging_depth`` is below 1.
+            WorkerError: ``invalid_descriptor`` when the group ranges do not
+                tile the physical pool exactly or a block-table dimension is
+                below 1.
+        """
         self.cache, self.info = cache, info
         self.layers = tuple(cache.config.layers)
         if len(self.layers) != info.num_layers:
@@ -110,9 +165,15 @@ class KVCacheManager:
             tuple[tuple[int, ...], bool, int | None], tuple[int, ...]
         ] = {}
 
+        # Transport locations of committed exports, updated by the batch
+        # commit; publication intervals retained under their buffers.
         self.exports: dict[BufferId, ExportLocations] = {}
         self._sources: dict[BufferId, CacheExport] = {}
 
+        # Execution accesses by completion future, indexed by page.
+        # ``_execution_completed`` runs as a future callback on the thread
+        # that resolves the completion, so both maps are mutated under
+        # ``_execution_lock``.
         self._executions: dict[Future[None], CacheAccess] = {}
         self._execution_pages: dict[int, set[CacheAccess]] = {}
         self._execution_lock = RLock()
@@ -128,6 +189,11 @@ class KVCacheManager:
             staging_depth=staging_depth,
         )
 
+        # Semantic directory, changed by ``apply_publications``,
+        # ``release_calls`` and ``drop`` and cleared by ``close``. Base maps
+        # hold the latest ``(source buffer, published extent)`` per
+        # ``(request, destination)``: ``_destination_bases`` for what this
+        # rank published and ``_installed_bases`` for what it installed.
         self._publications: dict[BufferId, KvTransfer] = {}
         self._destination_bases: dict[
             tuple[RequestKey, str], tuple[BufferId, int]
@@ -142,9 +208,18 @@ class KVCacheManager:
     def startup_pages(self, count: int, *, group: int = 0):
         """Borrow bounded scratch pages before scheduler admission.
 
-        The startup caller serializes this lease with other preparation and
-        returns only after its stream finishes. Serving allocation authority
-        remains with the scheduler; no request or publication is introduced.
+        Yields the first ``count`` allocatable pages of ``group``, zeroed on
+        entry and again on exit, after the current stream drains on CUDA. The
+        startup caller serializes this lease with other preparation. Serving
+        allocation authority remains with the scheduler; no request or
+        publication is introduced.
+
+        Raises:
+            RuntimeError: When any cache interval is still retained.
+            ValueError: When ``count`` is negative or exceeds the group's
+                allocatable pages.
+            WorkerError: ``invalid_descriptor`` when ``group`` is out of
+                range.
         """
         if self.has_pending_accesses:
             raise RuntimeError("startup scratch requires an idle KV pool")
@@ -162,10 +237,7 @@ class KVCacheManager:
 
     @property
     def has_pending_accesses(self) -> bool:
-        """Whether cache intervals still have publication, computation.
-
-        or import owners.
-        """
+        """Whether any publication, execution access or import is retained."""
         return (
             bool(self._sources) or bool(self._executions) or bool(self.imports)
         )
@@ -179,12 +251,19 @@ class KVCacheManager:
         length: int,
         completion: Future[None],
     ) -> None:
-        """Retain scheduler-authorized model accesses until their device work.
+        """Retain a model access until its device work completes.
 
-        completes. Model calls are ordered by the public runner. Their
-        existing output fence also prevents independent import streams and
-        page allocation from reusing these ranges while a producer or
-        consumer kernel is still running.
+        The access covers tokens ``[0, length)`` of ``page_ids`` in
+        ``group``. Model calls are ordered by the runner; this retention
+        keeps independent import streams and page reuse
+        (``require_reusable``, ``write_dependencies``) away from these ranges
+        while a producer or consumer kernel may still run. A zero ``length``
+        retains nothing, and an already resolved ``completion`` retains
+        nothing and re-raises its failure or cancellation.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when the pages are invalid
+                for ``group``.
         """
         if not length:
             return
@@ -205,7 +284,8 @@ class KVCacheManager:
                 self._executions[completion] = execution
             execution.requests.add(request)
 
-            # Merge overlapping spans so each page retains a single interval.
+            # Each page keeps one interval: the hull of every span retained
+            # on it by this access.
             for page, offset, count in ranges:
                 previous = execution.ranges.get(page)
                 if previous is not None:
@@ -219,6 +299,9 @@ class KVCacheManager:
             completion.add_done_callback(self._execution_completed)
 
     def _execution_completed(self, completion: Future[None]) -> None:
+        # A failed or cancelled completion leaves its access registered: its
+        # ranges stay blocked, ``retirement_ready`` re-raises the failure for
+        # its requests, and ``close`` refuses to proceed.
         with self._execution_lock:
             if completion.cancelled() or completion.exception() is not None:
                 return
@@ -235,6 +318,7 @@ class KVCacheManager:
     def _execution_dependencies(
         self, ranges: Sequence[tuple[int, int, int]]
     ) -> tuple[Future[None], ...]:
+        """Return completions of accesses that overlap the given spans."""
         with self._execution_lock:
             return tuple(
                 {
@@ -250,7 +334,19 @@ class KVCacheManager:
     def require_reusable(
         self, page_ids: Sequence[int], *, group: int, start: int, length: int
     ) -> None:
-        """Authorize page initialization or stream import before submission."""
+        """Authorize page initialization or stream import before submission.
+
+        Applies ``require_writable`` and also rejects intervals that an
+        execution access still retains, including one whose completion
+        failed or was cancelled. ``zero_pages`` and
+        ``CacheImports.reserve`` call this before writing pages.
+
+        Raises:
+            WorkerError: A resource error when the interval overlaps a
+                publication, an import destination or an execution access;
+                ``invalid_descriptor`` when the pages are invalid and a
+                publication or import is retained.
+        """
         self.require_writable(page_ids, group=group, start=start, length=length)
         if self._execution_dependencies(
             tuple(
@@ -272,11 +368,17 @@ class KVCacheManager:
         start: int,
         length: int,
     ) -> CacheExport:
-        """Retain the exact published interval before exporting.
+        """Retain the exact published interval before exporting any view.
 
-        any of its views. The caller attaches every registration's
-        retirement future and releases this reservation if publication
-        is abandoned before semantic visibility.
+        The caller attaches every registration's retirement future with
+        ``retain_publication`` and releases this reservation
+        (``release_buffers``) if publication is abandoned before semantic
+        visibility.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when the pages are invalid,
+                the interval is empty, or ``buffer`` already has a retained
+                interval.
         """
         self._reap_sources()
         pages = self.validate_pages(page_ids, group=group)
@@ -297,9 +399,11 @@ class KVCacheManager:
     def retain_publication(
         self, source: CacheExport, retirement: Future[None]
     ) -> None:
-        """Retain the published interval until this physical registration.
+        """Retain the published interval until this registration retires.
 
-        retires.
+        Raises:
+            WorkerError: ``invalid_descriptor`` when the reservation has been
+                released or is no longer the one registered for its buffer.
         """
         if self._sources.get(source.buffer) is not source or source.released:
             raise invalid_descriptor(
@@ -308,9 +412,12 @@ class KVCacheManager:
         source.retirements = (*source.retirements, retirement)
 
     def release_buffers(self, buffers: Iterable[BufferId]) -> None:
-        """Revoke semantic ownership while preserving every pending physical.
+        """Revoke semantic ownership while preserving every pending read.
 
-        read.
+        Committed export registrations stop accepting new readers, imports
+        of these buffers are abandoned, and their publication intervals are
+        marked released. An interval is dropped only once all of its
+        retirements have succeeded.
         """
         selected = tuple(buffers)
         release_exports(self.exports, selected)
@@ -329,7 +436,15 @@ class KVCacheManager:
         requests: Iterable[RequestKey] = (),
         retained: frozenset[BufferId] = frozenset(),
     ) -> bool:
-        """Observe completion errors only for the selected allocation owners."""
+        """Report whether the selected owners retain no cache interval.
+
+        Publication intervals and imports are selected when their buffer is
+        in ``buffers``, or when a request in ``requests`` owns it and it is
+        not in ``retained``. Execution accesses are selected by request only.
+        Failures of the selected publications' retirements and execution
+        completions that have already resolved are re-raised here, so errors
+        surface only for these owners.
+        """
         selected = set(buffers)
         owners = set(requests)
         sources = tuple(
@@ -368,9 +483,15 @@ class KVCacheManager:
     def write_dependencies(
         self, page_ids: Sequence[int], *, group: int, start: int, length: int
     ) -> tuple[Future[None], ...]:
-        """Return retirements that must precede writing this physical.
+        """Return the futures that must resolve before writing an interval.
 
-        interval.
+        These are the completions of overlapping execution accesses and the
+        retirements of overlapping import destinations and publications.
+        Returns an empty tuple without validating the pages when nothing is
+        retained.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when the pages are invalid.
         """
         if not self.has_pending_accesses:
             return ()
@@ -398,6 +519,13 @@ class KVCacheManager:
         Device-indexed attention kernels borrow raw cache views. Their caller
         must validate the scheduler's write interval here before dispatch; no
         device-to-host read of per-token addresses is needed in the kernel path.
+        When no publication or import is retained, this returns without
+        validating the pages.
+
+        Raises:
+            WorkerError: A resource error when the interval overlaps a
+                publication or an import destination; ``invalid_descriptor``
+                when the pages are invalid.
         """
         # The runner orders model accesses. Only independent imports and
         # published immutable ranges add write conflicts at this boundary.
@@ -421,6 +549,11 @@ class KVCacheManager:
         left: Mapping[int, tuple[int, int]],
         right: Sequence[tuple[int, int, int]],
     ) -> bool:
+        """Whether any ``right`` span meets ``left``'s interval on its page.
+
+        Intervals overlap only on the same page and only when their token
+        ranges intersect.
+        """
         return any(
             (other := left.get(page)) is not None
             and offset < other[0] + other[1]
@@ -429,6 +562,8 @@ class KVCacheManager:
         )
 
     def _reap_sources(self) -> None:
+        # A failed or cancelled retirement keeps its interval, so
+        # ``retirement_ready`` re-raises the failure and ``close`` refuses.
         for buffer, source in tuple(self._sources.items()):
             if source.released and all(
                 future.done()
@@ -439,9 +574,14 @@ class KVCacheManager:
                 del self._sources[buffer]
 
     def close(self) -> None:
-        """Release semantic publications and require known physical.
+        """Release every publication and close the backing cache.
 
-        retirement.
+        Imports are stopped first. The backing cache is closed only when no
+        import, execution access or publication interval remains.
+
+        Raises:
+            WorkerError: A resource error when any of those still retains
+                storage; the cache stays open in that case.
         """
         self.imports.stop()
         self.release_buffers(tuple(self._sources))
@@ -467,9 +607,15 @@ class KVCacheManager:
         self,
         declared: Sequence[tuple[int, int]] | None,
     ) -> tuple[tuple[int, int], ...]:
-        """Normalize physical cache-group ranges and require exact.
+        """Normalize physical cache-group ranges.
 
-        non-overlapping page coverage.
+        The ranges must tile ``[0, num_blocks)`` exactly: no gaps, no
+        overlap. Page ``0`` lies in whichever group covers it but is never
+        allocatable (``page_ids``).
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when the ranges are empty,
+                out of bounds, overlapping or incomplete.
         """
         ranges = (
             ((0, self.info.num_blocks),)
@@ -479,7 +625,6 @@ class KVCacheManager:
         if not ranges:
             raise invalid_descriptor("KVCache declares no KV groups")
 
-        # Groups must tile the physical pool exactly: no gaps, no overlap.
         covered = [False] * self.info.num_blocks
         for group, (offset, count) in enumerate(ranges):
             end = offset + count
@@ -501,9 +646,11 @@ class KVCacheManager:
         return ranges
 
     def validate_group(self, group: int) -> int:
-        """Validate a cache-group index and return its normalized integer.
+        """Return ``group`` as an integer after checking its range.
 
-        value.
+        Raises:
+            WorkerError: ``invalid_descriptor`` when ``group`` is outside
+                ``[0, group_count)``.
         """
         value = int(group)
         if value < 0 or value >= self.group_count:
@@ -513,9 +660,9 @@ class KVCacheManager:
         return value
 
     def page_ids(self, group: int) -> range:
-        """Expose allocatable non-sentinel page ids assigned to one cache.
+        """Return the allocatable page ids of one cache group.
 
-        group.
+        The sentinel page ``0`` is excluded.
         """
         group_id = self.validate_group(group)
         offset, count = self.group_ranges[group_id]
@@ -528,9 +675,16 @@ class KVCacheManager:
         allow_sentinel: bool = False,
         group: int | None = None,
     ) -> tuple[int, ...]:
-        """Validate physical page identifiers against one group, optionally.
+        """Validate physical page ids and return them as a tuple of ints.
 
-        accepting the sentinel page.
+        Real (non-zero) pages must be unique, in ``[1, num_blocks)`` and,
+        when ``group`` is given, inside that group's range. The sentinel page
+        ``0`` is accepted, possibly repeated, only with ``allow_sentinel``.
+        Accepted tuples are memoized; the checks depend only on the pool
+        layout fixed at construction.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when any check fails.
         """
         # Resident scheduler tables already use immutable integer tuples. Check
         # their validated identity before normalizing every element again.
@@ -564,13 +718,20 @@ class KVCacheManager:
                     "KV allocation addresses another cache group"
                 )
 
+        # Bound the memo by clearing it wholesale.
         if len(self._validated_page_tuples) >= 16_384:
             self._validated_page_tuples.clear()
         self._validated_page_tuples[key] = pages
         return pages
 
     def zero_pages(self, group: int, page_ids: Iterable[int]) -> None:
-        """Zero every layer and field for the selected physical KV pages."""
+        """Zero every layer and field for the selected physical KV pages.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when the pages are invalid
+                for ``group``; a resource error from ``require_reusable``
+                when any selected page is still retained.
+        """
         pages = self.validate_pages(page_ids, group=group)
         if not pages:
             return
@@ -611,7 +772,22 @@ class KVCacheManager:
     ) -> KvTransfer:
         """Export a visible KV extent under its exact buffer identity.
 
+        Publications to one ``(request, destination)`` form a chain: this one
+        exports only tokens ``[base_extent, visible_length)``, where the base
+        is the latest committed publication to that destination. An empty
+        suffix exports no tensors. The suffix interval is reserved before
+        any view is exported. The returned ``KvTransfer`` becomes resident
+        only when the batch commits it (``validate_publications`` then
+        ``apply_publications``).
+
         `consumers` are the acknowledgment slots of the ranks that install it.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when the slot has no installed
+                table for ``group_id``, ``visible_length`` exceeds its
+                allocated length or trails the destination base, or the
+                reservation fails. A transport failure propagates after every
+                exported locator and the reservation are released.
         """
         installed = self._destination_bases.get((buffer.owner, destination))
         base, base_extent = (None, 0) if installed is None else installed
@@ -649,13 +825,17 @@ class KVCacheManager:
                 # Each run of layers sharing one backing exports as a single
                 # tensor per mechanism, so the descriptor's locator count
                 # follows the cache's allocation runs and the rank's
-                # mechanisms, never the model's depth.
+                # mechanisms, never the model's depth, which keeps the
+                # descriptor within its byte bound.
                 for field in fields:
                     locations: list[Locator] = []
                     for layer, stack in self._layer_stacks(f"{field}.values"):
                         # Stacks are [layers, pages, page tokens, kv heads,
                         # head dim]; each span view is [tokens, layers, kv
-                        # heads, head dim] over the run's layers.
+                        # heads, head dim] over the run's layers. Unencoded
+                        # views alias the live pages: ``require_writable``
+                        # rejects writes into the reserved interval until it
+                        # is released and retired.
                         views = tuple(
                             stack[:, page, start : start + count].permute(
                                 1, 0, 2, 3
@@ -668,6 +848,10 @@ class KVCacheManager:
                             # an immutable publication survives later
                             # numerical block updates.
                             views = (torch.cat(views, dim=0),)
+                        # The offset places this run inside the global
+                        # [suffix, total layers, total KV heads, head dim]
+                        # transfer at the run's first layer and this rank's
+                        # first KV head.
                         exported = publish_tensor(
                             transports,
                             views,
@@ -700,7 +884,8 @@ class KVCacheManager:
                             # Scale stacks are [layers, pages, 1, 1, 1] with
                             # one scale per page; published rows are [page,
                             # K/V, layers, head group], frozen like the values
-                            # they encode.
+                            # they encode. A rank's head group is its KV-head
+                            # offset divided by its local KV-head count.
                             views = (
                                 torch.cat(
                                     tuple(
@@ -757,9 +942,10 @@ class KVCacheManager:
         return publication
 
     def publication(self, buffer: BufferId) -> KvTransfer:
-        """Require the resident KV publication identified by a buffer.
+        """Return the resident KV publication registered for ``buffer``.
 
-        identity.
+        Raises:
+            WorkerError: ``invalid_descriptor`` when none is resident.
         """
         try:
             return self._publications[buffer]
@@ -782,9 +968,20 @@ class KVCacheManager:
         visible_length: int,
         publication: KvTransfer | None = None,
     ) -> KvTransfer:
-        """Verify that an installed buffer extends the request’s current.
+        """Verify that a request's allocation still covers a publication.
 
-        compatible KV base.
+        ``buffer`` must belong to ``request_key``, ``group_id`` must be the
+        publication's group, the published extent must lie within both
+        ``visible_length`` and the slot's allocated length, and the slot must
+        have an installed table for the group. ``publication`` skips
+        the directory lookup when the caller already holds it.
+
+        Returns:
+            The publication.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when any check fails or the
+                publication is not resident.
         """
         publication = (
             self.publication(buffer) if publication is None else publication
@@ -806,9 +1003,16 @@ class KVCacheManager:
         return publication
 
     def _validate_install(self, publication: KvTransfer) -> None:
-        """Check semantic lineage and the raw representation before destination.
+        """Check lineage and transfer shape before destination access.
 
-        access.
+        A first installation into ``(request, destination)`` has no base and
+        a zero base extent; a later one must name the currently installed
+        base and extent. When the publication carries tensors, the first
+        must have this worker's global
+        ``[suffix, total layers, total KV heads, head dim]`` shape.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when either check fails.
         """
         installed = self._installed_bases.get(
             (publication.source.owner, publication.destination)
@@ -843,7 +1047,21 @@ class KVCacheManager:
         initialized_pages: tuple[int, ...],
         transports: Mapping[str, Transport],
     ) -> CacheImport:
-        """Reserve scheduler pages and start their bounded physical import."""
+        """Reserve scheduler pages and start their bounded physical import.
+
+        ``page_ids`` is the destination's page table, ``allocated_length``
+        its token capacity, and ``initialized_pages`` the new pages the
+        import zeroes before copying. Pages that hold the installed base must
+        stay in place and must not be re-initialized. The copy runs in
+        ``CacheImports``; ``install`` adopts it once complete.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when lineage, shape, pages or
+                capacity are invalid, imports are closed, or the publication
+                source already has a registered import; a resource error
+                when a destination interval is still retained or the import
+                lane is closed or has no capacity.
+        """
         self._validate_install(publication)
         group_id = publication.group_id
         pages = self.validate_pages(page_ids, group=group_id)
@@ -887,9 +1105,18 @@ class KVCacheManager:
         installed_buffer: BufferId,
         write: CacheImport,
     ) -> KvTransfer:
-        """Adopt a completed physical import under its exact source and base.
+        """Adopt a completed physical import under its source and base.
 
-        version.
+        The request's block table must be unchanged since
+        ``prepare_install``. The slot's verified length becomes the published
+        extent; the returned ``KvTransfer`` becomes resident when the batch
+        commits (``apply_publications``).
+
+        Raises:
+            RuntimeError: When the import has not completed.
+            WorkerError: ``invalid_descriptor`` when identities, lineage or
+                the block table disagree, or the import was abandoned.
+            Exception: The import's own failure, re-raised.
         """
         publication = write.publication
         if installed_buffer.owner != publication.source.owner:
@@ -926,9 +1153,16 @@ class KVCacheManager:
         publications: Sequence[tuple[BufferId, KvTransfer]],
         installations: Sequence[tuple[BufferId, BufferId, KvTransfer]],
     ) -> None:
-        """Validate touched KV versions before any group resource becomes.
+        """Validate touched KV versions before any group resource is visible.
 
-        visible.
+        Checks the batch's publications and installations without changing
+        the directory. Several entries for one ``(request, destination)``
+        must chain in order.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when a buffer identity does
+                not match its transfer, a resident buffer names another
+                transfer, or a base is not the current one.
         """
         # Transaction-local views start from resident state, so the batch is
         # validated as one consistent step.
@@ -1004,8 +1238,9 @@ class KVCacheManager:
     ) -> None:
         """Apply a preflighted update without repeating fallible validation.
 
-        The caller must call validate_publications before committing any owner
-        and must not mutate this directory between preflight and application.
+        The caller must call ``validate_publications`` before committing any
+        owner and must not mutate this directory between preflight and
+        application.
         """
         for buffer, publication in publications:
             self._publications[buffer] = publication
@@ -1014,6 +1249,8 @@ class KVCacheManager:
                 publication.published_extent,
             )
 
+        # An installation is resident under both its source identity and
+        # the local installed identity.
         for source, installed_buffer, publication in installations:
             self._publications[source] = publication
             self._publications[installed_buffer] = publication
@@ -1027,13 +1264,13 @@ class KVCacheManager:
     def release_calls(
         self, releases: Sequence[tuple[RequestKey, CallId]]
     ) -> tuple[BufferId, ...]:
-        """Forget semantic publications and identify buffers.
+        """Forget resident publications produced by the given calls.
 
-        for the execution owner. Locator registration and physical
-        retirement belong to execution's canonical publication table.
-        Imported references may have no local registration; removing
-        their semantic record does not release a remote publisher's
-        storage.
+        Returns the removed buffer identities for the caller to release
+        (``release_buffers``). Locator registration and physical retirement
+        belong to the export directory and its transports. Imported
+        references may have no local registration; removing their semantic
+        record does not release a remote publisher's storage.
         """
         identities = {(key, call_id) for key, call_id in releases}
         publications_by_buffer = tuple(
@@ -1046,9 +1283,9 @@ class KVCacheManager:
         return publications_by_buffer
 
     def drop(self, request_id: int) -> None:
-        """Discard semantic KV state while execution retires the request's.
+        """Forget every resident publication and lineage base of a request.
 
-        registrations.
+        Physical registrations are retired separately by their owners.
         """
         selected = tuple(
             buffer

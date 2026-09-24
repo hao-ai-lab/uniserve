@@ -1,4 +1,19 @@
-"""Worker startup information shared with the scheduler."""
+"""Worker startup information shared with the scheduler.
+
+A rank answers the engine's ``info`` request (`RequestKind.INFO`, served by
+`uniserve_worker.service`) with `WorkerInfo.to_mapping()`: its endpoint,
+supported calls, scheduling bounds, KV and latent pool capacity, components,
+and transfer capabilities. The worker-ipc crate's `WorkerInfo` is the wire
+counterpart: the PyO3 extension converts the mapping into it, and its
+`validate` runs whenever the crate's codec encodes or decodes the response.
+The engine also checks the description against its launch configuration and
+derives the capacity the scheduler plans against. `WorkerInfo.__post_init__`
+checks the record's internal consistency when the worker builds it in
+`uniserve_worker.bootstrap.report`.
+
+The decoding helpers at the end of this module are local variants of those in
+`uniserve_worker.protocol.validation`, without their exact-type fast paths.
+"""
 
 from __future__ import annotations
 
@@ -20,9 +35,10 @@ from uniserve_worker.protocol.transfer import WorkerEndpoint
 
 
 class RequestKind(StrEnum):
-    """Defines IPC request verbs.
+    """IPC request kinds a worker serves.
 
-    Verbs cover discovery, submission, and shutdown.
+    ``info`` asks for the startup description, ``submit`` carries a batch,
+    and ``close`` shuts the worker down.
     """
 
     INFO = "info"
@@ -31,10 +47,10 @@ class RequestKind(StrEnum):
 
 
 class ResponseKind(StrEnum):
-    """Defines IPC response categories.
+    """IPC response kinds a worker sends.
 
-    Categories cover worker information, results, acknowledgements, and
-    errors.
+    ``info`` carries the `WorkerInfo` mapping, ``result`` a batch result,
+    ``ok`` the acknowledgement of ``close``, and ``error`` a failure.
     """
 
     INFO = "info"
@@ -52,7 +68,18 @@ class KvGroupKind(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class KvGroup:
-    """Describe the page count and optional window of one KV cache group."""
+    """Describe the page count and retention policy of one KV cache group.
+
+    Attributes:
+        num_blocks: Physical pages in this group's share of the page pool.
+        kind: Attention retention policy of the group.
+        window: With `KvGroupKind.SLIDING_WINDOW`, the number of recent tokens
+            retained for attention. Encoded only for a sliding window and
+            decoded as zero when absent.
+        sink: With `KvGroupKind.SLIDING_WINDOW`, the number of prefix tokens
+            retained outside the window. Encoded only for a sliding window
+            and decoded as zero when absent.
+    """
 
     num_blocks: int
     kind: KvGroupKind
@@ -61,7 +88,11 @@ class KvGroup:
 
     @classmethod
     def from_mapping(cls, value: object, where: str) -> KvGroup:
-        """Decode and validate one KV group from its scheduler wire mapping."""
+        """Decode and validate one KV group from its scheduler wire mapping.
+
+        The policy is a nested mapping tagged by its own ``kind`` key, with
+        ``window`` and ``sink`` beside the tag for a sliding window.
+        """
         data = _map(value, where)
         kind_data = _map(data.get("kind"), f"{where}.kind")
         return cls(
@@ -91,7 +122,11 @@ class KvGroup:
 class KVCacheInfo:
     """Publish KV cache layout to the scheduler.
 
-    Covers block size, dtype, token capacity, and group layout.
+    `num_layers` and `num_kv_heads` describe this rank's share of the model's
+    logical cache; `total_layers`, `total_kv_heads`, and the two offsets place
+    that share within it. `block_size` is tokens per physical page,
+    `num_blocks` the pages in the pool, which `groups` partition, and
+    `bytes_per_token` the physical bytes one token occupies on this rank.
     """
 
     block_size: int
@@ -108,9 +143,11 @@ class KVCacheInfo:
     dtype: str
 
     def __post_init__(self) -> None:
-        """Validate published KV dimensions.
+        """Validate the KV dimensions and the page partition.
 
-        Also validate dtype, token capacity, and group coverage.
+        Requires positive dimensions and a non-empty dtype, layer and head
+        intervals inside their logical totals, and groups whose positive page
+        counts sum to `num_blocks`.
         """
         if (
             min(
@@ -207,9 +244,12 @@ class KVCacheInfo:
 
 @dataclass(frozen=True, slots=True)
 class ComponentInfo:
-    """Loaded component membership and publishable tensor results.
+    """A loaded component's configuration and its publishable tensor results.
 
-    The component's computation publishes these tensor results.
+    On the wire the `ComponentConfig` fields sit beside ``name`` and
+    ``outputs`` in one flat mapping, as the worker-ipc crate's
+    `ComponentInfo` flattens them. The order of `outputs` defines product
+    output indices.
     """
 
     name: str
@@ -256,7 +296,21 @@ class ComponentInfo:
 
 @dataclass(frozen=True, slots=True)
 class WorkerInfo:
-    """Describes a worker’s capabilities, topology, and resource bounds."""
+    """Describes a worker’s capabilities, topology, and resource bounds.
+
+    Attributes:
+        queue_depth: Maximum unresolved physical runs; the engine requires it
+            to equal the depth it launched the rank with.
+        max_batch_calls: Maximum calls in one run.
+        max_batch_tokens: Maximum text tokens represented in one run.
+        request_slots: Number of resident request slots.
+        latent_page_units: Model-defined units stored in one latent page.
+        latent_pages: Physical latent pages, including the reserved sentinel
+            page that `latent_capacity_units` excludes.
+        buffer_pool_bytes: Persistent buffer-pool capacity in bytes.
+        max_unresolved_calls: Maximum unresolved calls per request.
+        host_lane_capacity: Concurrent host-lane tasks this rank admits.
+    """
 
     model_name: str
     endpoint: WorkerEndpoint
@@ -279,26 +333,33 @@ class WorkerInfo:
     weight_formats: tuple[str, ...] = ()
     activation_formats: tuple[str, ...] = ()
     # Identity of the loaded checkpoint files, distinct from the resolved
-    # execution configuration. The engine requires it from every rank that
-    # serves a checkpoint; a model built in-process without one reports none.
+    # execution configuration: a lowercase hex SHA-256, or empty for a model
+    # loaded without a checkpoint. The worker-ipc crate's
+    # `WorkerInfo::validate` accepts an empty identity only from the weightless
+    # stub model.
     checkpoint_identity: str = ""
     components: tuple[ComponentInfo, ...] = ()
     device: str = "cpu"
     transfer_backends: tuple[str, ...] = ("local",)
     # Whether this rank's device exports a handle another host can import.
     # A descriptor handle reaches only this host, so the engine refuses a
-    # transfer edge that would have to cross one.
+    # cross-host CUDA VMM transfer edge unless both ends report fabric
+    # handles.
     fabric_handles: bool = False
     media_components: dict[MediaCall, str] = field(default_factory=dict)
     num_inference_steps: int = 0
 
     def output_rank(self, component: str) -> int:
-        """Resolve the host publication owner from the call's component.
+        """Return the rank that publishes a component's host products.
 
-        Cooperative numerical outputs may reside on different ranks. Host
-        products belong to the component's first member, matching the
-        rank-report join requirements. An unconfigured local worker has one
-        possible owner.
+        Host products belong to the component's first member rank, the rank
+        whose reports the engine's `WorkerGroup` joins a call's results on.
+        Cooperative numerical outputs may reside on other ranks. A
+        single-rank worker without the component resolves to rank 0.
+
+        Raises:
+            WorkerError: `unsupported_setup` when the component is not
+                configured and the worker has more than one rank.
         """
         for candidate in self.components:
             if candidate.name == component:
@@ -320,9 +381,17 @@ class WorkerInfo:
         return self.kv_cache is not None
 
     def __post_init__(self) -> None:
-        """Validate advertised worker info.
+        """Validate the advertisement's internal consistency.
 
-        Covers topology, capacities, variants, and cache-group layout.
+        Covers transfer backends, scheduling bounds, the endpoint rank, the
+        KV cache that autoregressive calls require, pool sizes, supported and
+        media calls, latent pool completeness, the model name, and the
+        checkpoint identity format. The KV layout validates itself in
+        `KVCacheInfo`. The worker-ipc crate's `WorkerInfo::validate` checks
+        most of the same relations; it also checks the components (unique
+        names, membership within the world, and parallel degrees) and
+        refuses an empty checkpoint identity from any model but the
+        weightless stub.
         """
         if (
             not self.device
@@ -394,6 +463,8 @@ class WorkerInfo:
                     "media component uses an unsupported call"
                 )
 
+        # A latent pool is either absent or has at least one usable page
+        # beyond the reserved sentinel page.
         has_latent_geometry = bool(self.latent_page_units or self.latent_pages)
         if has_latent_geometry:
             if self.latent_page_units < 1 or self.latent_pages < 2:
@@ -564,6 +635,8 @@ class WorkerInfo:
         }
 
 
+# Local decoding helpers for the startup description; see the module
+# docstring for how they relate to `uniserve_worker.protocol.validation`.
 _E = TypeVar("_E", bound=StrEnum)
 
 

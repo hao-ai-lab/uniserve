@@ -1,4 +1,21 @@
-"""Construct bounded transport backends for one worker endpoint."""
+"""Construct bounded transport backends for one worker endpoint.
+
+The transport package moves a rank's published products (tensors) to the
+ranks that read them. Each backend is one physical mechanism:
+
+- `local`: a publication read within the producer's own address space.
+- `shm`: host bytes in a POSIX shared-memory segment, for readers on the
+  producer's host.
+- `cuda_vmm`: device storage exported as a CUDA VMM shareable handle, either
+  where it lies or copied into the device's pool.
+- `channel`: host bytes carried inside the locator itself, through the head,
+  for readers on another host.
+
+`publication.publish_tensor` chooses the mechanisms for one product,
+`fetch.fetch_tensor` assembles a consumer's region from the published
+locations, and `exports` operates on each storage owner's record of what it
+has published.
+"""
 
 from __future__ import annotations
 
@@ -39,6 +56,12 @@ def make_transports(
     rank's products, which decides how a device publication states
     readiness. Which ranks read a given product is stated on the call that
     produces it.
+
+    Raises:
+        WorkerError: `invalid_descriptor` for empty, duplicate or unknown
+            names, and `unsupported_setup` for a non-positive capacity. When
+            a backend fails to construct, the ones already built are closed
+            and its error propagates.
     """
     if not names or len(set(names)) != len(names):
         raise invalid_descriptor(
@@ -52,6 +75,8 @@ def make_transports(
         raise unsupported_setup(
             "transport byte and ticket capacities must be positive"
         )
+    # One budget shared by every backend: bytes or read tickets reserved by
+    # one backend are unavailable to the others.
     capacity = TransferCapacity(byte_capacity, ticket_capacity)
     endpoint = source or WorkerEndpoint.local()
     constructors: Mapping[str, Callable[..., Transport]] = {
@@ -78,6 +103,8 @@ def make_transports(
                 arguments["host_slots"] = host_slots
             transports[name] = constructors[name](**arguments)
     except BaseException:
+        # A partial construction must not leave the threads, sockets or
+        # endpoint registrations of the backends already built behind.
         for transport in transports.values():
             transport.close()
         raise

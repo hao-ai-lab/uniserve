@@ -1,4 +1,16 @@
-"""Primitive validation for decoded worker wire values."""
+"""Primitive validation for decoded worker wire values.
+
+The ``from_mapping`` constructors of the `uniserve_worker.protocol` records
+use these helpers to type-check each mapping field; `worker_info` keeps local
+variants instead. Every helper takes the decoded value and `where`, the path
+of the field (`_enum` also takes the enum type first); the checks a helper
+performs raise `invalid_descriptor` with that path in the message. Integer
+and number helpers reject `bool`, although it subclasses `int`.
+
+Most helpers test for the exact built-in type first and then fall back to
+`isinstance`, so subclasses and other `Mapping` or `Sequence` implementations
+are accepted as well.
+"""
 
 from __future__ import annotations
 
@@ -59,7 +71,11 @@ def _pair(value: object, where: str) -> Sequence[Any]:
 
 
 def _tagged(value: object, where: str) -> tuple[str, object]:
-    """Extract a non-empty variant tag and its mapping payload."""
+    """Split an adjacently tagged ``{"kind": ..., "value": ...}`` mapping.
+
+    Returns the tag, which must be a string, and the payload unvalidated;
+    the caller validates the payload according to the tag.
+    """
     data = _map(value, where)
     return _str(data.get("kind"), f"{where}.kind"), data.get("value")
 
@@ -88,7 +104,10 @@ def _uint(value: object, where: str) -> int:
 
 
 def _int(value: object, where: str) -> int:
-    """Decode a signed integer wire field while rejecting booleans."""
+    """Decode a signed integer wire field while rejecting booleans.
+
+    An `int` subclass is returned as a plain `int`.
+    """
     if type(value) is int:
         return value
     if not isinstance(value, int) or isinstance(value, bool):
@@ -117,8 +136,9 @@ def _float(value: object, where: str) -> float:
 def _uints(value: object, where: str) -> tuple[int, ...]:
     """Decode a sequence of non-negative integer wire values."""
     items = _seq(value, where)
-    # Fast path: copy directly when every item already validates, and only
-    # rebuild per item to locate the first invalid value for the error message.
+    # Fast path: copy directly when every item is an exact non-negative int.
+    # Otherwise validate per item, which also accepts int subclasses other
+    # than bool and names the index of the first invalid item.
     for item in items:
         if not (type(item) is int and item >= 0):
             return tuple(
@@ -139,7 +159,11 @@ def _ints(value: object, where: str) -> tuple[int, ...]:
 
 
 def _bytes(value: object, where: str) -> bytes:
-    """Decode a bytes-like wire payload to immutable bytes."""
+    """Decode a bytes-like wire payload to immutable bytes.
+
+    Accepts `bytes`, `bytearray`, `memoryview`, or a non-string sequence of
+    byte values, which `bytes` converts.
+    """
     if type(value) is bytes:
         return value
     if isinstance(value, (bytearray, memoryview)):
@@ -148,5 +172,5 @@ def _bytes(value: object, where: str) -> bytes:
 
 
 def _nonnegative(value: int, where: str) -> None:
-    """Validate a decoded integer is non-negative."""
+    """Validate that an already decoded integer field is non-negative."""
     _uint(value, where)

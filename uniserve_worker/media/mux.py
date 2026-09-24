@@ -5,7 +5,9 @@ encodes the audio track and assembles the encoded tracks into the request's
 container, each as a task on the rank's lane. A unit decoded on this host is
 read in place from the shared-storage segment its producer published. This
 module owns the rank-side scheduling: which task runs for which call, on
-which input, and what its result becomes.
+which input, and what its result becomes. Encoded units reach the muxer as
+length-prefixed rows of the encode call's product (`frame_encoded_unit`,
+`read_encoded_unit`).
 """
 
 from __future__ import annotations
@@ -48,7 +50,9 @@ __all__ = [
 ]
 
 # A framed media unit carries its own length because the product row that holds
-# it is sized for the largest unit a request can produce.
+# it is sized for the largest unit a request can produce. The prefix is a
+# uint64 in the host's native byte order, written by `frame_encoded_unit` and
+# read by `read_encoded_unit`.
 _LENGTH_BYTES = 8
 
 
@@ -60,7 +64,17 @@ def encoded_unit_bytes(frames: int, height: int, width: int) -> int:
 def frame_encoded_unit(
     payload: bytes, destination: torch.Tensor
 ) -> torch.Tensor:
-    """Write a framed unit and return its initialized prefix for publication."""
+    """Write a framed unit and return its initialized prefix for publication.
+
+    ``destination`` is a 1-D uint8 row sized by `encoded_unit_bytes`. Bytes
+    past the returned view are left untouched; the caller
+    (`uniserve_worker.execution.host_media`) publishes only the view's span
+    as the row's region.
+
+    Raises:
+        WorkerError: When ``payload`` does not fit in the row after the
+            length prefix.
+    """
     import torch
 
     capacity = int(destination.numel()) - _LENGTH_BYTES
@@ -81,7 +95,11 @@ def frame_encoded_unit(
 
 
 def read_encoded_unit(row: torch.Tensor) -> bytes:
-    """Return the encoded media unit a product row carries."""
+    """Return the encoded media unit a framed CPU uint8 row carries.
+
+    Raises:
+        WorkerError: When the length prefix exceeds the row's capacity.
+    """
     values = row.numpy()
     length = int(
         np.frombuffer(values[:_LENGTH_BYTES].tobytes(), dtype=np.uint64)[0]
@@ -105,7 +123,17 @@ def _pixels(source: HostBorrow | np.ndarray, config: AvMuxConfig) -> np.ndarray:
 
 
 def _map(source: HostBorrow) -> np.ndarray:
-    """Map a borrowed region of a shared-storage segment read-only."""
+    """Map a borrowed region of a shared-storage segment read-only.
+
+    The returned array keeps the ``mmap`` object, and so the mapping, alive
+    until the array and its views are collected; closing the descriptor
+    right after mapping does not invalidate it.
+
+    Raises:
+        WorkerError: When the region is negative or extends past the
+            segment's size.
+        OSError: When the segment cannot be opened or mapped.
+    """
     if source.offset < 0 or source.nbytes < 0:
         raise invalid_descriptor(
             "media unit lies outside its shared-storage segment"
@@ -117,6 +145,8 @@ def _map(source: HostBorrow) -> np.ndarray:
             raise invalid_descriptor(
                 "media unit lies outside its shared-storage segment"
             )
+        # The mapping starts at offset zero and the array view below selects
+        # the region, so ``source.offset`` need not be page-aligned.
         mapping = mmap.mmap(
             descriptor, source.offset + source.nbytes, prot=mmap.PROT_READ
         )
@@ -134,6 +164,10 @@ class MuxSession:
     Lane tasks hold ``lock`` while they touch the container. A request that
     ends early is marked discarded, and whichever of the discard and a task
     in progress releases the lock last closes the container.
+
+    ``audio_scheduled`` and ``finalized`` are set by `MediaMux` when it
+    schedules the corresponding task, before the task runs; ``audio`` is
+    written by the audio task under ``lock``.
     """
 
     config: AvMuxConfig
@@ -219,7 +253,12 @@ class MediaMux:
         self._sessions: dict[RequestKey, MuxSession] = {}
 
     def open(self, request_key: RequestKey, *, config: AvMuxConfig) -> None:
-        """Create the request-owned assembly session under its settings."""
+        """Create the request-owned assembly session under its settings.
+
+        Every audio and muxing call opens its session first
+        (`uniserve_worker.execution.host_media.execute`), so opening a key
+        that already has a session keeps that session and ignores ``config``.
+        """
         if request_key in self._sessions:
             return
         self._sessions[request_key] = MuxSession(config, AvMuxSession(config))
@@ -239,6 +278,10 @@ class MediaMux:
 
         The encoded track is the session's own state rather than a result,
         because only the assembled artifact is this request's output.
+
+        Raises:
+            WorkerError: When the request has no session, its audio is
+                already scheduled, or its artifact is already finalized.
         """
         session = self._session(request_key)
         if session.finalized or session.audio_scheduled:
@@ -268,7 +311,12 @@ class MediaMux:
         reservation: HostTask,
         call_id: CallId,
     ) -> HostTask:
-        """Schedule the next media units into the request's container."""
+        """Schedule the next media units into the request's container.
+
+        Raises:
+            WorkerError: When the request has no session, its artifact is
+                already finalized, or ``units`` is empty.
+        """
         session = self._session(request_key)
         if session.finalized:
             raise invalid_descriptor(
@@ -300,7 +348,14 @@ class MediaMux:
         """Schedule the artifact's assembly after every unit and the audio.
 
         The task muxes the audio track, publishes the MP4 to shared storage,
-        and results in the artifact's handle.
+        and results in the artifact's handle. Scheduling checks only that the
+        audio encode was scheduled; the task itself fails, for example, when
+        the encoded audio is missing or `AvMuxSession.finalize` finds a unit
+        missing.
+
+        Raises:
+            WorkerError: When the request has no session, its artifact is
+                already finalized, or its audio encode was never scheduled.
         """
         session = self._session(request_key)
         if session.finalized:
@@ -336,14 +391,23 @@ class MediaMux:
         )
 
     def drop(self, request_id: int) -> None:
-        """Remove every assembly session owned by a request identifier."""
+        """Discard every assembly session whose key carries ``request_id``.
+
+        Keys match on the identifier alone, whatever their epoch or engine.
+        A dropped session's scheduled task that has not started fails in
+        `MuxSession.held`; see `MuxSession.discard` for one in progress.
+        """
         for key in [
             key for key in self._sessions if key.request_id == int(request_id)
         ]:
             self._sessions.pop(key).discard()
 
     def close(self) -> None:
-        """Discard all active assembly sessions and reject new media work."""
+        """Discard all active assembly sessions.
+
+        The worker calls this when it closes or its startup fails. A later
+        `open` still creates a new session.
+        """
         for key in list(self._sessions):
             self._sessions.pop(key).discard()
 

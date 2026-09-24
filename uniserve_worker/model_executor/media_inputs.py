@@ -1,4 +1,10 @@
-"""Stage numerical media inputs for the worker's admitted requests."""
+"""Stage numerical media inputs for the worker's admitted requests.
+
+``MediaBuilder`` wraps a standalone ``VideoDenoiser`` for serving: it bounds
+admitted sizes, maps each size to the layout whose prepared context and
+captured ladder it shares, describes a request slot's storage, and places a
+request's solver samples in latent pool pages (``SamplePages``).
+"""
 
 from __future__ import annotations
 
@@ -76,11 +82,17 @@ class MediaBuilder:
         self.denoiser = denoiser
         self.num_steps = denoiser.num_steps
         # State descriptions per layout. Describing one builds the layout's
-        # packing, which costs milliseconds of host time; layouts are a small
-        # finite set bounded by the admitted frame and prompt capacity.
+        # packing on the host, so each is cached; layouts are a small finite
+        # set bounded by the admitted frame and prompt capacity.
         self._states: dict[object, Mapping[str, BufferConfig]] = {}
 
     def size(self, num_frames: int, num_text_tokens: int):
+        """Return the denoiser's exact size for an admitted request.
+
+        Raises:
+            ValueError: The size exceeds the admitted maximum frame count or
+                prompt length.
+        """
         size = self.denoiser.make_size(num_frames, num_text_tokens)
         if (
             size.num_frames > self.maximum.num_frames
@@ -122,6 +134,8 @@ class MediaBuilder:
             _aligned(math.prod(self.denoiser.latent_shape(name, self.maximum)))
             for name in names
         )
+        # Round the per-page share up to the alignment, then count the pages
+        # that share actually needs (at most ``REQUEST_PAGES``).
         page_units = _aligned(-(-capacity // REQUEST_PAGES))
         return SamplePages(page_units, -(-capacity // page_units), dtypes.pop())
 

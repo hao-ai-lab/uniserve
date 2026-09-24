@@ -1,4 +1,13 @@
-"""Translate numerical output layouts into bounded protocol products."""
+"""Translate numerical output layouts into bounded protocol products.
+
+Models describe each output as an ``OutputLayout`` (global shape, torch dtype,
+this rank's slice, variable axes). The worker reports products to the engine
+as ``OutputInfo`` values in ``ComponentInfo.outputs``, with a protocol
+``DType`` and a ``ShapeBound``. This module owns that translation, the
+protocol names of media products, and the ``encoded_units`` product the host
+video encoder publishes. ``uniserve_worker.bootstrap.capacity`` and
+``uniserve_worker.bootstrap.report`` also size product storage from the result.
+"""
 
 from __future__ import annotations
 
@@ -25,6 +34,8 @@ from uniserve_worker.protocol.tensor import (
     StaticDim,
 )
 
+# Torch dtypes a product may carry on the wire. An output in any other dtype
+# is refused by ``resolve_outputs``.
 _DTYPES = {
     torch.uint8: DType.U8,
     torch.int16: DType.I16,
@@ -37,7 +48,12 @@ _DTYPES = {
 
 
 def product_name(module: nn.Module, name: str) -> str:
-    """Name a numerical modality by its downstream protocol use."""
+    """Name a numerical modality by its downstream protocol use.
+
+    A denoiser's ``video``/``audio`` outputs are latents, a video decoder's
+    ``video`` output is its decoded media units, and an audio decoder's
+    ``audio`` output is audio samples. Every other name passes through.
+    """
     if isinstance(module, Denoiser):
         return {"video": "video_latents", "audio": "audio_latents"}.get(
             name, name
@@ -57,6 +73,20 @@ def resolve_outputs(
     Local shards retain their global allocation bound so remote consumers can
     assemble them. Wire dtypes and persistent product names belong here; model
     output layouts retain only their numerical representation and placement.
+
+    Every component ``describe_components`` reports for ``model`` is
+    resolved, not only the components this rank holds.
+
+    Returns:
+        A read-only mapping from component name to its products. Components
+        that publish nothing, such as the muxer, are omitted.
+
+    Raises:
+        ValueError: An output's dtype has no protocol ``DType``, an output
+            has more than one variable axis, or the video encoder component is
+            present but the model has no ``MediaBuilder`` or no
+            ``VideoDecoder``. Errors from ``media_builder``, the capability
+            lookups, ``describe_components`` and ``output_layouts`` propagate.
     """
     from uniserve_worker.bootstrap.components import (
         VIDEO_ENCODER_COMPONENT,
@@ -104,7 +134,8 @@ def resolve_outputs(
                     "dynamic axes"
                 )
             # A variable axis becomes a device-sized bound; every other
-            # extent is a static protocol dimension.
+            # extent is a static protocol dimension. ``ShapeBound`` admits at
+            # most one ``DeviceDim``, which the check above reports by name.
             outputs.append(
                 OutputInfo(
                     name if module is None else product_name(module, name),

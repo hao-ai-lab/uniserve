@@ -25,11 +25,18 @@ class KVConditioning:
     and rotary positions are retained for the request's lifetime.
     """
 
+    # Prefix token ids per source, with a flag that is true when the branch
+    # reads the request's own conditioning KV (``cache``) in place.
     prefixes: dict[BranchSource, tuple[tuple[int, ...], bool]] = field(
         default_factory=dict
     )
+    # ``ImageBuilder.positions`` coordinates keyed by temporal position.
     positions: dict[int, torch.Tensor] = field(default_factory=dict)
+    # The request's conditioning KV as (slot, group, visible length, token
+    # capacity), from ``calls.cache_coordinates``.
     cache: tuple[int, int, int, int] = (0, 0, 0, 0)
+    # Each branch's prefix as (slot, group, materialized prefix length, token
+    # capacity); the slot is the request's own or an alternative-prefix slot.
     entries: dict[Branch, tuple[int, int, int, int]] = field(
         default_factory=dict
     )
@@ -59,9 +66,10 @@ class DiffusionState:
     ``size`` is the admitted numerical size and ``schedules`` the fixed
     schedule of every sample modality. ``guidance`` selects and combines the
     branch predictions of a denoiser evaluated once per branch, and is
-    ``None`` for a denoiser with one prediction per step. Exactly one of
-    ``kv`` and ``slot`` is set, by how the denoiser is conditioned. Accepted
-    progress and product generations belong to the request, not this state.
+    ``None`` for a denoiser with one prediction per step. ``open`` sets
+    exactly one of ``kv`` and ``slot``, by how the denoiser is conditioned.
+    Accepted progress and product generations belong to the request, not
+    this state.
     """
 
     size: Any

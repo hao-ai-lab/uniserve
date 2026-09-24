@@ -1,4 +1,30 @@
-"""Admission, execution and retirement shared by direct and IPC callers."""
+"""Admission, execution and retirement shared by direct and IPC callers.
+
+``Executor`` owns the lifetime of every batch a ``Worker`` accepts while
+borrowing the Worker's storage owners (``TensorStore``, ``KVCacheManager``,
+``LatentPool``, ``RequestPool``). Direct callers reach it through
+``Worker.submit``, ``Worker.advance`` and ``Worker.poll``; the IPC loop in
+``uniserve_worker.service.Service`` drives the same methods.
+
+``submit`` admits a batch: its id must exceed every earlier one, the
+admission queue must have room, and the buffers its ``Free`` commands name
+are revoked at once. ``_can_start_batch`` then decides whether it may start
+while earlier batches are in flight; one that may not waits in
+``_queued_batches`` until ``advance`` retries it. Starting applies the
+batch's commands and validates it (``_prepare_execution``), submits its
+physical input reads (``advance_inputs``), and launches it through
+``step.execute_batch`` once those inputs are ready. Launch also begins
+retiring its ``Finish`` and ``Free`` commands (``_retire_commands``). Once
+every pending output is ready the batch materializes its outputs, and
+``_advance_retirement`` completes the retirement behind device events.
+``poll`` consumes the result and closes the batch.
+
+Input-readiness callbacks may run on the thread that completes a
+dependency. They only enqueue the batch on ``_preparation_ready`` and call
+the Worker's completion wake when one is registered
+(``_preparation_completed``); the batch is executed later by ``advance`` on
+the worker thread.
+"""
 
 from __future__ import annotations
 
@@ -57,9 +83,10 @@ class Submission:
 def _input_producers(
     batch: Batch,
 ) -> set[tuple[RequestKey, CallId]]:
-    """Identify producers requiring extended visibility.
+    """Return the ``(request, producer call)`` of every input the batch reads.
 
-    Their values must remain visible until input acquisition.
+    Covers tensor inputs, predicates and KV inputs. Those producers' outputs
+    must stay visible until this batch has acquired its inputs.
     """
     sources = {
         (reference.request_key, reference.producer_call_id)
@@ -85,11 +112,16 @@ class Executor:
         self.queue_depth = int(worker.info.queue_depth)
         self._last_batch_id = -1
         self._last_collective_seq = -1
+        # Accepted batches by id. Insertion order is submission order, which
+        # ``_admit_batch`` makes strictly increasing by id.
         self.inflight: dict[int, BatchState] = {}
         self._handles: dict[int, Submission] = {}
         self._preparation_ready: SimpleQueue[BatchState] = SimpleQueue()
         self._executing_batches: deque[BatchState] = deque()
         self._queued_batches: deque[BatchState] = deque()
+        # Whether a component this rank owns has a communicator spanning
+        # several ranks, or the worker samples across a multi-rank sampling
+        # group; ``_can_start_batch`` then runs one batch at a time.
         self._collective_component = any(
             group.size > 1
             for binding in worker.runner.bindings.values()
@@ -120,16 +152,29 @@ class Executor:
                 self._preparation_ready.get_nowait()
 
     def _can_start_batch(self, batch: Batch) -> bool:
-        """Preserve request dependencies and distributed invocation order."""
+        """Whether ``batch`` may start given the earlier in-flight batches.
+
+        Preserves request dependencies and distributed invocation order.
+        """
         request_ids = {
             item.request_key.request_id
             for item in (*batch.calls, *batch.commands)
         }
+        # ``inflight`` iterates in increasing id and holds this batch, so the
+        # scan visits every earlier batch and stops at this one.
         for previous in self.inflight.values():
             if previous.batch_id >= batch.batch_id:
                 break
+            # A rank of a collective component must not enter a later batch's
+            # collectives while a peer is still in an earlier one, so such a
+            # rank keeps one batch in flight: it starts a batch only after
+            # every earlier one has left ``inflight``, which happens when its
+            # result is polled.
             if self._collective_component:
                 return False
+            # With several ranks, an unlaunched earlier batch blocks every
+            # later one; on a single rank it blocks only those sharing one of
+            # its requests.
             if not (previous.launched or previous.complete) and (
                 self.worker.worker_config.world_size > 1
                 or request_ids.intersection(previous.request_ids)
@@ -144,10 +189,11 @@ class Executor:
 
         Preparation resolves a product this rank produced from its own store,
         so a batch naming one cannot be prepared before the batch producing it
-        has committed. A rank that enters collectives holds one batch in
-        flight and never reaches this; a rank whose components each sit on one
-        rank overlaps preparation with execution, and only the batches that
-        read an unwritten product wait.
+        has committed. On a rank that enters collectives, ``_can_start_batch``
+        has already required every earlier batch to leave ``inflight``, so no
+        earlier producer is found; a rank whose components each sit on one rank
+        overlaps preparation with execution, and only the batches that read an
+        unwritten product wait.
         """
         return any(
             producer is not None and not producer.launched
@@ -156,9 +202,13 @@ class Executor:
         )
 
     def _start_execution(self, batch: BatchState) -> None:
-        """Submit physical inputs for the batch.
+        """Start a batch now or queue it behind earlier work.
 
-        Directly launches the batch when the inputs are ready.
+        A batch ``_can_start_batch`` refuses joins ``_queued_batches``.
+        Otherwise it advances at once: a launched batch joins
+        ``_executing_batches``, and one still waiting for its inputs registers
+        ``_preparation_completed`` for their readiness. Failures are recorded
+        on the batch through ``_fail_run`` rather than raised.
         """
         if not self._can_start_batch(batch.batch):
             self._queued_batches.append(batch)
@@ -175,9 +225,12 @@ class Executor:
             self._fail_run(batch, error)
 
     def _advance_execution(self, batch: BatchState) -> bool:
-        """Execute prepared inputs on the worker thread.
+        """Prepare and launch a batch as far as its readiness allows.
 
-        Never executes from a notification callback.
+        Returns False while the batch cannot start or its inputs are not
+        ready, and True once it has launched, completed or failed; failures
+        are recorded through ``_fail_run``. Runs on the worker thread, never
+        from a readiness callback.
         """
         if batch.complete or batch.launched:
             return True
@@ -195,9 +248,10 @@ class Executor:
         return True
 
     def _advance_batch(self, batch: BatchState) -> None:
-        """Materialize the batch's outputs once every pending one is ready.
+        """Materialize a launched batch's outputs and advance its retirement.
 
-        Also advances physical command retirement.
+        Does nothing before launch or after completion. Failures are recorded
+        through ``_fail_run``.
         """
         if batch.complete or not batch.launched:
             return
@@ -214,6 +268,9 @@ class Executor:
                 for task in output.host.tasks:
                     task.submit_if_ready()
 
+        # Outputs are materialized into wire values, and their results
+        # applied to the ``RequestPool``, only once every pending output of
+        # the batch is ready.
         if not batch.materialized:
             outputs = tuple(batch.outputs)
             if any(value is None for value in outputs):
@@ -248,9 +305,10 @@ class Executor:
         *,
         context: str = "execute",
     ) -> None:
-        """Record a classified failure and close the batch.
+        """Record a classified failure, close the batch and mark it complete.
 
-        Also wakes its waiting responses.
+        A batch that is already complete is left unchanged. A cleanup failure
+        is attached as a note to the recorded error.
         """
         if batch.complete:
             return
@@ -266,17 +324,23 @@ class Executor:
         batch.complete = True
 
     def _preparation_completed(self, batch: BatchState) -> None:
-        """Enqueue readiness before waking the IPC loop that consumes it."""
+        """Enqueue readiness before waking the IPC loop that consumes it.
+
+        May run on whichever thread completes the batch's last dependency, so
+        it only enqueues and wakes.
+        """
         self._preparation_ready.put(batch)
         if self.worker._completion_wake is not None:
             self.worker._completion_wake()
 
     def _advance_executing_batches(self) -> bool:
-        """Launch preparation-ready work.
+        """Advance one preparation-ready batch and every executing one.
 
-        Also advances executing runs in launch order.
+        Returns whether any batch made progress.
         """
         advanced = False
+        # One readiness notification per pass; a True result makes
+        # ``Service.run`` call ``advance`` again at once.
         if not self._preparation_ready.empty():
             batch = self._preparation_ready.get_nowait()
             if not batch.complete:
@@ -310,9 +374,12 @@ class Executor:
         pending inputs, CPU work, and retirement, then poll to consume the
         batch's result. A batch identity remains owned until its result is
         consumed or the Worker closes. IDs strictly increase, including after
-        completion. A full admission queue raises ResourceError; consume a
-        result before retrying. Launch preserves request dependencies and
-        distributed invocation order while independent local work can proceed.
+        completion; a repeated or lower id raises ``invalid_descriptor``. A
+        full admission queue raises ResourceError without consuming the id;
+        consume a result before retrying. Launch preserves request
+        dependencies and distributed invocation order while independent local
+        work can proceed. With ``propagate_errors``, a failure recorded during
+        submission is raised after the batch is released.
         """
         self._require_open()
         self._admit_batch(batch)
@@ -358,7 +425,10 @@ class Executor:
             self.release_buffers(freed)
 
     def advance(self) -> bool:
-        """Progress dependencies, computation and physical retirement."""
+        """Progress dependencies, computation and physical retirement.
+
+        Returns whether any batch made progress.
+        """
         self._require_open()
         self.worker.device_events.reap()
         for transport in self.worker.transports.values():
@@ -374,7 +444,12 @@ class Executor:
         return advanced
 
     def poll(self, submission: Submission) -> BatchOutput | None:
-        """Consume the batch's result without launching computation."""
+        """Consume the batch's result without launching computation.
+
+        Returns None while the batch is not ready. Otherwise the batch is
+        released and its output returned, or its recorded error raised. A
+        handle this Worker does not own raises ``invalid_descriptor``.
+        """
         self._require_open()
         state = self.inflight.get(submission.batch_id)
         if (
@@ -401,13 +476,14 @@ class Executor:
         return output
 
     def _execute_batch(self, state: BatchState) -> None:
-        """Execute prepared numerical work.
+        """Launch a prepared batch and release what its launch consumed.
 
-        Retains the work's physical retirement facts.
+        Afterwards the batch is marked launched and its command retirement
+        begins (``_retire_commands``).
         """
         batch = state.batch
-        # Cooperative ranks launch computation in the same order. Preparation
-        # and host completion may overlap; neither retains old batch identities.
+        # Cooperative ranks launch computation in increasing
+        # ``collective_seq``; preparation and host completion may overlap.
         if self.worker.worker_config.world_size > 1 and batch.calls:
             if batch.collective_seq <= self._last_collective_seq:
                 # Peers of an out-of-order batch are already inside the
@@ -460,6 +536,8 @@ class Executor:
                 config=self.worker.worker_config,
             )
 
+        # Predecessor outputs this batch reads are revoked only now that its
+        # inputs are acquired; ``_prepare_execution`` revoked the unread ones.
         consumed = _input_producers(batch)
         self._release_predecessors(
             tuple(
@@ -471,6 +549,8 @@ class Executor:
             )
         )
 
+        # A predicate from the call's predecessor was revoked with that call's
+        # outputs above; any other predicate is revoked by its buffer id.
         self.worker.tensor_store.release_buffers(
             tuple(
                 predicate.buffer_id
@@ -483,9 +563,10 @@ class Executor:
         self._retire_commands(state)
 
     def _prepare_execution(self, state: BatchState) -> None:
-        """Validate the batch and apply its commands.
+        """Apply the batch's commands, validate it and prepare its inputs.
 
-        Also prepares the batch's physical inputs.
+        Raises ``invalid_descriptor`` for call kinds this worker cannot
+        execute, and propagates validation and preparation failures.
         """
         batch = state.batch
         unsupported = {
@@ -536,6 +617,9 @@ class Executor:
             if slots and self.worker.decode_state is not None:
                 self.worker.decode_state.reset(slots)
 
+        # Predecessor outputs no call of this batch reads are revoked before
+        # input acquisition; ``_execute_batch`` revokes the rest after launch.
+        # Batch id zero is the admission root, which has no outputs.
         consumed = _input_producers(batch)
         self._release_predecessors(
             tuple(
@@ -559,7 +643,9 @@ class Executor:
     def advance_inputs(self, state: BatchState) -> None:
         """Submit ready physical reads and predicate copies.
 
-        Does not launch a model.
+        Does not launch a model. Input reads are submitted once, after every
+        storage dependency is done when the batch imports products or KV;
+        later calls only capture predicates.
         """
         if state.inputs_closed:
             return
@@ -592,9 +678,13 @@ class Executor:
         capture_predicates(state, self.worker.tensor_store)
 
     def _retire_commands(self, state: BatchState) -> None:
-        """Submit release work for the batch's commands.
+        """Begin retiring the batch's ``Finish`` and ``Free`` commands.
 
-        Retains the events and futures required by its acknowledgement.
+        Releases the closed requests' tensor-store products, cancels their
+        pending latent and KV imports, and revokes the exports of closed
+        requests and freed buffers, keeping each ``Finish``'s retained
+        buffers. What ``_advance_retirement`` must still wait for is recorded
+        on ``state``. A batch without such commands is marked retired at once.
         """
         batch = state.batch
         closed = frozenset(
@@ -602,6 +692,7 @@ class Executor:
             for command in batch.commands
             if isinstance(command, Finish)
         )
+        # Only an epoch resident on this rank has request state to retire.
         local_closed = frozenset(
             key
             for key in closed
@@ -674,9 +765,10 @@ class Executor:
         )
 
     def _record_retirement_events(self) -> tuple[torch.cuda.Event, ...]:
-        """Record tracked completion events.
+        """Record one tracked event per CUDA device in the buffer pool.
 
-        One event per CUDA device in the buffer pool.
+        When the Worker has a completion wake bound, each event schedules it
+        to run once the device work recorded before the event finishes.
         """
         events = []
         for device in self.worker.buffer_pool.devices:
@@ -690,9 +782,16 @@ class Executor:
         return tuple(events)
 
     def _advance_retirement(self, state: BatchState) -> bool:
-        """Reset retired request slots.
+        """Advance a launched batch's command retirement.
 
-        Reset happens only after every physical reader has finished.
+        Waits for the release work's events, then for every store to report
+        the closed requests and freed buffers ready, then forgets their
+        exports and retires this rank's closed request epochs. Retiring
+        submits slot-reset writes, so fresh events are recorded and a later
+        call returns True once they complete.
+
+        Returns:
+            Whether retirement has finished.
         """
         self.worker.device_events.reap()
         # A device product is held until its consumers acknowledge it. They do
@@ -754,9 +853,12 @@ class Executor:
         return not state.retirement_events
 
     def _close_batch(self, state: BatchState) -> None:
-        """Cancel unresolved acceptance.
+        """Release an owned batch whose result is consumed or abandoned.
 
-        Real CPU and GPU readers retain storage meanwhile.
+        Calls whose outputs were never materialized are cancelled in the
+        ``RequestPool``, which closes their requests. Outstanding retirement
+        events are released once complete, and ``BatchState.close`` abandons
+        inputs and outputs while physical readers keep their own leases.
         """
         pending = tuple(
             output
@@ -778,9 +880,12 @@ class Executor:
         )
 
     def _execute_prepared(self, state: BatchState) -> None:
-        """Directly execute physical inputs once.
+        """Launch a batch whose inputs are ready, then close its inputs.
 
-        Releases their preparation leases.
+        Raises ``RuntimeError`` when the inputs were already consumed, or
+        when they are not ready, in which case they stay open. Otherwise
+        ``BatchState.close_inputs`` runs after ``_execute_batch`` whether or
+        not it raises.
         """
         self._require_open()
         if state.inputs_closed:
@@ -811,9 +916,9 @@ class Executor:
         )
 
     def release_buffers(self, buffers: Sequence[BufferId]) -> None:
-        """Revoke new reads immediately.
+        """Revoke new reads of ``buffers`` in every store.
 
-        Storage owners retain existing readers.
+        Existing readers keep their leases until their last access.
         """
         self.worker.tensor_store.release_buffers(buffers)
         if self.worker.kv_cache is not None:
@@ -824,9 +929,10 @@ class Executor:
     def _release_predecessors(
         self, predecessors: tuple[tuple[RequestKey, CallId], ...]
     ) -> None:
-        """Revoke predecessor outputs.
+        """Revoke predecessor call outputs in the tensor store and KV cache.
 
-        Revocation happens after every declared consumer has acquired them.
+        Callers pass only predecessors whose declared consumers in the batch
+        have acquired them or do not read them.
         """
         self.worker.tensor_store.release_calls(predecessors)
         if self.worker.kv_cache is not None:
@@ -834,9 +940,12 @@ class Executor:
             self.worker.kv_cache.release_buffers(released)
 
     def _release_commands(self, batch: Batch) -> None:
-        """Apply Free/Finish visibility.
+        """Revoke what the batch's ``Free`` and ``Finish`` commands release.
 
-        Visibility applies before work can wait for their reusable storage.
+        Runs during preparation, before the batch can wait for the storage
+        its ``Free`` and ``Finish`` commands make reusable. Each ``Finish``
+        keeps its retained buffers, and the finished requests' KV imports are
+        cancelled.
         """
         freed = {
             command.buffer
@@ -875,9 +984,12 @@ class Executor:
     def _release_request(
         self, request_id: int, retained: frozenset[BufferId]
     ) -> None:
-        """Reset a drained request's storage.
+        """Release a drained request's storage on this rank.
 
-        Independently owned products are preserved.
+        Buffers in ``retained`` are kept; every other export and tensor-store
+        product the request owns is released with its KV imports and cache
+        state, decode state, block tables, prefix slots, media mux state and
+        latent slot.
         """
         request = self.worker.requests.peek(request_id)
         if request is not None:
@@ -930,9 +1042,12 @@ class Executor:
         *,
         retained: frozenset[BufferId] = frozenset(),
     ) -> None:
-        """Retire the exact epoch after readers drain.
+        """Retire exactly ``request_key``'s epoch on this rank.
 
-        Independent products are retained.
+        Does nothing when that epoch is not resident or is already retired.
+        The caller must have waited for its readers to drain, as
+        ``_advance_retirement`` does through the stores' ``retirement_ready``
+        checks. Buffers in ``retained`` are kept.
         """
         request = self.worker.requests.peek(request_key.request_id)
         if (

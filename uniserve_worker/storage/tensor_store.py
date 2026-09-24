@@ -1,4 +1,33 @@
-"""Bounded immutable device values with generation-safe stream lifetimes."""
+"""Bounded immutable device values with generation-safe stream lifetimes.
+
+`TensorStore` is the worker's catalog of device products: tensors that one
+call writes and later calls, other ranks, or host work read. Execution code
+in ``uniserve_worker.execution`` reserves outputs while preparing a batch,
+publishes values after the producing call runs, and commits call outputs in
+`commit_batch`. `Executor` releases products by producer call once the
+consuming batch has acquired its reads, by buffer when buffers are freed, and
+by request when requests close.
+
+Each product has a logical identity (engine, request, epoch, producer call,
+output index) plus a logical generation carried by its `TensorRef`, and one
+live `TensorRecord` that binds that identity to physical storage. Storage
+comes from one of three places:
+
+- Persistent products borrow `BufferPool` ranges through the scheduler's
+  `BufferAllocation`; this store bounds their count per device.
+- Encoder features also borrow `BufferPool` ranges, but are bounded by their
+  own entry-count and per-entry byte limits.
+- Request-relay products are single scalars in flat arenas owned here, one
+  element per (request slot, lane, dtype, field). A slot's physical
+  generation changes on every rebinding so stale handles fail validation.
+
+A record moves through reserve, producer publication, commit (only committed
+records are consumable by reference), logical release, and physical
+retirement. Retirement never synchronizes a device stream: a released record
+is reclaimed only once it has no read leases, its transfer tickets have
+retired, its transport publications have finished successfully, and its
+producer and reader CUDA events query as complete.
+"""
 
 from __future__ import annotations
 
@@ -30,7 +59,8 @@ from uniserve_worker.transport.fetch import fetch_tensor
 from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.ticket import TransferTicket
 
-# Relay slot physical generations are 32-bit tags that wrap back to one.
+# Relay slot physical generations are 32-bit tags that wrap back to one; zero
+# is the initial value of a slot that has never been bound.
 _MAX_GENERATION: Final[int] = (1 << 32) - 1
 _DEVICE_DTYPES: Final[dict[DType, torch.dtype]] = {
     DType.U8: torch.uint8,
@@ -58,7 +88,12 @@ _TORCH_DTYPE_BYTES: Final[dict[torch.dtype, int]] = {
 
 
 def device_product_storage(dtype: DType) -> tuple[str, int]:
-    """Return the concrete tensor storage used for one product dtype."""
+    """Return the concrete tensor storage used for one product dtype.
+
+    Returns:
+        The torch dtype name without its ``torch.`` prefix (for example
+        ``"bfloat16"``) and the element size in bytes.
+    """
     return _DTYPE_STORAGE[DType(dtype)]
 
 
@@ -68,7 +103,16 @@ def device_product_capacity_bytes(
     *,
     max_value_bytes: int,
 ) -> int:
-    """Return the fixed backing bound for one ``TensorStore`` owner."""
+    """Return the fixed backing bound for one ``TensorStore`` owner.
+
+    The bound is ``slot_capacity * device_count * (scalars + max_value_bytes)``
+    where ``scalars`` sums the element size of every supported product dtype.
+    Request-relay arena bytes are not included;
+    ``uniserve_worker.bootstrap.capacity`` adds them separately.
+
+    Raises:
+        ValueError: If any dimension is less than one.
+    """
     slots = int(slot_capacity)
     devices = int(device_count)
     value_bytes = int(max_value_bytes)
@@ -89,16 +133,15 @@ def _invariant(message: str) -> WorkerError:
 
 # Logical product identity:
 # (engine, request, epoch, producer call, output index).
+# The logical generation is not part of the key; `_require_locked` compares
+# the full `TensorRef` of the live record to reject stale generations.
 _ReferenceKey = tuple[int, int, int, CallId, int]
 _CallKey = tuple[RequestKey, CallId]
 _SlotStorageKey = tuple[str, tuple[int, ...], torch.dtype]
 
 
 def _reference_key(reference: TensorRef) -> _ReferenceKey:
-    """Build the logical identity whose live record validates the full.
-
-    generation.
-    """
+    """Build the logical identity of a product, excluding its generation."""
     key = reference.request_key
     return (
         int(key.engine_id),
@@ -115,7 +158,11 @@ def _device_dtype(dtype: DType) -> torch.dtype:
 
 
 def _device_shape(reference: TensorRef) -> tuple[int, ...]:
-    """Resolve a product's bounded tensor dimensions to a concrete shape."""
+    """Resolve a product's bounded tensor dimensions to a concrete shape.
+
+    Static dimensions use their extent and dynamic dimensions their upper
+    bound. A zero-dimensional product is stored as shape ``(1,)``.
+    """
     dims = tuple(
         dim.extent if isinstance(dim, StaticDim) else dim.bound
         for dim in reference.shape_bound.dims
@@ -130,9 +177,27 @@ def _event_ready(event: torch.cuda.Event | None) -> bool:
 
 @dataclass(slots=True)
 class RelaySlot:
-    """Track ownership, generation, storage shape, and relay binding for one.
+    """One scalar element of a request-relay arena and its current binding.
 
-    product slot.
+    Slots are created lazily by `TensorStore._relay_slot_locked` and persist,
+    at a fixed arena address, until `TensorStore.close`.
+
+    Attributes:
+        index: Flat element index ``request_slot * relay_depth + lane`` in
+            the arena shared by every slot of the same device, dtype, and
+            field.
+        device_name: Canonical device string of the arena.
+        generation: Physical generation, bumped on every binding and wrapped
+            at ``_MAX_GENERATION``; a `TensorRecord` whose
+            ``physical_generation`` differs is stale.
+        owner: ``binding_id`` of the record currently bound to this slot, or
+            ``None`` while free.
+        tensor: One-element view into the arena.
+        shape: Always ``(1,)``.
+        dtype: Element dtype of the arena.
+        relay_lane: ``(device, request slot, request key, call, lane)`` of the
+            call associated with this slot. It can outlive ``owner`` and is
+            cleared once the call no longer holds its lane.
     """
 
     index: int
@@ -149,7 +214,8 @@ class RelaySlot:
 class ImageMetadata:
     """Spatial dimensions and numerical value range of an immutable image.
 
-    tensor.
+    Zero height and width mean the dimensions are undeclared. ``value_range``
+    is the numerical interval of the pixel values, such as ``(-1.0, 1.0)``.
     """
 
     height: int = 0
@@ -180,9 +246,20 @@ class FeatureMetadata:
 
 @dataclass(slots=True)
 class TensorRecord:
-    """One table-issued physical binding retained through producer.
+    """One store-issued binding of a logical product to physical storage.
 
-    submission.
+    Records are issued by `TensorStore` and act as handles. Store methods that
+    accept a record revalidate it with ``_require_write_locked``, so a record
+    that has been retired, or whose relay slot was rebound, raises an
+    invariant error instead of touching reused storage; `abandon_writes`
+    skips such records instead.
+
+    ``binding_id`` is unique within the store and keys its record table.
+    ``physical_generation`` is the `BufferBinding.binding_id` for
+    persistent storage or the `RelaySlot.generation` for relay storage.
+    ``tensor`` has ``shape``. For a shard, ``shape`` is that of ``region``
+    within ``logical_shape`` until `TensorStore.complete_import` expands the
+    record to the full tensor.
     """
 
     reference: TensorRef
@@ -195,14 +272,19 @@ class TensorRecord:
     relay_slot: RelaySlot | None = None
     feature: bool = False
 
-    # Lifecycle: reserved, published by its producer, committed for logical
-    # consumption, logically released, then physically retired.
+    # Lifecycle: reserved, published by its producer (`producer_recorded`),
+    # committed for logical consumption, logically released, then physically
+    # retired. Release may precede retirement.
     retired: bool = False
-    # Publication exposes the logical product; release may precede retirement.
+    # Only committed records resolve through `TensorStore._require_locked`,
+    # which every by-reference read uses.
     committed: bool = False
 
     region: tuple[slice, ...] | None = None
     logical_shape: tuple[int, ...] | None = None
+    # Transfer tickets that write into this storage and transport
+    # publications that expose it; the record is not reclaimed until every
+    # ticket has retired and every publication has finished successfully.
     transfers: tuple[TransferTicket, ...] = ()
     publications: tuple[Future[None], ...] = ()
 
@@ -215,8 +297,11 @@ class TensorRecord:
     # A deferred write is produced by host work after its call is committed;
     # it is published and committed when that work completes.
     deferred: bool = False
+    # One event or a deduplicated list; each attached event holds one
+    # `EventPool` reference for this record until reclamation.
     reader_events: torch.cuda.Event | list[torch.cuda.Event] | None = None
     released: bool = False
+    # Whether the record is listed in the store's per-call release index.
     _indexed: bool = False
 
     # Extent actually published by the producer, bounded by the reserved shape.
@@ -227,9 +312,12 @@ class TensorRecord:
 
 @dataclass(slots=True)
 class TensorRead:
-    """One generation-validated device read retained until its stream.
+    """One generation-validated device read lease on a `TensorRecord`.
 
-    snapshots it.
+    The lease keeps the record's storage from being reclaimed until
+    `TensorStore.complete_reads` fences it on the consuming stream. ``tensor``
+    is the published extent, or the import destination for an imported read.
+    ``consumer_call_id`` is ``None`` for imports.
     """
 
     tensor: torch.Tensor
@@ -245,9 +333,13 @@ class TensorRead:
 
 @dataclass(slots=True)
 class TensorImport:
-    """One shared fill of missing immutable regions, retained by consumer.
+    """One shared fill of a product's missing regions from transfer sources.
 
-    reads.
+    Concurrent imports of the same product share one instance; ``users``
+    counts the `TensorRead` leases holding it, and the last completed read
+    drops it. ``committed`` becomes true once the destination holds complete
+    coverage that the store has adopted, or at creation when the product was
+    already fully resident.
     """
 
     write: TensorRecord
@@ -264,6 +356,16 @@ class TensorStore:
     Registration, lookup, stream waits, reader recording, release, and
     reclamation all validate the exact logical and physical generation here.
     Reclamation only queries events; it never synchronizes a device stream.
+
+    Reclamation is opportunistic: it runs when outputs are bound, when
+    buffers or requests are released, from transfer-ticket retirement
+    callbacks, and from `retirement_ready` and `abandon_writes`. One
+    reentrant lock guards all tables; the retirement callbacks also take it.
+
+    Three bounds are independent: ``capacity`` limits resident (not yet
+    reclaimed) generic persistent products per device, ``entry_capacity``
+    and ``max_entry_bytes`` limit encoder features, and ``byte_capacity``
+    limits relay-arena bytes, the only storage this store allocates itself.
     """
 
     def __init__(
@@ -279,11 +381,33 @@ class TensorStore:
         buffer_pool: BufferPool,
         event_pool: EventPool | None = None,
     ) -> None:
-        """Initialize bounded product registries, relay arenas, and event.
+        """Initialize empty product registries and validate every bound.
 
-        ownership.
+        Relay arenas are allocated lazily, on first use of each device, dtype,
+        and field.
+
+        Args:
+            capacity: Resident generic persistent products per device.
+            byte_capacity: Bound on relay-arena bytes; defaults to the
+                `BufferPool` byte capacity.
+            entry_capacity: Resident encoder features across all devices.
+            max_entry_bytes: Largest ``max_bytes`` of one encoder feature.
+            devices: Devices on which encoder features may be reserved.
+            request_capacity: Request slots; relay request slots are
+                one-based, ``1..request_capacity``.
+            relay_depth: Relay lanes per request slot, each held by one call
+                at a time. Zero together with a zero ``request_capacity``
+                disables request relays.
+            buffer_pool: Borrowed owner of persistent product storage.
+            event_pool: Borrowed owner of CUDA events; a private pool is
+                created when omitted.
+
+        Raises:
+            ValueError: If a capacity or request-relay dimension is negative,
+                ``max_entry_bytes`` or the byte capacity is less than one, or
+                exactly one of the request-relay dimensions is zero.
         """
-        # Validate independent slot-byte capacity and the coupled request-relay
+        # Validate the independent capacities and the coupled request-relay
         # dimensions before creating any registries.
         self.capacity = int(capacity)
         self.entry_capacity = int(entry_capacity)
@@ -312,15 +436,18 @@ class TensorStore:
         if self.request_capacity < 0 or self.relay_depth < 0:
             raise ValueError("request-relay dimensions must not be negative")
 
-        # Storage pools are partitioned by device and tensor shape; relay
-        # arenas reserve stable request/lane addresses for graph capture.
+        # One flat relay arena per (device, dtype, field index), holding one
+        # element per (request slot, lane). Arenas are never reallocated, so
+        # each relay slot keeps a fixed address until `close`.
+        # `_allocated_bytes` counts only these arenas.
         self._allocated_bytes = 0
         self._relay_arenas: dict[
             tuple[str, torch.dtype, int], torch.Tensor
         ] = {}
-        # Group fields by physical lane so allocation and retirement
-        # inspect only this request's owners, independently of other
-        # admitted requests.
+        # Relay slots keyed by lane (device, request slot, lane), then by
+        # (dtype, field index), so lane occupancy checks inspect only this
+        # request slot's fields. `_relay_call_lanes` records the lane each
+        # call holds until every field of that lane is unowned.
         self._relay_slots: dict[
             tuple[str, int, int], dict[tuple[torch.dtype, int], RelaySlot]
         ] = {}
@@ -329,8 +456,13 @@ class TensorStore:
         ] = {}
 
         # Both reserved and committed products retain their logical identity
-        # until physical retirement. Only committed records are consumable.
-        # Physical handles are validated independently of logical publication.
+        # in `_products` until physical retirement. Only committed records are
+        # consumable. `_writes` holds the same records by `binding_id`;
+        # `_require_write_locked` validates physical handles against it
+        # independently of logical publication.
+        # `exports` maps each buffer this store's products were published
+        # under to its transport registrations (see
+        # `uniserve_worker.transport.exports`); execution code fills it.
         self.event_pool = EventPool() if event_pool is None else event_pool
         self._products: dict[_ReferenceKey, TensorRecord] = {}
         self._writes: dict[int, TensorRecord] = {}
@@ -344,9 +476,13 @@ class TensorStore:
         self._lock = RLock()
 
     def resident_bytes(self, device: torch.device | str) -> int:
-        """Return retained backing bytes on a device, counting shared arenas.
+        """Return retained backing bytes on a device.
 
-        once.
+        Counts each backing storage once: relay arenas and the storage viewed
+        by every resident record. A resident persistent record contributes
+        the whole `BufferPool` arena storage it views, and CUDA arenas from
+        ``uniserve_kernels.peer_storage.empty`` report their page-rounded
+        size.
         """
         name = str(torch.device(device))
         with self._lock:
@@ -374,9 +510,10 @@ class TensorStore:
             return sum(storage.nbytes() for storage in storages.values())
 
     def close(self) -> None:
-        """Release all resident product slots, events, relay storage.
+        """Drop every record, import, export, and relay arena this store holds.
 
-        and persistent bindings.
+        This does not return bindings to `BufferPool` or event references to
+        `EventPool`; the worker closes both owners after this store.
         """
         with self._lock:
             self.exports.clear()
@@ -395,10 +532,7 @@ class TensorStore:
         return int(math.prod(shape)) * _TORCH_DTYPE_BYTES[dtype]
 
     def _require_byte_capacity_locked(self, projected: int) -> None:
-        """Reject a projected persistent allocation.
-
-        above the configured byte capacity.
-        """
+        """Reject a projected relay-arena total above the byte capacity."""
         if projected > self.byte_capacity:
             raise resource_error(
                 f"device-product byte capacity is exhausted "
@@ -414,7 +548,31 @@ class TensorStore:
         regions: Mapping[TensorRef, tuple[slice, ...]] | None = None,
         shapes: Mapping[TensorRef, tuple[int, ...]] | None = None,
     ) -> tuple[TensorRecord, ...]:
-        """Atomically bind outputs and retain their direct scalar range."""
+        """Reserve storage for one group of outputs, all or none.
+
+        A group binds either entirely to persistent storage, when every
+        output's ``buffer_id`` has an entry in ``buffer_allocations``, or
+        entirely to request-relay scalars addressed by ``request_slots``.
+        Reserved records are neither published nor committed.
+
+        Args:
+            bindings: Each output reference and the device that produces it.
+            request_slots: One-based request slot of each request, used
+                by relay outputs.
+            buffer_allocations: Scheduler placements of persistent outputs.
+            regions: Shard region of an output within its logical shape.
+                Validated for every output; only persistent outputs use it.
+            shapes: Logical shape overriding the shape bound of an output.
+                Validated for every output; only persistent outputs use it.
+
+        Returns:
+            One record per binding, in order.
+
+        Raises:
+            WorkerError: If shapes, regions, placements, or identities are
+                invalid, or a capacity is exhausted. Records reserved by a
+                failed call are rolled back.
+        """
         device_bindings = bindings
         if not device_bindings:
             return ()
@@ -435,6 +593,7 @@ class TensorStore:
                 raise invalid_descriptor(
                     "tensor binding region disagrees with its logical bounds"
                 )
+
         # Allocation records select physical ownership. Tensor identity carries
         # no semantic role or duplicate storage-class tag.
         persistent = tuple(
@@ -443,8 +602,8 @@ class TensorStore:
             for reference, _device in device_bindings
         )
         if any(persistent):
-            # Persistent and generic storage have independent lifetimes, so one
-            # group may not mix them.
+            # The whole group goes to one binder, so persistent and
+            # request-relay outputs cannot share a group.
             if not all(persistent):
                 raise invalid_descriptor(
                     "persistent-buffer bindings cannot share a generic group"
@@ -468,9 +627,14 @@ class TensorStore:
         regions: Mapping[TensorRef, tuple[slice, ...]] | None = None,
         shapes: Mapping[TensorRef, tuple[int, ...]] | None = None,
     ) -> tuple[TensorRecord, ...]:
-        """Reserve features against their independent global entry and byte.
+        """Reserve encoder features in persistent storage.
 
-        bounds.
+        Features count against ``entry_capacity`` and ``max_entry_bytes``
+        instead of the per-device product capacity, must use a floating-point
+        dtype, and must target a device the store was constructed with. The
+        arguments mean the same as in `bind_outputs`, but every output needs
+        a buffer allocation and shapes and regions are not checked against
+        the shape bounds here.
         """
         return self._bind_persistent_outputs(
             bindings, buffer_allocations, regions, shapes, feature=True
@@ -485,9 +649,14 @@ class TensorStore:
         *,
         feature: bool = False,
     ) -> tuple[TensorRecord, ...]:
-        """Reserve scheduler placements without a second persistent-slot.
+        """Bind outputs to the `BufferPool` ranges of their allocations.
 
-        allocator.
+        This store rejects repeated or registered identities and missing
+        allocations and enforces its count bounds (and, for features, the
+        dtype, byte, and device limits); `BufferPool.bind` validates and
+        places each allocation, first-fit when the pool is compact. On any
+        failure every binding made by this call is released and no record
+        remains.
         """
         keys = tuple(
             _reference_key(reference) for reference, _device in bindings
@@ -518,6 +687,8 @@ class TensorStore:
                     "encoder cache has no query-ready entry capacity"
                 )
 
+            # Validate every output and count it against its bound before
+            # binding any placement.
             for (reference, raw_device), key in zip(
                 bindings, keys, strict=True
             ):
@@ -558,6 +729,7 @@ class TensorStore:
                             f"device-product arena for {name} has no "
                             "query-ready free generation"
                         )
+
             writes: list[TensorRecord] = []
             try:
                 for (reference, raw_device), key in zip(
@@ -639,9 +811,22 @@ class TensorStore:
         bindings: tuple[tuple[TensorRef, torch.device | str], ...],
         request_slots: Mapping[RequestKey, int],
     ) -> tuple[TensorRecord, ...]:
-        """Bind product references to stable request-and-lane relay slots.
+        """Bind scalar outputs to request-relay slots.
 
-        for graph-safe output.
+        All outputs of one call on one device and request slot share a lane:
+        the lane the call already holds, or the first lane of that request
+        slot with no bound field. Within the lane, outputs of the same dtype
+        take consecutive field indices from zero in binding order. Each
+        binding bumps its slot's physical generation.
+
+        Raises:
+            WorkerError: If request relays are disabled; an output is not a
+                single element, has no request slot or one outside
+                ``1..request_capacity``, has a non-positive logical
+                generation, or repeats or reuses a registered identity; the
+                request slot has no free lane; the arena byte bound would be
+                exceeded; or relay bookkeeping is inconsistent. Records
+                reserved by a failed call are rolled back.
         """
         if self.request_capacity < 1 or self.relay_depth < 1:
             raise resource_error("worker has no request-relay arena")
@@ -688,6 +873,7 @@ class TensorStore:
             raise invalid_descriptor(
                 "request-relay registration repeats an output identity"
             )
+
         with self._lock:
             self._reclaim_ready_locked()
             for (reference, _device, _slot, _dtype, _field), key in zip(
@@ -820,9 +1006,15 @@ class TensorStore:
         field: int,
         call: tuple[str, int, RequestKey, CallId],
     ) -> RelaySlot:
-        """Resolve or create one stable scalar relay slot inside.
+        """Resolve or create one scalar relay slot and associate it with a call.
 
-        its shape-specific arena.
+        Creating the first slot of a (device, dtype, field) allocates that
+        arena, charged against ``byte_capacity``. The caller must hold the
+        store lock and still has to check the slot's ``owner``.
+
+        Raises:
+            WorkerError: If the arena would exceed ``byte_capacity``, or the
+                slot is still associated with a different call.
         """
         device_name = str(device)
         lane_key = (device_name, request_slot, lane)
@@ -833,14 +1025,16 @@ class TensorStore:
             arena_key = (device_name, dtype, int(field))
             arena = self._relay_arenas.get(arena_key)
             if arena is None:
-                # Every (request_slot, lane) pair of this storage class shares
-                # one flat arena so each slot keeps a fixed device address that
-                # captured graphs can target.
+                # Every (request_slot, lane) pair of this dtype and field shares
+                # one flat arena. Request slots are one-based and index rows
+                # directly, so row zero is never bound.
                 elements = (self.request_capacity + 1) * self.relay_depth
                 projected = (
                     self._allocated_bytes + elements * _TORCH_DTYPE_BYTES[dtype]
                 )
                 self._require_byte_capacity_locked(projected)
+                # CUDA arenas use exportable peer storage, like the
+                # `BufferPool` arenas.
                 if device.type == "cuda":
                     from uniserve_kernels.peer_storage import empty
 
@@ -872,9 +1066,10 @@ class TensorStore:
         self,
         call: tuple[str, int, RequestKey, CallId],
     ) -> None:
-        """Release the stable relay-lane association for one completed.
+        """Drop a call's lane association once no field of that lane is owned.
 
-        call.
+        The association is kept while any field of the lane still has an
+        owner, so later outputs of the same call keep using the same lane.
         """
         lane = self._relay_call_lanes.get(call)
         if lane is None:
@@ -894,9 +1089,12 @@ class TensorStore:
         regions: Mapping[TensorRef, tuple[slice, ...]] | None = None,
         shapes: Mapping[TensorRef, tuple[int, ...]] | None = None,
     ) -> tuple[tuple[TensorRecord, ...], ...]:
-        """Atomically bind output groups while preserving direct producer.
+        """Bind several output groups, all or none.
 
-        ranges.
+        Each non-empty group goes through `bind_outputs` with the shared
+        arguments; empty groups are skipped and produce no entry in the
+        result. If any group fails, the records of earlier groups are
+        abandoned before the error propagates.
         """
         bindings: list[tuple[TensorRecord, ...]] = []
         with self._lock:
@@ -923,7 +1121,11 @@ class TensorStore:
         self,
         writes: tuple[TensorRecord, ...],
     ) -> tuple[torch.Tensor, ...]:
-        """Return unpublished tensors from table-issued physical bindings."""
+        """Return the reserved storage views that producers write into.
+
+        Raises:
+            WorkerError: If a record is stale or already published.
+        """
         if not writes:
             return ()
         with self._lock:
@@ -946,9 +1148,19 @@ class TensorStore:
         producer_event: torch.cuda.Event | None = None,
         metadata: ImageMetadata | FeatureMetadata | None = None,
     ) -> torch.Tensor:
-        """Commit a tensor into a reserved product slot with producer-stream.
+        """Publish a value into a reserved record.
 
-        synchronization.
+        Encoder features require `FeatureMetadata` and are cast to their
+        storage dtype; any other record rejects `FeatureMetadata`. The record
+        becomes consumable only after `commit_writes`.
+
+        Returns:
+            The storage view holding the value, shaped like ``value``.
+
+        Raises:
+            WorkerError: If the record is stale or already published, the
+                metadata does not match the record kind, or the value's dtype
+                or shape disagrees with the reservation.
         """
         with self._lock:
             entry = self._require_write_locked(write)
@@ -975,9 +1187,15 @@ class TensorStore:
         *,
         producer_event: torch.cuda.Event | None,
     ) -> torch.Tensor:
-        """Copy a value into a reserved slot and transfer readiness-event.
+        """Copy a value into a reserved record and record its producer event.
 
-        ownership.
+        A shard record requires exactly its region's shape; any other record
+        accepts a shape within its logical bound and stores it as a prefix of
+        the flattened storage. On CUDA the copy is enqueued on the current
+        stream. Without a supplied ``producer_event``, a pooled event is
+        recorded after the copy; a supplied event is only bound to the
+        current stream, so ordering it after the copy is the caller's
+        obligation. The record holds one `EventPool` reference to the event.
         """
         if entry.producer_recorded:
             raise _invariant("device product was published more than once")
@@ -1045,7 +1263,16 @@ class TensorStore:
         *,
         producer_event: torch.cuda.Event | None = None,
     ) -> tuple[torch.Tensor, ...]:
-        """Publish table-issued scalar bindings with one completion event."""
+        """Publish one scalar per record from a single values tensor.
+
+        ``values`` flattens to exactly one element per record, in order. All
+        records must be single-element and share one device and dtype; one
+        producer event covers the whole batch. Validation happens before any
+        copy, so a rejected batch publishes nothing.
+
+        Returns:
+            The single-element storage view of each record.
+        """
         if not writes:
             return ()
         with self._lock:
@@ -1065,10 +1292,7 @@ class TensorStore:
         *,
         producer_event: torch.cuda.Event | None,
     ) -> tuple[torch.Tensor, ...]:
-        """Publish aligned tensor values atomically across a reserved write.
-
-        batch.
-        """
+        """Scatter one scalar per record and share one producer event."""
         flat = values.detach().reshape(-1)
         if int(flat.numel()) != len(entries):
             raise invalid_descriptor(
@@ -1133,7 +1357,15 @@ class TensorStore:
         *,
         producer_event: torch.cuda.Event | None = None,
     ) -> torch.Tensor:
-        """Commit one boolean or integer into a reserved scalar product slot."""
+        """Publish one host boolean or integer into a reserved record.
+
+        The value fills only the record's first element, and the record
+        reports a published shape of ``(1,)``. The record becomes consumable
+        only after `commit_writes`.
+
+        Returns:
+            The single-element storage view.
+        """
         with self._lock:
             entry = self._require_write_locked(write)
             return self._publish_scalar_locked(
@@ -1149,10 +1381,7 @@ class TensorStore:
         *,
         producer_event: torch.cuda.Event | None,
     ) -> torch.Tensor:
-        """Store one host scalar in its reserved device slot and mark the write.
-
-        visible.
-        """
+        """Fill a record's first element and record its producer event."""
         if entry.producer_recorded:
             raise _invariant("device product was published more than once")
         tensor = entry.tensor
@@ -1181,9 +1410,9 @@ class TensorStore:
         consumer_call_id: CallId,
         device: torch.device | str | None = None,
     ) -> TensorRead:
-        """Acquire a generation-safe read of a published product on.
+        """Acquire a read lease on one committed product.
 
-        the consumer device.
+        See `consume_batch` for the contract.
         """
         return self.consume_batch(((reference, consumer_call_id, device),))[0]
 
@@ -1196,13 +1425,37 @@ class TensorStore:
         *,
         device: torch.device | str | None = None,
     ) -> tuple[TensorRead, ...]:
-        """Resolve exact generations and enqueue each producer event once.
+        """Acquire read leases on committed products for consuming calls.
 
-        per stream.
+        Each reference must name a committed, published, unreleased product
+        with its exact logical generation. On CUDA the current stream of the
+        consumer device waits on each distinct producer event once; the wait
+        is skipped when one event covers the batch and every product was
+        produced on the consumer's current stream. No data moves: the
+        consumer device must be the product's device.
+
+        Every returned read holds a lease that blocks reclamation until the
+        caller passes it to `complete_reads`.
+
+        Args:
+            requests: Each reference, its consuming call, and an optional
+                consumer device. With ``device`` set, a per-request device
+                must be absent or equal to it.
+            device: Shared consumer device for the whole batch.
+
+        Returns:
+            One read per request, in order, viewing the published extent.
+
+        Raises:
+            WorkerError: If a reference is unknown, uncommitted, stale,
+                released, or unpublished, or names a different device. No
+                lease is taken when any request fails validation.
         """
         if not requests:
             return ()
         shared_target = None if device is None else canonical_device(device)
+
+        # Shared-device batch: every product must live on `device`.
         if shared_target is not None:
             target_name = str(shared_target)
             with self._lock:
@@ -1237,6 +1490,8 @@ class TensorStore:
                         raise invalid_descriptor(
                             "device product consumer names a different device"
                         )
+                    # A producer may publish less than the reserved shape;
+                    # the read views only the published prefix.
                     tensor = (
                         storage
                         if entry.actual_shape == entry.shape
@@ -1299,6 +1554,8 @@ class TensorStore:
                     )
                     for entry, tensor, consumer_call_id in shared_resolved
                 )
+
+        # Per-request batch: each read defaults to its product's own device.
         assert shared_target is None
         with self._lock:
             resolved: list[
@@ -1394,9 +1651,27 @@ class TensorStore:
         device: torch.device | str | None = None,
         after_writes: tuple[TensorRecord, ...] = (),
     ) -> None:
-        """End read leases only after their consumer completion fences are.
+        """Fence reads on their consuming streams, then end their leases.
 
-        installed.
+        Call this after the consumer's work on each read has been enqueued on
+        the current stream. Each CUDA read gets a reader event that the
+        record keeps until reclamation: the producer event of the consuming
+        call's output in ``after_writes`` when that output was produced on
+        the current stream, otherwise an event recorded now. Reads already
+        completed are skipped.
+
+        Completing the last read of an import also drops the shared import:
+        its tickets are cancelled if the import was never adopted, every
+        ticket is closed, and a still-unpublished destination is abandoned.
+
+        Args:
+            reads: Leases returned by `consume_batch` or `import_tensor`.
+            device: Device every read must be on, when known.
+            after_writes: Outputs of the consuming calls. When it has one
+                entry per read and every pair shares the read's device and
+                consumer call (and, on CUDA, the current stream), each read
+                is fenced by its pair; otherwise published outputs are
+                matched to reads by consumer call.
         """
         with self._lock:
             pending = tuple(read for read in reads if not read._recorded)
@@ -1414,8 +1689,9 @@ class TensorStore:
                 if imported is not None:
                     imported.users -= 1
                     if imported.users == 0:
-                        # The last user drops the shared materialization and
-                        # cancels or closes its tickets.
+                        # The last user drops the shared materialization,
+                        # cancels its tickets unless it was adopted, and
+                        # closes them.
                         self._imports.pop(_reference_key(entry.reference))
                         for ticket in imported.tickets:
                             if not imported.committed:
@@ -1435,9 +1711,10 @@ class TensorStore:
         device: torch.device | str | None = None,
         after_writes: tuple[TensorRecord, ...] = (),
     ) -> None:
-        """Fence reads with a later output write or one event per consuming.
+        """Attach a reader event to each read's record on its consuming stream.
 
-        stream.
+        Reads on non-CUDA devices need no fence. See `complete_reads` for the
+        fence selection.
         """
         if not reads:
             return
@@ -1561,12 +1838,12 @@ class TensorStore:
                             )
                 return
 
+            # No declared device: group reads by their tensor's device and
+            # fence each device independently.
             grouped: dict[
                 str,
                 tuple[torch.device, list[tuple[TensorRead, TensorRecord]]],
             ] = {}
-            # No declared device: group reads by their tensor's device and
-            # fence each device independently.
             for read in reads:
                 entry = self._require_read_locked(read)
                 target = read.tensor.device
@@ -1612,9 +1889,11 @@ class TensorStore:
         self,
         releases: Iterable[tuple[RequestKey, CallId]],
     ) -> None:
-        """Release all product ownership associated with completed call.
+        """Logically release every committed product of the given calls.
 
-        identities.
+        Released products reject new reads. Their storage is reclaimed by a
+        later reclamation pass once their leases, tickets, publications, and
+        events have retired; this method does not run one.
         """
         with self._lock:
             for request_key, raw_call_id in releases:
@@ -1627,8 +1906,8 @@ class TensorStore:
                     else (() if call_writes is None else (call_writes,))
                 )
 
-                # A committed product not indexed under its call is still
-                # reachable through its logical identity at output index zero.
+                # Also release the call's output-zero product when it is
+                # committed but absent from the call index.
                 direct_key = (
                     int(request_key.engine_id),
                     int(request_key.request_id),
@@ -1653,9 +1932,11 @@ class TensorStore:
                     entry.released = True
 
     def release_buffers(self, buffers: Iterable[BufferId]) -> None:
-        """Revoke exact buffer identities and preserve all active physical.
+        """Revoke exports and logically release records of the given buffers.
 
-        leases.
+        Existing read leases, tickets, and publications keep their storage
+        until they retire; when any buffer is given, a reclamation pass runs
+        before returning.
         """
         selected = set(buffers)
         release_exports(self.exports, selected)
@@ -1673,9 +1954,14 @@ class TensorStore:
         *,
         retained: frozenset[BufferId] = frozenset(),
     ) -> None:
-        """Revoke request-owned products while preserving transferred.
+        """Logically release every record of the given requests.
 
-        allocation ownership.
+        Records whose buffer is in ``retained`` are left live; only persistent
+        records can be retained. When any request is given, a reclamation
+        pass runs before returning.
+
+        Raises:
+            WorkerError: If ``retained`` names the buffer of a relay record.
         """
         selected = set(requests)
         if not selected:
@@ -1699,9 +1985,16 @@ class TensorStore:
         requests: frozenset[RequestKey],
         retained: frozenset[BufferId] = frozenset(),
     ) -> bool:
-        """Confirm selected allocations have returned after every physical.
+        """Return whether the selected records have all been reclaimed.
 
-        reader.
+        Selects records of ``buffers`` and records of ``requests`` whose
+        buffer is not in ``retained``. Runs a reclamation pass first.
+
+        Raises:
+            WorkerError: If a selected record's transfer ticket cannot report
+                physical completion.
+            Exception: The failure of a finished transport publication of a
+                selected record.
         """
         with self._lock:
             for entry in tuple(self._writes.values()):
@@ -1709,6 +2002,9 @@ class TensorStore:
                     entry.reference.request_key in requests
                     and entry.reference.buffer_id not in retained
                 ):
+                    # Raise for a transfer whose physical completion is
+                    # unknown and for a failed publication; a failed
+                    # publication otherwise blocks reclamation indefinitely.
                     for transfer in entry.transfers:
                         transfer.retirement_ready()
                     for publication in entry.publications:
@@ -1729,13 +2025,19 @@ class TensorStore:
         self._detach_write_locked(entry)
         entry.released = True
         self._wake_retirement_locked(entry)
-        # Transfers into a never-published destination can never complete.
+        # Transfers still filling a never-published destination are
+        # cancelled; each ticket keeps the storage until it retires.
         if not entry.producer_recorded:
             for transfer in entry.transfers:
                 transfer.cancel()
 
     def _wake_retirement_locked(self, entry: TensorRecord) -> None:
-        """Schedule a reclamation wake on each event still guarding an entry."""
+        """Schedule a completion wake on each incomplete event of an entry.
+
+        When a completion wake is installed (`Worker.set_completion_wake`),
+        the `EventPool` wake rouses the worker's result polling once the event
+        completes, so a later pass can reclaim the entry.
+        """
         readers = entry.reader_events
         events = (
             entry.producer_event,
@@ -1754,9 +2056,11 @@ class TensorStore:
     def retain_publication(
         self, write: TensorRecord, retirement: Future[None]
     ) -> None:
-        """Keep a published pool range immutable until its transport.
+        """Block reclamation of a record until a transport publication retires.
 
-        registration retires.
+        ``retirement`` completes when the transport registration exposing
+        the record's storage has retired. Publications that finished
+        successfully are pruned from the record here.
         """
         with self._lock:
             entry = self._require_write_locked(write)
@@ -1772,9 +2076,14 @@ class TensorStore:
     def retain_transfer(
         self, write: TensorRecord, ticket: TransferTicket
     ) -> None:
-        """Guard a reserved destination until its backend finishes physical.
+        """Block reclamation of an unpublished record until a transfer retires.
 
-        access.
+        The record is the destination of ``ticket``. A reclamation pass runs
+        when the ticket retires.
+
+        Raises:
+            WorkerError: If the record is stale, already published, or
+                released.
         """
         with self._lock:
             entry = self._require_write_locked(write)
@@ -1791,9 +2100,11 @@ class TensorStore:
         ticket.add_retirement_callback(reclaim)
 
     def abandon_writes(self, writes: tuple[TensorRecord, ...]) -> None:
-        """Return unpublished reserved writes without creating resident.
+        """Release reserved records that will not be committed.
 
-        products.
+        Records that are already stale are skipped. Each remaining record is
+        marked released, and storage without pending leases, tickets,
+        publications, or events is reclaimed before returning.
         """
         with self._lock:
             for write in writes:
@@ -1817,9 +2128,33 @@ class TensorStore:
     ) -> TensorRead:
         """Borrow resident coverage and fetch only missing immutable regions.
 
-        A shard can be expanded in place only when its scheduler reservation
-        contains the full logical tensor. Compact shard reservations remain
-        valid producer storage but cannot serve a full local consumer.
+        An import of a product that already has a pending import shares it.
+        A committed, fully resident product needs no fetch. A committed shard
+        fetches the rest of the logical tensor around itself; this requires
+        that its scheduler reservation contains the full logical tensor and
+        that no earlier transfer into it is still unretired. Compact shard
+        reservations remain valid producer storage but cannot serve a full
+        local consumer. Without a committed product, a new record is reserved
+        (as an encoder feature when ``metadata`` is `FeatureMetadata`) and
+        the whole tensor is fetched.
+
+        Fetches are only submitted here. Once every ticket is ready, the
+        caller either orders its consumer with `wait_import` or adopts the
+        result with `complete_import`, which also waits, and ends the lease
+        with `complete_reads`.
+
+        Returns:
+            A read lease on the destination, which has ``tensor.shape``.
+
+        Raises:
+            WorkerError: If the import conflicts with a pending import or
+                with the resident product's generation, state, device,
+                metadata, shape, or dtype; if a resident shard's storage
+                cannot hold the full tensor or still has unretired
+                transfers; or if reservation fails. Errors from submitting
+                a fetch propagate unchanged. A failed call releases its
+                lease, cancels and closes its tickets, and abandons a record
+                it reserved.
         """
         target_device = canonical_device(device)
         key = _reference_key(reference)
@@ -1982,9 +2317,17 @@ class TensorStore:
             )
 
     def wait_import(self, read: TensorRead) -> None:
-        """Order a prepared read after its existing producer and physical.
+        """Make the current stream wait for an import's data.
 
-        transfers.
+        Calls `TransferTicket.result` on every ticket, which makes the current
+        stream wait on the ticket's fence when it carries one, then waits on
+        the record's producer event. The caller must first observe every
+        ticket as ready;
+        `TransferTicket.result` raises otherwise, and it re-raises a failed
+        transfer.
+
+        Raises:
+            WorkerError: If ``read`` is completed or is not an import.
         """
         if read._recorded or read.imported is None:
             raise _invariant("closed or ordinary tensor read is not an import")
@@ -1995,9 +2338,14 @@ class TensorStore:
             torch.cuda.current_stream(read.tensor.device).wait_event(event)
 
     def complete_import(self, read: TensorRead) -> None:
-        """Adopt complete coverage after ordering access on the consuming.
+        """Adopt an import's complete coverage into its record.
 
-        stream.
+        Orders the current stream after the import like `wait_import`, then:
+        a freshly reserved destination is published and committed; an
+        expanded shard becomes a full-tensor record, and on CUDA its new
+        producer event is recorded on the current stream. An import already
+        adopted, including one of a fully resident product, is only waited
+        on. The read lease stays open until `complete_reads`.
         """
         self.wait_import(read)
         value = read.imported
@@ -2015,6 +2363,8 @@ class TensorStore:
             else:
                 # A new fence covers the original shard and every fetched hole.
                 # Existing read leases retain their original view and region.
+                # The previous producer event's reference is released only
+                # once that event completes, through `EventPool.defer_release`.
                 if write.producer_event is not None:
                     stream = torch.cuda.current_stream(value.tensor.device)
                     stream.wait_event(write.producer_event)
@@ -2046,9 +2396,14 @@ class TensorStore:
             entry.deferred = True
 
     def validate_writes(self, writes: tuple[TensorRecord, ...]) -> None:
-        """Verify that a write batch still refers to active unpublished.
+        """Check that a batch's records are live, uncommitted candidates.
 
-        reservations.
+        Each record must be published, or deferred to host work that will
+        publish it later.
+
+        Raises:
+            WorkerError: If a record is stale, committed, or unpublished
+                without being deferred.
         """
         with self._lock:
             for write in writes:
@@ -2061,9 +2416,15 @@ class TensorStore:
                     )
 
     def commit_writes(self, writes: tuple[TensorRecord, ...]) -> None:
-        """Make a validated set of produced candidate generations.
+        """Make published records consumable and index them by call.
 
-        addressable.
+        Deferred records that are still unpublished are skipped and commit
+        later, when their host work publishes and commits them. All checks
+        run before any record is committed.
+
+        Raises:
+            WorkerError: If a record is stale, already committed, unpublished,
+                repeated, or no longer the registered record of its identity.
         """
         if not writes:
             return
@@ -2122,11 +2483,9 @@ class TensorStore:
         """Resolve a committed product and reject stale logical generations."""
         entry = self._products.get(_reference_key(reference))
         if entry is None or not entry.committed:
-            # The identity is what distinguishes a product this rank never
-            # held from one whose producing call has not committed yet.
-            # Naming the request's committed products distinguishes a
-            # product this rank never held from one whose producing call has
-            # not committed yet, which read the same way without them.
+            # The message lists the request's committed products so that a
+            # product this rank never held can be told apart from one whose
+            # producing call has not committed yet.
             committed = sorted(
                 (key[3].batch_id, key[4])
                 for key, value in self._products.items()
@@ -2161,9 +2520,11 @@ class TensorStore:
         return self._require_write_locked(read._write)
 
     def _release_storage_locked(self, entry: TensorRecord) -> None:
-        """Return a persistent span or relay version only after its readers.
+        """Return a record's persistent span or relay slot and mark it retired.
 
-        retire.
+        The caller has already established that nothing can still access the
+        storage. For a relay slot, the call's lane association is dropped
+        once no field of the lane is owned.
         """
         if entry.retired:
             raise _invariant("tensor storage was retired more than once")
@@ -2193,10 +2554,7 @@ class TensorStore:
         entry.retired = True
 
     def _detach_write_locked(self, entry: TensorRecord) -> None:
-        """Remove a logical write and release its physical slot when no aliases.
-
-        remain.
-        """
+        """Remove a record from the per-call release index, if listed."""
         if not entry._indexed:
             return
         reference = entry.reference
@@ -2226,9 +2584,12 @@ class TensorStore:
         device: torch.device,
         event: torch.cuda.Event | None,
     ) -> tuple[torch.cuda.Event, int]:
-        """Validate or record the producer event that guards one device.
+        """Return the producer event for a publication and its stream id.
 
-        publication.
+        A given event is bound to the current stream through
+        `EventPool.declare_stream` without being recorded; otherwise a pooled
+        event is recorded on the current stream. The caller retains the
+        returned event.
         """
         if event is None:
             return self._record_event_locked(device)
@@ -2247,10 +2608,7 @@ class TensorStore:
         event: torch.cuda.Event,
         device: torch.device,
     ) -> None:
-        """Attach one reader event to a write while deduplicating shared event.
-
-        ownership.
-        """
+        """Attach a reader event to a record unless it is already attached."""
         current = entry.reader_events
         if current is event:
             return
@@ -2267,16 +2625,23 @@ class TensorStore:
         self.event_pool.retain(event, device)
 
     def _reclaim_ready_locked(self) -> int:
-        """Reclaim released writes whose producer and reader events are.
+        """Reclaim every released record that nothing can still access.
 
-        query-ready.
+        A record is reclaimed once it is released, has no read leases, all
+        its transfer tickets have retired, all its publications have
+        finished successfully, and its producer and reader events query as
+        complete. Reclamation drops it from every table, returns its storage,
+        and releases its event references.
+
+        Returns:
+            The number of records reclaimed.
         """
         reclaimed = 0
         readiness: dict[int, bool] = {}
         released_events: dict[int, tuple[torch.cuda.Event, int]] = {}
 
         def release_event(event: torch.cuda.Event) -> None:
-            """Retain one pooled event for release after reclamation."""
+            """Count one event reference to release after the pass."""
             identity = id(event)
             current = released_events.get(identity)
             if current is None:
@@ -2289,10 +2654,7 @@ class TensorStore:
                 released_events[identity] = (event, current[1] + 1)
 
         def ready(event: torch.cuda.Event | None) -> bool:
-            """Query each CUDA event at most once during this reclamation.
-
-            pass.
-            """
+            """Query each CUDA event at most once during this pass."""
             if event is None:
                 return True
             identity = id(event)
@@ -2303,10 +2665,7 @@ class TensorStore:
             return result
 
         def readers_ready(entry: TensorRecord) -> bool:
-            """Require every consumer event associated with a product.
-
-            generation to complete.
-            """
+            """Return whether every reader event of a record is complete."""
             events = entry.reader_events
             if events is None:
                 return True
@@ -2346,8 +2705,8 @@ class TensorStore:
                     release_event(reader_events)
                 reclaimed += 1
 
-        # Return pooled-event references only after the pass, so no event
-        # identity can be reused while entries are still being queried.
+        # Return pooled-event references after the pass, with one
+        # `EventPool.release` call per distinct event.
         for event, count in released_events.values():
             self.event_pool.release(event, count)
         return reclaimed

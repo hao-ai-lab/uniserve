@@ -1,4 +1,10 @@
-"""Numerical kernels for request-slot reset and batched token advancement."""
+"""Numerical kernels for request-slot reset and batched token advancement.
+
+These Triton kernels back `DecodeState` (`storage.decode_state`). The state
+tensors they update are indexed by request slot, with row zero reserved as
+the padding sentinel. `DecodeState` falls back to equivalent tensor
+operations when Triton is unavailable or cannot launch on the device.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +17,9 @@ except Exception:  # pragma: no cover
 
 
 if triton is not None:
-
+    # Both kernels exclude per-call integers from Triton's value
+    # specialization, so a new row, coordinate or batch size does not compile
+    # another kernel variant.
     @triton.jit(
         do_not_specialize=[
             "row",
@@ -35,9 +43,13 @@ if triton is not None:
         vocab_size: tl.constexpr,
         block_size: tl.constexpr,
     ):
-        """Reset one device runtime row.
+        """Reset one request row.
 
-        The row's declared logical coordinates are preserved.
+        Continuation tokens become 1, penalty counts and the predicate become
+        zero, and the logical length, sampling position and verified cache
+        length take the supplied values. The launch grid must tile
+        ``max(continuation_width, vocab_size)`` in ``block_size`` chunks, as
+        `DecodeState._reset_device_row` sizes it.
         """
         offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
 
@@ -54,7 +66,8 @@ if triton is not None:
             mask=offsets < vocab_size,
         )
 
-        # Scalar per-row coordinates [rows]; only the first lane writes them.
+        # Scalar per-row coordinates [rows]; only lane zero of program zero
+        # writes them.
         scalar = offsets == 0
         tl.store(predicates_ptr + row + offsets, 0, mask=scalar)
         tl.store(
@@ -83,9 +96,13 @@ if triton is not None:
         continuation_width: tl.constexpr,
         block_size: tl.constexpr,
     ):
-        """Publish batched decode tokens.
+        """Publish batched decode tokens and advance runtime coordinates.
 
-        Also advance device-resident runtime coordinates.
+        Runs as a single program: ``block_size`` must be at least ``count``,
+        and lanes past ``count`` are masked. Row ``indices`` must be unique,
+        because the coordinate updates are unsynchronized load/store pairs.
+        `DecodeState._advance_tokens` checks uniqueness only on the host slot
+        sequence it receives with the device indices, before launch.
         """
         offsets = tl.arange(0, block_size)
         mask = offsets < count
@@ -94,7 +111,8 @@ if triton is not None:
         predicates = tl.load(predicates_in_ptr + offsets, mask=mask, other=0)
 
         # Publish each token into the first slot of its row's continuation span
-        # [rows, continuation_width], keeping only the low 31 token bits.
+        # [rows, continuation_width], keeping only the low 31 token bits: bit
+        # 31 is `TOKEN_CONTINUATION_BIT` in tagged relays, never a token bit.
         tl.store(
             future_tokens_ptr + indices * continuation_width,
             tokens & ((1 << 31) - 1),

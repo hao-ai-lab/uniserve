@@ -55,16 +55,22 @@ class Ladder:
     requires a new binding; each solver step already has its own typed input.
     """
 
+    # One typed input per solver step; ``inputs[i].step_index == i``.
     inputs: tuple[DenoiserInput, ...]
     schedules: Mapping[str, Schedule]
     state: Mapping[str, torch.Tensor]
+    # The request slot, 1-based; its bank row is ``slot - 1``.
     slot: int
     # The request's leading pages that hold the layout's samples.
     pages: tuple[int, ...]
     signature: Hashable
     # Tensor identity maps to an explicitly named field, never to a bank search.
     fields: Mapping[int, str]
+    # Banked field name -> (element offset in the slot's bank row, shape).
+    # Empty unless the runner captures.
     spans: Mapping[str, tuple[int, tuple[int, ...]]]
+    # Per step, the tensors that are neither samples nor named in ``fields``
+    # (timesteps among them); a replay copies them into the graph's inputs.
     temporal: tuple[tuple[torch.Tensor, ...], ...]
     # The runner storage the latents view; a ladder serves only its runner.
     samples: torch.Tensor
@@ -72,7 +78,13 @@ class Ladder:
 
 @dataclass
 class LadderBucket(GraphBucket):
-    """Slot staging and the captured steps shared by one ladder signature."""
+    """Slot staging and the captured steps shared by one ladder signature.
+
+    ``graphs`` maps a solver step index to its captured graph. ``state``
+    holds one staging tensor per banked field, and each ``gathers`` entry
+    pairs a bank's [slots, span] column view with its stage viewed as
+    [1, numel], so a graph copies the selected slot's span into the stage.
+    """
 
     state: Mapping[str, torch.Tensor] = field(default_factory=dict)
     gathers: tuple = ()
@@ -123,6 +135,8 @@ class DiffusionRunner(ModelRunner):
             if not value.is_contiguous():
                 raise ValueError(f"bank {name!r} requires contiguous rows")
         self.bank, self.slots = bank, slots
+        # [1] int64 device bank row a captured step gathers, set before each
+        # capture and replay from the pinned sources in ``_slot_values``.
         self._slot_index = (
             torch.zeros(1, dtype=torch.int64, device=self.device)
             if self.captures
@@ -130,9 +144,11 @@ class DiffusionRunner(ModelRunner):
         )
         self._slot_values: dict[int, torch.Tensor] = {}
 
-        # A standalone denoiser's samples: ``pages`` pool pages, gathered
+        # A standalone denoiser's samples, [pages * page_units,
+        # latent_width] in the pool's dtype: ``pages`` pool pages, gathered
         # from the source rows and scattered to the target rows ``_rows``
-        # names, [2, pages] int64. Both are allocated with the context.
+        # names, [2, pages] int64. ``for_layout`` allocates both with the
+        # context.
         self.pool, self.pages = pool, int(pages)
         self.samples: torch.Tensor | None = None
         self._rows: torch.Tensor | None = None
@@ -189,6 +205,8 @@ class DiffusionRunner(ModelRunner):
                     "a denoiser runner requires layout pages of a pool on "
                     "its device"
                 )
+            # Preparation on the runner's stream follows work the caller has
+            # already queued.
             if stream is not None:
                 stream.wait(torch.cuda.current_stream(device))
             with storage.allocate(runner):
@@ -221,9 +239,11 @@ class DiffusionRunner(ModelRunner):
             workspace=self.context.workspace,
         )["image"]
 
-        # Predictions come from the last pipeline stage; other stages
-        # broadcast placeholder storage that the broadcast overwrites, so
-        # every rank returns the same per-image values.
+        # Only the last pipeline stage returns predictions. Other stages
+        # allocate placeholder storage that the broadcast from the last stage
+        # overwrites, so every rank returns the same per-image values. A mesh
+        # without a ``pp`` axis selects the rank-local group, whose broadcast
+        # copies nothing.
         pipeline = module.mesh.get_group(
             "pp" if "pp" in module.mesh.axes else ()
         )
@@ -295,7 +315,12 @@ class DiffusionRunner(ModelRunner):
 
     @torch.inference_mode()
     def warmup(self, inputs, schedules, *, state):
-        """Prepare kernel specializations without advancing the samples."""
+        """Prepare kernel specializations without advancing the samples.
+
+        Runs one step eagerly, restores the samples it mutated, and
+        synchronizes the runner's stream (or the device's current stream)
+        on CUDA before returning.
+        """
         context = self.context
         call = self._call(inputs, schedules, state)
         if context.stream is not None:
@@ -408,6 +433,7 @@ class DiffusionRunner(ModelRunner):
         return ladder.samples is self.samples
 
     def _bucket(self, ladder: Ladder) -> LadderBucket:
+        """Return the ladder signature's bucket, creating its staging once."""
         bucket = self.buckets.get(ladder.signature)
         if bucket is None:
             stages, gathers = {}, []
@@ -467,6 +493,11 @@ class DiffusionRunner(ModelRunner):
         return samples
 
     def _slot_value(self, slot):
+        """Return the pinned [1] int64 host source holding ``slot - 1``.
+
+        Retained per slot, like ``_row_value``, so an asynchronous copy never
+        outlives its source.
+        """
         if slot not in self._slot_values:
             self._slot_values[slot] = torch.tensor(
                 [slot - 1], dtype=torch.int64
@@ -576,9 +607,11 @@ class DiffusionRunner(ModelRunner):
                         self._call(live, ladder.schedules, ladder.state)
                     ), "eager"
 
-                # The ladder's non-bank tensors have known positions. Keep
-                # their correspondence per binding, including new schedule
-                # objects.
+                # The graph's inputs are the step's schedules and its tensors
+                # other than samples and banked fields (``ladder.temporal``).
+                # Replay copies them by PyTree path, so any ladder of this
+                # signature, with its own schedule objects, maps onto the
+                # same captured inputs.
                 temporal = ladder.schedules, ladder.temporal[index]
                 cast(torch.Tensor, self._slot_index).copy_(
                     self._slot_value(ladder.slot), non_blocking=True
@@ -596,8 +629,8 @@ class DiffusionRunner(ModelRunner):
                 )
 
     def close(self):
-        # Pinned copies retain their destination stream; release them before
-        # the owner destroys that stream's execution partition.
+        # Pinned copy sources retain their destination stream; release them
+        # before the owner destroys that stream's execution partition.
         try:
             super().close()
         finally:

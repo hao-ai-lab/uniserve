@@ -1,4 +1,19 @@
-"""Token and visual-state packing and publication."""
+"""Token and visual-state packing and publication.
+
+This module is the autoregressive half of the numerical path that
+``forward`` drives. ``prepare_forward`` packs a prefill, decode or verify
+call into a ``TokenRow``, or into a visual-state row when a prefill carries
+image features. ``prepare_sampling`` turns the model's logits into
+``SamplingMetadata`` for the sampler, or into a direct outcome when the call
+samples nothing. ``publish_sample`` stages the sampled result and the
+request progress it implies on the call's ``PendingOutput``.
+
+Device state is only bound here: the ``runtime_*`` fields of
+``PendingOutput.token`` are applied to ``DecodeState`` by
+``commit._commit_runtime_states`` when the batch commits. A verify call
+leaves its accepted span on device; ``PendingOutput`` materialization
+resolves it on the host against the base coordinates recorded here.
+"""
 
 from __future__ import annotations
 
@@ -54,9 +69,19 @@ def prepare_forward(
     model_runner: ModelExecutor,
     decode_state: DecodeState | None,
 ) -> TokenRow | DiffusionRow:
-    """Pack autoregressive extension, decode.
+    """Pack one prefill, decode or verify call into a model-forward row.
 
-    or verification work into model-forward rows.
+    A prefill with a vision or latent feature input becomes a visual-state
+    row. Other rows start at the request's current logical position: a
+    prefill selects all logits when prompt log probabilities are requested
+    and the last logits otherwise, a decode feeds one token, and a verify
+    feeds the current token followed by the draft tokens and selects all
+    logits.
+
+    Raises:
+        WorkerError: When, for example, the request has no admitted sampling
+            state, or the call's input tokens or device token continuation
+            are missing or malformed.
     """
     request = state.pending_output(call.request_key.request_id)
     if request.request.sampling is None:
@@ -105,7 +130,9 @@ def prepare_forward(
         )
     elif mode is ForwardMode.DECODE:
         # Indexed decode reads its token and position directly from
-        # request-indexed device state instead of host-supplied values.
+        # request-indexed device state instead of host-supplied values. It
+        # requires CUDA decode state beside the page tables and a tagged (I64
+        # relay) predicate carrying the predecessor's device decision.
         indexed = (
             decode_state is not None
             and request_tables is not None
@@ -128,6 +155,9 @@ def prepare_forward(
             request_indexed_decode=indexed,
         )
     else:
+        # A predicated verify takes its current token from the device relay
+        # and `input_token_ids` holds only the draft; otherwise the ids are
+        # the current token followed by the draft.
         if call.predicate is not None:
             current = resolve_decode_token(
                 call, request, decode_state=decode_state
@@ -167,9 +197,15 @@ def prepare_sampling(
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> SamplingMetadata | PendingOutput:
-    """Convert token-model outputs into sampling work, prompt log probabilities.
+    """Turn a call's forward output into sampling work or a direct outcome.
 
-    or direct outcomes.
+    A prefill commits every query token and, with a ``DecodeState``, stages
+    the resulting runtime cache length; a decode commits one token without
+    staging it; a verify commits nothing here.
+    Returns a finished ``PendingOutput`` when a prefill declares no token
+    output or a visual call samples nothing. Otherwise returns
+    ``SamplingMetadata`` positioned after the tokens the call computed; a
+    verify samples one position per row.
     """
     request = state.pending_output(call.request_key.request_id)
     start = int(calls.require_progress(request).logical_position)
@@ -264,9 +300,17 @@ def publish_sample(
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> PendingOutput:
-    """Publish sampled tokens, speculative selections.
+    """Stage a sampled selection and the request progress it implies.
 
-    and request runtime transitions.
+    A prefill or decode advances the logical position by its computed tokens
+    and the RNG counter by one. A verify binds device tensors offset from its
+    base coordinates and records those coordinates on ``request.token`` so
+    host materialization can resolve the accepted span. A visual call
+    advances the RNG counter by one and its position as ``_finish_visual``
+    does.
+
+    ``sample_work`` may be None only for a decode whose selection came from
+    graph replay (``graph_decode_samples``).
     """
     request = state.pending_output(call.request_key.request_id)
     start = int(calls.require_progress(request).logical_position)
@@ -348,7 +392,11 @@ def publish_sample(
         initialized = task.seq_len + task.query_tokens
 
         # The verifier selects the accepted span on device; host completion
-        # resolves it later against these base coordinates.
+        # resolves it later against these base coordinates. The accepted
+        # token count is the accepted drafts plus a correction or bonus token,
+        # which is omitted when acceptance reaches the terminal draft prefix.
+        # It stays a device tensor, so the staged cache length and positions
+        # below are device values as well.
         device_selected = sampled.accepted_token_count
         if device_selected is None:
             accepted_device = sampled.accepted_draft_count
@@ -396,9 +444,15 @@ def _prepare_visual(
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
 ) -> TokenRow | DiffusionRow:
-    """Resolve image features and interleave them with prompt tokens for model.
+    """Build a visual-state row from a prefill's image features.
 
-    execution.
+    Consumes the call's single vision or latent feature tensor onto its first
+    device and builds the row at the request's logical position.
+
+    Raises:
+        WorkerError: When, for example, both or neither feature input is set,
+            the tensor lacks ``FeatureMetadata``, or the row exceeds the
+            call's token bound.
     """
     reference = call.vision_input or call.latent_feature_input
     if reference is None or (
@@ -466,9 +520,12 @@ def _prepare_visual_sampling(
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> SamplingMetadata | PendingOutput:
-    """Publish encoded visual features and update the request feature.
+    """Commit a visual row's KV, then sample its next token or finish it.
 
-    reference.
+    When the call declares a token output, returns ``SamplingMetadata`` for
+    the request's logical position advanced by the image builder's RoPE
+    advance (at least one); only vision rows produce logits. Otherwise
+    finishes the call through ``_finish_visual``.
     """
     request = state.pending_output(call.request_key.request_id)
 
@@ -514,9 +571,11 @@ def _finish_visual(
     image_builder: ImageBuilder | None,
     request_tables: BlockTables | None,
 ) -> PendingOutput:
-    """Finalize visual feature publication and advance the image call.
+    """Advance the logical position past a visual row and stage its outcome.
 
-    state.
+    A call that closes the image advances by the image builder's RoPE advance
+    (at least one); another vision row advances by one; a latent row keeps
+    its position.
     """
     request = state.pending_output(call.request_key.request_id)
     position = int(calls.require_progress(request).logical_position)
@@ -543,9 +602,13 @@ def graph_decode_samples(
     sampling_group: Communicator | None,
     request_pool_indices: torch.Tensor,
 ) -> tuple[SamplerRow, ...] | None:
-    """Validate and synchronize graph selections before common token.
+    """Accept a graph-replayed greedy selection for common token publication.
 
-    publication.
+    Returns one ``SamplerRow`` per call after broadcasting the tokens over
+    ``sampling_group`` and applying the same finish policy as eager sampling.
+    Returns None when ``output`` is None, when the call list is empty or
+    shapes disagree, or when any row needs eager sampling; the caller then
+    materializes the forward output and samples every row eagerly.
     """
     if output is None:
         return None
@@ -656,7 +719,22 @@ def prompt_logprob_details(
     state: BatchState,
     decode_state: DecodeState | None,
 ) -> tuple[tuple[int, int, int], ...]:
-    """Create per-position log-probability rows for a prompt logits tensor."""
+    """Score one prompt chunk and capture its log-probability ranges.
+
+    The first chunk (``start == 0``) scores every token after the first. A
+    continued chunk also scores its first token, using the last logits of the
+    previous chunk from the request's staged runtime logits or
+    ``DecodeState.prompt_logits``. This chunk's last logits are staged for
+    the next chunk and ``prompt_logits_ready`` is set.
+
+    Returns:
+        One ``(offset, count, row)`` completion-buffer span per scored token.
+
+    Raises:
+        WorkerError: When, for example, the logits do not align with
+            ``tokens``, there is no decode state, or a continued chunk has no
+            preceding logits.
+    """
     # logits is [num_tokens, vocab]; each token is scored by the logits of the
     # preceding position.
     tokens = tokens.reshape(-1).to(device=logits.device, dtype=torch.long)
@@ -732,13 +810,23 @@ def token_outcome(
     committed_tokens: tuple[int, ...] = (),
     request_tables: BlockTables | None,
 ) -> PendingOutput:
-    """Stage request progress and pending payloads for one autoregressive.
+    """Stage request progress and an OK status for one autoregressive call.
 
-    completion.
+    Without a speculative selection, the visible and computed KV length is
+    the runtime cache length staged by ``commit_kv``, else ``task.seq_len +
+    tokens`` when a task is given, else the current accepted length. After a
+    verify, both come from the coordinates ``publish_sample`` recorded: the
+    base visible extent and the extent the verify rows initialized.
+
+    Raises:
+        RuntimeError: When a non-speculative KV length is a device tensor.
+        WorkerError: When ``calls.cache_coordinates`` or
+            ``calls.require_progress`` rejects the request.
     """
     if request is None:
         request = state.pending_output(call.request_key.request_id)
 
+    # (request slot, cache group, accepted visible length, capacity).
     cache = calls.cache_coordinates(request, tables=request_tables)
     initialized = cache[2]
     if request.token.draft_tokens is None:
@@ -760,10 +848,9 @@ def token_outcome(
         initialized = request.token.initialized_kv
 
     progress = calls.require_progress(request)
-    # Publish one complete projection. Device-selected verifier acceptance stays
-    # unresolved until host completion, with the initialized KV extent retained.
-    # Verification keeps the base logical position so acceptance can advance it
-    # by the accepted span resolved at host completion.
+    # Publish one complete projection. Verification keeps the base logical
+    # position and visible extent beside the initialized KV extent; host
+    # completion advances them by the accepted span.
     request.progress = replace(
         progress,
         logical_position=(
@@ -798,7 +885,19 @@ def token_task(
     request_indexed_decode: bool = False,
     request_tables: BlockTables | None,
 ) -> TokenRow:
-    """Build an autoregressive row from runtime and token coordinates."""
+    """Build a ``TokenRow`` from token coordinates and cache coordinates.
+
+    With ``request_indexed_decode``, ``token_ids`` and ``positions`` must be
+    None because the row borrows both from ``DecodeState``. Otherwise they
+    must be non-empty and equally long; a single tensor token keeps its
+    device view. ``seq_len``, when given, must equal the request's accepted
+    visible KV length.
+
+    Raises:
+        WorkerError: ``invalid_descriptor`` when any of these checks fails,
+            or the error of ``calls.cache_coordinates`` when it rejects the
+            request's cache coordinates.
+    """
     if request_indexed_decode:
         if (
             call.kind is not ForwardMode.DECODE
@@ -834,6 +933,8 @@ def token_task(
 
     predicate_value = request.predicate
     sampling_state = call.sampling_state or SamplingState()
+
+    # (request slot, cache group, accepted visible length, capacity).
     cache = calls.cache_coordinates(request, tables=request_tables)
     visible = cache[2] if seq_len is None else int(seq_len)
     if visible != cache[2]:
@@ -870,9 +971,18 @@ def commit_kv(
     request_tables: BlockTables | None,
     decode_state: DecodeState | None,
 ) -> None:
-    """Advance computed KV length and optionally publish the updated request.
+    """Validate a row's computed KV extent after ``tokens`` query tokens.
 
-    runtime.
+    The count must lie within the row's query span and the resulting extent
+    within the request's allocated page table. With ``publish_runtime`` and a
+    ``DecodeState``, the extent is staged as
+    ``request.token.runtime_cache_length`` for the commit; otherwise nothing
+    is staged. A zero count stages nothing and skips the page-table check.
+
+    Raises:
+        RuntimeError: When the count or extent is out of range, there are no
+            page tables, or, when staging, the row belongs to another request
+            slot.
     """
     count = int(tokens)
     if count < 0 or count > task.query_tokens:
@@ -899,9 +1009,16 @@ def resolve_decode_token(
     *,
     decode_state: DecodeState | None,
 ) -> int | torch.Tensor:
-    """Resolve one decode input token from an explicit value or device relay.
+    """Resolve one decode input token from the call or the device relay.
 
-    product.
+    A predicated call reads the token its predecessor left in
+    ``DecodeState.future_input_tokens`` as an int64 view of shape ``[1]``
+    into that state, without host synchronization. Otherwise the first of
+    ``call.input_token_ids`` is returned.
+
+    Raises:
+        WorkerError: When the device continuation is not registered, there
+            is no decode state, or the call carries no input token.
     """
     if call.predicate is not None:
         predicate = request.predicate
@@ -935,7 +1052,11 @@ def publish_runtime_sample(
     decode_increment: bool = False,
     decode_state: DecodeState | None,
 ) -> None:
-    """Bind one call's selection for the batch's device state update."""
+    """Bind one call's selection for the batch's device state update.
+
+    Does nothing without a ``DecodeState``. ``commit._commit_runtime_states``
+    applies the bound values when the batch commits.
+    """
     if decode_state is None:
         return
     request.token.sampled = sample
@@ -952,13 +1073,13 @@ def publish_token_products(
     state: BatchState,
     tensor_store: TensorStore,
 ) -> None:
-    """Publish numerical token and transition columns through their storage.
+    """Publish sampled token and transition values into their reserved writes.
 
-    owner.
-
-    Rows retain their numerical batches. Token publication reads their selected
-    spans directly; variable transition payloads retain their own tensor
-    layouts.
+    Transition products are published in one pass and token products in a
+    second; each pass publishes every call that reserved that write through
+    one ``TensorStore.publish_writes`` call. Token products receive the
+    tagged token values. Transition payloads are concatenated unless they
+    already form one adjacent view.
     """
     for transitions in (True, False):
         writes: list[TensorRecord] = []
@@ -1003,9 +1124,23 @@ def build_sampling_metadata(
     draft_token_ids: tuple[int, ...] = (),
     decode_state: DecodeState | None,
 ) -> SamplingMetadata:
-    """Build sampling rows, penalties, RNG coordinates, predicates.
+    """Build the sampler inputs for one call's logit rows.
 
-    and device-product bindings.
+    ``logits`` holds one row per entry of ``positions``; a single row may be
+    1-D. Each row receives its allowed or forced tokens, its penalty counts
+    when penalties are enabled and, when sampling is stochastic, a Philox
+    uniform draw. A device-greedy call
+    without drafts or allowed or forced tokens carries no draw or parameter
+    tensors.
+
+    Raises:
+        WorkerError: ``invalid_descriptor`` when the request has no admitted
+            sampling parameters, stochastic sampling lacks matching
+            target-sampling RNG coordinates, or the logits do not align with
+            ``positions``; ``unsupported_setup`` when penalties
+            are enabled and ``DecodeState`` disagrees with the vocabulary or
+            device.
+        RuntimeError: When penalties are enabled without a ``DecodeState``.
     """
     parameters = require_sampling(request)
     sampling_state = call.sampling_state or SamplingState()
@@ -1028,8 +1163,10 @@ def build_sampling_metadata(
             )
         )
 
-    # Stochastic sampling must draw from the call's registered target
-    # layout so device and host evaluations agree on the Philox coordinates.
+    # Draws are addressed by request lineage and semantic position
+    # (`uniserve.nn.rng`), so the call's registered RNG coordinates must
+    # describe exactly these rows: the target-sampling layout, the admitted
+    # seed, and semantic indexes equal to `positions`.
     rng = call.rng
     if float(parameters.temperature) > 0.0:
         if rng is None or rng.draw_layout is not DrawLayout.TARGET_SAMPLING:
@@ -1108,9 +1245,9 @@ def build_sampling_metadata(
             for token_id in draft_token_ids[:index]:
                 row_counts[int(token_id)] += 1
 
-        # Processor step 2 forced-token constraint: point `index` of the
-        # call's span narrows selection to `forced_token_ids[index]`,
-        # overriding any allowed-token whitelist for that point.
+        # Forced-token constraint: point `index` of the call's span narrows
+        # selection to `forced_token_ids[index]`, overriding any allowed-token
+        # whitelist for that point.
         row_allowed = (
             (int(forced_token_ids[index]),)
             if index < len(forced_token_ids)
@@ -1203,9 +1340,12 @@ def _request_penalty_base(
 def _candidate_penalty_counts(
     request: PendingOutput, committed: torch.Tensor
 ) -> torch.Tensor:
-    """Include a selected token that has not yet reached committed penalty.
+    """Add a selection bound on this output but not yet committed.
 
-    storage.
+    ``request.token.sampled`` holds a selection that commit has not yet
+    applied to ``DecodeState.penalty_counts``. Its token is added to a copy
+    of ``committed`` when its row is valid and active; without one,
+    ``committed`` itself is returned.
     """
     sampled = request.token.sampled
     if sampled is None:

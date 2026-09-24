@@ -1,4 +1,15 @@
-"""Schedule dependency frontiers and dispatch ready worker calls."""
+"""Schedule dependency frontiers and dispatch ready worker calls.
+
+``step.execute_batch`` calls ``dispatch_batch`` after ``reserve_outputs`` has
+bound every call's pending output. Calls of one batch may consume products
+that other calls of the same batch produce, so execution proceeds in
+dependency frontiers: each round selects every live call whose in-batch
+producers have completed. A frontier containing model-forward work runs
+through the numerical helpers in ``forward``; any other frontier dispatches
+each call to its owning module (``transfer``, ``diffusion``, ``image``,
+``host_media`` or ``media``). Outcomes stay provisional until
+``commit.commit_batch`` publishes them.
+"""
 
 from __future__ import annotations
 
@@ -63,10 +74,17 @@ def dispatch_batch(
 ) -> tuple[PendingOutput, ...]:
     """Execute the batch's active calls and align outcomes with its call order.
 
-    A failure aborts the homogeneous batch; its owner discards all provisional
-    outputs before reporting the error.
+    Calls whose output ``reserve_outputs`` marked ``CallStatus.PREDICATED``
+    are not executed; ``_predicated_outcome`` stages their outcome. The
+    returned tuple holds one outcome per call of ``state.batch.calls``, in
+    that order.
+
+    A failure raises and aborts the homogeneous batch; its owner discards all
+    provisional outputs before reporting the error.
     """
     batch_calls = state.batch.calls
+
+    # Mark device execution start on every device an active call uses.
     active = tuple(
         call
         for call in batch_calls
@@ -95,6 +113,8 @@ def dispatch_batch(
         locations.append(call_index)
         scheduled.append(call)
 
+    # _execute_calls indexes outcomes by position in `scheduled`; `locations`
+    # maps each position back to its index in the batch.
     completed = _execute_calls(
         tuple(scheduled),
         kv_cache=kv_cache,
@@ -139,7 +159,18 @@ def _execute_ready_actions(
     model_runner: ModelExecutor,
     config: WorkerConfig,
 ) -> None:
-    """Execute a dependency frontier that contains no numerical model calls."""
+    """Execute a frontier that contains no model-forward rows.
+
+    Each call dispatches by kind to its owning module and runs inside
+    ``state.scope()``, which makes the batch stream current when the batch
+    has one. On a video worker (``video_postprocessor`` set), device
+    computation such as denoising and decode rounds also lands here through
+    ``media.execute``. Calls that already have an outcome are skipped.
+
+    Raises:
+        WorkerError: ``invalid_descriptor`` when no module serves the call's
+            kind on this worker.
+    """
     from uniserve_worker.execution import (
         diffusion,
         host_media,
@@ -166,6 +197,8 @@ def _execute_ready_actions(
                     model_runner=model_runner,
                     state=state,
                 )
+            # Latent preparation belongs to diffusion only on image workers;
+            # a video worker's latent preparation falls through to media.
             elif (
                 call.kind is MediaCall.LATENT_PREPARATION
                 and model_runner.image_builder is not None
@@ -235,9 +268,17 @@ def _execute_calls(
 ) -> dict[int, PendingOutput]:
     """Execute product dependency frontiers with direct numerical algorithms.
 
-    Each index addresses an original call. Only completed products unlock
-    successors; an error suppresses the rest of the completion. CFG prefixes
+    Each index addresses a position in ``scheduled``. A call is ready once
+    every tensor or KV input produced by a call of ``scheduled`` has an
+    outcome; inputs with no producer in ``scheduled`` do not gate readiness.
+    An error raises and suppresses the rest of the batch. CFG prefixes
     precede their homogeneous denoiser calls.
+
+    Returns:
+        The outcome of every call, keyed by its position in ``scheduled``.
+
+    Raises:
+        RuntimeError: When live calls remain but none is ready.
     """
     producers = {
         buffer: index
@@ -281,7 +322,9 @@ def _execute_calls(
             )
 
         # KV-conditioned image denoising and decoding run as forward rows; a
-        # standalone denoiser's calls are media actions.
+        # standalone denoiser's calls are media actions. When the frontier
+        # holds forward work, only those calls run in this round; the other
+        # ready calls stay live and run in a later round.
         images = model_runner.image_builder is not None
         numerical = tuple(
             index
@@ -334,6 +377,10 @@ def _execute_calls(
             )
         else:
             trajectories, step_count = {}, 1
+
+        # step_count is the longest declared solver interval among the opened
+        # trajectories; a trajectory with fewer steps drops out once its
+        # interval ends.
         for offset in range(step_count):
             # The numerical schedule is local to this loop. Accepted request
             # progress is published only after the complete declared interval.

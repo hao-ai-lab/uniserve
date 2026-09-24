@@ -1,6 +1,9 @@
-"""Call identities and scalar bounds derived from logical execution.
+"""Per-call identity and coordinate helpers shared by the execution modules.
 
-state.
+Call-kind handlers (such as `token`, `diffusion` and `image`), batch
+preparation and scheduling use these to key calls within a batch, to read
+the coordinates a call states, and to resolve the KV-cache coordinates a
+numerical call runs at.
 """
 
 from __future__ import annotations
@@ -18,16 +21,21 @@ from uniserve_worker.storage.block_tables import BlockTables
 
 
 def output_generations(call: Call) -> tuple[int, ...]:
-    """List logical generations in descriptor output order."""
+    """Return the generation of each tensor output the call declares.
+
+    Values follow `Call.tensor_outputs` order. Handlers store them as the
+    completion's ``product_generations``.
+    """
     return tuple(
         int(reference.generation) for reference in call.tensor_outputs()
     )
 
 
 def require_progress(output: PendingOutput) -> RequestProgress:
-    """Require real request progress for a state-consuming numerical.
+    """Return a pending output's progress for a state-consuming call.
 
-    call.
+    Raises:
+        WorkerError: ``invalid_descriptor`` when the output has no progress.
     """
     progress = output.progress
     if progress is None:
@@ -44,8 +52,12 @@ def execution_runtime(
 ) -> RequestProgress:
     """Project the coordinates used by a call's numerical consumers.
 
-    The call states them; the cache tuple overrides the KV extents when the
-    block tables resolved a different accepted prefix.
+    Returns a copy of ``request.progress``; the output is not modified. With
+    ``cache`` None, the KV extents are kept from ``request.progress`` and
+    ``computed_len`` is ignored. With a `cache_coordinates` tuple, the visible
+    length comes from the tuple and the computed length equals it unless
+    ``computed_len`` is given. ``flow_step`` replaces the solver step when
+    given.
     """
     progress = request.progress
     if cache is None:
@@ -68,9 +80,17 @@ def cache_coordinates(
     tables: BlockTables | None,
     group_id: int = 0,
 ) -> tuple[int, int, int, int]:
-    """Resolve the request slot, cache group.
+    """Resolve a request's KV-cache coordinates for one cache group.
 
-    accepted prefix and physical token capacity.
+    Returns:
+        ``(slot, group_id, visible, capacity)``: the request-pool slot, the
+        cache group, the accepted visible prefix the call states (tokens),
+        and the slot's installed token capacity.
+
+    Raises:
+        WorkerError: ``unsupported_setup`` when ``tables`` is None;
+            ``invalid_descriptor`` when the slot has no block table installed
+            for the group or the visible prefix exceeds the capacity.
     """
     slot = int(request.request.request_pool_idx)
     # Scheduler columns may reserve the full unobserved verifier prefix. The
@@ -80,6 +100,7 @@ def cache_coordinates(
     pool = tables
     if pool is None:
         raise unsupported_setup("call requires request-to-token storage")
+    # Called only for its check that a block table is installed.
     pool.pages(slot, group_id)
     capacity = pool.allocated_length(slot)
 
@@ -91,7 +112,11 @@ def cache_coordinates(
 
 
 def call_identity(call: Call) -> CallIdentity:
-    """Form the batch-local identity from generation and call ID."""
+    """Return the call's ``(request_key, call_id)`` identity.
+
+    The request key carries the request epoch, so calls of different epochs
+    of one request id never share an identity.
+    """
     return call.request_key, call.call_id
 
 
@@ -100,9 +125,12 @@ def _predicated_outcome(
     *,
     state: BatchState,
 ) -> PendingOutput:
-    """Construct an inactive outcome while preserving declared product.
+    """Mark a call whose completion predicate is false as predicated.
 
-    generations.
+    Reuses the call's reserved `PendingOutput`: sets `CallStatus.PREDICATED`,
+    keeps its progress coordinates, and clears finish flags and product
+    generations, which a predicated completion must not carry
+    (`RequestOutput.validate` rejects them).
     """
     request = state.pending_output(call.request_key.request_id)
     request.status = CallStatus.PREDICATED

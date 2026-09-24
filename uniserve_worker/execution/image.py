@@ -1,4 +1,17 @@
-"""Image encode, latent decode, and materialization transformations."""
+"""Image encode, latent decode, and materialization transformations.
+
+The worker-side steps around a request's image calls: encoding conditioning
+text, preparing images for the vision or latent encoder and publishing its
+features, building the prefill and denoiser rows that write image features
+or latents into KV, gathering a finished latent trajectory for the image
+decoder, and publishing a decoded image. Image outputs leave the device as
+a PNG: the image is quantized to uint8 on the device, copied into the
+batch's output buffer, and encoded on the rank's ``HostLane`` once that copy
+completes.
+
+``forward``, ``token``, ``schedule`` and ``transfer`` call into this module;
+the ``*_outcome`` helpers stage a call's successful ``PendingOutput``.
+"""
 
 from __future__ import annotations
 
@@ -75,9 +88,10 @@ def text(
     publication_transports: Mapping[str, Transport],
     model_runner: ModelExecutor,
 ) -> PendingOutput:
-    """Encode admitted conditioning tokens and publish their declared.
+    """Encode admitted conditioning tokens and publish their declared tensors.
 
-    tensors.
+    Runs the text encoder on the request's admitted prompt tokens and
+    publishes one tensor per declared output.
     """
     request = state.pending_output(call.request_key.request_id)
     admission = request.request.admission
@@ -128,9 +142,11 @@ def prepare_features(
     tensor_store: TensorStore,
     model_runner: ModelExecutor,
 ) -> PreparedImage:
-    """Stage image tensors and build the model batch for one encoder.
+    """Stage the source image of one vision or latent encoder call.
 
-    call.
+    The source is either the request's encoded image or a resident image
+    product (see ``encode_source``); it is resized and normalized by the
+    model's image processor onto the device of the call's execution entry.
     """
     image_processor = model_runner.image_processor()
     mode = call.kind
@@ -157,6 +173,9 @@ def prepare_features(
     )
     target_device = model_runner.call_devices(call)[1]
     if isinstance(source, tuple):
+        # A resident image records its numerical range: a (-1, 1) image is
+        # mapped to [0, 1] before the processor's transforms, and any other
+        # range is taken as [0, 1].
         source_tensor, source_metadata = source
         prepared = prepare_tensor_image(
             image_processor,
@@ -183,9 +202,11 @@ def publish_features(
     publication_transports: Mapping[str, Transport],
     config: WorkerConfig,
 ) -> PendingOutput:
-    """Split encoded features by request and prepare cache or product.
+    """Commit encoded features to the tensor store and export them if needed.
 
-    publication.
+    The features always land in the call's encoder-cache write. They are
+    also exported as a product when any non-local publication transport is
+    bound and this rank is the component's output rank.
     """
     request = state.pending_output(call.request_key.request_id)
     feature_output = call.encoder_output
@@ -237,7 +258,12 @@ def materialization_latent(
     latent_pool: LatentPool,
     model_runner: ModelExecutor,
 ) -> torch.Tensor:
-    """Gather the final latent trajectory and build its decoder batch."""
+    """Gather a completed latent trajectory for the image decoder.
+
+    Returns the request's current latent, gathered from its ``LatentPool``
+    pages into the call's staging. The trajectory must be at the admitted
+    image's final step.
+    """
     request = state.pending_output(call.request_key.request_id)
     latent_input = call.latent_input
     if latent_input is None:
@@ -284,7 +310,12 @@ def publish_image(
     state: BatchState,
     tensor_store: TensorStore,
 ) -> PendingOutput:
-    """Decode final latents and schedule bounded image-output publication."""
+    """Publish a decoded image and schedule its bounded PNG encoding.
+
+    When the call declares a resident image output, the image is also
+    committed to the tensor store for later consumers. The call's latent
+    trajectory is staged for release from the ``LatentPool`` at commit.
+    """
     request = state.pending_output(call.request_key.request_id)
     row = state.pending_output(call.request_key.request_id)
     params = row.latent.input_params
@@ -302,8 +333,8 @@ def publish_image(
                 "finalized resident image requires a positive generation"
             )
         write = bound_device_write(resident_output, state=state)
-        # Feedback storage uses the declared model dtype; preserve the decoder's
-        # existing conversion before handing the value to the tensor store.
+        # The reserved product storage has the product's declared dtype;
+        # convert the decoder output to it before committing.
         storage = tensor_store.producer_write_views((write,))[0]
         tensor_store.publish_write(
             write,
@@ -340,9 +371,16 @@ def state_outcome(
     products: tuple[TensorPublication, ...] = (),
     request_tables: BlockTables | None,
 ) -> PendingOutput:
-    """Stage execution progress and defer successor publication until stateful.
+    """Stage the successful outcome of a visual-state call, which wrote KV.
 
-    tensors are ready.
+    The reported KV length is the staged ``runtime_cache_length`` when one
+    exists, otherwise the request's visible KV length as checked against its
+    block table by ``calls.cache_coordinates``.
+
+    Raises:
+        WorkerError: When ``calls.cache_coordinates`` rejects the request's
+            KV coordinates.
+        RuntimeError: When the staged length is a device tensor.
     """
     request = state.pending_output(call.request_key.request_id)
     cache = calls.cache_coordinates(request, tables=request_tables)
@@ -369,9 +407,10 @@ def non_state_outcome(
     products: tuple[TensorPublication, ...] = (),
     completion_tasks: tuple[HostTask, ...] = (),
 ) -> PendingOutput:
-    """Record a stateless completion and its already materialized output.
+    """Record a stateless completion and its already materialized products.
 
-    products.
+    ``completion_tasks`` become the call's ``host.tasks``, which must finish
+    before its output is ready.
     """
     request = state.pending_output(call.request_key.request_id)
     request.status = CallStatus.OK
@@ -390,9 +429,16 @@ def encode_source(
     tensor_store: TensorStore,
     model_runner: ModelExecutor,
 ) -> str | tuple[torch.Tensor, ImageMetadata]:
-    """Resolve encoded request media and stage it according to the model’s.
+    """Resolve the source image of an encoder call.
 
-    image policy.
+    Returns the request's encoded image string when the call carries one;
+    otherwise consumes the call's resident image product onto its compute
+    device and returns it with its ``ImageMetadata``.
+
+    Raises:
+        WorkerError: When the call has no source, or the resident product's
+            metadata is not ``ImageMetadata`` with positive dimensions and a
+            value range.
     """
     if call.input_image is not None:
         return call.input_image
@@ -447,9 +493,13 @@ def vision_state_row(
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
 ) -> TokenRow:
-    """Publish vision features and construct the request runtime that.
+    """Build the prefill row that writes one image's vision features into KV.
 
-    references their token span.
+    ``features`` are ``[tokens, hidden]`` (or with a leading singleton batch
+    axis). The row is non-causal, writes KV at the request's cache
+    coordinates, and selects last logits when ``logits`` is set (hidden
+    states otherwise). A framed layout adds start and end marker tokens;
+    ``close_image`` adds the end marker in any layout.
     """
     cache = calls.cache_coordinates(
         state.pending_output(call.request_key.request_id),
@@ -519,7 +569,7 @@ def vision_state_row(
 
 
 def _feature_token_id(injection: FeatureInjection, *, start: bool) -> int:
-    """Read a marker identity already bound by the input-asset resolver."""
+    """Read a marker token id already resolved on the feature injection."""
     value = injection.start_token_id if start else injection.end_token_id
     if value is None:
         raise invalid_descriptor(
@@ -540,9 +590,12 @@ def _vision_positions(
     close_image: bool,
     model_runner: ModelExecutor,
 ) -> torch.Tensor:
-    """Build temporal-height-width positions and boundary markers for vision.
+    """Build position ids for a vision row's marker and feature slots.
 
-    tokens.
+    Returns ``[query]`` positions for ``PositionLayout.TEMPORAL``, all at
+    ``conditioning_position``. Otherwise returns ``[3, query]`` rows of
+    temporal, height and width coordinates: feature slots take their raster
+    grid coordinates and marker slots zero spatial coordinates.
     """
     query = int(leading) + feature_tokens + int(trailing)
     if layout is PositionLayout.TEMPORAL:
@@ -602,7 +655,13 @@ def latent_state_row(
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
 ) -> DiffusionRow:
-    """Publish image latents and build the diffusion-conditioning runtime."""
+    """Build the denoiser row that writes an image latent into KV.
+
+    The row runs the latent at timestep zero between the builder's two
+    framing tokens, non-causally, at the request's cache coordinates. It
+    requires an image builder with two framing tokens and a latent whose
+    token count matches the declared image size.
+    """
     builder = model_runner.image_builder
     if builder is None or builder.framing != 2:
         raise invalid_descriptor(
@@ -652,9 +711,10 @@ def diffusion_finalize_frames(
     tensor_store: TensorStore,
     model_runner: ModelExecutor,
 ) -> PendingOutput:
-    """Validate finalized diffusion output and return RGB frames with their.
+    """Schedule PNG encoding of a finalized resident image product.
 
-    numeric range.
+    Used for an image-decoding call without a latent input. A product whose
+    metadata records no value range is treated as ``(-1, 1)``.
     """
     image, metadata = transfer.fetch_product(
         call,
@@ -689,9 +749,23 @@ def defer_image_encoding(
     state: BatchState,
     max_bytes: int,
 ) -> HostTask:
-    """Reserve output storage and schedule image encoding after the device copy.
+    """Configure the call's host task to PNG-encode an image after its copy.
 
-    completes.
+    Quantizes ``image`` to HWC uint8 on its device and captures it into the
+    batch's output buffer. The call's single reserved ``HostTask`` then
+    encodes the host copy to base64 PNG once the buffer's device copies
+    complete; it holds a CPU reader on the buffer until it finishes or, when
+    cancelled, until the buffer's copy completes. The encode task itself
+    fails with ``RuntimeError`` when its payload is empty or exceeds
+    ``max_bytes``.
+
+    Raises:
+        WorkerError: When ``max_bytes`` is not positive or the quantized
+            image alone exceeds it.
+        ValueError: When ``image`` is not one RGB CHW image (optionally with
+            a singleton batch axis).
+        RuntimeError: When the call does not hold exactly one reserved host
+            task, or ``HostTask.configure`` rejects it.
     """
     if max_bytes < 1:
         raise invalid_descriptor(
@@ -725,6 +799,7 @@ def defer_image_encoding(
             )
         return payload
 
+    # configure transfers the reader to the task only on success.
     release = state.output_buffer.retain_cpu_reader()
     try:
         return reservation.configure(
@@ -744,7 +819,8 @@ def bound_device_write(
 ) -> TensorRecord:
     """Return the staged device-product write matching a declared output.
 
-    reference.
+    Raises:
+        WorkerError: When the request has no such write or more than one.
     """
     request = state.pending_output(reference.request_key.request_id)
     matches = tuple(
@@ -765,7 +841,8 @@ def bound_encoder_write(
 ) -> TensorRecord:
     """Return the staged encoder-cache write matching a declared output.
 
-    reference.
+    Raises:
+        WorkerError: When the request has no such write or more than one.
     """
     request = state.pending_output(reference.request_key.request_id)
     matches = tuple(

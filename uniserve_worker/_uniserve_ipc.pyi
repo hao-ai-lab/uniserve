@@ -1,4 +1,12 @@
-"""Native asynchronous request server exposed to the Python worker."""
+"""Type stub for the native worker IPC extension built from worker-ipc-py.
+
+``Server`` is the rank's end of its channel to the engine: it receives the
+engine's requests and publishes the worker's responses over iceoryx2 shared
+storage or a TCP socket. ``StreamSignal`` turns CUDA stream completion into a
+readable descriptor for selector loops. ``atomic_store_u32`` and
+``atomic_load_u32`` order the header words of shared-storage segments, which
+``uniserve_worker.transport.segment`` reads and writes across processes.
+"""
 
 from types import TracebackType
 from typing import Any, Self, final
@@ -13,7 +21,15 @@ __all__ = [
 
 @final
 class Server:
-    """Receives bounded IPC requests and publishes their responses."""
+    """Receives bounded IPC requests and publishes their responses.
+
+    ``recv``, ``try_recv``, ``wait_incoming`` and ``respond`` take exclusive
+    use of the endpoint and release the GIL while they hold it. A call to any
+    of them, to ``endpoint`` or to ``close`` made meanwhile from another
+    thread raises ``RuntimeError`` instead of waiting. ``wake`` and
+    ``wake_on_stream`` do not need the endpoint and may be called from any
+    thread while it is in use.
+    """
 
     def __new__(
         cls,
@@ -24,21 +40,32 @@ class Server:
     ) -> Self:
         """Bind this rank's channel.
 
-        The channel bounds payload size and in-flight request capacity.
-        ``transport`` is ``"iceoryx2"``, the default, for a rank on the head's
-        host, which serves shared storage under ``service_name``, or ``"tcp"``
-        for a rank elsewhere, where ``service_name`` is the interface to bind.
+        The channel bounds payload size in bytes and in-flight capacity:
+        ``max_inflight`` counts outstanding requests for shared storage and
+        queued response frames for a socket. ``transport`` is ``"iceoryx2"``,
+        the default, for a rank on the head's host, which serves shared
+        storage under ``service_name``, or ``"tcp"`` for a rank elsewhere,
+        where ``service_name`` is the interface to bind on a system-chosen
+        port. A socket bind does not wait for the engine to connect.
+
+        Raises:
+            RuntimeError: The bind fails or ``transport`` names neither
+                mechanism.
         """
         ...
     def endpoint(self, service: str) -> str:
         """Return the endpoint this rank reports to the head.
 
         A shared-storage endpoint is ``service`` itself; a socket endpoint is
-        the address its bind produced.
+        the address its bind produced, whose host may be a wildcard that
+        ``uniserve_worker.bootstrap.launch.register_endpoint`` replaces.
         """
         ...
     def __enter__(self) -> Self:
-        """Return this open endpoint and close it when the scope exits."""
+        """Return this open endpoint and close it when the scope exits.
+
+        Raises ``RuntimeError`` when the endpoint is already closed.
+        """
         ...
     def __exit__(
         self,
@@ -48,7 +75,8 @@ class Server:
     ) -> None:
         """Close the endpoint.
 
-        An exception raised inside the scope is preserved.
+        An exception raised inside the scope is preserved; a close failure is
+        attached to it as a note instead of replacing it.
         """
         ...
     @property
@@ -58,73 +86,127 @@ class Server:
     def close(self) -> None:
         """Idempotently release the service.
 
-        The release happens after all endpoint operations have stopped.
+        The caller must have stopped every endpoint call first: close does not
+        wait for one, and raises ``RuntimeError`` while another thread holds
+        the endpoint.
         """
         ...
     def recv(self) -> Any:
-        """Block until the next validated request is available."""
+        """Block until the next validated request is available.
+
+        There is no deadline, and ``wake`` does not end the wait. A submit
+        request arrives as ``{kind, message_id, batch}`` with a constructed
+        ``uniserve_worker.protocol.batch.Batch``; every other request kind
+        arrives in its schema-derived Python representation.
+        """
         ...
     def try_recv(self) -> Any | None:
         """Return the next request immediately.
 
-        Return ``None`` when the queue is empty.
+        Requests take the same form as from ``recv``. Return ``None`` when the
+        queue is empty.
         """
         ...
     def wait_incoming(self, timeout_us: int) -> None:
-        """Wait up to ``timeout_us`` for request or wake activity."""
+        """Wait up to ``timeout_us`` microseconds for a request or a wake.
+
+        Returns the same way on a request, a wake, and the timeout, and may
+        consume a pending wake; the caller re-checks every progress source
+        afterwards.
+        """
         ...
     def wake(self) -> None:
-        """Interrupt a pending receive wait from another thread."""
+        """Fire the completion wake that ends a ``wait_incoming``.
+
+        A wake fired while no wait is pending ends the next one unless a
+        receive consumes it first. Wakes fired before one is consumed
+        coalesce into one.
+        """
         ...
     def wake_on_stream(self, stream: int) -> None:
         """Schedule a server wake.
 
         The wake fires after the CUDA stream reaches its current point.
+        ``stream`` is the native stream handle, ``torch.cuda.Stream``'s
+        ``cuda_stream``.
         """
         ...
     def respond(self, response: Any) -> None:
-        """Publish one response to the request identified by its envelope."""
+        """Publish one response to the request identified by its envelope.
+
+        A shared-storage endpoint refuses a message id that matches no
+        received, unanswered request; a socket endpoint sends whatever id it
+        is given.
+
+        Raises:
+            ValueError: ``response`` does not decode as a worker response.
+            RuntimeError: The endpoint is closed or in use, or encoding or
+                publication fails.
+        """
         ...
 
 @final
 class StreamSignal:
-    """Bridges CUDA stream completion into an asyncio-readable signal."""
+    """Bridges CUDA stream completion into an asyncio-readable signal.
+
+    A signal is one-shot: it can be scheduled successfully once. The
+    descriptor stays open until both this object and a scheduled callback
+    that has not yet run release it.
+    """
 
     def __new__(cls) -> Self:
-        """Create an owned completion descriptor.
+        """Create an owned, non-blocking completion descriptor.
 
         The descriptor receives CUDA stream notifications.
         """
         ...
     def fileno(self) -> int:
-        """Return the readable descriptor signaled by completed stream work."""
+        """Return the readable descriptor signaled by completed stream work.
+
+        The descriptor is borrowed; the signal owns and closes it.
+        """
         ...
     def schedule(self, stream: int) -> None:
         """Signal the descriptor.
 
         The signal fires after the CUDA stream reaches its current point.
+        ``stream`` is the native stream handle. Raises ``RuntimeError`` when
+        the signal was already scheduled, the CUDA runtime cannot be loaded,
+        or CUDA rejects the callback; only a rejected callback leaves the
+        signal schedulable again.
         """
         ...
     def consume(self) -> None:
-        """Drain pending readiness notifications from the descriptor."""
+        """Read the fired signal from the descriptor.
+
+        Call it once the descriptor is readable: the read does not block, and
+        ``RuntimeError`` is raised when no signal is pending.
+        """
         ...
 
 def service_name(id: str) -> str:
-    """Return the shared-storage service name for one endpoint identifier."""
+    """Return the shared-storage service name for one endpoint identifier.
+
+    A rank names its own channel endpoint and reports it to the head, so both
+    sides must spell the name the same way; this function is that spelling.
+    """
     ...
 
 def atomic_store_u32(buffer: memoryview, offset: int, value: int) -> None:
     """Store a 32-bit word with release ordering.
 
-    ``buffer`` must be writable and contiguous, and the word at ``offset``
-    must be four-byte aligned and lie inside it; otherwise ``RuntimeError``
-    is raised.
+    Every write the calling thread made before the store is visible to a
+    process that loads the word with ``atomic_load_u32`` and observes
+    ``value``. ``buffer`` must be writable and contiguous, and the word at
+    ``offset`` must be four-byte aligned and lie inside it; otherwise
+    ``RuntimeError`` is raised.
     """
     ...
 
 def atomic_load_u32(buffer: memoryview, offset: int) -> int:
     """Load a 32-bit word with acquire ordering.
 
-    ``buffer`` carries the same requirements as for ``atomic_store_u32``.
+    ``buffer`` carries the same requirements as for ``atomic_store_u32``,
+    including writability.
     """
     ...

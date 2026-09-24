@@ -1,6 +1,23 @@
-"""Bounded execution of numerical video capabilities and media artifact.
+"""Device execution of a standalone video denoiser's request calls.
 
-actions.
+``uniserve_worker.execution.schedule`` dispatches here the video calls of a
+worker whose model has a ``VideoPostprocessor``: latent preparation, one
+denoising step per call, and video and audio decode rounds. A video decode
+round also converts its media unit to RGB and publishes it as a host product;
+``uniserve_worker.execution.host_media`` encodes and muxes those products.
+
+Each request keeps a ``DiffusionState`` whose ``SlotLadder`` holds views of
+its request slot (the denoising state: tables, noise draws and retained
+conditioning; or the video overlap state on a video decoding rank) and its
+bound ladder. The solver samples live in the worker's ``LatentPool``:
+preparation writes them to bank one of the request's pages, each step gathers
+the committed bank and writes its successor to the other bank, and the batch
+commit publishes each result through the ``LatentUpdate`` the call leaves on
+its output.
+
+The module also holds the startup passes ``ModelExecutor.warmup`` runs for
+these capabilities, and ``begin_noise``, which the batch ``Executor`` calls
+when it applies a diffusion request's start command.
 """
 
 from __future__ import annotations
@@ -45,9 +62,14 @@ if TYPE_CHECKING:
 
 
 def video_shape(runner: ModelExecutor, media: DiffusionParams, tokens: int):
-    """Resolve admission into exact numerical dimensions.
+    """Resolve a video admission into its exact numerical size.
 
-    without prompt padding.
+    ``tokens`` is the admitted prompt length; the size is not rounded up to
+    the layout it occupies. Raises ``invalid_descriptor`` when the rank lacks
+    a media builder or video decoder, when the builder or decoder rejects the
+    frame count or prompt length (a size beyond the worker's capacity
+    included), or when the admission's media unit count or step count
+    disagrees with the model.
     """
     builder = runner.media_builder
     decoder = runner.video_decoder
@@ -119,6 +141,18 @@ def prepare_call(
     Only request state survives in the trajectory. Runners own their
     constants and workspace and may be retired after their dependent graphs
     drain.
+
+    Returns the request's slot views for the call and the execution context
+    whose constants and workspace it uses: the ``"denoising"`` views and the
+    layout runner's context for preparation and denoising, the
+    ``"video_overlap"`` views and the decoder's context for a video decode
+    round (which also prepares the post-processor's context), and no views
+    for an audio decode round. Other kinds return ``({}, None)``. Slot views
+    are taken from ``storage`` on first use and kept in the trajectory.
+    Raises ``invalid_descriptor`` when the trajectory has no slot state, and
+    ``RuntimeError`` when a preparation or denoising call reaches a rank that
+    does not denoise, or when views must be taken and ``storage`` is ``None``;
+    errors of ``prepare_module`` and ``component`` propagate.
     """
     kind, size, slot = call.kind, trajectory.size, slot_ladder(trajectory)
 
@@ -203,7 +237,9 @@ def warmup_denoising(
     decoder = runner.video_decoder
     final_window = decoder.frame_slices(maximum.num_frames)[-1]
     minimum = final_window.stop - final_window.start
-    # Representative (frames, text tokens) tile boundaries to compile.
+    # Representative (frames, text tokens) tile boundaries to compile. Sizes
+    # sharing a layout are warmed once, and lengths beyond the worker's text
+    # capacity are skipped.
     shapes = (
         (maximum.num_frames, 65),
         (minimum, 1),
@@ -221,6 +257,8 @@ def warmup_denoising(
             continue
         prepared.add(layout)
         diffusion = runner.diffusion_runner(layout)
+        # ``storage[0]`` is request slot one's tensors; no request owns a
+        # slot while these passes run.
         views = storage[0].view(builder.buffers(size))
         samples = builder.sample_views(size, diffusion.samples)
         _stage_placeholder(builder, size, views, samples, diffusion.context)
@@ -315,10 +353,14 @@ def capture_denoising(
         if layout in captured:
             continue
         captured.add(layout)
+        # Whether a runner captures depends on its stream and the graph
+        # policy, which every layout shares, so one non-capturing runner ends
+        # the pass.
         if not runner.diffusion_runner(layout).captures:
             return
         diffusion = runner.diffusion_runner(layout, pin=True)
-        # Any slot's rows and pages serve the capture; the first slot's do.
+        # Any slot's rows and pages serve the capture; slot one's do, held in
+        # ``storage[0]`` and named to the ladder below.
         views = storage[0].view(builder.buffers(size))
         samples = builder.sample_views(size, diffusion.samples)
         _stage_placeholder(builder, size, views, samples, diffusion.context)
@@ -656,6 +698,16 @@ def execute(
     Latent preparation, denoising steps and decode rounds run here on the
     device; a video decode round also converts its media unit to RGB and
     publishes it as a host product for the host ranks that encode it.
+
+    Preparation and each denoising step leave a ``LatentUpdate`` on the
+    returned output, which the batch commit applies to the latent pool; a
+    denoising step also advances the output's ``flow_step``. Nothing here
+    commits request progress. Returns the call's ``PendingOutput`` with an
+    ``OK`` status and its publications. Raises ``invalid_descriptor`` when
+    the call, its inputs, parameters or progress disagree with the admitted
+    request or this rank's model, and ``RuntimeError`` when the rank lacks
+    the call's storage or capability or a module returns no statistics;
+    errors of the executor, tensor store and latent pool calls propagate.
     """
     if model_runner.video_postprocessor is None:
         raise invalid_descriptor("video execution requires a video model")
@@ -704,6 +756,8 @@ def execute(
                 "video preparation requires complete conditioning coverage"
             )
 
+        # Without a staging future from ``begin_noise``, the seeded draw and
+        # the request's tables are staged here on the service thread.
         encoded = conditioning.tensor
         staging = slot_ladder(trajectory).staging
         if staging is None:
@@ -764,6 +818,9 @@ def execute(
                 "video denoising requires one selected numerical step"
             )
 
+        # ``step_banks`` checks the slot's committed trajectory against
+        # ``start_step``, its generation and the call's parameters, and names
+        # the bank holding it; the runner writes the successor to the other.
         assert pool is not None
         source, _ = pool.step_banks(
             slot_index,
@@ -776,7 +833,9 @@ def execute(
         )
 
         # The ladder is bound over the request's slot views and the samples
-        # of its layout's runner once, and replayed by every later step.
+        # of its layout's runner once, and replayed by every later step. It
+        # views that runner's samples, so it is bound again when the layout's
+        # runner has been retired and replaced since.
         slot_state = slot_ladder(trajectory)
         layout = builder.layout(numerical_shape)
         diffusion = model_runner.diffusion_runner(layout)
@@ -814,6 +873,9 @@ def execute(
             calls.require_progress(request),
             flow_step=start_step + step_count,
         )
+
+        # Only the call that completes denoising may declare products, and
+        # it publishes the step's result, the final samples.
         if call.outputs:
             if (
                 calls.require_progress(request).flow_step
@@ -973,9 +1035,9 @@ def execute(
         raise invalid_descriptor(f"unsupported video call {call.kind!r}")
 
     request.status = CallStatus.OK
-    # Reconstruction calls consume products without advancing the diffusion
-    # trajectory. Keep their progress absent; denoising retains the step
-    # already projected above through the same completion boundary.
+    # Without cache coordinates the projection copies the output's progress
+    # unchanged: reconstruction and preparation leave it as staged, and a
+    # denoising step keeps the ``flow_step`` it advanced above.
     request.progress = calls.execution_runtime(request, None)
     request.finish_flags = FinishFlags()
     request.product_generations = calls.output_generations(call)

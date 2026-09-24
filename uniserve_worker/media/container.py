@@ -6,6 +6,9 @@ Closing an x264 encoder joins its thread pool while PyAV holds the
 interpreter lock, which stalls the rank's service thread for that time; a
 host rank has no device work to launch and no other task in flight, so the
 stall only extends the task it belongs to.
+
+This module holds the PyAV work itself; `uniserve_worker.media.mux` decides
+which of these functions runs as which lane task and for which request.
 """
 
 from __future__ import annotations
@@ -36,6 +39,9 @@ AUDIO_CODEC = "aac"
 # on one host, so a session must not size its thread pool to the machine.
 # Measured at this preset and raster, eight threads encode a unit as fast as an
 # unbounded pool does; one thread takes four to five times as long.
+# `encoded_video_bytes` budgets one slice header per thread per frame, so this
+# value also sizes the encoded unit rows reserved for a round's product
+# (`encoded_unit_bytes` in `uniserve_worker.media.mux`).
 _ENCODER_THREADS = 8
 
 
@@ -50,11 +56,12 @@ def encoded_video_bytes(frames: int, height: int, width: int) -> int:
     macroblock headers and 16 pairs of motion-vector differences. NAL escaping
     adds at most one byte per two source bytes.
 
-    Eight slice headers per frame need at most 1024 bytes each. MP4 sample
-    tables need at most 64 bytes per packet; parameter sets, encoder SEI and
-    fixed container boxes fit in 64 KiB. These are syntax bounds, independent
-    of image entropy or the achieved compression ratio. See x264's
-    encoder/cavlc.c and encoder/encoder.c and FFmpeg's libavformat/movenc.c.
+    Up to `_ENCODER_THREADS` slice headers per frame need at most 1024 bytes
+    each. MP4 sample tables need at most 64 bytes per packet; parameter sets,
+    encoder SEI and fixed container boxes fit in 64 KiB. These are syntax
+    bounds, independent of image entropy or the achieved compression ratio.
+    See x264's encoder/cavlc.c and encoder/encoder.c and FFmpeg's
+    libavformat/movenc.c.
     """
     if any(
         type(value) is not int or value < 1 for value in (frames, height, width)
@@ -72,7 +79,12 @@ def encoded_video_bytes(frames: int, height: int, width: int) -> int:
 def require_media_codecs(video_codec: str, audio_codec: str) -> None:
     """Verify that the configured encoders are available through PyAV.
 
-    Both the video and the audio encoder are checked.
+    Both codec names must be listed by PyAV and open as an encoder context.
+
+    Raises:
+        RuntimeError: When PyAV is not installed or does not list a codec.
+            PyAV raises its own error when a listed codec cannot be created
+            as an encoder.
     """
     try:
         import av
@@ -133,7 +145,17 @@ class AvMuxConfig:
 
 
 def encode_video_unit(config: AvMuxConfig, rgb24: np.ndarray) -> bytes:
-    """Encode one media unit as a self-contained MP4 starting at a keyframe."""
+    """Encode one media unit as a self-contained MP4 starting at a keyframe.
+
+    ``rgb24`` holds the unit's uint8 frames as ``[frames, height, width, 3]``.
+    Frame timestamps start at zero in every unit; `AvMuxSession.append`
+    shifts them onto the request's timeline.
+
+    Raises:
+        ValueError: When ``rgb24`` does not match the configured raster or
+            holds no frame, or ``config.video_codec`` is not a video encoder.
+            PyAV raises its own errors for codec and encoding failures.
+    """
     import av
 
     if (
@@ -151,6 +173,10 @@ def encode_video_unit(config: AvMuxConfig, rgb24: np.ndarray) -> bytes:
         if not isinstance(stream, av.VideoStream):
             raise ValueError(f"{config.video_codec} is not a video encoder")
         stream.width, stream.height = config.width, config.height
+        # `encoded_video_bytes` derives its size bound from these encoder
+        # settings. A change it does not account for can overflow the
+        # reserved product row, which `frame_encoded_unit` in
+        # `uniserve_worker.media.mux` rejects.
         stream.pix_fmt = "yuv420p"
         stream.options = {"preset": "ultrafast", "tune": "zerolatency"}
         stream.codec_context.thread_count = _ENCODER_THREADS
@@ -170,8 +196,16 @@ def encode_video_unit(config: AvMuxConfig, rgb24: np.ndarray) -> bytes:
 def encode_audio_track(config: AvMuxConfig, pcm: np.ndarray) -> bytes:
     """Encode the request's stereo PCM as a self-contained MP4.
 
-    The track is aligned to the video timeline, truncated or zero-padded, and
-    encoded in fixed-size planar frames whose last one carries padding only.
+    ``pcm`` holds interleaved int16 samples as ``[samples, 2]``. The track is
+    truncated or zero-padded to the video's duration, ``frame_count /
+    frame_rate`` seconds at ``audio_rate``, and encoded in planar frames of
+    ``audio_frame_samples`` samples; the last frame is zero-padded to that
+    size when the track does not fill it.
+
+    Raises:
+        ValueError: When ``pcm`` is not a ``[samples, 2]`` array, or
+            ``config.audio_codec`` is not an audio encoder. PyAV raises its
+            own errors for codec and encoding failures.
     """
     import av
 
@@ -228,10 +262,13 @@ class AvMuxSession:
 
     def __init__(self, config: AvMuxConfig) -> None:
         self.config = config
+        # The container and its streams are created by the first `append`.
         self._buffer: io.BytesIO | None = None
         self._container: Any = None
         self._video_out: Any = None
         self._audio_out: Any = None
+        # End of the video copied so far, in the unit packets' time base; the
+        # next unit's timestamps are shifted by it.
         self._offset = 0
         self.units_appended = 0
 
@@ -273,7 +310,14 @@ class AvMuxSession:
             track.close()
 
     def append(self, units: tuple[bytes, ...]) -> None:
-        """Copy the packets of the next media units, in order."""
+        """Copy the packets of the next media units, in order.
+
+        The first unit ever appended also creates the container (`_open`).
+
+        Raises:
+            ValueError: When the units would exceed the request's unit count;
+                nothing is appended in that case.
+        """
         import av
 
         if self.units_appended + len(units) > self.total_units:
@@ -288,12 +332,15 @@ class AvMuxSession:
                 stream = source.streams.video[0]
                 last = self._offset
                 for packet in source.demux(stream):
+                    # ``demux`` ends a stream with an empty flush packet that
+                    # has no timestamp and nothing to copy.
                     if packet.dts is None:
                         continue
                     packet.stream = self._video_out
                     packet.pts = (packet.pts or 0) + self._offset
                     packet.dts = packet.dts + self._offset
                     self._container.mux(packet)
+                    # A packet without a recorded duration counts one tick.
                     last = max(last, packet.dts + (packet.duration or 1))
                 self._offset = last
             finally:
@@ -301,13 +348,24 @@ class AvMuxSession:
             self.units_appended += 1
 
     def finalize(self, audio: bytes) -> bytes:
-        """Mux the audio track after every unit and return the artifact."""
+        """Mux the audio track after every unit and return the artifact.
+
+        The session is closed once its container is finalized, so a later
+        call raises.
+
+        Raises:
+            ValueError: When not every media unit has been appended, or the
+                session was closed.
+            RuntimeError: When the finished container is empty.
+        """
         import av
 
         if self.units_appended != self.total_units or self._container is None:
             raise ValueError(
                 "artifact assembly requires every media unit of the request"
             )
+        # The audio track starts at time zero, as the first unit does, so
+        # its packets are copied without an offset.
         track = av.open(io.BytesIO(audio), mode="r")
         try:
             for packet in track.demux(track.streams.audio[0]):

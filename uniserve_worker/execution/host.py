@@ -3,6 +3,18 @@
 A host task is a callable that runs on one of the lane's threads. The lane's
 capacity is the one its rank advertises, so the engine's lane ledger never
 hands the rank more host work than its threads serve.
+
+``HostLane.reserve`` admits a task, taking one unit of capacity, before its
+input exists. ``HostTask.submit`` runs an immediate action; a deferred one is
+attached with ``HostTask.configure`` together with its input lease, and the
+worker's executor calls ``HostTask.submit_if_ready`` until the input is
+CPU-readable. A lane thread runs the action and resolves ``HostTask.promise``.
+Capacity returns only when an unsubmitted task is abandoned or cancelled by
+``HostLane.close``, or when a task actually finishes; never when a caller
+stops waiting for a submitted one.
+
+The worker builds one lane per rank; ``CacheImports`` builds its own for KV
+cache imports.
 """
 
 from __future__ import annotations
@@ -39,6 +51,8 @@ class _Worker:
         self.thread.start()
 
     def _serve(self, lane: HostLane) -> None:
+        # ``None`` is the stop sentinel from ``close`` or ``abort``. After an
+        # abort, tasks still queued ahead of it are cancelled, not run.
         while True:
             item = self.queue.get()
             if item is None:
@@ -62,6 +76,8 @@ class HostLane:
     The lane admits at most ``max_inflight`` tasks and owns each one until it is
     cancelled before submission or actually completes. Its capacity is the one
     the rank advertises, so the engine's lane ledger never overcommits it.
+    Submitted tasks go to the thread with the fewest queued or running tasks;
+    ``workers`` must lie in ``[1, max_inflight]``.
     """
 
     def __init__(self, *, max_inflight: int, workers: int) -> None:
@@ -84,6 +100,10 @@ class HostLane:
             raise
 
     def set_completion_wake(self, wake: Callable[[], None] | None) -> None:
+        """Register the callback a lane thread calls after a task finishes.
+
+        The worker uses it to wake result polling; ``abort`` clears it.
+        """
         self._completion_wake = wake
 
     @property
@@ -93,9 +113,14 @@ class HostLane:
             return len(self._tasks)
 
     def reserve(self) -> HostTask:
-        """Admit a task under the pool's capacity lease before its inputs.
+        """Admit a task under the lane's capacity before its inputs exist.
 
-        exist.
+        The returned task holds one unit of capacity until it finishes, or
+        until ``abandon`` or ``close`` cancels it before submission.
+
+        Raises:
+            ResourceError: When the lane is closed or its capacity is
+                exhausted.
         """
         with self._lock:
             if self._closed:
@@ -130,6 +155,9 @@ class HostLane:
     def abort(self) -> None:
         """Stop admission without waiting for device inputs.
 
+        Returns without joining the lane threads. Tasks already queued are
+        cancelled when a thread dequeues them, a running task finishes
+        normally, and reserved but unsubmitted tasks are left unresolved.
         A running thread may hold a CUDA-dependent read; its resources remain
         owned by the failed worker until process exit.
         """
@@ -140,12 +168,20 @@ class HostLane:
             worker.queue.put(None)
 
     def close(self) -> None:
-        """Reject admission, cancel unsubmitted tasks and drain host readers."""
+        """Reject admission, cancel unsubmitted tasks and drain host readers.
+
+        Unless the lane was aborted, submitted tasks still run to completion;
+        the call returns once every lane thread has drained its queue and
+        exited.
+        """
         with self._lock:
             self._closed = True
             unused = tuple(task for task in self._tasks if not task._submitted)
             self._tasks.difference_update(unused)
-        # Cancelling a promise can wake dependent jobs that need the pool lock.
+        # As in ``HostTask.abandon``, ``_cancel`` runs after the lane lock is
+        # released: it synchronously runs the promise's done-callbacks and,
+        # unless the input's producer copy is still in flight, the input
+        # ``release`` callback.
         try:
             close_resources(*(task._cancel for task in unused))
         finally:
@@ -159,6 +195,15 @@ class HostTask:
     exists. The worker calls ``submit_if_ready`` to advance deferred actions;
     ``ready`` is pure. Abandoning submitted work neither cancels its reads nor
     returns its capacity.
+
+    The task's ``release`` callback runs at most once: when the task
+    finishes or, on cancellation, once the input's producer copy
+    (``input_completion``, when given) has completed.
+
+    Attributes:
+        promise: Resolves with the action's value or error, or is cancelled
+            when the task is cancelled before it runs (``abandon``, ``close``,
+            or ``abort`` of a queued task).
     """
 
     def __init__(self, pool: HostLane) -> None:
@@ -190,6 +235,27 @@ class HostTask:
         """Attach an action and transfer its input release responsibility.
 
         The action runs on a lane thread once its dependencies complete.
+
+        Args:
+            action: The host work; its return value resolves ``promise``.
+            dependencies: Futures the lane thread waits on before running
+                ``action``; a failed or cancelled dependency fails this task
+                with that error.
+            input_ready: Polled by ``submit_if_ready``; the task is submitted
+                once it returns True. None submits on the first poll.
+            input_completion: Returns the future of the copy that produces the
+                input, so cancellation defers ``release`` until the copy stops
+                writing the leased storage.
+            release: Returns the input lease; see the class docstring.
+            profile_name: Profiler range name around ``action``.
+
+        Returns:
+            This task, for chaining.
+
+        Raises:
+            RuntimeError: When the task is no longer admitted, the lane is
+                closed, or the task is already configured. Release
+                responsibility then stays with the caller.
         """
         with self._pool._lock:
             if self not in self._pool._tasks or self._pool._closed:
@@ -207,15 +273,20 @@ class HostTask:
     def submit(
         self, function: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs
     ) -> concurrent.futures.Future[_T]:
-        """Submit an immediate action using already reserved capacity."""
+        """Submit an immediate action using already reserved capacity.
+
+        Configures the task with ``function(*args, **kwargs)`` and no input
+        lease, submits it, and returns ``promise``.
+        """
         self.configure(partial(function, *args, **kwargs))
         self._pool._submit(self)
         return self.promise
 
     def submit_if_ready(self) -> None:
-        """Submit a configured action after its input copy becomes.
+        """Submit a configured action once its input is CPU-readable.
 
-        CPU-readable.
+        Does nothing when the task is already submitted or resolved, or when
+        ``input_ready`` still returns False.
         """
         if self.promise.done() or self._submitted:
             return
@@ -239,6 +310,9 @@ class HostTask:
     def _finish(
         self, *, value: Any = None, error: BaseException | None = None
     ) -> None:
+        # A release failure is reported only when the action itself succeeded.
+        # Capacity returns before the promise resolves, so a caller observing
+        # the result can reserve again immediately.
         try:
             self._release_input()
         except BaseException as release_error:
@@ -269,9 +343,13 @@ class HostTask:
         return self.promise.done()
 
     def result(self) -> Any:
-        """Return the completed value without blocking the worker's event.
+        """Return the completed value without blocking the worker's event loop.
 
-        loop.
+        Re-raises the action's error, or ``CancelledError`` for a cancelled
+        task.
+
+        Raises:
+            RuntimeError: When the task has not completed.
         """
         if not self.ready():
             raise RuntimeError(
@@ -280,6 +358,11 @@ class HostTask:
         return self.promise.result(timeout=0)
 
     def abandon(self) -> None:
+        """Cancel an unsubmitted task and return its capacity.
+
+        A no-op for a task that is submitted or no longer admitted: submitted
+        work keeps running and holds its capacity until it finishes.
+        """
         with self._pool._lock:
             if self not in self._pool._tasks or self._submitted:
                 return
@@ -290,8 +373,8 @@ class HostTask:
         self.promise.cancel()
         self._action = None
         self._dependencies = ()
-        # Cancellation cannot authorize reuse while a preceding D2H
-        # still writes.
+        # The input's device-to-host copy may still be writing the leased
+        # storage; defer the release until that copy completes.
         if self._input_completion is not None:
             completion = self._input_completion()
             if not completion.done():

@@ -1,4 +1,12 @@
-"""One byte budget for all captured calls on a worker's devices."""
+"""One byte budget for all captured calls on a worker's devices.
+
+``ModelExecutor`` owns one ``GraphStorage`` shared by every runner
+(``Execution``). Each runner reserves a private ``torch.cuda.MemPool`` per
+CUDA device and allocates its graph captures, prepared workspace and fixed
+graph inputs from it; the storage sums those pools per device against one
+budget. ``Worker`` rebinds each budget with ``set_budget`` from its
+remaining device-storage grant before startup warmup and capture.
+"""
 
 from contextlib import ExitStack, contextmanager
 
@@ -27,6 +35,15 @@ class GraphStorage:
             raise ValueError("graph storage budgets must be nonnegative")
 
     def reserve(self, owner, devices):
+        """Create ``owner``'s private pools and return them by device.
+
+        Non-CUDA devices are skipped, so the result may be empty. A device
+        without a budget gets the default share of its total memory from
+        ``graph_storage_budget_bytes``.
+
+        Raises:
+            RuntimeError: If ``owner`` already holds pools here.
+        """
         if owner in self._pools:
             raise RuntimeError("graph storage owner is already registered")
         pools = {}
@@ -46,14 +63,22 @@ class GraphStorage:
 
     @contextmanager
     def allocate(self, owner):
-        """Charge persistent preparation and input allocations to the owner."""
+        """Charge persistent preparation and input allocations to the owner.
+
+        Allocations made inside the block on the owner's devices come from
+        its private pools. The owner must be reserved.
+        """
         with ExitStack() as scope:
             for device, pool in self._pools[owner].items():
                 scope.enter_context(torch.cuda.use_mem_pool(pool, device))
             yield
 
     def check(self):
-        """Reject residency above the byte bound after preparation/capture."""
+        """Reject residency above the byte bound after preparation/capture.
+
+        Raises:
+            CUDAGraphError: If any device's pooled bytes exceed its budget.
+        """
         if not self._budgets:
             return
         for device, used in self.resident_bytes().items():
@@ -71,7 +96,12 @@ class GraphStorage:
         self.check()
 
     def resident_bytes(self):
-        """Return reserved pool bytes, including reusable capture workspace."""
+        """Return reserved pool bytes, including reusable capture workspace.
+
+        Sums the allocator segments of every owner's pools, by device, from
+        ``torch.cuda.memory_snapshot``; budgeted devices without pooled
+        segments report zero.
+        """
         sizes = dict.fromkeys(self._budgets, 0)
         ids = {
             (device.index, tuple(pool.id)): device
@@ -92,7 +122,11 @@ class GraphStorage:
         return sizes
 
     def release(self, owner):
-        """Release a pool only after its graphs and borrowed views retire."""
+        """Stop accounting for ``owner``'s pools and drop this reference.
+
+        Callers release a pool only after its graphs and borrowed views
+        retire.
+        """
         self._pools.pop(owner, None)
 
     def close(self):

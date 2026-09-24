@@ -6,6 +6,10 @@ and identity travel inside the published storage, and a consumer says it has
 finished by writing its acknowledgment word there. The producing rank sweeps
 those words when it retires the publication, so a consumer on another host
 retires a product the same way one on this host does.
+
+`Publications` is shared by `ShmTransport` and `CudaVmmTransport`; each
+supplies the callbacks that decide when its storage is settled and how it is
+handed back.
 """
 
 from __future__ import annotations
@@ -30,7 +34,10 @@ from uniserve_worker.protocol.transfer import (
 if TYPE_CHECKING:
     from uniserve_worker.transport.interface import Transport
 
-# The address-space lookup borrows existing owners without extending lifetime.
+# Process-wide registry from endpoint name to its live transport. Reads by
+# `LocalTransport` and `CudaVmmTransport` use it to reach a publication's owner
+# in the same address space; weak values keep a registration from extending
+# the owner's lifetime.
 _endpoints: weakref.WeakValueDictionary[str, Transport] = (
     weakref.WeakValueDictionary()
 )
@@ -67,7 +74,9 @@ class _Publication(Generic[Source]):
     locator: Locator
     source: Source
     digest: bytes
-    pending: bool  # the producer may still be writing the published bytes
+    # The producer may still be writing the published bytes; `ShmTransport`
+    # registers a device product pending until its host copy completes.
+    pending: bool
     retired: bool = False
     error: BaseException | None = None
     retirement: Future[None] = field(default_factory=Future)
@@ -84,6 +93,17 @@ class Publications(Generic[Source]):
     so one that never began holds nothing. A producer that fails with unknown
     physical completion keeps its source registered, so nothing reuses storage
     a device may still be writing.
+
+    Args:
+        capacity: Maximum number of registered publications, retired ones
+            still awaiting hand-back included.
+        reclaim: Hands a source back to its owner and completes the given
+            retirement future, possibly later. Called under this table's lock.
+        drain: Blocks until an in-flight reclamation completes; used by
+            `close`.
+        settled: Reports whether no named consumer is still reading a source.
+            `CudaVmmTransport` always reports settled and sweeps its pool
+            chunks' acknowledgments itself.
     """
 
     def __init__(
@@ -97,9 +117,9 @@ class Publications(Generic[Source]):
         if capacity < 1:
             raise ValueError("publication capacity must be positive")
 
-        # The incarnation names this address space in every locator it
-        # publishes, so a locator from an earlier life of the process is
-        # refused rather than resolved against the wrong owner.
+        # A fresh name per table, carried as the endpoint of every locator it
+        # publishes, so a locator from another or earlier table is refused
+        # rather than resolved against the wrong owner.
         self.name = f"uniserve-publications-{uuid.uuid4().hex}"
         self._capacity = capacity
         self._reclaim = reclaim
@@ -116,7 +136,13 @@ class Publications(Generic[Source]):
     ) -> None:
         """Register an immutable source.
 
-        The producer may still be writing its bytes.
+        With `pending`, the producer may still be writing its bytes and
+        `complete` must follow before the source can be handed back.
+
+        Raises:
+            WorkerError: `resource_error` when the table is closing or full,
+                and `invalid_descriptor` when the locator names no shared
+                transport or its identity is already registered.
         """
         key = publication_key(locator)
         with self._lock:
@@ -251,7 +277,11 @@ class Publications(Generic[Source]):
                 raise
 
     def _reap_locked(self) -> None:
-        """Forget retired publications whose owners took their storage back."""
+        """Forget retired publications whose owners took their storage back.
+
+        An entry whose retirement completed with an error is kept, so `close`
+        reports its source as retained.
+        """
         for key, publication in tuple(self._publications.items()):
             if (
                 publication.reclaiming

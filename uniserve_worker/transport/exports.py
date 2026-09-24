@@ -1,4 +1,13 @@
-"""Calls on transport registrations held by their storage owners."""
+"""Calls on transport registrations held by their storage owners.
+
+Each storage owner (`TensorStore`, `KVCacheManager`, `LatentPool`) keeps an
+`exports` map from a buffer it published to the (transport, locator) pairs of
+that publication. `validate_exports` guards a batch commit against reusing a
+committed identity. The executor selects retiring buffers with
+`retiring_exports`; `release_exports` revokes them, called by the executor
+and by each owner's own buffer release; and the executor drops them with
+`forget_exports` once every owner reports the retirement ready.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +17,7 @@ from uniserve_worker.protocol.identity import BufferId, RequestKey
 from uniserve_worker.protocol.transfer import Locator
 from uniserve_worker.transport.interface import Transport
 
+#: The (transport, locator) pair of each location a buffer was published at.
 ExportLocations = tuple[tuple[Transport, Locator], ...]
 
 
@@ -17,7 +27,12 @@ def validate_exports(
 ) -> None:
     """Reject conflicting registrations.
 
-    Registrations are rejected before a completion group's writes commit.
+    Registrations are rejected before a completion group's writes commit. A
+    candidate identical to the resident registration is accepted.
+
+    Raises:
+        RuntimeError: A candidate buffer is already registered with different
+            locations.
     """
     for buffer, locations in candidates.items():
         existing = resident.get(buffer)
@@ -34,7 +49,11 @@ def retiring_exports(
     requests: frozenset[RequestKey] = frozenset(),
     retained: frozenset[BufferId] = frozenset(),
 ) -> tuple[BufferId, ...]:
-    """Select local registrations whose allocation ownership is ending."""
+    """Select local registrations whose allocation ownership is ending.
+
+    A registration retires when its buffer is in `buffers`, or when its owning
+    request is in `requests` and the buffer is not in `retained`.
+    """
     return tuple(
         buffer
         for buffer in exports

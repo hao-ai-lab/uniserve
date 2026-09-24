@@ -1,13 +1,19 @@
 """Host media calls: media unit encoding, audio encoding and muxing.
 
 These calls run on host ranks, one codec task at a time per rank. A video
-encode consumes the RGB media units its rank is handed from a decode round,
-borrowed in place from the shared-storage segment the decoding rank on this
-host published, so the codec reads the producer's bytes directly; the
-encoded unit rows are this rank's product, published when the encodes
-complete. An audio encode consumes the request's PCM timeline, imported like
-any product because its decoding ranks may be on other hosts; a mux consumes
-the encoded unit rows.
+encode consumes the RGB media units its rank is handed from a decode round.
+When the decoding rank on this host published the round to a shared-storage
+segment, the units are borrowed in place, so the codec reads the producer's
+bytes directly; otherwise (for example, a round decoded on another host) it
+is imported and copied into a host array the task owns. The encoded unit
+rows are this rank's product, published when the encodes complete. An audio
+encode consumes the request's PCM timeline, imported like any product
+because its decoding ranks may be on other hosts; a mux consumes the encoded
+unit rows.
+
+``execute`` only schedules the codec work: it configures the host tasks
+reserved for the call during batch preparation and returns the call's
+``PendingOutput``, which is not ready until those tasks finish.
 """
 
 from __future__ import annotations
@@ -64,7 +70,11 @@ def encoded_unit_positions(
 
     A round's units are dealt to the encoder's ranks in order, each taking
     ``units_per_rank`` consecutive positions, the same order the engine used
-    to project the call onto its ranks.
+    to project the call onto its ranks. The result is empty for a rank whose
+    first position is at or past the round's ``max_units``.
+
+    Raises:
+        ValueError: When ``rank`` is not one of the component's ranks.
     """
     from uniserve_worker.execution.media import decode_range
 
@@ -89,6 +99,7 @@ def _input_publication(
 
 
 def _shm(transports: Mapping[str, Transport]) -> ShmTransport:
+    """Return the rank's shared-storage transport, bound under ``"shm"``."""
     from uniserve_worker.transport.shm import ShmTransport
 
     transport = transports.get("shm")
@@ -122,7 +133,8 @@ def _borrow(
 
     The location holding the row must be a shared-storage segment on this
     host: a host product's other mechanisms carry copies, which an encoder
-    reading in place has no use for.
+    reading in place has no use for. The borrow spans the row's full padded
+    extent; the caller releases it, or hands it to the encode task that does.
     """
     shm = _shm(transports)
     tensor = publication.value.tensor
@@ -150,6 +162,17 @@ def read_encoded_units(
     Logical row capacity bounds encoding; physical locations carry only the
     framed bytes. Shared storage reaches this host and channel bytes reach
     other hosts. Never import the uninitialized remainder of a logical row.
+
+    Locations are tried in publication order and skipped when their
+    mechanism is not reachable from this rank (shared storage when this rank
+    binds none or it lies on another node, a local transfer when this rank
+    binds none or it lies in another address space, or any other mechanism
+    than a channel) or when every row they carry was already read.
+
+    Raises:
+        WorkerError: When ``tensor`` is not 2-D ``uint8``, a location does
+            not start at its row's length prefix, a row names an invalid
+            length, or some row has no reachable location.
     """
     import torch
 
@@ -222,7 +245,7 @@ def read_encoded_units(
 
 
 def _host_array(value: torch.Tensor) -> np.ndarray:
-    """Copy an imported tensor into the rank's own host array for a codec.
+    """Copy an imported tensor's bytes into a host array the rank owns.
 
     An input imported from another host lives in this rank's tensor store,
     whose storage the call's retirement returns; the codec runs later on the
@@ -245,7 +268,23 @@ def execute(
     transports: Mapping[str, Transport],
     model_runner: ModelExecutor,
 ) -> PendingOutput:
-    """Schedule one host media call on the rank's lane."""
+    """Schedule one host media call on the rank's lane.
+
+    Configures the call's reserved ``HostTask`` slots (one per encoded unit
+    position for a video encode, one otherwise) and stages them on the
+    returned ``PendingOutput`` as ``host.tasks``. A video encode also stages
+    ``host.finish``, which frames and publishes the encoded rows once every
+    encode has completed. Audio encodes and unit appends leave their results
+    in the request's mux session; the task of the final mux call, which
+    carries no inputs, results in a ``MediaOutput`` holding the assembled
+    artifact's handle.
+
+    Raises:
+        WorkerError: When, for example, the call's inputs, reservations or
+            mux resources disagree with its kind.
+        RuntimeError: When the call has no reserved lane slots, or
+            ``HostTask.configure`` rejects one.
+    """
     from uniserve_worker.execution import transfer
     from uniserve_worker.execution.media import mux_config
 
@@ -277,6 +316,8 @@ def execute(
         cursor = int(decode_range(call, state=state).cursor)
         config = mux_config(model_runner, media)
         publication = _input_publication(call, state)
+        # Batch preparation borrows the round only when it is published over
+        # shared storage on this node; otherwise the tensor store holds it.
         imported = call.inputs[0].buffer_id not in state.borrowed_inputs
         imported_read = None
         imported_units = None
@@ -304,6 +345,7 @@ def execute(
                 # unit's row is padded to the round's longest unit.
                 unit = cursor + position
                 frames = config.video_unit_frames[unit]
+                # RGB24: three bytes per pixel.
                 expected = frames * config.height * config.width * 3
                 source: HostBorrow | np.ndarray
                 if imported_units is None:
@@ -316,6 +358,7 @@ def execute(
                             "decoded media unit holds fewer bytes than its "
                             "frames"
                         )
+                    # Narrow the borrow to this unit's own frames.
                     borrow.nbytes = expected
                     source = borrow
                 else:
@@ -383,8 +426,9 @@ def execute(
                 ),
             )
             _validate_completion_products(call, products)
-            # Products were recorded when the call was committed,
-            # before its encodes ran; these join them for the batch's result.
+            # The batch recorded its products when the call committed, before
+            # its encodes ran and with none from this call; append these rows
+            # so the batch's result carries them.
             request.products = products
             state.products = (*state.products, *products)
 
@@ -479,5 +523,7 @@ def execute(
     request.product_generations = calls.output_generations(call)
     request.host.tasks = tasks
     request.host.finish = finish
+    # The call has no product at commit; a video encode's ``finish`` sets
+    # them once its encodes complete.
     request.products = ()
     return request

@@ -1,4 +1,10 @@
-"""Stream readiness and physical retirement of one transport read."""
+"""Stream readiness and physical retirement of one transport read.
+
+Every backend's `fetch` returns a `TransferTicket`. Copy reads are driven by
+`TransferPool`; borrowed views of an in-process publication are driven by
+`LocalTransport`. Both complete the same two stages, which consumers and
+storage owners observe separately.
+"""
 
 from __future__ import annotations
 
@@ -16,8 +22,22 @@ if TYPE_CHECKING:
 class TransferTicket:
     """One read, available once its consuming stream can wait on a fence.
 
-    Descriptor readiness does not imply device completion. The transport keeps
-    physical source and mapping leases until its copy has actually completed.
+    A ticket completes in two stages:
+
+    - Readiness (`ready`, `result`, `add_done_callback`): the destination
+      views and, for a CUDA read, a fence the consumer's stream waits on are
+      available, or the read has failed. Readiness does not imply device
+      completion.
+    - Physical retirement (`retired`, `add_retirement_callback`): the
+      backend has stopped all access to source and destination storage.
+      `TransferPool` retires a copy read once its read stream has drained;
+      a borrowed view retires in `events_released`, after the fences `close`
+      records on its consumer streams complete.
+
+    The transport keeps physical source and mapping leases until retirement.
+    A read whose device work could not be drained never retires, and
+    `retirement_ready` then raises. Methods and attributes with a leading
+    underscore are the backend's side of the contract.
     """
 
     def __init__(self, event_pool: EventPool) -> None:
@@ -34,12 +54,17 @@ class TransferTicket:
         self._retirement: concurrent.futures.Future[None] = (
             concurrent.futures.Future()
         )
+        # The executor task running a pool read, cleared when it finishes;
+        # `cancel` cancels it while it is still queued.
         self._work: concurrent.futures.Future[None] | None = None
 
         # Borrowed-view consumption: streams that received the views and the
         # release that returns the source grant once they all complete.
         self._consumer_release: Any = None
         self._consumer_streams: dict[int, torch.cuda.Stream] = {}
+        # Copy reads only: the caller's stream on a CUDA destination, recorded
+        # by `TransferPool.submit` and waited on by the read stream in
+        # `TransferPool.copy`.
         self._destination_stream: torch.cuda.Stream | None = None
         self._consumer_events: tuple[torch.cuda.Event, ...] = ()
         self._closed = False
@@ -53,9 +78,10 @@ class TransferTicket:
         ] = concurrent.futures.Future()
 
     def ready(self) -> bool:
-        """Query whether result() can establish stream access.
+        """Report whether the read reached readiness or failed.
 
-        No host wait is needed.
+        Once true, `result` returns the views or raises the failure without
+        a host wait; before that it raises.
         """
         return self._future.done()
 
@@ -64,9 +90,14 @@ class TransferTicket:
         return self._retirement.done()
 
     def retirement_ready(self) -> bool:
-        """Require known physical completion first.
+        """Report physical retirement, raising when it can never be known.
 
-        Only then can an allocation be acknowledged free.
+        An allocation owner calls this before treating a destination as free.
+
+        Raises:
+            WorkerError: `resource_error`, chained from the read's failure,
+                when the read's device access could not be drained and its
+                resources are retained indefinitely.
         """
         if self._unretired:
             raise resource_error(
@@ -75,9 +106,9 @@ class TransferTicket:
         return self.retired()
 
     def add_retirement_callback(self, callback: Any) -> None:
-        """Notify allocation owners after access finishes.
+        """Invoke `callback` once, after the read physically retires.
 
-        Both physical access and acknowledgement must finish first.
+        The callback reference is dropped after its call.
         """
 
         def notify(_future: concurrent.futures.Future[None]) -> None:
@@ -90,7 +121,15 @@ class TransferTicket:
         self._retirement.add_done_callback(notify)
 
     def cancel(self) -> None:
-        """Revoke consumption while retaining storage until the read retires."""
+        """Revoke consumption while retaining storage until the read retires.
+
+        A read that has not reached readiness fails with a cancellation error,
+        and after readiness `result` raises that error instead of returning
+        the views. A queued read that has not started is cancelled in its
+        executor. A running read stops at its next `_require_active` check; a
+        copy already submitted to a device still runs to completion before
+        the ticket retires.
+        """
         with self._state_lock:
             self._cancelled = True
             if self._error is None:
@@ -114,7 +153,21 @@ class TransferTicket:
     def result(
         self, stream: torch.cuda.Stream | None = None
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        """Return destination views and order reads on the consumer stream."""
+        """Return destination views and order reads on the consumer stream.
+
+        When the read carries a fence, `stream` (default: the current stream
+        on the views' device) waits on it, and every view is recorded on the
+        stream so the caching allocator does not reuse destination storage
+        before the consumer's queued work completes. For a borrowed view, the
+        stream is also tracked so `close` can fence it.
+
+        Raises:
+            RuntimeError: When called before readiness, or after `close`
+                ended a borrowed-view read.
+            WorkerError: `invalid_descriptor` when `stream` is on another
+                device than the views. The read's failure, if any, is raised
+                as is.
+        """
         if not self.ready():
             raise RuntimeError("transfer ticket was observed before readiness")
         if self._error is not None:
@@ -148,7 +201,8 @@ class TransferTicket:
         """End a borrowed-view read after work submitted by its consumers.
 
         Records one fence on every consumer stream observed by result(); the
-        source grant returns only after all of those fences complete.
+        source grant returns only after all of those fences complete. Does
+        nothing for a copy read or a ticket already closed.
         """
         if self._consumer_release is None or self._closed:
             return
@@ -173,7 +227,12 @@ class TransferTicket:
             self.events_released()
 
     def events_released(self) -> None:
-        """Return source grant after every borrowed-view consumer completed."""
+        """Return the source grant and retire the borrowed-view read.
+
+        `EventPool.reap` calls this once every fence `close` recorded has
+        completed; `close` calls it directly when no consumer stream was
+        observed.
+        """
         release = self._consumer_release
         self._consumer_release = None
         self._consumer_streams.clear()
@@ -190,7 +249,10 @@ class TransferTicket:
         self._events.reap()
 
     def add_done_callback(self, callback: Any) -> None:
-        """Notify the owner when stream access or an error is observable."""
+        """Invoke `callback` once, when readiness or a failure is observable.
+
+        The callback reference is dropped after its call.
+        """
 
         def notify(_future: object) -> None:
             nonlocal callback
@@ -206,6 +268,12 @@ class TransferTicket:
         value: torch.Tensor | tuple[torch.Tensor, ...],
         event: torch.cuda.Event | None = None,
     ) -> None:
+        """Publish readiness with the destination views and their fence.
+
+        The ticket takes its own event-pool reference on `event`, released by
+        `__del__` once the fence has completed. A ticket that already failed,
+        for example by cancellation, keeps its failure.
+        """
         with self._state_lock:
             if event is not None:
                 device = (
@@ -221,9 +289,14 @@ class TransferTicket:
                 self._future.set_result((value, event))
 
     def _fail(self, error: BaseException) -> bool:
-        """Preserve failures after stream readiness.
+        """Record a failure, before or after readiness.
 
-        Submission failures are preserved as well.
+        A failure before readiness is what `result` raises. After readiness
+        the views may already be in use, so the failure is kept for later
+        `result` calls and the backend must also surface it elsewhere.
+
+        Returns:
+            Whether the failure arrived after a successful readiness.
         """
         with self._state_lock:
             late = self._future.done() and self._future.exception() is None
@@ -233,10 +306,14 @@ class TransferTicket:
             return late
 
     def _retain_failed_read(self, *resources: object) -> None:
-        """Keep allocations whose device access could not be drained."""
+        """Keep allocations whose device access could not be drained.
+
+        The ticket then never retires, and `retirement_ready` raises.
+        """
         self._unretired = resources
 
     def __del__(self) -> None:
+        # A borrowed view its consumer never closed is closed on collection.
         self.close()
         if self._event is not None:
             self._events.defer_release((self._event,), self._future)

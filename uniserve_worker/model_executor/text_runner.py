@@ -1,6 +1,9 @@
-"""Worker output selection around the public causal language-model.
+"""Worker output selection around the public causal language-model capability.
 
-capability.
+``TextRunner`` evaluates a ``CausalLM`` backbone once per staged call and
+returns, per row, final-token logits, all-token logits or hidden states. With
+pipeline parallelism, only the last stage projects vocabulary columns, and
+it broadcasts the selected results so every stage returns the same rows.
 """
 
 from __future__ import annotations
@@ -69,13 +72,13 @@ class TextRunner(ModelRunner):
         self.vocab = VocabShard(size, slice(start, stop), padded, tensor_group)
 
     def last_logits(self, inputs: TextInput) -> ExecutionOutput:
-        """Project one final position per sequence.
-
-        including discarded padding rows.
+        """Project one final position per sequence, padding rows included.
 
         A graph bucket can contain empty padding sequences. Their placeholder
         result is discarded by execution; live rows must each contain a token.
-        Device offsets select positions on every replay.
+        Device offsets select positions on every replay, and the output has
+        one row per sequence regardless of host query lengths.
+        ``batch_forward`` uses this path for padded last-logits buckets.
         """
         hidden = self.model(inputs)
         attention = inputs.attention
@@ -136,6 +139,9 @@ class TextRunner(ModelRunner):
 
         hidden = self.model(inputs)
         last = self.pipeline.rank == self.pipeline.size - 1
+
+        # Walk rows in order, collecting logit token indices and the per-row
+        # lengths by which the logit and hidden results are split below.
         indices = []
         logit_lengths, hidden_lengths = [], []
         for index, (length, selection) in enumerate(
@@ -171,6 +177,8 @@ class TextRunner(ModelRunner):
                     hidden, token_indices=token_indices
                 ).values
             else:
+                # Earlier stages allocate the receive buffer for the
+                # broadcast below.
                 logits = hidden.new_empty(
                     (
                         num_logits,
@@ -209,6 +217,7 @@ class TextRunner(ModelRunner):
                     selected_hidden, src=self.pipeline.size - 1
                 )
 
+        # Interleave both runs back into row order.
         outputs, vocabularies = [], []
         logits_rows = iter(logits.split(logit_lengths))
         hidden_rows = (
@@ -223,7 +232,11 @@ class TextRunner(ModelRunner):
         return ExecutionOutput(tuple(outputs), tuple(vocabularies))
 
     def batch_forward(self, batch, *, padded=False):
-        """Select numerical language outputs from one prepared input batch."""
+        """Select numerical language outputs from one prepared input batch.
+
+        A padded batch has one selection for all rows (``pad_text``); padded
+        last-logits batches use ``last_logits``.
+        """
         return (
             self.last_logits(batch.inputs)
             if padded
@@ -232,6 +245,13 @@ class TextRunner(ModelRunner):
         )
 
     def select_graph_shape(self, batch, *, eligible):
+        """Choose a text graph bucket and pad the batch to it.
+
+        Single-token decode batches may use decode buckets even when prefill
+        graphs are disabled. Returns ``None`` for eager execution, otherwise
+        ``(key, padded_batch, True)``; ``ModelRunner._run_batch`` reads
+        ``key[1]`` as the ``text_shape`` tuple.
+        """
         if not eligible or not self.pools:
             return None
 

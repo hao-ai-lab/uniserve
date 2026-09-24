@@ -1,4 +1,15 @@
-"""Stable identities shared by worker protocol messages."""
+"""Stable identities shared by worker protocol messages.
+
+`RequestKey` names one admitted request epoch, `CallId` one call of it, and
+`BufferId` one versioned output of that call. Workers use these records as
+dictionary keys throughout execution and storage. Each memoizes its hash in a
+`_hash_value` slot declared with ``init=False`` and ``compare=False``, which
+keeps it out of the constructor, equality, and ordering; `to_mapping` does not
+emit it.
+
+The PyO3 transport (`crates/worker-ipc-py`) constructs these records
+positionally, so their field order is part of that contract.
+"""
 
 from __future__ import annotations
 
@@ -11,9 +22,14 @@ from uniserve_worker.protocol.validation import _map, _nonnegative, _uint
 
 @dataclass(frozen=True, slots=True, order=True)
 class CallId:
-    """Logical batch and selection ordinal.
+    """Logical call identity: engine batch id and selection ordinal.
 
-    Independent of physical worker packing.
+    The request index is the ordinal the engine assigns at selection, before
+    physical row packing, so the identity is preserved when a scheduler batch
+    is split across workers. `CallId(0, 0)` names a request's admission root,
+    which no real call uses because real calls have a positive batch id.
+    Ordering compares ``(batch_id, request_index)``; `RequestPool` relies on
+    it to keep an out-of-order result from rolling request progress back.
     """
 
     batch_id: int
@@ -24,9 +40,10 @@ class CallId:
     )
 
     def __post_init__(self) -> None:
-        """Validate the uint64 batch and uint32 request ordinal.
+        """Validate the uint64 batch id and uint32 request ordinal.
 
-        Also validates the admission-identity rule.
+        Batch id zero is reserved for the admission root, so it requires
+        request index zero.
         """
         if not 0 <= self.batch_id <= 0xFFFFFFFFFFFFFFFF:
             raise invalid_descriptor("computation batch id is outside uint64")
@@ -53,7 +70,7 @@ class CallId:
     ) -> CallId:
         """Parse a batch and request-ordinal pair.
 
-        Passes through live instances.
+        An existing `CallId` instance is returned unchanged.
         """
         if isinstance(value, cls):
             return value
@@ -72,7 +89,12 @@ class CallId:
 
 @dataclass(frozen=True, slots=True)
 class RequestKey:
-    """Identifies one request epoch within an engine instance."""
+    """Identifies one request epoch within an engine instance.
+
+    The engine stamps each admission with the next value of an epoch counter,
+    so a reused request id yields a distinct key and no call or product
+    reference aliases across requests or epochs.
+    """
 
     engine_id: int
     request_id: int
@@ -83,7 +105,7 @@ class RequestKey:
     )
 
     def __post_init__(self) -> None:
-        """Validate the non-negative request identifier and epoch."""
+        """Require a non-negative engine id, request id, and epoch."""
         _nonnegative(self.engine_id, "request_key.engine_id")
         _nonnegative(self.request_id, "request_key.request_id")
         _nonnegative(self.request_epoch, "request_key.request_epoch")
@@ -100,10 +122,7 @@ class RequestKey:
     def from_mapping(
         cls, value: object, where: str = "request_key"
     ) -> RequestKey:
-        """Parse and validate an engine instance and request id.
-
-        Also parses the admission epoch.
-        """
+        """Parse an engine instance id, request id, and admission epoch."""
         data = _map(value, where)
         return cls(
             engine_id=_uint(data.get("engine_id"), f"{where}.engine_id"),
@@ -124,7 +143,13 @@ class RequestKey:
 
 @dataclass(frozen=True, slots=True)
 class BufferId:
-    """Identifies a versioned call output buffer and its owning request."""
+    """Identifies a versioned call output buffer and its owning request.
+
+    A `TensorRef` projects to one through `TensorRef.buffer_id`; KV
+    endpoints (`Call.kv_input`, `Call.kv_output`, `KvTransfer.source`) carry
+    one directly. `BufferAllocation` and the `Free` batch command name their
+    buffer by this identity.
+    """
 
     owner: RequestKey
     producer_call_id: CallId
@@ -136,7 +161,7 @@ class BufferId:
     )
 
     def __post_init__(self) -> None:
-        """Validate the owning request, call identifier, and version."""
+        """Require a positive allocation generation."""
         if self.generation < 1:
             raise invalid_descriptor("buffer id has no logical generation")
 
@@ -171,10 +196,7 @@ class BufferId:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Serialize persistent-buffer ownership and generation fields.
-
-        Produces the IPC wire mapping.
-        """
+        """Serialize buffer ownership and generation into the wire mapping."""
         return {
             "owner": self.owner.to_mapping(),
             "producer_call_id": self.producer_call_id.to_mapping(),
@@ -183,4 +205,5 @@ class BufferId:
         }
 
 
+# Full identity of one call: its request epoch and its call id.
 CallIdentity: TypeAlias = tuple[RequestKey, CallId]

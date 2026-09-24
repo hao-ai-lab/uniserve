@@ -1,4 +1,14 @@
-"""Execute and commit worker batches at their completion boundary."""
+"""Execute and commit worker batches at their completion boundary.
+
+``execute_batch`` is the worker executor's entry point for one prepared batch.
+It runs three phases in order: ``prepare.reserve_outputs`` binds completion
+storage and provisional resources, ``schedule.dispatch_batch`` runs the calls,
+and ``commit.commit_batch`` makes resources and request progress visible.
+Every call of a batch has the same kind and component, and a failure in any
+phase fails the whole batch. Nonfatal failures become ``CallStatus.ERROR``
+outputs for every call; fatal failures, and every failure when the caller asks
+for propagation, are raised as a classified ``WorkerError``.
+"""
 
 from __future__ import annotations
 
@@ -53,7 +63,11 @@ logger = logging.getLogger(__name__)
 
 
 def _completion_error_code(code: WorkerErrorCode) -> ErrorCode:
-    """Map internal failure classes to their completion-wire error codes."""
+    """Map internal failure classes to their completion-wire error codes.
+
+    Every class without its own case, including descriptor, setup, input and
+    scheduler errors, maps to ``ErrorCode.INVALID_CALL``.
+    """
     if code == WorkerErrorCode.RESOURCE_ERROR:
         return ErrorCode.RESOURCE_EXHAUSTED
     if code == WorkerErrorCode.COMPUTE_ERROR:
@@ -87,10 +101,21 @@ def execute_batch(
     transfer_backends: Mapping[str, Transport],
     config: WorkerConfig,
 ) -> None:
-    """Execute a run, reusing staged inputs when present.
+    """Reserve, execute and commit one prepared batch.
 
-    Startup propagates computation errors; service execution reports nonfatal
-    errors as the batch's completion so the worker can keep serving.
+    The caller must have observed ``state.inputs_ready()``; a batch whose
+    inputs are not ready raises ``RuntimeError``. The prepared predicate
+    values must cover exactly the calls with a U8 completion predicate, or
+    ``invalid_descriptor`` is raised. A batch without calls is only marked
+    launched and records no outputs.
+
+    On success the batch's outputs are recorded by ``commit_batch``. On a
+    nonfatal failure every call receives an error output through
+    ``_error_outputs`` and the function returns normally, so the worker keeps
+    serving. With ``propagate_errors`` (as warmup submits) or a fatal
+    classification, the classified ``WorkerError`` is raised instead.
+    Provisional resources are released before either outcome unless the batch
+    had already begun publication.
     """
     batch = state.batch
     if not state.inputs_ready():
@@ -116,6 +141,8 @@ def execute_batch(
         state.launched = True
         return
 
+    # reserve_outputs releases what it bound before re-raising (see its
+    # docstring), so this failure path only classifies and reports.
     try:
         reserve_outputs(
             batch,
@@ -143,6 +170,8 @@ def execute_batch(
         if propagate_errors or classified.fatal:
             raise classified
 
+        # state.started_ns is set only by BatchState.bind_outputs, which a
+        # registration failure may precede, so this path times from `started`.
         _error_outputs(
             state,
             classified,
@@ -220,6 +249,9 @@ def execute_batch(
             config=config,
         )
     except BaseException as error:
+        # Once commit_batch sets state.published, resources may already be
+        # visible and cannot be discarded; the failure is always fatal, so
+        # the error outputs below are recorded only for unpublished batches.
         if state.published:
             classified = _publication_failure(
                 error,
@@ -262,9 +294,13 @@ def _classify_failure(
     phase: str,
     state: BatchState,
 ) -> WorkerError:
-    """Classify a pre-publication batch failure with complete.
+    """Classify and log a pre-publication batch failure.
 
-    call and route context.
+    An error built from any other exception carries the coordinates of every
+    call of the batch, plus request and call identity when the batch holds
+    exactly one call. ``classify`` returns an existing ``WorkerError`` itself
+    and fills only its None-valued fields, so its ``calls`` and ``fatal``
+    stay as raised.
     """
     scheduled = tuple(
         (
@@ -276,7 +312,6 @@ def _classify_failure(
         for call in state.batch.calls
     )
 
-    # Attach request coordinates when the batch holds exactly one call.
     sole = state.batch.calls[0] if len(state.batch.calls) == 1 else None
 
     classified = classify(
@@ -298,9 +333,10 @@ def _publication_failure(
     *,
     state: BatchState,
 ) -> WorkerError:
-    """Classify a post-visibility publication failure as a fatal invariant.
+    """Classify a failure after publication began as a fatal invariant error.
 
-    violation.
+    Part of the batch's state may already be visible to successors, so it
+    cannot be discarded and the error is always fatal.
     """
     scheduled = tuple(
         (
@@ -328,7 +364,11 @@ def _log_failure(
     *,
     cause: BaseException | None = None,
 ) -> None:
-    """Log a batch failure, adding a diagnostic traceback."""
+    """Log a batch failure and clear the frames of its exception chain.
+
+    Error classes for which ``should_capture_trace`` holds log at error level
+    with the cause's traceback; the others log a warning without it.
+    """
     capture_trace = should_capture_trace(error.code)
     log = logger.error if capture_trace else logger.warning
     log(
@@ -359,14 +399,16 @@ def _error_outputs(
     forward_stats: ForwardStats,
     request_pool: RequestPool,
 ) -> None:
-    """Record final errors at the owning completion boundary without accepting.
+    """Record an error output for every call without accepting progress.
 
-    progress.
+    Each output reports the request's already accepted progress, or zero
+    coordinates when the call has no predecessor or the request pool no
+    longer holds the call's exact request key.
     """
     completion_code = _completion_error_code(error.code)
     records: list[RequestOutput] = []
     for call in state.batch.calls:
-        # Report execution coordinates only for the matching admitted epoch;
+        # Report accepted coordinates only for the matching admitted epoch;
         # a stale descriptor cannot observe a replacement request slot.
         request = request_pool.peek(call.request_key.request_id)
         if (

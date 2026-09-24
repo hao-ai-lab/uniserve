@@ -1,4 +1,13 @@
-"""Device-resident execution image of scheduler-owned block tables."""
+"""Device-resident execution image of scheduler-owned block tables.
+
+The engine scheduler owns request-slot and KV-page assignment and sends each
+batch's block tables in `Batch.block_tables`. `execution.prepare` validates
+the page ids against `KVCacheManager` and installs the tables here, before the
+batch's forward calls read them. `BlockTables` holds the device copy that
+the decode input kernels (`model_executor._decode_inputs`) index by request
+slot, plus a host mirror used for change detection and for host-side lookups
+such as attention input construction (`model_executor.attention`).
+"""
 
 from __future__ import annotations
 
@@ -22,7 +31,20 @@ class BlockTables:
 
     Slot zero is permanently reserved for padding and CUDA-graph rows. A live
     slot is installed from the scheduler's complete block-table value and is
-    cleared before it can be reused.
+    cleared by `release` before it can be reused. Cleared and unused
+    page-table entries hold page ``0``, the KV pool's padding sentinel.
+
+    Device tensors (``rows = request_pool_size + 1``):
+
+    - ``page_tables``: int32 ``[group_count, rows, max_blocks_per_request]``.
+    - ``verified_lengths``: int32 ``[rows]``, tokens whose KV is valid. The
+      worker shares this tensor with `DecodeState` as its verified cache
+      lengths.
+    - ``alloced_lens``: int32 ``[rows]``, tokens the installed pages can hold.
+
+    The device staging tensors are single-buffered and reused by every
+    `install` and `release`. Nothing but the order of the CUDA stream current
+    at each call separates one use from the next.
     """
 
     def __init__(
@@ -35,12 +57,18 @@ class BlockTables:
         device: torch.device | str,
         staging_depth: int = 1,
     ) -> None:
-        """Allocate device block tables and bounded host staging for atomic.
+        """Allocate device block tables and bounded host staging.
 
-        table updates.
+        ``staging_depth`` is the number of pinned host staging generations per
+        staging tensor; an update blocks only when it reuses a generation
+        whose previous host-to-device copy has not completed.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when any dimension is below 1.
+            ValueError: When ``staging_depth`` is below 1.
         """
-        # Slot zero is included in every device row allocation but remains
-        # reserved for padding and graph replay rather than scheduler requests.
+        # Alternative-prefix slots (for example CFG branch prefixes) owned by
+        # each exact request epoch; see `retain_prefix`.
         self._prefix_slots: dict[RequestKey, set[int]] = {}
         self.group_count = int(group_count)
         self.request_pool_size = int(request_pool_size)
@@ -59,6 +87,8 @@ class BlockTables:
                 "request-to-token pool dimensions are invalid"
             )
 
+        # One installation can touch at most every (slot, group) pair; the
+        # staging tensors are sized for that worst case.
         self._table_capacity = self.request_pool_size * self.group_count
         buffer_configs = self.buffers(
             group_count=self.group_count,
@@ -118,9 +148,15 @@ class BlockTables:
     def buffers(
         *, group_count: int, request_pool_size: int, max_blocks_per_request: int
     ) -> dict[str, BufferConfig]:
-        """Describe page tables and the full request/group installation.
+        """Describe the device tensors `__init__` allocates.
 
-        workspace.
+        `__init__` allocates exactly these configurations, and startup memory
+        accounting (`bootstrap.report`) sums them, so every device tensor the
+        class owns belongs here. Row zero of every slot-indexed tensor is the
+        padding slot.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when any dimension is below 1.
         """
         if min(group_count, request_pool_size, max_blocks_per_request) < 1:
             raise invalid_descriptor(
@@ -135,7 +171,10 @@ class BlockTables:
             # [slot]: verified and allocated token lengths per request slot.
             "verified_lengths": BufferConfig((rows,), torch.int32),
             "alloced_lens": BufferConfig((rows,), torch.int32),
-            # Device staging targets for one full installation batch.
+            # Device staging targets for one full installation batch. In
+            # `install`, row 0 of ``_slot_staging`` holds slots of changed page
+            # rows and row 1 holds slots whose allocated length changed;
+            # `release` stages its slots in row 0.
             "_page_staging": BufferConfig(
                 (tables, max_blocks_per_request), torch.int32
             ),
@@ -148,9 +187,26 @@ class BlockTables:
         self,
         tables: Sequence[tuple[int, int, Sequence[int], int]],
     ) -> None:
-        """Atomically install validated request block tables and allocated.
+        """Install scheduler block tables and allocated lengths on the device.
 
-        lengths on the device.
+        Each entry is ``(slot, group, pages, allocated_tokens)`` and replaces
+        that slot's page row for the group. Only rows and lengths that differ
+        from the host mirror are copied. On CUDA the device writes are
+        enqueued asynchronously on the current stream; the host blocks only
+        when a pinned staging generation is reused before its previous copy
+        has completed.
+
+        This method checks table-local bounds only: slots in
+        ``[1, request_pool_size]``, groups in range, positive unique pages
+        that fit the row, ``allocated_tokens`` within the pages' capacity, no
+        repeated ``(slot, group)``, and one allocated length per slot across
+        its groups. The caller validates page ids against the physical pool
+        (`KVCacheManager.validate_pages`). All entries are validated before
+        any staging or device write, so a rejected update changes nothing.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when the update exceeds the
+                staging capacity or any entry fails validation.
         """
         count = len(tables)
         if count == 0:
@@ -166,6 +222,7 @@ class BlockTables:
         slot_allocations: dict[int, int] = {}
         identities: set[tuple[int, int]] = set()
 
+        # Validate every entry and collect only the changes.
         for raw_slot, raw_group, raw_pages, raw_allocated in tables:
             slot = int(raw_slot)
             group = int(raw_group)
@@ -184,6 +241,8 @@ class BlockTables:
                 or (slot, group) in identities
             ):
                 raise invalid_descriptor("scheduler block table is invalid")
+            # The allocated length is per slot; all of a slot's cache groups
+            # must report the same value.
             previous = slot_allocations.setdefault(slot, allocated_tokens)
             if previous != allocated_tokens:
                 raise invalid_descriptor(
@@ -229,6 +288,9 @@ class BlockTables:
             )
             self._page_host.record_copy(page_slot)
             self._group_host.record_copy(group_slot)
+            # Scatter the staged rows into page_tables[group, slot, :]. A
+            # staged row is zero past its page count, which clears any longer
+            # previous row.
             self.page_tables[
                 self._group_staging[:changed_count],
                 self._slot_staging[0, :changed_count],
@@ -261,9 +323,12 @@ class BlockTables:
             self._host_alloced_lens[slot] = allocated_tokens
 
     def pages(self, request_pool_idx: int, group_id: int) -> tuple[int, ...]:
-        """Resolve the installed cache-page table for one request slot.
+        """Return the installed page ids for one request slot and cache group.
 
-        and cache group.
+        Reads the host mirror; no device access.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when no table is installed.
         """
         try:
             return self._host_tables[(int(request_pool_idx), int(group_id))]
@@ -273,11 +338,23 @@ class BlockTables:
             ) from None
 
     def allocated_length(self, request_pool_idx: int) -> int:
-        """Expose the token capacity currently installed for a request slot."""
+        """Return the installed token capacity of a slot, or 0 if none."""
         return self._host_alloced_lens.get(int(request_pool_idx), 0)
 
     def set_verified(self, slots: torch.Tensor, lengths: torch.Tensor) -> None:
-        """Update verified cache lengths without changing page tables."""
+        """Update verified cache lengths without changing page tables.
+
+        ``slots`` and ``lengths`` are 1-D and row aligned; slots are not
+        range-checked here. Each length must lie in
+        ``[0, alloced_lens[slot]]``. On CUDA the bound is checked with
+        ``torch._assert_async``, which avoids a host synchronization but
+        reports a violation as an asynchronous device assertion; on CPU a
+        violation raises ``invalid_descriptor`` before any write.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when the inputs are not row
+                aligned, or on CPU when a length is out of bounds.
+        """
         slots = slots.to(device=self.page_tables.device, dtype=torch.int64)
         lengths = lengths.to(device=self.page_tables.device, dtype=torch.int32)
         if slots.ndim != 1 or lengths.shape != slots.shape:
@@ -297,9 +374,11 @@ class BlockTables:
         self.verified_lengths.index_copy_(0, slots, lengths)
 
     def close(self) -> None:
-        """Retire pinned page-table sources before their borrowed streams are.
+        """Release pinned staging sources and clear host bookkeeping.
 
-        destroyed.
+        Waits for outstanding host-to-device staging copies and drops the
+        pinned sources; call it while the CUDA streams those copies ran on
+        still exist. The device tensors are not freed here.
         """
         close_resources(
             self._page_host.close,
@@ -312,18 +391,26 @@ class BlockTables:
         self._host_alloced_lens.clear()
 
     def retain_prefix(self, request_key: RequestKey, slot: int) -> None:
-        """Associate an alternative CFG prefix row with its exact request.
+        """Record that a request epoch uses another slot as a prefix row.
 
-        epoch.
+        `execution.prepare` calls this for forward rows whose slot differs
+        from the request's own slot, such as a CFG branch prefix. The slot is
+        cleared by `release_prefixes` for the same `RequestKey`.
         """
         self._prefix_slots.setdefault(request_key, set()).add(int(slot))
 
     def release_prefixes(
         self, request_key: RequestKey, slots: Sequence[int] | None = None
     ) -> None:
-        """Release selected alternative rows, or every row owned by a retiring.
+        """Clear alternative-prefix slots and stop tracking them.
 
-        epoch.
+        With ``slots``, clears exactly those slots (tracked or not); without
+        it, clears every slot recorded for ``request_key``. The key's entry is
+        dropped once it tracks no slot.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when a slot is outside
+                ``[1, request_pool_size]``; nothing is cleared then.
         """
         tracked = self._prefix_slots.get(request_key, set())
         selected = tuple(tracked) if slots is None else tuple(slots)
@@ -333,9 +420,16 @@ class BlockTables:
             self._prefix_slots.pop(request_key, None)
 
     def release(self, slots: Sequence[int]) -> None:
-        """Clear selected request slots and return them to the scheduler-owned.
+        """Clear selected request slots for reuse by the scheduler.
 
-        free state.
+        Zeroes the slots' page rows in every group together with their
+        verified and allocated lengths, and drops their host mirror entries.
+        Duplicates are ignored. Alternative-prefix tracking is unchanged; see
+        `release_prefixes`.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when a slot is outside
+                ``[1, request_pool_size]``.
         """
         values = tuple(dict.fromkeys(int(slot) for slot in slots))
         if not values:

@@ -1,4 +1,11 @@
-"""Persistent per-request tensor banks and borrowed slot views."""
+"""Persistent per-request tensor banks and borrowed slot views.
+
+``RequestSlots`` backs the per-request state fields a model declares
+(``state_buffers``) for every scheduler request slot until ``close``.
+``RequestPool`` owns one instance; request execution borrows a slot's views
+through ``tensors``, and ``DiffusionRunner`` borrows the device banks to
+gather a slot's state by a device slot index.
+"""
 
 from __future__ import annotations
 
@@ -21,16 +28,29 @@ class RequestSlots:
         state_buffers: Mapping[str, BufferConfig] | None,
         device: torch.device | str,
     ) -> None:
+        """Allocate every declared field for ``capacity`` request slots.
+
+        Args:
+            capacity: Number of request slots; slot ids are one-based.
+            state_buffers: Declared per-slot fields by name. ``None`` or an
+                empty mapping allocates nothing, and ``tensors`` then raises.
+            device: Device of the non-host fields. Host fields are pinned when
+                it is a CUDA device.
+
+        Raises:
+            ValueError: ``capacity`` is below one.
+        """
         size = int(capacity)
         if size < 1:
             raise ValueError("request storage capacity must be positive")
         self.capacity = size
         self._closed = False
         # Device state fields live in one bank per field with a leading slot
-        # axis, so a captured graph can index a request's sample and
-        # conditioning storage through a device slot tensor instead of baking
-        # a slot's addresses in. Each slot borrows its row of every bank; host
-        # fields stay one pinned allocation per slot.
+        # axis, so a captured graph can index a request's state, such as the
+        # denoiser's tables and conditioning, through a device slot tensor
+        # instead of baking a slot's addresses in. Row ``slot - 1`` of each
+        # bank, at the field's capacity shape, belongs to request slot
+        # ``slot``. Host fields stay one allocation per slot.
         self._bank: TensorBuffers | None = None
         self._host_slots: tuple[TensorBuffers, ...] = ()
         self.bank: Mapping[str, torch.Tensor] = {}
@@ -91,7 +111,11 @@ class RequestSlots:
             )
 
     def tensors(self, request_pool_idx: int) -> TensorBuffers:
-        """Borrow a slot's tensors until its execution lease is retired."""
+        """Borrow a slot's tensors until its execution lease is retired.
+
+        Raises ``RuntimeError`` after close, and ``invalid_descriptor`` when
+        the one-based slot is out of range or no fields were declared.
+        """
         if self._closed:
             raise RuntimeError("request storage is closed")
         slot = int(request_pool_idx)

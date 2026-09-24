@@ -1,4 +1,28 @@
-"""Worker-owned execution of declared numerical capabilities."""
+"""Worker-owned execution of declared numerical capabilities.
+
+``ModelExecutor`` binds a loaded model's components to this rank, discovers
+their capabilities, and owns everything that executes them: CUDA streams
+(execution lanes and their forks), input staging, and prepared execution
+contexts and captured graphs, whose allocations its ``GraphStorage``
+accounts against per-device budgets. It keeps three kinds of runner:
+
+- staged entries, created once by ``configure_inputs`` per (component, path,
+  lane) with fixed input buffers, which ``forward`` drives with homogeneous
+  batches of token rows and image-path rows (vision and latent encoding,
+  image denoising and decoding);
+- module entries, prepared by ``prepare_module`` per exact numerical size
+  and invoked through ``run_module`` for standalone calls such as encoders,
+  decoders and the video post-processor;
+- diffusion runners, one per layout of a standalone video denoiser, which
+  ``run_denoising`` steps (see ``uniserve_worker.execution.media``).
+
+The worker constructs one executor per rank and drives it through startup
+(``bind_diffusion_storage`` on a denoising rank, ``configure_inputs`` on a
+rank that owns a KV cache, ``warmup`` and ``capture`` on a rank with
+numerical methods, then ``complete_startup``), serves calls, and at shutdown
+releases it with ``close_graphs`` and ``close`` (an aborted shutdown calls
+only ``close``).
+"""
 
 from __future__ import annotations
 
@@ -137,6 +161,26 @@ class ModelExecutor:
     Each numerical call uses its declared capability. Shared Parameters remain
     in the loaded module tree; independent call/lane contexts own mutable plans,
     workspaces, communication resources and captured input/output storage.
+
+    Args:
+        model: The loaded model whose components this rank executes.
+        worker_config: The rank's execution configuration.
+        bindings: Component bindings by entry name. ``None`` binds every
+            declared component to this rank alone, a video decoder's as a
+            one-rank temporal-unit distribution.
+        entry_points: IPC entry declarations; ``None`` uses the
+            ``entry_points`` of the module that defines the model's class.
+        attention: Attention backend name; ``None`` uses the configured
+            backend, or ``"auto"``.
+        image_processor: Image preprocessing settings, required by calls
+            that go through ``image_processor``.
+        flow_prompt: The model's flow prompt, from which image denoising
+            calls, warmup requests and startup graph capture resolve their
+            branch prefixes.
+        max_inflight: The worker's queue depth. It sizes the streams' event
+            rings when ``module_stream`` initializes them before
+            ``configure_inputs`` does; a lane's own ``max_inflight``
+            overrides it.
     """
 
     def __init__(
@@ -298,9 +342,10 @@ class ModelExecutor:
         )
 
     def component(self, kind, *, capability_type=None):
-        """Return the single module that provides a computation kind on this.
+        """Return the single module that provides ``kind`` on this rank.
 
-        rank.
+        ``capability_type`` further restricts the candidates to instances of
+        that class. Raises ``InputError`` unless exactly one module matches.
         """
         calls = [
             call
@@ -318,9 +363,11 @@ class ModelExecutor:
         return calls[0].module
 
     def _module_call(self, name, method=None):
-        """Return the uniquely identified ``(binding.
+        """Return the unique ``(binding, call)`` pair of component ``name``.
 
-        call)`` pair for a component.
+        ``method`` selects among the component's numerical methods. Raises
+        ``RuntimeError`` once the executor is closed and ``InputError`` unless
+        exactly one call matches.
         """
         if self._closed:
             raise RuntimeError("model runner is closed")
@@ -341,9 +388,10 @@ class ModelExecutor:
     def prepare_module(self, name, size, *, method=None):
         """Prepare one exact numerical size before dependent media calls.
 
-        Prepared contexts are kept in an LRU per (entry, path, method); when
-        the residency bound is reached, the oldest context and the graphs that
-        borrow it are retired.
+        Prepared contexts are kept in an LRU per (entry, path, method), keyed
+        by the input signature of ``size``; when the residency bound, the
+        request pool size, is reached, the least recently used context and the
+        graphs that borrow it are retired. Returns the prepared runner.
         """
         binding, call = self._module_call(name, method)
         key = (name, call.path, call.entry_point.method, input_signature(size))
@@ -365,6 +413,9 @@ class ModelExecutor:
                 # other stages never reach.
                 groups=call.groups,
             )
+            # An entry given graph devices captures a graph the first time it
+            # executes each input signature (``ModelRunner.execute_model``); a
+            # video post-processor is given none and always runs eagerly.
             entry = self._runner_types[id(call)](
                 name,
                 call,
@@ -395,9 +446,13 @@ class ModelExecutor:
         return self._module_entries[key]
 
     def module_stream(self, name, *, method=None):
-        """Bind one numerical entry to a stream in its existing resource.
+        """Bind one numerical entry to a stream in its existing resource grant.
 
-        grant.
+        Returns ``None`` for an entry on a non-CUDA device. Each (entry, path,
+        method) gets one stream on first use, kept until ``close``. Raises
+        ``InputError`` when more than one lane stream on the entry's device
+        covers its call kinds, or when lanes are configured and none does;
+        errors of ``_module_call`` and ``_initialize_streams`` propagate.
         """
         binding, call = self._module_call(name, method)
         if binding.device.type != "cuda":
@@ -406,8 +461,11 @@ class ModelExecutor:
         self._initialize_streams(event_slots=self._event_slots)
         key = (name, call.path, call.entry_point.method)
         if key not in self._module_streams:
-            # A standalone entry forks the lane stream that covers its call
-            # kinds, or creates a full-device stream when lanes are off.
+            # A standalone entry forks the stream on its device that covers
+            # its call kinds: a lane stream, or without lanes the device's
+            # full-device stream, which covers every kind. Without lanes, an
+            # entry on a device that has no full-device stream gets a stream
+            # of its own.
             entry_kinds = self._call_kinds[id(call)]
             parents = tuple(
                 stream
@@ -460,9 +518,14 @@ class ModelExecutor:
         return entry
 
     def call_stream(self, call):
-        """Select a standalone capability's stream.
+        """Select the stream a standalone capability's batch runs on.
 
-        staged batches bind their own lanes.
+        Returns ``None`` for a call a staged entry serves, since staged
+        batches bind their own lanes; for latent preparation of a component
+        whose denoising is staged; for a call with no bound capability; and
+        for a capability on a non-CUDA device. Raises ``InputError`` when the
+        component's capabilities for the call do not narrow to exactly one,
+        and propagates the errors of ``module_stream``.
         """
         if (call.component, call.kind) in self._forward_calls:
             return None
@@ -500,9 +563,14 @@ class ModelExecutor:
         return None if owner is None else owner.stream
 
     def _initialize_streams(self, *, event_slots):
-        """Realize execution grants for both staged and standalone.
+        """Realize execution grants for both staged and standalone capabilities.
 
-        capabilities.
+        Once streams exist, later calls keep them, whatever their
+        ``event_slots``. With lanes configured it partitions the worker
+        device's SMs into one stream per lane, and raises ``ValueError`` if
+        graphs may also allocate on another device; without lanes it creates
+        one full-device stream per CUDA device the worker computes or
+        captures on.
         """
         if self._lane_streams:
             return
@@ -547,9 +615,10 @@ class ModelExecutor:
                     )
 
     def _retire_module(self, key):
-        """Drain a producer before releasing the graphs that borrow its.
+        """Retire the module entry under ``key`` and its captured graphs.
 
-        resources.
+        The entry's stream is drained first, so no queued work still uses
+        what the entry releases.
         """
         entry = self._module_entries.pop(key)
         if entry.context.stream is not None:
@@ -558,6 +627,7 @@ class ModelExecutor:
 
     @property
     def encoder_kinds(self):
+        """Encoder kinds, as ``run_encoder`` names them, bound on this rank."""
         return frozenset(
             self._encoder_kind(call.module)
             for _, call in self._module_calls.values()
@@ -575,9 +645,11 @@ class ModelExecutor:
         return "conditioning"
 
     def run_encoder(self, kind, *values):
-        """Run the rank's encoder of the given kind ("text", "vision", "latent".
+        """Run this rank's encoder of ``kind``.
 
-        "conditioning").
+        ``kind`` is ``"text"``, ``"vision"``, ``"latent"`` or
+        ``"conditioning"`` (see ``encoder_kinds``). Raises ``InputError``
+        unless exactly one bound encoder has that kind.
         """
         found = [
             (name, call)
@@ -614,6 +686,8 @@ class ModelExecutor:
             try:
                 return runner.execute_model(*args, **kwargs)
             except CUDAGraphError:
+                # Retire the failed context and its graphs; the next call at
+                # this size prepares a fresh one.
                 self._retire_module(
                     (
                         name,
@@ -730,9 +804,15 @@ class ModelExecutor:
     ):
         """Resolve the published layout of one call output on this rank.
 
+        ``media`` supplies the request's frame count (the builder's maximum
+        when ``None``), ``decode`` the media units of a scheduled decode round
+        (every unit when ``None``), and ``num_prompt_tokens`` the prompt
+        length. A distributed component's layout is narrowed to the units
+        this rank publishes.
+
         Returns None for outputs this rank does not publish: non-output ranks,
         degenerate denoiser slices, and empty temporal-unit shares of a
-        distributed decoder.
+        distributed component.
         """
         binding = self.bindings.get(entry)
         if (
@@ -836,7 +916,9 @@ class ModelExecutor:
         Creates one capability runner per (entry, path, lane) covering a
         computation kind, with its input buffers, execution context, decode /
         prefill capture shapes, and private CUDA graph storage pools. Callable
-        exactly once.
+        once: a second call raises ``RuntimeError`` when the first bound any
+        entry. Raises ``ValueError`` when two staged entries of one component
+        cover the same computation kind, and as ``_initialize_streams`` does.
         """
         from uniserve_worker.config.execution import (
             DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
@@ -901,6 +983,9 @@ class ModelExecutor:
             if not entry_kinds:
                 continue
 
+            # An entry covering latent encoding or image decoding is staged on
+            # the generation device, or the worker device when none is
+            # configured; any other entry on its component's placement device.
             target = (
                 canonical_device(config.generation_device or config.device)
                 if entry_kinds
@@ -912,6 +997,9 @@ class ModelExecutor:
                 for lane, stream in self._lane_streams
                 if stream.device == target
             ]
+            # One runner per stream on the target device whose lane covers
+            # some of the entry's kinds (a full-device stream covers all);
+            # with no stream there, as on a CPU device, one runner without.
             for lane, stream in streams or ((None, None),):
                 kinds = (
                     entry_kinds
@@ -1070,9 +1158,12 @@ class ModelExecutor:
     def call_devices(self, call):
         """Return ``(compute, staged, output)`` devices for one call.
 
-        Media-generation kinds run on the generation device when one is
-        configured. The staged device is the bound execution entry's device,
-        or the compute device when the call has no staged binding.
+        The compute and output device is the component's placement device, or
+        the worker device for an unbound component. With an image builder,
+        latent preparation, denoising and image decoding compute and output on
+        the generation device, or the worker device when none is configured. The
+        staged device is the bound execution entry's device, or the compute
+        device when the call has no staged binding.
         """
         binding = self.bindings.get(call.component)
         source = (
@@ -1152,9 +1243,12 @@ class ModelExecutor:
         self.synchronize()
 
     def complete_startup(self):
-        """Seal startup: check captured-graph storage budgets and stream.
+        """Seal startup: check captured-graph storage budgets and stream grants.
 
-        grants.
+        Afterwards the staged entries capture no further batch graphs (see
+        ``ModelRunner``). Raises ``CUDAGraphError`` when graph residency
+        exceeds its budget, and ``CUDAError`` when a lane stream has lost its
+        SM partition.
         """
         self.graph_storage.check()
 
@@ -1165,9 +1259,11 @@ class ModelExecutor:
             entry._startup_complete = True
 
     def synchronize(self):
-        """Host-synchronize every owned stream and each active device's current.
+        """Host-synchronize every owned stream and each device's current stream.
 
-        stream.
+        The devices are the worker device and the devices graphs may allocate
+        on. Every stream is attempted even if one fails; the first failure is
+        raised.
         """
         streams = [self._preparation_stream]
         streams.extend(stream.stream for _, stream in self._lane_streams)
@@ -1195,9 +1291,11 @@ class ModelExecutor:
         )
 
     def close_graphs(self):
-        """The caller drains all borrowed output readers before this.
+        """Destroy every runner's captured graphs, keeping their contexts.
 
-        call.
+        The caller drains all borrowed output readers first. A non-aborted
+        worker close calls this before releasing the KV cache, latent pool and
+        product backing the graphs reference.
         """
         actions = [
             entry.close_graphs
@@ -1210,9 +1308,7 @@ class ModelExecutor:
         close_resources(*actions)
 
     def close(self, *, aborted: bool = False):
-        """Release every owned context, buffer, graph.
-
-        and stream exactly once.
+        """Release every owned context, buffer, graph and stream exactly once.
 
         ``aborted`` releases after a failure on this rank. Retiring a
         communicator is collective and synchronizing waits on the device, and
@@ -1225,6 +1321,7 @@ class ModelExecutor:
 
         # A draw writes request storage, so it completes before its owners
         # release anything; an aborted release leaves it running until exit.
+        # A constructor failure closes before ``noise_draws`` is assigned.
         noise_draws = getattr(self, "noise_draws", None)
         if noise_draws is not None:
             noise_draws.shutdown(wait=not aborted, cancel_futures=True)
@@ -1299,13 +1396,17 @@ class ModelExecutor:
     def preparing_inputs(
         self, transfers: tuple[tuple[torch.Tensor, torch.Tensor], ...]
     ) -> Iterator[None]:
-        """Overlap reserved input copies with computation.
+        """Overlap reserved input copies with computation, then join order.
 
-        then join device order.
-
+        Each ``(destination, source)`` pair is copied on the executor's
+        preparation stream while the body runs on the current stream. The
+        copies are not ordered after work already queued on the current
+        stream, so sources must be ready and destinations free on entry.
         Sources and destinations must remain reserved through this call's
         physical completion. The final stream wait also covers failed compute,
         so completion and request retirement cannot overtake the input copies.
+        Raises ``RuntimeError`` without a live CUDA executor and ``ValueError``
+        when a pair differs in shape or dtype.
         """
         stream = self._preparation_stream
         if (
@@ -1352,9 +1453,13 @@ class ModelExecutor:
         tables: BlockTables | None,
         states: DecodeState | None,
     ) -> Iterator[tuple[tuple[int, ...], ExecutionOutput | BaseException]]:
-        """Execute actual compatible rows.
+        """Execute rows as homogeneous numerical calls, yielding by index.
 
-        yielding results at their original indexes.
+        Yields ``(indexes, outcome)`` pairs, where ``indexes`` are positions in
+        ``tasks`` and ``outcome`` is the group's ``ExecutionOutput`` or the
+        error that failed it. A row with no staged entry yields its own
+        ``invalid_descriptor`` error before any group runs; groups then run in
+        the order their first row appears.
 
         A failed model call identifies every participating row. The caller owns
         batches and decides which dependent calls to suppress.
@@ -1447,9 +1552,14 @@ class ModelExecutor:
         tables: BlockTables | None,
         states: DecodeState | None,
     ) -> ExecutionOutput:
-        """Stage forward rows, choose eager or CUDA graph execution.
+        """Stage one homogeneous group of rows, run it, and validate outputs.
 
-        invoke the model, and validate outputs.
+        The staged entry chooses eager or CUDA graph execution. Returns the
+        output with its request slot indices, its lane output fence, and
+        statistics for this one call. Raises ``RuntimeError`` once closed,
+        ``ValueError`` for an empty or mixed-kind group, ``InputError`` when
+        the group has no staged entry or staging fails, and the error
+        ``_execution_failure`` classifies when execution or validation fails.
         """
         if self._closed:
             raise RuntimeError("model runner is closed")
@@ -1457,6 +1567,8 @@ class ModelExecutor:
         if not tasks:
             raise ValueError("model runner received an empty call")
 
+        # Only token forward modes and denoising are eligible for CUDA graphs;
+        # other staged kinds run eagerly.
         started = time.perf_counter_ns()
         graph_eligible = all(
             isinstance(task.forward_mode, ForwardMode)
@@ -1518,6 +1630,8 @@ class ModelExecutor:
                     )
                     request_pool_indices = batch.request_pool_indices
             except Exception as error:
+                # Join staging copies already submitted to the lane before
+                # reporting, as for execution failures below.
                 output_event = (
                     None if lane_runtime is None else lane_runtime.record()
                 )
@@ -1623,9 +1737,9 @@ def _input_failure(
     forward_mode: ForwardMode | MediaCall,
     calls: tuple[tuple[int, int, int, CallId], ...],
 ) -> InputError:
-    """Classify invalid model inputs with their phase and call.
+    """Classify invalid model inputs with their phase and call identities.
 
-    identities.
+    An ``InputError`` is returned unchanged.
     """
     if isinstance(error, InputError):
         return error
@@ -1642,9 +1756,12 @@ def _execution_failure(
     forward_mode: ForwardMode | MediaCall,
     calls: tuple[tuple[int, int, int, CallId], ...],
 ) -> WorkerError:
-    """Classify a model failure and attach the active phase and call.
+    """Classify a model failure and attach the active phase and call identities.
 
-    identities.
+    A ``WorkerError`` is returned unchanged. A CUDA graph failure, or an error
+    ``classify`` maps to a resource or fatal worker failure, becomes a
+    ``ResourceError`` that keeps the classified fatality; anything else becomes
+    a ``ComputeError``.
     """
     if isinstance(error, WorkerError):
         return error
