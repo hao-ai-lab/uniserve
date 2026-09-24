@@ -3,7 +3,19 @@
 
 // block_sparse_kernel_sm100a.cuh -- VSA block-sparse FMHA forward (per-q-block top-k), sm_100a.
 // Warp-specialized: load / MMA (tcgen05) / softmax / correction / epilogue / scheduler.
-// Writes O and, when asked, the log-sum-exp the backward consumes.
+// Writes O and, when lse_out is non-null, the base-2 logarithm of each query
+// row's softmax normalizer, log2(sum_j exp(sm_scale * s_j)); a row with no
+// visible key gets -FLT_MAX * scale_log2 rather than -inf. The torch binding
+// never requests the LSE.
+//
+// Each CTA processes work items of two adjacent query tiles (m-tiles) of one
+// head. Each m-tile walks its own list of selected key blocks from q2k_idx,
+// K_TILE keys per iteration, through one shared K/V ring in shared memory. S
+// and O accumulate in tensor memory (TMEM); softmax uses an online maximum and
+// sum with conditional rescaling, and the correction warps rescale and finally
+// normalize O. Keys past variable_block_sizes[block] are masked. Barrier and
+// buffer names below: "full" barriers signal data ready, "empty" barriers
+// signal a buffer free for reuse.
 //
 #ifndef BLOCK_SPARSE_VSA_KERNEL_SM100A_CUH
 #define BLOCK_SPARSE_VSA_KERNEL_SM100A_CUH
@@ -47,6 +59,8 @@ constexpr bool BLK128 = VSA_BLK128;
 #endif
 constexpr bool DEFER_ROWSUM = VSA_DEFER_ROWSUM;
 
+// Tile geometry. The block-64 build pairs two 64-row m-tiles per CTA and
+// walks 256 keys (four sparse blocks) per K-tile. HEAD_DIM is fixed at 128.
 constexpr int BLOCK  = BLK128 ? 128 : 64;
 constexpr int M_TILE = BLOCK;
 constexpr int M_TILES_PER_CTA = 2;
@@ -55,6 +69,8 @@ constexpr int BLOCKS_PER_KTILE = K_TILE / BLOCK;
 constexpr int KV_HALF = K_TILE / 2;
 constexpr int HEAD_DIM = 128;
 
+// Shared-memory tiles are stored as 64-channel (128-byte) subtiles, the row
+// width of the 128-byte TMA/UMMA swizzle.
 constexpr int SUB_COLS_BF16 = 64;
 constexpr int SUB_COLS_BYTES = SUB_COLS_BF16 * (int)sizeof(__nv_bfloat16);
 constexpr int Q_SUBTILES = HEAD_DIM / SUB_COLS_BF16;
@@ -64,6 +80,8 @@ constexpr int Q_SUB_COLS_BYTES = M_TILE * SUB_COLS_BYTES;
 constexpr int K_SUB_COLS_BYTES = K_TILE * SUB_COLS_BYTES;
 constexpr int Q_TILE_BYTES = Q_SUBTILES * Q_SUB_COLS_BYTES;
 
+// K/V ring. Every slot, K or V, holds exactly KV_RING_SLOT_BYTES of TMA data;
+// the load warp's expect_tx relies on it.
 constexpr int KV_RING_SLOT_BYTES = 32 * 1024;
 constexpr int SLOTS_PER_KV_TILE = BLK128 ? 1 : 2;
 
@@ -71,33 +89,66 @@ constexpr int NUM_KV_STAGES = BLK128 ? 3 : 4;
 
 constexpr int V_BLK_BYTES = HEAD_DIM * SUB_COLS_BYTES;
 
+// TMEM columns per m-tile for S (FP32), later overwritten in place by P
+// (packed BF16 pairs, S_COLS / 2 columns). An MMA atom has K = 16: 16
+// channels of a subtile in QK and 16 keys in PV.
 constexpr int S_COLS = 128;
 constexpr int K_ATOMS_PER_TILE = SUB_COLS_BF16 / 16;
+// SPLIT_P publishes P in two parts: the first SPLIT_P_N scores (SPLIT_P_COL
+// TMEM columns, MMA atoms before SPLIT_P_ATOM) and then the rest, so the PV
+// MMA can start before the whole row is stored.
 constexpr int SPLIT_P_N    = S_COLS / 4 * 3;
 constexpr int SPLIT_P_ATOM = SPLIT_P_N / 16;
 constexpr int SPLIT_P_COL  = SPLIT_P_N / 2;
+// EX2_EMU: within each 32-score fragment except the last, the final EX2_RES of
+// every EX2_FREQ scores use ex2_emu_f32x2 and the rest use ex2.approx.
 constexpr int EX2_FRG_PAIRS = 16;
 constexpr int EX2_FRG_CNT   = S_COLS / 32;
 constexpr int EX2_FREQ      = 16;
 constexpr int EX2_RES       = 4;
 
+// TMEM columns (all 512 are allocated): [0, 128) S/P of m-tile 0,
+// [128, 256) S/P of m-tile 1, [256, 384) O of m-tile 0, [384, 512) O of
+// m-tile 1. An address holds the lane in bits 16+ and the column below.
+//
+// In the block-64 build, the 64 x 256 score tile of an m-tile occupies all 128
+// TMEM lanes: lane r holds row r against key half 0 of the K-tile (sparse
+// blocks 0-1) and lane r + 64 holds it against key half 1 (blocks 2-3). Each
+// half keeps its own running max and sum; the correction warps merge the two
+// halves' statistics and partial outputs at the end of a work item.
 constexpr int O_COLS = HEAD_DIM;
 constexpr int TMEM_TOTAL = 512;
 
+// Softmax-to-correction statistics in shared memory, per m-tile: region 0
+// alpha, region 1 row sum l, region 2 row max m (block-64 only), each with
+// one float per TMEM lane.
 constexpr int STATS = BLK128 ? M_TILE : 2 * M_TILE;
 constexpr int STAT_REGIONS = BLK128 ? 2 : 3;
 
+// Warp roles: 0-3 softmax for m-tile 0, 4-7 softmax for m-tile 1, 8-11
+// correction, 12 MMA, 13 epilogue, 14 load, 15 scheduler. A warp can access
+// only the TMEM lane quarter given by its warp index modulo 4, so the softmax
+// and correction groups start at multiples of 4. With one 512-thread CTA per
+// SM, the setmaxnreg budgets (192 softmax, 80 correction, 48 for warps 12-15)
+// sum to the full register file: 32 * (8 * 192 + 4 * 80 + 4 * 48) = 65536.
 constexpr int W_CORR0 = 8, W_MMA = 12, W_EPI = 13, W_LOAD = 14, W_SCHED = 15;
 constexpr int N_WARPS = 16;
 constexpr int CLC_STAGES = 2;
 
+// Every swizzled tile carved from this base starts at a multiple of 1024 bytes,
+// the period of the 128-byte swizzle pattern.
 extern __shared__ __align__(1024) uint8_t fmha_smem[];
 
+// A 64-bit smem descriptor with 32-bit word access, so the low word can be
+// stepped alone.
 union SmemDescPair {
   uint64_t u64;
   uint2 w;
 };
 
+// Adds inc to the low 32 bits of a descriptor (start address and leading byte
+// offset) without touching the high word; callers pass start-address steps in
+// 16-byte units.
 __device__ __forceinline__ void desc_add_lo(SmemDescPair& d, uint32_t inc) {
   asm volatile(
       "{\n\t"
@@ -110,6 +161,8 @@ __device__ __forceinline__ void desc_add_lo(SmemDescPair& d, uint32_t inc) {
       : "r"(inc));
 }
 
+// Weight-stationary (.ws) forms of the lead-predicated MMAs in primitives.cuh;
+// the block-64 build issues its M = 64 MMAs through these.
 __device__ __forceinline__ void tcgen05_mma_ws_f16_ss_1sm_lead(uint32_t lead,
     uint32_t tmem_d, uint64_t desc_a, uint64_t desc_b, uint32_t idesc,
     bool enable_input_d) {
@@ -152,10 +205,15 @@ struct WorkItem {
   // masks them to -inf via the per-tile count below, contributing nothing.
   int num_kv_blocks;
   // Each q-tile's OWN q2k_num. Used for (a) the q2k_idx window clamp in the
-  // load warp and (b) the vbs-threshold masking in the softmax warps. The
-  // The pair may have different counts; each row retains its own mask.
+  // load warp and (b) the vbs-threshold masking in the softmax warps. The two
+  // tiles of a pair may have different counts; each keeps its own mask.
   int num_kv_blocks_mt[2];
 };
+// Maps a work-item index to (sample, head, m-tile pair). With Q_RASTER,
+// consecutive indices walk the m-tile pairs of one head before the next head;
+// otherwise they walk the heads of one pair. Every work-processing warp role
+// (all but the scheduler) decodes the same index itself and derives its loop
+// bounds from the result.
 template <bool Q_RASTER>
 __device__ __forceinline__ WorkItem decode_workitem(
     int workitem_id, int num_heads, int num_blocks, int packed_mtiles_per_seq,
@@ -178,8 +236,10 @@ __device__ __forceinline__ WorkItem decode_workitem(
   it.global_mtile1  = it.global_mtile0 + 1;
   it.num_kv_blocks_mt[0] = q2k_num[it.global_mtile0];
   // A trailing unpaired query tile keeps every pipeline participant active.
-  // Its absent partner has zero selected keys; Q/O tensor maps zero-fill and
-  // discard out-of-bounds rows without accessing another head's metadata.
+  // Its absent partner has zero selected keys and reads no metadata. With
+  // BHSD, the Q/O tensor maps end at seqlen, so the partner's rows zero-fill
+  // on load and are discarded on store. Without BHSD, the row coordinate is
+  // absolute across samples.
   it.num_kv_blocks_mt[1] = it.mtile1 < num_blocks ? q2k_num[it.global_mtile1] : 0;
   // Floor of 1: a pair whose rows are BOTH empty still walks one K-tile so no
   // mbarrier wait is left without its arrive (the load/MMA/softmax/correction
@@ -189,10 +249,14 @@ __device__ __forceinline__ WorkItem decode_workitem(
   return it;
 }
 
+// S_LD_COLS: TMEM columns per softmax load of S. RESCALE_THRESHOLD: in scaled
+// log2 units, how far the row maximum may grow before the running maximum is
+// replaced and O rescaled. EX2_EMU and SPLIT_P are described at their
+// constants, FULL_NAMED_BAR, SOFTMAX_THROTTLE and USE_CLC in
+// launch_block_sparse_sm100a, and Q_RASTER at decode_workitem; MHA is unused.
 template <int S_LD_COLS = 32, bool FULL_NAMED_BAR = false, bool EX2_EMU = false, bool SPLIT_P = false,
           bool SOFTMAX_THROTTLE = false, bool USE_CLC = true, bool Q_RASTER = true, bool MHA = true,
           int RESCALE_THRESHOLD = 8,
-
           bool BHSD = false>
 __global__ void __cluster_dims__(1, 1, 1) __launch_bounds__(N_WARPS * 32, 1)
 fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
@@ -205,19 +269,32 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
     const int* __restrict__ q2k_idx, const int* __restrict__ q2k_num,
     const int* __restrict__ variable_block_sizes,
       float* __restrict__ lse_out) {
-// Multi-arch builds: torch's cmake appends -gencode for EVERY entry of
-// TORCH_CUDA_ARCH_LIST to this TU on top of the pinned compute_100a pass, and
-// tcgen05/setmaxnreg do not exist outside sm_100a -- ptxas rejects the sm_120a
-// (or plain sm_100) pass outright. Keep the body only where it can compile:
-// the host pass (no __CUDA_ARCH__, needed for launch plumbing) and the
-// sm_100a device pass (arch 1000 WITH the family-specific feature set that the
-// "a" suffix defines). Every other device pass gets an empty stub; the Python
-// is_supported() / host launcher never dispatch here off sm_100, so the stub
-// is unreachable at runtime.
+// The body uses tcgen05 and setmaxnreg, which ptxas rejects in other device
+// passes such as plain sm_100, so it compiles only for the host pass (no
+// __CUDA_ARCH__, needed for launch plumbing) and the sm_100a device pass (arch
+// 1000 WITH the architecture-specific feature set that the "a" suffix
+// defines). Any other device pass, such as an extra -gencode target, compiles
+// an empty stub. vsa_native pins sm_100a and its supported() gate restricts
+// dispatch to compute capability 10.0, so the stub is unreachable at runtime.
 #if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ == 1000 && defined(__CUDA_ARCH_FEAT_SM100_ALL))
 
   const int total_workitems = num_samples * num_heads * packed_mtiles_per_seq;
 
+  // Shared-memory carve-up; launch_block_sparse_sm100a sizes the allocation
+  // from the same layout. Barriers, by producer -> consumer:
+  //   full_bar / empty_bar          K/V ring: load (TMA) -> MMA (commit frees)
+  //   full_bar_q / empty_bar_q      Q tile per m-tile: load -> MMA
+  //   full_bar_spo                  S ready: MMA commit -> softmax
+  //   empty_bar_spo                 P written and O rescaled or read out:
+  //                                 softmax + correction -> MMA
+  //   full_bar_p_last               second SPLIT_P part stored: softmax -> MMA
+  //   full_bar_alpha, full_bar_l    per-step alpha, final l (and m):
+  //                                 softmax -> correction
+  //   empty_bar_alpha_and_l         statistics consumed: correction -> softmax
+  //   full_bar_o_acc                last PV complete: MMA commit -> correction
+  //   full_bar_o_epi / empty_bar_o_epi  normalized BF16 O staged in sO_bufs:
+  //                                 correction -> epilogue (TMA store frees)
+  //   clc_full / clc_empty          work-stealing responses: scheduler -> all
   uint8_t* sQ0 = fmha_smem;
   uint8_t* sQ1 = sQ0 + Q_TILE_BYTES;
   uint8_t* sQ[2] = { sQ0, sQ1 };
@@ -247,6 +324,9 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
 
   const int tid = threadIdx.x, warp_id = tid >> 5, lane = tid & 31;
 
+  // Warp 0 allocates all TMEM columns once for the CTA's lifetime and gives up
+  // the permit to allocate more; the base address reaches the other warps
+  // through tmem_slot.
   if (warp_id == 0) {
     tcgen05_alloc<1>(smem_ptr_u32(tmem_slot), TMEM_TOTAL);
     tcgen05_relinquish_alloc_permit<1>();
@@ -254,6 +334,11 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
   __syncthreads();
   const uint32_t tmem_base = *tmem_slot;
 
+  // Arrival counts: 1 for barriers completed by one elected arrive or a
+  // tcgen05 commit (with TMA transaction bytes where applicable), 128 for one
+  // four-warp softmax or correction group, 256 for empty_bar_spo (the m-tile's
+  // softmax group plus the correction group), and N_WARPS for clc_empty (one
+  // elected lane per warp).
   if (tid == 0) {
     #pragma unroll
     for (int s = 0; s < NUM_KV_STAGES; ++s) {
@@ -287,6 +372,7 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
   fence_mbarrier_init_release_cluster();
   __syncthreads();
 
+  // Load warp: TMA producer for the Q tiles and the K/V ring.
   if (warp_id == W_LOAD) {
     setmaxnreg_dec<48>();
 
@@ -303,6 +389,9 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
       const int mtile[2] = { it.mtile0, it.mtile1 };
       const int num_k_tiles = (it.num_kv_blocks + BLOCKS_PER_KTILE - 1) / BLOCKS_PER_KTILE;
 
+      // Warp-cooperative cache of q2k_idx: each lane holds one entry of a
+      // 32-entry window and __shfl_sync broadcasts entry j, so all 32 lanes
+      // must call get_kv_block_id together. The sentinel forces the first fill.
       int window_start[2] = { -(1 << 30), -(1 << 30) };
       int kv_block_id_cache[2] = { 0, 0 };
       auto get_kv_block_id = [&](int mtile_idx, int j) -> int {
@@ -322,12 +411,15 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
         return __shfl_sync(0xffffffffu, kv_block_id_cache[mtile_idx], j & 31);
       };
 
+      // One K ring slot: channel subtile s of the K-tile's BLOCKS_PER_KTILE key
+      // blocks (all subtiles of the one block in the 128-token build).
       auto load_k_oneslot = [&](int mtile_idx, int ktile_idx, int s) {
         const int kv_stage = kv_empty_ph.get_stage();
 
         mbarrier_wait_parity_suspend(smem_ptr_u32(&empty_bar[kv_stage]), kv_empty_ph.get_phase());
         kv_empty_ph.advance();
 
+        // Block IDs are gathered by the whole warp before one lane issues TMA.
         int kv_tok[BLOCKS_PER_KTILE];
         #pragma unroll
         for (int blk = 0; blk < BLOCKS_PER_KTILE; ++blk)
@@ -335,7 +427,6 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
         if (elect_one_sync()) {
           mbarrier_arrive_expect_tx(smem_ptr_u32(&full_bar[kv_stage]), KV_RING_SLOT_BYTES);
           if constexpr (BLK128) {
-
             if constexpr (BHSD)
                   tma_load_4d(smem_ptr_u32((sKV + kv_stage * KV_RING_SLOT_BYTES)), &tmap_k, smem_ptr_u32(&full_bar[kv_stage]),
                               0, kv_tok[0] - k_start, 0, it.sample * num_heads + it.head);
@@ -356,6 +447,9 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
           }
         }
       };
+      // One V ring slot. In the block-64 build, slot p holds key blocks p and
+      // p + 2 of the K-tile (one from each key half), each with all channel
+      // subtiles.
       auto load_v_oneslot = [&](int mtile_idx, int ktile_idx, int p) {
         const int kv_stage = kv_empty_ph.get_stage();
 
@@ -363,11 +457,9 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
         kv_empty_ph.advance();
 
         if constexpr (BLK128) {
-
           const int kv_tok0 = k_start + get_kv_block_id(mtile_idx, ktile_idx) * BLOCK;
           if (elect_one_sync()) {
             mbarrier_arrive_expect_tx(smem_ptr_u32(&full_bar[kv_stage]), KV_RING_SLOT_BYTES);
-
               if constexpr (BHSD)
                 tma_load_4d(smem_ptr_u32((sKV + kv_stage * KV_RING_SLOT_BYTES)), &tmap_v, smem_ptr_u32(&full_bar[kv_stage]),
                             0, kv_tok0 - k_start, 0, it.sample * num_heads + it.head);
@@ -382,7 +474,6 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
             kv_tok[h] = k_start + get_kv_block_id(mtile_idx, ktile_idx * BLOCKS_PER_KTILE + 2 * h + p) * BLOCK;
           if (elect_one_sync()) {
             mbarrier_arrive_expect_tx(smem_ptr_u32(&full_bar[kv_stage]), KV_RING_SLOT_BYTES);
-
               #pragma unroll
               for (int h = 0; h < 2; ++h) {
                 #pragma unroll
@@ -409,6 +500,10 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
         if constexpr (!BLK128) load_v_oneslot(mtile_idx, ktile_idx, 1);
       };
 
+      // Both m-tiles share one ring, and the MMA warp consumes slots strictly
+      // in this issue order: K(0,0) K(1,0) | V(0,k) K(0,k+1) V(1,k) K(1,k+1)
+      // for each k | V(0,last) V(1,last). Any change here must be mirrored in
+      // the MMA warp, or it multiplies against the wrong slot.
       load_k(0, 0); load_k(1, 0);
 
       #pragma unroll
@@ -417,7 +512,6 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
         const int tok0 = q_start + mtile[m] * BLOCK;
         if (elect_one_sync()) {
           mbarrier_arrive_expect_tx(smem_ptr_u32(&full_bar_q[m]), Q_TILE_BYTES);
-
           tma_load_4d(smem_ptr_u32(sQ[m]), &tmap_q, smem_ptr_u32(&full_bar_q[m]),
                         0, BHSD ? it.sample * num_heads + it.head : it.head,
                         BHSD ? tok0 - q_start : tok0, 0);
@@ -430,6 +524,9 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
       }
       load_v(0, num_k_tiles - 1); load_v(1, num_k_tiles - 1);
 
+      // Every work-processing role advances to the next work item the same way:
+      // the CLC response names the cancelled CTA whose blockIdx.x becomes the
+      // next work item, or the static schedule strides by the grid size.
       if constexpr (USE_CLC) {
         ClcTileInfo next = clc_fetch_next_tile<1, 1, ClcRasterOrder::AlongN, 1, true>(
             clc_full, clc_empty, clc_response, clc_stage, clc_phase, elect_one_sync());
@@ -442,10 +539,14 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
       }
     }
   }
+  // MMA warp: one elected thread issues every tcgen05 MMA and commit.
   else if (warp_id == W_MMA) {
     setmaxnreg_dec<48>();
 
     const uint32_t lead = elect_one_sync() ? 1u : 0u;
+    // SBO 1024 is one 8-row x 128-byte swizzle atom. Q and K are K-major; V
+    // is read MN-major (transpose_b) with DESC_LBO_MN bytes between its
+    // 64-channel subtiles, and PV_DESC_STEP advances it by 16 keys.
     constexpr uint32_t DESC_SBO = 1024, DESC_LBO = 16;
 
     const uint32_t idesc_qk = make_idesc_bf16_f32(M_TILE, K_TILE, false, false);
@@ -473,6 +574,8 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
       const WorkItem it = decode_workitem<Q_RASTER>(workitem_id, num_heads, num_blocks, packed_mtiles_per_seq, magic0, magic1, magic2, q2k_num);
       const int num_k_tiles = (it.num_kv_blocks + BLOCKS_PER_KTILE - 1) / BLOCKS_PER_KTILE;
 
+      // S(i) = Q(i) K^T for one K-tile, accumulated over the channel subtiles.
+      // Each K=16 atom advances the K-major descriptors by 32 bytes (2 units).
       auto bmm1 = [&](int i) {
         const uint32_t s_tmem_addr = tmem_base + (uint32_t)(i * S_COLS);
         const uint64_t da_base = desc_q0 + (uint64_t)i * Q_MTILE_DESC_DELTA;
@@ -497,13 +600,19 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
             else
               tcgen05_mma_ws_f16_ss_1sm_lead(lead, s_tmem_addr, da + 2 * ki, db + 2 * ki, idesc_qk, enable_d);
           }
+          // The slot frees once the MMAs reading it complete.
           if (!BLK128 || s == Q_SUBTILES - 1)
             tcgen05_commit1_lead(lead, smem_ptr_u32(&empty_bar[slot]));
         }
 
+        // This commit also covers every earlier MMA, including the preceding PV
+        // of m-tile i, so once softmax sees S ready, O is stable for correction.
         tcgen05_commit1_lead(lead, smem_ptr_u32(&full_bar_spo[i]));
       };
 
+      // O(i) += P(i) V for one K-tile, with P read from TMEM over S(i). The
+      // first K-tile overwrites O. With SPLIT_P, the atoms from SPLIT_P_ATOM on
+      // wait for the second part of P.
       auto bmm2 = [&](int i, bool first_ktile, auto last_c) {
         constexpr bool last_ktile = decltype(last_c)::value;
         const uint32_t s_tmem_addr = tmem_base + (uint32_t)(i * S_COLS);
@@ -550,12 +659,16 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
         }
       };
 
+      // Prologue: S for K-tile 0 of both m-tiles.
       #pragma unroll
       for (int i = 0; i < M_TILES_PER_CTA; ++i) {
         mbarrier_wait_parity(smem_ptr_u32(&full_bar_q[i]), q_ph.get_phase());
         bmm1(i);
       }
 
+      // Steady state: once softmax has written P(k) and correction has
+      // rescaled or released O (empty_bar_spo), issue PV for K-tile k and S
+      // for k + 1.
       for (int k = 0; k + 1 < num_k_tiles; ++k) {
         #pragma unroll
         for (int i = 0; i < M_TILES_PER_CTA; ++i) {
@@ -567,11 +680,14 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
         spo_ph.advance();
       }
 
+      // Every QK MMA is issued; free the Q tiles for the next work item.
       #pragma unroll
       for (int i = 0; i < M_TILES_PER_CTA; ++i)
         tcgen05_commit1_lead(lead, smem_ptr_u32(&empty_bar_q[i]));
       q_ph.advance();
 
+      // Tail: the last PV, whose commit on full_bar_o_acc hands O to the
+      // correction warps.
       #pragma unroll
       for (int i = 0; i < M_TILES_PER_CTA; ++i) {
         mbarrier_wait_parity(smem_ptr_u32(&empty_bar_spo[i]), spo_ph.get_phase());
@@ -592,11 +708,13 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
       }
     }
   }
+  // Epilogue warp: TMA-stores each m-tile's normalized BF16 O from sO_bufs.
   else if (warp_id == W_EPI) {
     setmaxnreg_dec<48>();
 
     PhaseTracker<1> full_o_ph;
 
+    // Both staging buffers start free.
     if (elect_one_sync()) {
       #pragma unroll
       for (int m = 0; m < M_TILES_PER_CTA; ++m)
@@ -616,7 +734,6 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
 
         if (elect_one_sync()) {
           const int tok0 = q_start + mtile[m] * BLOCK;
-
           tma_store_4d(&tmap_o, 0, BHSD ? it.sample * num_heads + it.head : it.head,
                          BHSD ? tok0 - q_start : tok0, 0,
                        smem_ptr_u32(reinterpret_cast<const uint8_t*>(sO_bufs[m])));
@@ -624,6 +741,8 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
         }
       }
 
+      // Each m-tile's store is its own bulk group: once the older group has
+      // read shared memory, buffer 0 is free; once both have, buffer 1 is.
       if (elect_one_sync()) {
         cp_async_bulk_wait_group_read<1>();
         mbarrier_arrive(smem_ptr_u32(&empty_bar_o_epi[0]));
@@ -644,6 +763,10 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
       }
     }
   }
+  // Scheduler warp: with CLC, issues try_cancel requests into the CLC_STAGES
+  // response slots one at a time. Each response is consumed by all N_WARPS
+  // warps (this one included) before its slot is reused; an invalid response
+  // ends every role's work loop.
   else if (warp_id == W_SCHED) {
     setmaxnreg_dec<48>();
 
@@ -665,6 +788,7 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
         if (!next.valid) break;
       }
 
+      // Wait until every warp has released each response slot.
       for (int s = 0; s < CLC_STAGES; ++s) {
         if (lane == 0)
           mbarrier_wait_parity_suspend(smem_ptr_u32(&clc_empty[prod_stage]), prod_phase);
@@ -673,6 +797,9 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
       }
     }
   }
+  // Correction warps: rescale O in TMEM when softmax replaces a running max,
+  // then normalize O by the row sum, convert it to BF16 and stage it for the
+  // epilogue. corr_tid is the TMEM lane this thread owns.
   else if (warp_id >= W_CORR0 && warp_id < W_MMA) {
     setmaxnreg_dec<80>();
 
@@ -684,6 +811,10 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
     PhaseTracker<1> o_acc_ph;
     PhaseTracker<1> o_epi_empty_ph;
 
+    // Priming arrivals. A work item's last arrival on these barriers comes
+    // after O (empty_bar_spo) or l (empty_bar_alpha_and_l) has been read and
+    // pairs with the next item's first MMA or softmax wait; these stand in for
+    // the item before the first.
     #pragma unroll
     for (int i = 0; i < M_TILES_PER_CTA; ++i) {
       mbarrier_arrive(smem_ptr_u32(&empty_bar_spo[i]));
@@ -697,6 +828,8 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
       const WorkItem it = decode_workitem<Q_RASTER>(workitem_id, num_heads, num_blocks, packed_mtiles_per_seq, magic0, magic1, magic2, q2k_num);
       const int num_k_tiles = (it.num_kv_blocks + BLOCKS_PER_KTILE - 1) / BLOCKS_PER_KTILE;
 
+      // Softmax step 0 signals full_bar_alpha without writing an alpha (the
+      // first PV overwrites O); consume the signal and release the slot.
       #pragma unroll
       for (int i = 0; i < M_TILES_PER_CTA; ++i) {
         if constexpr (FULL_NAMED_BAR) full_bar_wait(i, corr_warp_id);
@@ -705,6 +838,8 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
       }
       if constexpr (!FULL_NAMED_BAR) alpha_ph.advance();
 
+      // K-tiles 1 and up: O holds PV through K-tile k - 1; scale it by alpha
+      // before the MMA warp accumulates PV(k) (released via empty_bar_spo).
       for (int k = 1; k < num_k_tiles; ++k) {
         #pragma unroll
         for (int i = 0; i < M_TILES_PER_CTA; ++i) {
@@ -714,9 +849,10 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
           const float alpha = alpha_and_l_smem[(i * STAT_REGIONS + 0) * STATS + corr_tid];
           if constexpr (!SOFTMAX_THROTTLE) mbarrier_arrive(smem_ptr_u32(&empty_bar_alpha_and_l[i]));
 
+          // alpha == 1 means softmax kept its running max; skip the TMEM
+          // round trip when the whole warp agrees.
           bool skip = __all_sync(0xffffffffu, alpha == 1.0f);
           if (!skip) {
-
             const uint32_t o_tmem_addr = tmem_base + (uint32_t)(2 * S_COLS + i * O_COLS) + ((uint32_t)(corr_warp_id * 32) << 16);
 
             const float2 alpha2 = f32x2_splat(alpha);
@@ -731,7 +867,6 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
               tcgen05_st_32x32b_x16(o_tmem_addr + (uint32_t)c0, o_regs);
             }
             tcgen05_wait_st();
-
             tcgen05_fence_before_thread_sync();
           }
           if constexpr (SOFTMAX_THROTTLE) mbarrier_arrive(smem_ptr_u32(&empty_bar_alpha_and_l[i]));
@@ -740,6 +875,7 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
         if constexpr (!FULL_NAMED_BAR) alpha_ph.advance();
       }
 
+      // End of the work item: wait for the last PV and the final statistics.
       #pragma unroll
       for (int i = 0; i < M_TILES_PER_CTA; ++i) {
         mbarrier_wait_parity_suspend(smem_ptr_u32(&full_bar_o_acc[i]), o_acc_ph.get_phase());
@@ -748,11 +884,15 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
 
         float scale_own;
         if constexpr (BLK128) {
-
           const float l = alpha_and_l_smem[(i * STAT_REGIONS + 1) * STATS + corr_tid];
           mbarrier_arrive(smem_ptr_u32(&empty_bar_alpha_and_l[i]));
           scale_own = (l > 0.f) ? rcp_approx_ftz_f32(l) : 0.f;
         } else {
+          // Merge this lane's key-half statistics with the partner lane's
+          // (corr_tid ^ 64): rescale the half with the smaller max by
+          // 2^(-|d|). Under the scale bound noted at the softmax masking, a row
+          // with no visible key has l_tot == 0 and a zero scale, so its output
+          // is exactly zero.
           const float l_own = alpha_and_l_smem[(i * STAT_REGIONS + 1) * STATS + corr_tid];
           const float m_own = alpha_and_l_smem[(i * STAT_REGIONS + 2) * STATS + corr_tid];
           const float l_par = alpha_and_l_smem[(i * STAT_REGIONS + 1) * STATS + (corr_tid ^ 64)];
@@ -774,10 +914,12 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
                     m_tot * scale_log2 + __log2f(l_safe);
             }
         }
+        // Normalize O and write BF16 rows into sO_bufs[i] in the 128-byte
+        // swizzled layout of the O tensor map: 16-byte chunk v of a row goes to
+        // chunk v ^ (row & 7).
         const float2 scale2 = f32x2_splat(scale_own);
         const uint32_t o_tmem_addr = tmem_base + (uint32_t)(2 * S_COLS + i * O_COLS) + ((uint32_t)(corr_warp_id * 32) << 16);
         if constexpr (BLK128) {
-
           #pragma unroll
           for (int c0 = 0; c0 < HEAD_DIM; c0 += 16) {
             uint32_t o_regs[16];
@@ -803,7 +945,10 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
             }
           }
         } else {
-
+          // Sum the two key halves through shared memory: half-1 lanes store
+          // their scaled partial O as BF16, then half-0 lanes add it to their
+          // own in FP32 and store the final BF16 row. The half-1 partial is
+          // therefore rounded to BF16 before the sum.
           mbarrier_wait_parity_suspend(smem_ptr_u32(&empty_bar_o_epi[i]), o_epi_empty_ph.get_phase());
           if (!kv_half0) {
             #pragma unroll
@@ -861,12 +1006,13 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
           bar_sync<9>(128);
         }
 
+        // O has been read out of TMEM, so the next work item's first PV may
+        // overwrite it.
         tcgen05_fence_before_thread_sync();
-
         mbarrier_arrive(smem_ptr_u32(&empty_bar_spo[i]));
 
+        // Make the generic-proxy writes to sO_bufs visible to the TMA store.
         fence_proxy_async_shared();
-
         mbarrier_arrive(smem_ptr_u32(&full_bar_o_epi[i]));
       }
       o_acc_ph.advance();
@@ -884,6 +1030,10 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
       }
     }
   }
+  // Softmax warps: four per m-tile, one TMEM lane (sm_tid) per thread. Each
+  // K-tile step turns S into P in place and publishes alpha; after the last
+  // step, the row sum (and, for block 64, the row max) go to the correction
+  // warps.
   else {
     setmaxnreg_inc<192>();
 
@@ -904,10 +1054,18 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
       const WorkItem it = decode_workitem<Q_RASTER>(workitem_id, num_heads, num_blocks, packed_mtiles_per_seq, magic0, magic1, magic2, q2k_num);
       const int num_k_tiles = (it.num_kv_blocks + BLOCKS_PER_KTILE - 1) / BLOCKS_PER_KTILE;
 
+      // m_run holds the running max of raw (unscaled) scores, which orders
+      // like the scaled max only because scale_log2 > 0 (the torch binding
+      // rejects other scales).
       float m_run = -INFINITY, l_run = 0.f;
       mbarrier_wait_parity_suspend(smem_ptr_u32(&empty_bar_alpha_and_l[m_tile]), scale_empty_ph.get_phase());
       scale_empty_ph.advance();
 
+      // Valid key counts of the blocks this warp's key half covers at K-tile
+      // k. Like the load warp's block-ID cache, each lane holds the counts of
+      // one K-tile in a 32-K-tile window and __shfl_sync broadcasts K-tile k,
+      // so all lanes must call it together. The softmax warps map positions to
+      // blocks exactly as the load warp does, reading q2k_idx independently.
       int thr_window = -(1 << 30);
       int thr_cache0 = BLOCK, thr_cache1 = BLOCK;
       auto get_vbs_thresholds = [&](int k, int gqb_mt, int half, int& t0, int& t1) {
@@ -954,6 +1112,8 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
 
         tcgen05_fence_before_thread_sync();
 
+        // Mask keys past each block's valid count (whole blocks for padding
+        // positions, whose threshold is 0).
         if constexpr (BLK128) {
           if (vbs_thr0_ < S_COLS) mask_s_row_r2p<false, S_COLS>(scores, 0, 0, vbs_thr0_);
         } else {
@@ -971,10 +1131,19 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
         }
         float new_m = fmaxf(fmaxf(rmax0, rmax1), fmaxf(rmax2, rmax3));
 
+        // A fully masked row keeps a finite max, so exp2 below yields 0 rather
+        // than the NaN of (-inf) - (-inf). This holds only while the offset
+        // -new_m * scale_log2 = FLT_MAX * scale_log2 stays finite, which
+        // scale_log2 <= 1 guarantees; a larger scale can overflow it to +inf and
+        // turn the masked scores into NaN.
           new_m = fmaxf(new_m, -FLT_MAX);
         float alpha = 0.0f;
         if constexpr (!IS_FIRST) {
-
+          // Conditional rescaling: while the max grows by at most
+          // RESCALE_THRESHOLD in scaled log2 units, keep the old max (alpha 1,
+          // no O rescale); P then stays at most 2^RESCALE_THRESHOLD. The final
+          // normalization uses the same max for l and O, so the result is
+          // unchanged.
           const float acc_scale_ = (m_run - new_m) * scale_log2;
           if (acc_scale_ >= -(float)RESCALE_THRESHOLD) { new_m = m_run; alpha = 1.0f; }
           else                     { alpha = ex2_approx_f32(acc_scale_); }
@@ -984,6 +1153,7 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
         if constexpr (FULL_NAMED_BAR) full_bar_arrive(m_tile, warp_in_group);
         else mbarrier_arrive(smem_ptr_u32(&full_bar_alpha[m_tile]));
 
+        // P = exp2(s * scale_log2 - m * scale_log2), converted to BF16 pairs.
         const float2 scale2 = f32x2_splat(scale_log2);
         const float2 neg_m_scaled2 = f32x2_splat(-new_m * scale_log2);
         uint32_t p_regs[S_COLS / 2];
@@ -1004,6 +1174,9 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
           if constexpr (!DEFER_ROWSUM) lt2_live = fadd2(lt2_live, scores2[c]);
           p_regs[c] = cvt_f32x2_to_bf16x2(scores2[c].x, scores2[c].y);
         }
+
+        // P overwrites S in TMEM. empty_bar_spo also needs the correction
+        // warps' arrival before the MMA warp may use it.
         const uint32_t p_tmem_addr = s_tmem_addr;
 
         if constexpr (SPLIT_P) {
@@ -1025,9 +1198,11 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
         }
 
         spo_ph.advance();
+
+        // With DEFER_ROWSUM, the row sum is accumulated here, after P has been
+        // handed to the MMA warp. The sum uses FP32 P; the MMA uses BF16 P.
         float2 lt2 = lt2_live;
         if constexpr (DEFER_ROWSUM) {
-
           float2 lt2a = make_float2(IS_FIRST ? 0.0f : l_run * alpha, 0.0f), lt2b = make_float2(0.f, 0.f);
           float2 lt2c = make_float2(0.f, 0.f), lt2d = make_float2(0.f, 0.f);
           #pragma unroll
@@ -1040,12 +1215,17 @@ fmha_context_bf16_gen_kernel(const __grid_constant__ CUtensorMap tmap_q,
           lt2 = fadd2(fadd2(lt2a, lt2b), fadd2(lt2c, lt2d));
         }
         l_run = lt2.x + lt2.y; m_run = new_m;
+
+        // Do not overwrite the alpha slot until the correction warps read it.
         mbarrier_wait_parity_suspend(smem_ptr_u32(&empty_bar_alpha_and_l[m_tile]), scale_empty_ph.get_phase());
         scale_empty_ph.advance();
       };
       if (num_k_tiles > 0) softmax_step(std::true_type{}, 0);
       for (int k = 1; k < num_k_tiles; ++k) softmax_step(std::false_type{}, k);
 
+      // The 128-token build writes its LSE here; the block-64 LSE needs both
+      // key halves and is written by the correction warps. Then publish l (and
+      // m) for the final normalization.
         if constexpr (BLK128) {
           if (lse_out != nullptr) {
             const int q_row = (m_tile == 0 ? it.mtile0 : it.mtile1) * BLOCK + sm_tid;

@@ -3,6 +3,9 @@
 Row indices select modulation parameters whose leading stride may include
 other parameter groups. Statistics and affine expressions accumulate in FP32;
 outputs use the activation dtype or carry a per-row E4M3 dequantization scale.
+
+``uniserve.nn.functional`` owns validation and the tensor-operation fallback
+for these kernels.
 """
 
 from __future__ import annotations
@@ -39,6 +42,10 @@ if triton is not None:
         FP8_OUTPUT: tl.constexpr,  # noqa: N803
         RETAIN: tl.constexpr,  # noqa: N803
     ):
+        # One program per activation row. ``BLOCK`` is ``WIDTH`` rounded up
+        # to a power of two, and masked lanes load zeros so they add nothing
+        # to the mean square. ``modulation_row`` selects this row's shift,
+        # scale and gate from rows ``*_row_stride`` elements apart.
         row = tl.program_id(0)
         columns = tl.arange(0, BLOCK)
         mask = columns < WIDTH
@@ -59,10 +66,12 @@ if triton is not None:
                 other=0.0,
             ).to(tl.float32)
             value = value + gate * update
+            # ``update`` receives the gated residual rounded to its dtype,
+            # while the normalization below reads the unrounded FP32 sum.
             tl.store(update_ptr + offsets, value, mask=mask)
         if RETAIN:
-            # Keep the normalized row's source as the residual for the caller,
-            # written in the same pass that reads it.
+            # Copy the normalized row's source (the gated sum when HAS_UPDATE)
+            # for the caller in the same pass that reads it.
             tl.store(retain_ptr + offsets, value, mask=mask)
 
         mean_square = tl.sum(value * value, axis=0) / WIDTH
@@ -85,7 +94,8 @@ if triton is not None:
 
         if FP8_OUTPUT:
             # Per-row E4M3 dequantization scale from the row's absolute max,
-            # clamped away from zero so the division stays well-defined.
+            # clamped away from zero so the division stays well-defined. 448
+            # is the largest finite E4M3 magnitude.
             output = tl.where(mask, output, 0.0)
             output_scale = (
                 tl.maximum(tl.max(tl.abs(output), axis=0), 1.0e-12) / 448.0
@@ -108,6 +118,9 @@ if triton is not None:
         WIDTH: tl.constexpr,  # noqa: N803
         BLOCK: tl.constexpr,  # noqa: N803
     ):
+        # Elementwise over the flat [rows, WIDTH] activation: each element
+        # recovers its row to select the gate row, so ``MAX_WIDTH`` does not
+        # apply. The result overwrites ``update``.
         offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         mask = offsets < ELEMENTS
         row = offsets // WIDTH
@@ -132,6 +145,9 @@ def can_run(value: torch.Tensor, *operands: torch.Tensor) -> bool:
     """Return whether contiguous BF16 CUDA rows and indexed operands fit.
 
     Operands may be strided between rows but are unit-strided per channel.
+    Contiguity of operands addressed as full activation rows (``update``,
+    ``retain``) and the ``MAX_WIDTH`` bound are checked by the callers in
+    ``uniserve.nn.functional``, not here.
     """
     return (
         launchable(value.device)
@@ -161,6 +177,12 @@ def modulated_rms_norm(
     retain: torch.Tensor | None = None,
 ) -> None:
     """Store ``rms(value) * weight * (1 + scale[i]) + shift[i]`` per row.
+
+    ``i`` is ``row_indices[row]``. ``value``, ``out``, ``update`` and
+    ``retain`` are contiguous ``[..., width]`` rows with ``width`` at most
+    ``MAX_WIDTH``; ``weight`` has ``width`` elements; ``shift``, ``scale``
+    and ``gate`` are indexed along their leading axis with unit channel
+    stride.
 
     With ``update`` and ``gate``, ``value + gate[i] * update`` is normalized
     and also stored into ``update``. ``output_scale`` selects E4M3 output with
@@ -201,7 +223,11 @@ def gated_residual(
     gate: torch.Tensor,
     row_indices: torch.Tensor,
 ) -> None:
-    """Store ``hidden + gate[i] * update`` into contiguous ``update``."""
+    """Store ``hidden + gate[i] * update`` into contiguous ``update``.
+
+    ``i`` is ``row_indices[row]``; ``gate`` rows may be strided but are
+    unit-strided per channel. ``hidden`` must be contiguous.
+    """
     _gated_residual_kernel[(triton.cdiv(hidden.numel(), 1024),)](
         hidden,
         update,

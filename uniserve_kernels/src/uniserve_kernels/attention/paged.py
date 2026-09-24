@@ -1,4 +1,12 @@
-"""Native paged-attention length columns with an optional fused K/V write."""
+"""Native paged-attention length columns with an optional fused K/V write.
+
+The TensorRT-LLM attention provider needs each sequence's complete key
+length (prefix plus current queries) and its cumulative offsets as device
+columns. One launch derives both from the live query and prefix columns and,
+when :func:`uniserve_kernels.cache.can_run_paged_kv_write` accepts the call's
+K/V write, also scatters those rows into the paged cache. The caller is
+``uniserve.runtime.backends.attention._paged_inputs``.
+"""
 
 from __future__ import annotations
 
@@ -34,10 +42,13 @@ if triton is not None:
         key_strides: tl.constexpr,
         value_strides: tl.constexpr,
     ):
-        # One additional CTA prepares both native columns. Counts follow the
-        # live launch rather than specializing every ragged batch encountered
-        # in eager execution. Scatter CTAs preserve the cache write's checks
-        # and initialization.
+        # Grid: (write rows + 1, column blocks). The last program along axis
+        # zero, in column block zero, builds both columns; the leading
+        # programs, launched only for a fused write, run the cache write's
+        # own scatter body, which keeps its device assertions and
+        # initialized-block flags. ``batch_size`` is excluded from Triton's
+        # integer specialization, so the batch count affects the compiled
+        # variant only through the power-of-two ``sequence_block``.
         if tl.program_id(0) == tl.num_programs(0) - 1:
             if tl.program_id(1) == 0:
                 # queries/prefixes are per-sequence length columns; offsets are
@@ -95,9 +106,26 @@ def prepare(
 ) -> None:
     """Build complete key lengths and offsets, and optionally scatter K/V.
 
-    ``columns`` holds query and prefix lengths followed by their cumulative
-    offsets. ``write`` is ``(key_cache, value_cache, slots, key, value,
-    key_initialized, value_initialized, block_size)`` for a fused cache write.
+    The launch enqueues on the current stream of ``lengths``'s device and
+    runs with Triton ``debug=True``, so out-of-range slots trip the scatter's
+    device assertions.
+
+    Args:
+        columns: Per-sequence query and prefix lengths (``batch_size``
+            entries each) followed by their cumulative offsets
+            (``batch_size + 1`` entries each, starting at zero); any stride.
+        lengths: Contiguous output receiving ``query + prefix`` for each
+            sequence.
+        offsets: Contiguous output receiving the ``batch_size + 1``
+            cumulative complete key offsets.
+        batch_size: Number of sequences.
+        write: ``None``, or ``(key_cache, value_cache, slots, key, value,
+            key_initialized, value_initialized, block_size)`` for a fused
+            cache write that
+            :func:`uniserve_kernels.cache.can_run_paged_kv_write` accepts:
+            contiguous ``[pages, block_size, heads, head_dim]`` caches, one
+            slot per ``[heads, head_dim]`` source row (``-1`` skips a row),
+            and the per-block initialized flags that written blocks set.
     """
     if write is None:
         key_cache = value_cache = slots = key = value = None
@@ -115,6 +143,8 @@ def prepare(
             value_initialized,
             block_size,
         ) = write
+        # One scatter program row per source token, each covering the
+        # flattened ``heads * head_dim`` row in 256-element column blocks.
         rows, width = key.shape[0], key.shape[1] * key.shape[2]
         pages, head_dim = key_cache.shape[0], key.shape[2]
         key_strides, value_strides = key.stride(), value.stride()
@@ -133,6 +163,7 @@ def prepare(
             value_initialized,
             tuple(column.stride(0) for column in columns),
             batch_size,
+            # Covers the ``batch_size + 1`` offset entries.
             triton.next_power_of_2(batch_size + 1),
             pages,
             block_size,

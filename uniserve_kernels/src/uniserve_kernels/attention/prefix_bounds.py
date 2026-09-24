@@ -1,4 +1,13 @@
-"""Reduces per-query visible-end limits into query-tile bounds."""
+"""Reduces per-query visible-end limits into query-tile bounds.
+
+``visible_end`` is the int32 ``[batch, query rows]`` table that
+:mod:`uniserve_kernels.attention.visible_end` masks with: each entry is the
+exclusive end of the key range a sequence-local query row may see. Reducing
+it per query tile gives the key tiles every row of the tile sees (below the
+tile minimum) and the key tiles some row sees (below the tile maximum).
+FlashAttention-4 consumes the result as block sparsity through
+``uniserve.runtime.backends.attention.flash_attn_4``.
+"""
 
 from __future__ import annotations
 
@@ -24,7 +33,29 @@ def compute_prefix_bounds_varlen(
     q_tile_size: int,
     num_q_tiles: int | None = None,
 ) -> torch.Tensor:
-    """Return tile bounds while excluding padding beyond each query length."""
+    """Return tile bounds while excluding padding beyond each query length.
+
+    Args:
+        visible_end: Int32 ``[batch, max_q]`` visible-end table.
+        seqlens_q: ``[batch]`` query lengths, each at most ``max_q``.
+        q_tile_size: Query rows per tile.
+        num_q_tiles: Tile count of the result. ``None`` derives it from the
+            longest query length, which reads ``seqlens_q`` on the host;
+            pass it explicitly to keep the call capturable in a CUDA graph.
+
+    Returns:
+        Contiguous int32 ``[batch, tiles, 2]`` holding the minimum and
+        maximum visible end over the valid rows of each tile, or zeros for a
+        tile with no valid rows.
+
+    Raises:
+        TypeError: If ``visible_end`` is not int32.
+        ValueError: If ``visible_end`` is not 2D, ``seqlens_q`` is not one
+            entry per batch row, ``q_tile_size`` is not positive, the
+            given or derived tile count is negative, or, for a CPU
+            ``visible_end`` and a nonempty result, a length lies outside
+            ``[0, max_q]``.
+    """
     batch, max_q = _validate_visible_end(visible_end)
     if seqlens_q.ndim != 1 or int(seqlens_q.shape[0]) != batch:
         raise ValueError(
@@ -49,14 +80,22 @@ def compute_prefix_bounds_varlen(
             dtype=torch.int32,
             device=visible_end.device,
         )
-    # CPU lengths can be rejected eagerly. Device lengths remain bounded by the
-    # validity mask so positions outside the padded matrix never affect a tile.
+
+    # Lengths are checked eagerly only when ``visible_end`` (and therefore
+    # the moved lengths) is on the CPU. Beyond the optional tile-count
+    # derivation above, device lengths are not read on the host, so
+    # out-of-range device lengths are not rejected.
     if seqlens_q.device.type == "cpu":
         lengths = tuple(int(value) for value in seqlens_q.tolist())
         if any(length < 0 or length > max_q for length in lengths):
             raise ValueError(
                 f"query lengths must be within visible_end width {max_q}"
             )
+
+    # Crop or zero-pad the query axis to whole tiles. The validity mask
+    # excludes every row at or beyond its sequence's length; for lengths
+    # within ``max_q`` that covers both the table's own padding columns and
+    # the zero padding appended here.
     tiled_width = max_tiles * q_tile_size
     if tiled_width <= max_q:
         values = visible_end[:, :tiled_width]
@@ -98,10 +137,26 @@ def prefix_block_sparsity(
     """Describe fully visible and masked KV tiles using the CuTe sparse ABI.
 
     Prefix minima identify tiles requiring no element mask; maxima bound the
-    tiles that need the per-query mask. Storage is bounded by host geometry,
-    while lengths, counts and offsets remain live device values under replay.
-    Variable-length indices have each sequence's actual KV-tile row stride.
+    tiles that need the per-query mask. For each query tile, key tiles
+    ``[0, full)`` are fully visible and the following ``partial`` tiles need
+    the per-element visible-end mask; later tiles are skipped. Bounds are
+    clamped to each sequence's key length.
+
+    Tensor extents come from host capacities (the ``visible_end`` shape and
+    ``max_key_length``). For a CUDA ``visible_end``, lengths, counts and
+    offsets are computed on the device without host reads, so a call
+    captured in a CUDA graph recomputes them from the live lengths on
+    replay.
+
+    The dense form (``variable_length=False``) has ``[batch, 1,
+    query_tiles]`` counts and ``[batch, 1, query_tiles, key_tiles]``
+    indices; the single head entry reflects a visible-end mask that is
+    independent of the head. The variable-length form packs each sequence's
+    query tiles back to back under ``cu_total_m_blocks``, and its indices
+    use each sequence's actual KV-tile count as their row stride under
+    ``cu_block_idx_offsets``.
     """
+    # FlashAttention-4 is an optional dependency, imported only when used.
     from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 
     batch, width = _validate_visible_end(visible_end)
@@ -132,6 +187,9 @@ def prefix_block_sparsity(
             block_size=(query_tile, key_tile),
         )
 
+    # Map each packed query-tile position to its owning sequence. Positions
+    # past the live total, which exist only because storage is sized for
+    # capacity, clamp into range and receive zero counts.
     q_tiles = (query_lengths + query_tile - 1) // query_tile
     k_tiles = (key_lengths + key_tile - 1) // key_tile
     cumulative_tiles = torch.nn.functional.pad(
@@ -152,6 +210,8 @@ def prefix_block_sparsity(
     full_counts = torch.where(valid, full.reshape(-1)[source], 0)
     mask_counts = torch.where(valid, partial.reshape(-1)[source], 0)
 
+    # Map each packed index position to its sequence, query tile and key
+    # tile column. A sequence without key tiles still divides by one.
     positions = torch.arange(
         batch * query_tiles * key_tiles,
         device=visible_end.device,

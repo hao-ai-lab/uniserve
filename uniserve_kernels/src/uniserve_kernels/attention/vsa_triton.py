@@ -1,4 +1,13 @@
-"""Architecture-portable Triton provider for block-64 video sparse attention."""
+"""Architecture-portable Triton provider for block-64 video sparse attention.
+
+``block_sparse_attention`` is the numerical call behind the runtime's Triton
+VSA backend (``uniserve.runtime.backends.attention.vsa.triton``). It reads a
+live, device-resident block map (per head and 64-row query tile, a list of
+key tiles and its count) plus per-key-tile valid row counts, so the map can
+change between calls without host-side planning. The provider is fixed to
+BF16 Q/K/V with 128-wide heads; the softmax scale defaults to
+``1 / sqrt(128)``.
+"""
 
 from __future__ import annotations
 
@@ -56,10 +65,14 @@ if triton is not None:
         head_dim: tl.constexpr,
         pipeline_stages: tl.constexpr,
     ):
-        """Apply a head-wise sparse block map.
+        """Apply a head-wise sparse block map using online softmax.
 
-        Apply a head-wise sparse block map using online softmax
-        accumulation.
+        Grid: ``(cdiv(query_rows, block_m), heads)``. Each program owns
+        ``block_m`` query rows of one head, all inside one 64-row query tile
+        because ``block_m`` divides ``tile_size``, and visits that tile's
+        selected key tiles one ``block_n``-row tile at a time. Logits and the
+        softmax state are fp32; probabilities are rounded to bf16 for the
+        P @ V product.
         """
         query_program = tl.program_id(0)
         head = tl.program_id(1)
@@ -84,6 +97,8 @@ if triton is not None:
         selected_count = tl.load(
             block_counts + head * counts_stride_head + query_tile
         )
+        # Counts past the index row width are clamped so the loop never
+        # reads beyond the row. Key-tile identifiers are not bounds-checked.
         selected_count = tl.minimum(selected_count, selected_width)
 
         for selected_offset in tl.range(
@@ -136,6 +151,8 @@ if triton is not None:
             normalizer_sum = normalizer_sum * correction + block_sum
             normalizer_max = next_max
 
+        # Rows that received no softmax mass (no selected key tile with a
+        # valid row) are written as zeros instead of 0 / 0.
         normalized = tl.where(
             normalizer_sum[:, None] > 0.0,
             accumulator / normalizer_sum[:, None],
@@ -152,9 +169,11 @@ if triton is not None:
 
 
 def available(device: torch.device | None = None) -> bool:
-    """Return whether Triton can compile kernels.
+    """Return whether the Triton provider can launch on ``device``.
 
-    Return whether Triton can compile kernels for the requested CUDA device.
+    ``None`` selects the current CUDA device. Only the Triton import, CUDA
+    availability and the device type are checked; compilation errors surface
+    from the first launch.
     """
     if triton is None or not torch.cuda.is_available():
         return False
@@ -239,14 +258,15 @@ def _validate_attention(
 
 
 def _launch_config(device: torch.device) -> tuple[int, int, int]:
-    """Choose the resident query tile and pipeline.
+    """Choose the resident query tile and software pipeline for one device.
 
-    Choose the resident query tile and software pipeline for one
-    architecture.
+    Returns ``(block_m, num_warps, pipeline_stages)``. ``block_m`` must
+    divide the 64-row tile because each program reads one query tile's block
+    map.
     """
     major, _minor = torch.cuda.get_device_capability(device)
-    # Returns (block_m, num_warps, pipeline_stages); Hopper sustains the
-    # deeper pipeline, other architectures use the conservative pairing.
+    # SM90 (Hopper) uses 64-row query blocks, eight warps and three stages;
+    # every other architecture uses 32 rows, four warps and two stages.
     if major == 9:
         return 64, 8, 3
     return 32, 4, 2
@@ -263,7 +283,26 @@ def block_sparse_attention(
     *,
     scale: float = _SOFTMAX_SCALE,
 ) -> torch.Tensor:
-    """Evaluate a mutable head-wise block map without host-side planning."""
+    """Evaluate a mutable head-wise block map without host-side planning.
+
+    ``query`` and ``output`` are ``[query_rows, heads, 128]`` and ``key`` and
+    ``value`` are ``[key_rows, heads, 128]``, all BF16 with unit column
+    stride (``output`` contiguous) and both row counts multiples of 64.
+    ``block_indices`` is ``[heads, query_tiles, width]`` and
+    ``block_counts`` is ``[heads, query_tiles]``, both int32; ``valid_sizes``
+    has one int32 entry per key tile. Validation covers shapes, dtypes,
+    devices and contiguity but not the index values: every key-tile
+    identifier within a row's count must be below the key tile count.
+    Counts above ``width`` are clamped to it.
+
+    Returns:
+        ``output`` viewed as ``[1, heads, query_rows, 128]``; no data is
+        copied.
+
+    Raises:
+        RuntimeError: If Triton cannot launch on ``query``'s device.
+        ValueError: If a tensor fails validation.
+    """
     if not available(query.device):
         raise RuntimeError(
             "Triton sparse video attention is unavailable"

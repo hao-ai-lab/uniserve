@@ -1,11 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// PyTorch binding for the native SM100 block-sparse attention forward. It
+// validates tensor geometry on the host, translates the tensors into
+// BlockSparseVsaArgs and launches on the current CUDA stream. Metadata values
+// (block indices, counts, valid sizes) stay on the device and are not read or
+// range-checked here. vsa_native._extension compiles this file as the only
+// translation unit, in the default block-64 configuration.
+
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <climits>
 #include <cmath>
 
+// Must precede the include: the kernel header defaults VSA_BHSD to false. The
+// BHSD tensor maps address rows and heads through explicit per-tensor strides
+// (batch folded into the head dimension), which is what admits the strided
+// row-major [rows, heads, 128] views this binding accepts.
 #define VSA_BHSD true
 #include "block_sparse_launch_sm100a.cuh"
 
@@ -60,6 +71,8 @@ void sparse_attention(
               "sparse counts and valid key sizes must match Q/K geometry");
   TORCH_CHECK(std::isfinite(scale) && scale > 0, "softmax scale must be positive and finite");
 
+  // Value initialization leaves lse null, so the kernel writes no LSE. The
+  // literal 64 and 128 above are the block-64 build's BLOCK and HEAD_DIM.
   BlockSparseVsaArgs args{};
   args.q = reinterpret_cast<const __nv_bfloat16*>(query.data_ptr());
   args.k = reinterpret_cast<const __nv_bfloat16*>(key.data_ptr());
@@ -84,6 +97,7 @@ void sparse_attention(
   args.num_blocks = static_cast<int>(query_tiles);
   args.max_kv = static_cast<int>(indices.size(2));
   args.sm_scale = static_cast<float>(scale);
+
   const auto result = launch_block_sparse_sm100a(args, at::cuda::getCurrentCUDAStream());
   TORCH_CHECK(result == cudaSuccess, "SM100 sparse attention: ", cudaGetErrorString(result));
 }

@@ -3,9 +3,10 @@
 
 """SM100 sparse attention with converged partial-output epilogues.
 
-The block-64 mainloop and scheduler come from cuDNN frontend. This provider owns
-its correction epilogue because context parallelism needs empty key partitions
-and lane-dependent softmax underflow to obey the same warp collective protocol.
+The block-64 mainloop and scheduler come from cuDNN frontend. This kernel
+overrides the correction epilogue so that, in the ``allow_empty_block_nums``
+specialization, rows with no softmax mass (empty key tiles or lane-dependent
+underflow) keep each warp's TMEM collectives warp-uniform.
 """
 
 import math
@@ -45,15 +46,25 @@ class SparseAttentionSm100(BlockSparseAttnForwardSm100Blk64):
         reduce_mbar_addr: Int32,
         mLSE_cur: cute.Tensor | None = None,  # noqa: N803
     ):
-        """Combine partial outputs.
+        """Combine the warp pairs' partial outputs into the ``sO`` tile.
 
-        C++ blk64-style WS epilogue combine using raw TMEM/SMEM addressing.
+        Overrides the cuDNN frontend method of the same name, a C++
+        blk64-style warp-specialized combine using raw TMEM/SMEM addressing.
+        Correction warps ``w`` and ``w ^ 2`` hold partial softmax states
+        (row sum ``my_sum``, raw-score row max ``my_max``) for the same query
+        rows. The only departure from the base method is the
+        ``allow_empty_block_nums`` branch, which chooses between the TMEM
+        combine and the zero store per warp rather than per lane. With
+        ``mLSE_cur``, rows inside ``seqlen_q`` also store their natural-log
+        LSE, or -inf when the row has no softmax mass.
         """
         corr_warp = tidx // cute.arch.WARP_SIZE
         lane_idx = tidx % cute.arch.WARP_SIZE
         partner_warp = corr_warp ^ 2
 
-        # Exchange the two warp-pair row stats: (0,2) and (1,3).
+        # Exchange the two warp-pair row stats: (0,2) and (1,3). The
+        # ``reduce_mbar_addr`` waits use phase parity 0 after this exchange
+        # and parity 1 after the partial-output exchange below.
         oStats[(partner_warp * 64) + lane_idx * 2 + 0] = my_sum
         oStats[(partner_warp * 64) + lane_idx * 2 + 1] = my_max
         bsa_fwd_helpers.mbar_arrive_and_wait(reduce_mbar_addr, Int32(0))

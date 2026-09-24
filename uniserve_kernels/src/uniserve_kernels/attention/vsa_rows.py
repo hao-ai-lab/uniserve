@@ -1,4 +1,34 @@
-"""Shared sparse input layouts and row-wise compression epilogues."""
+"""Packed input layouts and row-wise compression epilogues for VSA.
+
+The VSA layer (``uniserve.nn.attention.vsa``) receives projected Q/K/V as
+tile-aligned row intervals that may arrive out of order.
+``pack_sparse_input_rows`` and ``prepare_sparse_input_rows`` publish each
+interval into one caller-owned ``packed`` buffer holding all three components;
+``compose_attention`` adds the gated per-tile compression to the provider's
+attention output and routes the composed rows into row-owner destinations.
+The runtime VSA operators under ``uniserve.runtime.backends.attention.vsa``
+(``_Rows.prepare`` and ``_flashinfer.prepare_rows``) read the layer's
+``packed`` buffer (FlashInfer's BSR path receives a head-major copy of it), or
+pack their own inputs when given none, and compose their attention output with
+``compose_attention``.
+
+``packed`` is ``[3, rows, heads, width]`` (row-major, used by the row
+producers of the Triton, CuTe and SM100 operators and by the SM120 FlashInfer
+kernel) or ``[3, heads, rows, width]`` (head-major, used by FlashInfer's
+head-flattened BSR path). K and V keep packed row order, with rows past their
+tile's valid size stored as zeros. Q uses owner-interval order: the
+``rows // owners`` rows of each owner are cut into ``chunk_rows`` segments,
+and segment ``s`` of every owner is stored contiguously, owner after owner,
+starting at row ``s * chunk_rows * owners``. One exchange interval of all
+owners is therefore one contiguous slice of the Q component:
+``_flashinfer.prepare_rows`` narrows Q to that slice, and ``_Rows.prepare``
+slices the output of its whole-domain attention launch in the same order. In
+head-major storage each segment is itself head-major. With one owner and a
+single segment the Q order equals the row order.
+
+Extents, offsets and strides are ``tl.constexpr`` kernel arguments, so every
+distinct combination compiles and caches its own kernel specialization.
+"""
 
 from __future__ import annotations
 
@@ -40,10 +70,12 @@ if triton is not None:
         chunk_rows: tl.constexpr,
         row_major: tl.constexpr,
     ):
-        """Pack interval queries and full masked K/V.
+        """Pack one block of interval rows for one head into ``packed``.
 
-        Pack interval queries and full masked K/V in the provider's
-        physical layout.
+        Grid: ``(cdiv(input_rows, block_rows), heads)``. ``query``, ``key``
+        and ``value`` are the interval's ``[input_rows, heads, width]`` views
+        with unit column stride. Interval row ``i`` is packed row
+        ``row_start + i``, which also selects its entry in ``valid_sizes``.
         """
         input_offsets = (
             tl.program_id(0) * block_rows + tl.arange(0, block_rows)
@@ -53,8 +85,9 @@ if triton is not None:
         columns = tl.arange(0, width)
         row_mask = input_offsets[:, None] < input_rows
 
-        # K/V rows past a tile's valid size are masked out, leaving zeros in
-        # the packed buffer for the attention provider to ignore.
+        # K/V rows past a tile's valid size load as zeros and are stored as
+        # zeros. The providers also mask those keys; zero payload keeps
+        # padding values, NaN included, out of their matrix multiplications.
         valid_rows = tl.load(
             valid_sizes + row_offsets // tile_rows,
             mask=input_offsets < input_rows,
@@ -101,9 +134,12 @@ if triton is not None:
             mask=key_mask,
             other=0.0,
         )
-        # Queries are reordered into per-chunk intervals that group every
-        # owner's rows together, so each owner receives one contiguous span.
-        # K/V keep global row order; only the query component is rearranged.
+
+        # Queries are reordered into per-segment intervals that group every
+        # owner's rows of one segment together (see the module docstring);
+        # K/V keep packed row order. ``count`` is the segment's row count,
+        # shorter for an owner's last segment when ``chunk_rows`` does not
+        # divide ``owner_rows``.
         component_size = heads * rows * width
         owner_rows = rows // owners
         owner = row_offsets // owner_rows
@@ -179,18 +215,26 @@ if triton is not None:
     ):
         """Normalize, rotate, pool and pack one 64-row tile of one head.
 
+        Grid: one program per (interval tile, head). ``tile_offset`` is the
+        packed tile of the interval's first row; ``tile_offset + tile``
+        indexes ``valid_sizes`` and the pooled outputs.
+
         Q and K are RMS-normalized in fp32 over the full head and their even
-        rotary prefix is rotated split-half with compact factors, the same
-        arithmetic as the in-place norm-and-rope kernel. Each head row is
-        read once as two half-width column sets: ``x`` holds the first rotary
-        half followed by the first half of the unrotated tail, ``y`` the
-        partner column of each ``x`` column, so a lane owns a rotation pair
-        and tail columns ride along with unit factors. The packed rows hold
-        the rotated values rounded to the source dtype; the pooled means
-        average those rounded rows over the tile's valid rows in fp32.
-        Queries are packed in owner-interval order and K/V in global row
-        order with rows past a tile's valid size zeroed, the layout of the
-        packing kernel; the gate rows are copied in global row order.
+        rotary prefix is rotated split-half with compact factors, the formula
+        of ``triton_qk_rms_norm_rope_inplace`` in ``uniserve_kernels.rope``.
+        The squared-row sum here adds two half-width partial sums, a
+        different fp32 order, so a rounded element can differ from that
+        kernel's by one ulp. Each head row is read once as two half-width
+        column sets: ``x`` holds the first rotary half followed by the first
+        half of the unrotated tail, ``y`` the partner column of each ``x``
+        column, so a lane owns a rotation pair and tail columns ride along
+        with unit factors. The packed rows hold the rotated values rounded to
+        the source dtype; the pooled means average those rounded rows over
+        the tile's valid rows in fp32. Queries are packed row-major in
+        owner-interval order, including rows past the valid size, and K/V in
+        packed row order with those rows zeroed, the row-major layout of the
+        packing kernel; the gate rows are copied unmasked in packed row
+        order.
         """
         tile = tl.program_id(0)
         head = tl.program_id(1)
@@ -267,6 +311,8 @@ if triton is not None:
             key_y = key_y * key_rstd[:, None] * key_y_weight
 
             # Tail columns load unit factors and pass through the rotation.
+            # The always-true row term only broadcasts the column mask to the
+            # slab shape.
             factor_mask = rotated[None, :] & (local_rows[:, None] >= 0)
             factor_offsets = (
                 input_offsets[:, None] * rotary_stride_row + columns[None, :]
@@ -298,8 +344,8 @@ if triton is not None:
                 other=0.0,
             )
 
-            # Queries are reordered into per-chunk intervals that group every
-            # owner's rows together; K/V keep global row order.
+            # Same owner-interval query order as the packing kernel; K/V keep
+            # packed row order.
             owner = row_offsets // owner_rows
             local_row = row_offsets % owner_rows
             segment = local_row // chunk_rows
@@ -326,6 +372,7 @@ if triton is not None:
                 + full_columns[None, :],
                 value_values,
             )
+
             gate_values = tl.load(
                 gate
                 + input_offsets[:, None] * gate_stride_row
@@ -336,6 +383,8 @@ if triton is not None:
                 packed_gate + destination + full_columns[None, :], gate_values
             )
 
+            # K and V rows past the valid size are already zero, so only the
+            # query sums need the validity mask.
             query_x_sum += tl.sum(
                 tl.where(valid_mask, query_x_out.to(tl.float32), 0.0), axis=0
             )
@@ -372,7 +421,15 @@ if triton is not None:
         tile_rows: tl.constexpr,
         block_rows: tl.constexpr,
     ):
-        """Fuse the attention result with trained compression."""
+        """Compose one block of rows for one head into a single output.
+
+        ``attended`` is the provider output addressed as ``[1, heads, rows,
+        width]`` through its head and row strides, ``gate`` is ``[rows, heads,
+        width]`` and ``compressed`` is contiguous ``[heads, rows / tile_rows,
+        width]``. ``output`` must be contiguous ``[rows, heads, width]`` with
+        ``heads`` equal to the grid's second dimension, which supplies its
+        row stride.
+        """
         row_offsets = (
             tl.program_id(0) * block_rows + tl.arange(0, block_rows)
         ).to(tl.int64)
@@ -436,9 +493,16 @@ if triton is not None:
         start_row: tl.constexpr,
         global_rows: tl.constexpr,
     ):
-        """Compose sparse outputs and route local heads.
+        """Compose attended rows and route them into row-owner shards.
 
-        Compose sparse outputs and route local heads into row-owner shards.
+        ``attended`` holds ``rows`` rows as ``len(outputs)`` consecutive
+        segments of ``local_rows``, one per destination; segment ``d`` row
+        ``i`` reads global row ``d * owner_rows + start_row + i`` of ``gate``
+        (``[global_rows, heads, width]``) and that row's tile of the
+        contiguous ``compressed`` (``[heads, global_rows / tile_rows,
+        width]``). Each output is
+        contiguous ``[local_rows, global_heads, width]``, and this call's
+        ``local_heads`` land at head offset ``source_rank * local_heads``.
         """
         row_offsets = (
             tl.program_id(0) * block_rows + tl.arange(0, block_rows)
@@ -514,10 +578,33 @@ def pack_sparse_input_rows(
 
     Caller-owned storage supports out-of-order disjoint intervals produced by
     a distributed projection. Every row must be published before attention
-    consumes the buffer. Validity and destination offsets use global rows.
-    Storage is (3, rows, heads, width) for the native provider and
-    (3, heads, rows, width) for flattened BSR. Queries use owner-interval
-    order within their component; K/V retain global row order.
+    consumes the buffer. ``row_start`` and ``valid_sizes`` address rows and
+    tiles of ``packed``'s row axis, which under context parallelism is the
+    rank's local query domain rather than the whole sequence. Storage is
+    ``[3, rows, heads, width]`` with ``row_major`` and
+    ``[3, heads, rows, width]`` otherwise (see the module docstring for which
+    providers read each). Queries use owner-interval order within their
+    component; K/V retain packed row order.
+
+    Args:
+        query: Interval queries, ``[input_rows, heads, width]`` with unit
+            column stride; ``key`` and ``value`` share its shape.
+        valid_sizes: Valid rows per 64-row tile of the packed row axis. Its
+            length is not checked; it must cover every tile the interval
+            touches.
+        owners: Number of row owners; must divide ``rows``.
+        chunk_rows: Owner-local segment length; ``None`` means one segment
+            per owner covering all of its ``rows // owners`` rows.
+        packed: Destination storage. ``None`` allocates storage whose row
+            count equals the interval's, so ``row_start`` must then be 0.
+        row_start: Packed row of the interval's first row.
+
+    Returns:
+        ``packed``, or the newly allocated storage.
+
+    Raises:
+        ValueError: If shapes, dtype, device, contiguity, or the owner,
+            segment and interval bounds are invalid for ``packed``.
     """
     assert triton is not None
     input_rows, heads, width = (int(size) for size in query.shape)
@@ -605,12 +692,21 @@ def prepare_sparse_input_rows(
 
     One read of the projections yields the packed row-major input layout of
     ``pack_sparse_input_rows`` with Q and K normalized and rotated as
-    ``qk_norm_rope`` computes them with compact factors, the gate rows copied
-    into ``packed_gate`` at their global rows, and the per-tile means
-    ``pool_qkv_means`` computes from stored projections, written at the
-    interval's tiles. ``cosine`` and ``sine`` hold the interval's compact
-    half-width factors; the interval starts at ``row_start`` and covers whole
-    tiles.
+    ``uniserve.nn.functional.qk_norm_rope`` computes them for one normalized
+    domain with a partially rotated prefix, the gate rows copied into
+    ``packed_gate`` at their packed rows, and the per-tile means
+    ``vsa_tiles.pool_qkv_means`` computes from stored projections, written
+    at the interval's tiles. ``cosine`` and ``sine`` hold the interval's
+    compact half-width factors, one row per interval row; the interval
+    starts at ``row_start`` and covers whole tiles. The head width must be a
+    power of two. Pooled buffers are fp32 with unit column stride and are
+    indexed by packed tile, so they must reach the interval's last tile; all
+    three are addressed with ``pooled_query``'s tile and head strides.
+
+    Raises:
+        ValueError: If tensor shapes, dtypes or contiguity, the rotary or
+            head width, tile alignment, or the owner and pooled extents are
+            invalid.
     """
     assert triton is not None
     input_rows, heads, width = (int(size) for size in query.shape)
@@ -709,19 +805,41 @@ def compose_attention(
     owner_rows: int | None = None,
     start_row: int = 0,
 ) -> None:
-    """Fuse trained compression into masked attention.
+    """Add gated per-tile compression to attention output and route its rows.
 
-    Fuse trained compression into masked attention and route complete head
-    rows.
+    Writes ``attended + gate * compressed[tile]`` per row, head and feature,
+    computed in FP32 and stored in the destination dtype. Numerical providers
+    own key validity and softmax normalization; this epilogue only reads
+    their output.
 
-    Numerical providers own key validity and softmax normalization. Composition
-    accumulates in FP32 before writing the destination dtype.
+    Args:
+        attended: Provider output addressed as ``[1, heads, rows, width]``
+            (typically a transposed view of row-major storage).
+        gate: Row-major ``[gate_rows, heads, width]`` gate over the packed
+            row axis.
+        compressed: Contiguous ``[heads, gate_rows / 64, width]`` compressed
+            tile values.
+        outputs: Destinations, which must be contiguous; their shapes are not
+            checked here. One output without ``owner_rows`` receives all
+            ``rows`` rows as ``[rows, heads, width]``; ``attended`` row ``i``
+            then reads gate row ``i``, and ``compressed`` is addressed as
+            ``[heads, rows / 64, width]``. Otherwise each output receives
+            ``rows / len(outputs)`` consecutive ``attended`` rows.
+        source_rank: On the routed path, the head block of this call inside
+            each destination's head axis: heads land at
+            ``source_rank * heads``. The single-destination path ignores it.
+        owner_rows: Gate-row stride between consecutive destinations;
+            ``None`` means ``rows / len(outputs)``.
+        start_row: Gate-row offset of each destination's first row, which
+            for destination ``d`` is gate row ``d * owner_rows + start_row``.
+            The single-destination path ignores it.
     """
     assert triton is not None
     heads, rows, width = (int(size) for size in attended.shape[1:])
     block_rows = 8
     grid = (triton.cdiv(rows, block_rows), heads)
 
+    # A single unrouted destination needs no gate-row remapping.
     if len(outputs) == 1 and owner_rows is None:
         _compose_rows_kernel[grid](
             attended,
