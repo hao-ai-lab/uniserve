@@ -1,4 +1,12 @@
-"""Builds fixed-length MiniMax H3 text-to-video-with-audio prompts."""
+"""Builds fixed-length MiniMax H3 text-to-video-with-audio prompts.
+
+The prompt length is a workload dimension (``VideoConfig.prompt_tokens``)
+alongside the video duration. This adapter synthesizes one prompt whose token
+count under the model's tokenizer equals the target exactly, and every
+example repeats that prompt with the same seed. Server profiles that pass
+``--video-graph-shapes`` name shapes as seconds by prompt tokens; requests
+outside a captured shape's layout denoise without graphs.
+"""
 
 from __future__ import annotations
 
@@ -30,6 +38,8 @@ _PROMPT = (
     "the finished lantern down, while gentle breathing remains audible. "
     "non_diegetic_music: N/A"
 )
+# Per-example generation seed; the video task sends it in place of the
+# point's load seed.
 _SEED = 1000
 
 
@@ -41,12 +51,23 @@ class MiniMaxH3Dataset(Dataset):
     requires_tokenizer = True
 
     def load(self, tokenizer: Any | None = None) -> list[Example]:
-        """Construct repeated examples whose decoded prompt has the target length."""  # noqa: E501
+        """Construct repeated examples whose decoded prompt has the target length.
+
+        Token counts exclude special tokens.
+
+        Raises:
+            ValueError: If no tokenizer is supplied, the tokenizer encodes the
+                base or filler text to no tokens, or the decoded prompt does
+                not re-encode to exactly ``prompt_tokens`` tokens.
+        """  # noqa: E501
         if tokenizer is None:
             raise ValueError(
                 "MiniMax H3 benchmark prompt synthesis requires its tokenizer"
             )
         target = int(self.point.video.prompt_tokens)
+
+        # Truncate the base description or pad it with whole or partial
+        # copies of the filler sentence until the id count reaches the target.
         base_ids = list(tokenizer.encode(_PROMPT, add_special_tokens=False))
         filler_ids = list(
             tokenizer.encode(
@@ -60,6 +81,9 @@ class MiniMaxH3Dataset(Dataset):
         token_ids = base_ids[:target]
         while len(token_ids) < target:
             token_ids.extend(filler_ids[: target - len(token_ids)])
+
+        # Decoding and re-encoding need not preserve the token count, so the
+        # decoded text is measured again and rejected on a mismatch.
         prompt = tokenizer.decode(
             token_ids,
             skip_special_tokens=True,
@@ -71,6 +95,7 @@ class MiniMaxH3Dataset(Dataset):
                 f"MiniMax H3 synthesized prompt measured {len(measured)} "
                 f"tokens, expected {target}"
             )
+
         return [
             Example(
                 id=f"minimax-h3-{index:04d}",

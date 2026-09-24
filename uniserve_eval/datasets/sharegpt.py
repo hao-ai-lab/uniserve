@@ -1,4 +1,10 @@
-"""Loads deterministic two-turn ShareGPT text-generation examples."""
+"""Loads deterministic two-turn ShareGPT text-generation examples.
+
+Each conversation contributes its first turn as the prompt and its second
+turn as the reference completion. Only the completion's token count is kept:
+it becomes ``Example.output_len``, which the text task requests as
+``max_completion_tokens``.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +27,19 @@ class ShareGPTDataset(Dataset):
     requires_tokenizer: ClassVar[bool] = True
 
     def load(self, tokenizer: Any | None = None) -> list[Example]:
-        """Return seeded, non-empty prompt and completion pairs."""
+        """Return seeded, non-empty prompt and completion pairs.
+
+        ``dataset_path`` is used only when it names a file that parses as
+        JSON; otherwise the file is downloaded from the hub at
+        ``dataset_revision``. Pairs whose prompt or completion encodes to
+        fewer than two tokens are skipped. Token counts use
+        ``tokenizer.encode`` defaults, so they include any special tokens the
+        tokenizer adds. Errors from downloading and parsing the file
+        propagate.
+
+        Raises:
+            ValueError: If no tokenizer is supplied.
+        """
         if tokenizer is None:
             raise ValueError("dataset 'sharegpt' requires a tokenizer")
         point = self.point
@@ -39,6 +57,8 @@ class ShareGPTDataset(Dataset):
         with open(path, encoding="utf-8") as handle:
             dataset = json.load(handle)
 
+        # Rows name their turn list either ``conversations`` or
+        # ``conversation``; rows with fewer than two turns are dropped.
         dataset = [
             data
             for data in dataset
@@ -56,6 +76,8 @@ class ShareGPTDataset(Dataset):
             for data in dataset
         ]
 
+        # The shuffle reseeds and draws from the process-global ``random``
+        # generator rather than a private ``random.Random``.
         random.seed(point.load.seed)
         random.shuffle(dataset)
 
@@ -79,7 +101,10 @@ class ShareGPTDataset(Dataset):
 
 
 def _is_file_valid_json(path: str) -> bool:
-    """Report whether a path names a readable JSON document."""
+    """Report whether a path names a readable JSON document.
+
+    The whole document is parsed, so a valid local file is read twice.
+    """
     if not path or not os.path.isfile(path):
         return False
     try:

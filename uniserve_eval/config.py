@@ -1,4 +1,18 @@
-"""Loads and validates evaluator servers, benchmark points, and suites."""
+"""Loads and validates evaluator servers, benchmark points, and suites.
+
+An evaluator profile is a TOML file with optional `root` (default `.`) and
+`artifact_root` (default `artifacts/benchmark`) keys and up to three tables:
+`[servers.<name>]` describes how to launch a server, `[benchmarks.<name>]`
+describes one measured workload against a named server, and `[suites.<name>]`
+lists benchmark names in execution order. `load_config` turns the file into
+an `EvaluationConfig`, rejecting unknown keys in every server, benchmark, and
+suite table; unknown top-level keys are ignored. The adapters that
+`tasks.get_task` and `datasets.get_dataset` return validate the parts of a
+benchmark that depend on its task and dataset.
+
+String values in server and benchmark tables may reference the process
+environment as `${NAME}` or `${NAME:-default}`; see `expand_environment`.
+"""
 
 from __future__ import annotations
 
@@ -25,9 +39,14 @@ from .types import (
 
 #: The profiles this driver ships, which `--config` replaces.
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "profiles.toml"
+
+# `${NAME}` and `${NAME:-default}`. The default is matched non-greedily, so it
+# ends at the first `}` and cannot itself contain one.
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _ENV_DEFAULT_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-(.*?)\}")
 
+# Keys accepted in a `[benchmarks.<name>]` table. The nested load, sampling,
+# image, and video tables accept exactly the fields of their dataclasses.
 _ROOT_FIELDS = {
     "server",
     "task",
@@ -87,15 +106,25 @@ class SuiteProfile:
 class EvaluationConfig:
     """Contains the complete validated evaluator configuration."""
 
-    #: What the file's relative paths are relative to, which the file states.
+    #: Directory the profile's relative paths resolve against: the file's
+    #: `root` key (default `.`), itself relative to the file.
     root: Path
+    #: Default parent of per-point result directories; `artifact_root` in the
+    #: file, relative to `root` unless absolute. `run --output-root` overrides
+    #: it, and a relative override is taken from the current directory.
     artifact_root: Path
     servers: dict[str, ServerProfile]
     benchmarks: dict[str, BenchmarkPoint]
     suites: dict[str, SuiteProfile]
 
     def selected_points(self, selection: str) -> tuple[BenchmarkPoint, ...]:
-        """Resolve a benchmark or suite name to its ordered points."""
+        """Resolve a benchmark or suite name to its ordered points.
+
+        A benchmark name takes precedence over a suite of the same name.
+
+        Raises:
+            ValueError: If `selection` names neither a benchmark nor a suite.
+        """
         if selection in self.benchmarks:
             return (self.benchmarks[selection],)
         suite = self.suites.get(selection)
@@ -113,8 +142,19 @@ def load_config(path: Path = DEFAULT_CONFIG) -> EvaluationConfig:
     A profile's relative paths -- its executable, its interpreter, its
     deployment configuration, its artifact root -- are relative to the tree the
     file states as its `root`, itself relative to the file. Resolving them
-    against the file rather than against this module's own directory keeps a
-    profile's meaning independent of where the driver is installed.
+    against the file keeps a profile's meaning independent of where the
+    driver is installed.
+
+    Environment references are expanded here, but an unset reference without
+    a default stays in the value verbatim. `pipeline.setup.prepare_launch`
+    rejects a server command or benchmark workload that still contains one
+    before a run starts the server; server `environment` values are not
+    checked.
+
+    Validation stops at the first violation. Schema violations raise
+    `ValueError`, an unregistered task or dataset name raises `KeyError`, and
+    a mistyped value that reaches a dataclass constructor can raise other
+    exceptions such as `TypeError`.
     """
     config_path = Path(path).resolve()
     with config_path.open("rb") as handle:
@@ -122,6 +162,8 @@ def load_config(path: Path = DEFAULT_CONFIG) -> EvaluationConfig:
 
     root = (config_path.parent / str(raw.get("root", "."))).resolve()
 
+    # Benchmarks refer to servers and suites refer to benchmarks, so each
+    # table is validated against the ones parsed before it.
     servers = {
         name: _server_profile(name, value)
         for name, value in _table(raw, "servers").items()
@@ -147,7 +189,15 @@ def load_config(path: Path = DEFAULT_CONFIG) -> EvaluationConfig:
 
 
 def expand_environment(value: Any) -> Any:
-    """Expand declared environment references recursively when values exist."""
+    """Expand declared environment references recursively when values exist.
+
+    `${NAME:-default}` becomes the value of `NAME` when it is set, including
+    when it is set to an empty string, and `default` otherwise. `${NAME}`
+    becomes the value of `NAME` when it is set and is otherwise left in place
+    for `unresolved_environment` to report. Strings inside lists and dict
+    values are expanded; dict keys are converted to strings but not expanded.
+    Other values are returned unchanged.
+    """
     if isinstance(value, str):
         expanded = _ENV_DEFAULT_REF.sub(
             lambda match: os.environ.get(match.group(1), match.group(2)), value
@@ -180,7 +230,12 @@ def unresolved_environment(value: Any) -> tuple[str, ...]:
 
 
 def require_resolved(value: Any, *, context: str) -> None:
-    """Reject a value that still contains environment references."""
+    """Reject a value that still contains environment references.
+
+    Raises:
+        ValueError: If `unresolved_environment` finds any name; the message
+            starts with `context` and lists the names.
+    """
     names = unresolved_environment(value)
     if names:
         raise ValueError(
@@ -194,8 +249,22 @@ def server_launch(
 ) -> ServerLaunch:
     """Resolve a server profile into an executable launch description.
 
-    `root` is the tree the profile's relative paths are written against, which
-    the configuration states rather than this module deriving it.
+    Args:
+        server: Profile whose command is resolved.
+        executable: Replacement for the profile's first command element
+            (the server binary), or `None` to keep it. Either one resolves
+            against `root` when relative.
+        root: `EvaluationConfig.root`, the tree the profile's relative paths
+            are written against.
+
+    Returns:
+        A launch whose executable and any `--worker-python` value are
+        absolute paths, whose working directory is `root`, and whose
+        environment is a copy of the profile's. Environment references are
+        not checked here.
+
+    Raises:
+        ValueError: If `--worker-python` is the last command element.
     """
     command = list(server.command)
     selected_executable = (
@@ -213,7 +282,11 @@ def server_launch(
 
 
 def _resolve_command_path(command: list[str], option: str, base: Path) -> None:
-    """Make the path argument for a command option absolute in place."""
+    """Make the path argument for a command option absolute in place.
+
+    Only the first occurrence of `option` is resolved, and a command without
+    it is left unchanged.
+    """
     try:
         value_index = command.index(option) + 1
     except ValueError:
@@ -334,7 +407,12 @@ def _benchmark_point(
 
 
 def _metrics(raw: Any, context: str) -> tuple[MetricDefinition, ...]:
-    """Parse protected metric paths and optimization directions."""
+    """Parse protected metric paths and optimization directions.
+
+    Each key is a dotted path into the `metrics` mapping of the run summary
+    and each value is `higher` or `lower`. Run validation in `pipeline.report`
+    requires every listed metric to be finite and positive.
+    """
     table = _mapping(raw, f"{context}.metrics")
     metrics: list[MetricDefinition] = []
     for path, direction in table.items():
@@ -360,6 +438,8 @@ def _load_config(raw: Any, context: str) -> LoadConfig:
         return LoadConfig()
     value = _mapping(raw, context)
     _reject_unknown(value, _LOAD_FIELDS, context)
+    # A bare TOML `inf` already parses as a float; the quoted string "inf" is
+    # accepted as the same unbounded arrival rate.
     if "request_rate" in value and value["request_rate"] == "inf":
         value["request_rate"] = float("inf")
     return LoadConfig(**value)
@@ -393,6 +473,7 @@ def _image_config(
         interval = value["cfg_interval"]
         if not isinstance(interval, list) or len(interval) != 2:
             raise ValueError(f"{context}.cfg_interval must have two values")
+        # TOML arrays arrive as lists; the dataclass field is a float pair.
         value["cfg_interval"] = (float(interval[0]), float(interval[1]))
     return ImageConfig(**value)
 
@@ -439,7 +520,11 @@ def _table(raw: dict[str, Any], key: str) -> dict[str, Any]:
 
 
 def _mapping(value: Any, context: str) -> dict[str, Any]:
-    """Return a defensive copy of a required TOML mapping."""
+    """Return a defensive copy of a required TOML mapping.
+
+    The copy is shallow; callers may add or replace top-level keys without
+    changing the parsed TOML document.
+    """
     if not isinstance(value, dict):
         raise ValueError(f"{context} must be a TOML table")
     return dict(value)

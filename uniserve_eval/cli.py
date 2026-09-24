@@ -36,7 +36,12 @@ def list_items(args: argparse.Namespace) -> None:
 
 
 def plan(args: argparse.Namespace) -> None:
-    """Print the resolved execution plan for a benchmark selection."""
+    """Print the resolved execution plan for a benchmark selection.
+
+    Unlike `run`, planning neither takes the host lock nor rejects
+    unresolved environment references, so an unset `${NAME}` appears
+    verbatim in the printed command.
+    """
     config = load_config(args.config)
     points = config.selected_points(args.selection)
     rendered = []
@@ -52,6 +57,8 @@ def plan(args: argparse.Namespace) -> None:
                 "base_url": server.base_url,
                 "dataset": point.dataset,
                 "num_prompts": point.load.num_prompts,
+                # `json.dumps` would render infinity as the non-standard
+                # `Infinity` token.
                 "request_rate": (
                     "inf"
                     if point.load.request_rate == float("inf")
@@ -65,11 +72,25 @@ def plan(args: argparse.Namespace) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
-    """Run selected points serially and stop after the first invalid result."""
+    """Run selected points serially and stop after the first invalid result.
+
+    Each point launches its own server, measures against it, and stops it
+    before the next point starts, even when consecutive points name the same
+    server. Results go to `<output root>/<point name>`, which `run_point`
+    requires to be absent or empty, and server output goes to
+    `<output root>/server-logs/<point name>.log`.
+
+    Exits with status 2 when a point completes with a failed validation. An
+    exception while preparing, launching, or measuring a point propagates and
+    ends the run; `ManagedServer` stops a server that was already started.
+    """
     config = load_config(args.config)
     output_root = args.output_root or config.artifact_root
     points = config.selected_points(args.selection)
     failures = 0
+
+    # The lock is held for the whole selection, so another uniserve-eval
+    # process fails to acquire it instead of starting a server between points.
     with host_lock():
         for point in points:
             server = config.servers[point.server]
@@ -77,6 +98,10 @@ def run(args: argparse.Namespace) -> None:
             point_dir = output_root / point.name
             log_path = output_root / "server-logs" / f"{point.name}.log"
             launch_record = describe_launch(launch)
+
+            # The launch environment also applies to this process for the
+            # duration of the point and is restored afterwards; the server
+            # receives it through `ManagedServer`.
             with applied_environment(launch.environment):
                 with ManagedServer(
                     server,
@@ -93,6 +118,7 @@ def run(args: argparse.Namespace) -> None:
                             timeout_s=args.request_timeout_s,
                         )
                     )
+
             status = "pass" if result.summary["validation"]["valid"] else "fail"
             print(
                 f"{point.name}: {status} ({result.summary['ok_count']}"
@@ -120,6 +146,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     command.set_defaults(function=list_items)
 
+    # For `plan` and `run`, `selection` is a benchmark or suite name and
+    # `--executable` replaces the server binary, the first element of the
+    # profile's command. A relative `--executable` resolves against the
+    # profile's `root`, whereas a relative `--output-root` is taken from the
+    # current directory.
     command = subparsers.add_parser("plan")
     command.add_argument("selection")
     command.add_argument("--executable", type=Path)

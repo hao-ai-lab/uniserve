@@ -1,4 +1,9 @@
-"""Owns a benchmark server process from launch through termination."""
+"""Owns a benchmark server process from launch through termination.
+
+`cli.run` wraps each benchmark point in one `ManagedServer`, so every point
+measures a freshly launched server whose combined stdout and stderr go to a
+per-point log file.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +20,15 @@ from .config import ServerLaunch, ServerProfile
 
 
 class ManagedServer:
-    """Runs one server process group and waits for its TCP listener."""
+    """Runs one server process group and waits for its TCP listener.
+
+    Readiness is a successful TCP connect to `ServerProfile.host` and `port`,
+    so those must name the address the launch command binds; configuration
+    loading does not derive one from the other. With `uniserve serve`, the
+    HTTP listener is bound only after `uniserve_server::build_state` has
+    resolved the model assets and started the engine. A server that listens
+    earlier would be reported ready too soon.
+    """
 
     def __init__(
         self,
@@ -37,6 +50,10 @@ class ManagedServer:
         """Start the server and return after its listener accepts connections."""  # noqa: E501
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log = self.log_path.open("w", encoding="utf-8")
+
+        # Launch values override the inherited environment. A new session
+        # makes the server the leader of its own process group, which `stop`
+        # signals as a whole.
         environment = dict(os.environ)
         environment.update(self.launch.environment)
         self.process = subprocess.Popen(
@@ -48,6 +65,7 @@ class ManagedServer:
             text=True,
             start_new_session=True,
         )
+
         try:
             self._wait_until_ready()
         except BaseException:
@@ -65,7 +83,12 @@ class ManagedServer:
         self.stop()
 
     def stop(self) -> None:
-        """Terminate the server process group and release process resources."""
+        """Terminate the server process group and release process resources.
+
+        The group receives SIGTERM, then SIGKILL if the leader has not exited
+        within 10 seconds. Clearing `process` first makes a repeated call a
+        no-op.
+        """
         process = self.process
         self.process = None
         if process is not None and process.poll() is None:
@@ -80,7 +103,13 @@ class ManagedServer:
             self.log = None
 
     def _wait_until_ready(self) -> None:
-        """Wait for the configured TCP listener or reports early process exit."""  # noqa: E501
+        """Wait for the configured TCP listener or report early process exit.
+
+        Raises:
+            RuntimeError: If the server process exits before listening.
+            TimeoutError: If no connection succeeds before `timeout_s`
+                elapses.
+        """  # noqa: E501
         deadline = time.monotonic() + self.timeout_s
         while time.monotonic() < deadline:
             if self.process is not None and self.process.poll() is not None:

@@ -1,4 +1,16 @@
-"""Issues benchmark HTTP requests and records normalized observable outputs."""
+"""Issues benchmark HTTP requests and records normalized observable outputs.
+
+``send_request`` is the single entry point the benchmark runner
+(``uniserve_eval.pipeline.run``) uses per request. It routes by endpoint to a
+transport for synchronous video, image generations, streamed chat, or
+non-streaming chat, and folds everything observable into one
+``RequestRecord``: HTTP status, success and a stable failure classifier, client
+timing, token usage with its provenance, generated text, and decoded media.
+
+All timestamps are ``time.perf_counter`` values on the same clock as
+``RequestRecord.start_time``. Streamed events carry the client receipt time
+that ``SseParser`` stamps into their ``_client_t`` field.
+"""
 
 from __future__ import annotations
 
@@ -25,7 +37,22 @@ async def send_request(
     output_len_fallback: int = 0,
     scheduled_time: float | None = None,
 ) -> RequestRecord:
-    """Dispatch one task request through its endpoint-specific transport."""
+    """Dispatch one task request through its endpoint-specific transport.
+
+    The endpoint selects the transport before ``request.stream`` is
+    consulted, so video and image-generation requests never take the SSE
+    path. ``output_len_fallback`` becomes the record's
+    ``requested_output_len`` for every endpoint. On chat endpoints,
+    ``prompt_len`` and ``output_len_fallback`` stand in for token counts the
+    server does not report.
+
+    Returns:
+        The closed record. HTTP status and response-content failures carry
+        their own classifiers; any raised ``Exception``, including httpx
+        connection errors and timeouts, becomes ``transport_failure``.
+        Exceptions outside ``Exception``, such as ``asyncio.CancelledError``,
+        propagate.
+    """
     payload = {
         key: value
         for key, value in request.payload.items()
@@ -62,7 +89,14 @@ async def _send_images(
     payload: dict[str, Any],
     record: RequestRecord,
 ) -> None:
-    """Execute an image-generations request and validate embedded outputs."""
+    """Execute an image-generations request and validate embedded outputs.
+
+    Latency closes when the complete body has arrived, before parsing. A
+    non-JSON body is classified ``transport_status_<code>`` at any status.
+    For a JSON body, structural and image-decoding classifiers take
+    precedence; only an otherwise valid body with a status of 400 or above
+    is classified ``transport_status_<code>``.
+    """
     response = await client.post(url, json=payload)
     record.note_http(response.status_code)
     record.close_now()
@@ -77,6 +111,9 @@ async def _send_images(
     transport_ok = response.status_code < 400
     if not transport_ok and classifier == "ok":
         classifier = f"transport_status_{response.status_code}"
+    # `_classify_images` inspects only the first entry; every entry is
+    # checked here and decoded by `_attach_images`, which records its own
+    # failure classifier.
     images = data.get("data") if isinstance(data, dict) else None
     image_error: str | None = None
     if body_ok and isinstance(images, list):
@@ -87,6 +124,8 @@ async def _send_images(
             image_error = _attach_images(
                 record, images, assign_json_latency=False
             )
+    # Images are decoded without latencies above; only a successful response
+    # re-attaches them with the whole-response latency for every image.
     if image_error is None and body_ok and transport_ok:
         record.mark_success()
         record.attach_images(record.decoded_images, assign_json_latency=True)
@@ -103,6 +142,7 @@ async def _send_chat(
     output_len_fallback: int,
 ) -> None:
     """Execute a non-streaming chat request and record text, images, and usage."""  # noqa: E501
+    # Latency closes when the complete body has arrived, before parsing.
     response = await client.post(url, json=payload)
     record.note_http(response.status_code)
     record.close_now()
@@ -126,6 +166,8 @@ async def _send_chat(
         images = OpenAIChat.message_images(
             message if isinstance(message, dict) else None
         )
+    # A single JSON body has no per-token arrival times, so TTFT and ITL are
+    # unavailable and every image is assigned the whole-response latency.
     record.generated_text = content
     record.token_timing_available = False
     image_error = _attach_images(record, images, assign_json_latency=True)
@@ -137,6 +179,9 @@ async def _send_chat(
     record.apply_token_fallbacks(
         prompt_len=prompt_len, output_len_fallback=output_len_fallback
     )
+
+    # Usage is recorded above even when image decoding already marked the
+    # request failed.
     if image_error is not None:
         return
     if response.status_code < 400 and bool(content or record.decoded_images):
@@ -157,9 +202,15 @@ async def _send_chat_stream(
     prompt_len: int,
     output_len_fallback: int,
 ) -> None:
-    """Execute an SSE chat request and record event-level output timing."""
+    """Execute an SSE chat request and record event-level output timing.
+
+    The whole stream is collected before any event is interpreted, so
+    latency, TTFT, ITL, and image latencies derive from per-event receipt
+    stamps rather than from when this function processes them.
+    """
     async with client.stream("POST", url, json=payload) as response:
         # Reject transport or framing mismatches before interpreting event data.
+        # Any status other than 200 fails, including other 2xx codes.
         record.note_http(response.status_code)
         if response.status_code != 200:
             body = await response.aread()
@@ -169,6 +220,8 @@ async def _send_chat_stream(
                 body.decode("utf-8", errors="replace")[:500],
             )
             return
+        # A JSON body in reply to a stream request carries no event timing and
+        # gets its own classifier.
         if _is_json_content_type(response.headers.get("content-type", "")):
             await response.aread()
             record.close_now()
@@ -177,28 +230,37 @@ async def _send_chat_stream(
                 "stream request received a JSON response",
             )
             return
+        # Malformed event JSON becomes a `parse_error` event, which
+        # `OpenAIChat.classify_events` rejects, instead of raising into the
+        # generic transport failure. Without `stop_on`, the body is read until
+        # the server closes it; latency still closes at the last event stamp.
         events = await aiter_sse_events(
             response.aiter_lines(),
             stamp_time=True,
             on_parse_error="record",
         )
 
-    # Classify the complete stream before folding its content and timing fields.
+    # Classify the complete stream before folding its content and timing
+    # fields. A failed stream still folds its partial output below unless it
+    # contains non-object events.
     record.close_at(_last_event_time(events))
     ok, classifier = OpenAIChat.classify_events(events)
     if ok:
         record.mark_success()
     else:
         record.mark_failure(classifier)
+    # Fallback token counts are written first; `apply_usage` overwrites them
+    # and their provenance when the stream reports usage. Token timing becomes
+    # available only once `add_text` observes a text delta.
     record.prompt_len = prompt_len
     record.output_len = output_len_fallback
     record.token_timing_available = False
     if any(not isinstance(event, dict) for event in events):
         return
 
-    # Fold deltas in arrival order so text inter-token timing excludes
-    # image-only events while image latency still records every completed
-    # image part.
+    # Fold deltas in arrival order. A text gap that spans an image event is
+    # excluded from ITL, and each image part records the latency of the
+    # event that delivered it.
     last_text_time: float | None = None
     image_since_last_text = False
     image_parts: list[dict[str, Any]] = []
@@ -231,6 +293,8 @@ async def _send_chat_stream(
             image_since_last_text = True
             record.add_image_arrival(len(images), timestamp_f)
 
+    # Images decode after timing is folded; a decode failure replaces the
+    # stream's classification.
     _attach_images(record, image_parts)
 
 
@@ -240,7 +304,11 @@ async def _send_video(
     payload: dict[str, Any],
     record: RequestRecord,
 ) -> None:
-    """Execute a synchronous video request and validate its raw MP4 body."""
+    """Execute a synchronous video request and validate its raw MP4 body.
+
+    Latency closes once the complete body has been read, before the MP4 is
+    inspected.
+    """
     async with client.stream("POST", url, json=payload) as response:
         record.note_http(response.status_code)
         body = await response.aread()
@@ -262,7 +330,15 @@ async def _send_video(
 
 
 def _classify_images(payload: Any) -> tuple[bool, str]:
-    """Classify the structural validity of an image-generations payload."""
+    """Classify the structural validity of an image-generations payload.
+
+    Only the first ``data`` entry is inspected, and only for a non-empty
+    ``b64_json``; ``_send_images`` decodes every entry.
+
+    Returns:
+        ``(True, "ok")``, or ``False`` with ``empty_image_data`` or
+        ``missing_image_payload``.
+    """
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, list) or not data:
         return False, "empty_image_data"

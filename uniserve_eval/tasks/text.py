@@ -24,7 +24,14 @@ class TextTask(BenchmarkTask):
     image_count: ClassVar[ImageCountRule] = ImageCountRule.FORBIDDEN
 
     def build_request(self, example: Example) -> TaskRequest:
-        """Build a chat-completions request with usage-bearing streaming."""
+        """Build a chat-completions request with usage-bearing streaming.
+
+        The request always streams, regardless of ``sampling.stream``. A
+        row's non-empty ``messages`` replace its ``prompt`` as the
+        conversation. The output limit is the row's ``output_len``, else the
+        point's ``sampling.max_tokens``; with neither,
+        ``max_completion_tokens`` is omitted.
+        """
         output_len = (
             example.output_len
             if example.output_len is not None
@@ -38,6 +45,9 @@ class TextTask(BenchmarkTask):
             "stream_options": {"include_usage": True},
         }
         self.apply_text_sampling(payload)
+
+        # Set after `apply_text_sampling`, so the row or point limit overrides
+        # an `extra_body` entry of the same name.
         if output_len is not None:
             payload["max_completion_tokens"] = int(output_len)
         return TaskRequest(self.point.endpoint, payload, stream=True)

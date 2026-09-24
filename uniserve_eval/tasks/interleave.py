@@ -22,10 +22,19 @@ class InterleaveTask(BenchmarkTask):
     default_stream: ClassVar[bool] = True
     accepts_image: ClassVar[bool] = True
     image_count: ClassVar[ImageCountRule] = ImageCountRule.FORBIDDEN
+    # Lower bound on the mean number of images per request across the run.
+    # Individual requests may return no image; `validate_output` reports them
+    # as the `zero_image_requests` statistic.
     minimum_average_images: ClassVar[float] = 1.1
 
     def build_request(self, example: Example) -> TaskRequest:
-        """Build a chat request that streams both text and images."""
+        """Build a chat request that streams both text and images.
+
+        The request always streams, regardless of ``sampling.stream``. The
+        output limit is the row's ``max_tokens``, else the point's
+        ``sampling.max_tokens``, else 512. ``image_config`` never carries
+        ``num_images`` because this task forbids a configured image count.
+        """
         max_tokens = int(
             example.max_tokens
             if example.max_tokens is not None
@@ -52,6 +61,7 @@ class InterleaveTask(BenchmarkTask):
             record.generated_text for record in records
         )
         checks["server_usage"] = self.server_usage_ok(records)
+
         total_images = sum(record.images for record in records)
         mean_images = total_images / len(records) if records else 0.0
         checks["minimum_average_images"] = (

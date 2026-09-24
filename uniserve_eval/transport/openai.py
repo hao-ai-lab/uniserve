@@ -1,4 +1,10 @@
-"""Extracts values and classifies terminal state from chat completions."""
+"""Extracts values and classifies terminal state from chat completions.
+
+``uniserve_eval.transport.client`` uses these helpers to fold completed
+messages and streamed events into request records. Reasoning text
+(``reasoning_content`` or ``reasoning``) counts as generated text alongside
+visible content.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +18,12 @@ class OpenAIChat:
     @staticmethod
     def classify_events(events: Sequence[Any]) -> tuple[bool, str]:
         """Classify a streamed response by structure, terminal state, and output."""  # noqa: E501
+        # Checks run in precedence order and the first failure wins. The
+        # `sse_done` event type is synthesized by `SseParser` for the `[DONE]`
+        # sentinel, and `parse_error` for malformed JSON under the `record`
+        # parse-error policy that `_send_chat_stream` passes; neither is a
+        # server event. A stream terminates with either `[DONE]` or any
+        # choice carrying a `finish_reason`.
         if not events:
             return False, "response_empty_response"
         if any(not isinstance(event, dict) for event in events):
@@ -33,7 +45,11 @@ class OpenAIChat:
 
     @staticmethod
     def message_text(message: dict[str, Any] | None) -> str:
-        """Concatenate reasoning and visible text from a completed message."""
+        """Concatenate reasoning and visible text from a completed message.
+
+        Reasoning precedes content. ``content`` may be a string or a list of
+        parts, of which only ``text`` parts contribute.
+        """
         message = message or {}
         parts: list[str] = []
         reasoning = OpenAIChat._reasoning_text(message)
@@ -52,7 +68,11 @@ class OpenAIChat:
 
     @staticmethod
     def message_images(message: dict[str, Any] | None) -> list[dict[str, Any]]:
-        """Extract direct and content-part images from a completed message."""
+        """Extract direct and content-part images from a completed message.
+
+        Parts from ``message.images`` come first, followed by image parts of a
+        list-valued ``content``; the returned parts are not yet decoded.
+        """
         images: list[dict[str, Any]] = []
         if not isinstance(message, dict):
             return images
@@ -70,7 +90,12 @@ class OpenAIChat:
 
     @staticmethod
     def delta_text(event: dict[str, Any]) -> str:
-        """Concatenate reasoning and visible text across an event's choices."""
+        """Concatenate reasoning and visible text across an event's choices.
+
+        Each choice contributes delta reasoning, then delta string content,
+        then a completion-style ``text`` field. List-valued delta content
+        contributes no text; ``delta_images`` extracts its image parts.
+        """
         choices = event.get("choices")
         if not isinstance(choices, list) or not choices:
             return ""
@@ -132,7 +157,11 @@ class OpenAIChat:
 
     @staticmethod
     def _is_image_part(part: dict[str, Any]) -> bool:
-        """Recognize supported embedded image part shapes."""
+        """Recognize supported embedded image part shapes.
+
+        A recognized part is not guaranteed to be decodable;
+        ``decode_openai_image_part`` rejects one without a usable payload.
+        """
         return (
             part.get("type") == "image_url"
             or "image_url" in part
@@ -141,7 +170,7 @@ class OpenAIChat:
 
     @staticmethod
     def _reasoning_text(message: dict[str, Any]) -> str:
-        """Extract reasoning text across compatible field names."""
+        """Extract reasoning text, preferring ``reasoning_content``."""
         value = message.get("reasoning_content")
         if not isinstance(value, str):
             value = message.get("reasoning")

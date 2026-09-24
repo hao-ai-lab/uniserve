@@ -32,7 +32,12 @@ class T2ITask(BenchmarkTask):
 
     def build_request(self, example: Example) -> TaskRequest:
         """Build a request for the selected chat or image endpoint."""
+        # Profile parsing runs `check_image`, which rejects a T2I point without
+        # `image_count`; `or 0` only narrows the optional type.
         count = int(self.point.image.image_count or 0)
+
+        # The images endpoint receives no text-sampling fields: resolved image
+        # settings map onto its schema and `extra_body` is merged last.
         if self.point.endpoint == IMAGES_GENERATIONS:
             payload: dict[str, object] = {
                 "model": self.point.model,
@@ -55,7 +60,11 @@ class T2ITask(BenchmarkTask):
     def validate_output(
         self, records: Sequence[RequestRecord]
     ) -> ValidationResult:
-        """Check image integrity and exact configured output count."""
+        """Check image integrity and exact configured output count.
+
+        Decoded sizes are compared with the point's configured width and
+        height; per-row size overrides are not considered.
+        """
         count = int(self.point.image.image_count or 0)
         checks = self.image_integrity_checks(records)
         checks["exact_image_count"] = bool(records) and all(
