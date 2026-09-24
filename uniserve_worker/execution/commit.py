@@ -1,6 +1,21 @@
-"""Commit completed calls and retire the resources of failed logical.
+"""Commit or discard one executed batch at its publication boundary.
 
-groups.
+``uniserve_worker.execution.step.execute_batch`` calls ``commit_batch`` with
+the outcomes ``schedule.dispatch_batch`` returns, and ``discard_batch`` when
+dispatch or the validation half of the commit fails;
+``prepare.reserve_outputs`` also discards the batch when its reservation
+fails after the batch's pending outputs are bound.
+
+``commit_batch`` runs in two halves. The first fences device reads,
+publishes resolved completion predicates, validates every staged tensor
+write, latent update, KV publication and export against its owning store,
+and checks each completion's products and size bounds; nothing it does
+makes a product, latent generation, KV publication or request progress
+visible. The second sets ``BatchState.published`` and applies those
+changes to the ``TensorStore``, ``LatentPool``, ``KVCacheManager``,
+``DecodeState`` and ``RequestPool``. Setting ``published`` is the point of
+no return: ``discard_batch`` refuses a published batch, and
+``execute_batch`` classifies any later failure as fatal.
 """
 
 from __future__ import annotations
@@ -52,14 +67,22 @@ def commit_batch(
     decode_state: DecodeState | None,
     config: WorkerConfig,
 ) -> None:
-    """Publish validated resources, execution progress and batch outputs."""
+    """Publish validated resources, execution progress and batch outputs.
+
+    ``outcomes`` must be the batch's own bound ``PendingOutput`` records, in
+    call order. Every validation failure raises before ``state.published``
+    is set, leaving the batch discardable. On success each output is
+    recorded through ``BatchState.record_outputs`` and its calls are
+    registered as pending in the ``RequestPool``.
+    """
     with state.scope():
         commit_started = time.perf_counter_ns()
         calls = state.batch.calls
 
         # All device reads must finish and every staged resource must validate
         # before completion storage becomes immutable or any publication becomes
-        # visible.
+        # visible. Predicates publish first because ``validate_writes`` rejects
+        # a write that is neither producer-recorded nor deferred.
         _finish_device_reads(tensor_store=tensor_store, state=state)
         _publish_predicates(tensor_store=tensor_store, state=state)
         writes = tuple(
@@ -104,10 +127,16 @@ def commit_batch(
                     raise invalid_descriptor(
                         "KV publication exceeds its transfer-byte bound"
                     )
+                # Called only for its check, which raises when the descriptor
+                # exceeds ``MAX_TRANSFER_HANDLE_BYTES`` or names an unknown
+                # transport.
                 outcome.kv_output.encoded_size_bound()
 
             # The bound covers score values and prompt-position counts; framing
             # is owned by the single IPC result message, not by stored products.
+            # Each entry is one 12-byte ``TokenLogprob`` of the IPC schema and
+            # each reported row adds 4 bytes, the same costs the engine's
+            # ``logprob_result_bytes`` uses to size ``max_completion_bytes``.
             logprob_bytes = (
                 0
                 if outcome.token.logprob_range is None
@@ -127,6 +156,7 @@ def commit_batch(
             )
             report_products.extend(outcome.products)
             pending = request
+            # Dispatch must return the records bound to this batch, not copies.
             if outcome is not pending:
                 raise RuntimeError("call completion lost its prepared output")
             pending._reports_output = reports_output
@@ -204,7 +234,8 @@ def commit_batch(
 
         # From this point the batch cannot be discarded: apply
         # resource commits, then reserve the request publication that gates
-        # successor readiness.
+        # successor readiness. ``step.execute_batch`` classifies a failure
+        # below as fatal.
         state.published = True
         tensor_store.commit_writes(writes)
 
@@ -240,9 +271,11 @@ def _commit_runtime_states(
     state: BatchState,
     decode_state: DecodeState | None,
 ) -> None:
-    """Commit numerical updates held by the same pending outputs as host.
+    """Apply the batch's token-state updates to ``DecodeState``.
 
-    results.
+    The updates are the ``runtime_*`` fields and sampled rows that execution
+    left on each pending output. Without a ``DecodeState``, a sampled row,
+    runtime prompt logits or a runtime cache length raises ``RuntimeError``.
     """
     requests = state.pending_outputs()
     states = decode_state
@@ -333,9 +366,13 @@ def discard_batch(
     media_mux: MediaMux | None,
     transfer_backends: Mapping[str, Transport],
 ) -> None:
-    """Release all provisional batch resources that have not crossed.
+    """Release every provisional resource of an unpublished batch.
 
-    publication visibility.
+    Fences outstanding device reads, abandons the output buffer and pending
+    outputs, drops the media mux state of latent-preparation calls, returns
+    unpublished tensor writes, KV output buffers, imported latent slots and
+    latent product buffers, and releases exported transport locators. Raises
+    ``RuntimeError`` when ``state.published`` is already set.
     """
     with state.scope():
         if state.published:
@@ -404,7 +441,12 @@ def _validate_completion_products(
     call: Call,
     products: tuple[TensorPublication, ...],
 ) -> None:
-    """Validate completions against every product declared by the call."""
+    """Require each completion product to be declared by its call.
+
+    Raises ``invalid_descriptor`` for an undeclared product, and for a
+    product whose locators exceed ``MAX_TRANSFER_HANDLE_BYTES`` or name an
+    unknown transport.
+    """
     declared = {output: output for output in call.tensor_outputs()}
     for product in products:
         reference = declared.get(product.product)
@@ -418,9 +460,11 @@ def _validate_completion_products(
 def _publish_predicates(
     *, state: BatchState, tensor_store: TensorStore
 ) -> None:
-    """Publish predicate outputs after their producing calls have.
+    """Publish true into the completion outputs of calls that ran.
 
-    resolved.
+    Predicated calls already published false through
+    ``prepare._publish_predicated_outputs``, and a call whose execution wrote
+    its own completion output is skipped.
     """
     writes = tuple(
         request.completion_write
@@ -449,7 +493,10 @@ def _publish_predicates(
 def _finish_device_reads(
     *, state: BatchState, tensor_store: TensorStore
 ) -> None:
-    """Complete actual consumer reads using that call's producer fence."""
+    """End the batch's device read leases behind their consumers' fences.
+
+    Clears ``device_reads`` and ``feature_reads`` on every pending output.
+    """
     reads = tuple(
         read
         for request in state.pending_outputs()
@@ -458,6 +505,10 @@ def _finish_device_reads(
     if reads:
         # A source may belong to another request. Its reader's completion is
         # ordered by the consuming call's output, never by source identity.
+        # The writes are passed only when there is one per read, the
+        # precondition of the pairwise fence path of
+        # ``TensorStore.complete_reads``; with none, every CUDA read is fenced
+        # by an event recorded on its device's current stream.
         after_writes = tuple(
             request.producer_write
             for request in state.pending_outputs()

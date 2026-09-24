@@ -1,4 +1,25 @@
-"""Bounded request, sampling, and product startup scenarios."""
+"""Bounded request, sampling, and product startup scenarios.
+
+``Worker.warmup`` calls `warmup_requests` after the model executor's
+``warmup`` and ``capture`` and before serving. It drives synthetic requests
+through the same ``Worker.submit``/``advance``/``poll`` path that serving
+batches take, on CUDA devices only:
+
+- a token scenario: one PREFILL call followed, when supported, by a DECODE
+  call that consumes the prefill's device token;
+- a flow scenario per configured guidance-branch count: a KV_PUBLISH of the
+  conditioning, a LATENT_PREPARATION, and two chained DENOISING calls.
+
+No engine scheduler is present at startup, so this module takes over the
+engine storage pools' role: the scenarios choose request slots,
+`_build_warmup_batch` and `_warmup_flow_tables` lease KV and latent pages,
+and `_WarmupRequests` tracks those leases and allocates persistent buffer
+spans. Each ``Batch`` carries the resulting assignments. Batch ids and
+collective sequences are private to this sequence; ``Worker.warmup`` resets
+the executor's last batch id and collective sequence afterwards and raises
+if any request is still resident, so every successful scenario drops its
+requests before returning.
+"""
 
 from __future__ import annotations
 
@@ -49,18 +70,24 @@ logger = logging.getLogger(__name__)
 class _WarmupRequests:
     """Track synthetic request allocations.
 
-    Allocations borrow Worker execution resources.
+    Holds the leases that stand in for the engine's storage pools while no
+    scheduler is attached. KV pages and latent pages have no free list:
+    occupancy is recomputed from the lease maps whenever pages are leased,
+    so popping a lease (`drop_request`) returns its pages. Persistent buffer
+    spans use a first-fit extent list. Request slot zero, KV page zero, and
+    latent page zero are sentinels and are never assigned.
     """
 
     def __init__(self, worker: Worker) -> None:
-        """Borrow startup-owned worker resources.
-
-        The borrowed resources exercise every execution shape.
-        """
+        """Borrow the worker whose storage the synthetic requests occupy."""
         self.worker = worker
+        # Main KV block table of each (request, KV group), in logical order.
         self._kv_pages: dict[tuple[RequestKey, int], list[int]] = {}
+        # KV group 0 pages and request slot of each request's alternative
+        # guidance prefix (see `_warmup_flow_tables`).
         self._prefix_pages: dict[RequestKey, list[int]] = {}
         self._prefix_slots: dict[RequestKey, int] = {}
+        # Latent page table of each image request, in logical order.
         self._latent_pages: dict[RequestKey, list[int]] = {}
         self._buffers: dict[BufferId, BufferAllocation] = {}
         # Free extents of the synthetic persistent buffer pool, as
@@ -68,12 +95,18 @@ class _WarmupRequests:
         self._free_buffer_ranges: list[tuple[int, int]] = [
             (0, int(self.worker.info.buffer_pool_bytes))
         ]
+        # Last batch id assigned. `Executor.submit` requires strictly
+        # increasing ids, so control batches and call batches share this one
+        # counter.
         self._batch_id = 0
 
     def drop_request(self, request_id: int) -> None:
-        """Release warmup state for one identifier.
+        """Retire one synthetic request and release everything it holds.
 
-        Covers request, runtime, cache, latent, and product state.
+        Submits a ``Finish`` command and waits for it, removes the worker's
+        request row, forgets the request's KV, prefix, and latent leases, and
+        returns the buffer spans of products it owns to the synthetic pool.
+        An unknown id is a no-op.
         """
         request = self.worker.requests.peek(int(request_id))
         if request is None:
@@ -102,9 +135,9 @@ class _WarmupRequests:
         self._release_buffer_allocations(released)
 
     def free_products(self, buffers: tuple[BufferId, ...]) -> None:
-        """Release warmup products.
+        """Free products on the worker and recycle their buffer spans.
 
-        Recycles their synthetic persistent-buffer allocations.
+        Submits one ``Free`` command per buffer and waits for the batch.
         """
         if not buffers:
             return
@@ -112,9 +145,11 @@ class _WarmupRequests:
         self._release_buffer_allocations(buffers)
 
     def _execute_controls(self, commands: tuple[BatchCommand, ...]) -> None:
-        """Wait for the physical retirement acknowledgement.
+        """Submit a command-only batch and wait for it to finalize.
 
-        The same acknowledgement serving uses.
+        The batch carries no calls, so it keeps the default collective
+        sequence; the executor checks ordering only for batches with calls
+        on a multi-rank worker.
         """
         self._batch_id += 1
         _execute_warmup(
@@ -150,16 +185,21 @@ class _WarmupRequests:
         self._free_buffer_ranges = merged
 
     def buffer_allocation(self, product: TensorRef) -> BufferAllocation:
-        """Allocate warmup persistent storage for a product.
+        """Return the product's buffer span, allocating it on first use.
 
-        The slice is deterministic and aligned.
+        Repeated calls for one buffer id return the same span until it is
+        released.
+
+        Raises:
+            WorkerError: From `invalid_descriptor` when no free extent fits
+                ``product.max_bytes``.
         """
         existing = self._buffers.get(product.buffer_id)
         if existing is not None:
             return existing
 
-        # First-fit over the free extents, honoring the pool's 256-byte
-        # alignment.
+        # First-fit over the free extents with the 256-byte alignment the
+        # engine scheduler also uses for buffer spans.
         alignment = 256
         required = int(product.max_bytes)
         for index, (offset, extent) in enumerate(self._free_buffer_ranges):
@@ -207,10 +247,15 @@ def _warmup_batch(
 
     forward_inputs maps each call to its forward-row columns:
     (request_pool_indices, seq_lens, query_lens, write_kv). The batch
-    flattens them into the Batch's parallel row arrays.
+    flattens them into the Batch's parallel row arrays in call order. Every
+    LATENT_PREPARATION, DENOISING, or IMAGE_DECODING call must have an entry
+    in latent_params. Only the buffer allocations that some call references
+    are attached, and each admission becomes a ``Start`` command.
     """
     return Batch(
         batch_id=batch_id,
+        # Strictly increases with batch_id, which `Executor` requires of
+        # batches with calls when the world size exceeds one.
         collective_seq=max(1, int(batch_id) * 16 + 1),
         calls=calls,
         block_tables=tuple(
@@ -295,7 +340,11 @@ def _warmup_batch(
 def _warmup_token_output(
     request_key: RequestKey, call_id: CallId, generation: int
 ) -> TensorRef:
-    """Declare an encoded int64 token relay for warmup sampling."""
+    """Declare a call's ``token_output``: one packed int64 device scalar.
+
+    The scalar packs the sampled token with its continuation bit, which lets
+    a following DECODE call use it as its ``predicate``.
+    """
     from uniserve_worker.protocol.tensor import DType, ShapeBound
 
     return TensorRef(
@@ -314,20 +363,33 @@ def _execute_warmup(
     *,
     retain_device_outputs: bool = False,
 ) -> BatchOutput:
-    """Execute a runtime scenario.
+    """Submit one batch and block until `Worker.poll` consumes its result.
 
-    Optionally retains the scenario's published outputs.
+    Unless ``retain_device_outputs`` is set, a successful batch then frees
+    each call's ``outputs`` and its token, completion, transition, and image
+    outputs. Latent and KV outputs are never freed here: the flow scenario
+    frees consumed latents itself, and the ``Finish`` that
+    `_WarmupRequests.drop_request` submits retires the request's remaining
+    storage. Errors recorded during submission propagate from
+    ``Worker.submit``. On any failure the outputs stay allocated, and
+    release is left to the enclosing Worker scope (see `warmup_requests`).
+
+    Raises:
+        RuntimeError: A call completed with ``CallStatus.ERROR``, or a
+            completion is not a ``RequestOutput``.
     """
     worker = requests.worker
     state = worker.submit(batch, propagate_errors=True)
 
-    # A batch is one call on one component, so it returns one result.
+    # No service loop runs during startup, so warmup advances the executor
+    # itself until the submission finalizes.
     while True:
         worker.advance()
         finalized = worker.poll(state)
         if finalized is not None:
             break
         time.sleep(0.00005)
+
     device_buffers = tuple(
         output.buffer_id
         for call in batch.calls
@@ -383,9 +445,24 @@ def _build_warmup_batch(
     input_products: tuple[TensorPublication, ...] = (),
     image_size: tuple[int, int] | None = None,
 ) -> Batch:
-    """Derive allocations for a warmup submission.
+    """Derive allocations for a warmup submission and assemble its batch.
 
-    Covers cache, latent, buffer, and row allocations.
+    Takes the next batch id, so each call's ``CallId`` must already name
+    ``requests._batch_id + 1`` (``Batch.validate`` rejects calls of another
+    batch). Reserves buffer spans for the calls' persistent products, binds
+    request slots from the worker's rows or ``admissions``, grows the KV
+    leases of KV-using calls to cover ``kv_visible_len`` plus, for token
+    forwards, ``bounds.max_tokens``, leases latent pages for latent-holding
+    calls at ``image_size`` (default `_warmup_image_size`), and adds the
+    guidance-branch rows of DENOISING calls (`_warmup_flow_tables`). Leases
+    persist in ``requests`` across batches until `drop_request`.
+
+    Raises:
+        WorkerError: From `invalid_descriptor` when a call has no request
+            slot, a KV admission has a nonzero initial position, the worker
+            has no KV cache, a lease would shrink, or KV, latent, or buffer
+            capacity is exhausted, and from `_warmup_flow_tables` and
+            ``Batch.validate``.
     """
     requests._batch_id += 1
     admissions_by_key = {
@@ -407,8 +484,9 @@ def _build_warmup_batch(
     ] = {}
     latent_params: dict[tuple[RequestKey, CallId], LatentParams] = {}
     buffer_allocations: dict[BufferId, BufferAllocation] = {}
-    # Persistent products reserve stable buffer allocations before lane
-    # construction.
+
+    # Persistent products keep one span for their lifetime: an input
+    # resolves to the span its producer was given.
     for call in calls:
         for product in (
             *call.buffer_inputs(),
@@ -416,8 +494,9 @@ def _build_warmup_batch(
         ):
             allocation = requests.buffer_allocation(product)
             buffer_allocations[allocation.buffer] = allocation
-    # Bind request slots and grow reusable KV leases to each call's
-    # maximum shape.
+
+    # Bind request slots and grow the KV leases of each call that uses the
+    # KV cache to the call's maximum shape.
     for call in calls:
         request = requests.worker.requests.peek(
             int(call.request_key.request_id)
@@ -480,8 +559,9 @@ def _build_warmup_batch(
                 int(requests.worker.kv_cache.info.block_size),
             )
 
-            # Leases only grow: earlier captured graphs still reference
-            # these pages.
+            # A lease keeps every page granted to the request's earlier calls
+            # until `drop_request`; a call whose extent needs fewer pages than
+            # the lease already holds is rejected.
             missing = target_pages - len(block_table)
             if missing < 0:
                 raise invalid_descriptor(
@@ -534,8 +614,11 @@ def _build_warmup_batch(
                 (input_length,),
                 (True,),
             )
+
+    # Size each image request's latent page table: its latent units are the
+    # leading dimension of the denoiser's image ``latent_shape`` (one per
+    # patch), or a single unit on a worker without an image builder.
     height, width = image_size or _warmup_image_size(requests)
-    # Latents occupy a grid of (height/downsample) x (width/downsample) units.
     builder = requests.worker.runner.image_builder
     latent_units = (
         builder.denoiser.latent_shape("image", ImageConfig(height, width))[0]
@@ -567,6 +650,7 @@ def _build_warmup_batch(
                 "warmup latent allocation regresses its physical extent"
             )
 
+        # Page zero is the latent pool's sentinel, outside its capacity.
         allocated = tuple(
             page
             for page in range(1, int(requests.worker.info.latent_pages))
@@ -580,6 +664,9 @@ def _build_warmup_batch(
         page_table.extend(allocated)
         occupied_latent_pages.update(allocated)
 
+        # The call runs solver steps from the request's accepted flow step;
+        # warmup takes a DENOISING call's step count from its
+        # ``bounds.max_tokens``.
         request = requests.worker.requests.peek(
             int(call.request_key.request_id)
         )
@@ -600,6 +687,9 @@ def _build_warmup_batch(
                 else 0
             ),
         )
+
+        # A DENOISING call adds the alternative prefix's block table, if any,
+        # and its forward rows are the guidance-branch rows.
         if call.kind is MediaCall.DENOISING:
             extra_tables, extra_allocations, flow_rows = _warmup_flow_tables(
                 requests,
@@ -643,9 +733,28 @@ def _warmup_flow_tables(
     tuple[CachePageAllocation, ...],
     tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[bool, ...]],
 ]:
-    """Build KV tables and forward rows for all active CFG branches.
+    """Build KV tables and forward rows for a DENOISING call's CFG branches.
 
-    The tables cover alternative prefixes.
+    The branches are those the request's guidance evaluates at its accepted
+    flow step, with prefixes from `resolve_prefix`. A branch that reuses the
+    request's conditioning reads the main slot; all other branches must
+    share one alternative prefix. A nonempty alternative prefix is leased KV
+    group 0 pages and a request slot of its own, and the rows start with one
+    row that writes it into KV. Then follows one read-only row per branch
+    whose query is the image sequence (patches plus framing tokens). The
+    request must already be admitted.
+
+    Returns:
+        The alternative prefix's block tables, its newly allocated pages,
+        and the forward-row columns (request_pool_indices, seq_lens,
+        query_lens, write_kv).
+
+    Raises:
+        WorkerError: From `invalid_descriptor` when the request is unknown
+            or has no image parameters, the worker has no image builder or
+            KV cache, the image has no guidance, `resolve_prefix` rejects a
+            branch, branches need distinct alternative prefixes, or KV pages
+            or a request slot for the prefix are unavailable.
     """
     request = requests.worker.requests.get(call.request_key.request_id)
     image = request.image
@@ -665,8 +774,9 @@ def _warmup_flow_tables(
     runtime = request.accepted_progress
     query = generation.sequence_length(ImageConfig(height, width))
     image_prompt = image.image_prompts[0] if image.image_prompts else ""
-    # Branches either reuse the conditioned request slot or share one
-    # alternative prefix.
+
+    # Each branch either reuses the request's conditioning KV (the flag is
+    # True) or conditions on a prefix of its own.
     branch_prefixes: list[tuple[tuple[int, ...], bool]] = []
     for branch in branches:
         prefix, copy_conditioning = resolve_prefix(
@@ -690,6 +800,8 @@ def _warmup_flow_tables(
         )
     alternative = next(iter(alternatives), ())
 
+    # Grow the prefix lease in KV group 0, avoiding pages leased to other
+    # requests' prefixes and to every main KV lease.
     if requests.worker.kv_cache is None:
         raise invalid_descriptor("warmup flow requires KV cache storage")
 
@@ -707,8 +819,8 @@ def _warmup_flow_tables(
     occupied.update(
         page for pages in requests._kv_pages.values() for page in pages
     )
-    # Prefix pages persist across warmup shapes so graph capture observes
-    # stable tables.
+    # The lease persists until `drop_request`, so every DENOISING call of
+    # the request sees the same prefix table and allocates only new pages.
     allocated = tuple(
         page
         for page in requests.worker.kv_cache.page_ids(0)
@@ -729,6 +841,8 @@ def _warmup_flow_tables(
     write_kv: list[bool] = []
 
     if alternative:
+        # Prefix slots are taken downward from the highest slot while the
+        # flow scenario admits its requests upward from slot one.
         alternative_slot = requests._prefix_slots.setdefault(
             call.request_key,
             int(requests.worker.info.request_slots)
@@ -760,7 +874,7 @@ def _warmup_flow_tables(
         query_lens.append(len(alternative))
         write_kv.append(True)
 
-    # Append every column in the exact guidance-branch evaluation order.
+    # One row per branch, in the order ``guidance.branches`` returns them.
     for prefix, copy_conditioning in branch_prefixes:
         request_pool_indices.append(
             main_slot if copy_conditioning else alternative_slot
@@ -771,6 +885,7 @@ def _warmup_flow_tables(
         )
         query_lens.append(query)
         write_kv.append(False)
+
     return (
         tables,
         allocations,
@@ -786,6 +901,8 @@ def _warmup_flow_tables(
 def warmup_requests(worker: Worker) -> None:
     """Exercise synthetic requests through the configured execution paths.
 
+    Runs only on a CUDA worker device: the token scenario when the worker
+    supports PREFILL, and the flow scenario when it has an image builder.
     Successful scenarios retire their requests before returning. If execution
     fails, leave resource release to the enclosing Worker scope instead of
     issuing more execution commands that could replace the startup error.
@@ -803,9 +920,12 @@ def warmup_requests(worker: Worker) -> None:
 
 
 def _warmup_image_size(requests: _WarmupRequests) -> tuple[int, int]:
-    """Derive the largest square image for warmup.
+    """Derive a square warmup image size, in pixels.
 
-    The image's latent grid must fit the declared capacity.
+    The side, in latent patches, is the integer square root of the worker's
+    ``latent_capacity_units``, capped first at the image builder's
+    ``max_tokens + framing`` when one exists, and is at least one patch.
+    Without an image builder a patch is one pixel.
     """
     builder = requests.worker.runner.image_builder
     downsample = 1 if builder is None else builder.denoiser.downsample
@@ -818,9 +938,13 @@ def _warmup_image_size(requests: _WarmupRequests) -> tuple[int, int]:
 
 
 def _warmup_tokens(requests: _WarmupRequests) -> None:
-    """Exercise extend-to-decode token handoff.
+    """Exercise the prefill-to-decode token handoff.
 
-    Releases its synthetic request afterwards.
+    Admits one greedy request, runs a one-token PREFILL, then, when DECODE is
+    supported, a DECODE call gated on the prefill's device token. Returns
+    without running when the worker lacks PREFILL or already holds requests;
+    a PREFILL worker without KV cache storage raises ``WorkerError`` even if
+    it holds requests. Drops its request afterwards.
     """
     from uniserve.sampling import SamplingParams
     from uniserve_worker.protocol.batch import GenerationParams, NewRequest
@@ -840,6 +964,8 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
     if requests.worker.requests.request_ids():
         return
 
+    # Request ids double as one-based request slots; slot zero is the
+    # padding sentinel.
     batch_sizes = (1,)
     request_ids = tuple(range(1, max(batch_sizes) + 1))
     keys = {sid: RequestKey(0, sid, 1) for sid in request_ids}
@@ -916,6 +1042,7 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
             predicate=token_output,
         )
 
+    # Call ids name the batch id `_build_warmup_batch` assigns next.
     predecessors: dict[int, Call] = {}
     calls: list[Call] = []
     for sid in request_ids:
@@ -923,6 +1050,8 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
         call = prompt_op(sid, call_id, (0,))
         calls.append(call)
 
+    # A following decode reads the prefill's token output, so the output
+    # must outlive the prefill batch.
     _execute_warmup(
         requests,
         _build_warmup_batch(
@@ -951,6 +1080,9 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
                 ),
                 retain_device_outputs=True,
             )
+
+            # The decode has consumed its predecessors' outputs; its own stay
+            # retained as the predecessors of any later decode.
             requests.free_products(
                 tuple(
                     output.buffer_id
@@ -969,7 +1101,16 @@ def _warmup_tokens(requests: _WarmupRequests) -> None:
 
 
 def _warmup_flow(requests: _WarmupRequests) -> None:
-    """Drive chained denoise quanta through the real flow forward path."""
+    """Drive chained denoise quanta through the real flow forward path.
+
+    For each configured guidance-branch count, admits a batch of two-step
+    image requests, publishes their conditioning KV, prepares their initial
+    latents, runs both denoising steps as separate DENOISING calls, and
+    drops the requests. A shape whose row count exceeds the worker's request
+    slots is skipped. Returns without running when the worker lacks
+    LATENT_PREPARATION, DENOISING, or an image builder, or already holds
+    requests. Image decoding is not exercised.
+    """
     from uniserve_worker.protocol.batch import NewRequest
     from uniserve_worker.protocol.call import (
         Bounds,
@@ -999,8 +1140,9 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
     if requests.worker.requests.request_ids():
         return
 
-    # One scenario per CFG execution branch; numerical shape catalogs belong
-    # to the execution owners and are already resident before these requests.
+    # One scenario per configured guidance-branch count, at the last capture
+    # shape with that count or else one image of `_warmup_image_size`. The
+    # model executor's capture has already run before these requests.
     configured = tuple(
         next(
             (
@@ -1012,6 +1154,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         )
         for branches in requests.worker.runner.flow_cfg_branches
     )
+
     # Warmup identities and generations are private to this bounded
     # startup sequence.
     next_request_id = 1
@@ -1044,7 +1187,8 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         )
         roots = tuple(CallId(0, 0) for key in keys)
 
-        # Publish one conditioning KV product per request.
+        # Publish one conditioning KV product per request, in the batch that
+        # admits the requests.
         conditionings: list[BufferId] = []
         publications: list[Call] = []
         for key, root in zip(keys, roots, strict=True):
@@ -1077,6 +1221,8 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
             ),
         )
 
+        # Latents are declared flat, as the element count of the image
+        # ``latent_shape``; byte budgets assume BF16, 2 bytes per element.
         max_latent_elements = max(
             1,
             math.prod(
@@ -1085,9 +1231,8 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                 )
             ),
         )
-        # Byte budgets below assume BF16 latents: 2 bytes per element.
 
-        # Prepare each request's initial latent and its readiness product.
+        # Prepare each request's initial latent and its U8 readiness flag.
         initial_latents: list[TensorRef] = []
         transitions: list[Call] = []
         for key, root, conditioning in zip(
@@ -1147,8 +1292,9 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
         current_latents = tuple(initial_latents)
         flow_predecessors = dict(zip(request_ids, transitions, strict=True))
 
-        # Chain two denoise quanta so back-to-back execution shapes batch. Each
-        # quantum covers one step, so it enters at the step its index names.
+        # Run the two scheduled steps as chained DENOISING calls: each quantum
+        # covers one step, enters at the step its index names, and consumes
+        # the previous quantum's latent.
         for quantum in range(2):
             outputs: list[TensorRef] = []
             flows: list[Call] = []
@@ -1191,6 +1337,7 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
                     image_size=(height, width),
                 ),
             )
+
             requests.free_products(
                 tuple(product.buffer_id for product in current_latents)
             )

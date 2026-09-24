@@ -1,4 +1,13 @@
-"""Prepare bounded text inputs and CUDA graphs during worker startup."""
+"""Prepare bounded text inputs and CUDA graphs during worker startup.
+
+``ModelExecutor.capture`` calls these functions before serving begins, and
+before ``ModelExecutor.complete_startup`` seals graph capture. They stage
+startup rows (token ID zero for text; for image denoising, guidance-branch
+prefixes resolved through the model's ``FlowPrompt``) through the same
+``TokenBuffers`` and ``DiffusionBuffers`` serving uses, on scratch KV pages and
+latent values leased from the idle pools, and capture each configured bucket;
+when graphs are disabled, representative calls run eagerly as warmup instead.
+"""
 
 from __future__ import annotations
 
@@ -41,7 +50,13 @@ def stage_text(
     causal: bool = True,
     slots: tuple[int, ...] | None = None,
 ) -> InputBatch:
-    """Use serving's staging and attention preparation with numerical inputs."""
+    """Stage synthetic token rows through serving's staging path.
+
+    ``tokens`` holds each row's token IDs and ``pages`` its physical KV
+    pages. Rows default to empty prefixes and to request slots ``1..rows``;
+    slot 0 is the inactive sentinel. Every row writes KV. A decode batch
+    also carries the staging's cleared force-finish column.
+    """
     rows = len(tokens)
     lengths = tuple(len(value) for value in tokens)
     prefixes = (0,) * rows if prefixes is None else prefixes
@@ -95,7 +110,15 @@ def prepare_prefill(
     forward: Callable[[InputBatch], ExecutionOutput],
     shapes: tuple[PrefillShape, ...],
 ) -> None:
-    """Capture each selected physical token/row bucket in footprint order."""
+    """Capture each selected physical token/row bucket, largest first.
+
+    Buckets are ordered by token-times-row footprint. Each capture stages
+    ``live_rows`` rows totaling the bucket's token count on zeroed scratch
+    KV pages; the runner's ``select_graph_shape`` pads them to the bucket.
+
+    Raises:
+        ValueError: A bucket is prepared on a worker without a KV cache.
+    """
     for shape in sorted(
         shapes,
         key=lambda item: (
@@ -139,9 +162,13 @@ def prepare_decode(
     buffers: TokenBuffers,
     forward: Callable[[InputBatch], ExecutionOutput],
 ) -> None:
-    """Prepare valid one-token prefixes.
+    """Prepare valid one-token prefixes, then capture each decode bucket.
 
-    then capture each decode batch bucket.
+    Buckets are captured from the largest row count down. With graphs
+    disabled, one single-row decode runs eagerly instead.
+
+    Raises:
+        ValueError: A bucket is prepared on a worker without a KV cache.
     """
     row_counts = (
         tuple(reversed(runner.decode_shapes[entry]))
@@ -155,8 +182,8 @@ def prepare_decode(
         with cache.startup_pages(rows) as scratch:
             pages = tuple((page,) for page in scratch)
 
-            # Warm the one-token prompt eagerly so the decode capture below
-            # reads valid K/V prefixes instead of uninitialized pages.
+            # Prefill the one-token prompt eagerly so the decode capture below
+            # attends over K/V the model wrote rather than zeroed scratch.
             prompt = stage_text(buffers, cache, ((0,),) * rows, pages)
             entry.eager_batch(prompt, forward)
 
@@ -169,7 +196,8 @@ def prepare_decode(
                 decode=True,
             )
 
-            # Capture with every row live, then restore the caller's predicates.
+            # Capture with every row live (slots 1..rows, as staged above),
+            # then restore the caller's predicates.
             predicates = runner.decode_predicates
             saved = None if predicates is None else predicates.clone()
             try:
@@ -182,12 +210,11 @@ def prepare_decode(
 
 
 def capture_image_parameters(cfg_branches, *, steps, height, width):
-    """Build fixed image-generation params whose CFG scales match the branch.
-
-    count.
+    """Build fixed image-generation params whose CFG scales fit a branch count.
 
     One branch runs unconditioned, two add text guidance, and three add text
     and image guidance; each count maps to its (text, image) scale pair.
+    ``prepare_flow`` checks that the resulting guidance realizes the count.
     """
     text, image = {1: (1.0, 1.0), 2: (4.0, 1.0), 3: (4.0, 2.0)}[cfg_branches]
     return ImageParams(
@@ -202,9 +229,14 @@ def capture_image_parameters(cfg_branches, *, steps, height, width):
 
 @torch.inference_mode()
 def prepare_flow(runner, entry, latent_pool, tokenizer):
-    """Warm and capture configured image shapes with actual conditioning.
+    """Warm and capture configured image shapes on real conditioning prefixes.
 
-    prefixes.
+    For each shape, the prefix entry first prefills every nonempty branch
+    prompt prefix eagerly into scratch KV pages, then the denoising entry
+    stages rows that read those prefixes and captures them, or runs them
+    eagerly when graph capture or prefill graphs are disabled. Rows are
+    ordered by request with guidance branches varying fastest, and the
+    branches of one request share its slot and latent.
     """
     import math
 
@@ -221,9 +253,11 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
     capacity = min(builder.max_tokens, latent_pool.capacity_units)
     side = max(1, math.isqrt(capacity)) * builder.denoiser.downsample
 
-    # Without capture, warm one shape per guidance-branch count: the largest
-    # configured capture with that branch count, or a square fallback sized to
-    # the available latent capacity.
+    # Without capture, or without selected capture shapes, prepare one shape
+    # per guidance-branch count: the last selected capture with that count,
+    # or a one-row square image whose side derives from the smaller of the
+    # builder's token bound and the latent pool capacity. With capture
+    # enabled, the loop below still captures that fallback shape.
     shapes = (
         runner.flow_captures
         if capture and runner.flow_captures
@@ -240,6 +274,8 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
         )
     )
 
+    # Conditioning prefixes are prefilled by the same component's prefill
+    # entry.
     forward = entry.batch_forward
     prefix_entry = runner._forward_calls[(entry.name, ForwardMode.PREFILL)]
     stream = entry.context.stream
@@ -282,6 +318,8 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                     "count"
                 )
 
+            # One prefix per (request, branch), branch-fastest. A prefix can
+            # be empty (see ``resolve_prefix``).
             prefixes = (
                 tuple(
                     resolve_prefix(
@@ -315,6 +353,9 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
                     pages.append(tuple(scratch[cursor : cursor + count]))
                     cursor += count
 
+                # Only nonempty prefixes are prefilled, with hidden-state
+                # selection whose output is discarded; the denoising rows
+                # below read the written KV without writing.
                 selected = tuple(
                     index for index, prefix in enumerate(prefixes) if prefix
                 )

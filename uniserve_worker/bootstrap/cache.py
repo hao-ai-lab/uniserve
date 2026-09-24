@@ -1,4 +1,15 @@
-"""Describe the scheduler's rectangular K/V protocol from state layouts."""
+"""Describe a rank's paged K/V cache to the engine scheduler.
+
+The worker reports a ``KVCacheInfo`` in its ``WorkerInfo``: one rectangular
+region of the model's logical cache, a consecutive interval of layers times a
+consecutive interval of K/V heads, together with page geometry and the bytes
+one token occupies. The token-worker path of ``build_worker_layout`` in
+``uniserve_worker.bootstrap.report`` calls ``cache_info`` with a one-page
+pool to learn the per-token size, sizes the pool, and attaches the granted
+page count with ``resize_cache``. When the engine assembles a worker group
+from its ranks' startup reports, it requires their regions to cover every
+layer's K/V heads without a gap.
+"""
 
 from dataclasses import replace
 
@@ -24,6 +35,24 @@ def cache_info(
     The wire protocol describes contiguous homogeneous layer/head intervals.
     Library caches remain free to use other state layouts; unsupported wire
     layouts fail here before any scheduler grants or transfers are advertised.
+
+    Args:
+        model: The causal LM whose ``cache_config`` lists this rank's resident
+            cache layers and whose backbone orders all logical layers.
+        config: Supplies ``block_size`` and the optional ``kv_cache_dtype``
+            override of the layers' compute dtype.
+        num_blocks: Physical pages to advertise.
+
+    Returns:
+        The cache description with one full-context group of ``num_blocks``
+        pages.
+
+    Raises:
+        ValueError: There are no resident layers; they are not all MHA
+            layouts, not consecutive in ``cache_names`` order, not one
+            identical layout, or hold non-consecutive heads; a layer is not
+            named in ``cache_names``; ``block_size`` is below one; or the
+            configured dtype cannot store K/V values.
     """
     layers = model.cache_config.layers
     if not layers or any(
@@ -52,6 +81,8 @@ def cache_info(
             "the worker K/V protocol requires consecutive logical cache heads"
         )
 
+    # FP8 storage is expressed to the layout as its compute dtype plus a
+    # per-block FP8 quantizer; the published dtype names the stored FP8 type.
     dtype = (
         layout.compute_dtype
         if config.kv_cache_dtype is None
@@ -66,6 +97,8 @@ def cache_info(
         dtype=layout.compute_dtype if quantizer is not None else dtype,
         quantizer=quantizer,
     )
+    # One block's fields include per-block metadata (initialized flags and,
+    # with FP8, scales), so the per-token figure amortizes it and rounds up.
     bytes_per_token = ceil_div(
         len(layers) * sum(field.nbytes for field in fields.values()),
         config.block_size,
@@ -88,7 +121,10 @@ def cache_info(
 
 
 def resize_cache(info: KVCacheInfo, num_blocks: int) -> KVCacheInfo:
-    """Attach the granted capacity to one complete physical page group."""
+    """Attach the granted capacity to one complete physical page group.
+
+    ``info`` must carry the single group ``cache_info`` produces.
+    """
     return replace(
         info,
         num_blocks=num_blocks,

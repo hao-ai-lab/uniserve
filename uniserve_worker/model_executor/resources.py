@@ -1,6 +1,10 @@
-"""Query numerical result layouts and reserve caller-owned media input.
+"""Size per-request media storage and the layouts of call products.
 
-storage.
+These functions derive, from a rank's bound capabilities and its
+``MediaBuilder``, the request-slot fields a media rank reserves and the
+``OutputLayout`` of each product a call publishes to other components.
+Worker bootstrap (``bootstrap.capacity``, ``bootstrap.report`` and
+``bootstrap.outputs``) and ``ModelExecutor`` consume them.
 """
 
 from __future__ import annotations
@@ -34,7 +38,11 @@ def media_state_buffers(
 
     A rank that denoises holds the denoiser's tables, conditioning and host
     staging, and a rank that post-processes video holds its overlap state.
-    The denoiser's samples live in the latent pool instead.
+    The denoiser's samples live in the latent pool instead. Returns an empty
+    mapping without a media builder.
+
+    Raises:
+        ValueError: Two calls declare different fields under one name.
     """
     if builder is None:
         return {}
@@ -135,10 +143,24 @@ def output_layouts(
     frames: int | None = None,
     prompt_tokens: int | None = None,
 ) -> Mapping[str, OutputLayout]:
-    """Describe products using numerical capabilities resolved at construction.
+    """Describe the products one call publishes, keyed by product name.
 
-    Audio layouts require the media clock when a trajectory builder is bound;
-    a missing clock raises ``ValueError`` before product sizing.
+    ``frames`` and ``prompt_tokens`` size the layout for one request and
+    default to the admitted maxima. ``clock`` is the video post-processor
+    whose frame rate relates audio samples to video frames; with a clock, a
+    video decoder's product is its RGB media units (``decoded_units_layout``)
+    rather than its own declared layout.
+
+    The mapping is empty for a video post-processor, for a call that is
+    neither a text encoder's ``encode`` nor a denoiser, video decoder or
+    audio decoder call, for a video decoder with neither ``frames`` nor a
+    builder, and for a denoiser or audio decoder without a builder.
+
+    Raises:
+        ValueError: For a denoiser or audio decoder, the requested frames
+            or prompt exceed the builder's capacity; a denoiser on a media
+            timeline is not a ``VideoDenoiser``; or an audio decoder has no
+            ``clock``.
     """
     component = call.module
     if (

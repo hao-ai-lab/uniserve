@@ -36,11 +36,31 @@ def fetch_tensor(
 ) -> tuple[TransferTicket, ...]:
     """Deliver exactly the requested coverage using bound source edges.
 
-    Replica choice is deterministic in publication order. Coverage is
-    validated before any read starts; a failed selected source reports
-    failure and does not trigger another backend or producer execution.
-    Each ticket retains its own physical source and destination through
-    cancellation and device completion.
+    Replica choice is deterministic: locations published over `local` first,
+    then the rest in publication order. Coverage is validated before any read
+    starts; a failed selected source reports failure and does not trigger
+    another backend or producer execution. Each ticket retains its own
+    physical source and destination through cancellation and device
+    completion.
+
+    Args:
+        tensor: The logical tensor and every location it was published at.
+        destination: One tensor, or ordered first-axis spans, shaped like
+            `region` and on the device the reads target.
+        bindings: The transport bound for each (source endpoint, backend)
+            edge; a location whose edge is unbound is skipped.
+        region: The part of the logical tensor to read; the whole tensor when
+            omitted.
+        retain: Called with each ticket as soon as it is submitted.
+
+    Returns:
+        One ticket per physical read, in submission order.
+
+    Raises:
+        WorkerError: `invalid_descriptor` when the region, destination or
+            bound locations are invalid or do not cover the region. An error
+            raised while submitting, by a backend's `fetch` or by `retain`,
+            propagates after the tickets already submitted are cancelled.
     """
     region = region or tuple(
         slice(start, start + extent)
@@ -61,12 +81,12 @@ def fetch_tensor(
         device=device,
     )
 
-    # Greedily cover the requested region from bound source locations, the
-    # copies this rank holds itself before any other rank's and otherwise in
-    # publication order, so a replicated product is never read across ranks.
-    # The producer of every remote copy is told which ranks read it on that
-    # basis. Each read records its region in both source-local and
-    # region-local coordinates.
+    # Greedily cover the requested region from bound source locations. Those
+    # published over `local`, which only this address space can read, come
+    # first and the rest keep publication order, so a rank reads its own copy
+    # of a product before any other rank's; the head names a media product's
+    # readers on the same basis. Each read records its region in both
+    # source-local and region-local coordinates.
     missing = [region]
     reads: list[
         tuple[Transport, Locator, tuple[slice, ...], tuple[slice, ...]]

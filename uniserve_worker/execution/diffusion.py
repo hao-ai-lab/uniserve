@@ -1,4 +1,23 @@
-"""Flow prefix, denoise, Euler integration, and latent publication."""
+"""Image diffusion calls conditioned on a request's KV prefixes.
+
+These functions serve a worker whose ``ModelExecutor`` has an
+``image_builder``. ``uniserve_worker.execution.schedule`` sends latent
+preparation to ``prepare_latent``, and ``uniserve_worker.execution.forward``
+drives each denoising call through ``initialize``, then ``prepare_step`` and
+``flow_rows`` once per solver step, then ``finish`` after the last step of
+the call's declared interval. The solver update between steps runs in
+``forward.integrate_predictions``. A standalone video denoiser's calls go to
+``uniserve_worker.execution.media`` instead.
+
+The solver sample lives in the worker's ``LatentPool``. Preparation writes
+the seeded noise to bank one of the request's pages; each denoising call
+gathers the committed bank into its staging and ``finish`` scatters the
+successor to the inactive bank. Neither becomes visible until the batch
+commit applies the ``LatentUpdate`` left on the call's ``PendingOutput``.
+Each guidance branch attends to a KV prefix tracked in the request's
+``KVConditioning``; a prefix that is not yet materialized gets a prefill row
+from ``prefix_row``, forwarded before the step's denoising rows.
+"""
 
 from __future__ import annotations
 
@@ -61,7 +80,12 @@ def _to_device(
 
 
 def image_state(builder, size, image: ImageParams) -> DiffusionState:
-    """Open an admitted image's diffusion state from its sampling choices."""
+    """Open an admitted image's diffusion state from its sampling choices.
+
+    The schedules are built on the host; ``prepare_step`` reads each step's
+    time as a Python float. A non-positive ``timestep_shift`` is passed as
+    ``None``, leaving the shift to the denoiser's ``make_schedules``.
+    """
     denoiser = builder.denoiser
     return DiffusionState.open(
         denoiser,
@@ -89,6 +113,11 @@ def kv_conditioning(trajectory: DiffusionState) -> KVConditioning:
 
 
 def require_inputs(runner):
+    """Return the executor's ``ImageBuilder``.
+
+    Raises ``invalid_descriptor`` when the model has no ``ImageDenoiser``
+    capability, so the executor has no builder.
+    """
     if runner.image_builder is None:
         raise invalid_descriptor(
             "image computation requires its denoiser input builder"
@@ -108,9 +137,23 @@ def prepare_latent(
     model_runner: ModelExecutor,
     config: WorkerConfig,
 ) -> PendingOutput:
-    """Seed and publish the initial latent trajectory for one diffusion.
+    """Seed a diffusion request's trajectory and stage its first latent.
 
-    request.
+    Validates the call's conditioning publication, flow-noise RNG coordinates
+    and output generation, opens the request's ``DiffusionState``, draws the
+    seeded noise into the call's staging and writes it to bank one of the
+    request's ``LatentPool`` pages. The ``LatentUpdate`` that publishes it as
+    ``output.generation`` at step zero is applied by the batch commit.
+
+    Returns:
+        The call's ``PendingOutput`` with status OK and the latent product
+        when ``publish_latent_transfer`` publishes one.
+
+    Raises:
+        WorkerError: For example when the worker has no image builder or KV
+            storage, the conditioning publication, image parameters, RNG
+            coordinates, output generation or staged latent do not match the
+            call, or the request's trajectory has already started.
     """
     require_inputs(model_runner)
     request_id = call.request_key.request_id
@@ -183,6 +226,8 @@ def prepare_latent(
         raise invalid_descriptor("trajectory call has no staged latent inputs")
 
     pool = latent_pool
+    # ``LatentPool.initialize`` writes the whole staging, so the page padding
+    # past ``latent_units`` is zeroed rather than left stale.
     staging.value.zero_()
     initial = staging.value[: int(params.latent_units)]
     trajectory = image_state(
@@ -243,9 +288,14 @@ def initialize(
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
 ) -> DiffusionState:
-    """Bind reusable request state and refill the call from its exact.
+    """Open a denoising call's trajectory from its exact input generation.
 
-    latent version.
+    Validates the call's conditioning publication and latent generations,
+    gathers the committed bank at ``params.start_step`` into the call's
+    staging, and returns the request's ``DiffusionState``, reopening it when
+    it is absent or has a different size. ``KVConditioning.cache`` is set
+    from this call's descriptors and ``entries`` is cleared for
+    ``prepare_step`` to fill again.
     """
     require_inputs(model_runner)
     request_id = call.request_key.request_id
@@ -340,9 +390,24 @@ def prepare_step(
     torch.Tensor,
     tuple[tuple[Branch, TokenRow], ...],
 ]:
-    """Gather current latent pages and construct one guided diffusion-step.
+    """Stage one solver step's time and resolve each branch's KV prefix.
 
-    batch.
+    Prefix tokens are resolved once per branch source and retained in
+    ``KVConditioning.prefixes``; each branch's ``(slot, group, materialized
+    prefix length, token capacity)`` coordinate is recorded in
+    ``KVConditioning.entries`` on its first step of this call.
+
+    Returns:
+        The guidance branches active at ``step_index``, the one-element
+        timestep view in the slot's ``LatentPool`` storage, and
+        ``(branch, row)`` pairs for prefixes that a prefill forward must
+        materialize before the step's denoising rows.
+
+    Raises:
+        IndexError: ``step_index`` is outside the image schedule.
+        WorkerError: For example when image parameters, staged latents,
+            guidance or forward-row metadata are missing, or a prefix exceeds
+            its slot's capacity or disagrees with its materialized extent.
     """
     request = state.pending_output(call.request_key.request_id)
     image = request.request.image
@@ -400,6 +465,9 @@ def prepare_step(
         prefix, copy_conditioning = kv.prefixes[source]
         descriptor = denoise_descriptors[branch_index]
 
+        # ``resolve_prefix`` sets ``copy_conditioning`` for the conditioning
+        # source when the image prompt is blank; the branch then reads the
+        # request's own conditioning KV in place.
         if copy_conditioning:
             entry = kv.cache
         else:
@@ -410,6 +478,8 @@ def prepare_step(
                     "flow prefixes require request page tables"
                 )
             capacity = page_tables.allocated_length(slot)
+            # Called only for its check, which raises when the slot has no
+            # block table installed for cache group 0.
             page_tables.pages(slot, 0)
 
             # A sibling forward in this same submission may already write the
@@ -448,6 +518,8 @@ def prepare_step(
                 "state"
             )
 
+        # ``forward.prepare_diffusion_step`` forwards the prefill rows and
+        # advances each entry's materialized length by the rows it wrote.
         initialize_prefix = entry[2] == 0 and prefix_length > 0
         entries[branch] = entry
         if initialize_prefix and prefix:
@@ -472,9 +544,15 @@ def finish(
     request_tables: BlockTables | None,
     config: WorkerConfig,
 ) -> PendingOutput:
-    """Integrate predicted velocity, write the next latent bank.
+    """Write a denoising call's integrated latent and stage its publication.
 
-    and prepare publication.
+    ``forward.integrate_predictions`` calls this after applying the last
+    solver step of the call's declared interval to its staging. Scatters the
+    staging to the inactive bank and records the ``LatentUpdate`` that
+    advances the request from ``params.start_step`` by ``params.step_count``
+    steps at the batch commit. When that final step reaches the admitted
+    ``image.steps``, the alternative-prefix slots of the guidance branches
+    are released here, before the batch commit.
     """
     request = state.pending_output(call.request_key.request_id)
     row = state.pending_output(call.request_key.request_id)
@@ -564,7 +642,13 @@ def publish_latent_transfer(
     publication_transports: Mapping[str, Transport],
     config: WorkerConfig,
 ) -> tuple[TensorPublication, ...]:
-    """Publish a committed-candidate trajectory for an exact staged consumer."""
+    """Publish the latent bank a call wrote as a transport product.
+
+    Returns no product unless a transport other than ``local`` is configured
+    and this rank is the component's output rank. Otherwise the written bank
+    is reserved through ``LatentPool.reserve_publication`` and published by
+    ``transfer.publish_latent_source``.
+    """
     params = row.latent.input_params
     if params is None:
         raise invalid_descriptor("latent publication has no staged parameters")
@@ -606,9 +690,10 @@ def initial_latent(
     seed: int,
     model_runner: ModelExecutor,
 ) -> None:
-    """Create deterministic bounded latent noise or reuse the request’s staged.
+    """Draw a request's seeded initial latent into ``target``.
 
-    image latent.
+    The seed is ``flow_noise_seed(seed, rng.semantic_index_base)``.
+    ``prepare_latent`` validates ``call.rng`` before calling this.
     """
     rng = call.rng
     assert rng is not None and rng.draw_layout is DrawLayout.FLOW_NOISE
@@ -623,9 +708,11 @@ def prefix_row(
     tokens: tuple[int, ...],
     entry: tuple[int, int, int, int],
 ) -> TokenRow:
-    """Build the model-forward row that materializes one diffusion conditioning.
+    """Build the prefill row that writes one guidance branch's KV prefix.
 
-    prefix.
+    ``entry`` is the branch's ``(slot, group, materialized prefix length,
+    token capacity)`` coordinate; ``tokens`` are written causally from the
+    materialized length onward, selecting hidden states rather than logits.
     """
     positions = torch.arange(entry[2], entry[2] + len(tokens), dtype=torch.long)
     return TokenRow(
@@ -651,7 +738,15 @@ def flow_rows(
     conditioning_position,
     device,
 ):
-    """Borrow one learned sample copy for every active guidance branch."""
+    """Build one denoising row per guidance branch over one shared sample.
+
+    Every row borrows ``current`` (copied to ``device`` first when it lives
+    elsewhere) and attends to its branch's KV entry without writing KV. The
+    conditioned branch takes its temporal position from
+    ``conditioning_position``; every other branch takes its entry's
+    materialized prefix length. Position tensors are cached by temporal
+    position in ``KVConditioning.positions``.
+    """
     from uniserve_worker.protocol.call import MediaCall
 
     current = _to_device(current, device)

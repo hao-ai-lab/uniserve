@@ -19,9 +19,19 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionOutput:
-    """Row-aligned numerical results with execution observations and reader.
+    """Row-aligned numerical results with execution observations and fences.
 
-    fences.
+    For a staged batch ``values`` holds one tensor per row, which
+    ``validate_for`` checks; for a standalone call it holds the module
+    call's tensors. A value with a ``VocabShard`` in ``vocabularies`` holds
+    logits over this rank's vocabulary columns; ``materialize`` gathers them
+    into the full vocabulary. ``layouts`` optionally describes each value as
+    an ``OutputLayout``. For a staged batch, ``ModelExecutor`` sets
+    ``request_pool_indices`` and ``output_event``, which is recorded on the
+    lane stream after the forward and is None without a lane stream.
+    ``greedy`` is the greedy decode a replayed text graph computed. It is
+    None whenever ``graph_inputs.greedy_decode`` declines the batch, after
+    eager execution, and for a batch staged without a force-finish column.
     """
 
     values: tuple[torch.Tensor, ...]
@@ -55,9 +65,12 @@ class ExecutionOutput:
             raise ValueError("output layouts must align with execution rows")
 
     def materialize(self) -> ExecutionOutput:
-        """Gather global vocabulary rows.
+        """Gather global vocabulary rows, preserving their row counts.
 
-        preserving their caller-visible shapes.
+        The current stream first waits for ``output_event``. Each gather is
+        an all-gather collective over the shard's tensor group, so every rank
+        of that group must make the matching call. The result has no
+        vocabulary metadata; it is ``self`` when no row is sharded.
         """
         if self.output_event is not None:
             if not self.values:
@@ -114,10 +127,12 @@ class ExecutionOutput:
     def clone(self) -> ExecutionOutput:
         """Own detached copies that survive reuse of the producer's storage.
 
-        Outputs on one device with one dtype share a contiguous allocation.
-        Shapes and logical tensor values are preserved independently of source
-        strides; storage remains live for as long as any returned tensor is
-        retained.
+        The current stream first waits for ``output_event``, and the copy
+        carries no event. Outputs on one device with one dtype share a
+        contiguous allocation. Shapes and logical tensor values are preserved
+        independently of source strides; storage remains live for as long as
+        any returned tensor is retained. ``greedy`` and
+        ``request_pool_indices`` are cloned as well.
         """
         if self.output_event is not None:
             if not self.values:

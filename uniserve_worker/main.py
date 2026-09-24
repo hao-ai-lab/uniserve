@@ -1,4 +1,14 @@
-"""CLI boundary for the Python worker process."""
+"""CLI boundary for the Python worker process.
+
+The Rust launchers (the engine's worker process launcher and the
+``uniserve-host`` binary) start each rank as
+``python -m uniserve_worker.main`` with the arguments
+`uniserve_worker.bootstrap.cli.parse_worker_args` reads; the
+``uniserve-worker`` console script runs the same ``main``. This module owns
+only process-level concerns: logging setup, signal-triggered traceback dumps,
+and the exit status; `uniserve_worker.bootstrap.launch.run_worker` builds and
+serves the rank.
+"""
 
 from __future__ import annotations
 
@@ -26,15 +36,20 @@ def main() -> None:
     _install_fault_dump_handlers()
     process_args = parse_worker_args()
 
+    # Both exception paths end the process with ``os._exit``, which skips
+    # interpreter shutdown and the ``finally`` clause below; that clause logs
+    # only when ``run_worker`` returns.
     try:
         run_worker(process_args)
     except KeyboardInterrupt:
         logger.info("worker interrupted; shutting down")
+        # 130 is the shell convention for termination by SIGINT (128 + 2).
         os._exit(130)
     except BaseException:
         # Failed CUDA accesses and transfer threads retain backing until the
         # rank exits. Python's executor/finalizer shutdown would try to drain
-        # them and can wait forever for the failed peer.
+        # them and can wait forever for the failed peer. ``os._exit`` does not
+        # flush stdio buffers.
         logger.exception("worker failed")
         sys.stderr.flush()
         os._exit(1)
@@ -43,9 +58,13 @@ def main() -> None:
 
 
 def _install_fault_dump_handlers() -> None:
-    """Enable Python fault dumps.
+    """Register signal-triggered Python traceback dumps.
 
-    Also register user-triggered traceback signals.
+    SIGQUIT and SIGUSR1 write every thread's traceback to stderr and the
+    process keeps running, which lets an operator inspect a wedged rank. A
+    signal the platform lacks, or one ``faulthandler`` cannot register, is
+    skipped. The worker does not enable dumps on fatal signals
+    (``faulthandler.enable``).
     """
     for sig_name in ("SIGQUIT", "SIGUSR1"):
         sig = getattr(signal, sig_name, None)

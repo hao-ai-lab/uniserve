@@ -1,22 +1,24 @@
 """One bounded VMM pool per device on a publishing rank.
 
-A device product used to take its own allocation: every publication created
-physical pages, exported a handle for them, and released them when the
-publication retired. Section 5.7 reserves one bounded pool per device at
-startup and exports one handle for it, so a publication is a chunk of that
-pool addressed by offset and size.
+`CudaVmmTransport` reserves one pool per device the first time that device
+publishes a product it cannot export where it lies, sized by the rank's
+transfer byte budget, and exports one shareable handle for the pool's whole
+allocation. Such a publication is a chunk of that pool addressed by byte
+offset and size, so a consumer imports one handle per producing device rather
+than one per product.
 
-Two things follow. A consumer imports one handle per producing device rather
-than one per product, and it can keep that mapping for as long as the producer
-lives. And a publishing rank's PyTorch allocator segments never need to be
-exportable, so every rank serves from expandable segments.
+Because the pool is reserved outside the PyTorch caching allocator,
+publication never needs exportable allocator segments, and the engine enables
+expandable segments on every rank unless the environment already configures
+the allocator.
 
 A chunk carries its own acknowledgment header but does not track who owes an
-acknowledgment: that belongs to the publication the chunk backs, which the
-device transport owns and retires.
+acknowledgment: that belongs to the publication the chunk backs, which
+`CudaVmmTransport` owns, retires and sweeps.
 
-A product that does not fit the pool falls back to host transport for that
-product, and the exhaustion is reported once rather than per publication.
+A product that does not fit the pool raises `PoolExhaustedError`, and
+`publication.publish_tensor` publishes that product as host bytes instead.
+The pool logs its exhaustion once rather than once per product.
 """
 
 from __future__ import annotations
@@ -41,8 +43,9 @@ ACKNOWLEDGED = 2
 #: Acknowledgment slots one chunk header carries.
 #:
 #: Every rank of an instance owns one slot, assigned by the head, and writes
-#: that slot's word in each chunk it reads. Giving a rank its own word removes
-#: any need for cross-process atomics, at one word per rank rather than a page.
+#: that slot's word in each chunk it reads. Because no two ranks write the same
+#: word, no cross-process read-modify-write is needed. `segment` lays out the
+#: shared storage header's acknowledgment words with the same bound.
 MAX_ACKNOWLEDGMENT_SLOTS = 64
 #: Bytes reserved at the head of every chunk for its acknowledgments.
 HEADER_BYTES = ACK_WORD_BYTES * MAX_ACKNOWLEDGMENT_SLOTS
@@ -51,9 +54,10 @@ HEADER_BYTES = ACK_WORD_BYTES * MAX_ACKNOWLEDGMENT_SLOTS
 #: A consumer imports the pool's whole allocation and addresses chunks by
 #: offset, so a chunk does not have to begin on a CUDA page. What it does have
 #: to satisfy is the alignment its own contents need: the acknowledgment words
-#: are 32-bit, and payload spans are read as tensors of the product's dtype and
-#: copied in vector widths. This bound covers both and keeps a pool's capacity
-#: proportional to what it carries rather than to the number of products in it.
+#: are 32-bit, and payload spans, which begin `HEADER_BYTES` after the chunk,
+#: are read as tensors of the product's dtype and copied in vector widths.
+#: This bound covers both and keeps a pool's capacity proportional to what it
+#: carries rather than to the number of products in it.
 CHUNK_ALIGNMENT = 512
 
 
@@ -64,9 +68,9 @@ class PoolChunk:
     The chunk begins with one acknowledgment word per instance rank. A
     consumer claims the word of its own slot before its first read and
     acknowledges it when those reads retire, and the producing rank returns
-    the chunk once no named consumer is still reading. That is what lets a
-    product retire without a reader-grant connection, which a Unix socket
-    could not carry to another host.
+    the chunk once no named consumer is still reading. Retirement therefore
+    needs no connection to the producer, so a consumer on another host
+    acknowledges a chunk the same way as one on this host.
     """
 
     #: Byte offset of the chunk's header within the pool's exported allocation.
@@ -90,6 +94,9 @@ class PoolChunk:
         nothing, and one that claimed must acknowledge before its span is
         handed out again. A product with no remote consumer is settled on
         publication: no other rank reads it.
+
+        The words live in device memory, so the check runs on the current
+        stream and blocks the host until that stream reaches it.
         """
         if not slots:
             return True
@@ -108,9 +115,18 @@ class VmmPool:
     publication retires. The pool does not compact: a publication's chunk is
     live while a consumer may still read it, and moving it would invalidate the
     offset that consumer was given.
+
+    `reserve` and `release` are serialized by one lock and may be called from
+    any thread.
     """
 
     def __init__(self, device: torch.device, *, capacity_bytes: int) -> None:
+        """Reserve and export the pool's physical allocation on `device`.
+
+        Raises:
+            ValueError: When `capacity_bytes` is not positive. Errors from
+                reserving, mapping or exporting the allocation propagate.
+        """
         from uniserve_kernels.peer_storage import (
             allocate,
             allocation_granularity,
@@ -118,8 +134,8 @@ class VmmPool:
 
         if capacity_bytes <= 0:
             raise ValueError("a VMM pool needs a positive capacity")
-        # The allocation itself is physical pages; the chunks inside it are
-        # not.
+        # The exported allocation is a whole number of allocation-granularity
+        # units; the chunks inside it are not.
         page = allocation_granularity(device)
         self._capacity = ((capacity_bytes + page - 1) // page) * page
         self._allocation = allocate(
@@ -130,7 +146,8 @@ class VmmPool:
         self._device = device
 
         self._lock = threading.Lock()
-        # Offsets handed out and not yet released, by offset.
+        # Byte span of each chunk handed out and not yet released, keyed by
+        # the chunk's offset.
         self._live: dict[int, int] = {}
         self._watermark = 0
         self._reported_exhaustion = False
@@ -151,14 +168,19 @@ class VmmPool:
 
     @property
     def capacity(self) -> int:
-        """Return the pool's byte capacity, rounded up to CUDA pages."""
+        """Return the pool's byte capacity, rounded up to the granularity."""
         return self._capacity
 
     def reserve(self, nbytes: int) -> PoolChunk:
-        """Reserve one chunk, or report that the product does not fit.
+        """Reserve one chunk for an `nbytes` payload.
 
-        A chunk is page aligned so a consumer can map it without knowing how
-        the producer packed the pool.
+        The chunk spans the acknowledgment header plus the payload, rounded up
+        to `CHUNK_ALIGNMENT`, and its acknowledgment words are cleared.
+
+        Raises:
+            ValueError: When `nbytes` is not positive.
+            PoolExhaustedError: When no free span of the pool fits the chunk.
+                The first exhaustion of this pool is also logged.
         """
         if nbytes <= 0:
             raise ValueError("a pool chunk needs a positive length")
@@ -189,7 +211,8 @@ class VmmPool:
             self._live[offset] = span
             payload = offset + HEADER_BYTES
             acknowledgments = self._storage[offset:payload].view(torch.int32)
-            # A chunk is reused, so its words start unclaimed.
+            # A span is reused, and a stale CLAIMED word would keep the new
+            # chunk from ever settling, so every word starts unclaimed.
             acknowledgments.zero_()
             return PoolChunk(
                 offset=offset,
@@ -200,7 +223,7 @@ class VmmPool:
             )
 
     def release(self, chunk: PoolChunk) -> None:
-        """Return one chunk's span to the pool."""
+        """Return one chunk's span to the pool; a chunk not live is ignored."""
         with self._lock:
             if self._live.pop(chunk.offset, None) is None:
                 return
@@ -211,7 +234,13 @@ class VmmPool:
                 self._watermark = 0
 
     def _free_offset(self, span: int) -> int | None:
-        """Find the lowest offset where this span fits, or None."""
+        """Return an offset where `span` bytes fit, or None.
+
+        The watermark is used while the span fits below the capacity;
+        otherwise the lowest free gap that fits, before, between or after the
+        live chunks, is returned. The caller holds the lock and records the span
+        as live.
+        """
         if self._watermark + span <= self._capacity:
             offset = self._watermark
             self._watermark += span

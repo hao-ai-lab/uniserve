@@ -1,4 +1,15 @@
-"""Load public numerical modules and bind worker-owned execution choices."""
+"""Load public numerical modules and bind worker-owned execution choices.
+
+Model loading runs in two phases around process-group creation in
+``Worker.from_config``. ``prepare_worker_model`` reads the checkpoint's
+configuration, builds a meta-device skeleton, validates the component
+placement and resolves which module paths this rank must load.
+``load_worker_model`` then materializes those modules through
+``uniserve_models.loading.load_model`` with the component meshes and attention
+partitioning, and resolves the load-time ``WorkerConfig``. The launch's
+``quantization_config`` is translated here into the public
+``uniserve.loading.weights.Config``.
+"""
 
 from __future__ import annotations
 
@@ -53,14 +64,31 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class WorkerModel:
-    """Loaded composition and caller-owned input processing."""
+    """Loaded composition and caller-owned input processing.
+
+    Attributes:
+        model: The loaded numerical model. On a host worker, whose
+            components have no numerical calls, it is the weight-less
+            meta-device description.
+        config: The execution configuration. For a checkpoint model it is
+            resolved by ``loaded_worker_config``, and a numerical worker also
+            applies the launch's ``kv_cache_dtype`` override.
+        tokenizer: The loaded tokenizer; ``None`` for the stub model, on a
+            host worker, or for a checkpoint without one.
+        image_processor: The model's image preprocessing, if any.
+        flow_prompt: The checkpoint's flow prompt template, if any.
+        checkpoint_identity: Identity of the loaded checkpoint; empty for a
+            model without one.
+        entry_points: The checkpoint's IPC entry declarations; ``None`` for
+            the stub model, whose declarations ``describe_components`` reads
+            from the model's module.
+    """
 
     model: nn.Module
     config: WorkerConfig
     tokenizer: Any | None = None
     image_processor: ImageProcessor | None = None
     flow_prompt: FlowPrompt | None = None
-    # Identity of the loaded checkpoint; empty for a model without one.
     checkpoint_identity: str = ""
     entry_points: Mapping[str, ComponentEntry] | None = None
 
@@ -87,11 +115,21 @@ def verify_checkpoint_identity(
 def prepare_worker_model(
     config: WorkerProcessArgs,
 ) -> tuple[models.Config | None, nn.Module, dict[str, tuple[Call, ...]]]:
-    """Resolve the resident checkpoint closure.
+    """Resolve the checkpoint configuration and this rank's resident modules.
 
-    The closure is resolved before creating process groups, and its checkpoint
-    identity is verified against the launch expectation before any weight
-    is read.
+    This runs before process groups exist. The checkpoint identity is
+    verified against the launch expectation before ``load_worker_model``
+    materializes any weight. A placement that does not fit the model's
+    declarations, or a checkpoint identity that differs from the launch
+    expectation, raises ``WorkerError`` with ``UNSUPPORTED_SETUP``. Errors
+    from reading the checkpoint configuration and from ``_weight_config``
+    propagate.
+
+    Returns:
+        A tuple of the checkpoint configuration, narrowed to the module paths
+        this rank's components call and carrying the launch's weight choices
+        (``None`` for the stub model); the meta-device model skeleton; and
+        the validated component declarations.
     """
     if config.use_stub_model:
         from uniserve_models.stub import Model
@@ -108,7 +146,8 @@ def prepare_worker_model(
         )
 
     # A meta-device skeleton is enough to validate placement and select the
-    # modules this rank must read from the checkpoint.
+    # modules this rank must read from the checkpoint. This first read selects
+    # no modules, so it resolves no weight payload source.
     metadata = models.read_config(
         launch.path, io=config.load, modules=frozenset()
     )
@@ -118,6 +157,8 @@ def prepare_worker_model(
         model, dict(config.components), entries=metadata.entry_points
     )
 
+    # The second read narrows payload downloads, and later the load, to the
+    # module paths this rank's components call.
     resident = frozenset(
         call.path
         for name, component in config.components
@@ -126,8 +167,8 @@ def prepare_worker_model(
     )
     source = models.read_config(launch.path, io=config.load, modules=resident)
 
-    # The host name is the same identity the rank's endpoint reports, so the
-    # refusal and the engine's own report name one host.
+    # The host name is the ``node`` the rank's ``WorkerEndpoint`` reports, so
+    # the refusal and the engine's own report name one host.
     verify_checkpoint_identity(
         launch.checkpoint_identity,
         source.checkpoint_identity,
@@ -148,7 +189,26 @@ def prepare_worker_model(
 
 
 def _weight_config(source, options, execution) -> weights.Config:
-    """Translate launch precision selectors into the public loading value."""
+    """Translate launch precision selectors into the public loading value.
+
+    ``options`` is the launch's ``quantization_config``. Exactly one source
+    selects the base weight configuration: ``components`` selectors passed to
+    the model package's ``weight_config`` factory (with ``mode`` or
+    ``quant_method`` as its preset, ``default`` without one); a named
+    precision in ``source.precisions``; a ``quant_method`` among the generic
+    formats, applied to every module; or, with no selector, the checkpoint's
+    own weights. ``ignored_layers`` then maps each listed module path to no
+    quantization, and the dtype comes from ``execution.model_dtype``.
+    ``kv_cache_dtype`` is accepted here but applied by ``load_worker_model``.
+
+    Raises:
+        ValueError: An unknown key, both ``mode`` and ``quant_method``,
+            numerical selectors for a checkpoint whose format owns its
+            numerics, component selectors for a model without a
+            ``weight_config`` factory, or an unknown precision.
+        TypeError: ``components`` is not a mapping or ``ignored_layers`` is
+            not a list of strings.
+    """
     unknown = options.keys() - {
         "mode",
         "quant_method",
@@ -198,6 +258,8 @@ def _weight_config(source, options, execution) -> weights.Config:
         result = source.weights
     elif selected in source.precisions:
         result = source.precisions[selected]
+    # The quantization mapping resolves by longest module-path prefix, so the
+    # empty key applies the generic format to every module.
     elif "quant_method" in options and selected in {
         "unquantized",
         "fp8",
@@ -237,7 +299,14 @@ def _weight_config(source, options, execution) -> weights.Config:
 
 
 def attention_parallel(component: ComponentConfig) -> AttentionParallelConfig:
-    """Translate degree declarations into mathematical attention axes."""
+    """Translate degree declarations into mathematical attention axes.
+
+    The ``ulysses`` and ``hybrid`` sequence-parallel kinds partition attention
+    heads; ``allgather`` and ``hybrid`` gather the context partition over the
+    ``cp`` axis. ``initialize_components`` passes the same value to
+    ``communication_axes`` to decide which fibers need backend groups, and
+    ``load_worker_model`` passes it to the model loader.
+    """
     sequence = component.parallel_config.sequence_parallel
     heads = Ulysses() if sequence.kind in {"ulysses", "hybrid"} else None
     context = (
@@ -256,7 +325,18 @@ def load_worker_model(
     description: nn.Module,
     declarations: Mapping[str, tuple[Call, ...]],
 ) -> WorkerModel:
-    """Materialize selected modules and attach borrowed capability methods."""
+    """Materialize this rank's selected modules on their meshes.
+
+    ``source``, ``description`` and ``declarations`` are the results of
+    ``prepare_worker_model``; ``bindings`` come from
+    ``initialize_components``. The stub model is built directly on the worker
+    device. When no configured component has numerical calls (a host
+    worker), no weights load and the meta-device description is kept.
+    Otherwise each outermost declared module path of a meshed component is
+    loaded on that component's mesh with its ``attention_parallel``
+    partitioning. Capability methods are attached later, by
+    ``bind_components`` in ``ModelExecutor``.
+    """
     if config.use_stub_model:
         from uniserve_models.stub import Model, image_processor
 
@@ -308,8 +388,10 @@ def load_worker_model(
         if binding.mesh is None:
             continue
         paths = {call.path for call in declarations[name]}
-        # Contained encoders are bound by their numerical parent's traversal;
-        # siblings sharing a backbone retain their independent capability roots.
+        # Only the outermost declared paths receive a mesh: a path nested in
+        # another declared path is bound by its parent's traversal, and the
+        # empty path (the model root) contains every other path. Siblings
+        # sharing a backbone remain independent roots.
         roots = {
             path
             for path in paths
@@ -334,6 +416,9 @@ def load_worker_model(
     worker_config = loaded_worker_config(
         model, config.execution, config.ipc.queue_depth
     )
+
+    # ``kv_cache_dtype`` in the launch's quantization_config overrides the
+    # KV storage dtype; ``_weight_config`` accepts the key but ignores it.
     override = config.model.quantization_config.get("kv_cache_dtype")
     if override is not None:
         if not isinstance(override, str):
@@ -355,7 +440,20 @@ def load_worker_model(
 def _devices(
     model: nn.Module, generation_device: str | None
 ) -> Mapping[str, str] | None:
-    """Place the flow route and denoiser modules on the selected device."""
+    """Place the flow route and denoiser modules on the selected device.
+
+    The selected modules are every ``Denoiser``'s direct children that are not
+    part of a ``CausalLM``, every ``flow`` entry of a ``ModuleDict``, and
+    every ``ImageDecoder`` and ``PatchAutoencoder``.
+
+    Returns:
+        Every module path of a selected module, including aliases, mapped to
+        ``generation_device``; ``None`` when no generation device is set.
+
+    Raises:
+        WorkerError: With ``UNSUPPORTED_SETUP`` when a generation device is
+            set but the model has no module to place on it.
+    """
     if generation_device is None:
         return None
     text_modules = {
@@ -397,7 +495,19 @@ def loaded_worker_config(
 
     A resident media slot occupies three positions of the worker's batch
     queue, one reserved pipeline position and two unresolved outputs, and a
-    media worker keeps at least two slots resident.
+    media worker keeps at least two slots resident. The same three-position
+    bound governs ``request_tensor_window`` and ``resolve_request_capacity``
+    in ``uniserve_worker.bootstrap.capacity``.
+
+    Only a model containing a ``VideoDecoder`` is adjusted: its batch bounds
+    and maximum request-pool size become the slot count, its minimum
+    request-pool size becomes two, and it drops the KV token capacity,
+    attention backend and generation device. Any other model's configuration
+    is returned unchanged.
+
+    Raises:
+        WorkerError: With ``UNSUPPORTED_SETUP`` when the queue depth or
+            ``max_batch_calls`` leaves fewer than two slots.
     """
     if any(isinstance(module, VideoDecoder) for module in model.modules()):
         state_slots = min(config.max_batch_calls, queue_depth // 3)

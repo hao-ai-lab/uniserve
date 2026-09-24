@@ -1,4 +1,20 @@
-"""Typed process arguments for one Python worker rank."""
+"""Typed process arguments for one Python worker rank.
+
+The engine writes one JSON launch descriptor per rank, and
+``uniserve_worker.bootstrap.cli`` reads it into an ``argparse.Namespace``.
+``WorkerProcessArgs.from_namespace`` validates that namespace once and resolves
+it into immutable values, so later bootstrap stages consume typed fields and
+never reparse descriptor text. Values this module rejects raise
+``ValueError``, which the launch adapter reports as a usage error before the
+worker starts; a value that passes these checks but violates a
+``WorkerConfig`` invariant raises ``WorkerError`` from
+``WorkerConfig.__post_init__`` instead.
+
+``SequenceConfig``, ``ParallelConfig`` and ``ComponentConfig`` mirror the
+component declarations in the ``uniserve-core`` crate's ``parallel`` module:
+the same field names, a missing degree defaulting to one, and unknown fields
+rejected.
+"""
 
 from __future__ import annotations
 
@@ -23,9 +39,10 @@ from uniserve_worker.protocol.call import (
     TransferMode,
 )
 
-# These launch selectors assign capabilities to a worker pool. A media
-# selector includes both tracks; submitted call kinds still identify the
-# concrete call.
+# These launch selectors assign capabilities to a worker pool. The engine
+# sends the selected group names as one comma-separated ``supported_calls``
+# value. A media selector includes both tracks; submitted call kinds still
+# identify the concrete call.
 SUPPORTED_CALL_GROUPS: dict[str, tuple[CallKind, ...]] = {
     "ar_extend": (ForwardMode.PREFILL,),
     "ar_decode": (ForwardMode.DECODE,),
@@ -51,11 +68,15 @@ SUPPORTED_CALL_GROUPS: dict[str, tuple[CallKind, ...]] = {
 
 
 def _positive_degree(name: str, value: object) -> int:
+    # ``type(...) is int`` rather than ``isinstance`` rejects ``True``, which
+    # JSON decoding could otherwise let through as a degree of one.
     if type(value) is not int or value < 1:
         raise ValueError(f"{name} must be a positive integer")
     return value
 
 
+# Degree fields each sequence strategy accepts, in the order
+# ``SequenceConfig.degrees`` stores them.
 _SEQUENCE_FIELDS = {
     "local": (),
     "ulysses": ("ulysses_degree",),
@@ -66,7 +87,12 @@ _SEQUENCE_FIELDS = {
 
 @dataclass(frozen=True, slots=True)
 class SequenceConfig:
-    """Select the sequence-parallel algorithm and its active degrees."""
+    """Select the sequence-parallel algorithm and its active degrees.
+
+    ``degrees`` holds one positive value per field that ``kind`` names in
+    ``_SEQUENCE_FIELDS``, in that order; for ``hybrid`` it is
+    ``(ulysses_degree, allgather_degree)``.
+    """
 
     kind: str = "local"
     degrees: tuple[int, ...] = ()
@@ -93,7 +119,13 @@ class SequenceConfig:
 
     @property
     def dimensions(self) -> tuple[tuple[str, int], ...]:
-        """Return context axes followed by the Ulysses axis."""
+        """Return context axes followed by the Ulysses axis.
+
+        The allgather degree becomes the ``cp`` mesh axis, which model loading
+        uses as the context-parallel gather axis. Every strategy reports both
+        axes, with size one when inactive, so every component mesh carries the
+        same axis names.
+        """
         match self.kind:
             case "local":
                 return (("cp", 1), ("ulysses", 1))
@@ -108,6 +140,12 @@ class SequenceConfig:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> SequenceConfig:
+        """Parse the descriptor object tagged by its ``kind`` field.
+
+        Raises:
+            ValueError: If ``kind`` is unknown, a field does not belong to that
+                strategy, or a degree is not a positive integer.
+        """
         kind = value.get("kind")
         if not isinstance(kind, str) or kind not in _SEQUENCE_FIELDS:
             raise ValueError(f"unknown sequence parallel strategy {kind!r}")
@@ -162,7 +200,13 @@ class ParallelConfig:
 
     @property
     def dimensions(self) -> tuple[tuple[str, int], ...]:
-        """Return mesh axes in rank order, with Ulysses varying fastest."""
+        """Return mesh axes in rank order, with Ulysses varying fastest.
+
+        Component ranks map onto this shape in row-major order, so the order
+        decides which ranks form each pipeline, tensor, context, and Ulysses
+        group. ``uniserve_worker.bootstrap.distributed`` and the component
+        binding both build their ``DeviceMesh`` from it.
+        """
         *context, ulysses = self.sequence_parallel.dimensions
         return (
             ("pp", self.pipeline_parallel_size),
@@ -203,7 +247,17 @@ class ParallelConfig:
 
 @dataclass(frozen=True, slots=True)
 class ComponentConfig:
-    """Configure rank placement and parallelism for one model component."""
+    """Configure rank placement and parallelism for one model component.
+
+    Without a ``distribution``, ``ranks`` form one model-parallel group whose
+    size equals the parallel world size. With ``temporal_units``, every rank
+    runs its own local instance and the component divides independent media
+    units across the ranks: each rank takes a contiguous run of
+    ``units_per_rank`` units in the order of ``ranks``, and the parallel world
+    size must be one. Which components accept a distribution is checked
+    against the model's declared calls by ``validate_components`` in
+    ``uniserve_worker.bootstrap.components``.
+    """
 
     ranks: tuple[int, ...]
     parallel_config: ParallelConfig = ParallelConfig()
@@ -257,6 +311,7 @@ class ComponentConfig:
                 "component requires ranks and a parallel_config object"
             )
 
+        # Type checks happen here; value checks happen in ``__post_init__``.
         distribution = value.get("distribution")
         units = value.get("units_per_rank", 1)
         if distribution is not None and not isinstance(distribution, str):
@@ -272,6 +327,8 @@ class ComponentConfig:
         )
 
     def to_dict(self) -> dict[str, object]:
+        # The distribution fields appear only with a distribution;
+        # ``from_dict`` restores their defaults when they are absent.
         value: dict[str, object] = {
             "ranks": list(self.ranks),
             "parallel_config": self.parallel_config.to_dict(),
@@ -287,7 +344,19 @@ class ComponentConfig:
 def parse_components(
     value: dict[str, object], world_size: int
 ) -> tuple[tuple[str, ComponentConfig], ...]:
-    """Parse model component placement supplied by the worker launcher."""
+    """Parse model component placement supplied by the worker launcher.
+
+    Args:
+        value: Mapping from component name to its descriptor object.
+        world_size: Size of the process world every rank must fall inside.
+
+    Returns:
+        ``(name, config)`` pairs sorted by name.
+
+    Raises:
+        ValueError: If the mapping is empty, an entry is malformed, or a rank
+            lies outside the process world.
+    """
     if not value:
         raise ValueError("component configuration must not be empty")
 
@@ -326,12 +395,11 @@ class WorkerIpcConfig:
     # A host product reaches a consumer among them over shared storage and any
     # other over the rank channel; the head derives this from the placement.
     host_slots: tuple[int, ...]
-    # Acknowledgment slots of the ranks that read this rank's device products,
-    # which the head derives from the transfer edges. A rank cannot name them
-    # itself: it knows its own component, not which component consumes it.
     # Whether any rank that reads this rank's device products is on another
     # host. An interprocess event carries readiness within a host at no cost to
-    # the producing stream; only a crossing needs a producer synchronize.
+    # the producing stream; only a crossing needs a producer synchronize. The
+    # head derives this from the transfer edges and the placement, which only
+    # it holds.
     products_cross_hosts: bool
     max_payload_bytes: int
     queue_depth: int
@@ -339,7 +407,7 @@ class WorkerIpcConfig:
 
 @dataclass(frozen=True)
 class ModelLaunchConfig:
-    """Selects checkpoint identity, precision policy."""
+    """Selects the checkpoint and its quantization policy."""
 
     path: str
     quantization_config: dict[str, object]
@@ -351,7 +419,12 @@ class ModelLaunchConfig:
 
 @dataclass(frozen=True)
 class DataPlaneConfig:
-    """Bind receive and required publication mechanisms for a rank."""
+    """Bind receive and required publication mechanisms for a rank.
+
+    ``WorkerProcessArgs.from_namespace`` requires ``publication_backends`` to
+    be a subset of ``backends``: a rank publishes only over mechanisms it also
+    binds.
+    """
 
     backends: tuple[str, ...]
     publication_backends: tuple[str, ...]
@@ -377,9 +450,20 @@ class WorkerProcessArgs:
 
     @classmethod
     def from_namespace(cls, namespace: argparse.Namespace) -> WorkerProcessArgs:
-        """Validate parsed CLI values.
+        """Validate parsed launch values into immutable worker configuration.
 
-        Values resolve into immutable worker launch configuration.
+        Args:
+            namespace: Launch descriptor fields, as produced by
+                ``uniserve_worker.bootstrap.cli.read_launch_descriptor``.
+
+        Returns:
+            The validated launch configuration for this rank.
+
+        Raises:
+            ValueError: If a value is malformed, out of range, inconsistent
+                with another value, or names an unsupported option.
+            WorkerError: If execution settings that pass these checks violate
+                a ``WorkerConfig`` invariant.
         """
         supported_calls = _parse_supported_calls(namespace.supported_calls)
         device = _normalize_device(namespace.device)
@@ -394,6 +478,9 @@ class WorkerProcessArgs:
         model_path = str(namespace.model or "").strip()
 
         _validate_scalars(namespace)
+
+        # ``no_model`` builds the stub model, which serves synthetic outputs;
+        # it is accepted only together with ``allow_stub``.
         use_stub_model = bool(namespace.no_model)
         if use_stub_model and not bool(namespace.allow_stub):
             raise ValueError(
@@ -451,9 +538,11 @@ class WorkerProcessArgs:
 
 
 def _validate_scalars(namespace: argparse.Namespace) -> None:
-    """Validate positive capacities.
+    """Validate positive capacities and scalar process settings.
 
-    Also normalize optional scalar process settings.
+    Raises:
+        ValueError: If a value is out of range; the message names the launch
+            option.
     """
     positive_fields = {
         "--block-size": namespace.block_size,
@@ -473,6 +562,10 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
     ):
         raise ValueError("--kv-token-capacity must be positive when provided")
 
+    # The frame bounds at 24 frames per second match the validation the
+    # server's configuration applies to the same setting. The upper bound
+    # leaves room in a u32 for the up to 16 frames that the server's frame
+    # alignment (``align_num_frames``) adds.
     max_video_seconds = float(namespace.max_video_seconds)
     if not math.isfinite(max_video_seconds) or max_video_seconds <= 0:
         raise ValueError(
@@ -491,7 +584,12 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
 
 
 def _load_config(namespace: argparse.Namespace) -> IOConfig:
-    """Separate the serialized reader selector into format and loading mode."""
+    """Separate the serialized reader selector into format and loading mode.
+
+    The descriptor carries one ``load_format`` token. A file format implies
+    eager loading; ``dummy`` and ``layered`` select a loading mode and leave
+    the file format to auto-detection.
+    """
     selected = str(namespace.load_format)
     file_format: Literal["auto", "safetensors", "pt"]
     mode: Literal["eager", "layered", "dummy"]
@@ -521,6 +619,7 @@ def _parse_supported_calls(value: object) -> frozenset[CallKind]:
     """
     if value is None:
         value = ",".join(SUPPORTED_CALL_GROUPS)
+
     names = tuple(
         part.strip() for part in str(value).split(",") if part.strip()
     )
@@ -534,6 +633,8 @@ def _parse_supported_calls(value: object) -> frozenset[CallKind]:
         raise ValueError(
             f"unknown call in supported calls {value!r}"
         ) from error
+
+    # Groups are disjoint, so a duplicate call means a repeated group name.
     if len(set(calls)) != len(calls):
         raise ValueError("supported calls contain duplicate entries")
     return frozenset(calls)
@@ -544,7 +645,16 @@ def _parse_mesh(
     *,
     device: str,
 ) -> str | None:
-    """Parse and validate a named device-mesh declaration."""
+    """Parse and validate a named device-mesh declaration.
+
+    The declaration is a comma-separated list of ``key=value`` entries; keys
+    compare case-insensitively with ``_`` and ``-`` equivalent. ``tower`` is
+    the only supported key.
+
+    Returns:
+        The generation device selected by a ``tower`` entry, or ``None`` when
+        the declaration is empty.
+    """
     text = value.strip()
     if not text:
         return None
@@ -573,9 +683,13 @@ def _parse_mesh(
 
 
 def _parse_expert_device(value: str, *, device: str) -> str:
-    """Resolve the optional flow device.
+    """Resolve the generation device of a ``tower`` mesh entry.
 
-    Text stays on the Worker's rank device.
+    The value has the form ``text:<device>;gen:<device>``. The text tower
+    always runs on the rank device, so ``text`` may be omitted and, when
+    given, must name that device. ``gen`` is required and must name a
+    different device; model loading places the flow route, denoiser, and image
+    decoder modules there.
     """
     parameters: dict[str, str] = {}
     for raw_part in value.split(";"):
@@ -591,6 +705,7 @@ def _parse_expert_device(value: str, *, device: str) -> str:
         if normalized_name in parameters:
             raise ValueError(f"duplicate tower params {normalized_name!r}")
         parameters[normalized_name] = target.strip()
+
     if "gen" not in parameters:
         raise ValueError("tower params requires gen:<device>")
 
@@ -608,13 +723,13 @@ def _parse_expert_device(value: str, *, device: str) -> str:
 def _normalize_device(value: object) -> str:
     """Pin an unindexed CUDA device to the concrete index the rank owns.
 
-    The frontend launches single-GPU (tp=1) workers with ``--device cuda`` while
-    the model materializes tensors on ``cuda:0``. Downstream validation compares
-    ``torch.device`` objects, and ``torch.device("cuda")`` (index ``None``) does
-    not equal ``torch.device("cuda:0")`` — so an unindexed device would reject
-    every forward. Each worker process sees its GPU as device 0 under
-    ``CUDA_VISIBLE_DEVICES``, so an unindexed CUDA device resolves to ``cuda:0``
-    (this mirrors the tower-params normalization above).
+    A worker scoped by ``CUDA_VISIBLE_DEVICES`` to one GPU sees it as device 0,
+    so the tensors it creates land on ``cuda:0``. Downstream validation
+    compares ``torch.device`` objects, and ``torch.device("cuda")`` (index
+    ``None``) does not equal ``torch.device("cuda:0")``, so an unindexed
+    device would reject every forward; it therefore resolves to ``cuda:0``.
+    Every other value, including an indexed CUDA device, is returned
+    unchanged. The ``tower`` devices pass through the same normalization.
     """
     import torch
 
@@ -625,7 +740,10 @@ def _normalize_device(value: object) -> str:
 
 
 def _parse_transfer_backends(value: object) -> tuple[str, ...]:
-    """Decode explicit unique physical mechanisms without fallback selection."""
+    """Decode explicit unique physical mechanisms without fallback selection.
+
+    The order of the declared mechanisms is preserved.
+    """
     backends = tuple(part.strip() for part in str(value).split(","))
     if not backends or len(set(backends)) != len(backends):
         raise ValueError("transfer backends must be nonempty and unique")

@@ -1,4 +1,13 @@
-"""Fixed pinned sources with per-slot H2D reuse fences."""
+"""Fixed pinned sources with per-slot H2D reuse fences.
+
+``HostBuffers`` is a small ring of preallocated CPU tensors that callers
+fill on the host and copy to a CUDA device with ``non_blocking=True``. An
+asynchronous copy reads its pinned source after the host call returns, so a
+source must not be rewritten until that copy finishes; each slot therefore
+carries the CUDA event recorded after its last copy. Users include
+``BlockTables``, ``LatentPool``, the model executor's input buffers and
+``EncoderRunner``.
+"""
 
 from __future__ import annotations
 
@@ -8,9 +17,13 @@ from uniserve.runtime.device import canonical_device
 
 
 class HostBuffers:
-    """Own generation-safe CPU sources for asynchronous host-to-device.
+    """Own generation-safe CPU sources for asynchronous host-to-device copies.
 
-    copies.
+    Callers pair every ``acquire`` with a ``record_copy`` of the returned slot
+    after enqueueing the copy that reads it, on the stream that is current at
+    that point. Slots are handed out round-robin rather than tracked as
+    leased: the ``depth``-th later ``acquire`` returns the same slot, and
+    without a ``record_copy`` it waits only on the slot's previous fence.
     """
 
     def __init__(
@@ -21,7 +34,14 @@ class HostBuffers:
         depth: int,
         device: torch.device | str,
     ) -> None:
-        """Allocate a generation-safe ring of pinned host copy sources."""
+        """Allocate a ring of ``depth`` host copy sources of one shape.
+
+        Sources are pinned only when ``device`` is CUDA; for other devices
+        no fences are recorded.
+
+        Raises:
+            ValueError: When ``depth`` is not positive.
+        """
         count = int(depth)
         if count < 1:
             raise ValueError("host staging depth must be positive")
@@ -36,9 +56,13 @@ class HostBuffers:
         self._cursor = 0
 
     def acquire(self) -> tuple[int, torch.Tensor]:
-        """Lease the next pinned host integer buffer and return.
+        """Return the next ring slot and its host tensor.
 
-        its generation-tagged slot.
+        Blocks the calling thread until the slot's previous copy, if any, has
+        completed. The tensor keeps the contents of its previous use.
+
+        Raises:
+            RuntimeError: When the ring has been closed.
         """
         if not self._buffers:
             raise RuntimeError("host staging storage is closed")
@@ -51,7 +75,14 @@ class HostBuffers:
         return slot, self._buffers[slot]
 
     def record_copy(self, slot: int) -> None:
-        """Return a validated host-staging slot to the free ring."""
+        """Fence the copy just enqueued from ``slot`` on the current stream.
+
+        The next ``acquire`` of this slot waits for the recorded event. Does
+        nothing for a non-CUDA device.
+
+        Raises:
+            ValueError: On a CUDA device, when ``slot`` is outside the ring.
+        """
         if self.device.type != "cuda":
             return
         index = int(slot)
@@ -64,9 +95,10 @@ class HostBuffers:
         event.record(torch.cuda.current_stream(self.device))
 
     def close(self) -> None:
-        """Drain copies and release pinned storage while its streams still.
+        """Drain copies and release pinned storage while its streams exist.
 
-        exist.
+        Waits for every recorded copy, then drops the sources and events;
+        a later ``acquire`` raises ``RuntimeError``.
         """
         for event in self._events:
             if event is not None:

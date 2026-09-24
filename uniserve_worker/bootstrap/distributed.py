@@ -1,4 +1,20 @@
-"""Construct process worlds and component fibers in canonical rank order."""
+"""Bind each configured component's mesh onto the worker's process world.
+
+``Worker.from_config`` creates the process world with
+``initialize_process_groups`` and then calls ``initialize_components``, which
+binds every component's ``DeviceMesh`` through ``ProcessGroups.bind`` and
+returns one ``ComponentBinding`` per configured component. A fiber is the
+group of ranks along a selection of mesh axes; with declarations, only the
+fibers a component's calls communicate over (plus ``tp`` for a component with
+a ``CausalLM`` call) are bound, and only a fiber of several ranks receives a
+backend group.
+
+Backend group creation is collective over the whole process world, so every
+rank must request the same multi-rank fibers in the same order. Components are
+visited in sorted name order, and ``Worker.from_config`` passes declarations
+that ``prepare_worker_model`` resolves on every rank from the same
+meta-device skeleton.
+"""
 
 from __future__ import annotations
 
@@ -22,7 +38,27 @@ def initialize_components(
     *,
     declarations: Mapping[str, tuple[Call, ...]] | None = None,
 ) -> dict[str, ComponentBinding]:
-    """Bind declared components to their local meshes and process world."""
+    """Bind declared components to their local meshes and process world.
+
+    Args:
+        groups: The initialized process world of this worker.
+        components: The worker's component placement.
+        declarations: Each component's calls from ``validate_components``.
+            When given, a component binds only the fibers its calls and their
+            entry points communicate over; when ``None``, it binds each
+            individual mesh axis.
+
+    Returns:
+        A binding for every configured component. Only components this rank
+        is a member of have a mesh, participation groups and, for a
+        temporally distributed numerical component, a ``units`` ring.
+
+    Raises:
+        ValueError: Among other causes, when this rank is a member of no
+            component (checked after every rank has taken part in group
+            creation) or when ``ComponentBinding`` finds a placement that
+            disagrees with its mesh.
+    """
     meshes = {}
     rings = {}
     participation = {}
@@ -30,6 +66,8 @@ def initialize_components(
         if component.distribution is not None and is_host_component(name):
             # A host component encodes each media unit independently and
             # exchanges nothing, so its ranks stay outside any collective.
+            # Skipping it on non-members is safe because a one-rank mesh
+            # creates no backend group.
             if groups.rank not in component.ranks:
                 continue
             ranks: tuple[int, ...] = (groups.rank,)
@@ -53,6 +91,11 @@ def initialize_components(
             ranks = (groups.rank,)
         else:
             ranks = component.ranks
+
+        # A non-distributed component's mesh is bound on every rank, members
+        # and non-members alike, so the collective group creation matches. A
+        # distributed component reaches here only on its members, with a
+        # one-rank mesh that creates no backend group.
         topology = DeviceMesh(
             ranks=ranks,
             shape=tuple(
@@ -84,7 +127,8 @@ def initialize_components(
             )
         )
         # Sampling broadcasts the selected token even when the numerical
-        # model produces replicated logits without a tensor-parallel layer.
+        # model produces replicated logits without a tensor-parallel layer;
+        # ``Worker.from_config`` takes this ``tp`` group as its sampling group.
         if declarations is not None and any(
             isinstance(call.module, CausalLM)
             for call in declarations.get(name, ())

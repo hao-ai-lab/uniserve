@@ -1,4 +1,12 @@
-"""Resolved component placement and borrowed numerical calls."""
+"""Resolved component placement and borrowed numerical calls.
+
+A ``ComponentBinding`` records where one model component runs across the
+Worker's ranks. ``uniserve_worker.bootstrap.distributed`` builds one per
+configured component (``ModelExecutor`` builds rank-local ones when none are
+supplied), and ``uniserve_worker.bootstrap.components.bind_components``
+attaches the component's ``Call`` values on member ranks. Runners and lanes
+borrow those calls; they do not own the modules or communicators.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +24,13 @@ from uniserve_worker.protocol.call import CallKind
 
 @dataclass(frozen=True, slots=True)
 class Call:
-    """A borrowed capability method and its numerical participation groups."""
+    """A borrowed capability method and its numerical participation groups.
+
+    ``groups`` lists the communicators the call exchanges tensors in on this
+    rank; ``bind_components`` fills it from the module's communicators, the
+    entry point's declared communication axes and, for a temporally
+    distributed ``VideoPostprocessor``, the component's unit ring.
+    """
 
     path: str
     module: torch.nn.Module
@@ -25,6 +39,7 @@ class Call:
 
     @property
     def forward(self) -> Callable[..., Any]:
+        """The bound entry-point method, resolved on the module per access."""
         return getattr(self.module, self.entry_point.method)
 
 
@@ -33,8 +48,9 @@ class ComponentBinding:
     """A component's placement and borrowed numerical calls.
 
     All ranks retain placement for routing and product sizing. Only members
-    have a mesh; their callable is attached after checkpoint materialization.
-    Lanes reference these calls without copying the component's topology.
+    have a mesh; ``bind_components`` attaches their calls and call kinds
+    after the model is loaded. Lanes reference these calls without copying
+    the component's topology.
     """
 
     name: str
@@ -57,6 +73,9 @@ class ComponentBinding:
                 f"component {self.name} members lie outside its Worker"
             )
 
+        # Mesh agreement is checked only without a distribution: a
+        # ``temporal_units`` member's mesh is that rank alone, which differs
+        # from the configured ranks whenever there are several.
         if self.config.distribution is None:
             if (self.mesh is not None) != self.owns:
                 raise ValueError(
@@ -97,6 +116,9 @@ class ComponentBinding:
         if config.distribution is not None:
             return config.ranks
 
+        # ``pp`` is the outermost axis of ``ParallelConfig.dimensions`` and
+        # ranks map onto the mesh in row-major order, so stage 0 is the
+        # leading ``world_size / pipeline_parallel_size`` ranks.
         width = (
             config.parallel_config.world_size
             // config.parallel_config.pipeline_parallel_size
@@ -110,7 +132,10 @@ class ComponentBinding:
         if config.distribution is not None:
             return config.ranks
 
-        # Only tp coordinate 0 on the last pipeline stage owns each replica.
+        # Only tp coordinate 0 on the last pipeline stage owns each replica;
+        # other axes (context, Ulysses) keep all their ranks. The mesh is an
+        # unbound descriptor used only for coordinate arithmetic, so any
+        # member serves as its ``rank``.
         mesh = DeviceMesh(
             ranks=config.ranks,
             rank=config.ranks[0],

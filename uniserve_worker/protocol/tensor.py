@@ -1,4 +1,14 @@
-"""Logical tensor descriptions used by worker call kinds."""
+"""Logical tensor descriptions used by worker calls.
+
+The engine declares every cross-call tensor as a `TensorRef`: a request-scoped
+identity plus a `DType` and a `ShapeBound` that fix its maximum size before any
+worker runs. The actual shape travels separately with the published transfer.
+`OutputInfo` is the same bounded representation before request binding, as a
+component advertises its results in `ComponentInfo`. These records mirror the
+Rust `uniserve_worker_ipc` tensor types. The PyO3 transport
+(`crates/worker-ipc-py`) constructs `TensorRef`, `ShapeBound`, `StaticDim`,
+and `DeviceDim` positionally, so their field order is part of that contract.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +30,11 @@ from uniserve_worker.protocol.validation import (
 
 
 class DType(StrEnum):
-    """Defines wire-stable scalar dtypes supported by scheduler descriptors."""
+    """Wire-stable element dtypes supported by scheduler descriptors.
+
+    Members are matched by string value. The declaration order differs from
+    the Rust `DType` discriminant order and carries no meaning.
+    """
 
     U8 = "u8"
     I32 = "i32"
@@ -32,7 +46,7 @@ class DType(StrEnum):
 
     @property
     def element_bytes(self) -> int:
-        """Width of one scalar in the logical representation."""
+        """Storage width of one element in bytes."""
         return {
             DType.U8: 1,
             DType.I32: 4,
@@ -53,9 +67,9 @@ class StaticDim:
 
 @dataclass(frozen=True, slots=True)
 class DeviceDim:
-    """Bounds one tensor dimension.
+    """Bounds one tensor dimension whose live extent is chosen on the device.
 
-    The live extent is selected on the device.
+    Storage and `ShapeBound.max_elements` use `bound`.
     """
 
     bound: int
@@ -66,15 +80,17 @@ DimBound: TypeAlias = StaticDim | DeviceDim
 
 @dataclass(frozen=True, slots=True)
 class ShapeBound:
-    """Defines the maximum physical tensor shape allowed for a product."""
+    """The maximum shape a tensor product may take.
+
+    A bound is host-static except for at most one `DeviceDim`. An empty bound
+    denotes a scalar. A bound consisting of a single `DeviceDim` denotes flat
+    capacity: the tensor may have any rank as long as its element count fits.
+    """
 
     dims: tuple[DimBound, ...] = ()
 
     def __post_init__(self) -> None:
-        """Normalize dimensions.
-
-        Rejects empty or non-positive shape bounds.
-        """
+        """Reject more than one `DeviceDim` and any non-positive extent."""
         device_dims = sum(1 for dim in self.dims if isinstance(dim, DeviceDim))
         if device_dims > 1:
             raise invalid_descriptor(
@@ -95,9 +111,13 @@ class ShapeBound:
         return elements
 
     def contains_shape(self, shape: tuple[int, ...]) -> bool:
-        """Check tensor bounds.
+        """Return whether a concrete tensor shape fits this bound.
 
-        A single dynamic dimension denotes flat capacity.
+        Any non-positive extent fails. A scalar bound accepts any shape with
+        exactly one element. A flat-capacity bound accepts any rank whose
+        element count is at most its bound. Otherwise the ranks must match,
+        static extents must be equal, and the device extent must not exceed
+        its bound.
         """
         if any(extent < 1 for extent in shape):
             return False
@@ -117,10 +137,7 @@ class ShapeBound:
     def from_mapping(
         cls, value: object, where: str = "shape_bound"
     ) -> ShapeBound:
-        """Parse static and device-selected dimension bounds.
-
-        Reads the bounds from the wire schema.
-        """
+        """Parse tagged ``static`` and ``device`` dimension variants."""
         data = _map(value, where)
         dims: list[DimBound] = []
         for index, item in enumerate(
@@ -152,7 +169,7 @@ class ShapeBound:
 
 
 def _dim_to_mapping(dim: DimBound) -> dict[str, object]:
-    """Encode a static or symbolic dimension bound for the wire format."""
+    """Encode a static or device dimension bound as a tagged wire variant."""
     if isinstance(dim, StaticDim):
         return {"kind": "static", "value": dim.extent}
     return {"kind": "device", "value": {"max": dim.bound}}
@@ -160,9 +177,9 @@ def _dim_to_mapping(dim: DimBound) -> dict[str, object]:
 
 @dataclass(frozen=True, slots=True)
 class OutputInfo:
-    """Name and bounded representation of a component result.
+    """A component's named tensor result, before request and storage binding.
 
-    Applies before request binding.
+    `ComponentInfo.outputs` lists these for each loaded component.
     """
 
     name: str
@@ -175,7 +192,7 @@ class OutputInfo:
 
     @property
     def max_bytes(self) -> int:
-        """Maximum physical storage required by this Tensor result."""
+        """Maximum storage in bytes: bound element count times dtype width."""
         return self.shape_bound.max_elements * self.dtype.element_bytes
 
     @classmethod
@@ -203,7 +220,12 @@ class OutputInfo:
 
 @dataclass(frozen=True, slots=True)
 class TensorRef:
-    """Identifies tensor storage independently of its role in a computation."""
+    """Identifies tensor storage independently of its role in a computation.
+
+    Carries the identity (owning request, producing call, output index,
+    allocation generation) and the bounded representation (dtype and
+    `ShapeBound`), but not the actual shape or physical location.
+    """
 
     request_key: identity.RequestKey
     producer_call_id: identity.CallId
@@ -217,7 +239,7 @@ class TensorRef:
     )
 
     def __post_init__(self) -> None:
-        """Validate allocation generation and bounded tensor capacity."""
+        """Require a positive generation and re-check the shape bound."""
         if self.generation < 1:
             raise invalid_descriptor(
                 "product reference has no logical generation"
@@ -226,9 +248,12 @@ class TensorRef:
 
     @property
     def buffer_id(self) -> identity.BufferId:
-        """Borrow the immutable storage identity.
+        """Return the `BufferId` that keys this tensor's storage.
 
-        The identity is shared by this reference's consumers.
+        The `BufferId` is derived on first access and memoized in the
+        ``_buffer_id`` slot, so every consumer of this reference shares one
+        instance. The slot's field flags keep it out of the constructor and
+        equality, and `to_mapping` does not emit it.
         """
         buffer_id = self._buffer_id
         if buffer_id is None:
@@ -243,9 +268,10 @@ class TensorRef:
 
     @property
     def max_bytes(self) -> int:
-        """Return the maximum physical bytes allowed.
+        """Maximum storage in bytes: bound element count times dtype width.
 
-        The bound derives from this product’s shape and dtype.
+        `Batch.validate` requires each persistent output's buffer allocation
+        to be at least this large.
         """
         return self.shape_bound.max_elements * self.dtype.element_bytes
 

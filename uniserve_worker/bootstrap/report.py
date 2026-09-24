@@ -1,4 +1,19 @@
-"""Build WorkerInfo from a loaded model and worker resource settings."""
+"""Build WorkerInfo from a loaded model and worker resource settings.
+
+``Worker.__init__`` calls ``build_worker_layout`` after ``ModelExecutor`` has
+bound the model and ``resolve_request_capacity`` has fitted the request pool.
+The resulting ``WorkerLayout`` carries the ``WorkerInfo`` the worker reports
+to the engine (supported calls, batch bounds, request slots, KV cache
+geometry, latent pages, buffer pool size, component products) together with
+the allocation sizes the worker then reserves.
+
+Two sizing paths exist. A token worker (no ``VideoPostprocessor`` and no
+media request state) sizes paged KV, latent pages and text input staging;
+given a storage grant, its KV pool is sized from, or with a configured
+``kv_token_capacity`` checked against, the grant left after its fixed
+allocations. A request-tensor worker (media) holds fixed per-request state
+and products and has no KV cache.
+"""
 
 from __future__ import annotations
 
@@ -74,7 +89,24 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class WorkerLayout:
-    """Resolved worker allocations and their public capacity report."""
+    """Resolved worker allocations and their public capacity report.
+
+    Attributes:
+        info: The capacity report sent to the engine.
+        arena: Latent pool, tensor store, device-product, transfer and
+            host-lane budgets.
+        input_config: Token input staging bounds; ``None`` without a
+            ``CausalLM`` and on a request-tensor worker.
+        fixed_device_bytes: ``(device, bytes)`` reserved outside the KV pool
+            on each device of a token worker; empty on a request-tensor
+            worker. With a KV cache, the primary device's entry is already
+            charged against the KV grant; ``Worker.__init__`` checks each
+            other CUDA device against its own grant.
+        physical_buffer_pool_bytes: Bytes this rank's ``BufferPool`` backs.
+            On a request-tensor rank that backs only some products it is
+            smaller than ``info.buffer_pool_bytes``, and the worker builds a
+            compact pool.
+    """
 
     info: WorkerInfo
     arena: ArenaCapacity
@@ -124,6 +156,19 @@ def build_worker_layout(
     restrictions do not shrink the storage needed by warmup and graph
     capture. ``checkpoint_identity`` is reported as loaded; a model built
     without a checkpoint reports none.
+
+    ``state_buffers`` defaults to the media request state derived from
+    ``bindings``; a non-empty value, or a ``VideoPostprocessor`` in the model,
+    selects the request-tensor path. For a token worker with a ``CausalLM``, a
+    ``capacity_group`` spanning several ranks makes them agree on one KV page
+    count through a collective, so every member must call this.
+
+    Raises:
+        WorkerError: ``queue_depth`` is not positive, or the model serves none
+            of ``allowed_calls``.
+        ValueError: ``completion_payload_bytes`` is not positive, or the KV
+            pool does not fit the storage grant. Errors from the sizing
+            helpers propagate.
     """
     if queue_depth <= 0:
         raise unsupported_setup("worker pipeline depth must be positive")
@@ -190,6 +235,9 @@ def build_worker_layout(
         max_calls = min(max_calls, lane.max_batch_calls or max_calls)
         max_tokens = min(max_tokens, lane.max_batch_tokens or max_tokens)
 
+    # The per-path layouts report every call and media route the model
+    # declares; the fields below narrow them to this placement's held
+    # components and allowed calls.
     outputs = resolve_outputs(model, worker_config)
     held = tuple(name for name, _ in components)
     info = replace(
@@ -255,12 +303,26 @@ def _token_worker_layout(
     bindings: Mapping[str, ComponentBinding] | None,
     checkpoint_identity: str,
 ) -> WorkerLayout:
-    """Size token inputs, paged KV, and latent storage before admission."""
+    """Size token inputs, paged KV, and latent storage before admission.
+
+    Without a configured ``kv_token_capacity``, the KV pool takes the whole
+    pages of its storage grant (``pool_storage_bytes``) left after every
+    fixed allocation on the primary device: the buffer pool and its share of
+    the device products, the latent pool and input staging placed there,
+    block tables, decode state, KV import workspaces, graph padding pages and
+    the graph storage budget. A CUDA device requires that grant; another
+    device without one takes ``derive_runtime_kv_capacity``'s default page
+    count. A configured capacity is checked against the grant when one is
+    given.
+    """
     encoder_cache_entries = (
         worker_config.encoder_cache_entries
         if image_processor is not None
         else 0
     )
+
+    # The one-page cache description supplies the per-token geometry;
+    # ``resize_cache`` attaches the granted page count at the end.
     text = capability(model, CausalLM)
     owns_kv = text is not None
     cache = (
@@ -319,6 +381,10 @@ def _token_worker_layout(
         "max_vision_feature_bytes": max_vision_feature_bytes,
         "bytes_per_token": bytes_per_token,
     }
+
+    # A provisional arena without KV pages supplies the device-product bytes,
+    # which do not depend on the page count; the final arena below is
+    # recomputed with the granted pages, which bound its transfer bytes.
     arena = model_arena_capacity(
         model,
         worker_config,
@@ -341,8 +407,8 @@ def _token_worker_layout(
             )
         )
     )
-    # Every device has its own persistent and product backing. Request tables
-    # and continuation rows are shared across lanes on the primary device.
+    # Every device has its own persistent and product backing; the latent
+    # pool lives on the generation device, or the primary device without one.
     fixed_bytes = dict.fromkeys(
         devices, buffer_pool_bytes + arena.device_product_bytes // len(devices)
     )
@@ -360,6 +426,10 @@ def _token_worker_layout(
         )
         from uniserve_worker.protocol.call import ForwardMode, MediaCall
 
+        # Reserve the input staging ``ModelExecutor`` allocates for each call
+        # this rank owns and each lane serving it, including the prefill row
+        # widening for captured graphs. The worker-wide row and token bounds
+        # are used here, so the reservation covers lanes with narrower bounds.
         staged = buffered_kinds(diffusion=flow is not None)
         for name, calls in describe_components(model).items():
             placement = None if bindings is None else bindings.get(name)
@@ -415,6 +485,10 @@ def _token_worker_layout(
                         field.nbytes for field in allocation.buffers().values()
                     )
 
+        # Block tables (reserved here for one KV group), decode state and the
+        # KV import workspaces are charged to the primary device and shared
+        # by every lane. The workspaces are sized by the same unresolved-call
+        # window the worker gives ``CacheImports``.
         schemas = (
             BlockTables.buffers(
                 group_count=1,
@@ -469,6 +543,8 @@ def _token_worker_layout(
                 token_capacity=blocks * capacity.block_size,
             )
 
+    # ``build_worker_layout`` replaces the supported calls and media routes
+    # with the placement's narrowed values.
     supported = tuple(
         code for code in CALL_KINDS if code in supported_calls(model)
     )
@@ -533,7 +609,13 @@ def _request_tensor_worker_layout(
     bindings: Mapping[str, ComponentBinding] | None,
     checkpoint_identity: str,
 ) -> WorkerLayout:
-    """Describe request tensors, products, and persistent capacity."""
+    """Describe request tensors, products, and persistent capacity.
+
+    ``info.buffer_pool_bytes`` covers every product of every resident request
+    and is the logical pool the engine assigns buffer offsets in; the physical
+    pool backs only the products this rank produces or holds a consumer of
+    (``local_product_storage_bytes``).
+    """
     slots = int(worker_config.max_request_pool_size)
     depth = int(queue_depth)
     unresolved_window = request_tensor_window(depth, slots)
@@ -584,7 +666,8 @@ def _request_tensor_worker_layout(
 
     # A host rank is one codec slot, the same on each of a host worker's
     # ranks, so the engine's ledger admits one host task per rank. Any other
-    # worker's host lane is the arena's executor.
+    # worker's host lane is the arena's executor. ``Worker.__init__`` sizes
+    # its ``HostLane`` by the same rule, so the two must change together.
     host = bindings is not None and holds_host_components(bindings)
     return WorkerLayout(
         info=replace(
@@ -621,7 +704,15 @@ def _kv_residency_shape(
     bytes_per_token: int,
     co_resident_bytes: int,
 ) -> tuple[int, int]:
-    """Describe the single KV pool and co-resident fixed allocations."""
+    """Describe the single KV pool and co-resident fixed allocations.
+
+    Returns:
+        ``(resident_copies, co_resident_blocks)`` for
+        ``derive_runtime_kv_capacity``: one resident KV pool, and the graph
+        padding pages plus the graph storage budget and ``co_resident_bytes``,
+        each of the latter rounded up to whole pages of ``bytes_per_token``
+        per token.
+    """
     block_size = int(worker_config.block_size)
     padding_blocks = graph_padding_block_count(block_size)
     # Captured executables are held for the worker's lifetime, so they occupy

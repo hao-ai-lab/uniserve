@@ -1,4 +1,12 @@
-"""Process launch for one configured worker."""
+"""Process launch for one configured worker rank.
+
+A rank opens its IPC channel endpoint, reports that endpoint to the head over a
+one-shot TCP connection to the registration address, and only then builds the
+``Worker`` (model loading, process groups, resource allocation) and runs its
+blocking serve loop. The endpoint mechanism is the one the launch descriptor's
+``channel_transport`` names: shared storage for a rank on the head's host, a
+TCP socket for a rank elsewhere.
+"""
 
 from __future__ import annotations
 
@@ -52,16 +60,17 @@ def endpoint_name(config: WorkerProcessArgs) -> str:
 def register_endpoint(config: WorkerProcessArgs, endpoint: str) -> None:
     """Report this rank's bound endpoint to the head's registration address.
 
-    One JSON line carries the report; the connection carries nothing else and
-    closes once the head has read it. The endpoint is what the rank actually
-    bound, which for a socket is the address rather than the interface it was
-    given.
+    One JSON line carries the report (``worker_id``, ``rank``, ``transport``
+    and ``endpoint``); the connection carries nothing else and closes after
+    the write. ``endpoint`` is what the channel actually bound.
 
-    A socket endpoint accepts on every interface, so what it bound names none
-    of them and the head cannot dial it. This connection is the answer: its
-    local end is an address of this host that the head, at the other end,
-    routes to, so the report names the rank by that address and the port it
-    bound.
+    A socket endpoint binds every interface, so its bound address names no
+    interface the head can dial. The report therefore replaces the host part
+    with this connection's local address, which is an address of this host
+    that the head routes to, and keeps the bound port.
+
+    A connection failure, including a connect or write that exceeds
+    ``REGISTRATION_TIMEOUT_SECONDS``, raises ``OSError``.
     """
     host, _, port = config.ipc.registration_address.rpartition(":")
     with socket.create_connection(
@@ -80,7 +89,12 @@ def register_endpoint(config: WorkerProcessArgs, endpoint: str) -> None:
 
 
 def run_worker(config: WorkerProcessArgs) -> None:
-    """Own the IPC endpoint around model construction and the blocking run."""
+    """Own the IPC endpoint around model construction and the blocking run.
+
+    Returns when ``Worker.run`` returns. Every exit, including an exception
+    from registration, construction or the run, closes the endpoint, and a
+    constructed worker is closed before it.
+    """
     from uniserve_worker.worker import Worker
 
     endpoint_service = endpoint_name(config)

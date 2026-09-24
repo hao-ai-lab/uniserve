@@ -1,4 +1,10 @@
-"""IPC request dependencies and protocol response envelopes."""
+"""Worker IPC request decoding helpers and response envelopes.
+
+`uniserve_worker.service.Service` uses these to read a request's kind and
+fields and to build the response mapping it hands to the endpoint. The PyO3
+transport (`crates/worker-ipc-py`) decodes result and error responses strictly,
+so the envelope shape built here is part of the wire contract.
+"""
 
 from __future__ import annotations
 
@@ -12,12 +18,16 @@ from uniserve_worker.protocol.worker_info import RequestKind, ResponseKind
 
 
 def response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
-    """Build a protocol response.
+    """Build a response envelope with the kind tag and payload fields.
 
-    With the canonical kind tag and payload fields.
+    Raises:
+        WorkerError: `payload` names a field the envelope does not declare.
     """
     # The envelope carries every field the wire protocol allows; payloads may
     # only override declared fields, leaving the rest at their null defaults.
+    # The null defaults matter: the transport rejects a result response whose
+    # info or error fields (message, code, fatal, phase, route, calls) carry
+    # data, and an error response whose info or result is set.
     response: dict[str, Any] = {
         "kind": kind.value,
         "message_id": None,
@@ -43,7 +53,8 @@ def response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
 def required(request: Mapping[str, Any], field: str, kind: RequestKind) -> Any:
     """Return a required request field.
 
-    Raise a classified descriptor error when it is absent.
+    Raises:
+        WorkerError: The field is absent or None.
     """
     value = request.get(field)
     if value is None:
@@ -55,7 +66,12 @@ def required(request: Mapping[str, Any], field: str, kind: RequestKind) -> Any:
 
 
 def integer(request: Mapping[str, Any], field: str, kind: RequestKind) -> int:
-    """Decode a required request field as a non-negative integer."""
+    """Decode a required request field as a non-negative integer.
+
+    Raises:
+        WorkerError: The field is absent, None, a bool, not an int, or
+            negative.
+    """
     value = required(request, field, kind)
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise invalid_descriptor(
@@ -67,7 +83,11 @@ def integer(request: Mapping[str, Any], field: str, kind: RequestKind) -> int:
 
 
 def request_kind(request: Mapping[str, Any]) -> RequestKind:
-    """Decode and validate the request kind discriminator."""
+    """Decode the request kind discriminator.
+
+    Raises:
+        WorkerError: The kind is not a string or names no `RequestKind`.
+    """
     raw = request.get("kind")
     if not isinstance(raw, str):
         raise invalid_descriptor("worker request kind must be a string")
@@ -80,9 +100,10 @@ def request_kind(request: Mapping[str, Any]) -> RequestKind:
 
 
 def batch_requests(batch: Batch) -> frozenset[int]:
-    """Collect request identifiers referenced by a batch.
+    """Collect the request ids a batch references.
 
-    Admissions, calls, and commands each reference request keys.
+    Admissions, calls, and commands each carry a request key; only its
+    `request_id` is collected, not the engine id or epoch.
     """
     keys = (
         *(admission.request_key for admission in batch.admissions),
@@ -93,9 +114,11 @@ def batch_requests(batch: Batch) -> frozenset[int]:
 
 
 def raw_request_ids(request: Mapping[str, Any]) -> frozenset[int]:
-    """Extract the request identifiers a command touches.
+    """Extract the request ids a raw request's batch references.
 
-    Covers submit and lifecycle commands.
+    Accepts either a decoded `Batch` or its wire mapping under ``"batch"``.
+    Malformed entries are skipped rather than rejected, and a request without
+    a batch yields an empty set.
     """
     requests: set[int] = set()
     batch = request.get("batch")
@@ -138,7 +161,12 @@ def raw_request_ids(request: Mapping[str, Any]) -> frozenset[int]:
 
 
 def finalize_response(response: Mapping[str, Any]) -> dict[str, Any]:
-    """Convert a resident batch result into its transport mapping."""
+    """Replace a `BatchOutput` result with its wire mapping.
+
+    The transport decodes a result response only from plain mappings and
+    lists, so `Service` passes every queued response through this before
+    sending it. Returns a shallow copy; the input mapping is not modified.
+    """
     finalized = dict(response)
     report = finalized.get("result")
     if isinstance(report, BatchOutput):
@@ -159,10 +187,9 @@ def with_message_id(
 def error_response(
     error: WorkerError, request: Mapping[str, Any]
 ) -> dict[str, Any]:
-    """Encode a classified error.
-
-    Preserve the request correlation identifier on the response.
-    """
+    """Encode a classified error, keeping the request's message id."""
+    # WorkerError.to_mapping includes its own "kind", which would collide with
+    # the envelope's kind argument.
     fields = error.to_mapping()
     fields.pop("kind", None)
     return with_message_id(response(ResponseKind.ERROR, **fields), request)

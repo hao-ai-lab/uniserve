@@ -1,4 +1,13 @@
-"""Construct explicit attention inputs from scheduler-assigned page tables."""
+"""Construct explicit attention inputs from scheduler-assigned page tables.
+
+The engine's scheduler assigns each request slot its KV pages; the worker's
+``BlockTables`` hold the installed tables. This module validates one
+homogeneous group of ``AttentionRow`` values against those tables and builds
+the host-side attention input (``PagedInput`` for rows that append to the
+cache, ``SegmentedInput`` for read-only prefix/current calls) that
+``uniserve_worker.model_executor.input_buffers`` then stages into its fixed
+device backing.
+"""
 
 from __future__ import annotations
 
@@ -27,9 +36,26 @@ def cache_pages(
     tables: BlockTables | None,
     cache: KVCacheManager | None,
 ) -> tuple[tuple[tuple[int, ...], ...], int]:
-    """Validate scheduler cache extents and return physical pages and bounded.
+    """Validate scheduler cache extents and resolve each row's physical pages.
 
-    width.
+    Args:
+        tasks: Rows of one attention call; all must share one KV group.
+        tables: Installed request block tables.
+        cache: Resident KV storage, which authorizes each row's write interval.
+
+    Returns:
+        Each row's installed page table, and the block-table width to stage:
+        the longest row rounded up to a power of two and capped at the tables'
+        ``max_blocks_per_request``.
+
+    Raises:
+        WorkerError: An ``invalid_descriptor`` error when ``tasks`` is empty,
+            storage or tables are absent, rows mix KV groups, a length is out
+            of range, a request slot has no installed table, or a row's
+            resulting length exceeds its allocated capacity. Errors from
+            ``cache.require_writable`` for a writing row propagate: a
+            resource error when the interval overlaps a publication or an
+            import destination, or ``invalid_descriptor`` for invalid pages.
     """
     if not tasks:
         raise invalid_descriptor("attention metadata requires forward rows")
@@ -55,6 +81,8 @@ def cache_pages(
     capacities = tuple(
         tables.allocated_length(task.request_pool_idx) for task in tasks
     )
+    # Only rows that write KV extend the cached sequence; read-only rows need
+    # capacity for their prefix alone.
     for task, prefix, query, capacity, row_pages in zip(
         tasks, prefix_lens, query_lens, capacities, pages, strict=True
     ):
@@ -68,9 +96,9 @@ def cache_pages(
                 row_pages, group=group_id, start=prefix, length=query
             )
 
-    # The last shape bucket can end at a non-power-of-two context capacity.
-    # Both resident and staged tables own that exact bound; shape padding
-    # must not invent columns beyond their scheduler-visible page bounds.
+    # Power-of-two widths keep graph shapes few, but the table capacity need
+    # not be a power of two. Resident and staged tables are exactly
+    # ``max_blocks_per_request`` wide, so padding stops at that bound.
     width = min(
         bucketed_length(max(1, max(map(len, pages)))),
         tables.max_blocks_per_request,
@@ -81,9 +109,20 @@ def cache_pages(
 def from_blocks(
     *, pages, query_lengths, prefix_lengths, block_size, causal, write
 ):
-    """Build ordinary paged appends or a read-only prefix/current attention.
+    """Build a paged append input or a read-only prefix/current input.
 
-    call.
+    All arguments align by row. When any row writes, the result is a
+    ``PagedInput`` whose rows with ``write`` false keep their query positions
+    but carry write index -1, the convention for "no cache write" that graph
+    padding in ``graph_inputs.pad_text`` also relies on. When no row writes,
+    the result is a ``SegmentedInput`` in which each query sees its prefix
+    and its whole current segment; that form requires every row to be
+    noncausal. Tensors are built on the host for later staging.
+
+    Raises:
+        ValueError: If a read-only call has a causal row or no host query
+            lengths, if a partially writing call has no write indices, or if
+            the attention input constructors reject the pages and lengths.
     """
     if any(write):
         result = PagedInput.from_blocks(
@@ -107,6 +146,8 @@ def from_blocks(
 
     queries = SequenceLengths.from_lengths(query_lengths, device="cpu")
     prefixes = SequenceLengths.from_lengths(prefix_lengths, device="cpu")
+    # [rows, max pages] int32; short rows are zero-padded and their prefix
+    # lengths bound the valid span.
     table = torch.zeros(
         (len(pages), max(1, max(map(len, pages)))), dtype=torch.int32
     )
@@ -120,8 +161,10 @@ def from_blocks(
     if maximum is None:
         raise ValueError("read-only calls require host query lengths")
 
-    # Read-only rows write no KV and see their whole current segment, so the
-    # per-position visibility end is simply each row's own query length.
+    # Read-only rows write no KV (no write indices) and see their whole
+    # current segment, so the per-position visibility end, [rows, max query],
+    # is each row's own query length and the current segment is fully
+    # visible.
     return SegmentedInput(
         queries,
         prefixes,

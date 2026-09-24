@@ -1,4 +1,17 @@
-"""Pinned output allocations and their CPU/GPU retirement fences."""
+"""Pinned output allocations and their CPU/GPU retirement fences.
+
+Batch execution copies small device results (sampling columns, packed
+logprob columns, call predicates, quantized image bytes) into pinned
+``OutputBuffer`` leases from the worker's bounded ``OutputPool``. Sealing a
+buffer records a completion event per declared CUDA device; ``read_tokens``
+refuses reads until those events complete, and a ``capture_bytes`` caller
+must wait for them itself. Every lease carries a process-wide generation, so
+``observe`` rejects and ``discard`` ignores a completion record from an
+earlier lease of the same buffer. The buffer returns to its pool only once
+every row is observed or discarded (or the lease is abandoned), its events
+are released to the shared ``EventPool``, and every retained CPU reader has
+finished.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +29,8 @@ from uniserve_worker.errors import WorkerError, WorkerErrorCode, resource_error
 from uniserve_worker.profiling import timing_events_enabled
 from uniserve_worker.sampling.output import decode_logprobs
 
+# Next lease generation. It spans every buffer in the process, so a lease's
+# generation is never reused by another lease.
 _next_buffer_generation = 1
 
 
@@ -29,7 +44,18 @@ def _invariant(message: str) -> WorkerError:
 
 
 class OutputBuffer:
-    """Pinned host storage and completion events for one lane commit."""
+    """Pinned host storage and completion events for one lane commit.
+
+    One int64 allocation holds all captures: token captures fill it from the
+    head upward in words, byte captures from the tail downward in bytes, and
+    a capture that would cross the other region fails.
+
+    Each lease reports queued, device, copy and host-observation durations.
+    Device and copy durations come from CUDA timing events when the lease has
+    a CUDA device and ``timing_events_enabled`` holds, from host clocks when
+    the lease has no CUDA device and ``begin_device`` was called, and are
+    zero otherwise.
+    """
 
     __slots__ = (
         "event_pool",
@@ -74,9 +100,23 @@ class OutputBuffer:
         event_pool: EventPool,
         release_to_pool: Callable[[OutputBuffer], None] | None = None,
     ) -> None:
-        """Reserve pinned completion rows and generation-tagged CUDA copy.
+        """Reserve pinned completion rows and generation-tagged CUDA copy state.
 
-        state.
+        Args:
+            rows: Result rows; each must be observed or discarded before the
+                buffer can retire, unless the lease is abandoned.
+            token_capacity: Allocation size in int64 words, shared by token
+                and byte captures.
+            devices: Devices that may produce captures. Non-CUDA devices are
+                dropped, and the allocation is pinned only when a CUDA device
+                remains.
+            event_pool: Owner of every CUDA event this buffer records.
+            release_to_pool: Called once when the lease fully retires.
+
+        Raises:
+            ValueError: ``rows`` is below one.
+            WorkerError: From ``resource_error`` when ``token_capacity`` is
+                below ``rows``.
         """
         global _next_buffer_generation
         count = int(rows)
@@ -161,7 +201,12 @@ class OutputBuffer:
         token_capacity: int,
         devices: Sequence[torch.device | str],
     ) -> None:
-        """Begin a new lease over this persistent pinned allocation."""
+        """Begin a new lease over this persistent pinned allocation.
+
+        The previous lease's events must already be released. The allocation
+        is kept unless the lease needs more words or introduces CUDA producers
+        to pageable storage, and the lease receives a new generation.
+        """
         global _next_buffer_generation
         if not self._events_released or self._release_pending:
             raise _invariant(
@@ -232,14 +277,16 @@ class OutputBuffer:
     def generation(self) -> int:
         """Identify the lease generation guarding all captures from this buffer.
 
-        use.
+        Completion records carry it; ``observe`` rejects and ``discard``
+        ignores a record from another lease.
         """
         return self._generation
 
     def register_device(self, device: torch.device | str) -> None:
-        """Verify that a CUDA producer belongs to the devices declared for this.
+        """Verify that a CUDA producer belongs to this lease's declared devices.
 
-        lease.
+        Non-CUDA devices are always accepted. Raises an invariant violation
+        after the buffer is sealed or for an undeclared CUDA device.
         """
         if self._sealed:
             raise _invariant(
@@ -250,7 +297,12 @@ class OutputBuffer:
             raise _invariant("completion work uses an undeclared CUDA device")
 
     def begin_device(self, device: torch.device | str) -> None:
-        """Mark device execution start and record its optional timing event."""
+        """Mark device execution start and record its optional timing event.
+
+        The first call on any device stamps the host start time. With timing
+        events enabled, the first call per CUDA device records a start event
+        on its current stream.
+        """
         if self._sealed:
             raise _invariant(
                 "completion device timing began after its buffer was sealed"
@@ -273,9 +325,12 @@ class OutputBuffer:
         self._start_events[name] = event
 
     def _mark_copy_started(self, device: torch.device) -> None:
-        """Record the stream event that protects one device-to-host completion.
+        """Mark the start of one device's device-to-host copies for timing.
 
-        copy.
+        The first call stamps the host copy-start time. With timing events
+        enabled, the first call per device records a producer event on its
+        current stream, which ends that device's device interval and starts
+        its copy interval in ``observe``. It is not a completion fence.
         """
         if self._copy_started_ns == 0:
             self._copy_started_ns = time.perf_counter_ns()
@@ -293,9 +348,19 @@ class OutputBuffer:
         self._producer_events[name] = event
 
     def capture(self, tokens: torch.Tensor) -> tuple[int, int]:
-        """Copy a token tensor into the next bounded span of pinned host.
+        """Copy a token tensor into the next bounded span of pinned storage.
 
-        storage.
+        Values are flattened and converted to int64. A CUDA source is copied
+        asynchronously, so the span is readable only through ``read_tokens``
+        once the buffer is ready; a CPU source is copied synchronously.
+
+        Returns:
+            The span's ``(offset, count)`` in int64 words.
+
+        Raises:
+            WorkerError: After sealing, when the span would cross the byte
+                tail, when a CUDA source is on an undeclared device, or when a
+                CUDA copy would target pageable storage.
         """
         if self._sealed:
             raise _invariant(
@@ -328,12 +393,11 @@ class OutputBuffer:
         return offset, count
 
     def capture_bytes(self, value: torch.Tensor) -> torch.Tensor:
-        """Copy uint8 values into the buffer tail and borrow their shaped host.
+        """Copy uint8 values into the buffer tail and borrow their host view.
 
-        view.
-
-        The caller must wait for this buffer's completion before reading the
-        view, and retain a CPU reader until its last asynchronous use finishes.
+        The returned view has the shape of ``value``. The caller must wait for
+        this buffer's completion before reading the view, and retain a CPU
+        reader until its last asynchronous use finishes.
         """
         if value.dtype is not torch.uint8:
             raise ValueError("completion byte capture requires uint8 storage")
@@ -386,9 +450,11 @@ class OutputBuffer:
         )
 
     def seal(self) -> None:
-        """Record completion events for every producer device and prohibit.
+        """Record completion events for every declared device and seal captures.
 
-        additional captures.
+        Each event is recorded on its device's current stream, so it covers
+        the copies enqueued there, and schedules the event pool's completion
+        wake when one is registered. Sealing twice does nothing.
         """
         if self._sealed:
             return
@@ -410,7 +476,11 @@ class OutputBuffer:
         self._bind_completion()
 
     def ready(self) -> bool:
-        """Return whether all sealed device-copy events have completed."""
+        """Return whether all sealed device-copy events have completed.
+
+        The first true result stamps the ready time and resolves the
+        completion future.
+        """
         if not self._sealed:
             return False
         if self._ready_ns:
@@ -422,9 +492,7 @@ class OutputBuffer:
         return True
 
     def completion_future(self) -> concurrent.futures.Future[None]:
-        """Expose this output lease's existing device fence to physical storage.
-
-        owners.
+        """Expose this output lease's device fence to physical storage owners.
 
         The future belongs to this lease even after the pinned buffer is reused.
         It adds no CUDA event or host/device payload allocation.
@@ -438,6 +506,12 @@ class OutputBuffer:
         return future
 
     def _bind_completion(self) -> None:
+        """Arrange for the completion future to resolve once sealed events do.
+
+        Runs once per lease after both sealing and a completion-future
+        request. The future resolves at once when the lease is already ready,
+        its events are released, or it has no CUDA events.
+        """
         future = self._completion_future
         if not self._sealed or future is None or self._completion_registered:
             return
@@ -468,9 +542,10 @@ class OutputBuffer:
             self._resolve_completion(future)
 
     def read_tokens(self, offset: int, count: int) -> tuple[int, ...]:
-        """Read a registered integer range only after its producer copy.
+        """Read a registered integer range once its producer copy completes.
 
-        completes.
+        Values are cached per range. Raises an invariant violation before the
+        buffer is ready or when the range leaves the captured token extent.
         """
         key = (int(offset), int(count))
         cached = self._token_cache.get(key)
@@ -494,9 +569,11 @@ class OutputBuffer:
     def logprob_values(
         self, span: tuple[int, int, int]
     ) -> tuple[float, tuple[tuple[int, float, int], ...]]:
-        """Decode one row.
+        """Decode one row, sharing parsing of its packed column with other rows.
 
-        sharing parsing of its packed column with other rows.
+        ``span`` is the ``(offset, count, row)`` that ``capture_logprobs``
+        returned; the column is decoded once through its recorded
+        ``logprob_layouts`` entry.
         """
         offset, count, index = span
         key = (offset, count)
@@ -509,9 +586,13 @@ class OutputBuffer:
         return details[index]
 
     def observe(self, row: int, generation: int) -> tuple[int, int]:
-        """Mark one result row observed and return copy and host-observation.
+        """Mark one result row observed and return copy and observation timing.
 
-        timing.
+        Returns ``(copy_us, ready_to_observed_us)`` of the lease, computed at
+        its first observation. Observing the last row releases the lease's
+        events. Raises an invariant violation for another lease's generation,
+        an out-of-range row, a buffer that is not ready, or incomplete timing
+        events.
         """
         index = int(row)
         if int(generation) != self._generation:
@@ -584,18 +665,21 @@ class OutputBuffer:
         return self._timing[2], self._timing[3]
 
     def timing(self) -> tuple[int, int, int, int]:
-        """Expose submit, seal, ready.
+        """Return the observed lease's durations in microseconds.
 
-        and observation timestamps for the completed lease.
+        The tuple is ``(queued_us, device_us, copy_us, ready_to_observed_us)``.
+        Raises an invariant violation before the first ``observe``.
         """
         if self._timing is None:
             raise _invariant("completion timing was read before observation")
         return self._timing
 
     def discard(self, row: int, generation: int) -> None:
-        """Retire one unobserved result row while preserving unfinished device.
+        """Retire one unobserved result row while preserving unfinished copies.
 
-        copies.
+        A row of another lease or out of range is ignored. When the last row
+        retires, the events are released at once if the buffer is ready and
+        otherwise deferred to the event pool until the copies complete.
         """
         index = int(row)
         if (
@@ -612,7 +696,11 @@ class OutputBuffer:
                 self._defer_release()
 
     def abandon(self) -> None:
-        """Seal and retire the entire output lease without exposing its rows."""
+        """Seal and retire the entire output lease without exposing its rows.
+
+        Event release is deferred to the event pool while copies are still
+        in flight. Abandoning twice does nothing.
+        """
         if self._abandoned:
             return
         if not self._sealed:
@@ -632,7 +720,11 @@ class OutputBuffer:
         )
 
     def _release_events(self) -> None:
-        """Return all owned device-copy events to the shared event pool."""
+        """Return all owned device-copy events to the shared event pool.
+
+        Callers first establish readiness: ``EventPool.release`` rejects an
+        event whose last reference drops before it completes.
+        """
         if self._events_released or self._release_pending:
             return
         for event in self._all_events():
@@ -641,9 +733,9 @@ class OutputBuffer:
         self._return_to_pool()
 
     def _defer_release(self) -> None:
-        """Defer buffer reuse until every outstanding device-copy event.
+        """Defer buffer reuse until every outstanding copy event completes.
 
-        completes.
+        The event pool calls ``events_released`` once they do.
         """
         if self._events_released or self._release_pending:
             return
@@ -658,16 +750,22 @@ class OutputBuffer:
             self._return_to_pool()
 
     def events_released(self) -> None:
-        """Receive completion of an event-pool asynchronous release."""
+        """Receive completion of an event-pool asynchronous release.
+
+        Also resolves the completion future and returns the buffer to its
+        pool when no CPU reader remains.
+        """
         self._release_pending = False
         self._events_released = True
         self._complete_dependents()
         self._return_to_pool()
 
     def retain_cpu_reader(self) -> Callable[[], None]:
-        """Retain pinned storage until a configured CPU task finishes reading.
+        """Retain pinned storage until a CPU task finishes reading it.
 
-        it.
+        Returns the release callable, which the reader calls once; the buffer
+        is not returned to its pool while a reader remains. Raises an
+        invariant violation once the buffer has returned to its pool.
         """
         with self._reader_lock:
             if self._released_to_pool:
@@ -683,9 +781,10 @@ class OutputBuffer:
         self._return_to_pool()
 
     def _return_to_pool(self) -> None:
-        """Return storage only after both device writes and CPU readers.
+        """Return storage only after both device writes and CPU readers retire.
 
-        retire.
+        Runs at most once per lease; a buffer without a pool owner is never
+        returned.
         """
         with self._reader_lock:
             if (
@@ -700,7 +799,12 @@ class OutputBuffer:
 
 
 class OutputPool:
-    """Bounded owner of reusable pinned lane-output allocations."""
+    """Bounded owner of reusable pinned lane-output allocations.
+
+    At most ``capacity`` buffers are ever allocated, and no lease may exceed
+    ``max_words`` int64 words. A retired buffer is reused, grown if needed,
+    by a later lease.
+    """
 
     def __init__(
         self,
@@ -728,9 +832,11 @@ class OutputPool:
         token_capacity: int,
         devices: Sequence[torch.device | str] = (),
     ) -> OutputBuffer:
-        """Lease a reset or newly allocated output buffer within startup row.
+        """Lease a reset or newly allocated output buffer within pool bounds.
 
-        and byte bounds.
+        Raises ``resource_error`` when ``token_capacity`` exceeds
+        ``max_words``, the pool is closed, or all ``capacity`` buffers are
+        leased; the leased buffer's own row-count checks also apply.
         """
         words = int(token_capacity)
         if words > self.max_words:
@@ -758,9 +864,9 @@ class OutputPool:
             return buffer
 
     def _release(self, buffer: OutputBuffer) -> None:
-        """Accept a released completion buffer back into the bounded free.
+        """Accept a released completion buffer back into the bounded free list.
 
-        list.
+        Returns after close are dropped.
         """
         with self._lock:
             if self._closed:
@@ -770,9 +876,11 @@ class OutputPool:
             self._free.append(buffer)
 
     def close(self) -> None:
-        """Stop admission and retire every output lease through its existing.
+        """Stop admission and retire every lease through its device fences.
 
-        device fences.
+        Seals and synchronizes every lease whose events are not yet released,
+        then abandons every lease, so the final ``EventPool.reap`` finds each
+        buffer's events complete and runs any deferred release.
         """
         with self._lock:
             self._closed = True

@@ -1,4 +1,13 @@
-"""Worker graph shapes, stable numerical inputs and captured call ownership."""
+"""Worker graph shapes, stable numerical inputs and captured call ownership.
+
+Text calls replay graphs captured at configured bucket shapes. Selection
+(``text_shape``) picks a bucket for a staged batch, ``pad_text`` widens the
+batch's views of the runner's fixed staging to that bucket and makes the
+padding inert, and ``capture_batch``/``replay_batch`` capture and replay the
+call together with graph-capturable greedy decoding. The ``select_*``
+helpers turn configured sizes into the capture shapes ``ModelExecutor``
+prepares at startup.
+"""
 
 from __future__ import annotations
 
@@ -31,6 +40,13 @@ from uniserve_worker.sampling.result import (
 
 @dataclass(frozen=True, slots=True)
 class DiffusionShape:
+    """An image-denoising capture shape.
+
+    ``rows`` images of ``height`` x ``width`` pixels, each evaluated for
+    ``cfg_branches`` guidance branches, so one call holds
+    ``rows * cfg_branches`` sequences.
+    """
+
     rows: int
     height: int
     width: int
@@ -39,6 +55,21 @@ class DiffusionShape:
 
 @dataclass(frozen=True, slots=True)
 class PrefillShape:
+    """A prefill capture bucket.
+
+    Attributes:
+        token_bucket: Flat token count the bucket pads to.
+        row_bucket: Row count the bucket pads to, including one padding
+            sequence: ``text_shape`` only selects a bucket with more rows than
+            the batch.
+        live_rows: Row count of the startup capture batch in
+            ``uniserve_worker.model_executor.startup.prepare_prefill``;
+            ``select_prefill_captures`` sets it to the next smaller
+            configured row size, one for the smallest.
+        causal: Attention causality of every row.
+        selection: Output selection of every row.
+    """
+
     token_bucket: int
     row_bucket: int
     live_rows: int
@@ -58,9 +89,14 @@ def select_flow_captures(
     physical_tokens: Callable[[int, int], int],
     image_tokens: Callable[[int, int], int],
 ) -> tuple[DiffusionShape, ...]:
-    """Intersect configured shapes with staging.
+    """Keep the configured shape combinations that fit staging capacity.
 
-    per-image and latent capacity.
+    Every combination of image shape, request count and guidance-branch
+    count is kept when the request count is positive and at most
+    ``max_calls``, its requests times branches sequences fit ``max_tokens``
+    flat tokens as counted by ``physical_tokens``, one image fits
+    ``per_image_capacity`` latent units, and all images fit
+    ``latent_capacity``.
     """
     return tuple(
         DiffusionShape(rows, height, width, branches)
@@ -79,8 +115,14 @@ def select_prefill_captures(
 ):
     """Build prefill capture buckets from configured token and row sizes.
 
-    Each row bucket carries the previous bucket's row count as its live-row
-    minimum, so a bucket only serves batches larger than the next smaller one.
+    ``text_shape`` routes a batch only to a row bucket strictly larger than
+    its row count, leaving room for the padding sequence, so row sizes
+    of one are dropped and each bucket's ``live_rows`` is the next smaller
+    configured row size (one for the smallest). Buckets are built while
+    their ``live_rows`` fits ``max_rows``; a bucket's own row count is the
+    configured size and may exceed ``max_rows``, since a full batch still
+    needs a strictly larger bucket. With ``visual``, each shape is also
+    captured for noncausal rows selecting logits or hidden states.
     """
     buckets: list[PrefillShape] = []
     variants: tuple[tuple[bool, TokenSelection], ...] = (
@@ -115,7 +157,12 @@ def select_prefill_captures(
 
 
 def bind_attention(static, live):
-    """Pair captured addresses with the current host sequence metadata."""
+    """Pair captured addresses with the current host sequence metadata.
+
+    Returns ``static`` with its device tensors unchanged and the host query
+    and prefix lengths taken from ``live``, for
+    ``ExecutionContext.bind_attention`` planning before a replay.
+    """
     return replace(
         static,
         queries=replace(static.queries, host=live.queries.host),
@@ -124,9 +171,21 @@ def bind_attention(static, live):
 
 
 def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
-    """Choose a resident bucket with the call's attention and output.
+    """Choose a bucket with the call's attention and output semantics.
 
-    semantics.
+    Returns:
+        ``(rows, tokens, width, decode)`` for ``pad_text``, where ``width``
+        is the block-table width to stage (at least ``context_blocks``). A
+        single-token causal decode batch selecting last logits uses the
+        first configured decode size at least its row count, with
+        ``tokens == rows``. Any other batch, or a decode batch no decode size
+        fits, uses the smallest prefill shape, by rows then tokens, with more
+        rows than the batch and at least its token count. None when the
+        input is not paged text, rows mix causality or output selection, a
+        row has no query token, or no configured shape fits.
+
+    Raises:
+        ValueError: If the attention input has no host query lengths.
     """
     inputs = batch.inputs
     if not isinstance(inputs, TextInput) or not isinstance(
@@ -175,9 +234,15 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, context_blocks):
 
 
 def _fixed_view(tensor, shape):
-    """Borrow a leading view of shape from a bucket tensor's captured.
+    """Borrow a view of ``shape`` from where ``tensor`` starts in storage.
 
-    storage.
+    The view keeps ``tensor``'s strides and may extend past its extent into
+    the fixed staging buffer it views, which is how a live batch grows to
+    its bucket shape without a copy.
+
+    Raises:
+        ValueError: If the rank differs, an extent is negative, or the view
+            would end past the underlying storage.
     """
     strides = tensor.stride()
     if len(shape) != tensor.ndim or any(value < 0 for value in shape):
@@ -200,6 +265,11 @@ def pad_text(batch, rows, tokens, width, decode):
     Physical block zero is valid storage. Padding queries read disposable values
     but never write a block: their write indices are -1 and their results are
     discarded. Prefill padding belongs to one additional numerical sequence.
+
+    The batch's tensors must be views of the runner's fixed staging: padding
+    is written in place past the live extents, and the returned batch views
+    the same storage at the bucket shape. Padding rows use request slot zero,
+    which the block tables reserve for padding.
     """
     inputs, live_rows = batch.inputs, batch.row_count
     attention, live_tokens = inputs.attention, inputs.input_ids.numel()
@@ -319,12 +389,14 @@ def widen_prefix(batch, width):
 
 
 def restore_writes(batch, cache: PrefixCache | None):
-    """Snapshot complete touched cache blocks.
+    """Snapshot the cache blocks the batch writes and return its restorer.
 
-    including scales and initialization.
-
-    Capturing or warming a call is observationally neutral to the live prefix.
-    Reading addresses here is startup preparation, outside graph capture.
+    Blocks are snapshotted only when ``cache`` is given and the attention
+    input has write indices. Each block is saved whole, quantization buffers
+    and initialized flags included, along with ``decode_force_finish`` when
+    present, so capturing or warming a call leaves the live prefix
+    unchanged. Reading write addresses to the host happens here, during
+    startup preparation, outside graph capture.
     """
     snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
     attention = getattr(batch.inputs, "attention", None)
@@ -360,7 +432,12 @@ def restore_writes(batch, cache: PrefixCache | None):
 def capture_batch(
     context, batch, call, *, pools=None, cache=None, predicates=None
 ):
-    """Capture numerical batch output and greedy decoding on common backing."""
+    """Capture numerical batch output and greedy decoding on common backing.
+
+    The graph returns ``(ExecutionOutput, SamplerOutput | None)`` and retains
+    ``batch`` as its fixed input. The state ``restore_writes`` snapshots is
+    restored after the warm call and after capture.
+    """
     with context.activate():
         attention = getattr(batch.inputs, "attention", None)
         if attention is not None:
@@ -377,7 +454,12 @@ def capture_batch(
 
 
 def replay_batch(graph: CUDAGraphRunner, batch, *, rows=None, borrow=False):
-    """Replay staged inputs and retain the live output rows."""
+    """Replay staged inputs and retain the live output rows.
+
+    ``rows`` is the live row count (default: ``batch.row_count``); outputs of
+    padding rows are dropped. With ``borrow``, the result views the graph's
+    output storage, which the next replay overwrites; otherwise it is cloned.
+    """
     context = graph.executable.context
     with context.activate():
         graph.inputs.copy(batch)
@@ -425,9 +507,17 @@ def greedy_decode(
     output: ExecutionOutput,
     predicate_state: torch.Tensor | None,
 ) -> SamplerOutput | None:
-    """Derive graph-capturable greedy tokens and continuation state from model.
+    """Derive graph-capturable greedy tokens and continuation state.
 
-    logits.
+    Returns None unless the batch is paged text input with one query token
+    per row, ``predicate_state`` and ``decode_force_finish`` are present,
+    every row selects last logits with one output per row, and all rows
+    share one vocabulary partition. Otherwise a row is ``valid`` when its
+    maximum logit is finite, ``active`` when its request's predicate is set,
+    and continues when valid, active and not forced to finish.
+
+    Raises:
+        ValueError: If the per-row logits are not one contiguous tensor.
     """
     force_finish = batch.decode_force_finish
     if (
@@ -463,8 +553,10 @@ def greedy_decode(
     tags = torch.where(continuation, TOKEN_CONTINUATION_BIT, 0)
     tagged_tokens = tokens.bitwise_or(tags)
 
-    # Fixed four-section layout [valid | active | tokens | reserved] per row;
-    # trim_greedy depends on these exact sections when slicing padded rows.
+    # Four row-length sections [valid | active | tokens | accepted], the
+    # layout ``uniserve_worker.sampling.sampler.sampling_columns`` builds;
+    # greedy decode accepts no drafts, so the last is zero. trim_greedy
+    # slices padded rows per section.
     completion = torch.cat(
         (
             valid,

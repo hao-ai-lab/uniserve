@@ -1,4 +1,12 @@
-"""Worker completion records and response serialization."""
+"""Worker completion records and response serialization.
+
+A rank reports each submitted batch as one `BatchOutput`: a `RequestOutput`
+per call plus the tensor products successful calls published. The execution
+package builds these records once every call's output has materialized on the
+host; `messages.finalize_response` serializes them with `to_mapping` for the
+PyO3 transport (`crates/worker-ipc-py`), which decodes the mapping into the
+Rust `BatchOutput`.
+"""
 
 from __future__ import annotations
 
@@ -29,8 +37,7 @@ from uniserve_worker.protocol.validation import (
 
 
 def _logprob_entries(value: object) -> tuple[tuple[int, float, int], ...]:
-    """Read ranked scores carried directly by a result record."""
-    # Each entry decodes to (token_id, logprob, rank) for one candidate token.
+    """Decode ranked candidates as ``(token_id, logprob, rank)`` tuples."""
     entries = []
     for item in _seq(value, "logprob entries"):
         data = _map(item, "logprob entry")
@@ -54,9 +61,10 @@ def _logprob_value(value: object) -> float:
 
 @dataclass(frozen=True, slots=True)
 class FinishFlags:
-    """Records length, stop-token, EOS, and forced termination conditions.
+    """Device-observed finish candidates for a token call.
 
-    The conditions describe generated output.
+    `eos` means an end-of-sequence token was selected, `length` that the
+    length limit was reached, and `stop` that a stop condition matched.
     """
 
     eos: bool = False
@@ -82,9 +90,9 @@ class FinishFlags:
 
 @dataclass(frozen=True, slots=True)
 class TimingCounters:
-    """Accumulates queue, device, copy, and host execution time.
+    """Per-call queue, device, copy, and host time in microseconds.
 
-    All values are in microseconds.
+    Accounting only; timings are not part of any call identity.
     """
 
     queued_us: int = 0
@@ -96,10 +104,7 @@ class TimingCounters:
     def from_mapping(
         cls, value: object, where: str = "timing_counters"
     ) -> TimingCounters:
-        """Parse nonnegative queue, device, copy, and host timings.
-
-        All values are in microseconds.
-        """
+        """Parse non-negative microsecond timings; absent fields are zero."""
         data = _map(value, where)
         return cls(
             queued_us=_uint(data.get("queued_us", 0), f"{where}.queued_us"),
@@ -120,12 +125,18 @@ class TimingCounters:
 
 @dataclass(frozen=True, slots=True)
 class PosixShmArtifact:
-    """Identifies a completed media artifact stored in POSIX shared storage."""
+    """Identifies a completed media artifact stored in POSIX shared storage.
+
+    The worker writes the bytes and closes its mapping before publishing the
+    name (`uniserve_worker.media.storage.publish_media_bytes`); the engine
+    claims the object by name, which unlinks it, when it receives the batch
+    result.
+    """
 
     name: str
 
     def __post_init__(self) -> None:
-        """Validate the shared-storage artifact name and byte length."""
+        """Require a non-empty object name without a path separator."""
         if not self.name or "/" in self.name:
             raise invalid_descriptor(
                 "POSIX shared-storage artifact name is invalid"
@@ -135,7 +146,7 @@ class PosixShmArtifact:
     def from_mapping(
         cls, value: object, where: str = "artifact handle"
     ) -> PosixShmArtifact:
-        """Parse and validate a POSIX shared-storage media handle."""
+        """Parse a ``{"transport": "posix_shm", "value": {...}}`` handle."""
         data = _map(value, where)
         if data.get("transport") != "posix_shm":
             raise invalid_descriptor(f"{where}.transport is invalid")
@@ -149,19 +160,13 @@ class PosixShmArtifact:
 
 @dataclass(frozen=True, slots=True)
 class MediaOutput:
-    """Describes a produced media artifact.
-
-    Covers format, dimensions, duration, and storage reference.
-    """
+    """A completed media artifact: its storage handle and length in bytes."""
 
     handle: PosixShmArtifact
     bytes: int
 
     def __post_init__(self) -> None:
-        """Validate media format, dimensions, and duration.
-
-        Also validates artifact consistency.
-        """
+        """Require a positive byte length."""
         if self.bytes < 1:
             raise invalid_descriptor("media output locator is invalid")
 
@@ -185,38 +190,64 @@ class MediaOutput:
 
 @dataclass(frozen=True, slots=True)
 class RequestOutput:
-    """A call completion with accepted progress and tokens.
+    """One call's completion: status, accepted progress, tokens, and products.
 
-    Also carries products and timing.
+    A successful call reports the request's coordinates after it ran; a
+    predicated call did not run and reports the request's accepted
+    coordinates.
     """
 
     request_key: identity.RequestKey
     call_id: identity.CallId
     status: CallStatus
+    # Allocation generations of the products the call emitted.
     product_generations: tuple[int, ...]
+    # Set exactly when status is ERROR.
     error_code: ErrorCode | None
     timing_counters: TimingCounters
+    # Kind of the call that produced this result; the engine requires it to
+    # match the submitted call.
     kind: CallKind
+    # Logical position of the request's next input token.
     position: int
+    # Accepted KV prefix a successor may attend to, in tokens.
     kv_visible_len: int
+    # KV extent execution initialized, in tokens, including rejected
+    # speculative positions.
     kv_computed_len: int
+    # Denoising steps completed for the request.
     num_completed_steps: int
+    # Token ids the sampler accepted.
     committed_tokens: tuple[int, ...]
     finish_flags: FinishFlags
     media_output: MediaOutput | None = None
+    # KV publication; only a successful KV_PUBLISH call carries one.
     kv_output: transfer.KvTransfer | None = None
+    # Natural-log probability of the final accepted token, when requested.
     sampled_logprob: float | None = None
+    # Ranked (token_id, logprob, rank) candidates for the final accepted token.
     top_logprobs: tuple[tuple[int, float, int], ...] = ()
+    # Ranked candidates for each scored prompt position, in input order.
     prompt_logprobs: tuple[tuple[tuple[int, float, int], ...], ...] = ()
 
     def validate(self) -> None:
-        """Verify completion coherence.
+        """Check that identity, status, coordinates, and outputs agree.
 
-        Status, products, errors, and timing must form a coherent
-        completion.
+        `PendingOutput.materialize` in `uniserve_worker.execution.output`
+        calls this on every completion it builds, and `from_mapping` on every
+        parsed one.
+
+        Raises:
+            WorkerError: The call id is not positive; a KV publication is
+                attached to anything but a successful KV_PUBLISH of this
+                call; the visible KV extent exceeds the computed one; a
+                coordinate is negative; the error code does not match the
+                status; or a predicated completion carries tokens,
+                logprobs, products, or finish flags.
         """
         if self.call_id.batch_id < 1:
             raise invalid_descriptor("completion call id must be positive")
+
         if self.kv_output is not None and (
             self.status is not CallStatus.OK
             or self.kind is not TransferMode.KV_PUBLISH
@@ -271,10 +302,7 @@ class RequestOutput:
     def from_mapping(
         cls, value: object, where: str = "completion"
     ) -> RequestOutput:
-        """Parse a completion.
-
-        Enforces its status-specific result and error rules.
-        """
+        """Parse a completion mapping and run `validate` on the result."""
         data = _map(value, where)
         record = cls(
             request_key=identity.RequestKey.from_mapping(
@@ -341,9 +369,11 @@ class RequestOutput:
         return record
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode one call completion.
+        """Encode the completion into the wire mapping the transport decodes.
 
-        Includes accepted progress, products, timing, and error metadata.
+        The request-key, finish-flag, and timing mappings are written
+        inline; they must stay identical to those records' `to_mapping`
+        output.
         """
         flags = self.finish_flags
         key = self.request_key
@@ -399,9 +429,16 @@ class RequestOutput:
 
 @dataclass(frozen=True, slots=True)
 class ForwardStats:
-    """Aggregates model-path, attention, graph, and relay measurements.
+    """Aggregate model-forward counters reported with a batch result.
 
-    Also aggregates speculative-decoding measurements for a run.
+    Covers forward modes, component time, attention, CUDA graphs, decode
+    relays, FlashInfer decode planning, and speculative verification. Every
+    field is either an ``int`` or a ``str -> int`` mapping; `combine` and
+    `to_mapping` iterate the dataclass fields generically and depend on that.
+    `to_mapping` emits every field by name, and the PyO3 decoder
+    (`forward_stats_from_py` in `crates/worker-ipc-py`) requires each counter
+    of the Rust `ForwardStats`, so a field renamed or removed here fails the
+    whole batch result.
     """
 
     mode_counts: Mapping[str, int] = field(default_factory=dict)
@@ -439,9 +476,10 @@ class ForwardStats:
 
     @classmethod
     def combine(cls, values: Sequence[ForwardStats]) -> ForwardStats:
-        """Sum scalar and keyed counters.
+        """Sum scalar counters and per-key mapping counters across values.
 
-        Does not change their wire definitions.
+        An empty sequence yields zeroed stats, and a single value is returned
+        as-is. The first value's field type decides how each field is merged.
         """
         if not values:
             return cls()
@@ -468,9 +506,12 @@ class ForwardStats:
     def from_mapping(
         cls, value: object, where: str = "worker forward stats"
     ) -> ForwardStats:
-        """Parse aggregate execution counters.
+        """Parse forward counters; absent fields default to zero or empty.
 
-        Rejects malformed mode, backend, or speculative statistics.
+        Raises:
+            WorkerError: `value` or a keyed field is not a mapping, a
+                mapping key is not a string, or a counter is not a
+                non-negative integer.
         """
         data = _map(value, where)
 
@@ -589,10 +630,7 @@ class ForwardStats:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Serialize scalar and keyed execution counters.
-
-        Uses plain wire values.
-        """
+        """Serialize every counter field, copying mappings into plain dicts."""
         return {
             name: dict(value) if isinstance(value, Mapping) else value
             for name, value in (
@@ -604,7 +642,12 @@ class ForwardStats:
 
 @dataclass(frozen=True, slots=True)
 class BatchOutput:
-    """One batch's complete result, carrying only host-owned values."""
+    """One batch's complete result, carrying only materialized host values.
+
+    `BatchState.take_output` in `uniserve_worker.execution.batch` builds it
+    with only the product publications of calls that completed with status
+    OK; the record itself does not check this.
+    """
 
     batch_id: int
     completions: tuple[RequestOutput, ...] = ()
@@ -616,10 +659,7 @@ class BatchOutput:
     def from_mapping(
         cls, value: object, where: str = "completion report"
     ) -> BatchOutput:
-        """Parse the unchanged flat response fields.
-
-        Adds no execution wrappers.
-        """
+        """Parse a batch result mapping, validating each completion."""
         data = _map(value, where)
         return cls(
             batch_id=_uint(data.get("batch_id"), f"{where}.batch_id"),
@@ -652,10 +692,7 @@ class BatchOutput:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode final values in protocol order.
-
-        Pending resources cannot enter this type.
-        """
+        """Encode the result into the mapping the transport decodes."""
         return {
             "batch_id": self.batch_id,
             "completions": [value.to_mapping() for value in self.completions],

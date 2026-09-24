@@ -1,4 +1,22 @@
-"""Build homogeneous model calls and publish their results."""
+"""Build homogeneous model calls and publish their results.
+
+``schedule`` drives one batch's calls through dependency rounds; this module
+holds the stages of a round that contains numerical work. Per diffusion step
+offset, ``prepare_diffusion_step`` stages each open trajectory's guidance
+branches (running any missing branch prefixes first),
+``prepare_forward_rows`` builds the round's token, encoder, denoiser and
+image-decoder rows, ``forward_values`` runs them through
+``ModelExecutor.forward``, ``publish_forward_values`` turns the values into
+samples, features, images or retained denoiser predictions, and
+``integrate_predictions`` advances each solver and finishes a trajectory at
+its last step.
+
+Shared conventions: a call is named by its ``index`` into ``scheduled``, and
+``outcomes`` maps an index to the ``PendingOutput`` that finished it in this
+batch. The stages skip an index already in ``outcomes`` (and leave it out of
+the rows they pass on), so a call that finishes early (for example a prefill
+with no token output) drops out of the remaining stages and steps.
+"""
 
 from __future__ import annotations
 
@@ -68,7 +86,29 @@ def forward_values(
     states: DecodeState | None,
     sampling_group: Communicator | None,
 ) -> tuple[ForwardValue | None, ...]:
-    """Bind numerical outputs to calls and attribute execution statistics."""
+    """Bind numerical outputs to calls and attribute execution statistics.
+
+    Runs ``inputs`` through ``ModelExecutor.forward`` and returns one
+    ``(value, request_pool_index, graph_sample, layout)`` tuple per input row,
+    in input order. ``graph_sample`` is the row's graph-replayed greedy
+    selection when ``token.graph_decode_samples`` accepts it for the whole
+    output group, and None when the group is sampled eagerly; eager groups
+    are materialized first (waiting on the forward's output event and
+    gathering vocabulary shards). Each group's ``ForwardStats`` is appended
+    to ``state.forward_stats``.
+
+    With ``retain_sampling``, the graph's greedy output is cloned before it
+    is bound. A batch of single-token last-logits decode rows borrows the
+    graph's output storage, which the next replay overwrites; ``schedule``
+    sets the flag while later step offsets remain in the batch.
+
+    Raises:
+        BaseException: The error that failed any output group, re-raised as
+            yielded by ``ModelExecutor.forward``.
+        RuntimeError: When an output lacks statistics or request slot views.
+    """
+    # A call's staged CUDA device must be one the batch's output buffer
+    # declares; ``register_device`` also fails once the buffer is sealed.
     for row, _call in inputs:
         state.output_buffer.register_device(model_runner.call_devices(_call)[1])
 
@@ -137,9 +177,13 @@ def _publish_samples(
     decode_state: DecodeState | None,
     sampling_group: Communicator | None,
 ) -> None:
-    """Sample compatible token rows and publish their request-visible.
+    """Sample token rows and publish their request-visible results.
 
-    results.
+    Each candidate is ``(index, row, logits, sampling_metadata,
+    graph_sample)``; exactly one of the last two is set. Rows without a graph
+    selection are sampled together in one ``sample`` call, the selections are
+    captured into the batch's output buffer, token products are published,
+    and each call's outcome is staged into ``outcomes``.
     """
     from uniserve_worker.execution import token
 
@@ -222,7 +266,14 @@ def initialize_trajectories(
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
 ) -> tuple[dict[int, DiffusionState], int]:
-    """Open diffusion trajectories and return the longest declared interval."""
+    """Open diffusion trajectories and return the longest declared interval.
+
+    Opens a ``DiffusionState`` for every live denoising call in
+    ``numerical`` and returns them by index together with the largest
+    ``step_count`` among their staged latent parameters (1 when none is
+    open). The caller runs that many step offsets; a shorter trajectory drops
+    out once its own interval ends.
+    """
     from uniserve_worker.execution import diffusion
 
     trajectories: dict[int, DiffusionState] = {}
@@ -269,7 +320,14 @@ def prepare_diffusion_step(
     sampling_group: Communicator | None,
     tokenizer: PreTrainedTokenizerBase | None,
 ) -> dict[int, tuple[tuple[Branch, ...], torch.Tensor]]:
-    """Prepare one solver step and materialize any missing CFG prefixes."""
+    """Prepare one solver step and materialize any missing guidance prefixes.
+
+    For each live trajectory whose interval covers ``offset``, stages the
+    step's guidance branches and timestep, returned by index. A branch whose
+    KV prefix is not yet materialized comes back from
+    ``diffusion.prepare_step`` as a prefix row; those rows run through one
+    ``forward_values`` call here, before the denoiser rows that read them.
+    """
     from uniserve_worker.execution import diffusion, token
 
     step_inputs: dict[int, tuple[tuple[Branch, ...], torch.Tensor]] = {}
@@ -328,6 +386,9 @@ def prepare_diffusion_step(
             continue
 
         value, _sampling_index, _selection, _layout = numerical_result
+        # The prefix fills a guidance branch's KV slot rather than extending
+        # the request's own sequence, so its extent is validated without
+        # staging a runtime cache length for the request.
         token.commit_kv(
             task,
             task.query_tokens,
@@ -336,7 +397,8 @@ def prepare_diffusion_step(
             request_tables=request_tables,
             decode_state=decode_state,
         )
-        # The branch's prefix is now materialized up to the committed rows.
+        # An entry is (pool slot, KV group, materialized prefix length, token
+        # capacity); the branch's prefix now extends over the committed rows.
         kv = diffusion.kv_conditioning(trajectories[index])
         entry = kv.entries[branch]
         kv.entries[branch] = (
@@ -364,7 +426,16 @@ def prepare_forward_rows(
     model_runner: ModelExecutor,
     decode_state: DecodeState | None,
 ) -> tuple[list[tuple[int, InputRow]], dict[int, PreparedImage]]:
-    """Build homogeneous numerical rows for the current dependency frontier."""
+    """Build homogeneous numerical rows for the current dependency frontier.
+
+    Returns ``(index, row)`` pairs for the forward and the prepared encoder
+    images by index. Only open trajectories run after the first step offset;
+    every other call builds its row at offset 0. A trajectory contributes one
+    denoiser row per guidance branch, so an index can appear more than once.
+    An image-decoding call without a latent input finishes here without a
+    forward (``image.diffusion_finalize_frames``), and rows whose call
+    finished during preparation are dropped from the result.
+    """
     from uniserve_worker.execution import diffusion, image, token
 
     forward: list[tuple[int, InputRow]] = []
@@ -387,6 +458,8 @@ def prepare_forward_rows(
                     "trajectory call has no staged latent inputs"
                 )
 
+            # The model sees only the first ``latent_units`` rows of the
+            # page-sized staging.
             rows = diffusion.flow_rows(
                 diffusion.require_inputs(model_runner),
                 trajectories[index],
@@ -432,6 +505,8 @@ def prepare_forward_rows(
                     image.encode_row(cast(MediaCall, call.kind), prepared),
                 )
             )
+        # The remaining calls are image decodes. Without a latent input the
+        # decoded image is already a resident product and only needs encoding.
         elif call.latent_input is None:
             outcomes[index] = image.diffusion_finalize_frames(
                 call,
@@ -492,7 +567,19 @@ def publish_forward_values(
     sampling_group: Communicator | None,
     config: WorkerConfig,
 ) -> dict[int, list[torch.Tensor]]:
-    """Publish completed numerical values and retain diffusion predictions."""
+    """Publish completed numerical values and retain diffusion predictions.
+
+    Dispatches each forward value by its call: denoiser predictions are
+    collected per trajectory index and returned for
+    ``integrate_predictions``; sequence rows become sampling candidates (or
+    finish directly when ``token.prepare_sampling`` returns an outcome);
+    encoder values publish features; image-decoder values publish images.
+    All sampling candidates are then sampled and published together.
+
+    Raises:
+        ValueError: When an image decoder's output layout declares no value
+            range.
+    """
     from uniserve_worker.execution import image, token
 
     predictions: dict[int, list[torch.Tensor]] = defaultdict(list)
@@ -510,6 +597,9 @@ def publish_forward_values(
             # A sequence call's row comes from token.prepare_forward.
             assert isinstance(task, (TokenRow, DiffusionRow))
             if graph_sample is not None:
+                # A graph-sampled decode commits its one token as
+                # ``token.prepare_sampling`` does for an eager decode: without
+                # staging a runtime cache length.
                 request = state.pending_output(call.request_key.request_id)
                 token.commit_kv(
                     task,
@@ -590,9 +680,12 @@ def integrate_predictions(
     model_runner: ModelExecutor,
     config: WorkerConfig,
 ) -> None:
-    """Advance diffusion solvers and publish trajectories at their final.
+    """Advance diffusion solvers and publish trajectories at their final step.
 
-    step.
+    ``predictions`` holds one denoiser output per guidance branch, in the
+    branch order ``prepare_diffusion_step`` staged. The solver integrates them
+    into the call's latent staging in place; when ``offset`` is the
+    trajectory's last step, ``diffusion.finish`` stages its outcome.
     """
     from uniserve_worker.execution import diffusion
 

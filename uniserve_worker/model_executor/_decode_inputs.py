@@ -4,6 +4,13 @@ The Triton kernel gathers live request rows, expands their paged-cache tables,
 derives each token's cache write location, and initializes inactive capacity in
 one launch. This keeps graph-replayed decode inputs internally consistent while
 the scheduler changes the set of live request slots.
+
+`TokenBuffers` in `uniserve_worker.model_executor.input_buffers` uses it for
+a call without prepared attention whose rows are all request-indexed decode
+rows, when the request state is resident on the lane's CUDA device. That
+state comes from `BlockTables` (page tables and verified cache lengths) and
+`DecodeState` (next tokens and logical lengths), both indexed by request
+slot.
 """
 
 from __future__ import annotations
@@ -19,7 +26,9 @@ except Exception:
     tl = None
 
 if triton is not None:
-
+    # Request counts and table extents change during serving. Keeping them as
+    # unspecialized runtime values means an arrival does not load another
+    # kernel variant.
     @triton.jit(do_not_specialize=["rows", "table_width", "group_id"])
     def _gather_request_decode_inputs_kernel(
         request_pool_indices,
@@ -55,10 +64,11 @@ if triton is not None:
 
         Rows are selected by request slot.
         """
-        # Request counts and table extents change during serving. Keep them as
-        # runtime values so an arrival does not load another kernel variant.
-        # The scalar CTA reads the same request state as table-copy CTAs. Its
-        # scan has no dependency on their stores and needs no global barrier.
+        # Program 0 writes every per-row scalar column; the other programs
+        # copy block-table cells. Their outputs are disjoint, and the only
+        # input program 0 stores to (``request_pool_indices`` past ``rows``)
+        # is never loaded by the table programs, which read slots only for
+        # live rows, so no global barrier is needed.
         if tl.program_id(0) == 0:
             offsets = tl.arange(0, row_block)
             scalar_mask = offsets < max_rows
@@ -96,10 +106,15 @@ if triton is not None:
                 write_pages.to(tl.int64) * page_size + cache % page_size,
                 -1,
             )
+            # Padded rows are redirected to slot 0, the permanent inactive
+            # slot of `BlockTables` and `DecodeState`.
             tl.store(
                 request_pool_indices + offsets, 0, mask=scalar_mask & ~live_rows
             )
             tl.store(input_ids + offsets, tokens, mask=scalar_mask)
+
+            # Only the first axis carries the token position; the spatial axes
+            # of three-axis multimodal positions stay zero for text tokens.
             for axis in tl.static_range(position_axes):
                 tl.store(
                     positions + axis * position_axis_stride + offsets,
@@ -109,6 +124,10 @@ if triton is not None:
             tl.store(cache_lengths + offsets, cache, mask=scalar_mask)
             tl.store(query_lengths + offsets, 1, mask=scalar_mask)
             tl.store(write_indices + offsets, writes, mask=scalar_mask)
+
+            # Exclusive prefix sums over the full capacity: every row,
+            # including padding, has one query token, and padded rows add no
+            # cached tokens.
             tl.store(query_offsets, 0)
             tl.store(prefix_offsets, 0)
             tl.store(query_offsets + offsets + 1, offsets + 1, mask=scalar_mask)
@@ -171,10 +190,29 @@ def gather_request_decode_inputs(
     The function materializes their selected KV-group page tables, next-token
     ids and position axes, cache/query lengths and offsets, and append indices.
     Output rows beyond ``rows`` are initialized for safe fixed-shape graph
-    replay. Every tensor must reside on the same CUDA device.
+    replay: token id 1, zero positions and cache length, one query token, a
+    zeroed table row, and the write-index sentinel -1. The function also
+    overwrites ``request_pool_indices[rows:]`` with slot 0.
+
+    Every tensor must reside on the same CUDA device. The kernel honors the
+    strides of ``request_page_tables``, the first-axis strides of
+    ``request_tokens`` and ``request_positions``, the row stride of
+    ``block_tables`` and the axis stride of ``positions``; every other
+    dimension is indexed with unit stride, which is checked only for the
+    columns of ``positions``.
+
+    Raises:
+        ValueError: When the tensors are not on one CUDA device, ``rows`` is
+            outside ``[1, request_pool_indices.numel()]``, a table has the
+            wrong rank, capacity or group, ``page_size`` is not positive,
+            ``positions`` is not one or three unit-stride axes, or an output
+            buffer is smaller than the capacity requires.
+        RuntimeError: When Triton is unavailable or cannot launch on the
+            device.
     """
-    # A single-device requirement lets the fused kernel dereference every input
-    # directly and prevents partially staged graph inputs.
+    # The fused kernel dereferences every tensor directly, so all must share
+    # one CUDA device. All validation precedes the launch, so a rejected call
+    # stages nothing.
     tensors = (
         request_pool_indices,
         request_page_tables,
@@ -246,7 +284,9 @@ def gather_request_decode_inputs(
     if min(query_offsets.numel(), prefix_offsets.numel()) < max_rows + 1:
         raise ValueError("request-indexed decode offset buffers are undersized")
 
-    # One CTA produces all scalar columns; the remaining CTAs copy table cells.
+    # One program produces all scalar columns over a power-of-two row block
+    # (``tl.arange`` extents must be powers of two) masked to ``max_rows``;
+    # the remaining programs copy ``block`` table cells each.
     block = 256
     _gather_request_decode_inputs_kernel[
         (1 + triton.cdiv(int(block_tables.numel()), block),)

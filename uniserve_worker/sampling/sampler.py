@@ -1,4 +1,17 @@
-"""Batched numerical token selection, predicates, and speculative acceptance."""
+"""Batched numerical token selection, predicates, and speculative acceptance.
+
+``sample`` groups sampled calls by device, vocabulary size, and path, then
+runs one of three selectors per group: device greedy argmax, the compiled
+fixed-top-k sampler (``uniserve.sampling.sample_top_k``), or the general path
+that shapes logits (``_shape_sampling_logits_batch``), inverts the categorical
+CDF with the call's precomputed semantic RNG draws (argmax at zero
+temperature), and resolves speculative acceptance. Every path then resolves
+predicates, finish, and transition decisions as device tensors and packs the
+completion column that output capture copies to the host. With a
+``selection_broadcast``, the source rank's selection replaces each rank's own
+before those decisions, so tensor-parallel ranks resolve them from one common
+selection.
+"""
 
 from __future__ import annotations
 
@@ -29,9 +42,11 @@ from uniserve_worker.sampling.result import (
 
 
 def device_greedy_parameters(parameters: SamplingParams) -> bool:
-    """Return whether sampling parameters reduce exactly to unpenalized greedy.
+    """Return whether parameters reduce exactly to unpenalized greedy selection.
 
-    selection.
+    Any logprob request also disqualifies, because the device greedy path
+    produces no logprobs. Callers additionally require no allowed-token
+    restriction and no drafts before taking that path.
     """
     return (
         float(parameters.temperature) <= 0.0
@@ -54,7 +69,26 @@ def sample(
     *,
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> tuple[SamplerRow, ...]:
-    """Shape and draw every compatible sampling row in each device batch."""
+    """Shape and draw every compatible sampling row in each device batch.
+
+    Args:
+        tasks: One ``SamplingMetadata`` per sampled call.
+        selection_broadcast: Publishes the source rank's selection tensor to
+            every tensor-parallel rank. It must overwrite the tensor it is
+            given in place: the greedy and fused paths ignore its return
+            value, and the general path reads the broadcast tensor back.
+
+    Returns:
+        One ``SamplerRow`` per task, in ``tasks`` order. Rows of one group
+        share a ``SamplerOutput`` batch.
+
+    Raises:
+        WorkerError: ``INVALID_DESCRIPTOR`` when a task's logits, rows, draws,
+            parameter values, or draft tokens are malformed;
+            ``UNSUPPORTED_SETUP`` when its vocabulary exceeds the tagged-token
+            range or fused top-k sampling cannot launch on its device.
+    """
+    # Validate each task and assign it to a (device, vocab, path) group.
     grouped: dict[
         tuple[torch.device, int, int], list[tuple[int, SamplingMetadata]]
     ] = defaultdict(list)
@@ -146,6 +180,8 @@ def sample(
             (index, task)
         )
 
+    # Sample each group with one batched selection and scatter its rows back
+    # to their task positions.
     result: list[SamplerRow | None] = [None] * len(tasks)
     for (_device, _vocab, sampling_path), compatible in grouped.items():
         indexes, group = zip(*compatible, strict=True)
@@ -179,10 +215,14 @@ def sample_device_greedy_group(
     apply_suppression: bool,
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
 ) -> tuple[SamplerRow, ...]:
-    """Resolve predicates, greedy tokens, finish state.
+    """Resolve greedy tokens, predicates, finish state, and completion values.
 
-    and completion values for a group.
+    Every task has exactly one row (``sample`` enforces this), so the group's
+    logits form a [tasks, vocab] matrix. With ``apply_suppression``, each
+    task's ``suppress`` ids are masked on a float32 copy before argmax.
     """
+    # Borrow one view when the task rows already sit adjacent in one storage;
+    # otherwise concatenate them.
     logits = adjacent_view(tuple(task.logits for task in tasks))
     if logits is None:
         logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
@@ -199,6 +239,8 @@ def sample_device_greedy_group(
                 if 0 <= token_id < vocab:
                     selection_logits[row_index, token_id].fill_(float("-inf"))
 
+    # A row is usable only with no NaN or +inf entries and at least one finite
+    # candidate, the same rule the shaping path applies.
     device_tokens = torch.argmax(selection_logits, dim=-1)
     valid = (
         ~torch.isnan(selection_logits).any(dim=-1)
@@ -246,9 +288,13 @@ def sample_device_greedy_group(
 
 
 def _fused_top_k(task: SamplingMetadata, vocab: int) -> int:
-    """Return a fused top-k width when the task is supported by the compiled.
+    """Return the task's fused top-k width, or 0 when the kernel cannot run it.
 
-    kernel.
+    The compiled sampler applies temperature, top-p, and min-p within an
+    exact top-k candidate set. It supports no penalties, allowed-token
+    restriction, suppression, logit bias, typical-p, or drafts, and this
+    path is taken only for CUDA logits. The ``top_k <= 128`` and
+    ``top_k < vocab`` bounds match the ones ``sample_top_k`` itself enforces.
     """
     if task.logits.device.type != "cuda":
         return 0
@@ -281,9 +327,10 @@ def _sample_fused_top_k_group(
     *,
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
 ) -> tuple[SamplerRow, ...]:
-    """Sample a homogeneous fused-top-k group and return its numerical.
+    """Sample a group sharing one fused top-k width and return its rows.
 
-    selections.
+    Logprobs, when any task requests them, are scored from the general
+    shaping path's logits while the kernel's selected tokens are kept.
     """
     # The compiled kernel consumes one contiguous column for each sampling
     # input, so compatible task rows are concatenated before a single launch.
@@ -376,9 +423,12 @@ def _sample_task_group(
     *,
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
 ) -> tuple[SamplerRow, ...]:
-    """Sample arbitrary compatible tasks, resolve speculative acceptance.
+    """Sample tasks through the general shaping path.
 
-    and capture outputs.
+    Handles any combination of penalties, allowed tokens, suppression, bias,
+    and truncation, and resolves speculative acceptance for draft chains.
+    Each task contributes all of its candidate rows to one flattened matrix;
+    the output holds one selection per task.
     """
     # Flatten task-local candidate rows into one sampling matrix while retaining
     # offsets needed to restore one selected result per call.
@@ -424,8 +474,12 @@ def _sample_task_group(
         torch.argmax(work, dim=-1),
     )
 
-    # Speculative tasks accept the longest matching draft prefix. A terminal
-    # prefix selects its final draft token without adding a continuation point.
+    # Speculative tasks accept the longest prefix where row i's selection
+    # equals draft i. Without a terminal prefix, the output row is the first
+    # mismatching row, whose selection is the correction, or the bonus row
+    # after a full match. Reaching a terminal prefix clamps acceptance to it
+    # and emits its final draft token instead of the output row's selection,
+    # so the emitted-token count adds no extra token.
     accepted_counts: list[torch.Tensor] = []
     accepted_token_counts: list[torch.Tensor] = []
     terminal_finishes: list[torch.Tensor] = []
@@ -514,6 +568,8 @@ def _sample_task_group(
     tagged_tokens = tagged_token_values(task_tokens, continuation_values)
     span = sampling_columns(task_valid, active, task_tokens, counts)
 
+    # A terminal selection emits the finish draft token, which was scored by
+    # the verification row before the output row.
     details = logprob_details(
         work,
         output_indexes - terminal_finish.to(dtype=torch.long),
@@ -548,9 +604,16 @@ def sampling_columns(
     tokens: torch.Tensor,
     accepted: torch.Tensor,
 ) -> torch.Tensor:
-    """Pack validity, activity, token.
+    """Pack validity, activity, token, and acceptance into one column.
 
-    and acceptance vectors into completion storage.
+    The result is ``[valid | active | token | accepted]``, each section one
+    row per call, with every value promoted to one common dtype.
+    ``capture_samples`` in ``uniserve_worker.execution.output`` copies this
+    column into completion storage, and graph-replayed greedy decode builds
+    the same layout.
+
+    Raises:
+        RuntimeError: The four vectors differ in length.
     """
     count = int(tokens.numel())
     if (
@@ -580,9 +643,14 @@ def sampled_finish_values(
     device_tokens: torch.Tensor,
     valid: torch.Tensor,
 ) -> torch.Tensor:
-    """Evaluate per-row terminal token policies entirely on the sampling.
+    """Evaluate per-row terminal token policies on the sampling device.
 
-    device.
+    A row finishes when it is valid and either forced to finish or its token
+    is in its finish set. ``valid`` is the caller's eligibility mask; every
+    caller passes ``valid & active``.
+
+    Raises:
+        RuntimeError: The per-row inputs differ in length.
     """
     count = len(finish_token_ids)
     tokens = device_tokens.reshape(-1)
@@ -640,10 +708,14 @@ def _sample_predicates(
     tasks: tuple[SamplingMetadata, ...],
     device: torch.device,
 ) -> torch.Tensor:
-    """Collect one active predicate per task.
+    """Collect one boolean active predicate per task.
 
-    decoding tagged continuation values when needed.
+    A task without a predicate is active. A tagged predicate is an int64
+    token relay, active when its continuation bit is set; an untagged one is
+    converted to bool.
     """
+    # When every predicate is a tagged relay, the relay scalars are joined
+    # (as one view when adjacent) and decoded with a single comparison.
     if tasks and all(
         task.predicate is not None and task.tagged_predicate for task in tasks
     ):
@@ -677,9 +749,14 @@ def tagged_token_values(
     *,
     in_place: bool = False,
 ) -> torch.Tensor:
-    """Pack token identifiers with continuation flags into signed 64-bit relay.
+    """Pack token ids with continuation flags into int64 relay values.
 
-    values.
+    Returns ``tokens | TOKEN_CONTINUATION_BIT`` where ``continuation`` holds,
+    flattened. The result is a new tensor unless ``in_place`` is true, in
+    which case the flags are ORed into ``tokens.reshape(-1)``.
+
+    Raises:
+        RuntimeError: ``tokens`` and ``continuation`` differ in length.
     """
     if int(tokens.numel()) != int(continuation.numel()):
         raise RuntimeError(
@@ -699,9 +776,18 @@ def _sampled_transition_values(
     *,
     destination: torch.Tensor | None = None,
 ) -> dict[int, torch.Tensor]:
-    """Match selected tokens against requested transition sets and return.
+    """Match selected tokens against each call's transition token set.
 
-    numerical row views.
+    Only tasks with ``return_transition`` participate. A transition requires
+    a valid, active selection whose token is in the task's
+    ``transition_token_ids``.
+
+    Returns:
+        A map from task index to a one-element boolean view of its decision.
+        When ``destination`` is supplied, the views alias it.
+
+    Raises:
+        RuntimeError: The per-task vectors or ``destination`` do not align.
     """
     # Only calls declaring a transition product participate; indexes keep
     # their token and eligibility rows aligned after filtering.
@@ -724,8 +810,8 @@ def _sampled_transition_values(
     selected_tokens = select_device_values(tokens, indexes)
     selected_eligibility = select_device_values(eligibility, indexes)
 
-    # Captured graphs may supply fixed destination storage. Its one-bit row
-    # shape must exactly match the selected product subset.
+    # A supplied destination must hold exactly one bool per participating
+    # task, on the tokens' device.
     target: torch.Tensor | None = None
     if destination is not None:
         target = destination.reshape(-1)
@@ -785,9 +871,12 @@ def _resolve_sampled_finish_values(
     active: torch.Tensor,
     terminal_finish: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Combine token, speculative-terminal, validity.
+    """Combine token, speculative-terminal, validity, and activity policies.
 
-    and activity finish policies.
+    Returns:
+        ``(finish, continuation)``: a call finishes when it is valid, active,
+        and either matches its finish policy or accepted a terminal draft
+        prefix; it continues when it is valid, active, and not finished.
     """
     finish_values = sampled_finish_values(
         tuple(task.finish_token_ids for task in tasks),
@@ -802,7 +891,11 @@ def _resolve_sampled_finish_values(
 def select_device_values(
     values: torch.Tensor, indexes: tuple[int, ...]
 ) -> torch.Tensor:
-    """Gather device values at a validated tuple of host-selected indices."""
+    """Gather device values at host-selected indices.
+
+    Returns the flattened input itself for the identity selection and a view
+    when the selected elements are adjacent; otherwise concatenates them.
+    """
     flat = values.reshape(-1)
     if len(indexes) == int(flat.numel()) and all(
         index == expected for expected, index in enumerate(indexes)
@@ -823,7 +916,26 @@ def _shape_sampling_logits_batch(
     suppressed_tokens: Sequence[tuple[int, ...]],
     penalty_counts: Sequence[torch.Tensor | None],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply the canonical shaping and truncation order to a logits matrix."""
+    """Apply the canonical shaping and truncation order to a logits matrix.
+
+    Stages run in this order on a float32 copy: allowed-token restriction,
+    suppression, penalties, logit bias, temperature, top-k with nested top-p,
+    full-vocabulary top-p, min-p, and typical-p. Temperature, top-p, and
+    min-p values come from the ``parameter_values`` columns. ``parameters``
+    decides which rows take the top-k, full-vocabulary top-p, min-p, and
+    typical-p stages and supplies the top-k, penalty, bias, and typical-p
+    values. Out-of-vocabulary ids in the allowed, suppressed, and bias sets
+    are ignored.
+
+    Returns:
+        ``(work, valid)``: the shaped [rows, vocab] float32 logits with
+        dropped tokens at -inf, and whether each row keeps a usable
+        distribution.
+
+    Raises:
+        WorkerError: The per-row sequences do not match the logits rows
+            (``INVALID_DESCRIPTOR``).
+    """
     work = logits.to(dtype=torch.float32, copy=True)
     row_count, vocab = (int(value) for value in work.shape)
     if any(
@@ -881,9 +993,8 @@ def _shape_sampling_logits_batch(
             float("-inf"),
         )
 
-    # Penalties over the device-resident committed count base. Each penalty row
-    # carries a dense per-vocabulary count vector (committed generated tokens
-    # plus any speculative prefix); repetition is multiplicative and sign-aware,
+    # Penalties apply to tokens with a positive count in the row's
+    # ``penalty_counts`` vector: repetition is multiplicative and sign-aware,
     # frequency scales with the count, and presence is a flat once-appeared
     # subtraction. Masked (-inf) entries are preserved.
     penalty_rows = [
@@ -962,6 +1073,8 @@ def _shape_sampling_logits_batch(
 
     # Top-k truncation; top-p is applied within each retained top-k candidate
     # set, so rows sharing a width are truncated in one gather/sort pass.
+    # ``top_k_candidates`` is shared with ``sample_top_k``, so both paths keep
+    # the same candidates, including ties at the top-k and nucleus bounds.
     top_k_groups: dict[int, list[int]] = defaultdict(list)
     for index, row in enumerate(parameters):
         top_k = int(row.top_k)
@@ -979,6 +1092,8 @@ def _shape_sampling_logits_batch(
         work.index_copy_(0, indexes, truncated)
 
     # Full-vocabulary top-p truncation for rows without a top-k restriction.
+    # The token that first crosses top_p is kept: each drop decision is
+    # shifted one position to the right.
     top_p_rows = tuple(
         index
         for index, row in enumerate(parameters)
@@ -1082,9 +1197,26 @@ def logprob_details(
     output_tokens: torch.Tensor,
     parameters: Sequence[SamplingParams],
 ) -> LogprobValues | None:
-    """Compute selected-token, top-k.
+    """Compute selected-token, top, and requested-token logprobs and ranks.
 
-    and requested-token log probabilities and ranks.
+    Scores are ``log_softmax`` of the shaped logits, only for calls whose
+    parameters request logprobs. Ranks are 1-based competition ranks: one
+    plus the number of strictly larger scores in the row.
+
+    Args:
+        work: Shaped [rows, vocab] logits.
+        output_rows: Per call, the ``work`` row that scored its selection.
+        output_tokens: Per call, the selected token.
+        parameters: Per call, its sampling parameters.
+
+    Returns:
+        ``LogprobValues`` whose int64 column concatenates these row-major
+        fields over the requesting calls: selected token, selected score
+        bits, selected rank, top token ids, top score bits, top ranks,
+        requested score bits, and requested ranks. Top fields are
+        ``max_count`` wide and requested fields ``max_requested`` wide.
+        ``decode_logprobs`` in ``uniserve_worker.sampling.output`` reverses
+        this layout. None when no call requests logprobs.
     """
     vocab = int(work.shape[1])
     requested_rows = tuple(
@@ -1197,7 +1329,10 @@ def logprob_details(
         )
 
     def float_bits(values: torch.Tensor) -> torch.Tensor:
-        """Encode float32 values as unsigned-preserving integer bit patterns."""
+        """Reinterpret float32 values as int32 bit patterns widened to int64.
+
+        The widening sign-extends, so decoders keep only the low 32 bits.
+        """
         return (
             values.to(dtype=torch.float32)
             .contiguous()
@@ -1230,8 +1365,8 @@ def logprob_details(
 def broadcast_selection(
     group: Communicator | None, value: torch.Tensor
 ) -> torch.Tensor:
-    """Publish selected tokens through the bound tensor-parallel.
+    """Broadcast a selection tensor in place from the group's rank 0.
 
-    communicator.
+    With no communicator the value is returned unchanged.
     """
     return value if group is None else group.broadcast(value, src=0)

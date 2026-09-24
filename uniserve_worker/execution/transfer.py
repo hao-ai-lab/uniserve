@@ -1,4 +1,19 @@
-"""Product, KV, and latent movement with no model call."""
+"""Product, KV, and latent movement with no model call.
+
+``execute`` runs the ``TransferMode`` calls that ``schedule`` dispatches: KV
+publication and installation through ``KVCacheManager``, and product
+transfers that republish one resident tensor or the committed trajectory's
+current latent pages. The publication helpers are shared with the image,
+media, diffusion and host-media call paths.
+
+Every tensor publication checks the physical tensor against the product's
+declared shape bound, dtype and byte size before exporting it. Publications made
+during execution record their locators on the call's ``PendingOutput``:
+``commit.commit_batch`` makes the exports visible and
+``commit.discard_batch`` releases the locators of a failed batch.
+``publish_deferred_product`` runs after its call committed and registers and
+commits its export with ``TensorStore`` directly.
+"""
 
 from __future__ import annotations
 
@@ -54,9 +69,19 @@ def execute(
     request_tables: BlockTables | None,
     model_runner: ModelExecutor,
 ) -> PendingOutput:
-    """Execute a tensor transfer or KV publication/install call and stage.
+    """Execute one transfer call and stage its outcome.
 
-    its result.
+    ``KV_PUBLISH`` exports the request's visible KV extent under the call's
+    KV output identity. ``KV_INSTALL`` adopts the physical import reserved
+    for the call's KV input and sets the staged visible and computed KV
+    lengths to its published extent. Any other mode republishes the call's
+    single tensor input as its single output.
+
+    Raises:
+        WorkerError: ``unsupported_setup`` when no publication transport or,
+            for a latent transfer, no latent pool is configured;
+            ``invalid_descriptor`` when, for example, KV storage, a declared
+            identity or a reserved input is missing.
     """
     from uniserve_worker.execution import image
 
@@ -77,6 +102,8 @@ def execute(
                 "KV publication requires a cache output identity"
             )
         request = state.pending_output(request_id)
+
+        # (request slot, cache group, accepted visible length, capacity).
         cache = calls.cache_coordinates(request, tables=request_tables)
         snapshot = publications.publish(
             request_pool_idx=request.request.request_pool_idx,
@@ -182,7 +209,14 @@ def _publish_current_latent(
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
 ) -> TensorPublication:
-    """Publish the committed trajectory's current latent pages as a product."""
+    """Publish the committed trajectory's current latent pages as a product.
+
+    ``LatentPool.reserve_current_publication`` requires the staged start
+    step, the input's generation, units, raster and pages to match the
+    slot's committed trajectory. The product must be the call's declared
+    latent output, and publication leaves the request's generation and step
+    unchanged.
+    """
     if product != call.latent_output:
         raise invalid_descriptor(
             "product transfer changes the physical product kind"
@@ -226,9 +260,13 @@ def publish_latent_source(
     latent_pool: LatentPool,
     publication_transports: Mapping[str, Transport],
 ) -> TensorPublication:
-    """Register exact latent page spans and retain their bank for every.
+    """Publish reserved latent page spans as one latent product.
 
-    reader.
+    The spans are published as a ``[latent_units, latent_width]`` tensor in
+    the pool's storage dtype. Each publication's retirement future is
+    attached through ``LatentPool.retain_publication``, which keeps the page
+    bank until its readers retire. The locators are recorded on the
+    product's pending output.
     """
     params = row.latent.input_params
     if params is None:
@@ -286,8 +324,10 @@ def publish_tensors(
 ) -> tuple[TensorPublication, ...]:
     """Publish each numerical result from the rank owning its assigned region.
 
-    A product published as `host` travels as host bytes over the host
-    mechanism of the rank's edges, whatever device produced it.
+    Only outputs for which this rank holds a non-feature write are published;
+    the others are skipped, so the result may hold fewer publications than
+    ``values``. A product published as `host` travels as host bytes over the
+    host mechanism of the rank's edges, whatever device produced it.
     """
     outputs = call.outputs
     if len(outputs) != len(values):
@@ -323,10 +363,23 @@ def publish_product(
     consumers: Sequence[int] = (),
     host: bool = False,
 ) -> TensorPublication:
-    """Publish a typed device, encoder or artifact product.
+    """Publish one encoder-feature or device product from ``value``.
+
+    A product the call reserved as a feature write carries its spatial
+    dimensions from ``FeatureMetadata`` and its source kind from the
+    producing call's vision or latent feature input. Any other product
+    fills its bound device write, possibly as a region of a larger logical
+    tensor. The value is validated against the declared representation,
+    written through ``TensorStore.publish_write`` and exported; the locators
+    are recorded on the product's pending output.
 
     `consumers` are the acknowledgment slots the producing call names; a
     `host` product is published as host bytes.
+
+    Raises:
+        WorkerError: ``unsupported_setup`` without a publication transport;
+            ``invalid_descriptor`` when the metadata, region or
+            representation disagrees with the product.
     """
     from uniserve_worker.execution.image import bound_device_write
 
@@ -351,6 +404,8 @@ def publish_product(
         else bound_device_write(product, state=state)
     )
 
+    # A value with `ImageMetadata` that declares a range names it: [-1, 1] is
+    # "signed_unit" and any other range "unit". Otherwise the range is empty.
     height = 0 if source_metadata is None else source_metadata.height
     width = 0 if source_metadata is None else source_metadata.width
     value_range = (
@@ -384,6 +439,8 @@ def publish_product(
     elif height == 0 and value_range:
         raise invalid_descriptor("non-image tensor carries an image range")
 
+    # A region write publishes `value` at its offset within the write's
+    # logical shape, which is what the descriptor reports.
     region = None if device_write is None else device_write.region
     if region is not None and tuple(value.shape) != _slices.shape(region):
         raise invalid_descriptor(
@@ -476,6 +533,8 @@ def publish_deferred_product(
     the publication with the completion the work belongs to. If only regions
     are initialized, publish those views at their logical offsets. Consumers
     must read these regions rather than the uninitialized reserved capacity.
+    If publishing any view fails, the views already published are released
+    before the error propagates.
     """
     if not publication_transports:
         raise unsupported_setup(
@@ -556,9 +615,13 @@ def fetch_product(
     tensor_store: TensorStore,
     model_runner: ModelExecutor,
 ) -> tuple[torch.Tensor, ImageMetadata | FeatureMetadata | None]:
-    """Fetch a transfer handle and stage its typed value for the consuming.
+    """Consume the call's single resident source with its metadata.
 
-    call.
+    A vision or latent feature input takes precedence and must carry
+    ``FeatureMetadata``; otherwise the call must name exactly one source
+    among its tensor, token and image inputs. The read lands on the call's
+    first device and is recorded on its pending output, where commit or
+    discard completes it.
     """
     request = state.pending_output(call.request_key.request_id)
     for reference in (call.vision_input, call.latent_feature_input):
@@ -596,10 +659,7 @@ def fetch_product(
 
 
 def tensor_matches_product(tensor: TensorTransfer, product: TensorRef) -> bool:
-    """Verify that a transfer locator's byte size, dtype.
-
-    and shape match its product.
-    """
+    """Check a transfer tensor's shape, dtype and size against its product."""
     return _representation_matches_product(
         tensor.shape, tensor.dtype, tensor.nbytes, product
     )
@@ -608,7 +668,12 @@ def tensor_matches_product(tensor: TensorTransfer, product: TensorRef) -> bool:
 def _representation_matches_product(
     shape: tuple[int, ...], physical_dtype: str, nbytes: int, product: TensorRef
 ) -> bool:
-    """Match physical storage to its declaration without conversion."""
+    """Match physical storage to its declaration without conversion.
+
+    Every dimension must be positive and within the product's shape bound,
+    ``physical_dtype`` must name the product dtype's storage dtype, and
+    ``nbytes`` must be exactly the element count times its element size.
+    """
     elements = math.prod(shape)
     shape_matches = product.shape_bound.contains_shape(shape)
     dtype, element_bytes = device_product_storage(product.dtype)
@@ -626,7 +691,10 @@ __all__ = ["execute"]
 def _release_locators(
     locators: Iterable[Locator], *, transfer_backends: Mapping[str, Transport]
 ) -> None:
-    """Release transfer locators through the runtime transport owner."""
+    """Release transfer locators through the runtime transport owner.
+
+    Does nothing when no transport is configured.
+    """
     if not transfer_backends:
         return
     for locator in locators:
@@ -641,9 +709,9 @@ def reserved_unit_rows(
 ):
     """Return the product rows reserved for this rank's encoded media units.
 
-    The rows are filled and published when the host tasks that image the
+    The rows are filled and published when the host tasks that encode the
     units complete. Nothing reads them before then: the muxer's call is
-    scheduled only once every image round has completed.
+    scheduled only once every encode round has completed.
     """
     from uniserve_worker.execution.image import bound_device_write
 

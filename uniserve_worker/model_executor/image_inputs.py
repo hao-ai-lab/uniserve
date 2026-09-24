@@ -1,4 +1,14 @@
-"""Image decoding and staging for model-owned processing policy."""
+"""Image decoding and staging for model-owned processing policy.
+
+The model declares its image policy as a ``uniserve.processing``
+``ImageProcessor``; this module applies it for the worker. An inline base64
+payload (``prepare_image``) or an already decoded RGB tensor
+(``prepare_tensor_image``) is resized to the model's canvas (a patch tower
+keeps the source size) and then to the selected tower's input size,
+normalized, packed into patches for a ``PatchTransform`` tower, and staged
+on the target device. The input rows for vision encoding and image decoding
+live here as well.
+"""
 
 from __future__ import annotations
 
@@ -31,7 +41,15 @@ _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 @dataclass(frozen=True, slots=True)
 class PreparedImage:
-    """Normalized pixels, patch coordinates, and model canvas dimensions."""
+    """Normalized pixels, patch coordinates, and model canvas dimensions.
+
+    For a ``PatchTransform`` tower, ``pixels`` is
+    [patches, channels * patch * patch] with patches in raster order, and
+    ``grid`` is a [1, 2] int64 tensor holding ``grid_shape`` (rows, columns
+    of patches). For a ``TowerTransform`` tower, ``pixels`` is
+    [channels, height, width] and both grid fields are None. ``height`` and
+    ``width`` are the canvas dimensions, not the tower's input size.
+    """
 
     pixels: torch.Tensor
     grid: torch.Tensor | None
@@ -43,7 +61,24 @@ class PreparedImage:
 def _image_plan(
     processor: ImageProcessor, kind: MediaCall, height: int, width: int
 ) -> tuple[PatchTransform | TowerTransform, tuple[int, int], tuple[int, int]]:
-    """Resolve canvas and tower dimensions independently of pixel storage."""
+    """Resolve canvas and tower dimensions independently of pixel storage.
+
+    Vision encoding uses the processor's ``vit`` transform and every other
+    call kind its ``vae`` transform. A patch tower keeps the source size as
+    its canvas. For a ``TowerTransform``, whether ``vit`` or ``vae``, the
+    canvas is the source resized by the ``vae`` stride policy when the
+    processor declares a ``vae`` transform, and the tower input applies the
+    selected transform's stride policy to that canvas.
+
+    Returns:
+        The selected transform, the canvas (height, width) and the tower's
+        input (height, width).
+
+    Raises:
+        WorkerError: An ``invalid_descriptor`` error when the model declares
+            no transform for ``kind``, or, for a patch tower, when
+            ``_bounded_grid_shape`` rejects the dimensions.
+    """
     transform = (
         processor.vit if kind is MediaCall.VISION_ENCODING else processor.vae
     )
@@ -70,6 +105,8 @@ def _prepared_pixels(processor, transform, pixels, canvas, device):
     """Pack the numerical tower input and attach its canvas coordinates."""
     grid = grid_shape = None
     if isinstance(transform, PatchTransform):
+        # [C, H, W] -> [gh, gw, C, patch, patch] -> one flattened row per
+        # patch, in raster order over the patch grid.
         patch = int(transform.patch_size)
         channels, height, width = pixels.shape
         grid_shape = (height // patch, width // patch)
@@ -118,7 +155,12 @@ def prepare_tensor_image(
     device: torch.device,
     signed_unit: bool,
 ) -> PreparedImage:
-    """Apply the same canvas and tower policy to an already decoded RGB view."""
+    """Apply the same canvas and tower policy to an already decoded RGB view.
+
+    ``image`` is [3, height, width] or [1, 3, height, width] with values in
+    [0, 1], or in [-1, 1] when ``signed_unit``; values are clamped to [0, 1]
+    before the transforms.
+    """
     value = image.detach().to(dtype=torch.float32)
     if value.ndim == 4:
         if int(value.shape[0]) != 1:
@@ -183,7 +225,11 @@ def _patch_image_shape(
     source_height: int,
     source_width: int,
 ) -> tuple[int, int]:
-    """Resolve patch-grid dimensions after applying processor pixel bounds."""
+    """Resolve the resized pixel dimensions for a patch tower.
+
+    Both dimensions become multiples of ``patch_size / downsample_ratio``
+    within the processor's pixel-area bounds.
+    """
     factor = int(
         round(int(processor.patch_size) / float(processor.downsample_ratio))
     )
@@ -204,7 +250,17 @@ def _bounded_grid_shape(
     minimum: int,
     maximum: int,
 ) -> tuple[int, int]:
-    """Fit an aspect-preserving patch grid within the token bounds."""
+    """Fit aspect-preserving pixel dimensions within pixel-area bounds.
+
+    Each dimension is rounded to a multiple of ``factor`` pixels; when the
+    resulting area falls outside [``minimum``, ``maximum``] the image is
+    rescaled, flooring toward ``maximum`` or ceiling toward ``minimum``.
+    Returns (height, width) in pixels.
+
+    Raises:
+        WorkerError: An ``invalid_descriptor`` error for a nonpositive
+            dimension or ``factor``, or an aspect ratio above 200.
+    """
     if min(height, width, factor) < 1:
         raise invalid_descriptor("image dimensions must be positive")
     if max(height, width) / min(height, width) > 200:
@@ -228,7 +284,11 @@ def _bounded_grid_shape(
 def _stride_image_shape(
     height: int, width: int, processor: StrideResize
 ) -> tuple[int, int]:
-    """Resolve both image dimensions at the configured spatial stride."""
+    """Resolve both image dimensions at the configured spatial stride.
+
+    Returns (height, width), while ``_stride_shape`` takes and returns
+    (width, height).
+    """
     scale = min(int(processor.max_size) / max(width, height), 1.0)
     scale = max(scale, int(processor.min_size) / min(width, height))
     new_width, new_height = _stride_shape(

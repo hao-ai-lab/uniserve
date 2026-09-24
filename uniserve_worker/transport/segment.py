@@ -11,6 +11,10 @@ consumer's call has resolved or will never be submitted, so no consumer
 begins reading after that. The words are written and read with release and
 acquire ordering, because the readiness word announces the payload written
 before it and the two live in different processes.
+
+`ShmTransport` writes the header as producer and reads it as consumer. The
+acknowledgment slot count and word size are shared with the device pool's
+chunk header in `vmm_pool`, so one slot numbering serves both mechanisms.
 """
 
 from __future__ import annotations
@@ -59,7 +63,11 @@ def ack_offset(slot: int) -> int:
 
 
 def initialize(buffer: memoryview, digest: bytes) -> None:
-    """Write a fresh header: this digest, pending, no acknowledgments."""
+    """Write a fresh header: this digest, pending, no acknowledgments.
+
+    The producer calls this before the locator naming the segment leaves
+    `ShmTransport.publish`, so no consumer can observe a partial header.
+    """
     buffer[DIGEST_OFFSET : DIGEST_OFFSET + DIGEST_BYTES] = digest
     for slot in range(MAX_ACKNOWLEDGMENT_SLOTS):
         atomic_store_u32(buffer, ack_offset(slot), 0)
@@ -72,7 +80,11 @@ def digest(buffer: memoryview) -> bytes:
 
 
 def set_state(buffer: memoryview, state: int) -> None:
-    """Announce readiness or failure, after every payload byte."""
+    """Announce readiness or failure, after every payload byte.
+
+    The store has release ordering, so a consumer whose `state` load sees
+    `READY` also sees the payload written before this call.
+    """
     atomic_store_u32(buffer, STATE_OFFSET, state)
 
 
@@ -89,10 +101,15 @@ def await_ready(
 ) -> None:
     """Wait until the producer announces the payload, failing on its failure.
 
-    The wait spins briefly, because a device-to-host publication usually
-    completes within microseconds of the consumer arriving, and then sleeps
-    so a long wait costs no core. `check` runs on every turn so a cancelled
-    read stops waiting as soon as it is cancelled.
+    The first turn polls without sleeping; later turns sleep for a pause
+    that grows linearly up to one millisecond, so a long wait does not
+    occupy a core. `check` runs on every turn, so a cancelled read stops
+    waiting within one turn of its cancellation.
+
+    Raises:
+        WorkerError: `resource_error` when the producer marks the segment
+            `FAILED` or `timeout` seconds pass before `READY`. Whatever
+            `check` raises propagates.
     """
     deadline = time.monotonic() + timeout
     pause = 0.0
