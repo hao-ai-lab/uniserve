@@ -9,7 +9,8 @@ pub(crate) struct VersionResponse {
     version: &'static str,
 }
 
-/// Returns the UniServe distribution version.
+/// Returns the UniServe distribution version, the Cargo workspace version
+/// fixed at compile time.
 pub(super) async fn version() -> Json<VersionResponse> {
     Json(VersionResponse {
         version: env!("CARGO_PKG_VERSION"),

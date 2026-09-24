@@ -15,9 +15,15 @@ use uniserve_server::profile::{ModelConfig, ModelDescription};
 use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use uniserve_server::serving::{InputProcessor, ServeRequestId};
 
+/// Base64 payload of a 1x1 PNG image.
 const PNG_1X1: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+/// Minimal ChatML template: one `<|im_start|>role\ncontent<|im_end|>` turn per
+/// message, then an open assistant turn when a generation prompt is requested.
 const CHAT_TEMPLATE: &str = "{%- for message in messages -%}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n{%- endif -%}";
+/// Special tokens added to the synthetic tokenizer: ChatML turn delimiters,
+/// the Bagel (`<|vision_*|>`) and SenseNova (`<img>`) image markers, and
+/// reasoning and answer delimiters.
 const SPECIAL_TOKENS: &[&str] = &[
     "<|im_start|>",
     "<|im_end|>",
@@ -31,6 +37,8 @@ const SPECIAL_TOKENS: &[&str] = &[
     "</answer>",
 ];
 
+/// Resolves `description` over a synthetic checkpoint with worker limits that
+/// cover every generation feature; see `try_resolved_model`.
 fn resolved_model(
     description: ModelDescription,
     model_type: &str,
@@ -38,12 +46,26 @@ fn resolved_model(
     try_resolved_model(description, model_type, runtime_limits()).unwrap()
 }
 
+/// Writes a synthetic checkpoint to a temporary directory and binds an
+/// `InputProcessor` for `description` over it with the given worker limits.
+///
+/// The tokenizer maps each ASCII code point from 1 to 127 to one token whose
+/// ID is the code point (no merges), plus `SPECIAL_TOKENS`, so outside the
+/// special tokens one character is one prompt token. `generation_config.json`
+/// sets a 128-token default generation length. The returned directory owns
+/// the checkpoint files.
+///
+/// # Errors
+///
+/// Returns the `InputProcessor::new` error, for example when `limits` do not
+/// cover a feature the profile needs. Other setup failures panic.
 fn try_resolved_model(
     description: ModelDescription,
     model_type: &str,
     limits: GenerationLimits,
 ) -> uniserve_server::serving::Result<(tempfile::TempDir, DynTokenizer, InputProcessor)> {
     let directory = tempdir().unwrap();
+
     let mut vocab = Vocab::from_iter([("<unk>".to_string(), 0_u32)]);
     for codepoint in 1_u32..=127 {
         vocab.insert(char::from_u32(codepoint).unwrap().to_string(), codepoint);
@@ -62,6 +84,7 @@ fn try_resolved_model(
     );
     let tokenizer_path = directory.path().join("tokenizer.json");
     tokenizer_builder.save(&tokenizer_path, false).unwrap();
+
     let config_path = directory.path().join("config.json");
     fs::write(
         &config_path,
@@ -93,6 +116,7 @@ fn try_resolved_model(
         chat_template_path: None,
         config_path: Some(config_path),
     };
+
     let tokenizer: DynTokenizer =
         Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap());
     let renderer = HfChatRenderer::new(
@@ -101,8 +125,9 @@ fn try_resolved_model(
         ChatTemplateContentFormatOption::String,
     )
     .unwrap();
-    // A pipeline family has no root configuration; it resolves from its
-    // pipeline index with the model's default duration limit.
+    // A diffusers pipeline checkpoint has no root `config.json`, so MiniMax H3
+    // is built by `ModelConfig::from_pipeline`, here with the server's default
+    // 15-second maximum video duration.
     let config = match description {
         ModelDescription::MiniMaxH3 => {
             ModelConfig::from_pipeline(description.id(), description, 15.0, Some(4096)).unwrap()
@@ -124,6 +149,8 @@ fn try_resolved_model(
     Ok((directory, tokenizer, model))
 }
 
+/// Worker limits that cover every generation feature with capacities no test
+/// request reaches.
 fn runtime_limits() -> GenerationLimits {
     GenerationLimits {
         features: uniserve_core::GenerationFeatures::all(),
@@ -139,6 +166,11 @@ fn runtime_limits() -> GenerationLimits {
     }
 }
 
+/// Chat request with one input image between two text parts.
+///
+/// The leading text contains a literal `</img>`, which the synthetic tokenizer
+/// encodes as the SenseNova end-of-image token. The top-level `seed` (9) and
+/// the `image_config` seed (17) differ so tests can tell which one wins.
 fn image_chat_request(model: &str) -> uniserve_server::openai::ChatCompletionRequest {
     serde_json::from_value(serde_json::json!({
         "model": model,
@@ -153,6 +185,10 @@ fn image_chat_request(model: &str) -> uniserve_server::openai::ChatCompletionReq
     .unwrap()
 }
 
+/// `InputProcessor::new` refuses to bind a profile whose worker limits lack a
+/// feature the profile's configured branches need, and names the missing
+/// feature by its `GenerationFeatures::name` diagnostic. SenseNova appears
+/// twice because it needs both ViT encoding and image generation.
 #[test]
 fn model_resolution_requires_every_configured_runtime_branch() {
     type ChangeLimits = fn(&mut GenerationLimits);
@@ -210,6 +246,10 @@ fn model_resolution_requires_every_configured_runtime_branch() {
     }
 }
 
+/// The literal `</img>` in the user text also encodes to the end-of-image
+/// token, so the prompt holds two of them. The image's position is the index
+/// of the end-of-image token of the marker rendered for its slot (the second
+/// occurrence), not the first one found in the text.
 #[test]
 fn sensenova_places_the_input_image_at_its_rendered_slot() {
     let (_directory, tokenizer, model) = resolved_model(ModelDescription::SenseNova, "neo_chat");
@@ -217,8 +257,11 @@ fn sensenova_places_the_input_image_at_its_rendered_slot() {
     let (generation, response) = model
         .preprocess_chat_request(ServeRequestId::new("image-params"), request)
         .unwrap();
+
+    // The `image_config` seed takes precedence over the text sampling seed.
     assert_eq!(generation.sampling.seed, Some(17));
     assert_eq!(generation.image.seed, Some(17));
+
     let end_image = tokenizer.token_to_id("</img>").unwrap();
     let marker_positions = response
         .prompt_token_ids
@@ -238,6 +281,9 @@ fn sensenova_places_the_input_image_at_its_rendered_slot() {
     );
     assert_eq!(position, marker_positions[1]);
     assert_eq!(steps, &[ImageIngestStep::VitEncode]);
+
+    // Feedback for the default 16:9 canvas (2048x1152) is a 64x36 ViT grid at
+    // 32 pixels per token plus one marker token.
     assert_eq!(
         generation
             .image_generation
@@ -267,6 +313,11 @@ fn bagel_places_the_input_image_between_surrounding_chat_text() {
             .map(|input| input.encoder)
             .collect::<Vec<_>>(),
     );
+
+    // Bagel removes the slot and places the image at the token count of the
+    // text before it, so text on both sides keeps it strictly inside the
+    // prompt. The Bagel profile configures a VAE and a ViT encoder input for
+    // each input image, in that order.
     assert!(position > 0);
     assert!((position as usize) < response.prompt_token_ids.len());
     assert_eq!(
@@ -293,11 +344,16 @@ fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
         )
         .unwrap();
 
+    // The prompt is tokenized without chat framing. One second is 24 frames
+    // at 24 fps, which rounds up to the next count of the form `5 + 17k`:
+    // 39 frames, decoded as two 17-frame video units plus a 5-frame tail.
     assert_eq!(request.prompt_token_ids, expected);
     assert_eq!(request.sampling.seed, 17);
     assert_eq!(request.sampling.num_frames, 39);
     assert_eq!(request.sampling.video_units, 2);
 
+    // Rejections: a model name other than the served one, a whitespace-only
+    // prompt, and a duration that is not finite and positive.
     let invalid = |model_name: &str, prompt: &str, seconds| {
         model
             .preprocess_video_request(
@@ -332,6 +388,8 @@ fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
     }
 }
 
+/// `InputProcessor::new` replaces the checkpoint's context length with the
+/// worker's `max_model_tokens`, and text preprocessing enforces that bound.
 #[test]
 fn worker_context_capacity_limits_preprocessed_requests() {
     let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::Qwen3, "qwen3");
@@ -354,6 +412,7 @@ fn worker_context_capacity_limits_preprocessed_requests() {
         true,
     )
     .unwrap();
+
     assert_eq!(processor.config().max_model_tokens, Some(8));
     let request = uniserve_server::serving::TextPromptRequest::new(
         "context-capacity",
@@ -373,6 +432,9 @@ fn worker_context_capacity_limits_preprocessed_requests() {
     ));
 }
 
+/// Defaults fill only omitted controls: an explicit zero temperature stays
+/// zero rather than taking the default 1.0, while an explicit zero completion
+/// length is rejected rather than replaced by the 128-token checkpoint default.
 #[test]
 fn sampling_defaults_preserve_explicit_zero_controls() {
     let (_directory, _tokenizer, model) = resolved_model(ModelDescription::Qwen3, "qwen3");
@@ -401,6 +463,10 @@ fn sampling_defaults_preserve_explicit_zero_controls() {
     ));
 }
 
+/// The image API produces an image-only (`GenOnly`) request that keeps the
+/// requested canvas, steps, seed, guidance scale, and negative prompt.
+/// SenseNova accepts only its resolution buckets, and 1536x1536 is one of
+/// them.
 #[test]
 fn image_api_preserves_requested_dimensions_seed_and_guidance() {
     for (description, model_type, width, height) in [
@@ -440,6 +506,10 @@ fn image_api_preserves_requested_dimensions_seed_and_guidance() {
     }
 }
 
+/// Cache namespace and salt select a stable isolation partition, the bypass
+/// flags disable prefix-cache reads and writes without changing the
+/// partition, and prompt logprobs disable reads only, because a prefix-cache
+/// hit would skip the prompt positions whose logprobs are requested.
 #[test]
 fn cache_controls_preserve_isolation_and_prompt_logprob_requirements() {
     use uniserve_server::serving::TextPromptRequest;
@@ -451,10 +521,12 @@ fn cache_controls_preserve_isolation_and_prompt_logprob_requirements() {
     ] {
         let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
         let mut request = TextPromptRequest::new("cache-controls", "hello");
+
         let (shared, _) = processor.preprocess_text_request(request.clone()).unwrap();
         assert_eq!(shared.cache.isolation_key, None);
         assert!(shared.cache.read && shared.cache.write);
 
+        // The same namespace and salt always produce the same key.
         request.cache_namespace = Some("ab".to_string());
         request.cache_salt = Some("c".to_string());
         let (isolated, _) = processor.preprocess_text_request(request.clone()).unwrap();
@@ -486,6 +558,9 @@ fn cache_controls_preserve_isolation_and_prompt_logprob_requirements() {
     }
 }
 
+/// Negative seeds are accepted and reinterpreted as their two's-complement
+/// `u64` value, and a logprob count of `-1` requests every candidate
+/// (`u32::MAX`) while values below `-1` are rejected, for every token model.
 #[test]
 fn sampling_controls_have_the_same_meaning_across_token_models() {
     for (description, model_type) in [
@@ -507,6 +582,9 @@ fn sampling_controls_have_the_same_meaning_across_token_models() {
     }
 }
 
+/// An omitted duration resolves to the default advertised by
+/// `video_capabilities` (the lesser of 5 seconds and the configured maximum,
+/// here 2 seconds) and yields the same sampling as requesting it explicitly.
 #[test]
 fn omitted_video_duration_uses_the_advertised_model_default() {
     let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
@@ -528,6 +606,7 @@ fn omitted_video_duration_uses_the_advertised_model_default() {
         true,
     )
     .unwrap();
+
     let input: uniserve_server::openai::VideoGenerationRequest =
         serde_json::from_value(serde_json::json!({
             "model": "minimax_h3", "prompt": "a river"

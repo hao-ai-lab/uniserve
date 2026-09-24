@@ -1,10 +1,32 @@
 //! Request admission, resource reservation, and waiting-queue insertion.
+//!
+//! Submission (`enqueue`, `enqueue_media`) validates a request and checks it
+//! against the loaded worker's capabilities and the waiting-queue bound. It
+//! either queues the request or rejects it synchronously with
+//! `EngineCoreOutput::Rejected` on the request's event channel. Admission
+//! (`admit`, `admit_media`), which the scheduling pass runs before and
+//! between batch assembly, moves requests from the head of the token and
+//! media waiting queues into the running set while `max_num_seqs` and
+//! storage allow. A head that does not fit yet blocks the requests behind it
+//! in its queue, and running requests are never preempted to make room.
+//!
+//! A token request reserves a request row and one KV table per group; its
+//! prefill worker is recorded in `Placement::affinity`. A media request
+//! reserves a request row and every declared result buffer on each worker of
+//! its route.
 
 use super::*;
 use uniserve_worker_ipc::ForwardMode;
 
 impl Scheduler {
     /// Validates and queues one token-generation request or rejects it synchronously.
+    ///
+    /// Rejects with `RejectionKind::Invalid` when the runtime has no KV cache,
+    /// the request fails validation, the worker lacks a required generation
+    /// feature, or `validate_resources` or `max_kv_tokens` fails against
+    /// `generation_limits`; rejects with `RejectionKind::Overloaded` when the
+    /// waiting bound is reached. A rejection is sent on `event_tx` and its
+    /// send result is ignored.
     pub(super) fn enqueue(&mut self, req: GenerationRequest, event_tx: EventTx) {
         if self.storage.cache.is_none() {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
@@ -44,10 +66,11 @@ impl Scheduler {
                 return;
             }
         };
-        // Waiting-queue backpressure sheds load instead of letting the waiting
-        // queue grow without bound under overload —
-        // an unbounded burst would otherwise OOM the process and take down every
-        // in-flight request. Reject the new submit with a typed event.
+        // Backpressure: under overload the new submission is rejected rather
+        // than letting queued requests grow without bound and exhaust process
+        // memory. The bound covers both waiting queues and retired requests
+        // whose events are still undelivered; `enqueue_media` applies the
+        // same count.
         let waiting = self.pending_request_count() + self.output.retained_len();
         if waiting >= self.config.max_num_waiting {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
@@ -56,13 +79,12 @@ impl Scheduler {
             });
             return;
         }
+        // Worst-case KV in blocks; `admit` reserves it only for requests with
+        // `reserve_worstcase` set.
         let worst = max_kv_tokens.div_ceil(self.info.kv_block_size() as usize);
         // Multimodal requests reserve their configured bounded KV envelope at
         // admission so excess concurrency queues instead of exhausting KV.
         let reserve_worstcase = !req.multimodal_inputs.images.is_empty() || req.generates_images();
-        // A request with staged images usually encodes them before prefill.
-        // Context-image requests prefill the text before each image position,
-        // then encode the image into that marker gap.
         let finish_token_ids = finish_token_ids(&req, &self.ctrl.eos);
         let st = RequestState {
             finish_token_ids,
@@ -72,6 +94,9 @@ impl Scheduler {
             last_state_call_id: CallId::default(),
             latest_token: None,
             speculative_chain_invalidated: false,
+            // Every request starts in prefill. A request with context images
+            // prefills the text up to each image position, then encodes that
+            // image into the marker gap before continuing.
             phase: Phase::Prefill,
             num_computed_prompt_tokens: 0,
             num_ingested_images: 0,
@@ -110,6 +135,11 @@ impl Scheduler {
             req,
         };
         self.next_request_epoch = self.next_request_epoch.saturating_add(1);
+
+        // Admission examines only the queue head, so the insertion position
+        // fixes the admission order. Under `Priority` a request goes after
+        // every queued request with a lower priority value, or an equal one
+        // and an earlier or equal arrival, so ties stay FIFO.
         let position = match self.config.policy {
             SchedulingPolicy::Fcfs => self.waiting.len(),
             SchedulingPolicy::Priority => self.waiting.partition_point(|queued| {
@@ -119,7 +149,24 @@ impl Scheduler {
         self.waiting.insert(position, st);
     }
 
-    /// Resolve storage from loaded numerical result contracts before admission.
+    /// Resolves the result tensors a media request reserves at admission.
+    ///
+    /// Reads the output declarations of the component serving text encoding,
+    /// denoising, video decoding, video encoding, and audio decoding, as bound
+    /// on each call's first placement candidate. The text encoder's
+    /// `DimBound::Device` dimensions become `num_prompt_tokens`, and the
+    /// leading dimension of the video decoder and encoder outputs becomes
+    /// `sampling.video_units`. Returns one `(component, output index, dtype,
+    /// shape bound)` entry per declared output.
+    ///
+    /// Returns `None` when one of those calls has no reported component or no
+    /// candidate, the candidate declares no binding for the component it
+    /// serves, a component declares an unexpected number of outputs, a text
+    /// encoder output has no device dimension, a video output's leading
+    /// dimension is missing or not a device bound, or the prompt length or
+    /// unit count is zero or exceeds the declared maximum. `enqueue_media`
+    /// rejects such a request, and `admit_media` calls this again to size the
+    /// reservation.
     fn media_outputs(
         &self,
         sampling: uniserve_core::DiffusionSamplingParams,
@@ -186,7 +233,15 @@ impl Scheduler {
     /// The denoiser is selected first because it defines the expensive replica
     /// residency. Components co-located with that worker follow it; shared
     /// components such as a TP text encoder and the host codec worker retain
-    /// their own independently bounded request rows.
+    /// their own independently bounded request rows. Otherwise the candidate
+    /// with the fewest distinct requests placed on it in `Placement::affinity`
+    /// wins, then the one with the most free request rows.
+    ///
+    /// Returns a map from component name to worker, or `None` when some
+    /// component has no ready candidate that is already on the route or has
+    /// a free request row. When the executor reports admissible video
+    /// encoders for the video decoder's chosen worker, the video encoder's
+    /// candidates are further limited to those.
     fn media_routes(&self) -> Option<HashMap<String, crate::WorkerId>> {
         use uniserve_worker_ipc::MediaCall;
 
@@ -196,6 +251,9 @@ impl Scheduler {
             .iter()
             .map(|(call, component)| (*call, component.clone()))
             .collect::<Vec<_>>();
+        // Routing order: the denoiser first, then the calls that feed it, then
+        // decoders before encoders, since the video encoder's admissible
+        // workers depend on the route chosen for the video decoder.
         required.sort_by_key(|(call, _)| match call {
             MediaCall::Denoising => 0,
             MediaCall::TextEncoding | MediaCall::LatentPreparation => 1,
@@ -207,6 +265,7 @@ impl Scheduler {
         let mut routes = HashMap::new();
         let mut selected_workers = HashSet::new();
         for (call, component) in required {
+            // A component serving several media calls is routed once.
             if routes.contains_key(&component) {
                 continue;
             }
@@ -233,6 +292,11 @@ impl Scheduler {
                                 .is_some_and(|storage| storage.requests.available() > 0))
                 })
                 .collect::<Vec<_>>();
+
+            // A worker already on the route is preferred, so co-located
+            // components follow the denoiser. It needs no further free row
+            // because `reserve_media` takes one request row per distinct
+            // worker.
             let resident = candidates
                 .iter()
                 .copied()
@@ -257,6 +321,13 @@ impl Scheduler {
     }
 
     /// Validates and queues one terminal media-generation request.
+    ///
+    /// Rejects with `RejectionKind::Invalid` when the request fails
+    /// validation, the worker reports no muxing component, the request's
+    /// inference-step count differs from the loaded model's, `media_outputs`
+    /// cannot bound its results, or the worker has fewer than two request
+    /// slots; rejects with `RejectionKind::Overloaded` when the waiting bound
+    /// is reached. A rejection's send result is ignored.
     pub(super) fn enqueue_media(&mut self, submission: PendingMedia) {
         let request = &submission.request;
         if let Err(message) = request.validate() {
@@ -266,9 +337,9 @@ impl Scheduler {
             });
             return;
         }
-        // A worker reports the component serving each media call it implements, so a
-        // deployment that assembles an artifact is the one that can serve a
-        // video request; reporting some call is not enough.
+        // A worker reports the component serving each media call it
+        // implements, so a deployment that assembles an artifact is the one
+        // that can serve a video request; reporting some call is not enough.
         if !self
             .info
             .media_components
@@ -319,8 +390,15 @@ impl Scheduler {
 
     /// Reserves a media request's row and output buffers on every routed worker.
     ///
-    /// Returns `Ok(None)`, with nothing reserved, when some worker lacks
-    /// capacity now; the request then waits at the head of the queue.
+    /// Every declared output is reserved in full on every routed worker, not
+    /// only on the worker whose component produces it; spans are sized from
+    /// the shape bound's maximum element count and 256-byte aligned.
+    ///
+    /// Returns `Ok(None)`, with nothing reserved, when a request row or buffer
+    /// span cannot be allocated on some worker now; `admit_media` then leaves
+    /// the request at the head of the queue. Returns `Err` when a routed
+    /// worker has no media storage, after releasing what was already reserved
+    /// on known workers.
     fn reserve_media(
         &mut self,
         route_workers: &HashSet<crate::WorkerId>,
@@ -370,6 +448,11 @@ impl Scheduler {
     }
 
     /// Admits queued media requests while request and product storage remain available.
+    ///
+    /// Media and token requests share the `max_num_seqs` running bound.
+    /// Admission stops at the first request that cannot be routed or
+    /// reserved, leaving it at the queue head. A broken scheduler invariant
+    /// also requeues the request, latches engine-fatal, and stops.
     pub(super) fn admit_media(&mut self) {
         while self.running_request_count() < self.config.max_num_seqs {
             let Some(submission) = self.waiting_media.pop_front() else {
@@ -405,6 +488,10 @@ impl Scheduler {
                     break;
                 }
             };
+
+            // `allocations` holds the request's row on every routed worker;
+            // the admission carries the denoiser's row, and a call placed on
+            // another worker uses that worker's row.
             let primary_component = self.info.media_components[&MediaCall::Denoising].as_str();
             let request_pool_idx = allocations.request_slot(&routes[primary_component]);
             // Submission validated the prompt and sampling this admission carries.
@@ -427,6 +514,8 @@ impl Scheduler {
                     break;
                 }
             };
+
+            // The admission commits here; nothing below requeues the request.
             for (component, worker) in &routes {
                 self.placement
                     .affinity
@@ -483,7 +572,11 @@ impl Scheduler {
         }
     }
 
-    /// Returns the number of configured VAE workers.
+    /// Returns the number of latent positions of an image of `ip`'s size.
+    ///
+    /// Computes `(height / d) * (width / d)` with floor division, where `d` is
+    /// `latent_downsample` (at least 1). Denoising call planning adds
+    /// `commit_marker_tokens` to it for the call's query length.
     pub(super) fn num_vae(&self, ip: &uniserve_core::ImageParams) -> u64 {
         let dl = u64::from(self.generation_limits.latent_downsample).max(1);
         (ip.height as u64 / dl) * (ip.width as u64 / dl)
@@ -511,6 +604,11 @@ impl Scheduler {
     }
 
     /// Computes image-latent capacity required by a request.
+    ///
+    /// The result counts latent positions: with `d = latent_downsample` (at
+    /// least 1), it is `ceil(height / d) * ceil(width / d)`, each side
+    /// counting at least one position. Unlike `num_vae`, partial positions
+    /// round up.
     pub(super) fn worker_image_latent_units_for(&self, st: &RequestState) -> u64 {
         let downsample = (self.generation_limits.latent_downsample as u64).max(1);
         let (height, width) = (st.req.image.height, st.req.image.width);
@@ -519,6 +617,14 @@ impl Scheduler {
     }
 
     /// Materializes the negative-prompt KV prefix required by multi-branch guidance.
+    ///
+    /// Allocates the prefix its own request row and KV tables sized to the
+    /// negative prompt, and stores them in `RequestState::flow_prefix`.
+    /// Returns `true` when the prefix is in place, the request uses a single
+    /// guidance branch, or the request is not running. Returns `false`,
+    /// holding nothing new, when no request row or KV capacity is free, or
+    /// (after latching engine-fatal) the KV cache is missing;
+    /// `reserve_generation_resources` then declines the denoising call.
     pub(super) fn ensure_flow_prefix(&mut self, id: RequestId) -> bool {
         let (prefix_tokens, needs_alternative) = self
             .running
@@ -634,6 +740,15 @@ impl Scheduler {
     ///
     /// Requests configured for worst-case reservation acquire their full KV capacity here,
     /// keeping that capacity resident for the request lifetime.
+    ///
+    /// A worst-case request is admitted when free KV blocks cover
+    /// `max_reserved_kv_blocks` and its encoder-cache entries fit the budget;
+    /// any other request needs only the blocks of its first prefill chunk
+    /// beyond its cached prefix. A head that can never fit the total KV
+    /// capacity is rejected with `RejectionKind::Invalid`. Admission stops
+    /// when the queue is empty, `max_num_seqs` is reached, no request row is
+    /// free, the head does not fit yet or finds no ready prefill worker, or a
+    /// scheduler invariant breaks.
     pub(super) fn admit(&mut self) {
         let bs = self.info.kv_block_size() as usize;
         loop {
@@ -645,6 +760,7 @@ impl Scheduler {
             let Some(head) = self.waiting.front() else {
                 break;
             };
+
             if head.reserve_worstcase {
                 let need = head.max_reserved_kv_blocks;
                 let encoder_entries = head.req.num_encoder_cache_entries();
@@ -680,8 +796,12 @@ impl Scheduler {
                     };
                     let id = st.req.request_id;
                     self.admit_running(st, target, reservation);
-                    // Physically allocate the worst case now: nothing can take
-                    // these blocks, so this request can never fail mid-flight.
+                    // Grow the tables to the whole worst case now, so later
+                    // admissions cannot take these blocks. The result is not
+                    // checked here; when an image branch opens,
+                    // `promote_gen_branch_reservation` finishes the request
+                    // with an error if its first table holds fewer than
+                    // `need` blocks.
                     self.ensure_request_capacity(id, need * bs);
                     self.storage.reserved_blocks += need;
                     continue;
@@ -701,6 +821,10 @@ impl Scheduler {
                 let Some((target, prefix_hit)) = self.prefill_target(head) else {
                     break;
                 };
+
+                // Blocks the first prefill chunk needs beyond the cached
+                // prefix. The chunk is bounded by `long_prefill_threshold` and
+                // `max_num_batched_tokens` and holds at least one token.
                 let cached_prefix_blocks = prefix_hit.cached_blocks;
                 let cached_prefix_blocks = cached_prefix_blocks.min(n.div_ceil(bs));
                 let cached_prefix_tokens = cached_prefix_blocks.saturating_mul(bs);
@@ -713,6 +837,7 @@ impl Scheduler {
                     .saturating_add(first_uncached_chunk)
                     .div_ceil(bs)
                     .saturating_sub(cached_prefix_blocks);
+                // The prompt alone must fit the smallest group's capacity.
                 if n > text_usable_blocks * bs {
                     let Some(st) = self.waiting.pop_front() else {
                         break;
@@ -723,6 +848,10 @@ impl Scheduler {
                     });
                     continue;
                 }
+
+                // A hit page that is currently unreferenced counts as free
+                // until acquisition takes it, so it is subtracted from each
+                // group's free pages.
                 let capacity_available = prefix_hit.cached_free_blocks.len()
                     == cache.block_pool.num_groups()
                     && prefix_hit.cached_free_blocks.iter().enumerate().all(
@@ -751,14 +880,21 @@ impl Scheduler {
                 }
             }
 
-            // Exact checkpoints retain their physical KV identity. Until the
-            // configured route provides relocatable checkpoint storage, a
-            // resident request remains non-preemptible and admission queues.
+            // The head does not fit yet. Resident requests keep their physical
+            // KV pages and are never preempted or relocated to make room, and
+            // later requests do not bypass the head, so admission waits for
+            // capacity to free.
             break;
         }
     }
 
     /// Probes the prefix cache on the configured prefill owner.
+    ///
+    /// Picks the first ready worker that serves prefill and returns it with
+    /// the component name it binds, plus the prefix hit on that worker's
+    /// endpoint (prefix-cache residency is keyed by endpoint). The hit is an
+    /// estimate; `acquire_cached_prefix` takes the actual prefix. Returns
+    /// `None` when the runtime has no KV cache or no prefill worker is ready.
     fn prefill_target(
         &self,
         state: &RequestState,
@@ -785,8 +921,10 @@ impl Scheduler {
             .next()
     }
 
-    /// Reserves request resources and moves one validated request into the runnable set.
     /// Accumulates one request's interval from queue entry to admission.
+    ///
+    /// Timestamps are in seconds; the statistics are in microseconds, and a
+    /// negative interval counts as zero.
     fn record_queue_wait(&self, queued_at: f64, scheduled_at: f64) {
         let queue_wait_us = ((scheduled_at - queued_at).max(0.0) * 1_000_000.0) as u64;
         self.stats
@@ -844,6 +982,14 @@ impl Scheduler {
         })
     }
 
+    /// Moves one validated request into the runnable set with its reservation.
+    ///
+    /// Records `target`'s worker as the owner of its component for the
+    /// request, emits the public `Scheduled` event (a closed receiver marks
+    /// the request cancelled), adds its encoder-cache entries to the reserved
+    /// count, and acquires its cached prefix, which sets the computed-prompt
+    /// cursors to the reused tokens. A failed acquisition latches
+    /// engine-fatal.
     pub(super) fn admit_running(
         &mut self,
         mut st: RequestState,
@@ -914,8 +1060,8 @@ pub(super) struct AdmissionReservation {
 
 /// Acquires a complete cross-group prefix hit and records cache accounting on the request.
 ///
-/// Fails, acquiring nothing, when the request's block tables do not cover the
-/// coordinator's KV groups.
+/// Fails, acquiring nothing, when the request holds no block tables or its
+/// tables do not match the pool's KV groups.
 fn acquire_cached_prefix(
     coordinator: &KvCacheCoordinator,
     state: &mut RequestState,
@@ -941,6 +1087,10 @@ fn acquire_cached_prefix(
             source,
         )
         .ok_or("an admitted request's block tables cover every KV group")?;
+
+    // Queries count the blocks eligible for lookup under the same rule as
+    // `prefix_lookup_limit` in `kv`: a block-aligned prompt's last block is
+    // never reused, so prefill computes at least one token.
     let block_size = pool.block_size();
     let full_blocks = prompt.len() / block_size;
     let query_blocks = if prompt.len().is_multiple_of(block_size) {
@@ -960,6 +1110,9 @@ fn acquire_cached_prefix(
         .prefix
         .hit_tokens
         .fetch_add((hit.cached_blocks * block_size) as u64, Ordering::Relaxed);
+
+    // The reused tokens are already in KV, so every prompt and KV cursor
+    // starts past them.
     state.prefix_block_hashes = hit.block_hashes;
     state.num_computed_prompt_tokens = (hit.cached_blocks * block_size) as u32;
     state.logical_position = state.num_computed_prompt_tokens;

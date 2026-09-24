@@ -1,4 +1,20 @@
 //! Buffered and streaming OpenAI chat-completion response assembly.
+//!
+//! Both paths consume the `RequestOutput` stream that
+//! `ServingRuntime::generate_chat` returns. `collect_chat_completion` folds it
+//! into one `ChatCompletionResponse`; `chat_completion_chunk_stream` maps it to
+//! `ChatCompletionStreamResponse` chunks, and `chat_completion_sse_stream`
+//! frames those chunks as SSE events ending in `data: [DONE]`.
+//!
+//! One decoded update from the engine becomes several events: semantic events
+//! (reasoning and text deltas, block and tool-call boundaries) followed by the
+//! update's token IDs and logprobs on a `TextDelta`. On the Qwen3 chat output
+//! path that metadata arrives as its own `TextDelta` with empty text; on the
+//! other generation paths it rides on the same `TextDelta` as the update's
+//! visible text, which may be empty. On the Qwen3 path, events flushed when
+//! generation finishes follow the final update's metadata. The streaming path
+//! relies on this order to attach metadata to the chunk of the same update and
+//! to drop the metadata of updates that contain hidden reasoning.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -24,6 +40,10 @@ use crate::openai::logprobs::{decoded_logprobs_to_openai_chat, decoded_prompt_lo
 use crate::openai::utils::completion_token_count;
 
 /// Converts a terminal serving event into its OpenAI representation.
+///
+/// `Cancelled` and `Aborted` become a normal `Finished` with
+/// `FinishStatus::Abort`, so the response carries `finish_reason: "abort"`.
+/// Every other event passes through unchanged.
 fn openai_terminal_event(event: RequestOutput) -> RequestOutput {
     match event {
         RequestOutput::Cancelled { .. } | RequestOutput::Aborted { .. } => {
@@ -49,6 +69,22 @@ macro_rules! bail_server_error {
 }
 
 /// Collects a chat event stream into one non-streaming response.
+///
+/// The flags mirror the fields of `ChatResponseContext`. `created` is the
+/// response timestamp in UNIX seconds.
+///
+/// When reasoning is present but `include_reasoning` is false, the response
+/// omits output logprobs and token IDs as well as the reasoning text, because
+/// that metadata covers every generated token, reasoning tokens included.
+///
+/// # Errors
+///
+/// Returns `ApiError::rejected` for a `Rejected` event and a server error
+/// when the stream yields an error or a `Failed` event, closes without a
+/// terminal event, finishes with `FinishStatus::Error`, completes an image
+/// without an inline PNG, lacks output logprobs the response must include or
+/// prompt logprobs the request asked for, or fails to convert output
+/// logprobs.
 #[allow(clippy::too_many_arguments)]
 pub async fn collect_chat_completion(
     stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,
@@ -76,6 +112,7 @@ pub async fn collect_chat_completion(
         image_steps_per_image,
         finish_status,
     } = collected;
+
     let stop_reason = finish_status_stop_reason(&finish_status);
     let saw_tool_calls = message.tool_calls().next().is_some();
     let reasoning = message.reasoning();
@@ -151,18 +188,25 @@ pub async fn collect_chat_completion(
     })
 }
 
+/// Everything `collect_chat_events` accumulates from one request's stream.
 #[derive(Debug, Clone, PartialEq)]
 struct CollectedChatOutput {
     message: AssistantMessage,
+    /// Prompt tokens from `Accepted`, replaced by the final `Usage` count.
     prompt_token_count: usize,
     prompt_token_ids: Vec<u32>,
     prompt_logprobs: Option<crate::serving::text::DecodedPromptLogprobs>,
+    /// Output logprobs concatenated across `TextDelta` updates; `None` when no
+    /// update carried any.
     logprobs: Option<DecodedLogprobs>,
     token_ids: Vec<u32>,
+    /// Visible plus internal generated tokens, as OpenAI usage counts them.
     output_token_count: usize,
     images: Vec<ContentPart>,
     image_count: u32,
     image_steps: u32,
+    /// `ImageStep` counts per completed image, in completion order. Images
+    /// that began but never completed are not listed.
     image_steps_per_image: Vec<u32>,
     finish_status: FinishStatus,
 }
@@ -185,9 +229,11 @@ async fn collect_chat_events(
     let mut image_step_counts = HashMap::<String, u32>::new();
     let mut completed_image_ids = Vec::<String>::new();
     let mut finish_status = None;
-    // Structured processors finalize text through `OutputBlockEnd`. Direct
-    // semantic deltas are retained separately so collection can assemble models
-    // that do not emit structured blocks without duplicating structured output.
+    // Structured processors finalize text through `OutputBlockEnd`, whose
+    // block carries the complete content, so deltas inside an open block are
+    // skipped. Deltas outside any block come from output processors that emit
+    // no structured blocks; they are appended after the stream ends, reasoning
+    // before text.
     let mut loose_text = String::new();
     let mut loose_reasoning = String::new();
     let mut structured_text = false;
@@ -290,6 +336,7 @@ async fn collect_chat_events(
                 request_id,
                 message,
             }) => {
+                // The failure detail is logged but not returned to the client.
                 error!(%request_id, %message, "chat completion failed");
                 bail_server_error!("Internal server error");
             }
@@ -338,6 +385,25 @@ async fn collect_chat_events(
 }
 
 /// Converts one serving event stream into OpenAI chat-completion chunks.
+///
+/// The flags mirror the fields of `ChatResponseContext`; `log_request` logs
+/// one summary line when the request finishes. The chunk sequence is an
+/// assistant-role start chunk, content, reasoning, tool-call, logprob, and
+/// image deltas, one chunk carrying `finish_reason`, and, with
+/// `include_usage`, a final usage chunk.
+///
+/// When logprobs or token IDs are requested, the semantic deltas of one
+/// decoded update are buffered in a `PendingChatChunk` and emitted together
+/// with that update's metadata. With reasoning hidden, the metadata of an
+/// update that touches hidden reasoning is dropped along with the reasoning
+/// text.
+///
+/// # Errors
+///
+/// Yields `ApiError::rejected` for a `Rejected` event, and a server error for
+/// a stream error, a `Failed` event, a `FinishStatus::Error` finish, an image
+/// without an inline PNG, or a logprob conversion failure. The stream ends
+/// after the first error.
 #[allow(clippy::too_many_arguments)]
 #[try_stream]
 pub async fn chat_completion_chunk_stream(
@@ -361,15 +427,17 @@ pub async fn chat_completion_chunk_stream(
     let mut image_steps = 0_u32;
     let mut image_step_counts = HashMap::<String, u32>::new();
     let mut completed_image_ids = Vec::<String>::new();
-    // Token metadata is emitted after all semantic deltas for one decoded update.
-    // If that update contains hidden reasoning, including delimiter-only block
-    // starts or ends, omit its token metadata as well as its visible delta.
+    // Token metadata arrives after all semantic deltas of one decoded update
+    // (see the module docs). `inside_hidden_reasoning` stays set across
+    // updates while a hidden reasoning block is open.
+    // `suppress_current_update_metadata` is set by the reasoning arms below,
+    // including for a delimiter-only block start or end, and is cleared when
+    // the current update's metadata arrives.
     let mut inside_hidden_reasoning = false;
     let mut suppress_current_update_metadata = false;
 
-    // If the client requested logprobs or token_ids, we need to buffer chunks until
-    // we receive the separate `LogprobsDelta` event, so that we can emit one
-    // combined chunk with both the semantic delta and its per-update metadata.
+    // With logprobs or token IDs requested, semantic deltas are buffered until
+    // the update's metadata `TextDelta` arrives, so one chunk carries both.
     let mut pending_chunk =
         (requested_logprobs || return_token_ids).then(PendingChatChunk::default);
 
@@ -524,6 +592,8 @@ pub async fn chat_completion_chunk_stream(
                 pixels_png_b64,
                 ..
             }) => {
+                // Flush buffered deltas first so the image chunk keeps its
+                // position after the text generated before it.
                 if let Some(pending_chunk) = pending_chunk.as_mut()
                     && let Some(chunk) =
                         pending_chunk.take_chunk(&request_id, &response_model, created)
@@ -675,15 +745,17 @@ fn image_content_part(png_b64: String) -> ContentPart {
 
 /// One in-flight chat-completions SSE chunk being assembled at the route layer.
 ///
-/// `chat` emits semantic chat events first and `LogprobsDelta` separately,
-/// because one decoded update may be rewritten into multiple chat events.
-/// The OpenAI chat API, though, wants one streamed chunk to optionally carry
-/// both the delta and its logprobs.
+/// Serving output processing splits one decoded update into several semantic
+/// events and delivers the update's token IDs and logprobs on a `TextDelta`
+/// after them (see the module docs). The OpenAI chat API, though, wants one
+/// streamed chunk to optionally carry both the delta and its logprobs.
 ///
 /// This small buffer accumulates the semantic delta first, then attaches the
-/// following `LogprobsDelta` and flushes one combined chunk. It relies on the
-/// current `chat` invariant that all semantic events from one decoded
-/// update are emitted before that update's `LogprobsDelta`.
+/// following metadata and flushes one combined chunk. It relies on the
+/// output-processing invariant that all semantic events from one decoded
+/// update are emitted before that update's metadata. Events flushed when
+/// generation finishes are buffered after the final metadata and emitted by
+/// the flush before the `finish_reason` chunk.
 #[derive(Debug, Default)]
 struct PendingChatChunk {
     /// The currently buffered OpenAI delta payload assembled from one or more
@@ -702,9 +774,10 @@ impl PendingChatChunk {
         match kind {
             AssistantBlockKind::Text => append_delta_text(&mut self.delta.content, delta),
             AssistantBlockKind::Reasoning => append_delta_text(&mut self.delta.reasoning, delta),
-            // Tool calls are expected to flow through the dedicated tool-call
-            // chunks, never as block deltas. Drop a stray tool-call delta with a
-            // loud log rather than panicking and tearing down the live stream.
+            // Callers pass only `Text` and `Reasoning`; tool calls use
+            // `push_tool_call_start` and `push_tool_call_arguments`. A stray
+            // tool-call kind is logged and dropped instead of panicking inside
+            // a live stream.
             AssistantBlockKind::ToolCall => {
                 error!("unexpected tool-call block delta on chunk path; dropping");
             }
@@ -751,9 +824,10 @@ impl PendingChatChunk {
     /// - a delta-only chunk
     /// - a logprobs-only chunk
     ///
-    /// The logprobs-only case is intentional: token-level metadata in one
-    /// decoded update is correlated with the same update boundary, not
-    /// necessarily with a visible/chat-semantic delta.
+    /// Metadata-only chunks are intentional: token metadata belongs to a
+    /// decoded update, and an update need not produce a visible delta, for
+    /// example while the decoder or the output parsers hold back incomplete
+    /// text.
     fn take_chunk(
         &mut self,
         request_id: &str,
@@ -846,7 +920,12 @@ fn to_error_sse_event(error: &ApiError) -> Event {
     json_sse_event(payload)
 }
 
-/// Serializes a value as a JSON server-sent event.
+/// Wraps a serialized JSON payload in a server-sent event.
+///
+/// Compact `serde_json` output already escapes line breaks inside strings;
+/// the replacement guarantees that one payload stays on one `data:` line.
+/// axum's `Event::data` splits a raw `\n` across several `data:` fields and
+/// panics on a raw `\r`.
 fn json_sse_event(payload: String) -> Event {
     Event::default().data(payload.replace('\r', "\\r").replace('\n', "\\n"))
 }
@@ -891,9 +970,10 @@ fn block_delta_chunk(
             reasoning: Some(delta),
             ..Default::default()
         },
-        // Tool calls are expected to flow through the dedicated tool-call
-        // chunks, never as block deltas. Emit an empty delta with a loud log
-        // rather than panicking and tearing down the live stream.
+        // Callers pass only `Text` and `Reasoning`; tool calls use
+        // `tool_call_start_chunk` and `tool_call_arguments_chunk`. A stray
+        // tool-call kind yields an empty delta and an error log instead of
+        // panicking inside a live stream.
         AssistantBlockKind::ToolCall => {
             error!("unexpected tool-call block delta on chunk path; emitting empty delta");
             ChatMessageDelta::default()
@@ -1004,7 +1084,11 @@ fn final_chunk(
     Ok(chunk)
 }
 
-/// Converts a chat finish status into OpenAI fields.
+/// Maps a finish status to the OpenAI `finish_reason` string.
+///
+/// A stop after any tool call reports `tool_calls`, and a repetition stop
+/// reports `stop`. `FinishStatus::Error` returns a server error instead of a
+/// reason.
 fn chat_finish_status_to_openai(
     finish_status: &FinishStatus,
     saw_tool_calls: bool,
@@ -1021,7 +1105,9 @@ fn chat_finish_status_to_openai(
     }
 }
 
-/// Finishes the status as str.
+/// Names a finish status for request logs, keeping the `repetition` and
+/// `error` statuses that `chat_finish_status_to_openai` does not report as
+/// such.
 fn finish_status_as_str(status: &FinishStatus) -> &'static str {
     match status {
         FinishStatus::Stop { .. } => "stop",
@@ -1032,7 +1118,9 @@ fn finish_status_as_str(status: &FinishStatus) -> &'static str {
     }
 }
 
-/// Finishes the status stop reason.
+/// Returns the `stop_reason` response value: the matched stop token ID or
+/// stop string, or `None` for an EOS stop, a stop without a recorded cause,
+/// and every non-stop status.
 fn finish_status_stop_reason(status: &FinishStatus) -> Option<Value> {
     match status {
         FinishStatus::Stop { cause } => cause.as_ref().and_then(|cause| match cause {

@@ -5,6 +5,11 @@
 //! `model_index.json`, where each component lives in the folder named by its
 //! key; the modular layout publishes `modular_model_index.json`, where a
 //! component's specification may name its folder explicitly.
+//!
+//! Server startup (`ModelConfig::load` in `serving::model`) consults this
+//! index before any other asset: its presence marks a checkpoint as a
+//! pipeline, and `_class_name` selects the family. The Dynamo worker binary
+//! uses the same index to accept only MiniMax H3 checkpoints.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -15,6 +20,8 @@ use crate::profile::assets::error::{Error, Result};
 use crate::profile::assets::model_files::resolve_model_file;
 
 /// Index files consulted in order: the classic pipeline index, then the modular one.
+///
+/// The first file that resolves wins, even when both are published.
 const PIPELINE_INDEX_FILES: [&str; 2] = ["model_index.json", "modular_model_index.json"];
 
 /// Pipeline class and component folders declared by a checkpoint's root index.
@@ -22,7 +29,8 @@ const PIPELINE_INDEX_FILES: [&str; 2] = ["model_index.json", "modular_model_inde
 pub struct PipelineIndex {
     /// Pipeline class the index declares in `_class_name`.
     pub class_name: String,
-    /// Component name mapped to the checkpoint folder holding its files.
+    /// Component name mapped to the checkpoint-relative folder holding its
+    /// files.
     components: BTreeMap<String, String>,
 }
 
@@ -30,9 +38,15 @@ impl PipelineIndex {
     /// Parses a root index.
     ///
     /// Keys starting with `_` are index metadata. Every other key whose value
-    /// is a component specification (`[library, class, options?]`) names a
-    /// component; its folder is the `subfolder` option when present and the
-    /// key otherwise.
+    /// is an array (a component specification `[library, class, options?]`)
+    /// names a component; its folder is the string `subfolder` option when
+    /// present and the key otherwise. Keys with non-array values are ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Invalid`] when `content` is not JSON or not a JSON
+    /// object, and [`Error::MissingField`] when `_class_name` is absent or not
+    /// a string.
     pub fn parse(content: &str) -> Result<Self> {
         let value: Value = serde_json::from_str(content)
             .map_err(|error| Error::invalid(format!("pipeline index is not JSON: {error}")))?;
@@ -65,6 +79,9 @@ impl PipelineIndex {
     }
 
     /// Returns the checkpoint-relative path of `filename` inside `component`'s folder.
+    ///
+    /// The result is suitable for `resolve_model_file`. An undeclared
+    /// component is [`Error::Invalid`].
     pub fn component_file(&self, component: &str, filename: &str) -> Result<String> {
         let folder = self.components.get(component).ok_or_else(|| {
             Error::invalid(format!(
@@ -80,6 +97,9 @@ impl PipelineIndex {
 ///
 /// A repository that publishes neither index file is not a pipeline
 /// checkpoint, so a resolution failure yields `None` rather than an error.
+/// Any `resolve_model_file` failure counts as absence, including a network or
+/// authentication error for a Hub repository. An index that resolves but
+/// cannot be read or parsed is an error.
 pub async fn resolve_pipeline_index(model_id: &str) -> Result<Option<PipelineIndex>> {
     for filename in PIPELINE_INDEX_FILES {
         if let Ok(path) = resolve_model_file(model_id, filename).await {

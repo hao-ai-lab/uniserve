@@ -1,9 +1,17 @@
 //! Request-response endpoints built on iceoryx2 shared storage.
 //!
-//! Frames carry a fixed header and a FlatBuffers payload. Companion event
+//! This is the rank channel for a rank on the head's host: the engine holds a
+//! [`ClientEndpoint`] and the rank a [`ServerEndpoint`], both opened on one
+//! iceoryx2 request-response service named by [`service_name`]. Frames carry a
+//! fixed [`Header`] and a FlatBuffers payload; the same header and payload
+//! travel over the socket transport in `crate::socket`. Companion event
 //! services provide blocking wakeups without polling the request rings.
+//!
+//! The module also owns the transport vocabulary shared by both transports:
+//! [`IpcError`], [`Frame`], [`IPC_VERSION`] and header validation.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -30,6 +38,9 @@ pub type IpcResult<T> = std::result::Result<T, IpcError>;
 #[derive(Debug, thiserror::Error)]
 pub enum IpcError {
     /// Submission was not accepted because the bounded send queue is full.
+    ///
+    /// Only the socket transport's send queue produces this. The shared-storage
+    /// transport reports an exhausted iceoryx2 request limit as `Transport`.
     #[error("rank channel send queue is full")]
     WouldBlock,
     /// Payload encoding, decoding, or semantic validation failed.
@@ -107,6 +118,10 @@ macro_rules! ipc_error {
 }
 
 /// IPC version this build emits on every [`Header`].
+///
+/// A wire-protocol change bumps this value. Receivers accept only this exact
+/// version, so the engine and the Python worker extension must be built with
+/// the same value.
 pub const IPC_VERSION: u16 = 69;
 
 /// Returns whether this build can decode a peer-advertised IPC `version`.
@@ -116,10 +131,20 @@ pub fn is_supported_ipc_version(version: u16) -> bool {
 
 /// Frame correlation, size, and protocol version. Message semantics live in the payload.
 /// The explicit reserved word keeps this zero-copy C layout padding-free.
+///
+/// Shared storage hands this struct across as a typed value, while the socket
+/// transport serializes the same fields in the same order by hand
+/// (`socket::encode_header`). A field change must update both; the size
+/// assertion below catches a size change but not a reordering or a type
+/// change of equal size.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     /// Request-response correlation identity.
+    ///
+    /// Zero marks a frame without a correlation identity. The engine allocates
+    /// identities from one, and when it routes a batch response it accepts a
+    /// zero header identity without comparing it with the request's.
     pub message_id: u64,
     /// Encoded payload length in bytes.
     pub len: u32,
@@ -145,6 +170,9 @@ const _: () = assert!(std::mem::size_of::<Header>() == 16);
 
 impl Header {
     /// Checks framing before allocating or decoding a payload on either transport.
+    ///
+    /// Rejects a foreign protocol version, a nonzero reserved word, and a
+    /// length above `bound` bytes. It does not compare `len` with a payload.
     pub(crate) fn validate(&self, bound: usize) -> IpcResult<()> {
         if !is_supported_ipc_version(self.version) {
             ipc_bail!(
@@ -166,6 +194,9 @@ impl Header {
     }
 
     /// Stamps the actual length and enforces the common send limit.
+    ///
+    /// Both transports call this before sending, so the sender refuses a frame
+    /// the receiver would reject under the same bound.
     pub(crate) fn for_payload(mut self, len: usize, bound: usize) -> IpcResult<Self> {
         self.len = payload_len_u32(len)?;
         self.validate(bound)?;
@@ -175,7 +206,7 @@ impl Header {
 
 /// Received frame header and owned FlatBuffers payload.
 pub struct Frame {
-    /// Zero-copy transport header.
+    /// Transport header as received and validated.
     pub header: Header,
     /// Owned encoded message payload.
     pub payload: Vec<u8>,
@@ -219,6 +250,10 @@ fn payload_len_u32(len: usize) -> IpcResult<u32> {
 }
 
 /// Builds the iceoryx2 service name for one worker identifier.
+///
+/// An identifier containing `/` is taken as a complete service name; any other
+/// identifier is placed under [`DEFAULT_SERVICE_PREFIX`]. The event companions
+/// append their own suffixes to the service name an endpoint opens.
 pub fn service_name(id: &str) -> String {
     if id.contains('/') {
         id.to_string()
@@ -233,18 +268,29 @@ pub struct ClientEndpoint {
     _node: Node<IxService>,
     /// Request-response port used to loan and send request frames.
     client: IxClient,
+    /// Largest payload in bytes accepted in either direction.
     max_payload: usize,
-    /// Deadline for establishing or awaiting worker connectivity.
+    /// How long `send_raw` keeps retrying while no server is connected.
     connect_timeout: Duration,
     /// Directional wake ports paired with the request-response service.
     events: ClientEvents,
 }
 
 impl ClientEndpoint {
-    /// Connects a host endpoint to an existing worker service.
+    /// Connects a host endpoint to a worker service, creating it if absent.
+    ///
+    /// `max_payload` bounds every payload in bytes. `max_inflight` is the number
+    /// of [`Pending`] handles this client may hold at once; the engine passes
+    /// its per-rank queue depth, which `RankProcess::finish_startup` requires
+    /// to equal the worker's advertised `queue_depth`. A send while that many
+    /// handles are alive fails with a transport error.
     pub fn connect(service: &str, max_payload: usize, max_inflight: usize) -> IpcResult<Self> {
-        // Create the request-response service with bounded, non-overflowing
-        // capacity so every pending handle names one retained request.
+        // Size the service for one client and one server, `max_inflight`
+        // outstanding requests and one response per request, and disable
+        // safe overflow so a full buffer never discards an unconsumed frame.
+        // `ServerEndpoint::bind` requests identical settings: either side may
+        // create the service through `open_or_create`, and iceoryx2 refuses to
+        // open an existing service whose settings are incompatible.
         let service_name = ServiceName::new(service).context("invalid iceoryx2 service name")?;
         let node = NodeBuilder::new()
             .create::<IxService>()
@@ -264,16 +310,20 @@ impl ClientEndpoint {
             .enable_safe_overflow_for_responses(false)
             .open_or_create()
             .context("opening iceoryx2 request-response service")?;
-        // Power-of-two growth accommodates variable FlatBuffers frame sizes.
+
+        // Start with a slice of at most 64 KiB; power-of-two growth
+        // accommodates larger, variable FlatBuffers frames.
         let client = factory
             .client_builder()
             .initial_max_slice_len(max_payload.clamp(1, 64 * 1024))
             .allocation_strategy(AllocationStrategy::PowerOfTwo)
             .create()
             .context("creating iceoryx2 client port")?;
+
         // Companion event ports provide file-descriptor-based wakeups.
         let events =
             ClientEvents::open(&node, service).context("opening client event companions")?;
+
         Ok(Self {
             _node: node,
             client,
@@ -284,7 +334,8 @@ impl ClientEndpoint {
     }
 
     /// Parks for {result, death} until a wake fires or `timeout`
-    /// elapses. Returns which sources fired.
+    /// elapses. Returns which sources fired; none set means no wake was
+    /// pending when the wait ended.
     pub fn wait_wake(&self, timeout: Duration) -> IpcResult<WakeEvents> {
         self.events.wait(timeout)
     }
@@ -296,6 +347,9 @@ impl ClientEndpoint {
     }
 
     /// Returns the borrowed descriptor used by an external poll loop.
+    ///
+    /// The descriptor stays owned by this endpoint and is valid only while it
+    /// lives. After it polls readable, call [`Self::drain_wakes`].
     pub fn wake_file_descriptor(&self) -> i32 {
         self.events.file_descriptor()
     }
@@ -305,7 +359,9 @@ impl ClientEndpoint {
         self.events.death_wake()
     }
 
-    /// Encodes and sends a request, waiting for ring capacity until the deadline.
+    /// Encodes and sends a request, retrying while no server is connected.
+    ///
+    /// See [`Self::send_raw`] for the retry and failure behavior.
     pub fn send_request(&self, req: &WorkerRequest) -> IpcResult<Pending> {
         let payload = encode_request(req)?;
         let mut header = header_for_request(req);
@@ -313,7 +369,10 @@ impl ClientEndpoint {
         self.send_raw(header, &payload)
     }
 
-    /// Attempts one non-blocking request submission.
+    /// Encodes and sends a request once, whether or not a server is connected.
+    ///
+    /// See [`Self::send_raw_attempt`]; the caller checks connectivity on the
+    /// returned handle.
     pub fn send_request_attempt(&self, req: &WorkerRequest) -> IpcResult<Pending> {
         let payload = encode_request(req)?;
         let mut header = header_for_request(req);
@@ -321,7 +380,13 @@ impl ClientEndpoint {
         self.send_raw_attempt(header, &payload)
     }
 
-    /// Sends a pre-encoded frame, waiting for ring capacity until the deadline.
+    /// Sends a pre-encoded frame, retrying while no server is connected.
+    ///
+    /// A request sent before the worker's server port exists reaches no one, so
+    /// such a send is discarded and repeated every 20 ms until a server is
+    /// connected or `connect_timeout` elapses. Any other send failure returns
+    /// immediately. The engine uses [`Self::send_request_attempt`] and its own
+    /// connectivity loop instead; this blocking form serves tests.
     pub fn send_raw(&self, header: Header, payload: &[u8]) -> IpcResult<Pending> {
         let deadline = Instant::now() + self.connect_timeout;
         loop {
@@ -329,6 +394,9 @@ impl ClientEndpoint {
             if pending.number_of_server_connections() > 0 {
                 return Ok(pending);
             }
+
+            // Release the unanswerable request's active-request slot before
+            // retrying.
             drop(pending);
             if Instant::now() >= deadline {
                 ipc_bail!("iceoryx2 worker service has no connected server");
@@ -337,7 +405,13 @@ impl ClientEndpoint {
         }
     }
 
-    /// Attempts one non-blocking pre-encoded frame submission.
+    /// Sends a pre-encoded frame once and wakes the worker's request listener.
+    ///
+    /// Stamps `header.len` from `payload`. Fails with a transport error when the
+    /// header is invalid, the payload exceeds `max_payload`, or iceoryx2 refuses
+    /// the loan or send, for example while `max_inflight` pending handles are
+    /// alive. Success does not imply that a server received the request; see
+    /// `Pending::number_of_server_connections`.
     pub fn send_raw_attempt(&self, header: Header, payload: &[u8]) -> IpcResult<Pending> {
         let header = header.for_payload(payload.len(), self.max_payload)?;
         // Loan exact shared-storage capacity, initialize the header and payload,
@@ -349,11 +423,17 @@ impl ClientEndpoint {
         *request.user_header_mut() = header;
         let request = request.write_from_slice(payload);
         let pending = request.send().context("sending iceoryx2 request")?;
+
+        // Notify only after the request is in the ring.
         self.events.notify_request();
         Ok(pending)
     }
 
     /// Attempts to receive the response associated with `pending`.
+    ///
+    /// Returns `Ok(None)` when no response has arrived. The payload is copied
+    /// out of shared storage, so the returned frame outlives the received
+    /// sample.
     pub fn try_recv_response(&self, pending: &Pending) -> IpcResult<Option<Frame>> {
         let Some(response) = pending.receive().context("receiving iceoryx2 response")? else {
             return Ok(None);
@@ -366,6 +446,10 @@ impl ClientEndpoint {
     }
 
     /// Waits up to `timeout` for the response associated with `pending`.
+    ///
+    /// Returns `Ok(None)` at the deadline. Host wakes observed while waiting,
+    /// including a worker-death wake, are drained without being reported, so a
+    /// caller that tracks death must not rely on this method to surface it.
     pub fn recv_response_timeout(
         &self,
         pending: &Pending,
@@ -391,6 +475,7 @@ pub struct ServerEndpoint {
     _node: Node<IxService>,
     /// Request-response port used to receive and answer request frames.
     server: IxServer,
+    /// Largest payload in bytes accepted in either direction.
     max_payload: usize,
     /// Active requests retained until their matching `message_id` is answered.
     active: VecDeque<(u64, IxActive)>,
@@ -400,9 +485,13 @@ pub struct ServerEndpoint {
 
 impl ServerEndpoint {
     /// Creates the worker endpoint and its directional wake services.
+    ///
+    /// `max_payload` and `max_inflight` size the service as in
+    /// [`ClientEndpoint::connect`]; each side enforces its own `max_payload` on
+    /// the frames it sends and receives.
     pub fn bind(service: &str, max_payload: usize, max_inflight: usize) -> IpcResult<Self> {
-        // Mirror client capacity on a single-server, single-client service and
-        // disable overflow so request ownership remains explicit.
+        // Mirror `ClientEndpoint::connect` exactly; iceoryx2 refuses to open a
+        // service whose existing settings are incompatible with the request.
         let service_name = ServiceName::new(service).context("invalid iceoryx2 service name")?;
         let node = NodeBuilder::new()
             .create::<IxService>()
@@ -422,6 +511,7 @@ impl ServerEndpoint {
             .enable_safe_overflow_for_responses(false)
             .open_or_create()
             .context("opening iceoryx2 request-response service")?;
+
         // Allocate response buffers with the same variable-size strategy.
         let server = factory
             .server_builder()
@@ -430,9 +520,11 @@ impl ServerEndpoint {
             .max_loaned_responses_per_request(1)
             .create()
             .context("creating iceoryx2 server port")?;
+
         // Companion event ports wake request and asynchronous-completion paths.
         let events =
             ServerEvents::open(&node, service).context("opening server event companions")?;
+
         Ok(Self {
             _node: node,
             server,
@@ -443,6 +535,11 @@ impl ServerEndpoint {
     }
 
     /// Attempts to receive one request without blocking.
+    ///
+    /// A received frame's active request is retained until
+    /// [`Self::respond_raw`] answers its `message_id`. A frame that fails header
+    /// validation is dropped together with its active request, so no response
+    /// can be sent for it.
     pub fn try_recv(&mut self) -> IpcResult<Option<Frame>> {
         let Some(active) = self
             .server
@@ -462,7 +559,10 @@ impl ServerEndpoint {
         Ok(Some(Frame { header, payload }))
     }
 
-    /// Waits for and receives one request before the call deadline.
+    /// Blocks until one request arrives; there is no overall deadline.
+    ///
+    /// Each park is bounded by `connect_timeout`, after which the ring is
+    /// checked again. Returns only with a frame or an error.
     pub fn recv(&mut self) -> IpcResult<Frame> {
         loop {
             if let Some(frame) = self.try_recv()? {
@@ -474,6 +574,8 @@ impl ServerEndpoint {
 
     /// Parks until an inbound request or asynchronous completion wake fires, or
     /// `timeout` elapses. The caller re-checks all progress sources after return.
+    ///
+    /// Returns `Ok(())` on timeout as well as on a wake.
     pub fn wait_incoming(&self, timeout: Duration) -> IpcResult<()> {
         self.events.wait_request(timeout)
     }
@@ -492,8 +594,16 @@ impl ServerEndpoint {
     }
 
     /// Publishes a pre-encoded response for the active request.
+    ///
+    /// `header.message_id` selects the oldest retained request with that
+    /// identity. Answering removes the request, so a further response under
+    /// that identity fails as unknown unless another retained request carries
+    /// it. An oversized payload fails before any request is consumed, but once
+    /// the request is resolved a failed loan or send still consumes it and no
+    /// response can follow.
     pub fn respond_raw(&mut self, header: Header, payload: &[u8]) -> IpcResult<()> {
         let header = header.for_payload(payload.len(), self.max_payload)?;
+
         // Resolve and remove the exact active transport request before loaning
         // its response buffer.
         let pos = self
@@ -511,6 +621,7 @@ impl ServerEndpoint {
             .remove(pos)
             .map(|(_, active)| active)
             .context("active request position disappeared")?;
+
         // Initialize the loaned response completely before publishing it.
         let mut response = active
             .loan_slice_uninit(payload.len())
@@ -518,18 +629,21 @@ impl ServerEndpoint {
         *response.user_header_mut() = header;
         let response = response.write_from_slice(payload);
         response.send().context("sending iceoryx2 response")?;
+
         // Notify only after the ring owns the fully initialized response.
         self.events.notify_response();
         Ok(())
     }
 
-    /// Returns the worker-side deadline used by blocking receive calls.
+    /// Returns the bound on one park inside [`Self::recv`].
     fn connect_timeout(&self) -> Duration {
         Duration::from_secs(300)
     }
 }
 
 /// Builds the request correlation header; send stamps the encoded length.
+///
+/// A request without a `message_id` gets header identity zero.
 pub fn header_for_request(req: &WorkerRequest) -> Header {
     Header {
         message_id: req.message_id().unwrap_or_default(),
@@ -538,6 +652,8 @@ pub fn header_for_request(req: &WorkerRequest) -> Header {
 }
 
 /// Builds the response correlation header; send stamps the encoded length.
+///
+/// A response without a `message_id` gets header identity zero.
 pub fn header_for_response(resp: &WorkerResponse) -> Header {
     Header {
         message_id: resp.message_id().unwrap_or_default(),
@@ -546,6 +662,10 @@ pub fn header_for_response(resp: &WorkerResponse) -> Header {
 }
 
 /// Verifies protocol version and payload length before frame decoding.
+///
+/// Checks the version and reserved word and that `header.len` equals `actual`.
+/// The payload bound is the receiving endpoint's check, so none is applied
+/// here beyond the `u32` range.
 fn verify_header_len(header: Header, actual: usize) -> IpcResult<()> {
     header.validate(u32::MAX as usize)?;
     if header.len as usize != actual {
@@ -563,9 +683,12 @@ mod tests {
 
     #[test]
     fn shared_storage_enforces_the_payload_bound_in_both_directions() {
+        // A frame one byte over the bound is refused by the sender on each
+        // side, and a frame exactly at the bound round-trips.
         let service = format!("payload-bound-{}", std::process::id());
         let mut server = ServerEndpoint::bind(&service, 256, 2).unwrap();
         let client = ClientEndpoint::connect(&service, 256, 2).unwrap();
+
         assert!(client.send_raw(Header::default(), &[0; 257]).is_err());
         let pending = client
             .send_raw(
@@ -578,6 +701,9 @@ mod tests {
             .unwrap();
         let request = server.recv().unwrap();
         assert_eq!(request.payload, vec![9; 256]);
+
+        // The oversized response is refused before it consumes the request,
+        // so the in-bound response can still answer it.
         assert!(server.respond_raw(request.header, &[0; 257]).is_err());
         server.respond_raw(request.header, &[3; 256]).unwrap();
         let response = client

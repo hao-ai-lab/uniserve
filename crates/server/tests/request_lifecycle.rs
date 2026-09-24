@@ -18,10 +18,18 @@ use uniserve_server::serving::{
     ServingRuntime, StopCause, TextPromptRequest,
 };
 
+/// Builds a serving runtime over a default `SimEngine`.
 fn runtime() -> ServingRuntime {
     runtime_with_worker(SimEngine::new())
 }
 
+/// Builds a Qwen3 serving runtime whose engine drives `worker` in process
+/// through `SimExecutor`.
+///
+/// The tokenizer maps each code point below 128 to one token whose ID is the
+/// code point; `<|im_end|>` is added as ID 128, which the model config names
+/// as its end-of-sequence token. The chat template renders only the first
+/// message's content.
 fn runtime_with_worker(worker: SimEngine) -> ServingRuntime {
     let vocabulary = (0_u32..128)
         .map(|id| (char::from_u32(id).unwrap().to_string(), id))
@@ -37,6 +45,7 @@ fn runtime_with_worker(worker: SimEngine) -> ServingRuntime {
     let path = directory.path().join("tokenizer.json");
     tokenizer.save(&path, false).unwrap();
     let tokenizer = Arc::new(HuggingFaceTokenizer::new(&path).unwrap());
+
     let client = Arc::new(
         EngineClient::connect_with_executor(
             EngineConfig::sim("sim-model"),
@@ -71,9 +80,12 @@ fn runtime_with_worker(worker: SimEngine) -> ServingRuntime {
         false,
     )
     .unwrap();
+
     ServingRuntime::new(processor, client, false)
 }
 
+/// Greedy text request that may sample only `a`, so it deterministically
+/// stops on the `aa` stop string after two output tokens.
 fn request(id: &str) -> TextPromptRequest {
     let mut request = TextPromptRequest::new(id, "prompt");
     request.sampling.max_tokens = Some(8);
@@ -83,6 +95,11 @@ fn request(id: &str) -> TextPromptRequest {
     request
 }
 
+/// A request identifier is refused while a request holding it is live and
+/// becomes reusable once the finished request leaves the active registry,
+/// which `drain_request` waits for. Dropping the first, already exhausted
+/// stream afterwards must not affect the second request that reuses the
+/// identifier.
 #[tokio::test]
 async fn stop_completion_releases_identity_without_dropping_the_exhausted_stream() {
     let runtime = runtime();
@@ -91,6 +108,7 @@ async fn stop_completion_releases_identity_without_dropping_the_exhausted_stream
         runtime.generate_text(request("same-id")).await,
         Err(uniserve_server::openai::ApiError::InvalidRequest { .. })
     ));
+
     let mut text = String::new();
     let mut output_tokens = None;
     loop {
@@ -115,12 +133,16 @@ async fn stop_completion_releases_identity_without_dropping_the_exhausted_stream
             _ => {}
         }
     }
+
+    // The matched stop string is withheld from the visible text, but both
+    // sampled tokens count toward usage.
     assert_eq!(text, "");
     assert_eq!(output_tokens, Some(2));
     assert_eq!(
         runtime.drain_request("same-id").await.unwrap().state,
         RequestLifecycleState::Finished
     );
+
     let mut second = runtime.generate_text(request("same-id")).await.unwrap();
     // A retained exhausted stream must not cancel a reused external identity.
     drop(first);
@@ -133,6 +155,10 @@ async fn stop_completion_releases_identity_without_dropping_the_exhausted_stream
     runtime.shutdown().await.unwrap();
 }
 
+/// Cancel, abort, and a dropped `generate_text` future each end a request
+/// whose preprocessing has not started. A control yields a single terminal
+/// event, abort takes precedence over an earlier or later cancel, and a
+/// disconnect is recorded as a cancellation.
 #[test]
 fn controls_and_disconnection_release_requests_during_preprocessing() {
     let executor = tokio::runtime::Builder::new_current_thread()
@@ -142,6 +168,7 @@ fn controls_and_disconnection_release_requests_during_preprocessing() {
         .unwrap();
     executor.block_on(async {
         let runtime = runtime();
+
         // Occupy the real blocking pool so preprocessing remains queued. This
         // controls the execution environment without replacing the tokenizer.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -151,11 +178,14 @@ fn controls_and_disconnection_release_requests_during_preprocessing() {
             let _ = release_rx.recv();
         });
         ready_rx.await.unwrap();
+
         for (id, expected) in [
             ("cancel", RequestLifecycleState::Cancelled),
             ("abort", RequestLifecycleState::Aborted),
             ("disconnect", RequestLifecycleState::Cancelled),
         ] {
+            // One poll registers the request before it waits for the blocking
+            // pool; the registered identifier already refuses a duplicate.
             let mut pending = Box::pin(runtime.generate_text(request(id)));
             assert!(poll!(pending.as_mut()).is_pending());
             assert_eq!(
@@ -187,6 +217,7 @@ fn controls_and_disconnection_release_requests_during_preprocessing() {
             }
             assert_eq!(runtime.drain_request(id).await.unwrap().state, expected);
         }
+
         assert_eq!(runtime.metrics_snapshot().cancelled, 2);
         assert_eq!(runtime.metrics_snapshot().aborted, 1);
         release_tx.send(()).unwrap();
@@ -195,6 +226,10 @@ fn controls_and_disconnection_release_requests_during_preprocessing() {
     });
 }
 
+/// A chat prompt that exceeds the total capacity of a two-block KV cache is
+/// returned as a stream and then rejected by engine admission. Collecting the
+/// completion must report that rejection as HTTP 400 and record the request
+/// as `Rejected`.
 #[tokio::test]
 async fn chat_admission_rejection_remains_a_bad_request() {
     let mut worker = SimEngine::new();
@@ -206,6 +241,7 @@ async fn chat_admission_rejection_remains_a_bad_request() {
         "max_completion_tokens": 8
     }))
     .unwrap();
+
     let stream = runtime
         .generate_chat("rejected-chat".into(), request)
         .await
@@ -223,6 +259,7 @@ async fn chat_admission_rejection_remains_a_bad_request() {
     )
     .await
     .unwrap_err();
+
     assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
     assert_eq!(
         runtime.request_stats("rejected-chat").unwrap().state,
@@ -231,6 +268,9 @@ async fn chat_admission_rejection_remains_a_bad_request() {
     runtime.shutdown().await.unwrap();
 }
 
+/// `compile_us` is measured from the start of `generate_text`, so it includes
+/// time spent queued for the blocking pool; the reported total latency must
+/// cover that wait as well.
 #[test]
 fn successful_total_includes_time_waiting_for_preprocessing() {
     let executor = tokio::runtime::Builder::new_current_thread()
@@ -240,6 +280,9 @@ fn successful_total_includes_time_waiting_for_preprocessing() {
         .unwrap();
     executor.block_on(async {
         let runtime = runtime();
+
+        // Hold the only blocking thread so preprocessing waits in the queue
+        // for a measurable interval before it runs.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let occupied = tokio::task::spawn_blocking(move || {
@@ -252,6 +295,7 @@ fn successful_total_includes_time_waiting_for_preprocessing() {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         release_tx.send(()).unwrap();
         occupied.await.unwrap();
+
         let mut stream = pending.await.unwrap();
         let mut timing = None;
         while let Some(event) = stream.next().await {

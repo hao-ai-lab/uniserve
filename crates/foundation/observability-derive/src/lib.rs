@@ -19,9 +19,15 @@ use syn::spanned::Spanned;
 ///
 /// Each field carries `#[metric(name = "...", help = "...")]`, where `name` is
 /// the Prometheus metric name and `help` is the metric help text. Both are
-/// passed verbatim to `Registry::register`. An optional `init = <expr>`
-/// supplies the field's initial value; without it the field is built with
-/// `Default::default()`.
+/// passed verbatim to `Registry::register`; `prometheus_client` itself appends
+/// a full stop to every help text and `_total` to counter names in the
+/// exposition. An optional `init = <expr>` supplies the field's initial value;
+/// without it the field is built with `Default::default()`.
+///
+/// The registry keeps a clone of each field and the struct keeps the
+/// original, so a field type must be a metric handle whose clones share state
+/// (as `prometheus_client` counters, gauges, histograms, and families do);
+/// otherwise updates through the field never reach the exported registry.
 ///
 /// The generated method is:
 ///
@@ -121,8 +127,8 @@ fn parse_field(field: &syn::Field) -> syn::Result<MetricField> {
     let mut help: Option<LitStr> = None;
     let mut init: Option<Expr> = None;
 
-    // Collect the single metric attribute while rejecting duplicate keys at
-    // their precise literal spans.
+    // Merge the keys of every `#[metric]` attribute on the field, rejecting a
+    // key repeated within or across attributes at its value's span.
     let mut metric_attr_seen = false;
     for attr in &field.attrs {
         if !attr.path().is_ident("metric") {

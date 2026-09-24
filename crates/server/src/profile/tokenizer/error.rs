@@ -10,4 +10,8 @@ pub type Result<T> = std::result::Result<T, TokenizerError>;
 #[thiserror_ext(macro(path = "crate::profile::tokenizer::error"))]
 #[error("tokenizer error: {0}")]
 /// Error returned while loading, encoding, or decoding tokens.
+///
+/// The `Macro` derive generates the `tokenizer_error!` format-style
+/// constructor; `profile::tokenizer` imports this module with `#[macro_use]`
+/// so its submodules can call it.
 pub struct TokenizerError(#[message] pub String);

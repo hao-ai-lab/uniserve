@@ -1,4 +1,10 @@
-//! Assistant output-processor traits and implementations.
+//! Assistant output processing for chat generation.
+//!
+//! Decoded text passes through the Qwen3 reasoning stage and then the tool-call
+//! stage (`qwen3`), which produce the [`AssistantEvent`] stream defined in
+//! `processor`. `assemble_chat_event_stream` drives that stream and uses
+//! `structured::OutputProcessor` to turn assistant events into content-block
+//! and tool-call serving events.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub(crate) mod processor;

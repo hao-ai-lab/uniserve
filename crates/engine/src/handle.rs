@@ -1,13 +1,33 @@
 //! Cloneable submission and control handles for an engine owner thread.
 //!
-//! Each accepted request receives a bounded event channel. Commands are queued
-//! independently and wake the engine after enqueueing.
+//! Frontends control the scheduler thread with [`Command`]s that an
+//! [`EngineHandle`] sends on a crossbeam channel; each successful send fires
+//! the handle's `CommandWaker`, which wakes a parked scheduler unless it is
+//! the no-op waker.
+//! Each accepted request receives a bounded event channel ([`EventTx`] and
+//! [`EventRx`], [`EVENT_BUFFER_CAPACITY`] events).
+//!
+//! [`EventRx`] also drives output acknowledgement. It counts received
+//! `TextToken` events and reports consumed prefixes as
+//! [`Command::Acknowledge`]. A token request without stop strings is
+//! acknowledged on receipt; for a request with stop strings the frontend
+//! decoder calls [`EventRx::acknowledge_consumed_prefix`] after checking that
+//! a token completes no stop string, or [`EventRx::cancel_at_consumed_prefix`]
+//! on a match. Dropping an [`EventRx`] before a terminal event cancels the
+//! request at its acknowledged prefix.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use tokio::sync::mpsc;
 use uniserve_core::{EngineCoreOutput, Request, RequestId};
 
 /// Pollable command ingress whose lifetime is independent of Worker membership.
+///
+/// A nonblocking Unix socket pair: the `CommandWaker` from [`Self::waker`]
+/// owns the write end and writes a byte per wake (a full socket already holds
+/// a pending notification), and the owner polls [`Self::descriptor`] for
+/// readability and consumes the bytes with [`Self::drain`]. `WorkerExecutor`
+/// owns one beside its worker groups and polls it with their progress
+/// descriptors.
 pub(crate) struct WakeSignal {
     reader: std::os::unix::net::UnixStream,
     waker: uniserve_core::CommandWaker,
@@ -37,12 +57,18 @@ impl WakeSignal {
         self.waker.clone()
     }
 
+    /// Raw read-end descriptor for `poll`; valid while this value lives.
     pub(crate) fn descriptor(&self) -> i32 {
         use std::os::fd::AsRawFd as _;
         self.reader.as_raw_fd()
     }
 
     /// Consumes latched notifications before the owner considers parking again.
+    ///
+    /// Returns whether at least one notification was pending. Reads until the
+    /// socket is empty or its write end has closed, so any number of wakes
+    /// coalesce into one `true`. Read errors other than `WouldBlock` and
+    /// `Interrupted` propagate.
     pub(crate) fn drain(&mut self) -> std::io::Result<bool> {
         use std::io::Read as _;
 
@@ -63,16 +89,19 @@ impl WakeSignal {
 }
 
 /// Maximum number of generation events buffered for one request consumer.
+///
+/// The scheduler sizes its per-request output journal
+/// (`OUTPUT_JOURNAL_CAPACITY`) from this value.
 pub const EVENT_BUFFER_CAPACITY: usize = 64;
 
 /// Failure to publish an event into a request's bounded channel.
 #[derive(Debug, thiserror::Error)]
 pub enum EventSendError {
     #[error("generation event channel is full")]
-    /// Returns the event rejected by a full bounded channel.
+    /// Carries the event rejected by a full bounded channel.
     Full(Box<EngineCoreOutput>),
     #[error("generation event channel is closed")]
-    /// Returns the event rejected after the receiver closed.
+    /// Carries the event rejected after the receiver closed.
     Closed(Box<EngineCoreOutput>),
 }
 
@@ -105,6 +134,10 @@ pub struct EventTx {
 
 impl EventTx {
     /// Attempts to publish an event without waiting for channel capacity.
+    ///
+    /// Never blocks. The scheduler keeps an event rejected as `Full` in the
+    /// request's output journal (`EventJournal`) and resends it, in order, on
+    /// a later flush that finds the channel has room.
     pub fn send(&self, event: EngineCoreOutput) -> Result<(), EventSendError> {
         self.inner.try_send(event).map_err(|error| match error {
             mpsc::error::TrySendError::Full(event) => EventSendError::Full(Box::new(event)),
@@ -135,9 +168,17 @@ pub struct EventRx {
     on_finish: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
+/// Control state that lets an [`EventRx`] act on its request.
+///
+/// The `handle` clone keeps the command channel open while the receiver
+/// holds it; it is dropped on the terminal event, channel close, or first
+/// cancellation.
 struct EventCancellation {
     handle: EngineHandle,
     request_id: RequestId,
+    /// Acknowledge each `TextToken` as soon as it is received. `submit` sets
+    /// this only for token requests without stop strings; for token requests
+    /// with stop strings the frontend decoder acknowledges explicitly.
     acknowledge_on_receive: bool,
 }
 
@@ -155,16 +196,23 @@ impl EventRx {
     }
 
     /// Registers a callback to run once on terminal completion or channel close.
+    ///
+    /// Dropping the receiver also runs a callback that has not yet run.
     pub fn set_on_finish(&mut self, on_finish: impl FnOnce() + Send + 'static) {
         self.on_finish = Some(Box::new(on_finish));
     }
 
     /// Receives the next event and advances output acknowledgement state.
+    ///
+    /// Returns `None` once the channel is closed and empty, which also runs
+    /// the completion callback.
     pub async fn recv(&mut self) -> Option<EngineCoreOutput> {
         let event = self.inner.recv().await;
         match event.as_ref() {
             Some(event) => {
                 self.observe(event);
+                // The freed channel slot may unblock a request stalled on
+                // output capacity.
                 self.waker.wake();
             }
             None => self.finish(),
@@ -211,6 +259,10 @@ impl EventRx {
     }
 
     /// Acknowledges every text token observed through this receiver.
+    ///
+    /// Sends nothing when no token arrived since the last acknowledgement or
+    /// when the receiver has no armed cancellation (built by `from_receiver`,
+    /// finished, or already cancelled).
     pub fn acknowledge_consumed_prefix(&mut self) {
         if self.text_tokens_received <= self.acknowledged_token_count {
             return;
@@ -230,6 +282,11 @@ impl EventRx {
     }
 
     /// Closes generation at the receiver's safe public-token boundary.
+    ///
+    /// `DroppedStream` cancels at the acknowledged token count;
+    /// `StopStringMatched` stops successfully after every text token received
+    /// so far. Only the first cancellation of an armed receiver sends a
+    /// command; see `acknowledge_consumed_prefix` for when it is disarmed.
     pub fn cancel_at_consumed_prefix(&mut self, cause: StreamCancelCause) {
         let Some(cancellation) = self.cancellation.take() else {
             return;
@@ -257,7 +314,9 @@ impl EventRx {
 }
 
 impl Drop for EventRx {
-    /// Releases resources owned by this value.
+    /// Cancels an unfinished request at its acknowledged prefix, runs an unrun
+    /// completion callback, and wakes the scheduler so it observes the closed
+    /// channel.
     fn drop(&mut self) {
         if let Some(cancellation) = self.cancellation.take() {
             let _ = cancellation.handle.send(Command::Cancel {
@@ -329,10 +388,15 @@ pub enum Command {
 /// Cloneable front door over the scheduler. `submit` enqueues to the scheduler;
 /// dropping the last handle tears the engine down.
 ///
-/// Every send fires the [`CommandWaker`] right after enqueuing, so when the
+/// The scheduler stops when every sender of its command channel has dropped,
+/// which includes the clones held by live [`EventRx`] values that are still
+/// armed for cancellation.
+///
+/// Every send fires the `CommandWaker` right after enqueuing, so when the
 /// scheduler is parked on an event-driven executor it wakes immediately to
 /// observe the command instead of waiting out the park's safety-net timeout.
-/// With the no-op waker (the polling path / sim), this is free.
+/// With the no-op waker, a parked scheduler observes commands only when its
+/// executor poll returns.
 #[derive(Clone)]
 pub struct EngineHandle {
     tx: crossbeam_channel::Sender<Command>,
@@ -340,8 +404,8 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
-    /// Constructs a handle with the no-op waker (the polling / sim path, which
-    /// observes commands through its own timed wait).
+    /// Constructs a handle with the no-op waker, for a scheduler that observes
+    /// commands only through its timed executor poll.
     pub fn new(tx: crossbeam_channel::Sender<Command>) -> Self {
         Self::with_waker(tx, uniserve_core::CommandWaker::noop())
     }
@@ -367,9 +431,16 @@ impl EngineHandle {
     }
 
     /// Submits a request and returns its bounded event stream.
+    ///
+    /// The returned receiver cancels the request when dropped before its
+    /// terminal event. Fails with `SubmitError::Closed` when the command
+    /// channel is closed; this handle never reports `SubmitError::Dead`,
+    /// which `EngineCore::submit` checks before calling it.
     pub fn submit(&self, request: impl Into<Request>) -> Result<EventRx, SubmitError> {
         let request = request.into();
         let request_id = request.request_id();
+        // Stop-string matching happens in the frontend decoder, which must
+        // withhold acknowledgement until it has checked each token.
         let acknowledge_on_receive = match &request {
             Request::Ar(request) | Request::Umm(request) => request.stop_strings.is_empty(),
             Request::Diffusion(_) => false,
@@ -476,6 +547,9 @@ mod tests {
         }
     }
 
+    /// A request without stop strings acknowledges tokens on receipt. When the
+    /// receiver drops after reading one of two published tokens, the cancel
+    /// covers only the token the consumer actually received.
     #[test]
     fn dropping_event_receiver_cancels_at_the_consumed_text_prefix() {
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -485,6 +559,7 @@ mod tests {
             Command::Submit { event_tx, .. } => event_tx,
             _ => panic!("expected Submit command"),
         };
+
         event_tx
             .send(EngineCoreOutput::TextToken {
                 id: 7,

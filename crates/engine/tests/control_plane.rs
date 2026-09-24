@@ -1,6 +1,30 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! End-to-end engine-loop lifecycle behavior over the GPU-free simulator.
+//!
+//! Each test drives a real `Scheduler` against `SimExecutor`/`SimEngine`,
+//! either on a spawned thread through `Scheduler::run` or stepped on the test
+//! thread with `Scheduler::step`, and observes behavior through `EngineHandle`
+//! event streams, `SchedulerStats` counters, and the scheduler's public
+//! accessors.
+//!
+//! Simulator conventions the tests rely on:
+//! - For request id `r`, the greedy token at text index `n` is
+//!   `1000 + (7r + n) % 5000` (1007, 1008, ... for request 1) until
+//!   `SimEngine::set_text_len` tokens have been produced; after that the
+//!   synthetic EOS (151645, the first EOS of `SpecialTokenIds::default`)
+//!   dominates the logits. The index restarts at zero when a generated image
+//!   is fed back into the request's context.
+//! - `SimEngine::set_queue_depth` bounds the batches the scheduler may keep
+//!   unresolved. Depth 1 is the serial oracle that the depth-invariance tests
+//!   compare depth 2 against.
+//! - The KV block size is 64 tokens (`WorkerInfo::default`) unless a test
+//!   calls `SimEngine::set_block_size`, and generated images default to
+//!   512x512 (`ImageParams::default`).
+//! - The `general` request gauges and the `kv_cache` and `encoder` counters in
+//!   `SchedulerStats` are snapshots that `Scheduler::publish_cache_stats`
+//!   refreshes as the loop runs, not when an event is sent, so they can trail
+//!   the event stream. The `prefix` counters are recorded at admission.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -18,10 +42,16 @@ use uniserve_engine::{
     EngineHandle, Scheduler, SchedulingPolicy, SimEngine, SimExecutor, SpecialTokenIds,
 };
 
+/// Default special tokens, whose first EOS id equals the simulator's synthetic
+/// EOS, so the simulator's end of text finishes requests with `Eos`.
 fn ctrl() -> SpecialTokenIds {
     SpecialTokenIds::default()
 }
 
+/// Advertised generation features follow the worker's supported calls: image
+/// generation needs the complete latent-preparation, denoising, and
+/// image-decoding path (video decoding does not substitute), and each encoder
+/// call enables only its own feature.
 #[test]
 fn generation_capabilities_require_complete_paths_and_distinct_encoders() {
     use uniserve_core::GenerationFeatures;
@@ -87,6 +117,9 @@ fn generation_capabilities_require_complete_paths_and_distinct_encoders() {
     }
 }
 
+/// Encoder feature byte limits clamp to the smaller of the worker's encoder
+/// cache entry size and buffer pool size, and the encoder cache entry count
+/// clamps to the worker's advertised entries.
 #[test]
 fn encoder_products_obey_worker_entry_capacity() {
     let mut sim = SimEngine::new();
@@ -105,6 +138,12 @@ fn text_input(token_ids: Vec<u32>) -> (Vec<u32>, MultimodalInputs) {
     (token_ids, MultimodalInputs::default())
 }
 
+/// Builds a prompt with one context image between `before` and `after`.
+///
+/// The image sits at prompt-token position `before.len()`, the boundary
+/// between `before` and `after`, occupies `logical_positions` positions, and
+/// contributes `physical_tokens` KV tokens through a single ViT encode. `hash` is the image identity from which encoder-cache keys are
+/// derived; the payload is a placeholder.
 fn image_input(
     mut before: Vec<u32>,
     after: Vec<u32>,
@@ -132,6 +171,19 @@ fn image_input(
     )
 }
 
+/// Builds a unified generation request with a fixed image-generation policy.
+///
+/// The policy triggers on token 1000, lets image-only requests start image
+/// computation without first generating internal text, and, for
+/// Default-constraint requests, feeds each generated image back through one
+/// ViT encode. Tests that need a different trigger use `with_trigger` or edit
+/// `image_generation` afterwards.
+///
+/// # Panics
+///
+/// Panics when the request fails `GenerationRequest::validate_resources`
+/// against the fixed limits below, so every test starts from a well-formed
+/// request. The scheduler validates again against its own resolved limits.
 fn generation_request(
     request_id: RequestId,
     (prompt_token_ids, multimodal_inputs): (Vec<u32>, MultimodalInputs),
@@ -206,6 +258,10 @@ struct Collected {
 
 /// Runs the given (constraint, count) requests through a fresh scheduler at `depth`,
 /// returning per-request collected counts.
+///
+/// Request ids are assigned from 1 in case order. A request that emits no event
+/// before the 20-second deadline has no entry in the result, and one that emits
+/// events but no terminal event has `finished == false`.
 fn batch_requests(
     depth: u32,
     policy: SchedulingPolicy,
@@ -285,6 +341,7 @@ fn text_and_image_requests_complete() {
     assert_eq!(out.len(), 5);
     for (id, c) in &out {
         assert!(c.finished, "req {id:?} did not finish");
+        // Ids follow case order, so 1-3 are the Und-only text requests.
         if id.0 <= 3 {
             assert!(c.text > 0, "text req {id:?} produced no tokens");
         } else {
@@ -293,6 +350,11 @@ fn text_and_image_requests_complete() {
     }
 }
 
+/// Cancelling a resident image request reports `Cancelled` and releases its
+/// resources, so an image request submitted behind it still completes. The
+/// latent pool (64 usable pages of 64 units) and buffer pool are reduced from
+/// the simulator defaults, and the first request runs `ImageParams::MAX_STEPS`
+/// denoising steps so it is still resident when the second arrives.
 #[test]
 fn cancellation_releases_latent_admission_for_a_waiting_image() {
     let mut sim = SimEngine::new();
@@ -446,7 +508,7 @@ fn scheduler_clamps_max_batch_to_worker_info() {
     assert_eq!(sched.config().max_batch, 3);
 }
 
-/// Single-worker correctness must be identical regardless of queue depth:
+/// Single-worker results must be identical regardless of queue depth:
 /// the same prompts produce the same per-request token counts at depth 1 and 2.
 #[test]
 fn queue_depth_is_token_identical() {
@@ -469,6 +531,9 @@ fn queue_depth_is_token_identical() {
     }
 }
 
+/// Per-domain call accounting balances over a request's lifetime: every
+/// launched call completes and returns its credit, and the stats reporter's
+/// snapshot shows the same balance.
 #[test]
 fn call_window_metrics_record_the_full_lifecycle() {
     let (command_tx, commands) = crossbeam_channel::unbounded();
@@ -500,6 +565,8 @@ fn call_window_metrics_record_the_full_lifecycle() {
         }
     }
     assert!(finished, "request finished");
+    // Keep stepping after the terminal event so the counters are compared only
+    // once the loop has drained.
     for _ in 0..32 {
         scheduler.step(&commands);
     }
@@ -540,6 +607,12 @@ fn call_window_metrics_record_the_full_lifecycle() {
     }));
 }
 
+/// Runs one text request by stepping a fresh scheduler on the test thread and
+/// returns its emitted token ids.
+///
+/// `depth` is the simulator queue depth: 1 gives the serial oracle, and 2 lets
+/// the scheduler submit a successor before its predecessor's token has been
+/// observed on the host.
 fn relay_run(
     sampling: SamplingParams,
     stop_token_ids: Vec<u32>,
@@ -584,6 +657,9 @@ fn relay_run(
     tokens
 }
 
+/// Sampling processors (penalties, logprobs, minimum-token floors, stop tokens,
+/// and allowlists) yield the same tokens when successors are launched ahead of
+/// host observation at depth 2 as in the serial depth-one run.
 #[test]
 fn generalized_processor_successors_match_depth_one_before_observation() {
     let cases: Vec<(&str, SamplingParams, Vec<u32>)> = vec![
@@ -654,8 +730,12 @@ fn generalized_processor_successors_match_depth_one_before_observation() {
     }
 }
 
+/// Decoding after a context image produces the same eight tokens and EOS at
+/// queue depths 1 and 2.
 #[test]
 fn image_context_decode_is_depth_invariant() {
+    // One command channel serves both runs: each run's scheduler drains the
+    // submission made just before it is stepped.
     let (command_tx, commands) = crossbeam_channel::unbounded();
     let handle = uniserve_engine::EngineHandle::new(command_tx);
 
@@ -715,6 +795,8 @@ fn stop_token_terminates_with_stop() {
         GenerationConstraint::UndOnly,
         64,
     );
+    // 1007 is request 1's first greedy token, so the request stops on its
+    // first sample; `include_stop_token` is false, so nothing is emitted.
     req.stop_token_ids = vec![1007];
     let mut erx = handle.submit(req).unwrap();
 
@@ -738,9 +820,11 @@ fn stop_token_terminates_with_stop() {
     assert_eq!(text, 0, "the stop token itself must not be emitted");
 }
 
-/// client cancel and server abort produce distinct finish reasons.
-/// A "forever" sim (huge text_len) keeps the request running so the control
-/// command is observed mid-flight.
+/// Issues `EngineHandle::abort` (when `abort`) or `EngineHandle::cancel` once
+/// a text request has emitted its first token, and returns its finish reason.
+///
+/// A long simulated text keeps the request generating, so the command is
+/// observed mid-flight.
 fn run_until_control(abort: bool) -> FinishReason {
     let mut sim = SimEngine::new();
     sim.set_text_len(1024);
@@ -761,7 +845,7 @@ fn run_until_control(abort: bool) -> FinishReason {
     );
     let mut erx = handle.submit(req).unwrap();
 
-    // wait until it's actually generating, then issue the control command.
+    // Wait until it is generating, then issue the control command.
     let mut saw_token = false;
     let deadline = Instant::now() + Duration::from_secs(10);
     while !saw_token && Instant::now() < deadline {
@@ -797,6 +881,8 @@ fn abort_and_cancel_are_distinct() {
     assert_eq!(run_until_control(true), FinishReason::Aborted);
 }
 
+/// A stop-string cutoff reported through `EngineHandle::stop_at` finishes only
+/// its own request with `Stop`; a concurrent request runs to its own end.
 #[test]
 fn stop_string_cutoff_is_request_local() {
     let mut sim = SimEngine::new();
@@ -829,6 +915,10 @@ fn stop_string_cutoff_is_request_local() {
     stopping.stop_strings = vec!["boundary".to_string()];
     let mut stopping_events = handle.submit(stopping).unwrap();
 
+    // A request with stop strings is acknowledged by the frontend decoder, not
+    // on receive (see `EngineHandle::submit`). The test plays that role for the
+    // first token and, once a second token arrives, stops the output at that
+    // one-token prefix.
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut consumed_tokens = 0;
     while consumed_tokens < 2 && Instant::now() < deadline {
@@ -875,12 +965,15 @@ fn stop_string_cutoff_is_request_local() {
     ));
 }
 
+/// A text request completes on a worker that advertises a full-attention and a
+/// sliding-window KV group in one block pool.
 #[test]
 fn hybrid_groups_handshake_runs() {
     use uniserve_core::{KvCacheGroup, KvGroupKind};
     let mut sim = SimEngine::new();
     sim.set_queue_depth(2);
-    // Group 0 covers [0, 2048); group 1 covers [2048, 4096).
+    // Groups take consecutive block-id ranges of the shared pool: group 0
+    // covers [0, 2048) and group 1 covers [2048, 4096).
     sim.set_groups(vec![
         KvCacheGroup {
             num_blocks: 2048,
@@ -928,22 +1021,23 @@ fn hybrid_groups_handshake_runs() {
     );
 }
 
-/// two requests sharing a (block-aligned) prompt prefix — the second
-/// reuses the first's cached blocks and skips prefill over the shared prefix.
+/// Two sequential requests with the same prompt: the first publishes its full
+/// prompt blocks to the prefix cache, and the second reuses them.
 #[test]
 fn prefix_cache_reuses_shared_prompt() {
     use std::sync::atomic::Ordering;
     let mut sim = SimEngine::new();
     sim.set_text_len(4);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32).unwrap(); // block_size 256
+    let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    // 600 tokens => 2 full 256-token blocks + a partial; the 2 full blocks are
-    // the cacheable shared prefix.
+    // 600 tokens span 9 full 64-token blocks plus a partial block; the
+    // assertions below are lower bounds. `prefix.hits` accumulates reused
+    // blocks, not lookups.
     let prompt: Vec<u32> = (0..600u32).map(|i| (i % 53) + 7).collect();
 
     let run_one = |rid: u64, handle: &EngineHandle| {
@@ -969,7 +1063,7 @@ fn prefix_cache_reuses_shared_prompt() {
         assert!(done, "req {rid} did not finish");
     };
 
-    // cold: req1 populates the prefix cache.
+    // Cold: req1 populates the prefix cache.
     run_one(1, &handle);
     assert!(
         stats.kv_cache.blocks_stored.load(Ordering::Relaxed) >= 2,
@@ -977,7 +1071,7 @@ fn prefix_cache_reuses_shared_prompt() {
     );
     let hits_before = stats.prefix.hits.load(Ordering::Relaxed);
 
-    // warm: req2 (same prompt) reuses the cached prefix.
+    // Warm: req2 (same prompt) reuses the cached prefix.
     run_one(2, &handle);
     let hits_after = stats.prefix.hits.load(Ordering::Relaxed);
     assert!(
@@ -990,6 +1084,10 @@ fn prefix_cache_reuses_shared_prompt() {
     let _ = jh.join();
 }
 
+/// Per-request `CachePolicy` governs prefix reuse: isolation keys partition the
+/// cache, `read: false` skips lookup but still publishes, and `write: false`
+/// looks up but publishes nothing. Each stage uses a fresh isolation key so
+/// earlier stages cannot supply hits.
 #[test]
 fn prefix_cache_enforces_read_write_and_isolation_policy() {
     use std::sync::atomic::Ordering;
@@ -1065,9 +1163,10 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
     let _ = jh.join();
 }
 
-/// under Fcfs with a small per-step token budget and a low chunk cap, a
-/// long prompt is prefilled in budget-sized chunks while a concurrent request's
-/// decodes proceed in the same steps — both complete correctly.
+/// Under FCFS with a 256-token step budget and prefill chunks capped at 64
+/// tokens, a 1000-token prompt is prefilled in many chunks; it and a
+/// concurrent short request must both finish and emit text. The test observes
+/// only completion, not how chunks and decodes share individual steps.
 #[test]
 fn chunked_prefill_progresses_with_decode() {
     let mut sim = SimEngine::new();
@@ -1080,7 +1179,7 @@ fn chunked_prefill_progresses_with_decode() {
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    // long prompt (≈ 4 full 256-blocks) + a short concurrent request.
+    // A long prompt plus a short concurrent request.
     let long_prompt: Vec<u32> = (0..1000u32).map(|i| (i % 91) + 7).collect();
     let mut erx1 = handle
         .submit(generation_request(
@@ -1126,7 +1225,9 @@ fn chunked_prefill_progresses_with_decode() {
 }
 
 /// Runs one text request with the given sampling params and a sim `text_len`,
-/// returning (emitted token ids, whether any logprob was populated, finished).
+/// returning the emitted token ids, whether any token event carried a logprob,
+/// and the finish reason (`None` when the request did not finish within the
+/// 10-second deadline).
 fn run_sampling(
     sampling: SamplingParams,
     text_len: usize,
@@ -1202,6 +1303,9 @@ fn allowed_tokens_restricts_output() {
     );
 }
 
+/// The bad-word sequence [4321, 4321] bans 4321 only directly after a 4321:
+/// the ban overrides the bias there, while the biased token still wins the
+/// first position and the output stays within the allowlist.
 #[test]
 fn bad_word_suffix_overrides_bias_without_suppressing_its_prefix() {
     let sampling = SamplingParams {
@@ -1220,7 +1324,7 @@ fn bad_word_suffix_overrides_bias_without_suppressing_its_prefix() {
 
 #[test]
 fn logit_bias_forces_token() {
-    // strongly bias token 4321; it should dominate every step.
+    // Strongly bias token 4321; it should dominate every step.
     let sp = SamplingParams {
         logit_bias: vec![(4321, 1000.0)],
         ..Default::default()
@@ -1235,8 +1339,8 @@ fn logit_bias_forces_token() {
 
 #[test]
 fn min_tokens_floor_overrides_early_eos() {
-    // text_len=1 makes the sim want to stop almost immediately; min_tokens=5
-    // forces at least 5 generated tokens before EOS is permitted.
+    // With text_len=1 the simulator prefers EOS from the second token on;
+    // min_tokens=5 makes the scheduler suppress EOS until 5 tokens exist.
     let sp = SamplingParams {
         min_tokens: 5,
         ..Default::default()
@@ -1252,8 +1356,8 @@ fn min_tokens_floor_overrides_early_eos() {
 
 #[test]
 fn default_sampling_is_unchanged() {
-    // No params set => greedy argmax of the synthetic distribution = the natural
-    // token (1000 + (1*7+n)%5000); first token is 1007.
+    // Default params are greedy (temperature 0), so the first token is the
+    // simulator's natural token for request 1 at index 0: 1007.
     let (toks, _lp, finished) = run_sampling(SamplingParams::default(), 8, 16);
     assert!(finished.is_some());
     assert_eq!(toks[0], 1007);
@@ -1270,8 +1374,9 @@ fn stochastic_sampling_reaches_synthetic_eos() {
     assert_eq!(finished, Some(FinishReason::Eos));
 }
 
-/// An image-in-prompt request encodes the image before prefill; a second request
-/// attaches the resident encoder output to its own KV without rerunning the vision tower.
+/// The first request with a context image misses the encoder cache and leaves
+/// its encoder output resident; a second request with the same image hash hits
+/// that cached output.
 #[test]
 fn multimodal_encode_then_cache_hit() {
     use std::sync::atomic::Ordering;
@@ -1326,6 +1431,8 @@ fn multimodal_encode_then_cache_hit() {
         0,
         "first image is a cache miss"
     );
+    // Encoder counters are snapshots that can trail the terminal event, so
+    // poll them briefly instead of reading once.
     let cache_deadline = Instant::now() + Duration::from_secs(2);
     while stats.encoder.cached.load(Ordering::Relaxed) == 0 && Instant::now() < cache_deadline {
         thread::sleep(Duration::from_millis(1));
@@ -1350,6 +1457,9 @@ fn multimodal_encode_then_cache_hit() {
     let _ = jh.join();
 }
 
+/// Two requests with the same image hash are both submitted before the
+/// scheduler first steps; once both finish, the encoder cache holds exactly
+/// one entry for that image.
 #[test]
 fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
     let (command_tx, commands) = crossbeam_channel::unbounded();
@@ -1455,6 +1565,10 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
     );
 }
 
+/// A Default-constraint request triggered by its second greedy token (1008)
+/// realizes all four budgeted images with three denoising steps each, resumes
+/// text, and ends at its 200-token text bound. Its text and image sequence is
+/// identical at queue depths 1 and 2.
 #[test]
 fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
     let mut signatures = Vec::new();
@@ -1547,6 +1661,9 @@ fn interleave_c4_generated_images_complete() {
     let mut events = HashMap::new();
     let mut results = HashMap::new();
 
+    // Each trigger is the request's own greedy token at index `trigger_offset`,
+    // so the four concurrent requests open their image branches at staggered
+    // decode positions.
     for (raw_id, trigger_offset) in [(1_u64, 0_u32), (2, 1), (3, 2), (4, 3)] {
         let request_id = RequestId(raw_id);
         let trigger = 1_000 + raw_id as u32 * 7 + trigger_offset;
@@ -1611,6 +1728,9 @@ fn interleave_c4_generated_images_complete() {
     }
 }
 
+/// With artifact-sourced feedback and a declared one-token ViT encoder recipe,
+/// the generated image is re-ingested before Und text resumes. The strong bias
+/// on the trigger opens the branch on the first sample.
 #[test]
 fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     let mut sim = SimEngine::new();
@@ -1676,8 +1796,10 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     );
 }
 
-/// Native multi-image passages can be requested intentionally through max_images;
-/// image starts must come from the model, not a scheduler-forced cadence.
+/// A `max_images` budget permits images but does not schedule them: image starts
+/// must come from the model, not a scheduler-forced cadence. The simulator never
+/// samples the trigger token 2222 here, so the request emits text only, and that
+/// text is identical at queue depths 1 and 2.
 #[test]
 fn gen_branch_waits_for_model_image_starts() {
     let mut runs = Vec::new();
@@ -1731,6 +1853,10 @@ fn gen_branch_waits_for_model_image_starts() {
     );
 }
 
+/// A Gen-only request whose model requires text before an image decodes Und
+/// tokens internally until it samples the trigger; the internally decoded
+/// tokens are never emitted, and the discovered trigger opens exactly one
+/// image.
 #[test]
 fn gen_only_can_discover_its_trigger_with_internal_und_decode() {
     let mut sim = SimEngine::new();
@@ -1831,6 +1957,9 @@ fn und_only_round_close_trigger_cannot_open_gen() {
     assert_eq!(images, 0, "Und-only round-close trigger opened Gen");
 }
 
+/// With the trigger token strongly biased, model-sampled image starts open
+/// branches until the four-image budget is spent, and the first image precedes
+/// any text.
 #[test]
 fn gen_branch_model_image_starts_spend_budget() {
     let mut sim = SimEngine::new();
@@ -1900,6 +2029,10 @@ fn gen_branch_model_image_starts_spend_budget() {
     );
 }
 
+/// Image-generating requests reserve their worst-case KV at admission. The
+/// prompt plus the 32,768-token text budget alone exceeds this 128-block x
+/// 256-token pool, so the scheduler rejects the request (a `Rejected` event and
+/// no `Finished`) instead of admitting it.
 #[test]
 fn gen_branch_rejects_oversized_worstcase_at_admission() {
     let mut sim = SimEngine::new();
@@ -1948,11 +2081,12 @@ fn gen_branch_rejects_oversized_worstcase_at_admission() {
     assert_eq!(finished, None);
 }
 
-/// A Gen-only request whose behavior finishes after its first generated-image
-/// commit stops there: the commit terminates the lineage rather than spending
-/// the remaining image budget on hidden images or the understanding budget on
-/// text filler. Internal Und decode discovers the biased trigger, Gen opens,
-/// one image commits, and `finish_after_gen_commit` closes the request.
+/// A Gen-only request finishes at its first generated-image commit instead of
+/// spending the remaining image budget on hidden images or the understanding
+/// budget on text filler. Internal Und decode discovers the biased trigger, Gen
+/// opens, one image commits, and because Gen-only requests do not continue
+/// after an image (`GenerationRequest::continues_after_image`), the scheduler
+/// finishes the request with `ImageDone`.
 #[test]
 fn commit_eos_finishes_without_spending_remaining_budget() {
     let mut sim = SimEngine::new();
@@ -2032,13 +2166,14 @@ fn gen_branch_literal_trigger_starts_images() {
     sim.set_text_len(1_000_000); // never EOS on its own
     sim.set_queue_depth(2);
     let executor = Box::new(SimExecutor::new(sim));
-    // Sim emits 1000 + ((id*7 + n) % 5000) for request id=1: 1007, 1008, 1009…
-    // After an image commits, the sim resets and the round repeats from 1007.
     let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
+    // Request 1 emits 1007, 1008, 1009, ... so the suffix [1008, 1009] matches
+    // on its third token. Once the generated image is fed back into context,
+    // the simulator restarts its sequence from 1007 and the suffix recurs.
     let req = with_trigger(
         generation_request(
             RequestId(1),
@@ -2079,7 +2214,8 @@ fn gen_branch_literal_trigger_starts_images() {
         images, 2,
         "literal trigger must start both images (seq={seq:?})"
     );
-    // The trigger fires mid-round: each image is preceded by the trigger text.
+    // The suffix trigger fires mid-round, so at least the three tokens through
+    // the suffix (1007, 1008, 1009) stream before the first image.
     let first_i = seq.iter().position(|&c| c == 'I').unwrap();
     assert!(
         seq[..first_i].iter().filter(|&&c| c == 'T').count() >= 3,
@@ -2098,12 +2234,13 @@ fn image_start_logit_bias_steers_gen_branch() {
         let mut sim = SimEngine::new();
         sim.set_text_len(1_000_000); // never EOS on its own
         let executor = Box::new(SimExecutor::new(sim));
-        // an image-start token inside the sim's vocab
         let sched = Scheduler::new(executor, ctrl(), 32).unwrap();
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
         let jh = thread::spawn(move || sched.run(rx));
 
+        // 2222 is an image-start token inside the simulator's vocabulary that
+        // its greedy sequence does not reach within this request's budget.
         let mut req = with_trigger(
             generation_request(
                 RequestId(1),
@@ -2157,7 +2294,7 @@ fn image_start_logit_bias_steers_gen_branch() {
     assert_eq!(images, 0, "negative bias must suppress the image pathway");
 }
 
-/// Native assistant prefixes can end at the image boundary. Generated branch must
+/// Native assistant prefixes can end at the image boundary. The generated branch must
 /// honor that prefilled control token immediately after prefill instead of
 /// waiting for the model to sample another image-start token.
 #[test]
@@ -2211,6 +2348,9 @@ fn gen_branch_prefilled_image_start_begins_without_text() {
     );
 }
 
+/// A request with a context image reasons in text and opens exactly one image
+/// branch when its round closes on EOS right after the trigger suffix. With
+/// `text_len` 2 the simulator's round for request 1 is 1007, 1008, EOS.
 #[test]
 fn context_image_request_commits_existing_image_context_at_round_close() {
     let mut sim = SimEngine::new();
@@ -2271,9 +2411,10 @@ fn context_image_request_commits_existing_image_context_at_round_close() {
 }
 
 /// Image-budget enforcement under a strong image bias: once max_images is
-/// spent, the image-start token is suppressed host-side, so a bias that would
-/// otherwise force it forever (an invisible un-actionable token stream) loses
-/// to the mask and generation returns to ordinary text.
+/// spent, the scheduler adds the image-start token to each call's suppressed
+/// tokens, so a bias that would otherwise force it forever (an invisible
+/// un-actionable token stream) loses to the mask and generation returns to
+/// ordinary text.
 #[test]
 fn image_budget_suppresses_biased_image_start() {
     let mut sim = SimEngine::new();
@@ -2341,7 +2482,9 @@ fn image_budget_suppresses_biased_image_start() {
     );
 }
 
-/// Every logical KV reservation returns to the block manager after completion.
+/// Every logical KV reservation returns to the block pool after completion,
+/// across text, image-only, and mixed requests, and no request remains running
+/// or in flight.
 #[test]
 fn kv_resources_return_after_completion() {
     let (command_tx, commands) = crossbeam_channel::unbounded();
@@ -2377,7 +2520,7 @@ fn kv_resources_return_after_completion() {
     let mut idle_steps = 0;
     for _ in 0..5000 {
         let progressed = sched.step(&commands);
-        // converged when several consecutive steps make no progress.
+        // Converged when several consecutive steps make no progress.
         idle_steps = if progressed { 0 } else { idle_steps + 1 };
         if idle_steps >= 3 {
             break;
@@ -2392,6 +2535,9 @@ fn kv_resources_return_after_completion() {
     );
 }
 
+/// Dropping 128 event receivers at once cancels every request (dropping an
+/// `EventRx` sends a cancel command), and all of them retire from the pending,
+/// running, and in-flight accounting.
 #[test]
 fn cancellation_storm_retires_every_request() {
     let (command_tx, commands) = crossbeam_channel::unbounded();
@@ -2431,6 +2577,10 @@ fn cancellation_storm_retires_every_request() {
     assert_eq!(scheduler.stats.general.in_flight.load(Ordering::Relaxed), 0);
 }
 
+/// A client that never reads its events stalls its own request on output
+/// capacity without holding execution: the concurrent request finishes, the
+/// stalled request stays running with nothing in flight, and it retires once
+/// its receiver is dropped.
 #[test]
 fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     let (command_tx, commands) = crossbeam_channel::unbounded();
@@ -2475,6 +2625,8 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
         "the consuming client must complete independently"
     );
 
+    // Step until the loop stops making progress, which leaves the slow request
+    // parked on output capacity.
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && scheduler.step(&commands) {}
     assert_eq!(

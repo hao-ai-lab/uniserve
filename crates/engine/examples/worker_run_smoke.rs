@@ -4,7 +4,14 @@
 //! parks on request notifications. The flow includes idle wakeup and graceful
 //! shutdown.
 //!
+//! The worker is one CPU rank launched with `stub: true`, so it runs its
+//! deterministic test model without weights. The run prints FAIL and exits
+//! with status 1 when a round misses its deadline or the scheduler reports a
+//! fatal exit. A setup or submission error, or a scheduler thread panic, ends
+//! it with an error instead.
+//!
 //! Set `PYTHONPATH` to the repository root before running the example.
+
 use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,7 +37,6 @@ fn submit_text(handle: &EngineHandle, rxs: &mut Rxs, id: u64) -> anyhow::Result<
         multimodal_inputs: Default::default(),
         negative_prompt_token_ids: Vec::new(),
         constraint,
-
         sampling: SamplingParams::default(),
         image: ImageParams::default(),
         max_und_tokens: 16,
@@ -48,6 +54,9 @@ fn submit_text(handle: &EngineHandle, rxs: &mut Rxs, id: u64) -> anyhow::Result<
 
 /// Drains events until every request in `ids` has emitted `Finished`, or until
 /// `deadline`. Returns the set that finished.
+///
+/// Events after `Finished` stay unread. The loop sleeps briefly only when a
+/// pass over the receivers saw no event.
 fn await_finished(rxs: &mut Rxs, ids: &[RequestId], deadline: Instant) -> Vec<RequestId> {
     let mut finished = Vec::new();
     while finished.len() < ids.len() && Instant::now() < deadline {
@@ -106,8 +115,12 @@ fn main() -> anyhow::Result<()> {
         transfer: Default::default(),
         ..worker_config
     })?;
+    // The binding identity must equal the `worker_id` the group launched with,
+    // which `WorkerExecutor::try_new` checks.
     let engine =
         WorkerExecutor::try_new(vec![(WorkerId("local".into()), engine)], Default::default())?;
+    // Commands sent through a handle built with this waker interrupt the
+    // executor's idle park, which round 2 exercises.
     let waker = engine.command_waker();
     let sched = Scheduler::new(Box::new(engine), SpecialTokenIds::default(), 32)?;
 
@@ -143,6 +156,8 @@ fn main() -> anyhow::Result<()> {
     );
     ok &= done2.len() == r2.len();
 
+    // `Scheduler::run` returns `true` only for an executor or worker failure,
+    // not for this orderly shutdown.
     handle.shutdown();
     let fatal = jh
         .join()

@@ -4,12 +4,33 @@
 //! asynchronous executor completions. All mutable engine state stays on its
 //! owner thread.
 //!
-//! Scheduling admits from its waiting queue, chunks prefill against sequence and
-//! token budgets, and reserves each request's maximum declared resources. A
-//! resident request remains in place when capacity prevents relocation.
+//! Scheduling admits from its waiting queue and chunks prefill against sequence
+//! and token budgets. A token request with context images or image generation
+//! reserves its worst-case KV blocks at admission; a text-only request needs
+//! only the blocks of its first prefill chunk. A request larger than the total
+//! KV capacity is rejected. A resident request is never relocated or
+//! preempted: when capacity is short, admission waits.
 //!
 //! Static worker state crosses the boundary once in [`NewRequest`]; subsequent
 //! calls carry only step-specific deltas.
+//!
+//! Submodules:
+//!
+//! - `run`: construction and the owner-thread loop.
+//! - `admission`: admission, resource reservation, and waiting-queue insertion.
+//! - `batching`: generation-path batch selection and call planning.
+//! - `generation`: per-request generation state, call builders, and result
+//!   validation.
+//! - `denoising`: solver progress of one latent trajectory.
+//! - `execution`: submission, completion application, video media scheduling,
+//!   and allocation reclamation.
+//! - `inflight`: submitted batches and calls, and request-local completion
+//!   ordering.
+//! - `output`: public events, semantic result resolution, and termination.
+//! - `allocation` and `placement`: storage ownership and worker placement.
+//! - `control`: cancellation and frontend lifecycle commands.
+//! - `config`, `stats`, and `stats_report`: limits and statistics.
+//! - `image_artifact`: validation of worker-produced PNG artifacts.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -91,20 +112,41 @@ use output::RequestOutput;
 
 /// Number of denoising steps planned for one scheduling burst by default.
 pub(crate) const DEFAULT_DENOISE_STEP_BURST: u16 = 1;
+/// Upper bound on concurrently reserved transfer calls. Construction clamps
+/// the executor's `queue_depth * max_batch_calls` to between one and this
+/// value to form `Scheduler::transfer_capacity`.
 const MAX_INFLIGHT_TRANSFERS: usize = 256;
 
+/// Execution lane a call kind is batched in (see `batch_kind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BatchKind {
+    /// Every forward prefill, and text, vision, and latent encoding.
     Prefill,
+    /// Token decode and speculative verification.
     Decode,
+    /// Latent preparation, denoising, image, video, and audio decoding, video
+    /// and audio encoding, muxing, and transfers.
     Media,
 }
 
+/// Timeout of `Executor::poll` while the loop parks
+/// (`Scheduler::park_for_progress`). A result ends the park, and an executor
+/// with wake integration also returns early on commands and consumer reads;
+/// the timeout is only a liveness deadline.
 const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
+/// Number of batches carrying prefill-lane calls that may await their
+/// results before ready decode work takes precedence over further prefill
+/// (`Scheduler::select_batch_kind`).
 const PREFILL_WINDOW_CREDITS: usize = 2;
+/// Environment variable overriding `DEFAULT_DENOISE_STEP_BURST`; a missing,
+/// unparsable, or zero value selects the default.
 const DENOISE_STEP_BURST_ENV: &str = "UNISERVE_DENOISE_STEP_BURST";
 
-/// Builds a validated image-completion event from a PNG payload.
+/// Builds a validated image-completion event from a base64 PNG payload.
+///
+/// Fully decodes the PNG through `validate_png_artifact`; returns `None` when
+/// the payload is not valid base64 or not a fully decodable PNG with nonzero
+/// dimensions.
 fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<EngineCoreOutput> {
     let metadata = validate_png_artifact(&pixels_png_b64, None)?;
     Some(EngineCoreOutput::ImageDone {
@@ -118,17 +160,22 @@ fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<EngineCoreO
 
 #[derive(Clone)]
 /// Model token identifiers used for sequence and image-content boundaries.
+///
+/// Serving resolves these from the loaded model's configuration in the server
+/// crate (`special_token_ids`); the `Default` values serve schedulers that
+/// tests and examples construct directly.
 pub struct SpecialTokenIds {
     /// Beginning-of-sequence token identifier.
     pub bos: u32,
-    /// Token identifiers that terminate generation.
+    /// Token identifiers that terminate generation. The first entry is the
+    /// primary EOS, which the output path substitutes for a completion that
+    /// commits no token, so the list must not be empty.
     pub eos: Vec<u32>,
     /// Token identifier that terminates encoded image content.
     pub end_of_image: u32,
 }
 
 impl Default for SpecialTokenIds {
-    /// Returns the default value.
     fn default() -> Self {
         Self {
             bos: 151644,
@@ -159,7 +206,8 @@ impl TerminalIntent {
         !matches!(self, Self::None)
     }
 
-    /// Records a terminal reason without replacing a previously resolved failure.
+    /// Records a finish reason unless a terminal intent (finish or failure)
+    /// is already recorded; the first recorded intent wins.
     fn finish(&mut self, reason: FinishReason) {
         if matches!(self, Self::None) {
             *self = Self::Finish(reason);
@@ -167,9 +215,21 @@ impl TerminalIntent {
     }
 }
 
+/// Negative-prompt KV prefix of a token request whose image generation uses
+/// more than one guidance branch (`Scheduler::ensure_flow_prefix`).
+///
+/// The prefix holds its own request-pool slot and KV allocation, separate
+/// from the request's main `RequestAllocations`, until
+/// `Scheduler::free_flow_prefix` releases them after the last denoising step
+/// or the request finishes.
 struct FlowPrefixState {
     allocations: RequestAllocations,
+    /// Pages per KV group, as `(group_id, page_ids)`, not yet declared to the
+    /// worker; the next denoising call drains them as fresh-page allocations.
     new_pages: Vec<(u32, Vec<BlockId>)>,
+    /// Set by the first successful denoising completion. Until then every
+    /// denoising call carries the prefix's block tables and, when the negative
+    /// prompt is not empty, prefills it.
     diffusion_finalized: bool,
 }
 
@@ -185,6 +245,8 @@ impl FlowPrefixState {
     }
 }
 
+/// Scheduler state of one admitted diffusion (media) request, advanced by the
+/// media path in `execution` rather than by `RequestState`.
 struct MediaFlowState {
     request: DiffusionRequest,
     output: output::EventJournal,
@@ -208,6 +270,8 @@ struct MediaFlowState {
     /// Encoded products carried by the muxing call in flight, retired with it.
     muxing_inputs: Vec<TensorRef>,
     audio: Option<TensorRef>,
+    /// Static worker admission, sent as a `BatchCommand::Start` in the batch
+    /// of the request's first scheduled call.
     admission: NewRequest,
     admission_state: WorkerRegistration,
     text_encoding_scheduled: bool,
@@ -231,10 +295,16 @@ struct MediaFlowState {
     artifact: Option<ArtifactEvent>,
 }
 
+/// Progress of a media request's worker admission (`NewRequest`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerRegistration {
+    /// No scheduled call has carried the admission yet; no worker holds
+    /// state for the request, so retirement needs no `Finish` command.
     Unsubmitted,
+    /// The call carrying the admission is in flight; the request offers no
+    /// further calls until it resolves.
     InFlight,
+    /// A valid result of the admitting call has confirmed registration.
     Registered,
 }
 
@@ -252,10 +322,13 @@ struct PendingMedia {
 }
 
 /// Permissive unified-multimodal limits for a scheduler built without
-/// worker-advertised capacity.
+/// model-derived limits.
 ///
-/// A serving deployment supplies real limits through `EngineConfig`; this
-/// default only bounds a scheduler constructed directly from an executor.
+/// `Scheduler::with_config_for_family` uses them for `RuntimeFamily::Umm`, and
+/// `EngineConfig::sim` uses them as its default. Construction intersects them
+/// with worker-reported capacities (`resolve_generation_limits` in `run`), so
+/// the effective bounds come from the loaded workers. A serving deployment
+/// supplies model limits through `EngineConfig`.
 pub(crate) fn unbounded_umm_generation_limits() -> uniserve_core::GenerationLimits {
     uniserve_core::GenerationLimits {
         features: uniserve_core::GenerationFeatures::UNDERSTANDING
@@ -281,6 +354,7 @@ pub struct Scheduler {
     /// Resident resource ownership and reservation accounting.
     storage: allocation::Storage,
     placement: placement::Placement,
+    /// Aggregate capacity view of the loaded workers.
     info: WorkerInfo,
     generation_limits: uniserve_core::GenerationLimits,
     family: RuntimeFamily,
@@ -292,16 +366,34 @@ pub struct Scheduler {
     waiting_media: VecDeque<PendingMedia>,
     running: HashMap<RequestId, RequestState>,
     running_media: HashMap<RequestId, MediaFlowState>,
+    /// Finished requests whose storage stays allocated until their workers
+    /// acknowledge the `Finish` command.
     retiring_requests: HashMap<RequestId, RetiringRequest>,
+    /// Maximum number of transfer calls holding a reservation at once
+    /// (`Inflight::num_pending_transfers`).
     transfer_capacity: usize,
+    /// Maximum denoising steps one call covers.
     denoise_step_burst: u16,
+    /// IPC dtype of image latents, mapped from the model dtype by
+    /// `worker_float_dtype`.
     latent_dtype: Option<DType>,
+    /// `engine_id` of every `RequestKey` this scheduler issues.
     engine_id: u64,
+    /// Engine-wide counter for product generations, drawn by
+    /// `generation::register_call` and `Scheduler::media_completion_product`;
+    /// both fail once a generation would exceed `u32::MAX`.
     next_product_generation: u64,
+    /// Epoch stamped on the next request state the scheduler creates, so
+    /// results from an earlier lifetime of a request id never match it.
     next_request_epoch: u64,
     config: SchedulerConfig,
+    /// Token and media requests in admission order. Media scheduling visits
+    /// them in this order; batch assembly uses it to break ties within
+    /// `assembly_priority`.
     running_order: Vec<RequestId>,
     output: output::OutputSender,
+    /// Whether the next scheduling pass tries video media work before
+    /// generation work (`Scheduler::schedule_batches`).
     prefer_media: bool,
     /// Engine-fatal latch: set when the executor/worker dies or a scheduler
     /// invariant breaks; the control loop exits and the host converts this
@@ -333,16 +425,17 @@ impl Scheduler {
     }
 }
 
-/// Returns the current scheduler time.
+/// Returns wall-clock seconds since the Unix epoch.
+///
+/// Uses the shared `uniserve_core::now_unix_secs` so scheduler timestamps
+/// match other components'. The clock is not monotonic; a time before the
+/// epoch reads as zero instead of panicking.
 fn now() -> f64 {
-    // route through the single shared epoch helper so every
-    // component's wall-clock timestamps match. It never panics on the hot loop:
-    // a wall clock set before the UNIX epoch (or stepped backward) clamps to 0
-    // instead of unwrapping the `Result`.
     uniserve_core::now_unix_secs()
 }
 
-/// Returns the worker floating-point data type.
+/// Maps a model dtype to the IPC dtype of worker latents; `None` maps to
+/// `None`.
 fn worker_float_dtype(
     value: Option<uniserve_core::ModelDtype>,
 ) -> Option<uniserve_worker_ipc::DType> {
@@ -354,7 +447,9 @@ fn worker_float_dtype(
     }
 }
 
-/// Adds the worker forward map.
+/// Adds each per-key delta of a worker forward statistic into the shared
+/// cumulative map in `SchedulerStats`. A poisoned lock is recovered rather
+/// than propagated.
 fn add_worker_forward_map(target: &Mutex<BTreeMap<String, u64>>, delta: &BTreeMap<String, u64>) {
     if delta.is_empty() {
         return;
@@ -368,6 +463,12 @@ fn add_worker_forward_map(target: &Mutex<BTreeMap<String, u64>>, delta: &BTreeMa
 }
 
 /// Returns tokens that stop a device-relay successor before host semantic resolution.
+///
+/// The sorted, deduplicated list holds the request's stop token ids, the EOS
+/// ids unless `ignore_eos` is set, and the image-generation trigger when the
+/// request generates images through a direct trigger token. It reaches the
+/// worker in `ArRequestParams::finish_token_ids` and bounds verified-draft
+/// prefixes in `validate_generation_result`.
 ///
 /// Terminal stop/EOS tokens end the request. A direct Gen trigger instead ends
 /// the current Und continuation window: the sampled trigger remains
@@ -388,7 +489,10 @@ fn finish_token_ids(request: &GenerationRequest, eos: &[u32]) -> Vec<u32> {
     finish_token_ids
 }
 
-/// Returns the call batch classification.
+/// Classifies a call kind into its execution lane.
+///
+/// Lane selection (`Scheduler::select_batch_kind`), batch assembly, and the
+/// prefill flag set by `Inflight::register_pending_batch` read this mapping.
 fn batch_kind(call_variant: CallKind) -> BatchKind {
     match call_variant {
         CallKind::Forward(ForwardMode::Prefill)
@@ -414,7 +518,12 @@ fn batch_kind(call_variant: CallKind) -> BatchKind {
     }
 }
 
-/// Returns the scheduling priority for a completion.
+/// Returns the order in which ready completions are applied; lower values go
+/// first, and equal values keep arrival order.
+///
+/// Denoising, image decoding, and KV installation completions precede all
+/// other kinds (`Inflight::take_ready_completions` and the resolution pass in
+/// `execution`).
 fn completion_priority(call_variant: CallKind) -> u8 {
     match call_variant {
         CallKind::Media(MediaCall::Denoising)
@@ -424,22 +533,38 @@ fn completion_priority(call_variant: CallKind) -> u8 {
     }
 }
 
+/// Events a request's output journal may hold beyond what its bounded event
+/// channel holds.
 const OUTPUT_JOURNAL_CAPACITY: usize = EVENT_BUFFER_CAPACITY;
+/// Output capacity, in events, that `Scheduler::output_window_ready` keeps
+/// free for the request's terminal events.
 const OUTPUT_TERMINAL_RESERVE: usize = 2;
 
+/// KV extent of one planned generation call, in tokens.
 #[derive(Debug, Clone, Copy)]
 struct KvLengths {
+    /// Tokens the call's KV-writing forward row appends: the prompt slice
+    /// length, the feature write's token capacity, or one for other prefills,
+    /// decode, and verify. Zero for KV publication, latent preparation, and
+    /// denoising, which only read the request's KV.
     input: u32,
+    /// Scheduled visible KV length before the call.
     visible: u32,
 }
 
-/// Computes ceiling division for unsigned values.
+/// Computes ceiling division for unsigned values; a zero divisor is treated
+/// as one.
 fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
     let divisor = divisor.max(1);
     value.div_ceil(divisor)
 }
 
-/// Computes the event capacity required before scheduling one transition.
+/// Returns the maximum number of output events one in-flight call can add to
+/// its request's event journal.
+///
+/// `Scheduler::output_window_ready` charges this for every in-flight call; the
+/// per-kind counts must stay in step with `Scheduler::next_output_bound`,
+/// which charges the same events before the call is planned.
 fn call_output_bound(code: CallKind, bounds: &uniserve_worker_ipc::Bounds) -> usize {
     match code {
         CallKind::Forward(ForwardMode::Verify) => (bounds.max_tokens as usize)

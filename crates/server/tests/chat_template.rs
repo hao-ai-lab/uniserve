@@ -1,7 +1,9 @@
 //! Public Hugging Face chat-template rendering behavior.
 //!
-//! The integration cases cover content-shape detection, deterministic
-//! continuation rendering, and lossless tool-argument formatting.
+//! The integration cases cover content-shape detection under
+//! `ChatTemplateContentFormatOption::Auto`, byte-exact rendering of prior
+//! assistant turns through the Qwen3 template, and key-order-preserving
+//! tool-argument formatting with `serde_json`-normalized numbers.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -35,6 +37,10 @@ fn base_request(messages: Vec<ChatMessage>) -> ChatRequest {
     }
 }
 
+/// One user message with two text parts, rendered without a generation prompt.
+///
+/// Flattened to a string, the content reads `"ab"`; in the OpenAI format it is
+/// a list of two text-part objects.
 fn multipart_user() -> ChatRequest {
     let mut request = base_request(vec![ChatMessage::user(vec![
         ChatContentPart::text("a"),
@@ -46,8 +52,10 @@ fn multipart_user() -> ChatRequest {
 
 #[test]
 fn auto_detection_treats_alias_loop_template_as_string() {
-    // `{% set parts = message.content %}{% for item in parts %}` aliases content
-    // first, which the detector must NOT treat as a direct content loop.
+    // The template only aliases content as `parts` and tests the alias with
+    // `is string`. Without a loop over a message's `content`, `Auto` selects
+    // the string format, so the parts arrive flattened and the string branch
+    // renders.
     let template = "{%- for message in messages -%}{%- set parts = message.content -%}\
 {%- if parts is string -%}STR:{{ parts }}{%- else -%}LIST{%- endif -%}{%- endfor -%}";
     let rendered = hf_render(
@@ -111,6 +119,10 @@ fn qwen3_preserves_prior_assistant_completion_text_byte_identically() {
 }
 
 /// Deliberately non-alphabetical key order plus mixed numeric spellings.
+///
+/// Key order survives because the workspace builds `serde_json` with
+/// `preserve_order` and the renderer exposes the parsed tool-call arguments to
+/// templates as insertion-ordered maps.
 const MIXED_ARGS: &str = r#"{"zulu":2,"alpha":1.00,"mike":"hi","delta":[3,4]}"#;
 
 fn assistant_tool_call_history(arguments: &str) -> Vec<ChatMessage> {

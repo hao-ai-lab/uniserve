@@ -1,4 +1,22 @@
 //! Multimodal prompt preprocessing for SenseNova and Bagel profiles.
+//!
+//! `InputProcessor::preprocess_generation` in `serving::model` calls
+//! [`preprocess_sensenova`] or [`preprocess_bagel`] for the loaded profile.
+//! Each fills the model computation inputs of the `GenerationRequest`
+//! (`prompt_token_ids`, `negative_prompt_token_ids`, `multimodal_inputs`,
+//! `image`, and `image_generation`) and returns the output processor policy.
+//! [`prepare_generation_resources`] then resolves sampling, cache policy, and
+//! the KV budget for both profiles.
+//!
+//! Chat images, and images attached to a SenseNova text prompt, are carried
+//! through prompt rendering as request-scoped text placeholders. After the
+//! chat template or prompt layout renders, each placeholder is replaced
+//! (SenseNova) or removed (Bagel), and its byte offset in the cleaned text is
+//! converted into a prompt-token position by tokenizing the text before it.
+//! Bagel text prompts place images at token positions fixed by the prompt
+//! layout instead (see `bagel_prompt`). Either way the position becomes
+//! `ImageInput::position`, the prompt-token boundary at which the image's
+//! encoder output enters the context.
 
 mod output;
 
@@ -44,17 +62,27 @@ pub enum OmniError {
 }
 
 impl From<String> for OmniError {
-    /// Converts the source value into this type.
+    /// Wraps a free-form message as [`OmniError::Invalid`].
+    ///
+    /// Preprocessing helpers flatten profile errors with
+    /// `.map_err(|error| error.to_string())?`, which relies on this conversion.
     fn from(message: String) -> Self {
         Self::Invalid(message)
     }
 }
 
+/// Denoising steps for Bagel context-image mode when the request sets none.
 const DEFAULT_STEPS: u16 = 50;
+// Omni sampler defaults applied by `prepare_generation_resources` before
+// request controls. A zero temperature selects greedy decoding.
 const DEFAULT_TEMPERATURE: f32 = 0.0;
 const DEFAULT_TOP_P: f32 = 1.0;
 const DEFAULT_TOP_K: u32 = 0;
 
+/// Fixed image parameters for Bagel context-image mode.
+///
+/// `bagel_context_image_params` applies these without consulting request
+/// controls.
 mod context_image_defaults {
     /// Default text classifier-free guidance scale.
     pub(super) const CFG_TEXT_SCALE: f32 = 4.0;
@@ -68,14 +96,32 @@ mod context_image_defaults {
     pub(super) const RESOLUTION: u32 = 512;
 }
 
+/// Input image whose prompt position is resolved but whose encoder inputs are not.
 #[derive(Debug, Clone)]
 struct RenderedImage {
+    /// FNV-1a hash of `b64`; `prepare_generation_resources` later mixes in the
+    /// request's cache isolation key when it has one.
     hash: u64,
+    /// Prompt-token position with the meaning of `ImageInput::position`.
     position: u32,
+    /// Base64 image payload, without any data-URL header.
     b64: String,
 }
 
 /// Fills the SenseNova prompt, image inputs, and image-generation parameters.
+///
+/// On success the request's prompt, negative prompt, multimodal inputs, image
+/// parameters, and image-generation policy are replaced; on error `generation`
+/// is left unmodified. The returned policy selects the SenseNova reasoning and
+/// visible-wrapper output filter.
+///
+/// # Errors
+///
+/// Fails, among other conditions, when the processor has no chat template
+/// (checked for text prompts too), rendering or tokenization fails, rendering
+/// loses or reorders an image slot, the prompt is empty, image controls are
+/// invalid, an image payload cannot be decoded, or the profile cannot size the
+/// image encoders or the requested output resolution.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn preprocess_sensenova(
     profile: &SenseNovaProfile,
@@ -100,6 +146,7 @@ pub(super) fn preprocess_sensenova(
         generation.constraint,
     )?;
     validate_prompt(&prompt_token_ids)?;
+
     let negative_prompt_token_ids = profile
         .render_negative_prompt_ids(&processor.tokenizer, negative_text.as_deref().unwrap_or(""))
         .map_err(|error| error.to_string())?;
@@ -124,11 +171,12 @@ pub(super) fn preprocess_sensenova(
     let policy = profile
         .image_generation_for_dimensions(image.width, image.height)
         .map_err(|error| error.to_string())?;
+
+    // Every fallible step is complete; publish the prepared inputs together.
     generation.prompt_token_ids = prompt_token_ids;
     generation.negative_prompt_token_ids = negative_prompt_token_ids;
     generation.multimodal_inputs = multimodal_inputs;
     generation.image = image;
-
     generation.image_generation = policy;
     Ok(OutputProcessorPolicy::SenseNova(
         profile.output_filter.clone(),
@@ -136,6 +184,19 @@ pub(super) fn preprocess_sensenova(
 }
 
 /// Renders Bagel input with the model's context-image conditioning rules.
+///
+/// A plain-text understanding-only request with input images uses context-image
+/// mode (see `bagel_prompt`): its negative prompt is a copy of the positive
+/// prompt and its image parameters come from `bagel_context_image_params`
+/// instead of `resolve_image_params`. Other requests resolve the negative
+/// prompt and image parameters as [`preprocess_sensenova`] does. On error
+/// `generation` is left unmodified. The returned policy is always
+/// `OutputProcessorPolicy::None`, so Bagel text is emitted without output
+/// filtering.
+///
+/// # Errors
+///
+/// Fails under the same kinds of conditions as [`preprocess_sensenova`].
 #[allow(clippy::too_many_arguments)]
 pub(super) fn preprocess_bagel(
     profile: &BagelProfile,
@@ -160,6 +221,7 @@ pub(super) fn preprocess_bagel(
         generation.constraint,
     )?;
     validate_prompt(&prompt_token_ids)?;
+
     let negative_prompt_token_ids = if context_image_mode {
         prompt_token_ids.clone()
     } else {
@@ -199,16 +261,20 @@ pub(super) fn preprocess_bagel(
     let policy = profile
         .image_generation_for_dimensions(image.width, image.height)
         .map_err(|error| error.to_string())?;
+
     generation.prompt_token_ids = prompt_token_ids;
     generation.negative_prompt_token_ids = negative_prompt_token_ids;
     generation.multimodal_inputs = multimodal_inputs;
     generation.image = image;
-
     generation.image_generation = policy;
     Ok(OutputProcessorPolicy::None)
 }
 
 /// Renders a SenseNova text or chat prompt and resolves positioned input images.
+///
+/// A text prompt with images gets one placeholder line per image prepended
+/// (see `prompt_with_image_slots`); chat images stay where their content parts
+/// appear.
 fn sensenova_prompt(
     profile: &SenseNovaProfile,
     tokenizer: &DynTokenizer,
@@ -245,6 +311,13 @@ fn sensenova_prompt(
 }
 
 /// Renders a Bagel prompt and selects its context-image conditioning mode.
+///
+/// The returned flag is `true` only for a text prompt under
+/// `GenerationConstraint::UndOnly` with input images. That layout is
+/// `wrap_context_text(CONTEXT_SYSTEM_PROMPT)`, then every image, then
+/// `wrap_context_text(prompt)`. Other text prompts place every image after the
+/// whole rendered prompt; chat prompts place each image where its content
+/// part appears.
 fn bagel_prompt(
     profile: &BagelProfile,
     tokenizer: &DynTokenizer,
@@ -300,6 +373,11 @@ fn bagel_prompt(
 }
 
 /// Renders structured SenseNova chat while preserving one placeholder per input image.
+///
+/// Inserts `SenseNovaProfile::default_system_prompt` when the request has no
+/// system message and the constraint defines one. A non-empty assistant
+/// prefix for the constraint is appended as a final assistant message that
+/// the template continues instead of opening a new assistant turn.
 fn render_sensenova_chat(
     profile: &SenseNovaProfile,
     tokenizer: &DynTokenizer,
@@ -330,6 +408,13 @@ fn render_sensenova_chat(
 }
 
 /// Replaces SenseNova image slots and computes their positions in token space.
+///
+/// Each placeholder becomes the profile's start-of-image and end-of-image
+/// marker text. An image's position is the index of its end-of-image token,
+/// so the image fills the gap between the two markers. The position is
+/// found by tokenizing the text up to the end of the marker and requiring its
+/// last token to be `controls.end_of_image`, which fails if the marker text
+/// does not encode to that token.
 fn preprocess_sensenova_with_slots(
     tokenizer: &DynTokenizer,
     rendered: &str,
@@ -393,6 +478,10 @@ fn render_bagel_chat(
 }
 
 /// Removes Bagel image slots and computes their positions in token space.
+///
+/// An image's position is the token count of the cleaned text before its
+/// slot. This assumes the prefix encodes to a prefix of the full prompt's
+/// tokens; unlike the SenseNova path, no marker token checks it.
 fn tokenize_bagel_with_slots(
     tokenizer: &DynTokenizer,
     rendered: &str,
@@ -420,12 +509,32 @@ fn tokenize_bagel_with_slots(
 }
 
 /// Resolves sampling and checks multimodal requirements against loaded model limits.
+///
+/// Runs after [`preprocess_sensenova`] or [`preprocess_bagel`] has filled the
+/// prompt and image inputs. It replaces `generation.sampling`, sets
+/// `max_und_tokens`, may clear `cache.read`, and rewrites each input image's
+/// `hash` into its cache-isolated form, so it must run exactly once per
+/// request. On error `generation` may be partially updated; the caller
+/// discards it.
+///
+/// # Errors
+///
+/// Fails when the prompt length does not fit in `u32`, the prompt fills the
+/// model context while the request decodes text, sampling or stop controls
+/// are invalid, `GenerationRequest::validate_resources` rejects the request
+/// against the loaded limits, the KV requirement exceeds
+/// `ModelConfig::max_model_tokens` even after shrinking the text budget, or
+/// the final request fails `GenerationRequest::validate`.
 pub(super) fn prepare_generation_resources(
     processor: &crate::serving::InputProcessor,
     controls: &crate::serving::SamplingConfig,
     stop: &crate::serving::StopConfig,
     generation: &mut GenerationRequest,
 ) -> OmniResult<()> {
+    // Omni profiles start from these fixed sampler defaults rather than the
+    // sampler values in the checkpoint's `sampling_defaults`; only its
+    // `max_output_tokens` applies, below. The seed already resolved by
+    // `preprocess_generation` (image seed first, then text seed) is kept.
     generation.sampling = SamplingParams {
         temperature: DEFAULT_TEMPERATURE,
         top_p: DEFAULT_TOP_P,
@@ -460,6 +569,8 @@ pub(super) fn prepare_generation_resources(
     .map_err(|error| error.to_string())?;
     let prompt_logprobs_requested = generation.sampling.prompt_logprobs_requested();
     generation.cache.read &= !prompt_logprobs_requested;
+    // Encoder-cache identity folds in the request's cache isolation key, so
+    // the same image in different cache partitions maps to different entries.
     for image in &mut generation.multimodal_inputs.images {
         image.hash = isolated_cache_key(image.hash, generation.cache.isolation_key);
     }
@@ -472,6 +583,9 @@ pub(super) fn prepare_generation_resources(
     let mut max_kv_tokens = generation
         .max_kv_tokens(&processor.limits)
         .map_err(|error| error.to_string())?;
+    // Shrink the text budget by the excess once; at least one text token must
+    // remain. The check after this block covers requests that do not decode
+    // text and so have no budget to shrink.
     if max_kv_tokens > processor.config.max_model_tokens() as usize && generation.decodes_text() {
         let excess = max_kv_tokens - processor.config.max_model_tokens() as usize;
         generation.max_und_tokens = generation.max_und_tokens
@@ -503,6 +617,11 @@ pub(super) fn prepare_generation_resources(
 }
 
 /// Merges profile defaults with request image controls and validates generation geometry.
+///
+/// Request fields override profile defaults field by field. The sampling seed
+/// (already resolved from the image and text seeds) overrides the profile
+/// seed. Generated images are retained by default unless the request is
+/// image-only (`GenerationConstraint::GenOnly`).
 fn resolve_image_params(
     defaults: &crate::profile::omni::ImageGenerationDefaults,
     resolution_policy: &ResolutionPolicy,
@@ -564,6 +683,12 @@ fn resolve_image_params(
 }
 
 /// Resolves Bagel image parameters for understanding requests with context images.
+///
+/// Guidance, renormalization, and resolution are fixed (see
+/// `context_image_defaults`) and cannot be overridden by the request; of the
+/// image controls only `steps`, `max_images`, `timestep_shift`, `prompts`, and
+/// `retain_images` are honored. The seed is the sampling seed, which already
+/// includes any image seed, or zero when neither is set.
 fn bagel_context_image_params(
     profile: &BagelProfile,
     image: crate::serving::ImageGenControls,
@@ -598,6 +723,10 @@ fn bagel_context_image_params(
 }
 
 /// Resolves each image's encoder inputs at its final prompt position.
+///
+/// `encoders_for_dimensions` receives the decoded image width and height in
+/// pixels and the request's total image count. The output is ordered by
+/// prompt position.
 fn prepare_image_inputs(
     num_prompt_tokens: usize,
     images: Vec<RenderedImage>,
@@ -624,6 +753,8 @@ fn prepare_image_inputs(
             })
         })
         .collect::<OmniResult<Vec<_>>>()?;
+    // The sort is stable, so images sharing a position keep their input order
+    // as `ImageInput::position` requires.
     images.sort_by_key(|image| image.position);
     Ok(MultimodalInputs { images })
 }
@@ -638,6 +769,15 @@ pub(crate) fn generation_constraint(modalities: ModalitySelection) -> Generation
 }
 
 /// Replaces chat image parts with unique template placeholders and retains their payloads.
+///
+/// Returns the base64 payloads and their placeholders in message order.
+/// Assistant messages are skipped, so images in assistant content are not
+/// collected.
+///
+/// # Errors
+///
+/// Fails when an image part is not a `data:image/*;base64` URL with valid
+/// base64 content (see `data_image_payload`).
 fn replace_chat_images(
     request_id: &str,
     messages: &mut [ChatMessage],
@@ -669,6 +809,10 @@ fn replace_chat_images(
 }
 
 /// Returns the placeholder for one image slot.
+///
+/// The placeholder embeds a hash of the request identifier and the slot index.
+/// `replace_rendered_slots` rejects a rendered prompt in which any placeholder
+/// does not occur exactly once, including when request text repeats it.
 fn image_placeholder(request_id: &str, index: usize) -> String {
     format!("[IMAGE_SLOT_{:016x}_{index}]", fnv1a(request_id.as_bytes()))
 }
@@ -681,6 +825,9 @@ fn image_placeholders(request_id: &str, count: usize) -> Vec<String> {
 }
 
 /// Replaces each rendered image placeholder exactly once and returns its byte offset.
+///
+/// Placeholders must appear in `placeholders` order. Each returned offset
+/// indexes the cleaned text just past that placeholder's `replacement`.
 fn replace_rendered_slots(
     rendered: &str,
     placeholders: &[String],
@@ -708,7 +855,10 @@ fn replace_rendered_slots(
     Ok((clean, byte_offsets))
 }
 
-/// Decodes an inline image data URL.
+/// Validates an inline image data URL and returns its base64 payload.
+///
+/// The payload is decoded only to validate it; the still-encoded text is
+/// returned.
 fn data_image_payload(url: &str) -> OmniResult<String> {
     let (metadata, payload) = url
         .split_once(',')
@@ -725,7 +875,7 @@ fn data_image_payload(url: &str) -> OmniResult<String> {
     Ok(payload.to_string())
 }
 
-/// Renders an image input for the model prompt.
+/// Pairs an image payload with its prompt position and content hash.
 fn rendered_image(b64: String, position: u32) -> RenderedImage {
     RenderedImage {
         hash: fnv1a(b64.as_bytes()),
@@ -734,7 +884,10 @@ fn rendered_image(b64: String, position: u32) -> RenderedImage {
     }
 }
 
-/// Builds a prompt containing the required image slots.
+/// Prepends the image slots to a SenseNova text prompt, one per line.
+///
+/// A single slot is bare; multiple slots are labeled `Image-1:`, `Image-2:`,
+/// and so on.
 fn prompt_with_image_slots(prompt: &str, placeholders: &[String]) -> String {
     let mut output = String::new();
     if placeholders.len() == 1 {
@@ -749,7 +902,9 @@ fn prompt_with_image_slots(prompt: &str, placeholders: &[String]) -> String {
     output
 }
 
-/// Returns the decoded image dimensions.
+/// Returns the `(width, height)` in pixels of a base64-encoded image.
+///
+/// Only the image header is read; the pixels are not decoded.
 fn image_dimensions(b64: &str) -> OmniResult<(u32, u32)> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
@@ -761,7 +916,7 @@ fn image_dimensions(b64: &str) -> OmniResult<(u32, u32)> {
         .map_err(|error| format!("invalid input image data: {error}"))?)
 }
 
-/// Validates the prompt.
+/// Rejects an empty prompt token sequence.
 fn validate_prompt(prompt_ids: &[u32]) -> OmniResult<()> {
     if prompt_ids.is_empty() {
         Err(OmniError::Invalid(
@@ -772,7 +927,7 @@ fn validate_prompt(prompt_ids: &[u32]) -> OmniResult<()> {
     }
 }
 
-/// Validates the max images.
+/// Requires `1 <= value <= limit` for `image.max_images`.
 fn validate_max_images(value: u16, limit: u16) -> OmniResult<()> {
     if value == 0 {
         return Err(OmniError::Invalid(
@@ -785,7 +940,7 @@ fn validate_max_images(value: u16, limit: u16) -> OmniResult<()> {
     Ok(())
 }
 
-/// Validates the CFG interval.
+/// Requires a finite `(lo, hi)` guidance interval with `lo <= hi`.
 fn validate_cfg_interval(value: (f32, f32)) -> OmniResult<()> {
     let (lo, hi) = value;
     if !lo.is_finite() || !hi.is_finite() || lo > hi {
@@ -806,6 +961,10 @@ fn finite(value: f32, name: &str) -> OmniResult<f32> {
 }
 
 /// Builds a cache key isolated by request namespace and salt.
+///
+/// Returns `content_key` unchanged when the request has no isolation key, so
+/// unisolated requests share encoder-cache entries for identical image
+/// payloads.
 fn isolated_cache_key(content_key: u64, isolation_key: Option<u64>) -> u64 {
     let Some(isolation_key) = isolation_key else {
         return content_key;
@@ -816,7 +975,7 @@ fn isolated_cache_key(content_key: u64, isolation_key: Option<u64>) -> u64 {
     fnv1a(&bytes)
 }
 
-/// Computes a stable FNV-1a hash.
+/// Computes a 64-bit FNV-1a hash that is stable across processes and builds.
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in bytes {

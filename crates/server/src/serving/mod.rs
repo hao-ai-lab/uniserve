@@ -3,6 +3,21 @@
 //! Requests follow one ownership chain:
 //! `HTTP schema / text prompt -> InputProcessor -> GenerationRequest ->
 //! EngineClient::submit_generation -> RequestOutput stream`.
+//! Video requests follow the same chain with a `DiffusionRequest`,
+//! `EngineClient::submit_media`, and `assembly::assemble_media_event_stream`.
+//!
+//! [`ServingRuntime`] owns each request from identity reservation to its terminal event. It
+//! reserves the external identifier and an engine `RequestId` in the engine client's
+//! `RequestRegistry` before preprocessing, runs model preprocessing on the blocking pool,
+//! submits the prepared request, and wraps the engine receiver in the assembler and in
+//! lifecycle tracking (`LifecycleGuard`, `LifecycleTrackedStream`).
+//!
+//! External cancel and abort commands are recorded in the registry and take precedence over
+//! any later engine output: the caller sees `RequestOutput::Cancelled` or
+//! `RequestOutput::Aborted` in place of the engine's own terminal event. Each request records
+//! exactly one terminal outcome, including when the caller drops the pending future or the
+//! response stream. Aggregate lifecycle counters reach the metrics route through
+//! [`RuntimeMetricsSnapshot::state_counts`].
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -57,7 +72,11 @@ use assembly::{assemble_chat_event_stream, assemble_event_stream};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-/// Validated external request identifier used throughout serving.
+/// Caller-visible request identifier used throughout serving.
+///
+/// The type performs no validation. The HTTP routes build it from the resolved request ID
+/// with an endpoint prefix (for example `chatcmpl-`), and `RequestRegistry::register` refuses
+/// an identifier that another live request already holds.
 pub struct ServeRequestId(String);
 
 impl ServeRequestId {
@@ -286,6 +305,11 @@ fn malformed_output(
 }
 
 /// Folds cache namespace/salt into a stable isolation key.
+///
+/// Returns `None` when both are absent, which leaves the request in the shared cache
+/// partition. Otherwise the key is a 64-bit FNV-1a hash (the same function as
+/// `model::stable_hash`) over length-prefixed material, so `("ab", "c")` and `("a", "bc")`
+/// hash different bytes. The hash is deterministic across processes.
 pub(crate) fn cache_isolation_key(namespace: Option<&str>, salt: Option<&str>) -> Option<u64> {
     (namespace.is_some() || salt.is_some()).then(|| {
         let namespace = namespace.unwrap_or_default();
@@ -301,6 +325,9 @@ pub(crate) fn cache_isolation_key(namespace: Option<&str>, salt: Option<&str>) -
 }
 
 /// Tokenized input retains only the response processing its computation needs.
+///
+/// Media requests carry no `ResponseOptions`: their stream is assembled from the prompt
+/// length and the runtime's model identity.
 enum Prepared {
     Generation(Box<(uniserve_core::GenerationRequest, ResponseOptions)>),
     Diffusion(uniserve_core::DiffusionRequest),
@@ -316,7 +343,9 @@ impl From<(uniserve_core::GenerationRequest, ResponseOptions)> for Prepared {
 pub struct ServingRuntime {
     model: Arc<InputProcessor>,
     engine: Arc<EngineClient>,
+    // Held only to keep the periodic logging task alive; dropping the logger aborts the task.
     _stats_logger: Option<Arc<crate::engine_client::generation::log_stats::StatsLogger>>,
+    // Cumulative lifecycle counters shared with every request's lifecycle guard and assembler.
     metrics: Arc<RuntimeLifecycleMetrics>,
 }
 
@@ -355,6 +384,9 @@ impl ServingRuntime {
     }
 
     /// Returns an aggregate point-in-time metrics snapshot.
+    ///
+    /// `active` is read from the request registry at call time; the other fields are
+    /// cumulative counters since the runtime started.
     pub fn metrics_snapshot(&self) -> RuntimeMetricsSnapshot {
         let mut snapshot = self.metrics.snapshot();
         snapshot.active = self.engine.requests.active_count() as u64;
@@ -440,11 +472,18 @@ impl ServingRuntime {
     }
 
     /// Owns the request across blocking preprocessing, submission, and public output.
+    ///
+    /// Registration precedes preprocessing, so a duplicate identifier is refused before any
+    /// tokenization work and a cancel or abort can target a request that is still compiling.
+    /// Every path after registration either returns a stream that carries the lifecycle guard
+    /// or records a terminal outcome through it.
     async fn generate_with(
         &self,
         request_id: ServeRequestId,
         preprocess: impl FnOnce(&InputProcessor) -> crate::openai::Result<Prepared> + Send + 'static,
     ) -> crate::openai::Result<RequestOutputStream> {
+        // `compile_us` and the lifecycle's elapsed times are measured from this instant, so
+        // time spent queued for the blocking pool counts toward compilation.
         let compile_started = Instant::now();
         let identity = self.model.event_identity();
 
@@ -463,6 +502,8 @@ impl ServingRuntime {
                 }
             })
             .map_err(crate::openai::serve_error_to_api)?;
+        // Created before the first await: if the caller drops this future, the guard's `Drop`
+        // records the request as cancelled, or as aborted when an abort is pending.
         let mut lifecycle = LifecycleGuard::new(
             request_id.clone(),
             Arc::clone(&self.metrics),
@@ -470,6 +511,9 @@ impl ServingRuntime {
             compile_started,
         );
 
+        // A control command that arrives during preprocessing ends the request immediately.
+        // Dropping the `spawn_blocking` handle detaches the task rather than cancelling it, so
+        // the preprocessing still runs to completion and its result is discarded.
         let model = Arc::clone(&self.model);
         let tokenize_request_id = request_id.clone();
         let tokenize_result = tokio::select! {
@@ -498,6 +542,8 @@ impl ServingRuntime {
             .requests
             .mark_submitting(&request_id, compile_duration_us);
 
+        // Preprocessing fills a placeholder engine identifier. `EngineClient::submit_generation`
+        // and `submit_media` accept only the identifier reserved at registration.
         match &mut tokenized {
             Prepared::Generation(prepared) => prepared.0.request_id = engine_request_id,
             Prepared::Diffusion(request) => request.request_id = engine_request_id,
@@ -508,6 +554,11 @@ impl ServingRuntime {
     }
 
     /// Submits a tokenized request and wraps its output with model and lifecycle processing.
+    ///
+    /// A control command can arrive at any point, so the registry is checked before
+    /// submission, after submission, and atomically when the request is accepted. A control
+    /// found at any checkpoint yields an immediate terminal stream in place of engine output.
+    /// A submission failure with no pending control records `Failed` and returns the error.
     async fn submit_and_stream(
         &self,
         prepared: Prepared,
@@ -567,6 +618,8 @@ impl ServingRuntime {
                             OutputProcessorPolicy::Qwen3(processor) => {
                                 Box::pin(assemble_chat_event_stream(assembly, processor))
                             }
+                            // `assemble_event_stream` applies the remaining policies as its
+                            // output sink.
                             output_processor => {
                                 Box::pin(assemble_event_stream(assembly, output_processor))
                             }
@@ -602,6 +655,9 @@ impl ServingRuntime {
             }
         };
 
+        // A control recorded while submission was in flight may not have reached the engine.
+        // Dropping the unpolled stream drops its `EventRx`, which sends the engine a cancel at
+        // the acknowledged prefix and releases the registry's engine side.
         if let Some(terminal) = self.engine.requests.control_terminal(&request_id) {
             if let Ok(stream) = stream_result {
                 drop(stream);
@@ -619,6 +675,9 @@ impl ServingRuntime {
                 return Err(error);
             }
         };
+
+        // `accept` refuses under the registry lock when a control was recorded after the
+        // previous check or when the request has no lifecycle record.
         if !self.engine.requests.accept(&request_id) {
             let terminal = self
                 .engine
@@ -629,6 +688,10 @@ impl ServingRuntime {
             self.apply_engine_control(&request_id, terminal).await;
             return Ok(self.control_event_stream(request_id, terminal, lifecycle));
         }
+
+        // Layering: the assembler produces public events, `control_aware_event_stream` ends
+        // them promptly on a control, and `LifecycleTrackedStream` records statistics and the
+        // single terminal outcome.
         self.metrics.accepted.fetch_add(1, Ordering::Relaxed);
         let stream = Box::pin(control_aware_event_stream(
             request_id.clone(),
@@ -639,6 +702,9 @@ impl ServingRuntime {
     }
 
     /// Builds an immediately terminal stream for a request controlled before engine ownership.
+    ///
+    /// Callers pass a control outcome (`Cancelled` or `Aborted`); any other terminal maps to
+    /// `RequestOutput::Cancelled`.
     fn control_event_stream(
         &self,
         request_id: ServeRequestId,
@@ -680,7 +746,10 @@ impl ServingRuntime {
         Ok(())
     }
 
-    /// Applies the engine control.
+    /// Reissues a control through `EngineClient::abort_request` (for `Aborted`) or
+    /// `cancel_request` (for any other terminal). These signal the engine only while the
+    /// registry still holds the request's claimed engine side. Failures are logged, not
+    /// returned.
     async fn apply_engine_control(&self, request_id: &str, terminal: LifecycleTerminal) {
         let result = match terminal {
             LifecycleTerminal::Aborted => self.engine.abort_request(request_id).await,
@@ -739,7 +808,10 @@ pub enum RequestLifecycleState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// Point-in-time request counts grouped by lifecycle state.
+/// Point-in-time lifecycle state, usage, and timing statistics for one request.
+///
+/// `RequestRegistry` maintains it from the public events it observes and retains it for a
+/// bounded number of completed requests.
 pub struct RequestStatsSnapshot {
     /// Caller-visible request identifier.
     pub request_id: ServeRequestId,
@@ -795,6 +867,7 @@ impl RequestStatsSnapshot {
     }
 }
 
+/// Request-scoped metadata the assemblers stamp onto public events and usage.
 #[derive(Debug, Clone)]
 struct EventContext {
     started: Instant,
@@ -803,9 +876,11 @@ struct EventContext {
     compile_duration_us: u64,
     cache: CacheAccounting,
     resources: ResourceAccounting,
+    // The assemblers increment `scheduled` when the engine reports scheduling.
     metrics: Arc<RuntimeLifecycleMetrics>,
 }
 
+/// Engine receiver and the response options a generation assembler consumes.
 struct StreamInput {
     request_id: ServeRequestId,
     event_context: EventContext,
@@ -818,6 +893,8 @@ struct StreamInput {
     stream: EventRx,
 }
 
+/// Cumulative per-runtime lifecycle counters. They use relaxed ordering: each is read
+/// independently for reporting and none orders other memory.
 #[derive(Debug, Default)]
 struct RuntimeLifecycleMetrics {
     accepted: AtomicU64,
@@ -846,9 +923,11 @@ impl RuntimeLifecycleMetrics {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-/// Aggregate request, cache, resource, and timing metrics.
+/// Aggregate request lifecycle counts: the active requests plus cumulative milestone and
+/// outcome counters.
 pub struct RuntimeMetricsSnapshot {
-    /// Number of requests presently tracked by the runtime.
+    /// Number of registered requests that have not reached a terminal outcome, including
+    /// requests still in preprocessing.
     pub active: u64,
     /// Cumulative number of engine-accepted requests.
     pub accepted: u64,
@@ -856,7 +935,8 @@ pub struct RuntimeMetricsSnapshot {
     pub scheduled: u64,
     /// Cumulative number of normally completed requests.
     pub finished: u64,
-    /// Cumulative number of requests rejected before execution.
+    /// Cumulative number of requests rejected before execution, including duplicate
+    /// identifiers and preprocessing failures.
     pub rejected: u64,
     /// Cumulative number of cancelled requests.
     pub cancelled: u64,
@@ -883,6 +963,11 @@ impl RuntimeMetricsSnapshot {
     }
 }
 
+/// Terminal-outcome latch for one registered request.
+///
+/// The guard moves from `generate_with` into the response stream. Its first `terminal` call
+/// completes the registry record and increments one outcome counter; later calls do nothing.
+/// Dropping it without a terminal records a cancellation or abort.
 struct LifecycleGuard {
     request_id: ServeRequestId,
     metrics: Arc<RuntimeLifecycleMetrics>,
@@ -891,6 +976,8 @@ struct LifecycleGuard {
     terminal: bool,
 }
 
+/// Response stream that feeds each event to the request registry and latches the terminal
+/// outcome, replacing the engine's terminal with a control terminal when one takes precedence.
 struct LifecycleTrackedStream {
     inner: RequestOutputStream,
     lifecycle: LifecycleGuard,
@@ -911,6 +998,9 @@ impl Stream for LifecycleTrackedStream {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(mut event))) => {
                 let elapsed_us = self.lifecycle.started.elapsed().as_micros() as u64;
+
+                // A pending control replaces this event and ends the stream; replacing
+                // `inner` drops the previous stream and any engine receiver it holds.
                 if let Some(control) =
                     self.lifecycle
                         .requests
@@ -921,6 +1011,10 @@ impl Stream for LifecycleTrackedStream {
                     self.inner = Box::pin(futures::stream::empty());
                     return Poll::Ready(Some(Ok(event)));
                 }
+
+                // `terminal` returns an outcome other than the engine's only when the registry
+                // holds a cancel or abort, which is why `control_terminal_event` accepts only
+                // those two outcomes.
                 let terminal = match &event {
                     RequestOutput::Finished { .. } => Some(LifecycleTerminal::Finished),
                     RequestOutput::Rejected { .. } => Some(LifecycleTerminal::Rejected),
@@ -938,6 +1032,8 @@ impl Stream for LifecycleTrackedStream {
                 }
                 Poll::Ready(Some(Ok(event)))
             }
+            // An error is a failure unless a control takes precedence, in which case the caller
+            // sees the control terminal instead of the error.
             Poll::Ready(Some(Err(error))) => {
                 let elapsed_us = self.lifecycle.started.elapsed().as_micros() as u64;
                 let actual = self
@@ -953,6 +1049,8 @@ impl Stream for LifecycleTrackedStream {
                     ))))
                 }
             }
+            // An inner stream that ends without a terminal event is recorded as failed; only a
+            // control outcome is surfaced to the caller as a synthesized event.
             Poll::Ready(None) => {
                 if !self.lifecycle.terminal {
                     let elapsed_us = self.lifecycle.started.elapsed().as_micros() as u64;
@@ -974,7 +1072,7 @@ impl Stream for LifecycleTrackedStream {
 }
 
 impl LifecycleGuard {
-    /// Creates an initialized serving runtime component.
+    /// Creates a guard for a request already registered in `requests`.
     fn new(
         request_id: ServeRequestId,
         metrics: Arc<RuntimeLifecycleMetrics>,
@@ -991,6 +1089,10 @@ impl LifecycleGuard {
     }
 
     /// Records the first terminal transition and increments its aggregate metric exactly once.
+    ///
+    /// Returns the recorded outcome: `RequestRegistry::complete` converts `kind` into
+    /// `Cancelled` or `Aborted` when a control is pending. After the first call, returns `kind`
+    /// unchanged without recording anything.
     fn terminal(&mut self, kind: LifecycleTerminal, elapsed_us: u64) -> LifecycleTerminal {
         if self.terminal {
             return kind;
@@ -1013,6 +1115,7 @@ impl LifecycleGuard {
     }
 }
 
+/// Terminal outcome of one request, as recorded by `LifecycleGuard`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifecycleTerminal {
     Finished,
@@ -1023,6 +1126,8 @@ pub(crate) enum LifecycleTerminal {
 }
 
 /// Returns the terminal lifecycle event represented by a state.
+///
+/// Pending `Cancelling` and `Aborting` states map to their eventual outcomes.
 fn lifecycle_terminal_for_state(state: RequestLifecycleState) -> Option<LifecycleTerminal> {
     match state {
         RequestLifecycleState::Finished => Some(LifecycleTerminal::Finished),
@@ -1074,7 +1179,8 @@ impl From<LifecycleTerminal> for RequestLifecycleState {
 }
 
 impl Drop for LifecycleGuard {
-    /// Releases resources owned by this value.
+    /// Records an unfinished request as aborted when an abort is pending and as cancelled
+    /// otherwise. This covers a caller that drops the pending future or the response stream.
     fn drop(&mut self) {
         if !self.terminal {
             let elapsed_us = self.started.elapsed().as_micros() as u64;
@@ -1085,7 +1191,7 @@ impl Drop for LifecycleGuard {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-/// Prefix and encoder cache activity for a request or interval.
+/// Cache policy and encoder-cache pin count resolved for one request during preprocessing.
 pub struct CacheAccounting {
     /// Whether the request may reuse existing cache entries.
     pub read_enabled: bool,
@@ -1096,7 +1202,8 @@ pub struct CacheAccounting {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-/// Allocated KV, latent, and buffer capacity.
+/// KV, latent, and encoder-cache requirements computed for one request during preprocessing.
+/// Media requests report `ResourceAccounting::default()`.
 pub struct ResourceAccounting {
     /// KV-token capacity required for the request.
     pub expected_kv_tokens: u64,
@@ -1104,14 +1211,16 @@ pub struct ResourceAccounting {
     pub image_latent_units: u64,
     /// Number of encoder-cache entries retained by the request.
     pub encoder_cache_pins: usize,
-    /// Whether the engine can reconstruct the request after worker recovery.
+    /// For a generation request, false when generated images feed back into the request's
+    /// context (`GenerationRequest::feeds_back_images`).
     pub replayable: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 /// Queue, execution, and end-to-end duration totals.
 pub struct RuntimeTimings {
-    /// Request validation and tokenization duration in microseconds.
+    /// Request validation and tokenization duration in microseconds, including time queued
+    /// for the blocking pool.
     pub compile_us: u64,
     /// Queue duration in microseconds, when scheduling timestamps are available.
     pub queue_us: Option<u64>,
@@ -1122,11 +1231,15 @@ pub struct RuntimeTimings {
 }
 
 /// Runtime event consumed by the HTTP response layer.
+///
+/// A stream returned by [`ServingRuntime`] yields at most one terminal variant (`Finished`,
+/// `Rejected`, `Cancelled`, `Aborted`, or `Failed`) or one error, and then ends.
 #[derive(Debug, Clone)]
 pub enum RequestOutput {
     /// Immutable generated media retained through response delivery.
     Artifact(uniserve_core::ArtifactEvent),
-    /// Latest diffusion progress.
+    /// Latest diffusion progress: the engine-reported phase and the number of completed
+    /// denoising steps.
     MediaProgress { phase: String, completed_steps: u32 },
     /// The engine accepted a compiled request.
     Accepted {
@@ -1149,9 +1262,11 @@ pub enum RequestOutput {
     Scheduled {
         /// Caller-visible request identifier.
         request_id: ServeRequestId,
-        /// Monotonic timestamp at which the request entered the serving queue.
+        /// Engine wall-clock time, in UNIX seconds, at which the request entered the
+        /// scheduler's waiting queue.
         queued_at: Option<f64>,
-        /// Monotonic timestamp at which model execution began.
+        /// Engine wall-clock time, in UNIX seconds, at which the scheduler admitted the
+        /// request for execution.
         scheduled_at: Option<f64>,
         /// Cache policy and pin counts.
         cache: CacheAccounting,
@@ -1371,6 +1486,10 @@ impl From<&FinishReason> for FinishStatus {
 
 #[try_stream]
 /// Forwards events until the stream ends or an external control reaches terminal precedence.
+///
+/// Waiting on the registry alongside the engine stream ends the response promptly even while
+/// the engine produces no events. Returning drops the inner stream and with it the engine
+/// receiver.
 async fn control_aware_event_stream(
     request_id: ServeRequestId,
     requests: Arc<RequestRegistry>,
@@ -1386,6 +1505,7 @@ async fn control_aware_event_stream(
         tokio::select! {
             next = stream.next() => match next {
                 Some(Ok(event)) => {
+                    // A control recorded while this event was pending still wins over it.
                     if let Some(terminal) = requests.control_terminal(&request_id) {
                         y.yield_ok(control_terminal_event(&request_id, terminal)).await;
                         return Ok(());
@@ -1489,6 +1609,7 @@ mod tests {
         )
         .collect::<Vec<_>>()
         .await;
+
         let delta = events
             .iter()
             .find_map(|event| match event {
@@ -1516,6 +1637,9 @@ mod tests {
         ));
     }
 
+    /// Committed image events are held back and published immediately before the next text
+    /// token (or before a terminal event or the end of the engine stream), so they stay
+    /// ordered ahead of that token.
     #[tokio::test]
     async fn assembler_publishes_an_image_with_its_next_text_token() {
         let tokenizer = crate::serving::test_support::configured_tokenizer();

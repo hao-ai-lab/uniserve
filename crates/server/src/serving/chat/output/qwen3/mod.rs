@@ -1,4 +1,9 @@
 //! Qwen3 reasoning and tool-call output processor composition.
+//!
+//! Decoded text flows through two chained stream stages: the reasoning stage
+//! splits `<think>` sections into reasoning deltas, and the tool stage extracts
+//! Qwen3 XML tool calls from the remaining visible text. A stage without a
+//! parser forwards text unchanged.
 
 mod reasoning;
 mod tool;
@@ -19,6 +24,18 @@ pub struct Qwen3ChatOutputProcessor {
 
 impl Qwen3ChatOutputProcessor {
     /// Creates a request-scoped Qwen3 reasoning and tool output processor.
+    ///
+    /// Tool-call parsing is enabled only when `tool_choice` is `Auto` and the
+    /// request declares tools, the same condition as
+    /// `ChatRequest::tool_parsing_enabled`, which also decides whether
+    /// `HfChatRenderer` exposes the tools to the template. Reasoning parsing is
+    /// enabled when `parse_reasoning` is set. The request is only read.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::ParserInitialization` when the reasoning parser cannot
+    /// be built, for example because the tokenizer lacks the `<think>` or
+    /// `</think>` token.
     pub fn new(
         request: &mut ChatRequest,
         tokenizer: DynTokenizer,
@@ -47,6 +64,8 @@ impl Qwen3ChatOutputProcessor {
     }
 
     /// Parses decoded text into reasoning, visible text, and incremental tool calls.
+    ///
+    /// Decoder errors propagate as `Error::Text`.
     pub fn parse(
         self,
         decoded: impl futures::Stream<

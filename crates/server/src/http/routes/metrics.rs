@@ -1,4 +1,7 @@
 //! OpenMetrics exposition endpoint.
+//!
+//! Renders the process-global `uniserve_observability::METRICS` registry, which
+//! the HTTP middleware and the engine client update as they run.
 
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderValue, StatusCode};
@@ -12,6 +15,8 @@ const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.
 
 /// Renders the current process registry in OpenMetrics text format.
 pub(super) async fn scrape(State(state): State<Arc<AppState>>) -> Response {
+    // Request-lifecycle gauges are not updated continuously; they are
+    // refreshed from the runtime's snapshot on each scrape, before rendering.
     let model = state.runtime().model().config();
     METRICS.serving.set_request_states(
         state.served_model_name(),

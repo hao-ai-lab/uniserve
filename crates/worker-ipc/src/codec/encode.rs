@@ -1,4 +1,25 @@
 //! Direct FlatBuffers construction from borrowed protocol values.
+//!
+//! The parent `codec` module reaches this submodule only through `request`
+//! and `response`, called by `encode_request` and `encode_response`, which
+//! first validate submitted batches, worker info, and batch outputs. The
+//! builders perform no checks of their own and cannot fail; they rely on that
+//! validation for narrowing casts such as the parallel degrees in `parallel`.
+//!
+//! FlatBuffers builds bottom-up: a table can reference only objects already
+//! written to the builder. Each function first serializes its strings,
+//! vectors, and child tables, then creates its own table from their offsets.
+//! The schema's structs (`CallId`, `CallKind`, `TokenLogprob`) are stored
+//! inline, so they are built as plain values rather than through the builder.
+//!
+//! Decoding lives in the parent module's `*_from_table` and `*_from_fb`
+//! functions, so a schema field written here must also be read there.
+//! Collections are written as vectors even when empty, with two exceptions:
+//! `allowed_token_ids` is written only when `Some`, because absence (no
+//! whitelist) and an empty vector mean different things, and `locator`
+//! writes only the vectors of the selected transport. The decoders read most
+//! absent vectors as empty, but reject an absent
+//! `WorkerInfo.transfer_backends` or `ComponentInfo.outputs`.
 
 use super::*;
 use flatbuffers::WIPOffset;
@@ -35,6 +56,9 @@ fn buffer_id<'a>(b: &mut FlatBufferBuilder<'a>, v: &BufferId) -> WIPOffset<fbs::
     )
 }
 
+/// Writes a tensor reference. The Rust value stores its storage identity as
+/// flat fields; the wire nests it in the schema-required `BufferId` table,
+/// assembled by `TensorRef::buffer_id`.
 fn tensor_ref<'a>(b: &mut FlatBufferBuilder<'a>, v: &TensorRef) -> WIPOffset<fbs::TensorRef<'a>> {
     let (extents, dynamic_axis) = shape_bound_to_parts(&v.shape_bound);
     let id = Some(buffer_id(b, &v.buffer_id()));
@@ -82,6 +106,8 @@ fn sampling_state<'a>(
     b: &mut FlatBufferBuilder<'a>,
     v: &SamplingState,
 ) -> WIPOffset<fbs::SamplingState<'a>> {
+    // `None` stays absent so that `call_from_table` decodes it back to
+    // `None`; a present empty whitelist is an all-masked distribution.
     let allowed_token_ids = v
         .allowed_token_ids
         .as_deref()
@@ -126,6 +152,8 @@ fn sampling<'a>(
             .collect::<Vec<_>>();
         Some(b.create_vector(&values))
     };
+    // `None` (no restriction) stays absent; `SamplingParams::validate`
+    // rejects a present empty whitelist.
     let allowed_token_ids = v
         .allowed_token_ids
         .as_deref()
@@ -145,6 +173,8 @@ fn sampling<'a>(
             frequency_penalty: v.frequency_penalty,
             presence_penalty: v.presence_penalty,
             logit_bias,
+            // `sampling_from_table` rejects a value that does not fit the
+            // receiver's `usize`.
             min_tokens: v.min_tokens as u64,
             n_logprobs: v.n_logprobs,
             bad_words_ids,
@@ -346,11 +376,15 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
     let coordinates = Some(coordinates(b, &v.coordinates));
     let component = Some(b.create_string(&v.component));
     let code = computation_to_fb(v.code);
+
+    // The schema has no `Bounds` table: the bounds are scalar fields of the
+    // `Call` table, which `call_from_table` reassembles.
     let max_tokens = v.bounds.max_tokens;
     let max_kv_pages = v.bounds.max_kv_pages;
     let max_latent_bytes = v.bounds.max_latent_bytes;
     let max_completion_bytes = v.bounds.max_completion_bytes;
     let max_transfer_bytes = v.bounds.max_transfer_bytes;
+
     let inputs = {
         let items = v
             .inputs
@@ -367,6 +401,7 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
             .collect::<Vec<_>>();
         Some(b.create_vector(&items))
     };
+
     let token_input = v.token_input.as_ref().map(|value| tensor_ref(b, value));
     let token_output = v.token_output.as_ref().map(|value| tensor_ref(b, value));
     let vision_input = v.vision_input.as_ref().map(|value| tensor_ref(b, value));
@@ -388,6 +423,7 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
         .as_ref()
         .map(|value| tensor_ref(b, value));
     let predicate = v.predicate.as_ref().map(|value| tensor_ref(b, value));
+
     let rng = v.rng.as_ref().map(|value| rng(b, value));
     let sampling_state = v
         .sampling_state
@@ -398,6 +434,7 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
     let kv_input = v.kv_input.as_ref().map(|value| buffer_id(b, value));
     let kv_output = v.kv_output.as_ref().map(|value| buffer_id(b, value));
     let consumer_slots = Some(b.create_vector(&v.consumer_slots));
+
     fbs::Call::create(
         b,
         &fbs::CallArgs {
@@ -456,7 +493,13 @@ fn endpoint<'a>(
     )
 }
 
+/// Writes one storage locator. `Locator` is a flat table whose `transport`
+/// discriminant selects which coordinate fields are meaningful.
 fn locator<'a>(b: &mut FlatBufferBuilder<'a>, v: &Locator) -> WIPOffset<fbs::Locator<'a>> {
+    // Transport-independent tensor metadata. `..Default::default()` leaves
+    // every other field at its schema default; the match below sets the
+    // discriminant and only that transport's fields, which are the only
+    // coordinate fields `transfer_locator_from_table` reads.
     let mut args = fbs::LocatorArgs {
         source: Some(endpoint(b, &v.source)),
         nbytes: v.nbytes,
@@ -466,6 +509,7 @@ fn locator<'a>(b: &mut FlatBufferBuilder<'a>, v: &Locator) -> WIPOffset<fbs::Loc
         device: Some(b.create_string(&v.device)),
         ..Default::default()
     };
+
     match &v.transport {
         TransferTransport::Local { endpoint, key } => {
             args.transport = fbs::TransferTransportKind::Local;
@@ -507,6 +551,7 @@ fn locator<'a>(b: &mut FlatBufferBuilder<'a>, v: &Locator) -> WIPOffset<fbs::Loc
             args.acknowledgment_offset = *acknowledgment_offset;
         }
     }
+
     fbs::Locator::create(b, &args)
 }
 
@@ -562,6 +607,8 @@ fn transfer_handle<'a>(
     b: &mut FlatBufferBuilder<'a>,
     v: &TransferHandle,
 ) -> WIPOffset<fbs::TransferHandle<'a>> {
+    // A FlatBuffers union is a type tag plus an untyped table offset; each arm
+    // returns the tag that matches the table it builds.
     let (value_type, value) = match v {
         TransferHandle::Encoder {
             height,
@@ -703,6 +750,9 @@ fn command<'a>(
     )
 }
 
+/// Writes a submitted batch. The schema has no `ForwardBatch` table: its
+/// aligned columns become top-level `Batch` vectors, with
+/// `ForwardBatch::call_indices` written as `forward_call_indices`.
 fn batch<'a>(b: &mut FlatBufferBuilder<'a>, v: &Batch) -> WIPOffset<fbs::Batch<'a>> {
     let calls = {
         let items = v.calls.iter().map(|item| call(b, item)).collect::<Vec<_>>();
@@ -828,6 +878,7 @@ fn finish_flags<'a>(
 fn token_logprob(v: &TokenLogprob) -> fbs::TokenLogprob {
     fbs::TokenLogprob::new(v.token_id, v.logprob, v.rank)
 }
+
 fn position_logprobs<'a>(
     b: &mut FlatBufferBuilder<'a>,
     v: &[TokenLogprob],
@@ -836,10 +887,15 @@ fn position_logprobs<'a>(
     let entries = Some(b.create_vector(&values));
     fbs::PositionLogprobs::create(b, &fbs::PositionLogprobsArgs { entries })
 }
+
 fn media_output<'a>(
     b: &mut FlatBufferBuilder<'a>,
     v: &MediaOutput,
 ) -> WIPOffset<fbs::MediaOutput<'a>> {
+    // `ArtifactHandle` has a single variant, so this pattern is irrefutable
+    // and `handle_type` is fixed. On the wire, a new variant also needs a
+    // member of the schema's `ArtifactHandle` union, a match here, and a
+    // decoder arm in `completion_record_from_table`.
     let ArtifactHandle::PosixShm { name } = &v.handle;
     let name = Some(b.create_string(name));
     let handle = Some(
@@ -1006,6 +1062,8 @@ fn batch_output<'a>(
 }
 
 fn kv_group<'a>(b: &mut FlatBufferBuilder<'a>, v: &KvCacheGroup) -> WIPOffset<fbs::KvGroup<'a>> {
+    // `window` and `sink` are meaningful only for sliding-window groups; a
+    // full-attention group writes zeros, which `kv_group_from_table` ignores.
     let (kind, window, sink) = match v.kind {
         KvGroupKind::Full => (fbs::KvGroupKind::Full, 0, 0),
         KvGroupKind::SlidingWindow { window, sink } => {
@@ -1052,6 +1110,10 @@ fn kv_cache<'a>(b: &mut FlatBufferBuilder<'a>, v: &KvCacheInfo) -> WIPOffset<fbs
     )
 }
 
+/// Writes a component's parallel degrees.
+///
+/// The `as u32` casts cannot truncate for a validated `WorkerInfo`:
+/// `WorkerInfo::validate` requires positive degrees whose product fits `u32`.
 fn parallel<'a>(
     b: &mut FlatBufferBuilder<'a>,
     v: &uniserve_core::ParallelConfig,
@@ -1142,12 +1204,15 @@ fn component_info<'a>(
         Some(b.create_vector(&values))
     };
     let parallel_config = Some(parallel(b, &v.config.parallel_config));
+    // Wire `Local` encodes an absent distribution; `distribution_from_fb`
+    // maps it back to `None`.
     let distribution = match v.config.distribution {
         None => fbs::ComponentDistribution::Local,
         Some(uniserve_core::ComponentDistribution::TemporalUnits) => {
             fbs::ComponentDistribution::TemporalUnits
         }
     };
+    // `WorkerInfo::validate` bounds `units_per_rank` to `u32`.
     let units_per_rank = v.config.units_per_rank as u32;
     let outputs = {
         let items = v
@@ -1218,6 +1283,8 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
         Some(b.create_vector(&items))
     };
     let kv_cache = v.kv_cache.as_ref().map(|value| kv_cache(b, value));
+    // The `MediaCall` to component-name map is written as a vector of pairs
+    // in key order; `info_from_table` rejects a repeated call.
     let media_components = {
         let values = v
             .media_components
@@ -1285,6 +1352,8 @@ fn error_call<'a>(
     )
 }
 
+/// Writes the root `WorkerRequest` table. Only `Submit` carries a batch;
+/// `request_from_table` rejects a batch on any other kind.
 pub(super) fn request<'a>(
     b: &mut FlatBufferBuilder<'a>,
     v: &WorkerRequest,
@@ -1300,6 +1369,11 @@ pub(super) fn request<'a>(
     )
 }
 
+/// Writes the root `WorkerResponse` table.
+///
+/// Besides `kind` and `message_id`, each kind writes only its own fields:
+/// `Info` and `Result` their payload, `Ok` nothing, and `Error` the error
+/// metadata. `response_from_table` rejects any other combination.
 pub(super) fn response<'a>(
     b: &mut FlatBufferBuilder<'a>,
     v: &WorkerResponse,
@@ -1316,6 +1390,9 @@ pub(super) fn response<'a>(
         WorkerResponse::Error { error, .. } => {
             args.message = Some(b.create_string(&error.message));
             args.code = error.code.as_deref().map(|s| b.create_string(s));
+            // `fatal` is an optional scalar (`bool = null`): `Some` writes it
+            // even when false, and `response_from_table` requires it on error
+            // responses.
             args.fatal = Some(error.fatal);
             args.phase = error.phase.as_deref().map(|s| b.create_string(s));
             args.route = error.route.as_deref().map(|s| b.create_string(s));

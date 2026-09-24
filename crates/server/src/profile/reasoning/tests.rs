@@ -10,6 +10,8 @@ use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 
 use super::{DelimitedReasoningParser, Qwen3ReasoningParser};
 
+/// Builds a tokenizer whose only special tokens are the reasoning delimiters
+/// and `<|im_end|>`, which stands in for a chat-turn boundary.
 fn reasoning_tokenizer() -> DynTokenizer {
     let model = BPE::builder()
         .vocab_and_merges(
@@ -47,6 +49,7 @@ fn delimited_parser_splits_reasoning_across_chunk_boundaries() {
     let mut parser =
         DelimitedReasoningParser::new(tokenizer, "<think>", "</think>", false).unwrap();
 
+    // A partial start delimiter is held back until the next delta completes it.
     assert!(parser.push("<thi").is_empty());
     let delta = parser.push("nk>reason</think>answer");
     assert_eq!(delta.reasoning.as_deref(), Some("reason"));
@@ -63,6 +66,8 @@ fn delimited_parser_flushes_partial_end_marker() {
 
     let delta = parser.push("unfinished</thi");
     assert_eq!(delta.reasoning.as_deref(), Some("unfinished"));
+
+    // At end of stream the incomplete delimiter is text of the current region.
     assert_eq!(parser.finish().reasoning.as_deref(), Some("</thi"));
 }
 
@@ -93,6 +98,8 @@ fn qwen3_prompt_boundaries_select_the_initial_output_region() {
     assert_eq!(delta.content.as_deref(), Some("answer"));
 }
 
+/// The backward prompt scan stops at `<|im_end|>` before reaching the earlier
+/// `<think>`, so the parser keeps its default content region.
 #[test]
 fn qwen3_prompt_scan_stops_at_the_last_special_token() {
     let tokenizer = reasoning_tokenizer();

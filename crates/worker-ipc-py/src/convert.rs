@@ -1,11 +1,35 @@
-//! Conversion between validated worker IPC frames and Python records.
+//! Typed conversion between worker IPC messages and the Python worker's
+//! protocol records.
 //!
-//! The conversion path crosses the FFI boundary once in each direction per
-//! batch. Mapping keys and enum strings are interned, lists are preallocated,
-//! and binary payloads remain Python `bytes`.
+//! This module converts submit requests into Python records and decodes
+//! result and error responses from Python, each in one call per message.
+//! Every other message kind uses the schema-derived serde representation
+//! (`pythonize_request` and `PyServer::respond` in the crate root choose the
+//! path).
 //!
-//! [`execute_request_to_py`] builds worker input, while
-//! [`try_completion_response_from_py`] strictly decodes worker output.
+//! - Inbound, [`execute_request_to_py`] turns a decoded submit request into
+//!   `{kind, message_id, batch}`, where `batch` is a fully constructed
+//!   `uniserve_worker.protocol.batch.Batch`. Python classes and enum members
+//!   are resolved once per process (`RequestTypes`); outside `kv_inputs`,
+//!   each distinct request key, call id, and shape bound is constructed once
+//!   per batch (`RequestConversion`); and `batch_from_validated` assembles the
+//!   batch without running `Batch.__post_init__`.
+//! - Outbound, [`try_completion_response_from_py`] decodes the mappings the
+//!   worker's `to_mapping` methods emit. That encoding differs from the serde
+//!   form: for example `Locator.to_mapping` writes a plain `transport` string
+//!   beside flattened transport fields, whereas `TransferTransport`
+//!   deserializes only from its adjacently tagged `transport`/`value` form.
+//!
+//! The encoder constructs many records positionally, so its argument order is
+//! coupled to the field order of the Python dataclasses in
+//! `uniserve_worker.protocol` and to the parameters of `batch_from_validated`.
+//! The round-trip test at the bottom of this file checks that each native
+//! batch equals `Batch.from_mapping(batch.to_mapping())`.
+//!
+//! Decoding is strict: integers reject Python `bool`, strings must be `str`,
+//! byte payloads must be `bytes`, and sequences must be `list` (except the
+//! logprob iterables). Any mismatch rejects the whole response with one
+//! generic `ValueError` that does not name the offending field.
 
 use std::collections::{BTreeMap, HashMap};
 use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
@@ -29,6 +53,12 @@ use uniserve_worker_ipc::{
 use uniserve_worker_ipc::Bounds;
 
 /// Converts a submit [`WorkerRequest`] into the Python worker mapping.
+///
+/// Returns a `dict` with `kind`, `message_id`, and a typed `batch`. Fails with
+/// `ValueError` for any other request kind, and propagates errors from
+/// resolving the Python types and exceptions raised by record constructors.
+/// Nested records that define `__post_init__` still run it; only `Batch`
+/// itself skips it.
 pub(crate) fn execute_request_to_py<'py>(
     py: Python<'py>,
     request: &WorkerRequest,
@@ -46,6 +76,11 @@ pub(crate) fn execute_request_to_py<'py>(
 }
 
 /// Cached constructors and enum members for transport-validated records.
+///
+/// `records` holds the classes built through [`construct`] by keyword; the
+/// classes and the function in the other fields are called positionally. The
+/// enum arrays are indexed by `RequestTypes::kind`, `RequestTypes::dtype`,
+/// and the draw-layout match in `RequestConversion::call`.
 struct RequestTypes {
     records: HashMap<&'static str, Py<PyAny>>,
     call: Py<PyAny>,
@@ -77,6 +112,10 @@ struct RequestTypes {
 static REQUEST_TYPES: std::sync::OnceLock<RequestTypes> = std::sync::OnceLock::new();
 
 /// Resolves named Python enum members into a fixed-size indexed cache.
+///
+/// Members are looked up by value (`Enum(value)`), so each spelling must be a
+/// value of the Python enum `name`, and the array order is the order of
+/// `values`.
 fn enum_members<const N: usize>(
     module: &Bound<'_, PyModule>,
     name: &str,
@@ -97,8 +136,7 @@ impl RequestTypes {
     fn build(py: Python<'_>) -> PyResult<Self> {
         // Resolve classes once so per-request conversion uses direct constructor
         // calls without repeated module or attribute lookup. Each name is
-        // imported from the protocol module that owns it at the current Python
-        // package structure.
+        // imported from the module that defines it.
         let batch = py.import("uniserve_worker.protocol.batch")?;
         let call = py.import("uniserve_worker.protocol.call")?;
         let identity = py.import("uniserve_worker.protocol.identity")?;
@@ -165,8 +203,11 @@ impl RequestTypes {
                 "batch_from_validated",
             )?,
 
-            // Enum members follow the stable Rust discriminant order used by
-            // the indexed accessors below.
+            // The `dtypes` and `draw_layouts` spellings sit at the indices that
+            // `dtype` and the draw-layout match in `RequestConversion::call`
+            // hardcode (the Rust discriminant values). `kind` indexes the other
+            // three with `as usize`, which relies on each `ALL` array listing
+            // variants in declaration order.
             dtypes: enum_members(
                 &tensor,
                 "DType",
@@ -191,16 +232,22 @@ impl RequestTypes {
         })
     }
 
-    /// Returns the process-wide type cache, initializing it under the GIL.
+    /// Returns the process-wide type cache, building it on first use.
+    ///
+    /// A failed build is not cached, so a later call retries the imports.
     fn get(py: Python<'_>) -> PyResult<&'static Self> {
         if let Some(types) = REQUEST_TYPES.get() {
             return Ok(types);
         }
+        // `build` is fallible and runs outside `get_or_init`, so concurrent
+        // first callers may each build a cache; the first one stored wins and
+        // the others are dropped.
         let built = Self::build(py)?;
         Ok(REQUEST_TYPES.get_or_init(|| built))
     }
 
-    /// Returns the Python enum member for a physical run kind.
+    /// Returns the Python `ForwardMode`, `MediaCall`, or `TransferMode` member
+    /// for a call kind.
     fn kind<'py>(&self, py: Python<'py>, kind: CallKind) -> Bound<'py, PyAny> {
         let member = match kind {
             CallKind::Forward(mode) => &self.forward_modes[mode as usize],
@@ -225,7 +272,12 @@ impl RequestTypes {
     }
 }
 
-/// Construct an explicit record from keyword arguments without reparsing a map.
+/// Constructs the record class registered as `name` with `fields` as keyword
+/// arguments.
+///
+/// The dictionary keys must match the class's field names. Panics if `name`
+/// was not registered in `RequestTypes::build`; every caller passes a name
+/// registered there.
 fn construct<'py>(
     py: Python<'py>,
     name: &str,
@@ -237,6 +289,11 @@ fn construct<'py>(
 }
 
 /// Per-batch construction context: repeated typed leaves are built once.
+///
+/// Equal request keys, call ids, and shape bounds converted through one
+/// context map to the same Python object. Sharing is safe because those
+/// records are frozen dataclasses. Tensor references and buffer ids are constructed anew on each
+/// use from the cached leaves.
 struct RequestConversion<'py> {
     py: Python<'py>,
     types: &'static RequestTypes,
@@ -257,7 +314,11 @@ impl<'py> RequestConversion<'py> {
         })
     }
 
-    /// Shares repeated producer and predecessor coordinates within the physical batch.
+    /// Returns the batch-canonical Python `CallId` for `id`.
+    ///
+    /// Call ids repeat across a batch, for example as call identities, as the
+    /// `call_id` of latent and decode params, and as the producers named by
+    /// tensor references and buffer ids.
     fn computation_id(&mut self, id: CallId) -> PyResult<Bound<'py, PyAny>> {
         if let Some(value) = self.computation_ids.get(&id) {
             return Ok(value.bind(self.py).clone());
@@ -334,9 +395,13 @@ impl<'py> RequestConversion<'py> {
     }
 
     /// Constructs a typed Python call from its computation fields.
+    ///
+    /// `Call` is constructed positionally: the argument tuple below follows
+    /// the field order of the `Call` dataclass in
+    /// `uniserve_worker.protocol.call`, and `Call` has no `__post_init__` to
+    /// reject a misordered argument. Reordering fields on either side requires
+    /// updating the other.
     fn call(&mut self, call: &Call) -> PyResult<Bound<'py, PyAny>> {
-        // Resolve identity, lineage, resource bounds, and product references
-        // before constructing the call.
         let request_key = self.request_key(call.request_key)?;
         let coordinates = self.types.call_coordinates.bind(self.py).call1((
             call.coordinates.logical_position,
@@ -373,6 +438,7 @@ impl<'py> RequestConversion<'py> {
             .rng
             .as_ref()
             .map(|rng| {
+                // Indices follow the `draw_layouts` order in `RequestTypes::build`.
                 let layout = match rng.draw_layout {
                     DrawLayout::TargetSampling => 0,
                     DrawLayout::SpeculativeProposal => 1,
@@ -519,8 +585,6 @@ impl<'py> RequestConversion<'py> {
 
     /// Constructs the typed Python variant for one batch control command.
     fn command(&mut self, command: &BatchCommand) -> PyResult<Bound<'py, PyAny>> {
-        // Start retains its schema-shaped admission mapping; steady-state
-        // controls use their cached typed constructors directly.
         match command {
             BatchCommand::Start { request } => {
                 let request = admission_to_py(self.py, request, self)?;
@@ -550,6 +614,11 @@ impl<'py> RequestConversion<'py> {
 }
 
 /// Constructs a fully typed Python batch from the validated wire record.
+///
+/// One `RequestConversion` spans the whole batch, so identity leaves are
+/// shared between calls, commands, input products, and the per-batch
+/// parameter records. `kv_inputs` are the exception: `kv_transfer_to_py`
+/// builds their buffer ids through `buffer_id_to_py`.
 fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>> {
     let mut native = RequestConversion::new(py)?;
 
@@ -578,7 +647,11 @@ fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>>
         tensor_publication_to_py(py, payload, &mut native)
     })?;
 
-    // Python only assembles records; wire constraints were checked by Rust.
+    // `batch_from_validated` sets these fields on a bare `Batch` without
+    // running `Batch.__post_init__`, because the frame was validated when it
+    // was decoded. Arguments are positional and follow its parameter order;
+    // the forward tuple is unpacked by index into `forward_call_indices`,
+    // `request_pool_indices`, `seq_lens`, `query_lens`, and `write_kv`.
     let arguments = pyo3::types::PyTuple::new(
         py,
         [
@@ -619,7 +692,8 @@ fn batch_to_py<'py>(py: Python<'py>, run: &Batch) -> PyResult<Bound<'py, PyAny>>
     native.types.batch_from_validated.bind(py).call1(arguments)
 }
 
-/// Converts a latent-page params into its Python record.
+/// Converts one trajectory's solver-step range and latent page table into a
+/// Python `LatentParams` record.
 fn latent_params_to_py<'py>(
     py: Python<'py>,
     params: &LatentParams,
@@ -646,7 +720,8 @@ fn latent_params_to_py<'py>(
     construct(py, "LatentParams", &dict)
 }
 
-/// Converts a diffusion decoder params into its Python record.
+/// Converts the cursor and unit bound of one diffusion decode call into a
+/// Python `DecodeRange` record.
 fn decode_range_to_py<'py>(
     py: Python<'py>,
     params: &DecodeRange,
@@ -777,7 +852,6 @@ fn diffusion_params_to_py<'py>(
 
 /// Converts sampling controls into the worker's typed parameters.
 fn sampling_to_py<'py>(py: Python<'py>, sampling: &SamplingParams) -> PyResult<Bound<'py, PyAny>> {
-    // Scalar controls are inserted directly under interned protocol keys.
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "temperature"), sampling.temperature)?;
     dict.set_item(intern!(py, "top_k"), sampling.top_k)?;
@@ -792,7 +866,8 @@ fn sampling_to_py<'py>(py: Python<'py>, sampling: &SamplingParams) -> PyResult<B
     dict.set_item(intern!(py, "frequency_penalty"), sampling.frequency_penalty)?;
     dict.set_item(intern!(py, "presence_penalty"), sampling.presence_penalty)?;
 
-    // Preserve the tuple shape expected for each token-bias pair.
+    // Python `SamplingParams.logit_bias` is a tuple of `(token_id, bias)`
+    // pairs rather than a mapping.
     dict.set_item(
         intern!(py, "logit_bias"),
         PyTuple::new(
@@ -816,7 +891,6 @@ fn sampling_to_py<'py>(py: Python<'py>, sampling: &SamplingParams) -> PyResult<B
         u32_tuple(py, &sampling.logprob_token_ids)?,
     )?;
 
-    // Materialize nested token collections only after the scalar fields.
     let bad_words = sampling
         .bad_words_ids
         .iter()
@@ -888,6 +962,12 @@ fn tensor_publication_to_py<'py>(
 }
 
 /// Converts tensor metadata and transport coordinates into a Python record.
+///
+/// The transport becomes a nested typed record (`LocalTransfer`,
+/// `PosixShmTransfer`, `CudaVmmTransfer`, or `ChannelTransfer`); the CUDA VMM
+/// event and allocation handles and channel payloads cross as `bytes`.
+/// `dtype` here is the torch dtype name string, not the `DType` enum used by
+/// tensor references.
 fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<Bound<'py, PyAny>> {
     // Tensor metadata is common to every transport family.
     let dict = PyDict::new(py);
@@ -965,6 +1045,10 @@ fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<B
 }
 
 /// Encodes the persistent buffer that identifies a KV publication.
+///
+/// Uses a fresh `RequestConversion`, so the owner request key and producer
+/// call id are equal to, but not the same objects as, the batch's cached
+/// leaves for the same identities.
 fn buffer_id_to_py<'py>(py: Python<'py>, buffer: &BufferId) -> PyResult<Bound<'py, PyAny>> {
     RequestConversion::new(py)?.buffer_id(*buffer)
 }
@@ -1040,7 +1124,12 @@ fn feature_kind_py<'py>(py: Python<'py>, kind: FeatureKind) -> &'py Bound<'py, P
 
 /// Decodes a Python result or error mapping with strict field typing.
 ///
-/// Returns `None` for response kinds handled by the schema-derived converter.
+/// Returns `None` for any other `kind`, which the caller decodes with the
+/// schema-derived converter. Fails with `ValueError` when the response is not
+/// a `dict`, has no `kind`, has a non-string `kind`, or is a result or error
+/// mapping that fails strict decoding; the last case carries no field detail.
+/// The semantic checks of `BatchOutput::validate` run afterwards, in
+/// `codec::encode_response` in the IPC crate, when the result is published.
 pub(crate) fn try_completion_response_from_py(
     response: &Bound<'_, PyAny>,
 ) -> PyResult<Option<WorkerResponse>> {
@@ -1073,13 +1162,14 @@ fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<Wor
     if kind.to_str().ok()? != "result" {
         return None;
     }
-    // Result reports reserve worker information for its response kind.
+    // Fields of the other response kinds must carry no data: `info` and the
+    // error fields below must be absent or `None`, and `calls` may also be an
+    // empty list.
     for key in [intern!(py, "info")] {
         if !absent_or_none(dict, key)? {
             return None;
         }
     }
-    // Decode the required result before checking that no error fields carry data.
     let report = run_result_from_py(&get(dict, intern!(py, "result"))?)?;
     let identities = error_calls_from_py(dict)?;
     if !identities.is_empty()
@@ -1123,12 +1213,14 @@ fn decode_error_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerRe
     })
 }
 
-/// Decodes an ordered run result from its Python mapping.
+/// Decodes a batch result, preserving completion and product order.
+///
+/// `completions` and `products` must be lists; `forward_stats` may be absent
+/// or `None`, but when present every counter is required.
 fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<BatchOutput> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
 
-    // Preserve completion and product order while converting owned records.
     let completions = get(dict, intern!(py, "completions"))?;
     let completions = completions.cast::<PyList>().ok()?;
     let mut records = Vec::with_capacity(completions.len());
@@ -1246,7 +1338,9 @@ fn forward_stats_from_py(value: &Bound<'_, PyAny>) -> Option<ForwardStats> {
     })
 }
 
-/// Reads ranked score arrays without an intermediate byte serialization.
+/// Decodes a sequence of `{token_id, logprob, rank}` mappings.
+///
+/// Unlike the list helpers, this accepts any iterable.
 fn token_logprobs_from_py(value: &Bound<'_, PyAny>) -> Option<Vec<TokenLogprob>> {
     value
         .try_iter()
@@ -1269,8 +1363,8 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
 
-    // Decode terminal status and optional error classification before result
-    // data so invalid enum spellings fail the whole record.
+    // Status and error code are closed string enums; an unknown spelling
+    // rejects the record.
     let status = str_field(dict, intern!(py, "status"))?;
     let status = match status.to_str().ok()? {
         "ok" => CallStatus::Ok,
@@ -1306,8 +1400,9 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
         host_us: u64_of(&get(timing, intern!(py, "host_us"))?)?,
     };
 
-    // Media metadata is optional, but a present handle must use the supported
-    // shared-storage transport and complete its nested value mapping.
+    // `media_output` may be absent or `None`. A present handle must use
+    // `posix_shm`, the only `ArtifactHandle` transport, in the
+    // `{"transport": ..., "value": {...}}` form.
     let media_output = if absent_or_none(dict, intern!(py, "media_output"))? {
         None
     } else {
@@ -1369,7 +1464,8 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<RequestOutput> 
     })
 }
 
-/// Decodes a tensor publication and its declared reference.
+/// Decodes a tensor publication: the product reference and its transfer
+/// handle, given as `{"kind": ..., "value": {...}}`.
 fn tensor_publication_from_py(value: &Bound<'_, PyAny>) -> Option<TensorPublication> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
@@ -1403,7 +1499,6 @@ fn tensor_publication_from_py(value: &Bound<'_, PyAny>) -> Option<TensorPublicat
         _ => return None,
     };
 
-    // Bind the materialized value to its independently decoded product identity.
     Some(TensorPublication {
         product: tensor_ref_from_py(&get(dict, intern!(py, "product"))?)?,
         value,
@@ -1411,6 +1506,12 @@ fn tensor_publication_from_py(value: &Bound<'_, PyAny>) -> Option<TensorPublicat
 }
 
 /// Decodes transport coordinates and their common logical tensor metadata.
+///
+/// Reads the flat form `Locator.to_mapping` emits: the `transport` value is a
+/// plain tag string and the transport's fields sit beside the common tensor
+/// metadata in the same mapping. In the serde form, `Locator.transport` is
+/// instead the adjacently tagged `{"transport": tag, "value": {...}}`
+/// mapping, so the schema-derived converter rejects the worker's locators.
 fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<Locator> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
@@ -1443,7 +1544,7 @@ fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<Locator> {
         },
         _ => return None,
     };
-    // Common tensor metadata remains independent of the selected transport.
+
     let source_value = get(dict, intern!(py, "source"))?;
     let source = source_value.cast::<PyDict>().ok()?;
     Some(Locator {
@@ -1491,7 +1592,9 @@ fn tensor_ref_from_py(value: &Bound<'_, PyAny>) -> Option<TensorRef> {
         "i16" => DType::I16,
         _ => return None,
     };
-    // Reconstruct each dimension from its tagged static-or-device bound.
+
+    // Each dimension is `{"kind": "static", "value": extent}` or
+    // `{"kind": "device", "value": {"max": bound}}`.
     let shape = get(dict, intern!(py, "shape_bound"))?;
     let shape = shape.cast::<PyDict>().ok()?;
     let dims = get(shape, intern!(py, "dims"))?;
@@ -1534,7 +1637,7 @@ fn feature_kind_from_py(value: &Bound<'_, PyAny>) -> Option<FeatureKind> {
     })
 }
 
-/// Decodes both coordinates of a computation's logical identity.
+/// Decodes a call id from its `batch_id` and `request_index` fields.
 fn computation_id_from_py(value: &Bound<'_, PyAny>) -> Option<CallId> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
@@ -1566,6 +1669,8 @@ fn error_call_from_py(value: &Bound<'_, PyAny>) -> Option<ErrorCallIdentity> {
 }
 
 /// Decodes an optional ordered list of call identities attached to an error.
+///
+/// An absent or `None` `calls` field decodes as an empty list.
 fn error_calls_from_py(dict: &Bound<'_, PyDict>) -> Option<Vec<ErrorCallIdentity>> {
     let py = dict.py();
     let Some(calls) = dict.get_item(intern!(py, "calls")).ok()? else {
@@ -1588,6 +1693,8 @@ fn get<'py>(dict: &Bound<'py, PyDict>, key: &Bound<'py, PyString>) -> Option<Bou
 }
 
 /// Returns whether a mapping key is absent or explicitly set to `None`.
+///
+/// Returns `None` only when the lookup itself raises.
 fn absent_or_none(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<bool> {
     match dict.get_item(key).ok()? {
         Some(value) => Some(value.is_none()),
@@ -1605,7 +1712,9 @@ fn str_field<'py>(
 
 /// Extracts an `i64` while rejecting Python booleans as integers.
 fn i64_of(value: &Bound<'_, PyAny>) -> Option<i64> {
-    // Integer fields reject Python booleans, which are a distinct protocol type.
+    // Python `bool` subclasses `int`, so `extract` alone would accept `True`
+    // and `False`. The protocol treats booleans as a distinct type; the other
+    // integer helpers apply the same check.
     if value.cast::<PyBool>().is_ok() {
         return None;
     }
@@ -1614,7 +1723,6 @@ fn i64_of(value: &Bound<'_, PyAny>) -> Option<i64> {
 
 /// Extracts a `u64` while rejecting Python booleans as integers.
 fn u64_of(value: &Bound<'_, PyAny>) -> Option<u64> {
-    // Integer fields reject Python booleans, which are a distinct protocol type.
     if value.cast::<PyBool>().is_ok() {
         return None;
     }
@@ -1723,6 +1831,8 @@ fn opt_string(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Opt
     }
 }
 
+/// Converts a logical tensor shape and its shard or replica locators into a
+/// Python `TensorTransfer` record.
 fn tensor_transfer_to_py<'py>(
     py: Python<'py>,
     tensor: &TensorTransfer,
@@ -1738,6 +1848,8 @@ fn tensor_transfer_to_py<'py>(
     construct(py, "TensorTransfer", &dict)
 }
 
+/// Decodes a tensor transfer and rejects it unless `TensorTransfer::validate`
+/// accepts the assembled descriptor.
 fn tensor_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<TensorTransfer> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
@@ -1756,6 +1868,8 @@ fn tensor_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<TensorTransfer> {
     Some(tensor)
 }
 
+/// Converts a KV publication imported by a batch into a Python `KvTransfer`
+/// record.
 fn kv_transfer_to_py<'py>(py: Python<'py>, transfer: &KvTransfer) -> PyResult<Bound<'py, PyAny>> {
     let KvTransfer {
         tensors,
@@ -1769,8 +1883,8 @@ fn kv_transfer_to_py<'py>(py: Python<'py>, transfer: &KvTransfer) -> PyResult<Bo
         page_size,
     } = transfer;
     let value = PyDict::new(py);
-    // KV publications may contain multiple physical tensors but share
-    // one published buffer and destination contract.
+    // Tensor order is keys, values, then scales for quantized storage (see
+    // `KvTransfer::tensors`); all of them belong to the one `source` buffer.
     let tensors = tensors
         .iter()
         .map(|tensor| tensor_transfer_to_py(py, tensor))
@@ -1792,11 +1906,15 @@ fn kv_transfer_to_py<'py>(py: Python<'py>, transfer: &KvTransfer) -> PyResult<Bo
     construct(py, "KvTransfer", &value)
 }
 
+/// Decodes the KV publication a completion reports in `kv_output`.
+///
+/// Each tensor is checked by `tensor_transfer_from_py`. `KvTransfer::validate`
+/// runs later, through `RequestOutput::validate`, when the result is
+/// published.
 fn kv_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<KvTransfer> {
     let py = value.py();
     let payload = value.cast::<PyDict>().ok()?;
-    // Preserve tensor order because it identifies the worker's
-    // physical KV tensor layout.
+    // Preserve tensor order: keys, values, then scales for quantized storage.
     let raw_tensors = get(payload, intern!(py, "tensors"))?;
     let raw_tensors = raw_tensors.cast::<PyList>().ok()?;
     let mut tensors = Vec::with_capacity(raw_tensors.len());
@@ -1833,6 +1951,9 @@ mod tests {
 
     use super::*;
 
+    /// An unquantized two-token KV publication of `source`: `bfloat16` keys
+    /// and values tensors of shape `[2, 1, 1, 4]`, each on a single
+    /// `posix_shm` locator.
     fn kv_publication(source: BufferId) -> KvTransfer {
         let tensors = ["keys", "values"]
             .into_iter()
@@ -1869,7 +1990,8 @@ mod tests {
     ///
     /// A batch carries one computation through one component, so the native
     /// conversion is exercised with a token call, a media call and a KV
-    /// transfer in three batches rather than one mixed submission.
+    /// transfer in three batches (batch ids 11, 12, and 13 under message ids
+    /// 9, 10, and 11) rather than one mixed submission.
     fn execute_requests() -> Vec<WorkerRequest> {
         let request_key = RequestKey::new(1, RequestId(2), 1);
         let admission = NewRequest::new(
@@ -1900,7 +2022,6 @@ mod tests {
             consumer_slots: Vec::new(),
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
-
             token_output: Some(token),
             vision_input: None,
             latent_feature_input: None,
@@ -1973,7 +2094,6 @@ mod tests {
             consumer_slots: Vec::new(),
             coordinates: uniserve_worker_ipc::CallCoordinates::default(),
             token_input: None,
-
             token_output: None,
             vision_input: None,
             latent_feature_input: None,
@@ -2078,6 +2198,12 @@ mod tests {
             .collect()
     }
 
+    /// The expected reply to the KV batch (message id 11).
+    ///
+    /// It holds a decode completion with sampled, top, and prompt logprobs,
+    /// and a KV-publish completion whose publication is owned by that
+    /// completion's own request and call, as `RequestOutput::validate`
+    /// requires.
     fn result_response() -> WorkerResponse {
         let request_key = RequestKey::new(1, RequestId(2), 1);
         let mut response = WorkerResponse::result(BatchOutput {
@@ -2096,9 +2222,7 @@ mod tests {
                 }]],
                 request_key,
                 call_id: CallId::new(13, 0),
-
                 status: CallStatus::Ok,
-
                 product_generations: vec![5],
                 error_code: None,
                 timing_counters: TimingCounters::default(),
@@ -2107,26 +2231,24 @@ mod tests {
                 kv_visible_len: 2,
                 num_completed_steps: 0,
                 kv_computed_len: 2,
-
                 committed_tokens: vec![42],
                 finish_flags: FinishFlags::default(),
                 media_output: None,
                 kv_output: None,
             }],
             products: Vec::new(),
-
             worker_exec_us: Some(12),
             forward_stats: None,
         });
         let WorkerResponse::Result { result, .. } = &mut response else {
             unreachable!();
         };
+
         let mut publication = result.completions[0].clone();
         publication.request_key = RequestKey::new(1, RequestId(4), 1);
         publication.call_id = CallId::new(13, 1);
         publication.code = CallKind::Transfer(TransferMode::KvPublish);
         publication.committed_tokens.clear();
-
         publication.sampled_logprob = None;
         publication.top_logprobs.clear();
         publication.prompt_logprobs.clear();
@@ -2143,12 +2265,14 @@ mod tests {
     }
 
     /// A minimal result for a batch whose values this test does not inspect.
+    ///
+    /// Its message id maps batch ids 11 and 12 to the message ids 9 and 10
+    /// that `execute_requests` assigned.
     fn acknowledgement(py: Python<'_>, batch_id: u64) -> Bound<'_, PyAny> {
         let mut response = WorkerResponse::result(BatchOutput {
             batch_id,
             completions: Vec::new(),
             products: Vec::new(),
-
             worker_exec_us: None,
             forward_stats: None,
         });
@@ -2156,9 +2280,17 @@ mod tests {
         pythonize(py, &response).unwrap()
     }
 
+    /// Drives the three submit requests through a real `PyServer` and back.
+    ///
+    /// Each natively constructed batch must equal what the Python codec
+    /// decodes from its own mapping, and the reply to the KV batch must decode
+    /// in Rust to `result_response()`.
     #[test]
     fn native_execute_and_result_round_trip_preserves_values() {
         Python::initialize();
+
+        // The process id and a timestamp keep concurrent test runs on
+        // separate IPC services.
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -2172,6 +2304,7 @@ mod tests {
         )
         .unwrap();
         let client = ClientEndpoint::connect(&service, 1 << 20, 4).unwrap();
+
         let requests = execute_requests();
         let pending = requests
             .iter()
@@ -2180,6 +2313,7 @@ mod tests {
         let expected = result_response();
 
         Python::attach(|py| {
+            // Import `uniserve_worker` from this repository's source tree.
             let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
                 .canonicalize()
@@ -2195,6 +2329,7 @@ mod tests {
                 .unwrap()
                 .getattr("Batch")
                 .unwrap();
+
             for (index, request) in requests.iter().enumerate() {
                 let native_request = server.recv(py).unwrap();
                 let request_dict = native_request.bind(py).cast::<PyDict>().unwrap();
@@ -2300,8 +2435,9 @@ mod tests {
                             .respond(py, &acknowledgement(py, batch.batch_id))
                             .unwrap();
                     }
-                    // The KV transfer names its imported publication, which
-                    // the response relays back as the installed location.
+                    // The KV install call reads the batch's imported
+                    // publication; the reply relays its tensors back in a
+                    // KV-publish completion.
                     _ => {
                         let imported_kv = native_batch
                             .getattr("kv_inputs")
@@ -2326,11 +2462,15 @@ mod tests {
                                 .unwrap()
                         );
 
+                        // `pythonize` renders the expected publication in the
+                        // serde form, whose nested locator transports the
+                        // native decoder rejects. Substitute the imported
+                        // publication's `to_mapping` form, re-owned by the
+                        // publishing completion. Its tensors equal the
+                        // expected ones, so the final Rust equality checks
+                        // every locator and extent after both native
+                        // directions.
                         let response = pythonize(py, &expected).unwrap();
-                        // Relay the imported physical metadata through the
-                        // public result mapping. The final Rust equality checks
-                        // every location and extent after both native
-                        // directions, not just Python serialization itself.
                         let publication = response
                             .get_item("result")
                             .unwrap()

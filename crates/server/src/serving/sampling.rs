@@ -1,10 +1,31 @@
 //! Shared normalization for token sampling; model callers supply numerical defaults.
+//!
+//! Two callers seed `SamplingParams` with model defaults and then apply the
+//! request controls here: `InputProcessor::resolve_sampling` for Qwen3 (from
+//! `ModelConfig::sampling_defaults`) and `omni::prepare_generation_resources`
+//! for SenseNova and Bagel (from fixed omni defaults).
 
 use super::{SamplingConfig, StopConfig, TokenizeError};
 use crate::profile::tokenizer::HuggingFaceTokenizer;
 use uniserve_core::SamplingParams;
 
 /// Applies public controls once, preserving model biases and an explicit image seed.
+///
+/// Temperature, top-k, top-p, min-p, and repetition penalty override the
+/// caller's defaults only when the request sets them. Frequency and presence
+/// penalties, `min_tokens`, `ignore_eos`, and every logprob, allowed-token, and
+/// bad-word field are replaced from the request. A seed already present in
+/// `sampling` wins over `controls.seed`. Biases already in `logit_bias` are
+/// summed per token with the request's biases.
+///
+/// Must be called once per request: a second call would add the request
+/// biases again.
+///
+/// # Errors
+///
+/// Fails when a logprob count is below `-1`, a bad word cannot be tokenized,
+/// or the result fails `SamplingParams::validate`. `sampling` may be partially
+/// updated on error.
 pub(super) fn apply_sampling(
     tokenizer: &HuggingFaceTokenizer,
     controls: &SamplingConfig,
@@ -24,6 +45,7 @@ pub(super) fn apply_sampling(
     sampling.min_tokens = controls.min_tokens.unwrap_or(0) as usize;
     sampling.frequency_penalty = controls.frequency_penalty.unwrap_or(0.0);
     sampling.presence_penalty = controls.presence_penalty.unwrap_or(0.0);
+    // The ordered map yields `logit_bias` sorted by token ID.
     let mut biases = sampling
         .logit_bias
         .drain(..)
@@ -45,6 +67,10 @@ pub(super) fn apply_sampling(
     Ok(())
 }
 
+/// Converts a wire logprob count into the engine count.
+///
+/// `-1` requests all candidates and maps to `u32::MAX`; an absent count is
+/// zero. Values below `-1` are rejected.
 fn logprob_count(field: &'static str, value: Option<i32>) -> Result<u32, TokenizeError> {
     match value {
         Some(-1) => Ok(u32::MAX),
@@ -54,8 +80,13 @@ fn logprob_count(field: &'static str, value: Option<i32>) -> Result<u32, Tokeniz
     }
 }
 
-/// Converts bad-word strings into token-ID sequences, encoding each word both
-/// with and without a leading space (prefix-space convention) and deduping.
+/// Converts bad-word strings into sorted, deduplicated token-ID sequences.
+///
+/// Each word is encoded as written. It is also encoded with a single leading
+/// space (after trimming existing leading whitespace), and that non-empty
+/// variant is kept only when the as-written encoding is empty, or when both
+/// encodings have the same length and different first tokens. Empty
+/// encodings are dropped. Returns `None` when no sequence remains.
 fn tokenize_bad_words(
     bad_words: &[String],
     tokenizer: &crate::profile::tokenizer::HuggingFaceTokenizer,

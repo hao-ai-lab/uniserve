@@ -2,6 +2,11 @@
 //!
 //! The parser exposes the serving command and lowers its model, scheduler,
 //! worker, and HTTP options into the typed server configuration.
+//!
+//! The `///` docs on the fields and variants of the clap-derived types
+//! (`Cli`, `Command`, `SchedulerPolicyArg`, `ServeArgs`, `SharedRuntimeArgs`,
+//! and `WorkerProcessOptions`) are rendered as `--help` text, so developer
+//! notes on those items belong in `//` comments.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -69,7 +74,6 @@ pub(crate) enum SchedulerPolicyArg {
 }
 
 impl From<SchedulerPolicyArg> for SchedulingPolicy {
-    /// Converts the source value into this type.
     fn from(value: SchedulerPolicyArg) -> Self {
         match value {
             SchedulerPolicyArg::Fcfs => SchedulingPolicy::Fcfs,
@@ -246,12 +250,18 @@ pub(crate) struct SharedRuntimeArgs {
 }
 
 impl SharedRuntimeArgs {
-    /// Returns the normalized model identifier used by server configuration.
+    /// Returns the positional `MODEL` argument unchanged; the server resolves
+    /// model assets from it. When `--served-model-name` is absent,
+    /// `async_main` defaults the served name to the same argument.
     pub(crate) fn resolved_model(&self) -> String {
         self.model.clone()
     }
 
-    /// Returns the configured API key, if present.
+    /// Returns the bearer token the server requires, if any.
+    ///
+    /// `--api-key` takes precedence over the `UNISERVE_API_KEY` environment
+    /// variable. Each source is trimmed, and a blank value counts as unset, so
+    /// a blank `--api-key` falls through to the environment variable.
     fn configured_api_key(&self) -> Option<String> {
         non_empty_secret(self.api_key.as_deref()).or_else(|| {
             std::env::var(API_KEY_ENV)
@@ -262,9 +272,11 @@ impl SharedRuntimeArgs {
 
     /// Returns the hosts the shorthand places ranks on, head's host first.
     ///
-    /// Section 7's eight-device configuration spans two hosts, and its muxer
-    /// sits on rank zero of the head's host, so the head's own identity leads
-    /// the list whether or not `--worker-hosts` repeats it.
+    /// `WorkerConfig::placed` assigns ranks to these hosts in contiguous blocks
+    /// in list order, so leading with this instance's own identity keeps rank
+    /// zero and the other lowest ranks on the head's host. Entries of
+    /// `--worker-hosts` that are empty or repeat this instance's identity are
+    /// dropped; other repeated names are kept as given.
     fn rank_hosts(&self) -> Vec<String> {
         let mut hosts = vec![self.host_identity.clone()];
         hosts.extend(
@@ -284,6 +296,10 @@ impl SharedRuntimeArgs {
     /// batch sizes to what the workers report. The IPC slot capacity a model's
     /// products require is applied when the model is resolved.
     pub(crate) fn engine_settings(&self) -> EngineSettings {
+        // `build_state` in `uniserve_server` completes these launch arguments:
+        // it sizes the IPC slots and the context length from the resolved
+        // model and derives the worker's per-run batch bounds from the
+        // settings built here.
         let mut worker_process = self.worker_process.to_args();
         worker_process.host = self.host_identity.clone();
         worker_process.python = self.worker_python.clone();
@@ -294,6 +310,7 @@ impl SharedRuntimeArgs {
         worker_process.kv_token_capacity = self.kv_token_capacity;
         worker_process.block_size = self.block_size;
         worker_process.attention_backend = self.attention_backend.clone();
+
         EngineSettings {
             max_batch: self.max_batch.unwrap_or(DEFAULT_MAX_BATCH),
             max_num_batched_tokens: self
@@ -329,6 +346,9 @@ impl SharedRuntimeArgs {
     }
 
     /// Builds the OpenAI-server config for the in-process UniServe engine.
+    ///
+    /// Reads `UNISERVE_API_KEY` from the environment when `--api-key` is
+    /// absent or blank (see `configured_api_key`).
     fn into_config(self, listener_mode: HttpListenerMode) -> Config {
         let engine = self.engine_settings();
         let model = self.resolved_model();
@@ -463,12 +483,16 @@ impl WorkerProcessOptions {
     }
 }
 
-/// Parses the JSON.
+/// Parses a JSON command-line value into `T` for clap.
+///
+/// The error text says "invalid JSON object" whatever `T` is; both callers
+/// parse values that must be objects.
 fn parse_json<T: DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_str(value).map_err(|e| format!("invalid JSON object: {}", e.as_report()))
 }
 
-/// Parses the JSON object.
+/// Parses a JSON value for clap and rejects anything but an object, such as
+/// an array or a scalar.
 fn parse_json_object(value: &str) -> Result<Value, String> {
     let parsed = parse_json::<Value>(value)?;
     if parsed.is_object() {
@@ -478,7 +502,8 @@ fn parse_json_object(value: &str) -> Result<Value, String> {
     }
 }
 
-/// Returns a secret only when it contains a nonempty value.
+/// Returns the secret with surrounding whitespace trimmed, or `None` when it
+/// is absent or blank.
 fn non_empty_secret(value: Option<&str>) -> Option<String> {
     let trimmed = value?.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -506,13 +531,16 @@ fn default_worker_python() -> std::path::PathBuf {
     "python3".into()
 }
 
-/// Parses the canonical worker list without a second configuration wrapper.
 /// Reads the deployment configuration a serve invocation was given.
 ///
-/// The configuration is a file rather than an inline argument because it
-/// states a whole deployment -- every rank's node and device, and every
-/// component placed on them -- and is written once and reused, not composed on
-/// a command line.
+/// The file holds a bare JSON array of `WorkerConfig` entries with no
+/// enclosing object. The configuration is a file rather than an inline
+/// argument because it states a whole deployment -- every rank's node and
+/// device, and every component placed on them -- and is written once and
+/// reused, not composed on a command line.
+///
+/// Runs as a clap value parser, so an unreadable file, malformed JSON, or a
+/// configuration `WorkerConfig::validate_all` rejects fails argument parsing.
 fn read_workers(path: &str) -> Result<Box<[WorkerConfig]>, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("reading deployment configuration {path}: {error}"))?;
@@ -556,6 +584,8 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The runtime options below parse together, and `--workers` reads and
+    /// validates the deployment file at parse time.
     #[test]
     fn serve_accepts_runtime_configuration() {
         let configuration = written_configuration(
@@ -611,10 +641,12 @@ mod tests {
             configuration.to_str().expect("configuration path"),
         ])
         .expect("configured serve invocation");
+
         let Command::Serve(args) = parsed.command;
         let workers = args.runtime.workers.expect("the configuration was read");
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].id.0, "text");
+        // The file's `memory_fraction` key deserializes into `storage_fraction`.
         assert_eq!(workers[0].storage_fraction, Some(0.25));
         assert_eq!(workers[0].components["model"].ranks, vec![0, 1]);
         assert_eq!(
@@ -626,6 +658,10 @@ mod tests {
     }
 
     /// Writes a deployment configuration and returns the path naming it.
+    ///
+    /// The file name carries the process ID and the calling thread's ID, so
+    /// concurrent callers in other test threads or processes write distinct
+    /// files.
     fn written_configuration(body: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "uniserve-deployment-{}-{:?}.json",

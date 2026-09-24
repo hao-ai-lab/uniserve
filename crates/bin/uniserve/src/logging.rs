@@ -1,4 +1,17 @@
 //! Process-wide tracing configuration and compact terminal log formatting.
+//!
+//! `main` calls `init_tracing` once, before the Tokio runtime is built. Each
+//! event is written as one line of the form
+//! `(RustFrontend pid=<pid>) <LEVEL> <MM-DD HH:MM:SS> [<file>:<line>] <fields>`,
+//! with the active spans, if any, written as `outer{..}:inner{..}: ` before
+//! the fields.
+//!
+//! `WARN` is printed as `WARNING`, the Python `logging` name, and
+//! `--log-level` and `--log-level-http` take Python level names.
+//!
+//! Logs go to stdout. ANSI colors follow the `fmt` layer's default: they are
+//! on unless `NO_COLOR` is set to a non-empty value, with no terminal
+//! detection, so redirected output also carries escape sequences.
 
 use std::{env, fmt, process};
 
@@ -26,9 +39,16 @@ const LOCAL_TIME_FORMAT: &[time::format_description::FormatItem<'static>] =
     format_description!("[month]-[day] [hour]:[minute]:[second]");
 
 const PROCESS_LABEL: &str = "RustFrontend";
+/// Tracing targets whose level `--log-level-http` sets, overriding, for those
+/// targets, the default level and any `RUST_LOG` directive naming exactly that
+/// target.
 const HTTP_LOG_TARGETS: &[&str] = &["axum", "hyper", "tower_http", "uniserve_server"];
 
 /// Installs the process-wide tracing subscriber for the CLI binary.
+///
+/// Reads `RUST_LOG` from the environment (see `build_targets_filter` for
+/// precedence). Installation failure, for example because a global subscriber
+/// is already set, is reported on stderr and is not fatal.
 pub(crate) fn init_tracing(log_level: Option<&str>, log_level_http: Option<&str>) {
     let filter = build_targets_filter(
         log_level,
@@ -60,7 +80,11 @@ pub(crate) fn init_tracing(log_level: Option<&str>, log_level_http: Option<&str>
 /// - A global `RUST_LOG` level such as `warn` overrides the CLI default.
 /// - Explicit `RUST_LOG` targets such as `hyper=info` override the active default
 ///   for those targets only.
-/// - `--log-level-http` applies to the HTTP server targets.
+/// - `--log-level-http` is applied last, to the `HTTP_LOG_TARGETS`.
+///
+/// An empty or unparsable `RUST_LOG` is ignored, and an unknown Python level
+/// name maps to INFO (see `map_python_log_level`), so a bad value never fails
+/// startup.
 fn build_targets_filter(
     log_level: Option<&str>,
     log_level_http: Option<&str>,
@@ -92,7 +116,9 @@ struct UniserveLocalTimer {
 }
 
 impl Default for UniserveLocalTimer {
-    /// Returns the default value.
+    /// Captures the local UTC offset once, falling back to UTC when it cannot
+    /// be determined. The timer keeps this offset, so a later offset change
+    /// such as a DST transition is not reflected in timestamps.
     fn default() -> Self {
         let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
         Self { local_offset }
@@ -100,7 +126,8 @@ impl Default for UniserveLocalTimer {
 }
 
 impl FormatTime for UniserveLocalTimer {
-    /// Formats a timestamp for structured log output.
+    /// Writes the current time in the captured local offset as
+    /// `MM-DD HH:MM:SS`.
     fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
         let now = time::OffsetDateTime::now_utc().to_offset(self.local_offset);
         let formatted = now.format(LOCAL_TIME_FORMAT).map_err(|_| fmt::Error)?;
@@ -115,7 +142,8 @@ struct UniserveEventFormatter {
 }
 
 impl UniserveEventFormatter {
-    /// Creates a log formatter with the selected output options.
+    /// Creates the formatter, fixing the process prefix and the timer's local
+    /// offset at construction.
     fn new() -> Self {
         Self {
             prefix: format!("({} pid={})", PROCESS_LABEL, process::id()),
@@ -129,7 +157,8 @@ impl UniserveEventFormatter {
         writer.write_char(' ')
     }
 
-    /// Writes the log level using the configured color policy.
+    /// Writes the level name, spelling WARN as Python's `WARNING`, colored
+    /// when `ansi` is set.
     fn write_level(&self, writer: &mut Writer<'_>, level: &Level, ansi: bool) -> fmt::Result {
         let (text, color) = match *level {
             Level::TRACE => ("TRACE", WHITE),
@@ -141,7 +170,8 @@ impl UniserveEventFormatter {
         write_colored(writer, ansi, Some(color), text)
     }
 
-    /// Writes the event timestamp when timestamps are enabled.
+    /// Writes the event timestamp, or `<unknown time>` when it cannot be
+    /// formatted.
     fn write_timestamp(&self, writer: &mut Writer<'_>, ansi: bool) -> fmt::Result {
         if ansi {
             writer.write_str(GREY)?;
@@ -155,7 +185,8 @@ impl UniserveEventFormatter {
         Ok(())
     }
 
-    /// Writes a compact source location when event metadata provides one.
+    /// Writes the source location when event metadata provides one: the path
+    /// shortened by `shorten_file_path` unless `full_path` is set.
     fn write_location(
         &self,
         writer: &mut Writer<'_>,
@@ -185,7 +216,9 @@ impl UniserveEventFormatter {
         Ok(())
     }
 
-    /// Writes the active span hierarchy and each span's formatted fields.
+    /// Writes the active span hierarchy, root first, as
+    /// `outer{fields}:inner{fields}: `, writing a span without formatted
+    /// fields by name alone; writes nothing outside any span.
     fn write_scope<S, N>(&self, ctx: &FmtContext<'_, S, N>, writer: &mut Writer<'_>) -> fmt::Result
     where
         S: Subscriber + for<'lookup> LookupSpan<'lookup>,
@@ -239,9 +272,11 @@ where
         writer.write_char(' ')?;
         self.write_timestamp(&mut writer, ansi)?;
         writer.write_char(' ')?;
-        // Use the full file path only when DEBUG (or more verbose) is enabled anywhere,
-        // independent of the level of this particular event. Filenames alone are often
-        // ambiguous, but full paths are too noisy for normal INFO-level call.
+
+        // Use the full file path only when DEBUG (or more verbose) is enabled
+        // for any target, independent of this event's level. Filenames alone
+        // are often ambiguous, but full paths are too noisy for INFO-level
+        // output.
         let full_path = LevelFilter::current() >= LevelFilter::DEBUG;
         self.write_location(&mut writer, meta.file(), meta.line(), full_path, ansi)?;
         writer.write_char(' ')?;
@@ -303,7 +338,12 @@ fn write_colored(
     writer.write_str(text)
 }
 
-/// Maps a Python logging level name to the corresponding Rust tracing level.
+/// Maps a Python logging level name, case-insensitively, to a tracing level
+/// filter.
+///
+/// `CRITICAL` and `FATAL` map to ERROR, the most severe tracing level,
+/// `NOTSET` enables everything (TRACE), `WARN` is accepted alongside
+/// `WARNING`, and any other name falls back to INFO.
 fn map_python_log_level(level: &str) -> LevelFilter {
     match level.to_ascii_uppercase().as_str() {
         "CRITICAL" | "FATAL" => LevelFilter::ERROR,

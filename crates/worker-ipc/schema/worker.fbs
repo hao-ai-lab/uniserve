@@ -1,10 +1,43 @@
+// Wire schema of the engine-to-rank worker protocol.
+//
+// Each rank channel frame carries one WorkerRequest (engine to rank) or
+// WorkerResponse (rank to engine) behind the transport's fixed header. The
+// `codec` module of `uniserve-worker-ipc` decodes these tables in its
+// `*_from_table` and `*_from_fb` functions and `codec::encode` builds them;
+// the owned Rust types they map to (`Batch`, `Call`, `WorkerInfo`, ...) carry
+// the full field semantics. The Python worker never reads these tables: the
+// `worker-ipc-py` extension converts the decoded Rust values.
+//
+// Receivers decode a frame only after its header matches this build's
+// `IPC_VERSION` (`Header::validate`), so a wire-format change here bumps that
+// constant and the engine and the Python extension are rebuilt together.
+//
+// Wire conventions the codec relies on:
+// - A scalar declared `= null` is optional and decodes as `Option`; every
+//   other scalar reads its schema default when absent.
+// - Most absent vectors decode as empty. `allowed_token_ids` in
+//   SamplingParams and SamplingState decodes absence as no whitelist, and
+//   `WorkerInfo.transfer_backends` and `ComponentInfo.outputs` are rejected
+//   when absent.
+// - Few fields carry `(required)`, which the FlatBuffers verifier enforces.
+//   The decoders reject the absence of many other fields and tables (for
+//   example `Call.coordinates` and `Locator.source`), so a field without
+//   `(required)` is not necessarily optional.
+// - Enums travel as ordinals, and each decoder rejects values it does not
+//   map.
+//
+// `///` comments flow into the generated Rust bindings; `//` comments do not.
+
 namespace uniserve.ipc;
 
+// ForwardMode, MediaCall, and TransferMode mirror the Rust enums of the same
+// names. Their leading `None` exists only to mark an unset CallKind tag.
 enum ForwardMode : ubyte { None, Prefill, Decode, Verify }
 enum MediaCall : ubyte { None, VisionEncoding, LatentEncoding, TextEncoding, LatentPreparation, Denoising, ImageDecoding, VideoDecoding, AudioDecoding, VideoEncoding, AudioEncoding, Muxing }
 enum TransferMode : ubyte { None, Tensor, KvPublish, KvInstall }
 
-// Exactly one field is non-None. This is a compact wire encoding of the Rust sum.
+/// Inline encoding of the Rust `CallKind` sum: exactly one of the three tags
+/// is not `None`. `computation_from_fb` rejects zero or several set tags.
 struct CallKind {
   forward_mode:ForwardMode;
   media:MediaCall;
@@ -14,6 +47,7 @@ struct CallKind {
 enum DType : ubyte { U8, I32, I64, F16, BF16, F32, I16 }
 enum FeatureKind : ubyte { Vision, Latent }
 
+/// `Predicated` reports a call skipped because its predicate was false.
 enum CallStatus : ubyte { Ok, Predicated, Error }
 
 enum ErrorCode : ubyte {
@@ -32,10 +66,14 @@ enum RespKind : ubyte { Info, Result, Ok, Error }
 enum KvGroupKind : ubyte { Full, SlidingWindow }
 enum TransferTransportKind : ubyte { Local, PosixShm, CudaVmm, Channel }
 
+// Collections FlatBuffers has no direct type for: nested vectors (U32List)
+// and maps, sent as vectors of pairs (TokenBias, StringU64Pair).
 table U32List { items:[uint]; }
 table TokenBias { token_id:uint; bias:float; }
 table StringU64Pair { key:string; value:ulong; }
 
+/// Admission-time sampling policy, decoded into `uniserve_core::SamplingParams`.
+/// Range checks run in `SamplingParams::validate` after decoding.
 table SamplingParams {
   temperature:float;
   top_k:uint;
@@ -50,6 +88,8 @@ table SamplingParams {
   min_tokens:ulong;
   n_logprobs:uint;
   bad_words_ids:[U32List];
+  /// Absent means no whitelist; `SamplingParams::validate` rejects a present
+  /// empty list.
   allowed_token_ids:[uint];
   return_logprobs:bool;
   return_prompt_logprobs:bool;
@@ -59,6 +99,10 @@ table SamplingParams {
   forced_token_ids:[uint];
 }
 
+/// Admission-time image-generation controls, decoded into
+/// `uniserve_core::ImageParams`. `cfg_interval_lo` and `cfg_interval_hi`
+/// decode into its `cfg_interval` pair, and `cfg_renorm_type` is parsed from
+/// its name.
 table ImageParams {
   steps:ushort;
   cfg_text_scale:float;
@@ -80,10 +124,15 @@ table ImageParams {
 table KvGroup {
   num_blocks:uint;
   kind:KvGroupKind;
+  /// Read only when `kind` is `SlidingWindow`.
   window:uint;
+  /// Read only when `kind` is `SlidingWindow`.
   sink:uint;
 }
 
+/// Paged KV geometry of one rank. `num_layers` and `num_kv_heads` are this
+/// rank's share; `total_layers`, `total_kv_heads`, and the two offsets place
+/// that share in the model's logical cache.
 table KVCacheInfo {
   block_size:uint;
   num_blocks:uint;
@@ -107,6 +156,9 @@ table WorkerEndpoint {
   incarnation:string;
 }
 
+// Sequence-parallel strategy of a component. The decoder requires the payload
+// table of every variant except LocalSequence, and GatherSequence decodes to
+// `SequenceParallel::Allgather`.
 table LocalSequence {}
 table UlyssesSequence { ulysses_degree:uint = 1; }
 table GatherSequence { allgather_degree:uint = 1; }
@@ -117,12 +169,20 @@ table ParallelConfig {
   pipeline_parallel_size:uint = 1;
   sequence_parallel:SequenceParallel;
 }
+/// `Local` decodes to no distribution: the component runs as one
+/// model-parallel group.
 enum ComponentDistribution:ubyte { Local, TemporalUnits }
 
+/// One declared tensor result of a component; its position in
+/// `ComponentInfo.outputs` is the product output index.
 table OutputInfo {
   name:string;
   dtype:DType;
+  /// One extent per axis: the static extent, or the maximum for the axis
+  /// named by `dynamic_axis`.
   extents:[uint];
+  /// Index of the one axis whose extent is known only on the device, or -1
+  /// when every axis is static.
   dynamic_axis:int = -1;
 }
 
@@ -135,16 +195,21 @@ table ComponentInfo {
   outputs:[OutputInfo];
 }
 
+/// Binds a media call to the component that runs it; the decoder rejects a
+/// call bound twice.
 table MediaComponent { call:MediaCall; component:string; }
 
+/// A loaded rank's identity and capabilities, answered to an Info request.
+/// `WorkerInfo::validate` checks internal consistency; the engine checks it
+/// against the launch.
 table WorkerInfo {
   model_name:string;
   endpoint:WorkerEndpoint;
   device:string;
   transfer_backends:[string];
-  // Whether this rank's device exports a fabric handle. A descriptor handle
-  // reaches only this host, so an edge that must cross one is refused at
-  // startup rather than failing on its first publication.
+  /// Whether this rank's device exports a fabric handle. A descriptor handle
+  /// reaches only this host, so an edge that must cross hosts is refused at
+  /// startup rather than failing on its first publication.
   fabric_handles:bool = false;
   world_size:uint = 1;
   model_dtype:string;
@@ -167,31 +232,43 @@ table WorkerInfo {
   media_components:[MediaComponent];
   num_inference_steps:uint;
   host_lane_capacity:uint = 1;
-  // Identity of the loaded checkpoint files. Empty only for the weightless
-  // stub model; every rank serving a checkpoint reports the same value.
+  /// Identity of the loaded checkpoint files. Empty only for the weightless
+  /// stub model; the engine refuses ranks or pools that report different
+  /// values.
   checkpoint_identity:string;
 }
 
 // Request identities and call records.
 
+/// Admission identity of one request. The scheduler stamps each admission
+/// with a fresh `request_epoch`, so a reused `request_id` yields a distinct
+/// key.
 table RequestKey {
   engine_id:ulong;
   request_id:ulong;
   request_epoch:ulong;
 }
 
+/// Logical call identity: the scheduler batch the call was selected into and
+/// its ordinal there, preserved when the batch is split across ranks. Stored
+/// inline, but every decoder requires it to be present.
 struct CallId {
   batch_id:ulong;
   request_index:uint;
 }
 
+/// Identity of one cross-call buffer, by which the engine routes and frees it.
 table BufferId {
   owner:RequestKey;
   producer_call_id:CallId;
+  /// Position in the producer's output list.
   output_index:ushort;
+  /// Nonzero allocation generation that prevents identity reuse.
   generation:uint;
 }
 
+/// A buffer identity with its element type and shape bound. `extents` and
+/// `dynamic_axis` follow the OutputInfo encoding.
 table TensorRef {
   id:BufferId (required);
   dtype:DType;
@@ -205,7 +282,10 @@ table Rng {
   draw_layout:DrawLayout;
 }
 
+/// Per-call token-processor inputs. Every list is strictly increasing, which
+/// `Call::validate` checks.
 table SamplingState {
+  /// Absent means no whitelist; a present empty list masks every token.
   allowed_token_ids:[uint];
   suppressed_token_ids:[uint];
   finish_token_ids:[uint];
@@ -213,9 +293,9 @@ table SamplingState {
   force_finish:bool;
 }
 
-// The coordinates a call carries so a rank does not derive them from the
-// calls that preceded it. The engine holds the request state they come
-// from; the rank asserts its own ledger agrees.
+/// The coordinates a call carries so a rank does not derive them from the
+/// calls that preceded it. The engine holds the request state they come
+/// from; the rank asserts its own ledger agrees.
 table CallCoordinates {
   logical_position:uint;
   kv_visible_len:uint;
@@ -223,12 +303,19 @@ table CallCoordinates {
   flow_step:uint;
 }
 
+/// One planned computation, decoded into `Call` and checked by
+/// `Call::validate`; relationships to other calls and to the batch's tables
+/// are checked by `Batch::validate`.
 table Call {
   request_key:RequestKey;
   call_id:CallId;
   coordinates:CallCoordinates;
   component:string (required);
   code:CallKind (required);
+  // Scheduler-reserved maxima, decoded into `Bounds`. `max_tokens` and
+  // `max_latent_bytes` are checked by `Call::validate` and
+  // `max_transfer_bytes` by `Batch::validate`; neither validator checks
+  // `max_kv_pages` or `max_completion_bytes`.
   max_tokens:uint;
   max_kv_pages:uint;
   max_latent_bytes:ulong;
@@ -247,13 +334,22 @@ table Call {
   image_output:TensorRef;
   completion_output:TensorRef;
   transition_output:TensorRef;
+  /// Device predicate that enables execution: a U8 flag or a packed I64
+  /// continuation scalar. A false predicate completes the call as
+  /// `Predicated`.
   predicate:TensorRef;
   rng:Rng;
   sampling_state:SamplingState;
+  /// Host-known input tokens; empty when a continuation reads its
+  /// predecessor's token on the device.
   input_token_ids:[uint];
+  /// Encoded source image in base64.
   input_image:string;
   kv_input:BufferId;
   kv_output:BufferId;
+  /// Acknowledgment slots of the ranks that read this call's products,
+  /// excluding the executing rank. A published product retires once each
+  /// has acknowledged it.
   consumer_slots:[uint];
 }
 
@@ -273,7 +369,8 @@ table CachePageAllocation {
 table LatentParams {
   request_key:RequestKey;
   call_id:CallId;
-  // Both are empty/zero when fixed request tensors own the trajectory.
+  // `page_table` is empty and `latent_units` zero when the trajectory lives
+  // in request-owned tensors instead of latent pages.
   page_table:[uint];
   latent_units:uint;
   height:uint;
@@ -282,7 +379,6 @@ table LatentParams {
   step_count:uint;
 }
 
-
 table DecodeRange {
   request_key:RequestKey;
   call_id:CallId;
@@ -290,6 +386,7 @@ table DecodeRange {
   max_units:uint;
 }
 
+/// A byte span of the rank's persistent-buffer arena reserved for one buffer.
 table BufferAllocation {
   buffer:BufferId;
   offset:ulong;
@@ -302,6 +399,7 @@ table FinishFlags {
   stop:bool;
 }
 
+/// Per-call accounting in microseconds, never state identity.
 table TimingCounters {
   queued_us:ulong;
   device_us:ulong;
@@ -330,13 +428,18 @@ struct TokenLogprob {
 
 table PositionLogprobs { entries:[TokenLogprob]; }
 
+/// The completion a worker emits once for every call, checked by
+/// `RequestOutput::validate`. `finish_flags` and `timing_counters` are
+/// required by the decoder.
 table RequestOutput {
   request_key:RequestKey;
   call_id:CallId;
   status:CallStatus;
   product_generations:[uint];
+  /// Present exactly when `status` is `Error`.
   error_code:ErrorCode = null;
   timing_counters:TimingCounters;
+  /// Must match the submitted call's kind.
   code:CallKind (required);
   position:uint;
   kv_visible_len:uint;
@@ -362,6 +465,7 @@ table FreeCommand { buffer:BufferId; }
 
 union BatchCommand { StartCommand, FinishCommand, FreeCommand }
 
+/// One entry of `Batch.commands`; the decoder rejects an empty union.
 table BatchCommandEnvelope { command:BatchCommand; }
 
 // Static request admission and physical run binding.
@@ -372,7 +476,6 @@ table ArRequestParams {
   finish_token_ids:[uint];
   initial_position:uint;
 }
-
 
 table DiffusionSamplingParams {
   num_frames:uint;
@@ -390,65 +493,96 @@ table NewRequest {
   prompt_token_ids:[uint];
 }
 
+/// The payload of a Submit request, decoded into `Batch` and checked as a
+/// whole by `Batch::validate`. Every vector keeps its wire order.
 table Batch {
-  // Strictly increasing in each worker's Submit order.
+  /// Strictly increasing in each worker's Submit order.
   batch_id:ulong;
   collective_seq:ulong;
   calls:[Call];
   block_tables:[BlockTable];
   new_cache_pages:[CachePageAllocation];
-  // Aligned model inputs; sequence lengths describe valid prefixes, not capacity.
+  // Parallel columns of the forward rows, decoded into `ForwardBatch`; entry
+  // `i` of each column describes row `i`, and `forward_call_indices` index
+  // into `calls`.
   forward_call_indices:[uint];
   request_pool_indices:[uint];
-  // Cached prefix plus current query, including non-persistent query rows.
+  /// Total attention length per row: cached prefix plus current query,
+  /// including query rows whose KV does not persist (`write_kv` false); not
+  /// an allocated capacity.
   seq_lens:[uint];
   query_lens:[uint];
   write_kv:[bool];
   latent_params:[LatentParams];
   decode_ranges:[DecodeRange];
   buffer_allocations:[BufferAllocation];
+  /// Applied in order.
   commands:[BatchCommandEnvelope];
+  /// Values of input products, matched to calls by TensorRef identity.
   input_products:[TensorPublication];
   kv_inputs:[KvTransfer];
 }
 
-// Worker response payloads.
+// Tensor publication descriptors and worker response payloads. Ranks report
+// publications in their results, and the engine forwards them in the batches
+// that consume them.
 
-
+/// Where one shard or replica of a published tensor lives. `transport`
+/// selects which fields the decoder reads:
+///
+/// - `Local`: `endpoint`, `key`.
+/// - `PosixShm`: `endpoint`, `name`.
+/// - `CudaVmm`: `endpoint` and `publication_id` through
+///   `acknowledgment_offset`.
+/// - `Channel`: `endpoint`, `payload`.
+///
+/// `source`, `nbytes`, `dtype`, `shape`, `offset`, and `device` are read for
+/// every transport. Fields of other transports are ignored.
 table Locator {
   source:WorkerEndpoint;
   transport:TransferTransportKind;
-  // Required for every transport: the publishing address-space incarnation.
+  /// Required for every transport: the name of the publishing rank's
+  /// transport endpoint.
   endpoint:string;
   key:ulong;
   name:string;
+  /// Exactly 32 characters; also keys the producer's descriptor grant when
+  /// `allocation_handle` is a process descriptor.
   publication_id:string;
   storage_size_bytes:ulong;
   storage_offsets_bytes:[ulong];
   span_lengths:[ulong];
   span_counts:[uint];
   tensor_stride:[long];
+  /// A 64-byte CUDA IPC event handle signaling readiness, or empty when any
+  /// of the producing rank's consumers is on another host, where the producer
+  /// synchronizes its stream before publishing instead.
   ready_event_handle:[ubyte];
-  // The producing rank's shareable allocation handle, of the type its device
-  // was probed for: a fabric handle another host can import, or a process
-  // descriptor that reaches only this one.
+  /// The producing rank's shareable allocation handle, of the type its device
+  /// was probed for: a 64-byte fabric handle another host can import, or a
+  /// 4-byte process descriptor that reaches only this one.
   allocation_handle:[ubyte];
-  // Byte offset of the publication's acknowledgment header inside the exported
-  // allocation, where a consumer writes its own slot's word once its reads have
-  // retired. Negative when the publication carries no header and so retires by
-  // its producer's own accounting.
+  /// Byte offset of the publication's acknowledgment header inside the
+  /// exported allocation, where a consumer writes its own slot's word once its
+  /// reads have retired. Negative when the publication carries no header and
+  /// so retires by its producer's own accounting.
   acknowledgment_offset:long = -1;
-  // A host product's bytes, carried on the rank channel's data path. Shared
-  // storage reaches only one host, so a product whose consumer is elsewhere
-  // travels in the producing rank's result and the consuming rank's batch.
+  /// A host product's bytes, carried on the rank channel's data path. Shared
+  /// storage reaches only one host, so a product whose consumer is elsewhere
+  /// travels in the producing rank's result and the consuming rank's batch.
   payload:[ubyte];
   nbytes:ulong;
+  /// Torch dtype name without its `torch.` prefix, such as `float32`.
   dtype:string;
+  /// Extents of this shard or replica in logical axis order.
   shape:[ulong];
+  /// Per-axis element index where this shard or replica starts in the
+  /// logical tensor.
   offset:[ulong];
   device:string;
 }
 
+/// A logical tensor's actual shape and the shards or replicas holding it.
 table TensorTransfer {
   shape:[ulong];
   locations:[Locator];
@@ -468,6 +602,10 @@ table DeviceProductTransfer {
   tensor:TensorTransfer;
 }
 
+/// An incremental KV cache publication: the destination already holds `base`,
+/// when set, up to `base_extent` tokens, and `tensors` carry only the tokens
+/// in `[base_extent, published_extent)`: keys, values, and, for quantized
+/// storage, scales.
 table KvTransfer {
   tensors:[TensorTransfer];
   source:BufferId;
@@ -488,6 +626,8 @@ table LatentTransfer {
   tensor:TensorTransfer;
 }
 
+/// Product-family metadata around exactly one TensorTransfer, decoded into the
+/// Rust `TransferHandle` variants.
 union TransferData { EncoderTransfer, DeviceProductTransfer, LatentTransfer }
 table TransferHandle { value:TransferData; }
 table TensorPublication {
@@ -495,6 +635,7 @@ table TensorPublication {
   value:TransferHandle;
 }
 
+/// The payload of a Result response, checked by `BatchOutput::validate`.
 table BatchOutput {
   batch_id:ulong;
   completions:[RequestOutput];
@@ -503,6 +644,8 @@ table BatchOutput {
   forward_stats:ForwardStats;
 }
 
+/// Worker execution counters, decoded into `uniserve_core::ForwardStats`.
+/// Each StringU64Pair vector is a map; pairs without a key are dropped.
 table ForwardStats {
   mode_counts:[StringU64Pair];
   mode_tokens:[StringU64Pair];
@@ -536,8 +679,11 @@ table ForwardStats {
   component_us:[StringU64Pair];
 }
 
+/// Engine-to-rank envelope. `batch` is present exactly for `Submit`.
 table WorkerRequest {
   kind:ReqKind;
+  /// Request-response correlation identity, copied into the frame header
+  /// (absent becomes zero); unrelated to CallId.
   message_id:ulong = null;
   batch:Batch;
 }
@@ -547,6 +693,11 @@ table ErrorCallIdentity {
   call_id:CallId;
 }
 
+/// Rank-to-engine envelope. `response_from_table` enforces the legal field
+/// set per kind: `Info` carries only `info`, `Result` only `result`, and `Ok`
+/// nothing. `Error` carries no success payload and requires a non-empty
+/// `message` and `fatal`; the remaining error fields are optional, and an
+/// empty `code` reads as absent.
 table WorkerResponse {
   kind:RespKind;
   message_id:ulong = null;
@@ -554,10 +705,13 @@ table WorkerResponse {
   result:BatchOutput;
   message:string;
   code:string;
+  /// Whether the worker is unsafe to serve further requests.
   fatal:bool = null;
   phase:string;
   route:string;
   calls:[ErrorCallIdentity];
 }
 
+// Only one root type can be declared; the codec decodes WorkerResponse with
+// `flatbuffers::root::<WorkerResponse>`.
 root_type WorkerRequest;

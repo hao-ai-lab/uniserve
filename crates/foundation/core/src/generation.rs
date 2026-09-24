@@ -2,6 +2,17 @@
 //!
 //! Requests own their input data and effective parameters. The engine owns
 //! mutable computation progress, output delivery, and physical allocations.
+//!
+//! "Und" names the autoregressive understanding branch that decodes text, and
+//! "Gen" names the diffusion branch that generates images. The server's model
+//! preprocessing builds a [`GenerationRequest`] and sizes it with the capacity
+//! helpers here against the engine's resolved limits before submission. The
+//! engine's admission (`Scheduler::enqueue`) runs
+//! [`GenerationRequest::validate`], checks
+//! [`ImageGenerationConfig::required_features`] with
+//! [`GenerationLimits::covers`], and then runs
+//! [`GenerationRequest::validate_resources`] and
+//! [`GenerationRequest::max_kv_tokens`] against the loaded limits.
 
 use std::str::FromStr;
 
@@ -61,34 +72,45 @@ pub struct GenerationConstraintParseError {
 /// Positioned media consumed alongside the already-tokenized positive prompt.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MultimodalInputs {
-    /// Input images in nondecreasing prompt-token position order.
+    /// Input images in nondecreasing prompt-token position order, as
+    /// `GenerationRequest::validate` requires.
     pub images: Vec<ImageInput>,
 }
 
 /// An encoded image and the model's requirements for adding it to context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageInput {
-    /// Stable content hash used for encoder-cache identity.
+    /// Stable content hash used for encoder-cache identity; see
+    /// [`encoder_cache_key`]. The engine derives encoder-cache keys from this
+    /// value and the encoder's index and kind only, so omni preprocessing in
+    /// the server folds `CachePolicy::isolation_key` into it to keep isolated
+    /// requests from sharing entries.
     pub hash: u64,
     /// Base64-encoded input image.
     pub b64: String,
     /// Exclusive prompt-token position at the end of this image's marker gap.
     /// Equal positions preserve input order, including multiple images at one marker.
     pub position: u32,
-    /// Required encoder stages and their logical and physical contributions.
     /// Logical positions contributed after all encoders finish; independent of KV length.
     pub num_positions: u32,
+    /// Required encoder stages in context write order, with their KV contributions.
     pub encoders: Vec<ImageEncoderInput>,
 }
 
 /// One encoder input and its physical KV contribution.
+///
 /// `num_kv_tokens` is exact when known. Otherwise `max_kv_tokens` bounds
-/// the worker-selected length; absent limits use the loaded encoder capacity.
+/// the worker-selected length; absent limits use the loaded encoder capacity
+/// (see [`ImageEncoderInput::kv_token_capacity`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageEncoderInput {
     /// Model encoder consuming this image. List order determines context write order.
     pub encoder: ImageIngestStep,
+    /// Exact KV tokens this encoder writes, when known before execution.
     pub num_kv_tokens: Option<u32>,
+    /// Upper bound on a worker-selected KV length. When both it and
+    /// `num_kv_tokens` are present, `GenerationRequest::validate` requires
+    /// `num_kv_tokens <= max_kv_tokens`.
     pub max_kv_tokens: Option<u32>,
 }
 
@@ -103,6 +125,11 @@ pub enum ImageIngestStep {
 }
 
 /// Derives the cache identity of one ordered image encoder.
+///
+/// `step_index` is the encoder's index in `ImageInput::encoders`. The engine
+/// derives the key when it looks up a cached product before encoding and
+/// again when it stores the encoder's product, so both must use the same
+/// index for a stored product to be found.
 pub fn encoder_cache_key(image_hash: u64, step_index: usize, step: ImageIngestStep) -> u64 {
     // Apply FNV-1a to the complete domain tuple in a fixed byte order. Including
     // the stage index distinguishes repeated encoder kinds within one image input.
@@ -240,7 +267,10 @@ pub struct ImageGenerationConfig {
     /// Whether image-only requests generate internal text before their first image.
     /// When false, image computation starts after prompt and input-image encoding.
     pub requires_text_for_image: bool,
-    /// Encoder inputs and continuation required after a generated image.
+    /// Product channel through which a completed image reaches feedback
+    /// encoding. With `None`, completed images do not reenter the context, and
+    /// `GenerationRequest::validate` rejects requests whose text continues
+    /// after an image.
     pub feedback_source: Option<FeedbackSource>,
     /// Encoder order and KV contributions of a completed image entering context.
     pub feedback_encoders: Vec<ImageEncoderInput>,
@@ -255,6 +285,8 @@ pub struct ImageGenerationConfig {
 impl ImageGenerationConfig {
     /// Returns whether the requested output can reach an image-generation branch.
     fn generates_images(&self, constraint: GenerationConstraint) -> bool {
+        // The Gen branch opens through the trigger, or, for an image-only
+        // request that needs no text first, directly after the prompt.
         constraint != GenerationConstraint::UndOnly
             && (!matches!(self.trigger, ImageTrigger::Disabled)
                 || (constraint == GenerationConstraint::GenOnly && !self.requires_text_for_image))
@@ -283,6 +315,7 @@ impl ImageGenerationConfig {
                 ImageIngestStep::VitEncode => GenerationFeatures::VISION_ENCODE,
             });
         }
+
         if self.generates_images(constraint) {
             needs.insert(GenerationFeatures::IMAGE_GENERATION);
         }
@@ -317,7 +350,11 @@ bitflags::bitflags! {
 }
 
 impl GenerationFeatures {
-    /// Returns the admission diagnostic name for the first represented feature.
+    /// Returns the admission diagnostic name of one represented feature.
+    ///
+    /// Features are checked in the order understanding, latent encode, vision
+    /// encode, image generation; an empty set yields
+    /// `runtime_generation_features`.
     pub fn name(self) -> &'static str {
         if self.contains(Self::UNDERSTANDING) {
             "runtime_und_execution"
@@ -334,22 +371,31 @@ impl GenerationFeatures {
 }
 
 impl std::fmt::Display for GenerationFeatures {
-    /// Writes the diagnostic name of the first represented feature.
+    /// Writes the diagnostic name chosen by [`GenerationFeatures::name`].
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
     }
 }
 
 /// Worker and scheduler limits needed to compile a bounded generation graph.
+///
+/// The server supplies the loaded model's requirements, and the engine's
+/// `resolve_generation_limits` intersects them with the capacities the worker
+/// reports. Zero in any numeric field other than `commit_marker_tokens`
+/// declares no capacity for that resource;
+/// [`GenerationRequest::validate_resources`] rejects requests that need it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GenerationLimits {
     /// Generation features implemented by the runtime.
     pub features: GenerationFeatures,
-    /// Maximum latent allocation units for one request.
+    /// Maximum latent grid units of one generated image, where one unit is one
+    /// `latent_downsample` x `latent_downsample` pixel block.
     pub max_latent_units: u64,
     /// Pixel-to-latent spatial downsample factor.
     pub latent_downsample: u32,
-    /// Maximum VAE grid tokens for a worker-selected length.
+    /// Maximum VAE grid tokens for a worker-selected length. It is also the
+    /// divisor that turns `max_latent_feature_bytes` into bytes per latent
+    /// unit in [`GenerationRequest::image_latent_bytes`].
     pub max_vae_grid_tokens: u32,
     /// Maximum vision grid tokens for a worker-selected length.
     pub max_vit_grid_tokens: u32,
@@ -357,7 +403,8 @@ pub struct GenerationLimits {
     pub max_latent_feature_bytes: u64,
     /// Maximum vision feature product size in bytes.
     pub max_vision_feature_bytes: u64,
-    /// KV tokens reserved for image commit markers.
+    /// Commit-marker tokens that the engine adds to an image's latent grid
+    /// tokens to form each denoising call's query length.
     pub commit_marker_tokens: u32,
     /// Maximum classifier-free-guidance branches.
     pub max_cfg_branches: u32,
@@ -416,7 +463,17 @@ impl GenerationRequest {
     }
 
     /// Maximum physical KV tokens required by the input, output budget, and image feedback.
-    /// Saturation preserves conservative admission for host-sized token budgets.
+    ///
+    /// Sums the prompt, the `max_und_tokens` budget, each context image's
+    /// encoder KV bounds, the feedback encoder bounds once per
+    /// `ImageParams::max_images` when completed images feed back, and the
+    /// negative prompt when the Gen branch is reachable. Saturation preserves
+    /// conservative admission for host-sized token budgets.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GenerationResourceError::UnboundedImageKv` when a counted
+    /// encoder input resolves to a zero KV length.
     pub fn max_kv_tokens(
         &self,
         limits: &GenerationLimits,
@@ -450,6 +507,9 @@ impl GenerationRequest {
 
     /// Encoder-cache entries that admission reserves for the ordered input encoders.
     /// Each ingest step retains its reservation even if another image has the same hash.
+    ///
+    /// Only context images count, not feedback encoders, and the count is zero
+    /// when the cache policy neither reads nor writes.
     pub fn num_encoder_cache_entries(&self) -> usize {
         if self.cache.read || self.cache.write {
             self.multimodal_inputs
@@ -463,6 +523,13 @@ impl GenerationRequest {
     }
 
     /// Validated latent grid size for one generated image, or zero for text-only work.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MissingRuntimeBound` when `latent_downsample` or
+    /// `max_latent_units` is zero, `ImageDimensionAlignment` when the image
+    /// width or height is not a multiple of `latent_downsample`, and
+    /// `LatentCapacity` when the grid exceeds `max_latent_units`.
     pub fn image_latent_units(
         &self,
         limits: &GenerationLimits,
@@ -501,6 +568,15 @@ impl GenerationRequest {
     }
 
     /// Allocation bytes for one image latent using the loaded model's byte density.
+    ///
+    /// The density is `max_latent_feature_bytes / max_vae_grid_tokens`,
+    /// rounded up to whole bytes per latent unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns every [`GenerationRequest::image_latent_units`] error, and
+    /// `MissingRuntimeBound` naming `max_latent_feature_bytes` when either
+    /// `max_latent_feature_bytes` or `max_vae_grid_tokens` is zero.
     pub fn image_latent_bytes(
         &self,
         limits: &GenerationLimits,
@@ -522,11 +598,25 @@ impl GenerationRequest {
 
     /// Checks reachable encoder work, image geometry, and guidance against loaded capacity.
     /// Admission separately acquires KV, cache entries, and latent storage from their pools.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failure among, in check order: the
+    /// [`GenerationRequest::max_kv_tokens`] error; `MissingRuntimeBound` for a
+    /// reachable encoder kind whose feature-byte limit is zero;
+    /// `MissingRuntimeBound` or `EncoderCacheCapacity` when reserved
+    /// encoder-cache entries exceed `encoder_cache_entries`; the
+    /// [`GenerationRequest::image_latent_bytes`] errors; and, when the Gen
+    /// branch is reachable, `MissingRuntimeBound` or `CfgBranchCapacity` when
+    /// the guidance branch count exceeds `max_cfg_branches`.
     pub fn validate_resources(
         &self,
         limits: &GenerationLimits,
     ) -> Result<(), GenerationResourceError> {
         self.max_kv_tokens(limits)?;
+
+        // Each encoder kind reachable from context images or feedback needs
+        // a nonzero feature-product size.
         let feedback = (self.continues_after_image()
             && self.image_generation.feedback_source.is_some())
         .then_some(self.image_generation.feedback_encoders.as_slice());
@@ -552,6 +642,7 @@ impl GenerationRequest {
                 return Err(GenerationResourceError::MissingRuntimeBound { resource });
             }
         }
+
         let entries = self.num_encoder_cache_entries();
         if entries > 0 {
             if limits.encoder_cache_entries == 0 {
@@ -566,7 +657,9 @@ impl GenerationRequest {
                 });
             }
         }
+
         self.image_latent_bytes(limits)?;
+
         if self.generates_images() {
             if limits.max_cfg_branches == 0 {
                 return Err(GenerationResourceError::MissingRuntimeBound {
@@ -585,7 +678,8 @@ impl GenerationRequest {
     }
 }
 
-/// Computes physical capacity from the concrete encoder inputs and loaded limits.
+/// Sums [`ImageEncoderInput::kv_token_capacity`] over one image's encoder
+/// inputs, saturating instead of overflowing.
 fn encoder_kv_bound(
     inputs: &[ImageEncoderInput],
     limits: &GenerationLimits,
@@ -597,6 +691,11 @@ fn encoder_kv_bound(
 
 impl ImageEncoderInput {
     /// Maximum KV contribution of this encoder, resolving dynamic lengths from the model.
+    ///
+    /// Uses `num_kv_tokens` when present, then `max_kv_tokens`, then the loaded
+    /// grid-token capacity for the encoder kind. Fails with
+    /// `GenerationResourceError::UnboundedImageKv` when the resolved length is
+    /// zero.
     pub fn kv_token_capacity(
         &self,
         limits: &GenerationLimits,
@@ -637,7 +736,7 @@ pub enum GenerationResourceError {
         /// Encoder call missing a bound.
         call: &'static str,
     },
-    /// Image generation requires a runtime resource maximum that is zero.
+    /// A resource the request needs has a zero runtime maximum.
     #[error("image generation requires the runtime to declare {resource}")]
     MissingRuntimeBound {
         /// Name of the missing resource maximum.
@@ -741,6 +840,9 @@ pub struct GenerationRequest {
 
 impl GenerationRequest {
     /// Validates image conditions, input positions, and sampling.
+    ///
+    /// These checks depend only on the request; checks against loaded
+    /// capacity are in [`GenerationRequest::validate_resources`].
     pub fn validate(&self) -> Result<(), GenerationRequestError> {
         // Validate request-wide policy and parameter invariants before walking
         // the positioned multimodal inputs.
@@ -767,7 +869,9 @@ impl GenerationRequest {
             return Err(GenerationRequestError::GenOnlyCannotProduceImage);
         }
 
-        // Trigger sequences must be nonempty and image continuation needs an encoder.
+        // Trigger patterns must be nonempty. Text that continues after an image
+        // needs a feedback source and a continuation token, and configured
+        // feedback needs valid encoder inputs and logical positions.
         match &self.image_generation.trigger {
             ImageTrigger::Suffix { token_ids } if token_ids.is_empty() => {
                 return Err(GenerationRequestError::EmptyTriggerPattern);
@@ -861,7 +965,7 @@ pub enum GenerationRequestError {
     /// Understanding decode has a zero token budget.
     #[error("max_und_tokens must be positive")]
     ZeroMaxUndTokens,
-    /// An image context segment declares no encoder stages.
+    /// An image input, or configured image feedback, declares no encoder stages.
     #[error("image input has no encoders")]
     MissingImageEncoders,
     /// An input image carries no encoded payload.
@@ -878,7 +982,8 @@ pub enum GenerationRequestError {
     /// Images would be consumed in a different order than their prompt positions.
     #[error("input images must follow prompt-token position order")]
     UnorderedImageInputs,
-    /// An image input contributes no logical model positions.
+    /// An image input, or configured image feedback, contributes no logical
+    /// model positions.
     #[error("image inputs and feedback must consume at least one logical position")]
     ZeroImageLogicalPositions,
     /// An explicit image KV length or capacity is zero.
@@ -952,6 +1057,11 @@ mod tests {
         }
     }
 
+    /// A default-constraint request that reaches every branch: one context
+    /// image with a bounded VAE input and an exact ViT input, a round-close
+    /// trigger, and artifact feedback through both encoders. Its cache policy
+    /// neither reads nor writes, so encoder-cache reservations are opt-in per
+    /// test.
     fn complete_request() -> GenerationRequest {
         let policy = ImageGenerationConfig {
             trigger: ImageTrigger::RoundCloseThenSuffix {
@@ -1082,10 +1192,14 @@ mod tests {
         request
             .validate_resources(&runtime_limits())
             .expect("supported image input");
+        // Prompt, Und budget, the context image's VAE bound and exact ViT
+        // length, two feedback images through both bounded encoders, and the
+        // negative prompt.
         assert_eq!(
             request.max_kv_tokens(&runtime_limits()).unwrap(),
             4 + 16 + 64 + 32 + 2 * (64 + 64) + 1
         );
+        // The default 512x512 image over a downsample of 16 is a 32x32 grid.
         assert_eq!(
             request.image_latent_units(&runtime_limits()).unwrap(),
             1_024
@@ -1095,6 +1209,9 @@ mod tests {
 
     #[test]
     fn conservative_resources_use_each_exact_image_ingest_step() {
+        // Exact encoder lengths are charged as declared even above the loaded
+        // grid capacities, and an Und-only request charges no feedback or
+        // negative prompt.
         let mut request = complete_request();
         request.prompt_token_ids = vec![1; 35];
         request.multimodal_inputs.images = vec![ImageInput {
@@ -1139,6 +1256,8 @@ mod tests {
             Err(GenerationResourceError::UnboundedImageKv { call: "vit_encode" })
         );
 
+        // The remaining cases keep the unbounded ViT input, which resolves to
+        // the loaded `max_vit_grid_tokens` under the default limits.
         let mut limits = runtime_limits();
         limits.max_latent_units = 1_023;
         assert!(matches!(

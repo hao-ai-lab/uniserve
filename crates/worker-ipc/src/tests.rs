@@ -1,4 +1,9 @@
 //! Protocol round trips and validation behavior for every message family.
+//!
+//! Tests drive the public codec (`encode_request`, `decode_request`,
+//! `encode_response`, `decode_response`) and the message validators. The
+//! `batch_with_calls` fixture derives the planner columns `Batch::validate`
+//! expects, so a test can mutate a single field to exercise one rule.
 
 use std::collections::BTreeMap;
 
@@ -189,6 +194,7 @@ fn media_admission(prompt_token_ids: Vec<u32>) -> NewRequest {
     .unwrap()
 }
 
+/// Encodes `batch` as a submit request, decodes it, and returns the decoded batch.
 fn execute_round_trip(batch: Batch) -> Batch {
     let request = WorkerRequest::submit(batch);
     let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
@@ -210,6 +216,8 @@ fn forward_columns_preserve_cfg_rows_and_reject_misalignment() {
     };
     assert_eq!(execute_round_trip(run.clone()), run);
 
+    // Columns of different lengths, a sequence shorter than its query, and a
+    // row naming a call outside the batch are each rejected on encode.
     let mut missing_length = run.clone();
     missing_length.forward.seq_lens.pop();
     assert!(encode_request(&WorkerRequest::submit(missing_length)).is_err());
@@ -250,8 +258,14 @@ fn computation_coordinates_survive_physical_dispatch_and_reject_collisions() {
     assert!(encode_request(&WorkerRequest::submit(collision)).is_err());
 }
 
+/// Builds a batch around `calls` with the planner columns `Batch::validate`
+/// expects for them: a buffer allocation for every declared buffer output, a
+/// block table, cache-page allocation, and forward row for every call with KV
+/// page capacity, latent params for every call that addresses a trajectory,
+/// and a decode range for every video or audio decode or encode call.
 fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>) -> Batch {
-    // Calls name the batch they belong to.
+    // A call id names its batch, so the first call's batch id overrides the
+    // `batch_id` argument.
     let batch_id = calls.first().map_or(batch_id, |call| call.call_id.batch_id);
     let mut run = Batch::new(batch_id, admissions, calls);
     run.collective_seq = batch_id.max(1);
@@ -269,6 +283,8 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
         }
         let capacity_pages = call.bounds.max_kv_pages;
         if capacity_pages > 0 {
+            // The request id doubles as the request pool slot, which forward
+            // rows, block tables, and page allocations require to be positive.
             let request_pool_idx = u32::try_from(call.request_key.request_id.0).unwrap();
             let page_ids = (1..=capacity_pages).map(BlockId).collect::<Vec<_>>();
             run.block_tables.push(BlockTable {
@@ -326,6 +342,8 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
     run
 }
 
+/// Builds a `BatchOutput`; the first completion's batch id, when present,
+/// overrides `batch_id`.
 fn lane_report(
     batch_id: u64,
     completions: Vec<RequestOutput>,
@@ -356,6 +374,10 @@ fn every_call_kind_round_trips_through_ipc() {
 }
 
 /// Constructs malformed wire input independently of the validated encoder.
+///
+/// The frame holds one call with the given forward and media codes and no
+/// transfer mode. `computed_len` of `None` omits the call's coordinates;
+/// otherwise the coordinates state a visible KV length of four.
 fn malformed_call(
     forward: crate::schema::uniserve::ipc::ForwardMode,
     media: crate::schema::uniserve::ipc::MediaCall,
@@ -470,6 +492,9 @@ fn solver_parameters_round_trip_with_request_or_paged_storage() {
     let call = call_for(CallKind::Media(MediaCall::Denoising), CallId::new(101, 0));
     let mut run = batch_with_calls(1, Vec::new(), vec![call]);
     assert_eq!(execute_round_trip(run.clone()), run);
+
+    // Paged storage names pages and a positive unit count; request-owned
+    // storage has neither. A mixture of the two is rejected.
     run.latent_params[0].page_table.clear();
     run.latent_params[0].latent_units = 0;
     assert_eq!(execute_round_trip(run.clone()), run);
@@ -525,6 +550,8 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             predicate: None,
             rng: None,
         };
+        // A video decode range may start past the first unit, while an audio
+        // decode range must start at it. Neither call may omit its range.
         let mut run = batch_with_calls(index as u64 + 1, Vec::new(), vec![call]);
         if index == 0 {
             run.decode_ranges[0].cursor = 3;
@@ -599,6 +626,10 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
             None,
             None,
         );
+
+        // A replica differs only in its source rank. A report for another
+        // generation names a different identity: merging it fails and leaves
+        // the publication unchanged.
         let original = &mut report.products[0];
         let mut replica = original.clone();
         if let TransferHandle::DeviceProduct { tensor, .. } = &mut replica.value {
@@ -614,6 +645,9 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
             decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
                 .unwrap();
         assert_eq!(decoded.report().unwrap(), &report);
+
+        // Other product dtypes round-trip with locator byte sizes that follow
+        // their element widths.
         for (dtype, storage_dtype, nbytes) in [(DType::I64, "int64", 32), (DType::I16, "int16", 8)]
         {
             let mut typed_report = report.clone();
@@ -635,6 +669,9 @@ fn publication_round_trips_its_registered_view_and_endpoint() {
     }
 }
 
+/// A `[Static(2), Device { max: 4 }]` bound requires rank two, an exact first
+/// extent, and a second extent within the maximum. Rebinding the same tensor to
+/// flat capacity accepts any rank whose element count fits.
 #[test]
 fn tensor_publication_preserves_static_axes_within_dynamic_capacity() {
     let mut reference = output_product(CallId::new(11, 0));
@@ -714,6 +751,7 @@ fn unchanged_kv_publication_round_trips_without_physical_tensors() {
             .unwrap();
     assert_eq!(decoded.report().unwrap(), &report);
 
+    // A grown extent must carry the tensors of its suffix.
     let KvTransfer {
         published_extent, ..
     } = report.completions[0].kv_output.as_mut().unwrap();
@@ -721,6 +759,10 @@ fn unchanged_kv_publication_round_trips_without_physical_tensors() {
     assert!(encode_response(&WorkerResponse::result(report)).is_err());
 }
 
+/// Shards of a 4x4 tensor: the left half plus the top-right quarter leave the
+/// bottom-right quarter uncovered until it is added. A full replica then
+/// substitutes for the left-half shard, and removing that replica uncovers
+/// the left half again.
 #[test]
 fn tensor_coverage_preserves_replicas_and_detects_missing_regions() {
     let shard = |offset: Vec<u64>, shape: Vec<u64>| Locator {
@@ -772,6 +814,9 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
             device: "cpu".into(),
         }],
     };
+    // Five tokens past a base of three, with four-token pages, touch two
+    // source pages. Each tensor is one rank's shard: three of six kv heads
+    // starting at head three, and for FP8 one of two scale head groups.
     for (dtype, itemsize) in [("bfloat16", 2), ("float8_e4m3fn", 1)] {
         let mut tensors = vec![
             tensor("keys", dtype, vec![5, 2, 3, 4], itemsize),
@@ -813,6 +858,8 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
                 .unwrap();
         assert_eq!(decoded.report().unwrap(), &report);
 
+        // Zero generations, a zero page size, and malformed or unexpected
+        // scales are each rejected on encode.
         for invalid_field in ["source", "base", "page_size", "scales"] {
             let mut invalid = report.clone();
             let KvTransfer {
@@ -862,6 +909,9 @@ fn request_retirement_requires_unique_buffers_from_its_request() {
             dims: vec![DimBound::Static(2), DimBound::Device { max: 16 }],
         },
     );
+
+    // Both a repeated buffer and a buffer owned by another request are
+    // rejected.
     for retained_buffers in [
         vec![product.buffer_id(), product.buffer_id()],
         vec![BufferId {
@@ -973,6 +1023,8 @@ fn validation_allows_shared_encoder_features_and_rejects_foreign_request_state()
     call.vision_input = Some(feature);
     call.validate().unwrap();
 
+    // Only encoder features may belong to another request; the same tensor
+    // as a generic input is rejected.
     call.inputs.push(call.vision_input.take().unwrap());
     assert!(call.validate().is_err());
 }
@@ -1270,9 +1322,9 @@ fn full_image() -> ImageParams {
 }
 
 /// One batch per closed `CallKind` variant, each carrying that variant's
-/// single call on its own request key; the first two keys also carry
-/// admissions. A batch is one numerical call on one component, so the variants
-/// cannot share one.
+/// single call on its own request key. A batch is one numerical call on one
+/// component, so the variants cannot share one. The first batch also admits
+/// requests 100 and 110, and the last retires request 201.
 fn comprehensive_batches() -> Vec<Batch> {
     let ar_params = NewRequest::new(
         key_for_request(100),
@@ -1377,8 +1429,7 @@ fn comprehensive_batches() -> Vec<Batch> {
         };
         batches.push(batch_with_calls(42 + index as u64, admissions, calls));
     }
-    // The pass's retirement rides on its last batch, so no earlier call loses
-    // state it still reads.
+    // The pass's retirement rides on its last batch.
     let last = batches.pop().expect("one batch per computation variant");
     batches.push(last.with_commands(vec![BatchCommand::Finish {
         request_key: key_for_request(201),
@@ -1676,6 +1727,8 @@ fn a_rank_may_transfer_over_every_mechanism_its_edges_name() {
     };
     assert!(info.validate().is_ok());
 
+    // `socket` is not a transfer mechanism name (`local`, `shm`, `cuda_vmm`,
+    // or `channel`).
     info.transfer_backends = vec!["cuda_vmm".to_owned(), "socket".to_owned()];
     let error = info.validate().unwrap_err().to_string();
     assert!(error.contains("transfer capabilities"), "{error}");

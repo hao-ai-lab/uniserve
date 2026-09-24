@@ -1,9 +1,10 @@
 //! Directional wake services for the iceoryx2 request-response boundary.
 //!
 //! Request-response ports do not expose a file descriptor suitable for parking.
-//! A host wake service reports results and worker death, while a
-//! worker wake service reports submitted requests. Separate directions prevent
-//! broadcast notifications from accumulating on the sender's listener.
+//! A host wake service reports results and worker death, while a worker wake
+//! service reports submitted requests and asynchronous completions. Separate
+//! directions prevent broadcast notifications from accumulating on the
+//! sender's listener.
 //!
 //! Callers supply call or liveness deadlines to all waits.
 
@@ -27,6 +28,11 @@ macro_rules! ipc_error {
 /// Park on the event descriptor while preserving the caller's deadline across
 /// signal interruptions. iceoryx2's timed receive erases EINTR into a terminal
 /// InternalFailure, so use its descriptor and then its nonblocking drain.
+///
+/// Returns `Ok(())` both when the descriptor is readable and when `timeout`
+/// elapses; callers learn what fired from the drain that follows. Fails when
+/// poll fails with anything other than EINTR or reports the descriptor in an
+/// error state.
 fn wait_readable(listener: &Listener<IxService>, timeout: Duration) -> IpcResult<()> {
     let started = Instant::now();
     let mut descriptor = libc::pollfd {
@@ -40,6 +46,9 @@ fn wait_readable(listener: &Listener<IxService>, timeout: Duration) -> IpcResult
         if remaining.is_zero() {
             return Ok(());
         }
+        // Round up to whole milliseconds so a sub-millisecond remainder parks
+        // instead of becoming a zero-timeout poll that spins until the
+        // deadline.
         let milliseconds =
             remaining.as_millis() + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
         // SAFETY: poll borrows one initialized descriptor and retains no pointer.
@@ -60,6 +69,7 @@ fn wait_readable(listener: &Listener<IxService>, timeout: Duration) -> IpcResult
         if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             return Err(ipc_error!("worker event descriptor is unavailable"));
         }
+        // A zero result before the deadline polls again for the remainder.
         if result > 0 || started.elapsed() >= timeout {
             return Ok(());
         }
@@ -115,15 +125,21 @@ fn make_listener(factory: &EventFactory<IxService>) -> IpcResult<Listener<IxServ
         .map_err(|e| ipc_error!("creating iceoryx2 listener: {e:?}"))
 }
 
-/// A cloneable, thread-safe host wake source plus the `EventId` to stamp.
-/// Worker death can fire from arbitrary frontend / watcher threads.
+/// A cloneable, thread-safe wake source plus the `EventId` to stamp.
+///
+/// It backs the host's worker-death wake (`ClientEvents::death_wake`) and the
+/// worker's completion wake (`ServerEvents::completion_wake`). Both fire from
+/// threads other than the endpoint's owner, such as frontend, watcher, and
+/// completion-callback threads. Clones share one pending bit, so wakes fired
+/// between two listener drains coalesce into one notification.
 #[derive(Clone)]
 pub struct WakeSender {
     /// Shared event notifier safe to call from callback and watcher threads.
     notifier: Arc<Notifier<IxService>>,
     /// Event identity stamped onto each notification.
     event_id: usize,
-    /// Coalescing bit cleared when the corresponding listener drains.
+    /// Coalescing bit cleared when the corresponding listener drains; set
+    /// while a notification is outstanding.
     pending: Arc<AtomicBool>,
 }
 
@@ -202,8 +218,11 @@ impl ClientEvents {
 
     /// Drains pending host wakes and classifies their event identifiers.
     pub(crate) fn drain(&self) -> IpcResult<WakeEvents> {
-        // Re-arm coalesced local producers before draining event identities.
         let mut ev = WakeEvents::default();
+
+        // Re-arm coalesced local producers before draining event identities, so
+        // a death wake fired during or after this drain sends a fresh
+        // notification instead of being absorbed by one already drained.
         self.death_pending.store(false, Ordering::Release);
         self.wake_listener
             .try_wait_all(|id| match id.as_value() {
@@ -232,6 +251,9 @@ impl ClientEvents {
     }
 
     /// Tells the worker that one or more requests are available in the ring.
+    ///
+    /// A notify failure is ignored; the request stays in the ring, where a
+    /// parked worker finds it only when it re-checks after its wait times out.
     pub(crate) fn notify_request(&self) {
         let _ = self
             .request_notifier
@@ -269,16 +291,19 @@ impl ServerEvents {
     }
 
     /// Tells the host a response is available in the request-response ring.
+    ///
+    /// A notify failure is ignored; the response stays in the ring, where a
+    /// parked host finds it only when it re-checks after its wait times out.
     pub(crate) fn notify_response(&self) {
         let _ = self
             .wake_notifier
             .notify_with_custom_event_id(EventId::new(EVT_RESULT));
     }
 
-    /// Parks until an inbound request wake fires or `timeout` elapses, draining
-    /// every pending event id. The IPC client fires `EVT_REQUEST` after send, so
-    /// an idle server wakes immediately. The timeout belongs to the caller's
-    /// liveness or shutdown deadline.
+    /// Parks until an inbound request or completion wake fires or `timeout`
+    /// elapses, draining every pending event id. The IPC client fires
+    /// `EVT_REQUEST` after send, so an idle server wakes immediately. The
+    /// timeout belongs to the caller's liveness or shutdown deadline.
     pub(crate) fn wait_request(&self, timeout: Duration) -> IpcResult<()> {
         wait_readable(&self.wake_listener, timeout)?;
         self.drain_worker_wakes()
@@ -290,6 +315,8 @@ impl ServerEvents {
     pub(crate) fn drain_worker_wakes(&self) -> IpcResult<()> {
         self.wake_listener
             .try_wait_all(|id| {
+                // Re-arm the completion producer once its notification is
+                // drained, so the next completion wake notifies again.
                 if id.as_value() == EVT_COMPLETION {
                     self.completion_pending.store(false, Ordering::Release);
                 }
@@ -315,6 +342,8 @@ mod tests {
 
     #[test]
     fn wake_sources_deliver_across_busy_periods_and_listener_drains() {
+        // Request and completion wakes reach the worker's listener, and result
+        // and death wakes reach the host's.
         let node = NodeBuilder::new()
             .create::<IxService>()
             .expect("create event test node");
@@ -344,6 +373,8 @@ mod tests {
                 .result
         );
 
+        // A burst of death wakes before one drain coalesces into a single
+        // pending notification that the host still observes.
         for _ in 0..10_000 {
             death.wake();
         }

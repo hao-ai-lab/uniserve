@@ -1,4 +1,18 @@
 //! Chat-template content-shape detection and formatting options.
+//!
+//! Hugging Face templates expect message `content` either as a plain string or
+//! as an OpenAI-style list of typed parts. Under
+//! [`ChatTemplateContentFormatOption::Auto`],
+//! `detect_chat_template_content_format` inspects the parsed template AST:
+//!
+//! - no loop over a message's `content` selects `String`;
+//! - such a loop selects `OpenAi`;
+//! - such a loop plus an `if` condition testing `content is string` selects
+//!   `Preserve`, because the template handles both shapes.
+//!
+//! The analysis is name-based and ignores scoping: any assignment or loop
+//! anywhere in the template (including macro bodies) counts, and only plain
+//! variable targets are tracked.
 
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
@@ -9,7 +23,7 @@ use minijinja::machinery::{WhitespaceConfig, parse};
 use minijinja::syntax::SyntaxConfig;
 use serde_with::{DeserializeFromStr, SerializeDisplay};
 
-/// Chat template content format.
+/// Resolved message-content shape passed to a compiled template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum ChatTemplateContentFormat {
     /// Content is a simple string.
@@ -22,6 +36,10 @@ pub(super) enum ChatTemplateContentFormat {
 }
 
 /// Configurable chat-template content format selection.
+///
+/// `FromStr` accepts the `*_LITERAL` constants case-insensitively.
+/// `ChatTemplateContentFormat::Preserve` has no option; only `Auto` detection
+/// selects it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, DeserializeFromStr, SerializeDisplay)]
 pub enum ChatTemplateContentFormatOption {
     /// Detect the format from the template source.
@@ -45,7 +63,6 @@ impl ChatTemplateContentFormatOption {
 impl FromStr for ChatTemplateContentFormatOption {
     type Err = String;
 
-    /// Parses the value from its string representation.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         if value.eq_ignore_ascii_case(Self::AUTO_LITERAL) {
             Ok(Self::Auto)
@@ -65,7 +82,7 @@ impl FromStr for ChatTemplateContentFormatOption {
 }
 
 impl fmt::Display for ChatTemplateContentFormatOption {
-    /// Formats the value for diagnostic output.
+    /// Writes the lowercase configuration literal.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Auto => f.write_str(Self::AUTO_LITERAL),
@@ -95,6 +112,10 @@ fn is_attr_access(expr: &Expr, varname: &str, key: &str) -> bool {
 }
 
 /// Returns whether an expression references a variable or one of its elements.
+///
+/// With `key`, matches `varname.key` or `varname['key']`; without it, matches
+/// `varname` itself. Filters, tests, and slices applied to the match are looked
+/// through, so `messages|reverse` and `messages[1:]` still count as `messages`.
 fn is_var_or_elems_access(expr: &Expr, varname: &str, key: Option<&str>) -> bool {
     match expr {
         Expr::Filter(f) => f
@@ -179,7 +200,7 @@ fn visit_stmt<'a>(
     }
 }
 
-/// Collects the assignments and loops.
+/// Collects every `set` statement and `for` loop in the template.
 fn collect_assignments_and_loops<'a>(
     root: &'a Stmt<'a>,
 ) -> (Vec<&'a Set<'a>>, Vec<&'a ForLoop<'a>>) {
@@ -190,6 +211,9 @@ fn collect_assignments_and_loops<'a>(
 }
 
 /// Finds variables transitively assigned from a source variable or its elements.
+///
+/// Returns `varname` itself followed by every alias discovered breadth-first,
+/// e.g. `loop_messages` for `{% set loop_messages = messages[1:] %}`.
 fn iter_nodes_assign_var_or_elems(root: &Stmt<'_>, varname: &str) -> Vec<String> {
     let (assignments, _) = collect_assignments_and_loops(root);
 
@@ -245,7 +269,7 @@ fn iter_nodes_assign_messages_item(root: &Stmt<'_>) -> Vec<String> {
     discovered
 }
 
-/// Returns whether the value has content item loop.
+/// Returns whether some loop iterates over a message item's `content`.
 fn has_content_item_loop(root: &Stmt<'_>) -> bool {
     let message_varnames = iter_nodes_assign_messages_item(root);
     let (_, loops) = collect_assignments_and_loops(root);
@@ -293,6 +317,9 @@ fn expression_tests_content_string(expr: &Expr<'_>, message_varnames: &[String])
 }
 
 /// Returns whether a statement subtree tests message content for string representation.
+///
+/// Only `if` statement conditions are inspected; expressions in `set`
+/// statements, output blocks, and loop filters are not.
 fn statement_tests_content_string(stmt: &Stmt<'_>, message_varnames: &[String]) -> bool {
     let children_test = |children: &[Stmt<'_>]| {
         children
@@ -320,7 +347,8 @@ fn statement_tests_content_string(stmt: &Stmt<'_>, message_varnames: &[String]) 
     }
 }
 
-/// Returns whether the value has content string test.
+/// Returns whether some `if` condition tests a message item's `content` with
+/// `is string`.
 fn has_content_string_test(root: &Stmt<'_>) -> bool {
     let message_varnames = iter_nodes_assign_messages_item(root);
     statement_tests_content_string(root, &message_varnames)
@@ -336,6 +364,9 @@ pub(super) fn detect_chat_template_content_format(template: &str) -> ChatTemplat
         WhitespaceConfig::default(),
     ) {
         Ok(ast) => ast,
+        // `CompiledChatTemplate::new` compiles the same source right after
+        // detection, so a template that fails to parse here fails renderer
+        // construction there.
         Err(_) => return ChatTemplateContentFormat::String,
     };
 

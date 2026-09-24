@@ -1,4 +1,9 @@
 //! Deserialized tokenizer and processor metadata used during profile resolution.
+//!
+//! Each loader treats an absent file (a `None` path) as an empty document and
+//! fills every field with its serde default, so a missing optional file never
+//! fails resolution. Fields a present file omits also take their defaults,
+//! and unknown JSON fields are ignored.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -8,6 +13,10 @@ use serde::{Deserialize, Serialize};
 use crate::profile::assets::error::{Error, Result};
 
 /// Tokenizer metadata consumed by configured chat rendering and stop handling.
+///
+/// Read from `tokenizer_config.json` by `ModelConfig::from_files` (for the
+/// primary EOS) and by `HfChatRenderer::load` (for the template and the
+/// special tokens exposed to it).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct HfTokenizerConfig {
@@ -32,7 +41,8 @@ pub enum NamedSpecialToken {
 }
 
 impl Serialize for NamedSpecialToken {
-    /// Serializes the value with the provided serializer.
+    /// Serializes either form as its plain token text, which is the value a
+    /// chat template sees for `bos_token` and the other special tokens.
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -42,7 +52,7 @@ impl Serialize for NamedSpecialToken {
 }
 
 impl From<NamedSpecialToken> for String {
-    /// Converts the source value into this type.
+    /// Extracts the token text from either form.
     fn from(value: NamedSpecialToken) -> Self {
         match value {
             NamedSpecialToken::Text(string) => string,
@@ -52,7 +62,7 @@ impl From<NamedSpecialToken> for String {
 }
 
 impl NamedSpecialToken {
-    /// Returns the configured template text or path.
+    /// Returns the token text.
     pub fn as_str(&self) -> &str {
         match self {
             Self::Text(value) | Self::WithContent { content: value } => value,
@@ -64,6 +74,9 @@ impl NamedSpecialToken {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 /// Special-token strings resolved from tokenizer metadata.
+///
+/// Serialization omits unset tokens, so a chat template sees them as
+/// undefined rather than null.
 pub struct HfSpecialTokens {
     /// Beginning-of-sequence token.
     pub bos_token: Option<NamedSpecialToken>,
@@ -86,11 +99,17 @@ impl HfSpecialTokens {
 }
 
 /// Model metadata used to bind Qwen3, SenseNova, or Bagel to its description.
+///
+/// This is the raw view of the file `ResolvedModelFiles::config_path` selects,
+/// distinct from the resolved `crate::profile::ModelConfig`. Composite
+/// checkpoints (the SenseNova and Bagel layouts) nest their language model
+/// under `llm_config`; the root `model_type` still identifies the family.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct ModelConfig {
     model_type: Option<String>,
     max_position_embeddings: Option<u32>,
+    /// Nested language-model section of a composite checkpoint.
     llm_config: Option<Box<ModelConfig>>,
 }
 
@@ -116,7 +135,8 @@ pub struct GenerationConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
-/// Tokenizer field accepted as one token identifier or a list.
+/// Token-id field accepted as one identifier or a list, as
+/// `generation_config.json` writes `eos_token_id`.
 pub enum OneOrManyTokenIds {
     /// One token identifier.
     One(u32),
@@ -135,7 +155,8 @@ impl OneOrManyTokenIds {
 }
 
 impl ModelConfig {
-    /// Returns the language-model section of the configuration.
+    /// Returns the nested `llm_config` section when present, otherwise the
+    /// root configuration.
     fn language_model(&self) -> &Self {
         self.llm_config.as_deref().unwrap_or(self)
     }
@@ -145,7 +166,10 @@ impl ModelConfig {
         self.model_type.as_deref()
     }
 
-    /// Returns the declared maximum position count.
+    /// Returns the language model's declared maximum position count.
+    ///
+    /// Reads only the nested `llm_config` when it exists, without falling back
+    /// to a root-level value.
     pub fn max_position_embeddings(&self) -> Option<u32> {
         self.language_model().max_position_embeddings
     }
@@ -166,7 +190,9 @@ pub fn load_model_config(path: Option<&Path>) -> Result<ModelConfig> {
     read_json_file(path)
 }
 
-/// Reads the JSON file.
+/// Deserializes the JSON file at `path`, or returns `T::default()` for `None`.
+///
+/// A present but unreadable or malformed file is an error.
 fn read_json_file<T>(path: Option<&Path>) -> Result<T>
 where
     T: for<'de> Deserialize<'de> + Default,
@@ -188,6 +214,9 @@ where
 mod tests {
     use super::ModelConfig;
 
+    /// A flat Qwen3 layout and the nested SenseNova and Bagel layouts: the
+    /// family comes from the root `model_type` and the context limit from the
+    /// language-model section.
     #[test]
     fn configured_model_layouts_expose_context_limits() {
         for (source, model_type, max_tokens) in [

@@ -1,4 +1,16 @@
 //! Scheduler-owned pending batches and request-local completion ordering.
+//!
+//! [`Inflight`] owns everything between planning a call and applying its
+//! result: batches awaiting submission, submitted batches awaiting their
+//! results and command receipts, each request's queue of submitted calls,
+//! completions staged until their call may apply, deferred terminal events,
+//! lifecycle commands awaiting a batch, and the transfer reservation count.
+//!
+//! Results arrive in executor order, but a request's calls apply in submission
+//! order: a staged completion is released only when its call is at the front
+//! of the request's queue. The exception is an independent call, one with
+//! `InflightInput::Media` that does not advance state, which applies as soon
+//! as the producers of its tensor inputs have left the queue.
 
 use super::*;
 use uniserve_worker_ipc::MediaCall;
@@ -28,7 +40,8 @@ impl InflightInput {
     }
 }
 
-/// Submitted call awaiting completion.
+/// Submitted call awaiting completion, queued per request in submission
+/// order.
 pub(super) struct InflightCall {
     pub(super) call: Call,
     pub(super) input: InflightInput,
@@ -39,6 +52,8 @@ pub(super) struct PendingCompletion {
     pub(super) record: uniserve_worker_ipc::RequestOutput,
     /// Claimed media storage stays alive while its result waits or is discarded.
     pub(super) media: Option<Arc<SharedMedia>>,
+    /// Engine-wide staging order (`Inflight::next_arrival`), used to order
+    /// ready completions of equal priority.
     pub(super) arrival_seq: u64,
 }
 
@@ -51,23 +66,46 @@ pub(super) struct PendingFinish {
 /// One submitted batch remains owned until all results and command receipts arrive.
 /// Partial results consume identities without releasing the batch's queue credit.
 pub(super) struct PendingBatch {
+    /// Time the scheduling pass planned the batch; the batch round trip is
+    /// measured from it.
     pub(super) started: Instant,
+    /// Call identities whose results have not arrived. Result validation
+    /// removes each identity once and treats a repeated or unknown one as
+    /// invalid; the final result must leave this set empty.
     pub(super) calls: HashSet<(RequestKey, CallId)>,
+    /// Lifecycle commands other than `Start`, in batch order, so a position
+    /// here is the executor's `CommandResult::command_index`.
     pub(super) commands: Vec<BatchCommand>,
+    /// Worker execution time accumulated across partial results, in
+    /// microseconds.
     pub(super) worker_exec_us: u64,
+    /// Whether the batch carries a prefill-lane call; such batches count
+    /// against `PREFILL_WINDOW_CREDITS`.
     pub(super) prefill: bool,
 }
 
 /// Owns submitted identities and their lifetime through ordered reconciliation.
 pub(super) struct Inflight {
+    /// Planned batches the executor has not accepted yet, in dispatch order.
     pub(super) pending_submissions: VecDeque<ExecutionBatch>,
+    /// Transfer calls (nonzero `max_transfer_bytes`) holding a reservation,
+    /// bounded by `Scheduler::transfer_capacity`.
     pub(super) num_pending_transfers: usize,
+    /// Last issued batch id; ids start at 1, so a call id with batch zero has
+    /// not been assigned to a batch.
     pub(super) batch_id: u64,
+    /// Next staging sequence number, issued by `next_arrival`.
     pub(super) next_arrival_seq: u64,
+    /// Submitted calls per request, in submission order.
     pub(super) pending_calls: HashMap<RequestId, VecDeque<InflightCall>>,
+    /// Results staged until `take_ready_completions` releases them.
     pub(super) pending_completions: HashMap<RequestId, BTreeMap<CallId, PendingCompletion>>,
+    /// Terminal events deferred until the request's calls have drained.
     pub(super) pending_finishes: HashMap<RequestId, PendingFinish>,
+    /// Batches by id, from registration at planning until their final result;
+    /// includes batches still waiting in `pending_submissions`.
     pub(super) pending_batches: HashMap<u64, PendingBatch>,
+    /// `Finish` and `Free` commands awaiting a batch to carry them.
     pub(super) pending_commands: VecDeque<BatchCommand>,
 }
 
@@ -86,7 +124,11 @@ impl Inflight {
         }
     }
 
-    /// Registers the call kinds and command receipts owned by one scheduled batch.
+    /// Registers the call identities and command receipts owned by one
+    /// scheduled batch.
+    ///
+    /// `Start` admissions are left out of the receipts because the executor
+    /// numbers command results without them.
     pub(super) fn register_pending_batch(&mut self, batch: &ExecutionBatch, started: Instant) {
         self.pending_batches.insert(
             batch.id,
@@ -149,6 +191,15 @@ impl Inflight {
 
     /// Stateful calls retain request order. Pure media branches complete
     /// independently once their actual input producers have resolved.
+    ///
+    /// Removes and returns the staged completions that may apply now, ordered
+    /// by `completion_priority` and then arrival. A call is ready when it is at
+    /// the front of its request's queue, or when it is independent (an
+    /// `InflightInput::Media` call that does not advance state) and none of its
+    /// tensor inputs is produced by a call still queued. Applying a released
+    /// completion can make the next one ready, so the caller repeats until
+    /// nothing is returned. Completions of a request with no queued call stay
+    /// staged.
     pub(super) fn take_ready_completions(&mut self) -> Vec<PendingCompletion> {
         let mut ready = Vec::new();
         for (id, pending) in &self.pending_completions {
@@ -182,9 +233,10 @@ impl Inflight {
             }
         }
         ready.sort_unstable_by_key(|(priority, arrival, ..)| (*priority, *arrival));
-        let mut completions = Vec::with_capacity(ready.len());
+
         // Selection read these completions from the maps it now drains, so
         // each one is still present.
+        let mut completions = Vec::with_capacity(ready.len());
         for (_, _, id, call_id) in ready {
             let Some(pending) = self.pending_completions.get_mut(&id) else {
                 continue;
@@ -200,6 +252,13 @@ impl Inflight {
     }
 
     /// Removes a selected call and releases its transfer reservation.
+    ///
+    /// The call must obey the ordering of `take_ready_completions`: it is at
+    /// the front of its request's queue or is independent. Returns `None`,
+    /// changing nothing, for a call id with batch zero, an unknown request or
+    /// call, or a call that is not yet eligible. The batch's
+    /// `PendingBatch::calls` entry is not touched here; result validation
+    /// removed it when the result arrived.
     pub(super) fn pop_pending_call(
         &mut self,
         request_key: RequestKey,
@@ -228,7 +287,13 @@ impl Inflight {
         Some(inflight)
     }
 
-    /// Removes failed calls from the in-flight registry.
+    /// Removes one call a worker failure retired, regardless of its queue
+    /// position, and releases its transfer reservation.
+    ///
+    /// Returns `None` when the batch is unknown or no longer owns the call, or
+    /// when the request's queue does not hold it; the worker-failure path
+    /// treats that as engine-fatal. Once the call has left the batch's
+    /// `calls`, a missing queue entry is reported without restoring it.
     pub(super) fn retire_call(
         &mut self,
         batch_id: u64,
@@ -268,7 +333,13 @@ impl Inflight {
         }
     }
 
-    /// Removes failed calls from the in-flight registry.
+    /// Drops every submitted call after an unrecoverable execution failure.
+    ///
+    /// Clears the per-request call queues, staged completions, registered
+    /// batches, and transfer reservations. Returns the ids of requests that
+    /// owned a submitted call and the recorded commands of every dropped
+    /// batch. `pending_submissions`, `pending_finishes`, and `pending_commands`
+    /// are left for the caller.
     pub(super) fn clear_failed_calls(&mut self) -> (Vec<RequestId>, Vec<BatchCommand>) {
         let ids = self.pending_calls.keys().copied().collect();
         let commands = self

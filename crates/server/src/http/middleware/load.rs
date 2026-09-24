@@ -1,4 +1,10 @@
 //! Middleware that tracks active requests and streaming response bodies.
+//!
+//! The in-flight count lives in `AppState` (`server_load`). Only the generation
+//! routes in `TRACKED_HANDLERS` are counted and subject to the optional
+//! `max_concurrent_requests` limit. The video routes are not: asynchronous
+//! video jobs are bounded by the job slots in `crate::video_jobs::VideoJobs`
+//! instead, and `/v1/videos/sync` has no frontend concurrency bound.
 
 use std::sync::{Arc, Weak};
 
@@ -16,6 +22,9 @@ use serde_json::json;
 use crate::AppState;
 
 /// Generation endpoints counted as in-flight server work.
+///
+/// Entries are matched against the route template (`MatchedPath`), so they must
+/// equal the paths registered in `routes::build_router`.
 const TRACKED_HANDLERS: &[&str] = &["/v1/chat/completions", "/v1/images/generations"];
 
 /// `Retry-After` hint (in seconds) advertised when shedding load.
@@ -43,10 +52,14 @@ fn overloaded_response(limit: u64) -> Response {
 }
 
 /// Tracks frontend-local in-flight inference requests. When an admission limit
-/// is configured, tracked requests are shed with `503
-/// Service Unavailable` (plus a `Retry-After` hint) once that many requests are
-/// already in flight, so a fixed-capacity engine browns out gracefully instead
-/// of accepting unbounded work.
+/// is configured, tracked requests are shed with `503 Service Unavailable`
+/// (plus a `Retry-After` hint) once that many requests are already in flight,
+/// so a fixed-capacity engine browns out gracefully instead of accepting
+/// unbounded work.
+///
+/// A request counts as in flight from admission until its response body is
+/// dropped, so a streamed chat completion holds its slot for the whole stream.
+/// Requests to other routes pass through uncounted.
 pub(crate) async fn track_server_load(
     State(state): State<Arc<AppState>>,
     req: Request,
@@ -61,17 +74,18 @@ pub(crate) async fn track_server_load(
         return next.run(req).await;
     }
 
-    // Front-door admission control sheds load when the
-    // configured in-flight limit has been reached. The check-then-increment is
-    // intentionally not a single atomic compare-and-set; a brief overshoot of a
-    // request or two under contention is acceptable for load shedding and keeps
-    // the shared `AppState` counter API unchanged.
+    // The limit is a soft bound: the load check and the increment below are
+    // separate relaxed operations rather than one compare-and-set, so requests
+    // racing past the check can briefly push the count above the limit. That
+    // brief overshoot is accepted for load shedding.
     if let Some(limit) = state.max_concurrent_requests()
         && state.server_load() >= limit
     {
         return overloaded_response(limit);
     }
 
+    // The guard is created right after the increment so that the decrement
+    // also runs if this future is dropped before the handler returns.
     state.increment_server_load();
     let guard = ServerLoadGuard {
         state: Arc::downgrade(&state),
@@ -89,12 +103,15 @@ pub(crate) async fn track_server_load(
 }
 
 /// A guard that decrements the server load when dropped.
+///
+/// It holds a `Weak` reference, so an undelivered response body does not keep
+/// `AppState` alive or count toward the strong references `AppState::shutdown`
+/// waits on. Once the state is gone the decrement is skipped.
 struct ServerLoadGuard {
     state: Weak<AppState>,
 }
 
 impl Drop for ServerLoadGuard {
-    /// Releases resources owned by this value.
     fn drop(&mut self) {
         if let Some(state) = self.state.upgrade() {
             state.decrement_server_load();

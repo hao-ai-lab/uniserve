@@ -1,4 +1,9 @@
 //! Decoded events, finish reasons, and logprob conversion shared by output layers.
+//!
+//! `decoded` turns one request's engine events into [`DecodedTextEvent`]s,
+//! which `serving::assembly` consumes; `logprobs` converts engine token-ID
+//! candidates into decoded strings; `finish` carries the terminal reason.
+//! [`CollectedTextOutput`] folds a decoded event stream into one final value.
 
 pub use decoded::{DecodedTextEvent, Finished, TextDecodeOptions, decoded_text_event_stream};
 pub(crate) use decoded::{matches_stop_string, stop_string_holdback_bytes};
@@ -42,6 +47,20 @@ pub struct CollectedTextOutput {
 impl CollectedTextOutput {
     /// Collects the stream to completion and returns the final decoded text plus
     /// terminal metadata.
+    ///
+    /// Text, token IDs, and logprob positions of every `TextDelta` are
+    /// concatenated in stream order. Prompt metadata comes from the `Start`
+    /// event that precedes the first delta; without one, `prompt_token_ids`
+    /// is empty and `prompt_logprobs` is `None`. The function returns at the
+    /// first delta that carries `finished` and does not poll the stream
+    /// further.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error the stream yields, and
+    /// [`Error::StreamClosedBeforeTerminalOutput`] when the stream ends
+    /// without a terminal delta. `DecodedTextEvent` carries no request ID, so
+    /// errors raised here report `"unknown"`.
     pub async fn collect(
         stream: impl Stream<Item = Result<DecodedTextEvent>> + Send,
     ) -> Result<Self> {
@@ -78,6 +97,9 @@ impl CollectedTextOutput {
                             }
                         }
                     } else {
+                        // The `Error` finish reason is a placeholder that the
+                        // terminal delta overwrites; a stream that closes
+                        // before that delta returns an error instead.
                         collected = Some(CollectedTextOutput {
                             text: delta,
                             prompt_token_ids: Arc::clone(&prompt_token_ids),
@@ -173,6 +195,7 @@ mod tests {
         ]);
 
         let collected = CollectedTextOutput::collect(stream).await.unwrap();
+
         assert_eq!(collected.text, "bc");
         assert_eq!(
             collected.prompt_logprobs,
@@ -289,6 +312,7 @@ mod tests {
         ]);
 
         let collected = CollectedTextOutput::collect(stream).await.unwrap();
+
         assert_eq!(collected.text, "hello");
         assert_eq!(collected.prompt_logprobs, None);
         assert_eq!(collected.token_ids, vec![1, 2, 3, 4, 5]);

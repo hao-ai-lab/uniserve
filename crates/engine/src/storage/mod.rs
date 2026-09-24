@@ -2,6 +2,17 @@
 //!
 //! Each pool allocates its actual backing. Worker addresses are assembled from
 //! these owned allocations when constructing a batch; no region copies persist.
+//!
+//! The backing storage itself lives in the worker processes, which report its
+//! capacity in `WorkerInfo`; these pools assign its rows, pages, and byte
+//! ranges. Row zero of the request state and page zero of the latent pool are the
+//! worker's inactive sentinels, so neither pool ever hands them out, and the
+//! worker IPC validation rejects a request row or latent page of zero.
+//!
+//! An allocation is an owned, non-`Clone` value that the issuing pool's `free`
+//! consumes; the value does not record which pool issued it, so the caller
+//! returns it to the right one. `KvAllocation` has no `free`: its pages return
+//! to the `BlockPool` when its tables drop.
 
 use std::collections::BTreeMap;
 
@@ -27,6 +38,11 @@ impl RequestSlot {
 }
 
 /// KV page references retain shared prefixes through ordinary ownership.
+///
+/// One `BlockTable` per KV group, in group order. Each page is a counted
+/// reference, so dropping the allocation releases the request's references
+/// and a page shared through the prefix cache stays resident while another
+/// table still holds it.
 #[derive(Debug)]
 pub(crate) struct KvAllocation {
     pub(crate) tables: Vec<BlockTable>,
@@ -35,7 +51,11 @@ pub(crate) struct KvAllocation {
 /// Pages and capacity of a latent trajectory.
 #[derive(Debug)]
 pub(crate) struct LatentPages {
+    /// Physical page ids in logical order; never contains page zero.
     pub(crate) pages: Vec<u32>,
+    /// Logical capacity in model-defined latent units. The pages cover at
+    /// least this many units, and more when the last page is partly used or
+    /// after a narrowing `LatentPool::grow`, which keeps its pages.
     pub(crate) units: u64,
 }
 
@@ -43,6 +63,7 @@ pub(crate) struct LatentPages {
 #[derive(Debug)]
 pub(crate) struct BufferSpan {
     pub(crate) owner: RequestKey,
+    /// Byte offset, aligned as requested, into the issuing `BufferPool`.
     pub(crate) offset: u64,
     pub(crate) bytes: u64,
 }
@@ -70,15 +91,21 @@ pub enum OutOfStorage {
 /// Dense pool of stable request-state row identifiers.
 ///
 /// Only [`RequestPool::allocate`] creates a [`RequestSlot`] and only
-/// [`RequestPool::free`] consumes one, so a slot in hand names a live row of
-/// the pool that issued it and cannot be released twice.
+/// [`RequestPool::free`] consumes one, so a slot cannot be released twice.
+/// The slot does not record its pool; the scheduler holds several pools (its
+/// main pool and one per media worker) and must free a slot into its issuer.
 pub(crate) struct RequestPool {
+    /// Unassigned rows as a LIFO stack, initially ordered so that `allocate`
+    /// hands out the lowest row first.
     free: Vec<u32>,
     capacity: usize,
 }
 
 impl RequestPool {
     /// Creates an allocator for the supplied capacity.
+    ///
+    /// Rows are numbered `1..=capacity`, matching the worker's one-based
+    /// request rows. The capacity is clamped to `1..=u32::MAX` rows.
     pub(crate) fn new(capacity: usize) -> Self {
         let capacity = capacity.clamp(1, u32::MAX as usize);
         Self {
@@ -92,7 +119,7 @@ impl RequestPool {
         self.capacity
     }
 
-    /// Returns whether the collection contains no entries.
+    /// Returns whether every row is assigned, so `allocate` would fail.
     pub(crate) fn is_empty(&self) -> bool {
         self.free.is_empty()
     }
@@ -105,12 +132,17 @@ impl RequestPool {
 
 /// Fixed-size page allocator for request-owned latent storage.
 pub(crate) struct LatentPool {
+    /// Model-defined latent units stored in one page.
     page_units: u32,
+    /// Unassigned page ids as a LIFO stack.
     free: Vec<u32>,
 }
 
 impl LatentPool {
     /// Creates an allocator with page zero reserved for inactive input.
+    ///
+    /// `num_pages` counts that sentinel page, as `WorkerInfo::latent_pages`
+    /// does, so pages `1..num_pages` are allocatable.
     pub(crate) fn new(num_pages: u32, page_units: u32) -> Self {
         Self {
             page_units,
@@ -119,6 +151,9 @@ impl LatentPool {
     }
 
     /// Computes the number of physical pages needed for logical latent units.
+    ///
+    /// Returns `None` when nonzero units meet a zero page size or the page
+    /// count does not fit in `usize`.
     fn pages_needed(&self, units: u64) -> Option<usize> {
         if units == 0 {
             return Some(0);
@@ -130,6 +165,9 @@ impl LatentPool {
     }
 
     /// Extends an allocation atomically; narrowing retains its backing pages.
+    ///
+    /// Returns false, leaving `pages` and the free stack unchanged, when the
+    /// page count cannot be computed or too few pages are free.
     fn reserve(&mut self, pages: &mut Vec<u32>, units: u64) -> bool {
         let Some(needed) = self.pages_needed(units) else {
             return false;
@@ -153,11 +191,19 @@ impl LatentPool {
 pub(crate) struct KVCacheManager {
     pub(crate) block_pool: BlockPool,
     pub(crate) coordinator: KvCacheCoordinator,
+    /// Allocatable pages summed over every group, as
+    /// `BlockPool::request_page_capacity` reports them.
     pub(crate) usable_blocks: usize,
 }
 
-/// Builds scheduler KV state when a worker advertises paged cache capacity.
 impl KVCacheManager {
+    /// Builds scheduler KV state when a worker advertises paged cache capacity.
+    ///
+    /// Returns `None` when `info` has no KV cache. The advertised groups are
+    /// laid out as consecutive page ranges in their listed order; without
+    /// groups the pool is one group. `BlockPool::with_groups` panics on a zero
+    /// block size, a zero page count, or groups that do not partition the
+    /// pages; `KvCacheInfo::validate` rejects each of these.
     pub(crate) fn from_worker_info(info: &WorkerInfo) -> Option<Self> {
         info.kv_cache.as_ref().map(|kv_cache| {
             let block_pool = if kv_cache.groups.is_empty() {
@@ -188,9 +234,15 @@ impl KVCacheManager {
         })
     }
 }
+
 /// Aligned, byte-addressed persistent Tensor storage.
+///
+/// A first-fit allocator over free byte extents. Adjacent free extents are
+/// coalesced on release.
 pub(crate) struct BufferPool {
     capacity: u64,
+    /// Free extents as `offset -> length` in bytes, disjoint and ordered by
+    /// offset.
     free: BTreeMap<u64, u64>,
 }
 
@@ -205,6 +257,10 @@ impl BufferPool {
     }
 
     /// Allocates the first aligned extent large enough for `bytes`.
+    ///
+    /// The alignment applies to the returned offset. The unused head and tail
+    /// of the chosen extent stay free. Returns `None` for a zero size, an
+    /// alignment that is not a nonzero power of two, or no fitting extent.
     fn reserve(&mut self, bytes: u64, alignment: u32) -> Option<u64> {
         if bytes == 0 || alignment == 0 || !alignment.is_power_of_two() {
             return None;
@@ -228,6 +284,10 @@ impl BufferPool {
     }
 
     /// Returns an extent and coalesces it with immediately adjacent free ranges.
+    ///
+    /// The extent is clipped to the pool capacity. Releasing a range that is
+    /// already free is not detected; callers release each span once through
+    /// the consuming `BufferPool::free`.
     fn release(&mut self, offset: u64, bytes: u64) {
         let mut start = offset;
         let mut end = offset.saturating_add(bytes).min(self.capacity);
@@ -275,6 +335,9 @@ impl LatentPool {
     }
 
     /// Grow without moving existing pages; failure leaves the allocation intact.
+    ///
+    /// A `requested` below the current units lowers `units` but keeps every
+    /// page.
     pub(crate) fn grow(
         &mut self,
         allocation: &mut LatentPages,
@@ -408,6 +471,9 @@ mod tests {
 
     #[test]
     fn latent_growth_preserves_pages_and_failed_reservations() {
+        // Four pages of four units, one of them the sentinel: two one-page
+        // trajectories leave one page free, so growing the first to three
+        // pages fails until the second releases its page.
         let mut pool = LatentPool::new(4, 4);
         let mut first = pool.allocate(4).unwrap();
         let second = pool.allocate(4).unwrap();
@@ -417,16 +483,19 @@ mod tests {
             pages: other_pages, ..
         } = &second;
         assert!(pages.iter().all(|page| !other_pages.contains(page)));
+
         assert_eq!(pool.grow(&mut first, 12), Err(OutOfStorage::Latent));
         let LatentPages { pages, units, .. } = &first;
         assert_eq!(pages, &held_pages);
         assert_eq!(*units, 4);
+
         pool.free(second);
         pool.grow(&mut first, 12).unwrap();
         let LatentPages { pages, units, .. } = &first;
         assert!(pages.starts_with(&held_pages));
         assert_eq!(*units, 12);
         assert_eq!(pages.len(), 3);
+
         pool.free(first);
         assert!(pool.allocate(12).is_ok());
     }

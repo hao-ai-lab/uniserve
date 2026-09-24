@@ -33,6 +33,9 @@ pub struct Qwen3XmlToolParser {
 
 impl Qwen3XmlToolParser {
     /// Creates a Qwen XML tool parser.
+    ///
+    /// The declared tools are not read: parsed function names are not checked
+    /// against them.
     pub fn new(_tools: &[Tool]) -> Self {
         Self {
             inner: JsonToolCallParser::new(QWEN_XML_CONFIG),
@@ -40,16 +43,29 @@ impl Qwen3XmlToolParser {
     }
 
     /// Parses one text chunk into an existing output accumulator.
+    ///
+    /// Fails with `ToolParserError::ParsingFailed` on input outside the
+    /// grammar or when the pending buffer exceeds its size cap. Events parsed
+    /// before the failure remain in `output`, and `reset` returns the input
+    /// they did not consume.
     pub fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()> {
         self.inner.parse_into(chunk, output)
     }
 
     /// Flushes buffered parser state at end of generation.
+    ///
+    /// Buffered text is returned as plain text and the parser resets. Fails
+    /// with `ToolParserError::ParsingFailed`, leaving the state unchanged, when
+    /// a tool call is still open.
     pub fn finish(&mut self) -> Result<ToolParserOutput> {
         self.inner.finish()
     }
 
-    /// Resets parser state and returns any buffered normal text.
+    /// Resets parser state and returns the buffered input that no completed
+    /// event has consumed.
+    ///
+    /// After a `parse_into` failure, markers and header text that earlier
+    /// events consumed are therefore not included.
     pub fn reset(&mut self) -> String {
         self.inner.reset()
     }
@@ -124,6 +140,9 @@ mod tests {
         assert_eq!(output.calls[0].arguments, arguments);
     }
 
+    /// Argument bytes stream out chunk by chunk: the fifth chunk closes the
+    /// arguments object and the last one only closes the wrapper and the tag,
+    /// so exactly three argument deltas follow the header.
     #[test]
     fn qwen_xml_streaming_emits_argument_deltas() {
         let mut parser = Qwen3XmlToolParser::new(&test_tools());
@@ -199,6 +218,8 @@ mod tests {
         assert_eq!(output.calls[0].name.as_deref(), Some("say_\"hi"));
     }
 
+    /// Without the newline after `<tool_call>` the block is not a tool call,
+    /// and `finish` returns the whole input as plain text.
     #[test]
     fn qwen_xml_requires_newline_after_tool_call_start() {
         let mut parser = Qwen3XmlToolParser::new(&test_tools());

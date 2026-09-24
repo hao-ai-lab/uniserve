@@ -1,4 +1,12 @@
 //! Local and Hugging Face Hub model-file resolution.
+//!
+//! A model id that names an existing directory is read in place. Any other id
+//! is a Hub repository, read from the local Hub cache (under `HF_HOME` when
+//! set) without network access when the cache holds the needed file, and
+//! downloaded otherwise; see [`ResolvedModelFiles::new`] for how a cached
+//! `tokenizer.json` decides this for the whole file set. `ResolvedModelFiles`
+//! requires only `tokenizer.json`; every other file is optional and reported
+//! as `None` when absent.
 
 use std::path::{Path, PathBuf};
 
@@ -8,6 +16,8 @@ use thiserror_ext::AsReport as _;
 
 use crate::profile::assets::error::{Error, Result};
 
+/// Environment variable whose non-empty value overrides the token that
+/// `hf_hub` reads from the cache's token file.
 const HF_TOKEN_ENV: &str = "HF_TOKEN";
 
 /// Concrete files resolved for one configured Hugging Face model.
@@ -23,12 +33,25 @@ pub struct ResolvedModelFiles {
     pub preprocessor_config_path: Option<PathBuf>,
     /// Optional standalone chat template.
     pub chat_template_path: Option<PathBuf>,
-    /// Optional model architecture metadata.
+    /// Optional model architecture metadata: `config.json` when it declares
+    /// `model_type` or `architectures`, otherwise `llm_config.json` when
+    /// present, otherwise `config.json` as found.
     pub config_path: Option<PathBuf>,
 }
 
 impl ResolvedModelFiles {
     /// Resolves configured model files from a local directory, the local Hub cache, or the Hub.
+    ///
+    /// A cached `tokenizer.json` selects the cache for the whole set: optional
+    /// files missing from the cache are reported as absent rather than
+    /// downloaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MissingFile`] when the directory or the repository
+    /// listing has no `tokenizer.json`, [`Error::Remote`] when a Hub request
+    /// fails, and [`Error::Invalid`] when a cached tokenizer path has no
+    /// parent directory.
     pub async fn new(model_id: &str) -> Result<Self> {
         if Path::new(model_id).is_dir() {
             return resolve_local_model_files(Path::new(model_id));
@@ -41,6 +64,11 @@ impl ResolvedModelFiles {
 }
 
 /// Resolves one required file from a local model directory, the local Hub cache, or the Hub.
+///
+/// `filename` is checkpoint-relative and may name a subfolder. A missing
+/// local file is [`Error::MissingFile`]; a Hub client or download failure,
+/// including a file the repository lacks, is [`Error::Remote`], since this
+/// path downloads without consulting the repository listing.
 pub async fn resolve_model_file(model_id: &str, filename: &str) -> Result<PathBuf> {
     let local = Path::new(model_id);
     if local.is_dir() {
@@ -57,7 +85,7 @@ pub async fn resolve_model_file(model_id: &str, filename: &str) -> Result<PathBu
     download_known_file(&api.model(model_id.to_string()), model_id, filename).await
 }
 
-/// Resolves the local model files.
+/// Resolves the model files present in a local checkpoint directory.
 fn resolve_local_model_files(model_dir: &Path) -> Result<ResolvedModelFiles> {
     let tokenizer_path =
         local_file_if_exists(model_dir, "tokenizer.json").ok_or_else(|| Error::MissingFile {
@@ -120,7 +148,8 @@ async fn resolve_remote_model_files(model_id: &str) -> Result<ResolvedModelFiles
     })
 }
 
-/// Resolves a complete model-file set from the local repository cache when available.
+/// Resolves a model-file set from the local Hub cache when it holds
+/// `tokenizer.json`, returning `None` otherwise.
 fn resolve_cached_model_files(model_id: &str) -> Result<Option<ResolvedModelFiles>> {
     let cache_repo = Cache::from_env().model(model_id.to_string());
     let Some(tokenizer_path) = cache_repo.get("tokenizer.json") else {
@@ -132,6 +161,7 @@ fn resolve_cached_model_files(model_id: &str) -> Result<Option<ResolvedModelFile
             Error::invalid("resolved tokenizer file has no parent directory".to_string())
         })?
         .to_path_buf();
+
     let config_path = match cache_repo.get("config.json") {
         Some(path) if config_json_is_usable(&path) => Some(path),
         other => cache_repo.get("llm_config.json").or(other),
@@ -161,7 +191,7 @@ async fn download_if_present(
     }
 }
 
-/// Downloads the known file.
+/// Downloads a file the caller expects to exist, or returns its cached copy.
 async fn download_known_file(repo: &ApiRepo, model_id: &str, filename: &str) -> Result<PathBuf> {
     repo.get(filename).await.map_err(|error| Error::Remote {
         model: model_id.to_owned(),
@@ -169,7 +199,8 @@ async fn download_known_file(repo: &ApiRepo, model_id: &str, filename: &str) -> 
     })
 }
 
-/// Builds an authenticated model-hub API client.
+/// Builds a Hub API client with download progress enabled, authenticated by
+/// a non-empty `HF_TOKEN` and otherwise by the cache's token file, if any.
 fn build_api(model_id: &str) -> Result<Api> {
     let mut builder = ApiBuilder::from_env().with_progress(true);
     if let Ok(token) = std::env::var(HF_TOKEN_ENV)
@@ -189,7 +220,8 @@ fn local_file_if_exists(dir: &Path, filename: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// Returns whether a local model configuration is readable.
+/// Returns whether a configuration file is readable JSON that declares
+/// `model_type` or `architectures`.
 fn config_json_is_usable(path: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(path) else {
         return false;
@@ -200,7 +232,8 @@ fn config_json_is_usable(path: &Path) -> bool {
     }
 }
 
-/// Resolves the local config path.
+/// Selects the architecture config in a local directory with the same
+/// precedence as [`ResolvedModelFiles::config_path`] documents.
 fn resolve_local_config_path(dir: &Path) -> Option<PathBuf> {
     if let Some(path) = local_file_if_exists(dir, "config.json")
         && config_json_is_usable(&path)
@@ -211,7 +244,11 @@ fn resolve_local_config_path(dir: &Path) -> Option<PathBuf> {
         .or_else(|| local_file_if_exists(dir, "config.json"))
 }
 
-/// Selects the chat template sibling.
+/// Selects the standalone chat template from a repository listing.
+///
+/// `chat_template.json` wins over `chat_template.jinja`; otherwise the first
+/// top-level `.jinja` file in lexicographic order is used. Templates in
+/// subfolders are never selected.
 fn select_chat_template_sibling<'a>(
     siblings: &std::collections::BTreeSet<&'a str>,
 ) -> Option<&'a str> {
@@ -227,7 +264,9 @@ fn select_chat_template_sibling<'a>(
         .find(|name| name.ends_with(".jinja") && !name.contains('/'))
 }
 
-/// Discovers the chat template in dir.
+/// Discovers a standalone chat template in a local or cached checkpoint
+/// directory, with the same named-file precedence as
+/// [`select_chat_template_sibling`].
 fn discover_chat_template_in_dir(dir: &Path) -> Option<PathBuf> {
     for filename in ["chat_template.json", "chat_template.jinja"] {
         let path = dir.join(filename);
@@ -235,6 +274,8 @@ fn discover_chat_template_in_dir(dir: &Path) -> Option<PathBuf> {
             return Some(path);
         }
     }
+    // Directory iteration order is platform-defined, so with several
+    // top-level `.jinja` files the choice among them is unspecified.
     std::fs::read_dir(dir)
         .ok()?
         .flatten()

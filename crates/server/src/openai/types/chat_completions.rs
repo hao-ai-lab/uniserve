@@ -15,6 +15,15 @@ use super::common::{
 };
 
 /// The configured OpenAI-compatible chat request.
+///
+/// The route's `ValidatedJson` extractor deserializes it (unknown fields are
+/// rejected), calls [`Normalizable::normalize`], and then runs the field
+/// validators below and `validate_chat_cross_parameters`. The served-model
+/// and `prompt_logprobs` checks run later in `validate_request_compat`, and
+/// `InputProcessor::preprocess_chat_request` lowers the request into serving
+/// inputs. Besides the OpenAI fields, the schema accepts sampling and output
+/// extensions such as `top_k`, `min_p`, `prompt_logprobs`, and
+/// `return_token_ids`.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -28,7 +37,8 @@ pub struct ChatCompletionRequest {
     /// Frequency-based token penalty in the inclusive range `[-2, 2]`.
     #[validate(range(min = -2.0, max = 2.0))]
     pub frequency_penalty: Option<f32>,
-    /// Additive sampling biases keyed by decimal token identifier.
+    /// Additive sampling biases keyed by decimal token identifier. Keys are
+    /// parsed by `convert_logit_bias` during lowering, not by serde.
     pub logit_bias: Option<HashMap<String, f32>>,
     /// Whether generated-token log probabilities are returned.
     #[serde(default)]
@@ -42,7 +52,8 @@ pub struct ChatCompletionRequest {
     /// Presence-based token penalty in the inclusive range `[-2, 2]`.
     #[validate(range(min = -2.0, max = 2.0))]
     pub presence_penalty: Option<f32>,
-    /// Deterministic sampling seed.
+    /// Deterministic sampling seed. `apply_sampling` reinterprets the signed
+    /// value's bit pattern as `u64`.
     pub seed: Option<i64>,
     /// Text sequences that terminate generation.
     #[validate(custom(function = "validate_stop"))]
@@ -91,22 +102,29 @@ pub struct ChatCompletionRequest {
     /// Whether special tokens are omitted during text decoding.
     #[serde(default = "default_true")]
     pub skip_special_tokens: bool,
-    /// Number of alternate prompt-token logprobs, or `-1` for all.
+    /// Number of alternate prompt-token logprobs, or `-1` for all. The bound
+    /// and its interaction with `stream` are checked by
+    /// `validate_request_compat`.
     pub prompt_logprobs: Option<i32>,
     /// Optional whitelist of token identifiers eligible for sampling.
     pub allowed_token_ids: Option<Vec<u32>>,
     /// Text sequences excluded from generated output.
     pub bad_words: Option<Vec<String>>,
     /// Whether parsed reasoning content is included in responses.
+    ///
+    /// When false, response assembly also withholds output logprobs and token
+    /// IDs that would expose hidden reasoning tokens; a non-streaming
+    /// response that contains reasoning omits them for the whole completion.
     #[serde(default = "default_true")]
     pub include_reasoning: bool,
     /// Scheduler priority assigned to the request.
     pub priority: Option<i32>,
-    /// Whether token strings are rendered as token-identifier placeholders.
+    /// Whether logprob token strings are rendered as `token_id:<id>`
+    /// placeholders.
     pub return_tokens_as_token_ids: Option<bool>,
     /// Whether response objects include generated token identifiers.
     pub return_token_ids: Option<bool>,
-    /// Caller-provided salt used to isolate prompt-cache entries.
+    /// Caller-provided salt folded into the prompt-cache isolation key.
     pub cache_salt: Option<String>,
 }
 
@@ -144,7 +162,7 @@ pub struct ChatImageConfig {
     pub image_guidance_scale: Option<f32>,
     /// Image-generation random seed.
     pub seed: Option<u64>,
-    /// Number of images to generate.
+    /// Maximum number of generated images.
     pub num_images: Option<u16>,
     /// Classifier-free-guidance renormalization policy.
     pub cfg_norm: Option<uniserve_core::CfgRenorm>,
@@ -157,7 +175,11 @@ pub struct ChatImageConfig {
 }
 
 impl Normalizable for ChatCompletionRequest {
-    /// Normalizes the value into its canonical representation.
+    /// Defaults `tool_choice` when `tools` is present: `none` for an empty
+    /// list and `auto` otherwise.
+    ///
+    /// `ValidatedJson` calls this before validation, so
+    /// `validate_chat_cross_parameters` sees the defaulted value.
     fn normalize(&mut self) {
         if self.tool_choice.is_none()
             && let Some(tools) = &self.tools
@@ -189,7 +211,8 @@ pub struct ChatCompletionResponse {
     pub usage: Option<Usage>,
     /// Backend fingerprint, when reported.
     pub system_fingerprint: Option<String>,
-    /// Prompt logprobs aligned to prompt positions, when requested.
+    /// Prompt logprobs aligned to prompt positions, when requested. The
+    /// first entry is `null` because the first prompt token is not scored.
     pub prompt_logprobs: Option<Vec<Option<HashMap<String, f32>>>>,
     /// Prompt token identifiers, when requested.
     pub prompt_token_ids: Option<Vec<u32>>,
@@ -218,7 +241,7 @@ pub struct ChatCompletionChoice {
 pub struct AssistantRole;
 
 impl fmt::Display for AssistantRole {
-    /// Formats the value for diagnostic output.
+    /// Writes `assistant`; `SerializeDisplay` uses this as the wire value.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("assistant")
     }
@@ -237,13 +260,18 @@ pub struct ChatCompletionMessage {
     /// Parsed reasoning content, when requested.
     #[serde(rename = "reasoning_content")]
     pub reasoning: Option<String>,
-    /// Generated image content, when produced.
+    /// Generated images as `image_url` parts carrying PNG data URLs, when
+    /// produced.
     pub images: Option<Vec<ContentPart>>,
 }
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 /// One server-sent chat-completion chunk.
+///
+/// Chunks have no `prompt_logprobs` field; `validate_request_compat` rejects
+/// a streamed request that asks for a positive or `-1` `prompt_logprobs`
+/// count.
 pub struct ChatCompletionStreamResponse {
     /// OpenAI-compatible completion identifier.
     pub id: String,
@@ -337,6 +365,10 @@ fn validate_messages(messages: &[ChatMessage]) -> Result<(), validator::Validati
 }
 
 /// Validates dependencies and bounds that span multiple chat request fields.
+///
+/// Each failure is reported by its error code alone. `ValidatedJson` forwards
+/// the `validator` display text, which includes that code, as the client's
+/// invalid-request message, so the codes are part of the public error text.
 fn validate_chat_cross_parameters(
     request: &ChatCompletionRequest,
 ) -> Result<(), validator::ValidationError> {
@@ -345,11 +377,13 @@ fn validate_chat_cross_parameters(
             "top_logprobs_requires_logprobs",
         ));
     }
+
     if request.stream_options.is_some() && !request.stream {
         return Err(validator::ValidationError::new(
             "stream_options_requires_stream",
         ));
     }
+
     if let (Some(minimum), Some(maximum)) = (request.min_tokens, request.max_completion_tokens)
         && minimum > maximum
     {
@@ -357,6 +391,7 @@ fn validate_chat_cross_parameters(
             "min_tokens_exceeds_max_completion_tokens",
         ));
     }
+
     if request.modalities.is_empty() {
         return Err(validator::ValidationError::new("modalities_empty"));
     }
@@ -368,6 +403,7 @@ fn validate_chat_cross_parameters(
     if unique.len() != request.modalities.len() {
         return Err(validator::ValidationError::new("modalities_duplicate"));
     }
+
     let image_output = request.modalities.contains(&ChatModality::Image);
     if !image_output && request.image_config.is_some() {
         return Err(validator::ValidationError::new(
@@ -382,6 +418,9 @@ fn validate_chat_cross_parameters(
             return Err(validator::ValidationError::new("image_config_bounds"));
         }
     }
+
+    // After normalization, an explicit `auto` without a non-empty tool list
+    // is the only failing combination.
     if let Some(ToolChoice(choice)) = &request.tool_choice
         && *choice != ToolChoiceValue::None
         && !request
