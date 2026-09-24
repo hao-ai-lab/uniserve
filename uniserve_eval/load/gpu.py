@@ -1,4 +1,12 @@
-"""Samples host-visible NVIDIA GPU storage and utilization telemetry."""
+"""Samples host-visible NVIDIA GPU storage and utilization telemetry.
+
+``run_point`` runs a ``GpuStorageSampler`` around the warmup and measured
+load and persists its raw samples as ``gpu_samples.jsonl`` and its summary
+under the ``gpu_memory`` key. Readings come from ``nvidia-smi``, which
+reports every GPU it can see, not only those the server uses, and
+device-wide memory use, so they include processes other than the server
+under test. Memory is in MiB and utilization in percent.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +19,18 @@ from typing import Any
 
 
 def _read_gpu_rows() -> list[dict[str, int]]:
-    """Read one numeric telemetry row per GPU from nvidia-smi."""
+    """Read one numeric telemetry row per GPU from nvidia-smi.
+
+    Returns:
+        Rows in ``nvidia-smi`` output order, or an empty list when the
+        command exits nonzero. Lines that do not split into three integer
+        fields are skipped.
+
+    Raises:
+        OSError: If ``nvidia-smi`` cannot be executed.
+        subprocess.TimeoutExpired: If the query takes longer than its
+            timeout.
+    """
     out = subprocess.run(
         [
             "nvidia-smi",
@@ -44,11 +63,19 @@ def _read_gpu_rows() -> list[dict[str, int]]:
 
 @dataclass
 class GpuStorageSampler:
-    """Collects periodic GPU telemetry and aggregate peaks on a background thread."""  # noqa: E501
+    """Collects periodic GPU telemetry and aggregate peaks on a background thread.
+
+    After one ``start``, the sampling thread is the only writer while it
+    runs; read ``summary`` and ``sample_records`` after ``stop``. ``start``
+    does not check for a running thread, and the stop event is never
+    cleared, so a ``start`` after ``stop`` takes a single sample and exits.
+    """  # noqa: E501
 
     interval_s: float = 0.5
+    # Per-GPU lists are indexed by row position in ``nvidia-smi`` output.
     peak_per_gpu_mib: list[int] = field(default_factory=list)
     peak_utilization_gpu_pct: list[int] = field(default_factory=list)
+    # Running sum over samples of the utilization summed across GPUs.
     utilization_total_pct: int = 0
     peak_total_mib: int = 0
     samples: int = 0
@@ -69,14 +96,22 @@ class GpuStorageSampler:
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop sampling and join the background thread."""
+        """Stop sampling and join the background thread.
+
+        The join is bounded: a thread that has not finished by the timeout
+        keeps running as a daemon and ``stop`` returns anyway. Calling
+        ``stop`` more than once is harmless.
+        """
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=15)
             self._thread = None
 
     def _sample_once(self) -> None:
-        """Record one telemetry snapshot and update aggregate peaks."""
+        """Record one telemetry snapshot and update aggregate peaks.
+
+        A failed or empty query is dropped without counting as a sample.
+        """
         try:
             rows = _read_gpu_rows()
         except Exception:
@@ -85,6 +120,8 @@ class GpuStorageSampler:
             return
         used = [row["memory_used_mib"] for row in rows]
         util = [row["utilization_gpu_pct"] for row in rows]
+
+        # The peak lists grow to the largest GPU count seen so far.
         if len(self.peak_per_gpu_mib) < len(used):
             self.peak_per_gpu_mib.extend(
                 [0] * (len(used) - len(self.peak_per_gpu_mib))
@@ -114,7 +151,11 @@ class GpuStorageSampler:
             self._sample_once()
 
     def summary(self) -> dict[str, Any] | None:
-        """Return aggregate telemetry, or ``None`` when no sample succeeded."""
+        """Return aggregate telemetry, or ``None`` when no sample succeeded.
+
+        ``mean_total_utilization_gpu_pct`` averages the per-sample sum across
+        GPUs, so it can exceed 100 on multi-GPU hosts.
+        """
         if self.samples == 0:
             return None
         return {

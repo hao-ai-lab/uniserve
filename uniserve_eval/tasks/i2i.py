@@ -24,7 +24,15 @@ class I2ITask(BenchmarkTask):
     image_count: ClassVar[ImageCountRule] = ImageCountRule.OPTIONAL
 
     def build_request(self, example: Example) -> TaskRequest:
-        """Build a non-streaming image request with an embedded source image."""
+        """Build a non-streaming image request with an embedded source image.
+
+        ``image_config.num_images`` is sent only when the point configures
+        ``image_count``; otherwise the count is left to the server.
+
+        Raises:
+            ValueError: If the row has no base64 image or an invalid MIME
+                type.
+        """
         payload: dict[str, object] = {
             "model": self.point.model,
             "modalities": ["image"],
@@ -53,7 +61,13 @@ class I2ITask(BenchmarkTask):
     def validate_output(
         self, records: Sequence[RequestRecord]
     ) -> ValidationResult:
-        """Check image presence, integrity, geometry, and configured count."""
+        """Check image presence, integrity, geometry, and configured count.
+
+        Decoded sizes are compared with the point's configured width and
+        height; per-row size overrides are not considered. Without a
+        configured ``image_count``, any positive number of images per request
+        passes.
+        """
         checks = self.image_integrity_checks(records)
         checks["image_output"] = bool(records) and all(
             record.images > 0 for record in records

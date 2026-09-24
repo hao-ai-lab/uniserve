@@ -11,6 +11,7 @@ from .t2i import T2ITask
 from .text import TextTask
 from .video import VideoTask
 
+# Keyed by `TaskName` value strings, the form profiles declare.
 TASKS: dict[str, type[BenchmarkTask]] = {
     TaskName.TEXT.value: TextTask,
     TaskName.T2I.value: T2ITask,
@@ -22,7 +23,11 @@ TASKS: dict[str, type[BenchmarkTask]] = {
 
 
 def get_task(name: str | TaskName) -> type[BenchmarkTask]:
-    """Return the task adapter registered under a task identifier."""
+    """Return the task adapter registered under a task identifier.
+
+    Raises:
+        KeyError: If no adapter is registered under the identifier.
+    """
     key = name.value if isinstance(name, TaskName) else name
     if key not in TASKS:
         known = ", ".join(sorted(TASKS)) or "(none)"
