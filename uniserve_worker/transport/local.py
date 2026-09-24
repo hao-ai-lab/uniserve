@@ -1,4 +1,11 @@
-"""In-process tensor publication and borrowed consumer views."""
+"""In-process tensor publication and borrowed consumer views.
+
+A `local` publication is read only within the producer's own address space
+and on the source device. Its locator carries the publishing instance's
+endpoint name and an integer key into that instance's table; a reader finds
+the owning instance through the process-wide `_endpoints` registry, so any
+`LocalTransport` in the process can read another's publications.
+"""
 
 from __future__ import annotations
 
@@ -36,6 +43,20 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class _LocalSource:
+    """One registered publication and its reclamation state.
+
+    Attributes:
+        tensor: The detached published views.
+        event: Producer fence recorded at publication; None for a CPU source.
+        capacity: Budget the publication's bytes are reserved against.
+        locator: The exact locator the publication was registered under.
+        readers: Copies and borrowed views taken and not yet finished.
+        released: New reads are revoked, by `release` or `close`.
+        reclaiming: Hand-back has started; `retirement` completes once the
+            producer fence, if any, drains.
+        retirement: Completes when the bytes are returned to `capacity`.
+    """
+
     tensor: torch.Tensor | tuple[torch.Tensor, ...]
     event: torch.cuda.Event | None
     capacity: TransferCapacity
@@ -53,7 +74,11 @@ class _LocalSource:
 
 
 class LocalTransport(Transport):
-    """Same process, zero copy. The locator is a counter into a local table."""
+    """Publications read in the producer's process through a local table.
+
+    A read without a destination borrows the published views themselves and
+    copies nothing; a read with one copies into it on the read pool.
+    """
 
     name = "local"
 
@@ -68,6 +93,8 @@ class LocalTransport(Transport):
         self.source = source or WorkerEndpoint.local()
         self._table: dict[int, _LocalSource] = {}
         self._borrowed: weakref.WeakSet[TransferTicket] = weakref.WeakSet()
+        # Borrowed views draw on the same read-ticket semaphore as the copies
+        # `TransferPool` submits.
         self._borrow_slots = capacity.read_slots
         self._events = event_pool
         self._next = 0
@@ -283,6 +310,8 @@ class LocalTransport(Transport):
         self._borrow_slots.release()
 
     def _reclaim(self, source: _LocalSource) -> None:
+        # A source is handed back once, after new reads were revoked and its
+        # last reader finished; a CPU source has no fence to wait on.
         if not source.released or source.readers != 0 or source.reclaiming:
             return
         source.reclaiming = True
@@ -318,6 +347,9 @@ class LocalTransport(Transport):
                 return None
             source.released = True
             self._reclaim(source)
+            # A retirement waiting on the producer fence completes only when an
+            # `EventPool.reap` observes it, so the controller is woken once the
+            # fence completes.
             if not source.retirement.done() and source.event is not None:
                 self._events.schedule_completion_wake(
                     (
@@ -341,6 +373,8 @@ class LocalTransport(Transport):
                 for source in values:
                     source.released = True
                     self._reclaim(source)
+            # Drain each remaining fence. A source still unretired after that,
+            # such as one with a reader outstanding, raises `resource_error`.
             for source in values:
                 if not source.retirement.done() and source.event is not None:
                     source.event.synchronize()

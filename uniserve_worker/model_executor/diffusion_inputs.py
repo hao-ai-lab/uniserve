@@ -1,4 +1,11 @@
-"""Worker construction of image trajectory noise and numerical coordinates."""
+"""Worker construction of image trajectory noise and numerical coordinates.
+
+Serves ``ImageDenoiser`` networks, whose image sequence attends to a cached
+token prefix chosen per guidance branch. ``ImageBuilder`` wraps the model's
+``ImageDenoiser`` for the worker's execution code; ``DiffusionRow`` is the
+per-sequence input row the image path stages; ``resolve_prefix`` chooses the
+token prefix each guidance branch conditions on.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +30,10 @@ class ImageBuilder:
     the worker inserts a generated image into a continuing conversation.
     """
 
+    # Language positions a generated image spans in the conversation:
+    # ``uniserve_worker.execution.image`` places the closing framing token
+    # this far past the opening one, and ``uniserve_worker.execution.token``
+    # advances the request's logical position by it after the image.
     rope_advance = 2
 
     def __init__(self, denoiser: ImageDenoiser):
@@ -39,6 +50,7 @@ class ImageBuilder:
         return self.denoiser.max_sequence_tokens
 
     def sequence_length(self, size: image.Config) -> int:
+        """Patch tokens of an image of ``size`` plus its framing tokens."""
         return self.denoiser.latent_shape("image", size)[0] + self.framing
 
     def bind(
@@ -64,16 +76,19 @@ class ImageBuilder:
     def positions(
         self, size: image.Config, temporal: int, *, device
     ) -> torch.Tensor:
-        """Construct temporal/height/width coordinates in model sequence.
+        """Construct temporal/height/width coordinates in model sequence order.
 
-        order.
+        Returns an int64 tensor of shape [3, ``sequence_length(size)``] on
+        ``device``. Row 0 is ``temporal`` at every position, framing tokens
+        included; rows 1 and 2 hold each patch's row and column in raster
+        order. Framing tokens, when present, are assumed to be one leading
+        and one trailing token, and keep zero spatial coordinates.
         """
         stride = self.denoiser.downsample
         height, width = size.height // stride, size.width // stride
         count = self.sequence_length(size)
 
-        # [3, count]: one (temporal, height, width) coordinate per sequence
-        # position; framing tokens keep zero h/w coordinates at the edges.
+        # [3, count]: one (temporal, height, width) coordinate per position.
         result = torch.zeros((3, count), dtype=torch.int64, device=device)
         result[0].fill_(temporal)
         interior = result[:, 1:-1] if self.framing else result
@@ -97,9 +112,15 @@ class ImageBuilder:
     def initialize(
         self, size: image.Config, *, seed: int, out: torch.Tensor
     ) -> None:
-        """Draw on the trajectory device and preserve the model's native RNG.
+        """Fill ``out`` with one image's seeded initial latent.
 
-        order.
+        Noise is drawn in the model's native ``noise_shape`` on ``out``'s
+        device and converted by the model's ``prepare_latents``, so the
+        random sequence follows the model's native draw order.
+
+        Raises:
+            ValueError: If ``out`` does not have the canonical
+                ``latent_shape`` for ``size``.
         """
         if out.shape != self.denoiser.latent_shape("image", size):
             raise ValueError(
@@ -153,7 +174,21 @@ def resolve_prefix(
     negative_token_ids: tuple[int, ...],
     tokenizer: Any | None,
 ) -> tuple[tuple[int, ...], bool]:
-    """Resolve a branch prefix and detect empty positive-prompt conditioning."""
+    """Resolve the token prefix one guidance branch conditions on.
+
+    Returns:
+        The branch's prefix token ids and whether the branch instead reuses
+        the request's own conditioning KV. The conditioned branch reuses it
+        when ``image_prompt`` is blank; the negative branch uses
+        ``negative_token_ids`` when present. Otherwise the model's
+        ``FlowPrompt`` encodes the branch text (the image prompt, the negative
+        prompt, or empty text for ``BranchSource.START``), and without a
+        ``FlowPrompt`` the prefix is empty.
+
+    Raises:
+        WorkerError: An ``invalid_descriptor`` error when a non-blank
+            ``image_prompt`` targets a model without a ``FlowPrompt``.
+    """
     if source is BranchSource.CONDITIONING and not image_prompt.strip():
         return (), True
     if source is BranchSource.NEGATIVE_OR_START and negative_token_ids:

@@ -1,4 +1,17 @@
-"""Worker backing for scheduler-placed cross-call buffers."""
+"""Worker backing for scheduler-placed cross-call buffers.
+
+The engine scheduler places each cross-call output buffer at a byte offset in
+one logical pool of `WorkerInfo.buffer_pool_bytes` (`BufferAllocation`).
+`BufferPool` backs that pool with one fixed byte arena per worker device and
+returns typed tensor views over it; `TensorStore` binds and releases those
+views for the products it records.
+
+In the default mode a binding occupies exactly the scheduler's
+``[offset, offset + bytes)`` span. When this rank's physical pool is smaller
+than the logical pool, which happens when it produces or consumes only some
+components' products, `Worker` enables ``compact`` mode: scheduler offsets
+are ignored and each binding is placed first-fit in the physical arena.
+"""
 
 from __future__ import annotations
 
@@ -30,7 +43,13 @@ def _invariant(message: str) -> WorkerError:
 
 @dataclass(frozen=True, slots=True)
 class BufferBinding:
-    """Binds a logical buffer allocation to its validated tensor view."""
+    """Binds a logical buffer allocation to its validated tensor view.
+
+    ``physical_offset`` and ``physical_bytes`` give the byte span reserved in
+    the device arena, which can exceed the tensor's own bytes.
+    ``binding_id`` is unique per pool and distinguishes successive bindings
+    of the same buffer, so `BufferPool.release` rejects a stale binding.
+    """
 
     buffer: BufferId
     physical_offset: int
@@ -41,7 +60,11 @@ class BufferBinding:
 
 
 class BufferPool:
-    """One fixed byte-addressed arena per worker-owned device."""
+    """One fixed byte-addressed arena per worker-owned device.
+
+    Each arena is ``byte_capacity`` uint8 bytes. Live bindings on one device
+    never overlap; `bind` enforces this under a lock.
+    """
 
     def __init__(
         self,
@@ -50,9 +73,14 @@ class BufferPool:
         devices: tuple[torch.device | str, ...],
         compact: bool = False,
     ) -> None:
-        """Allocate one persistent arena, optionally remapping logical.
+        """Allocate one persistent arena per distinct device.
 
-        allocations.
+        Devices are canonicalized and deduplicated; an empty ``devices``
+        tuple allocates a single CPU arena. ``compact`` selects first-fit
+        placement instead of the scheduler's offsets.
+
+        Raises:
+            ValueError: When ``byte_capacity`` is negative.
         """
         self.byte_capacity = int(byte_capacity)
         if self.byte_capacity < 0:
@@ -89,7 +117,14 @@ class BufferPool:
         self._lock = RLock()
 
     def _compact_offset_locked(self, device_name: str, extent: int) -> int:
-        """Return the first aligned gap that can hold one physical binding."""
+        """Return the first aligned gap that can hold one physical binding.
+
+        Caller must hold ``_lock``.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when no gap on the device
+                can hold ``extent`` bytes.
+        """
         cursor = 0
         active_bindings = sorted(
             (
@@ -101,6 +136,9 @@ class BufferPool:
         )
 
         # Bindings start on 256-byte boundaries so any dtype view stays aligned.
+        # Product storage sizing in `bootstrap.capacity`
+        # (`product_storage_bytes`, `local_product_storage_bytes`) applies the
+        # same 256-byte rounding per product.
         for active in active_bindings:
             start = ((cursor + 255) // 256) * 256
             if start + extent <= active.physical_offset:
@@ -131,7 +169,17 @@ class BufferPool:
     ) -> BufferBinding:
         """Validate a buffer allocation and return its device tensor view.
 
-        with generation ownership.
+        The view has ``shape`` and ``dtype`` and starts at the reserved
+        span's first byte. The binding stays live until `release` receives
+        this exact binding.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when the device is not one of
+                the pool's devices, the allocation names another buffer, the
+                tensor is empty or larger than the allocation, its offset is
+                not aligned for ``dtype``, the buffer is already bound on the
+                device, the span exceeds the arena, or it overlaps a live
+                binding.
         """
         target = canonical_device(device)
         device_name = str(target)
@@ -162,6 +210,9 @@ class BufferPool:
             if key in self._active:
                 raise invalid_descriptor("buffer allocation is already bound")
 
+            # Compact mode reserves only the tensor's bytes rounded up to the
+            # 256-byte binding alignment; otherwise the scheduler's span is
+            # used as placed.
             extent = (
                 ((required + 255) // 256) * 256
                 if self.compact
@@ -189,6 +240,8 @@ class BufferPool:
                         "buffer allocation overlaps a live worker buffer"
                     )
 
+            # The view covers only the tensor's bytes; the rest of the extent
+            # stays reserved but unaddressed.
             tensor = arena.narrow(0, start, required).view(dtype).reshape(shape)
             binding = BufferBinding(
                 buffer=allocation.buffer,
@@ -203,7 +256,15 @@ class BufferPool:
             return binding
 
     def release(self, binding: BufferBinding) -> None:
-        """Release one generation-tagged persistent buffer binding."""
+        """Release one generation-tagged persistent buffer binding.
+
+        The caller must have retired every use of the binding's tensor; the
+        pool does not track device work or reader grants.
+
+        Raises:
+            WorkerError: A fatal ``INVARIANT_VIOLATION`` when the binding is
+                no longer the live one for its buffer.
+        """
         key = (binding.device_name, binding.buffer)
         with self._lock:
             current = self._active.get(key)
@@ -212,9 +273,10 @@ class BufferPool:
             self._active.pop(key)
 
     def close(self) -> None:
-        """Release arenas after the caller retires their device uses and reader.
+        """Drop every binding and arena reference.
 
-        grants.
+        The caller must first retire all device uses and reader grants of the
+        arenas; this method does not wait for them.
         """
         with self._lock:
             self._active.clear()

@@ -1,4 +1,12 @@
-"""Tensor representation, source regions, and destination span validation."""
+"""Tensor representation, source regions, and destination span validation.
+
+A published product or a read destination is either one tensor or a tuple of
+first-axis spans: views that concatenate along axis 0 into one logical
+tensor, such as pages of a paged allocation. The helpers here select regions
+of either form and walk two partitions together without packing them into a
+contiguous tensor. Dtypes travel as unqualified torch names, such as
+`bfloat16`.
+"""
 
 from __future__ import annotations
 
@@ -25,6 +33,11 @@ def validate_destination(
     Separate shard reads must not alias each other's destinations. Page views
     can interleave across a layer-major allocation, so overlapping envelopes
     are resolved into their actual contiguous physical intervals.
+
+    Raises:
+        WorkerError: `invalid_descriptor` when the dtype, device or shape
+            disagree with the published representation, or when any two
+            destination elements may share storage.
     """
     spans = destination if isinstance(destination, tuple) else (destination,)
     if not spans or any(
@@ -56,9 +69,10 @@ def validate_destination(
             "transfer destination disagrees with the published representation"
         )
 
-    # First pass: a coarse per-span envelope [data_ptr, data_ptr + extent). A
-    # stride smaller than the accumulated extent proves the view indexes the
-    # same element twice, which is rejected outright.
+    # First pass: a coarse per-span envelope [data_ptr, data_ptr + extent),
+    # with axes visited in ascending stride. A stride smaller than the extent
+    # already spanned by the smaller-stride axes may index an element twice;
+    # such a view is rejected outright, conservatively.
     ranges = []
     for span in spans:
         extent = 1
@@ -181,7 +195,10 @@ def resolve_dtype(name: str) -> torch.dtype:
 
 
 def tensor_nbytes(tensor: torch.Tensor | tuple[torch.Tensor, ...]) -> int:
-    """Return the physical byte size of a tensor view."""
+    """Return the byte size of a view's elements, summed over its spans.
+
+    Strided gaps between elements are not counted.
+    """
     spans = tensor if isinstance(tensor, tuple) else (tensor,)
     return sum(int(span.numel() * span.element_size()) for span in spans)
 
@@ -192,7 +209,17 @@ def read_destination(
     destination: torch.Tensor | tuple[torch.Tensor, ...] | None,
     region: tuple[slice, ...] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    """Validate exact read bounds and writable, disjoint destination spans."""
+    """Return the destination for reading `region` of a published view.
+
+    `region` is in the published view's coordinates and defaults to the whole
+    view. Without a destination, a new tensor of the region's shape is
+    allocated on `device`; a given destination is checked by
+    `validate_destination`.
+
+    Raises:
+        WorkerError: `invalid_descriptor` when the region exceeds the
+            published view or the destination does not match it.
+    """
     import torch
 
     region = region or tuple(
@@ -221,7 +248,19 @@ def publication_views(
 ) -> tuple[
     torch.Tensor | tuple[torch.Tensor, ...], tuple[int, ...], tuple[int, ...]
 ]:
-    """Validate ordered first-axis spans and retain their immutable views."""
+    """Validate ordered first-axis spans and retain their immutable views.
+
+    Returns:
+        The detached source in the caller's form (one tensor or a tuple of
+        spans), its logical shape, and its offset within the logical tensor,
+        zero on every axis when `offset` is omitted.
+
+    Raises:
+        WorkerError: `invalid_descriptor` when there are no spans, when they
+            are zero-dimensional, disagree on rank, dtype, device or trailing
+            dimensions, or have an empty axis, or when `offset` is not one
+            non-negative integer per axis.
+    """
     spans = tensor if isinstance(tensor, tuple) else (tensor,)
     if not spans:
         raise invalid_descriptor("publication has no source spans")

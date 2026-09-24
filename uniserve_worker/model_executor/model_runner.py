@@ -1,4 +1,18 @@
-"""Prepared numerical calls with owned inputs and graph residency."""
+"""Prepared numerical calls with owned inputs and graph residency.
+
+``ModelRunner`` is the base of the per-capability runners that
+``runner_type`` selects (text, diffusion, encoder, decoder). The base runner
+serves two call paths:
+
+- Staged batches: ``prepare_inputs`` stages rows into the runner's
+  ``InputBuffers``, and ``run_batch`` replays a graph bucket selected by
+  ``select_graph_shape`` or runs eagerly. Buckets are captured during startup
+  through ``capture_batch``; once ``ModelExecutor.complete_startup`` seals
+  the runner, no batch graph is captured.
+- Standalone invocations: ``execute_model`` evaluates one module call from
+  ``ModelExecutor.run_module`` and, when graph pools exist, captures a graph
+  per exact input signature on first use, at any time.
+"""
 
 from __future__ import annotations
 
@@ -94,11 +108,27 @@ class ModelRunner(Execution, ABC):
         )
 
     def select_graph_shape(self, batch, *, eligible):
-        """Use the exact numerical signature for non-text graph variants."""
+        """Use the exact numerical signature for non-text graph variants.
+
+        Returns ``None`` for eager execution: when the caller marks the batch
+        ineligible, graphs are disabled (no pools), or ``prefill_graph`` is off,
+        which here also disables exact graphs. Otherwise returns ``(key,
+        execution, bucketed)``: the graph key, the batch to replay, and whether
+        the key names a configured bucket that may be captured on first use
+        before startup is sealed. Exact keys are never bucketed.
+        """
         if not eligible or not self.pools or not self.prefill_graph:
             return None
+
+        # Only token and denoising batches reach this point: ``ModelExecutor``
+        # marks only those eligible, and startup captures only those. Their
+        # attention staging provides ``max_blocks_per_row``.
         execution = widen_prefix(batch, self.input_buffers.max_blocks_per_row)
         attention = getattr(execution.inputs, "attention", None)
+
+        # ``input_signature`` keys non-tensor leaves by value. Masking host
+        # prefix lengths lets calls that differ only in cached prefix length
+        # share one graph; ``replay_batch`` rebinds the live host lengths.
         keyed = execution
         if isinstance(attention, (PagedInput, SegmentedInput)):
             keyed = replace(
@@ -124,11 +154,19 @@ class ModelRunner(Execution, ABC):
 
     @torch.inference_mode()
     def execute_model(self, *args, **kwargs):
-        """Evaluate numerical arguments and return owned results."""
+        """Evaluate numerical arguments and return owned results.
+
+        The first call with a given input signature captures a graph when
+        pools exist; later calls replay it. The lane stream, when present,
+        waits for the caller's current stream before the call, and after a
+        successful call the caller's stream waits for the lane. The returned
+        output is a clone that does not alias graph storage.
+        """
         context, stream = self.context, self.context.stream
         if stream is not None:
             stream.wait(torch.cuda.current_stream(self.device))
         started, path = time.perf_counter_ns(), "eager"
+
         values = (args, kwargs)
         key = input_signature(values)
         bucket = self.buckets.get(key)
@@ -159,6 +197,7 @@ class ModelRunner(Execution, ABC):
             else:
                 result = self.call.forward(*args, **kwargs, **resources)
             output = self.result(result).clone()
+
         if stream is not None:
             torch.cuda.current_stream(self.device).wait_stream(stream.stream)
         elapsed = (time.perf_counter_ns() - started) // 1000
@@ -196,9 +235,16 @@ class ModelRunner(Execution, ABC):
 
     @torch.inference_mode()
     def capture_batch(self, batch, forward):
-        """Capture a staged batch's graph on the entry stream.
+        """Capture a staged batch's graph on the entry stream, fenced.
 
-        fenced on both sides.
+        The lane stream waits for the caller's current stream first, and the
+        caller's stream waits for the lane afterwards, also on failure. A
+        batch without a selectable graph shape runs once eagerly instead,
+        and a key that is already resident is not captured again.
+
+        Raises:
+            CUDAGraphError: Startup preparation is sealed, graph residency
+                exceeds its byte budget, or the capture itself fails.
         """
         context, stream = self.context, self.context.stream
         if stream is not None:
@@ -227,6 +273,7 @@ class ModelRunner(Execution, ABC):
             return
 
         invoke = partial(self.batch_forward, padded=True) if padded else forward
+
         # Text buckets use the entry's stable staging addresses, ordered on
         # its execution stream. Exact calls can include borrowed request
         # latents; own those inputs independently of their pool-slot lifetime.
@@ -249,6 +296,18 @@ class ModelRunner(Execution, ABC):
 
     @torch.inference_mode()
     def run_batch(self, batch, forward, *, eligible, borrow_output=False):
+        """Replay a resident graph for a staged batch or run it eagerly.
+
+        With ``borrow_output``, a replayed result views the graph's output
+        storage without a clone; the caller must finish reading it before
+        the bucket replays again. The result carries graph-dispatch
+        statistics only.
+
+        Raises:
+            CUDAGraphError: After startup, a configured text bucket that
+                the batch selects is not resident; before startup, capturing
+                a missing text bucket can also fail with it.
+        """
         with self.context.activate():
             return self._run_batch(
                 batch,
@@ -278,9 +337,12 @@ class ModelRunner(Execution, ABC):
                     ),
                 )
             if self._startup_complete:
-                # A physical bucket can serve additional numerical variants
-                # explicitly prepared through capture_batch. Unconfigured
-                # variants retain eager execution after startup is sealed.
+                # No capture happens after startup. A missing decode bucket
+                # (``key[1]`` is the text shape; its last field is the
+                # decode flag), or a missing prefill bucket whose causality
+                # and selection match a configured ``PrefillShape``, is an
+                # error. Only prefill variants matching no configured shape
+                # run eagerly.
                 configured = key[1][-1] or any(
                     shape.causal == execution.inputs.attention.causal[0]
                     and shape.selection is execution.token_selections[0]
@@ -305,6 +367,10 @@ class ModelRunner(Execution, ABC):
             rows=batch.row_count,
             borrow=borrow_output,
         )
+        # A decode bucket carries a force-finish column even for a batch
+        # staged without one (see ``TextRunner.select_graph_shape``), so its
+        # graph can return greedy continuations that such a batch did not
+        # request.
         if batch.decode_force_finish is None:
             result = replace(result, greedy=None)
 
@@ -348,7 +414,11 @@ class ModelRunner(Execution, ABC):
 
 
 def runner_type(module):
-    """Select a bound numerical runner from public model capabilities."""
+    """Select a bound numerical runner from public model capabilities.
+
+    Raises:
+        TypeError: ``module`` implements none of the supported capabilities.
+    """
     from uniserve.model import (
         AudioDecoder,
         CausalLM,
@@ -360,6 +430,8 @@ def runner_type(module):
     )
     from uniserve.nn.vae import PatchAutoencoder
 
+    # The runner modules import ``ModelRunner`` from this module, so they are
+    # imported here rather than at module scope.
     from .decoder_runner import DecoderRunner
     from .diffusion_runner import DiffusionRunner
     from .encoder_runner import EncoderRunner

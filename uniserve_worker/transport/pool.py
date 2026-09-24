@@ -1,4 +1,13 @@
-"""Shared byte reservations and bounded asynchronous transport reads."""
+"""Shared byte reservations and bounded asynchronous transport reads.
+
+`TransferCapacity` is one Worker rank's budget of reserved bytes and read
+tickets, shared by every backend `make_transports` builds. `TransferPool`
+runs one backend's reads on its own threads against that budget: a read holds
+its ticket slot and bytes from submission until it physically retires, and a
+CUDA read copies on a per-thread read stream that it drains before the read
+retires. `chunk_word` supplies the host words a read writes into a
+`vmm_pool` chunk header to claim and acknowledge that chunk.
+"""
 
 from __future__ import annotations
 
@@ -18,10 +27,20 @@ if TYPE_CHECKING:
 
 
 class TransferCapacity:
-    """Share a Worker rank's byte and read-ticket budget across its backends."""
+    """Share a Worker rank's byte and read-ticket budget across its backends.
+
+    Neither budget blocks: `acquire` raises `resource_error` when the bytes
+    are exhausted, and `read_slots` is taken without blocking by
+    `TransferPool.submit` and by `LocalTransport` for borrowed views, so an
+    exhausted budget surfaces as backpressure to the caller.
+    """
 
     def __init__(self, byte_capacity: int, ticket_capacity: int) -> None:
-        """Initialize reservations against a fixed positive capacity."""
+        """Initialize reservations against fixed capacities.
+
+        Raises:
+            ValueError: When either capacity is less than one.
+        """
         self.capacity = int(byte_capacity)
         self.ticket_capacity = int(ticket_capacity)
         if min(self.capacity, self.ticket_capacity) < 1:
@@ -45,7 +64,12 @@ class TransferCapacity:
             self.used = projected
 
     def release(self, amount: int) -> None:
-        """Return bytes after the physical owner releases its allocation."""
+        """Return bytes after the physical owner releases its allocation.
+
+        Raises:
+            RuntimeError: When `amount` is negative or exceeds the bytes
+                currently reserved.
+        """
         value = int(amount)
         with self._lock:
             if value < 0 or value > self.used:
@@ -63,6 +87,10 @@ def chunk_word(state: int) -> torch.Tensor:
     acknowledgment follows its last, so a producing rank sweeping a retired
     publication can tell a consumer that is still reading from one that never
     began.
+
+    One tensor is cached per state value and shared by every thread and read
+    in the process, so it is only ever a copy source and must never be
+    written.
     """
     import torch
 
@@ -72,7 +100,12 @@ def chunk_word(state: int) -> torch.Tensor:
 class TransferPool:
     """Bounds asynchronous transfers for one transport backend.
 
-    Both transfer count and aggregate bytes are bounded.
+    Both transfer count and aggregate bytes are bounded, by the
+    `TransferCapacity` shared with the rank's other backends.
+
+    A failure that arrives after a ticket already exposed its views, or a
+    read whose device access could not be drained, is recorded on the pool:
+    every later `submit` and `close` raise it.
     """
 
     def __init__(
@@ -94,13 +127,19 @@ class TransferPool:
         self._completion_wake: Any = None
         self._lock = threading.Lock()
         self._error: BaseException | None = None
+        # Tickets of reads that could not be drained, referenced for the
+        # pool's lifetime so the resources they retain are never freed.
         self._unretired: list[TransferTicket] = []
+        # One read stream per (transport thread ident, device), created on
+        # first use by `copy`.
         self._read_streams: dict[tuple[int, str], torch.cuda.Stream] = {}
 
     def set_completion_wake(self, wake: Any) -> None:
         """Install the controller callback for transfer completion.
 
-        The callback is invoked after an asynchronous transfer finishes.
+        Tickets submitted afterwards invoke the callback when they become
+        ready or fail and when they physically retire. A failure that arrives
+        after a ticket's readiness also invokes it.
         """
         self._completion_wake = wake
 
@@ -111,7 +150,21 @@ class TransferPool:
         nbytes: int,
         destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
     ) -> TransferTicket:
-        """Reserve a read and retain the caller's destination stream."""
+        """Reserve a read and run `call(ticket, *args)` on a transport thread.
+
+        `call` is `copy` itself or a backend read routine that ends by
+        calling it. When `destination` is on a CUDA device, the caller's
+        current stream on that device is recorded here, on the caller's
+        thread, so the read stream waits for work the caller already queued
+        on the destination. The ticket slot and `nbytes` stay reserved until
+        the read physically retires.
+
+        Raises:
+            BaseException: The pool's recorded failure, if any.
+            WorkerError: `resource_error` when read tickets or bytes are
+                exhausted. An error submitting to the executor propagates
+                after both reservations are returned.
+        """
         import torch
 
         with self._lock:
@@ -150,6 +203,11 @@ class TransferPool:
                 with torch.inference_mode():
                     call(ticket, *args)
             except BaseException as error:
+                # A failure before readiness reaches the consumer through the
+                # ticket alone. A late failure cannot retract views already
+                # exposed, and an undrained read never retires, so both are
+                # also recorded on the pool. The ticket's done callback fired
+                # at readiness, so a late failure wakes the controller here.
                 late = ticket._fail(error)
                 if late or ticket._unretired:
                     with self._lock:
@@ -164,6 +222,10 @@ class TransferPool:
             ticket._work = None
             # A cancelled executor task never enters run(), so credits and
             # destination lifetime must be settled by its terminal callback.
+            # A task that ran has drained any read stream it used, since
+            # `copy` synchronizes it before returning, so unless the ticket
+            # lists undrained resources no device access to its storage
+            # remains.
             if not ticket._unretired:
                 self._bytes.release(nbytes)
                 self._entries.release()
@@ -197,13 +259,28 @@ class TransferPool:
         producer: torch.cuda.Event | None = None,
         acknowledgment: torch.Tensor | None = None,
     ) -> None:
-        """Copy into a reserved view.
+        """Copy `source` into the reserved `destination` and complete `ticket`.
 
-        All storage is retained through device completion.
+        Runs on a transport thread, inside the `call` given to `submit`. A
+        CPU destination is copied synchronously and completes the ticket with
+        no fence. A CUDA destination is copied on this thread's read stream,
+        ordered after the caller's destination stream recorded by `submit`
+        and after `producer`; the ticket completes with a fence recorded on
+        the read stream, and this thread then waits for the fence and drains
+        the stream, so all storage is retained through device completion.
 
         `acknowledgment` is this rank's word in the source chunk's header. It
-        is written after the copies on the same stream, so the producer sees it
-        only once every read of that chunk has completed.
+        is claimed before the copies and acknowledged after them on the same
+        stream, so the producer sees the acknowledgment only once every read
+        of that chunk has completed.
+
+        When the read stream cannot be drained, the ticket retains every
+        resource of the read and never retires.
+
+        Raises:
+            WorkerError: The ticket's cancellation error when it was cancelled
+                before the copy began. Copy and drain errors propagate; the
+                task `submit` runs records them as the ticket's failure.
         """
         import torch
 
@@ -214,6 +291,8 @@ class TransferPool:
         pairs = tuple(copy_pairs(source, destination))
         device = spans[0].device
 
+        # A host destination: every copy below is synchronous, so the claim
+        # and acknowledgment bracket them directly.
         if device.type != "cuda":
             if acknowledgment is not None:
                 acknowledgment.copy_(chunk_word(vmm_pool.CLAIMED))
@@ -271,6 +350,8 @@ class TransferPool:
                 completed = self._events.acquire(device)
                 self._events.record(completed, device)
 
+            # Readiness is exposed before this thread waits, so a consumer can
+            # queue its work behind the fence while the copies still run.
             ticket._complete(destination, completed)
             completed.synchronize()
         except BaseException as error:
@@ -288,7 +369,10 @@ class TransferPool:
                 raise
 
     def close(self) -> None:
-        """Drain reads and report failure following consumable completion."""
+        """Wait for every submitted read, then raise any recorded failure.
+
+        Queued reads are not cancelled; they run to completion first.
+        """
         self._executor.shutdown(wait=True, cancel_futures=False)
         self._read_streams.clear()
         if self._error is not None:

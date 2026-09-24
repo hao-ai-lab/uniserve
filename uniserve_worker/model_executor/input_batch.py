@@ -1,4 +1,10 @@
-"""One numerical input view and the aligned rows used to construct it."""
+"""One numerical input view and the aligned rows used to construct it.
+
+Execution code describes each request's contribution to a call as a row
+(``InputRow`` and its subclasses here, in ``diffusion_inputs`` and in
+``image_inputs``). Runners stage a homogeneous group of rows into their
+fixed backing and evaluate the resulting ``InputBatch``.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +21,13 @@ InputT = TypeVar("InputT")
 
 @dataclass(frozen=True, slots=True)
 class InputBatch(Generic[InputT]):
-    """One typed numerical input and the worker's aligned output controls."""
+    """One typed numerical input and the worker's aligned output controls.
+
+    ``request_pool_indices`` is a nonempty [rows] vector naming the request
+    slot that receives each row's output. Text calls (a ``ForwardMode``)
+    carry one ``TokenSelection`` per row, and ``decode_force_finish``, when
+    present, is a [rows] bool mask; ``__post_init__`` checks both.
+    """
 
     forward_mode: ForwardMode | MediaCall
     inputs: InputT
@@ -61,7 +73,9 @@ class AttentionRow(InputRow):
     """Position and cache coordinates of one attention sequence."""
 
     positions: torch.Tensor | None = None
+    # Cached prefix length in tokens that the query follows.
     seq_len: int = 0
+    # KV cache group whose block table locates the row's pages.
     group_id: int = 0
     write_kv: bool = False
     causal: bool = True
@@ -91,9 +105,10 @@ class TokenRow(AttentionRow):
 
     @property
     def query_tokens(self) -> int:
-        """Return the live token or image-patch count represented by this.
+        """Return the query length this row appends after its cached prefix.
 
-        row.
+        One for indexed decode; otherwise the number of ``token_ids``, or zero
+        without them.
         """
         if self.request_indexed_decode:
             return 1

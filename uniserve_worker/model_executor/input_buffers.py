@@ -1,4 +1,19 @@
-"""Fixed-address staging for homogeneous numerical capability calls."""
+"""Fixed-address staging for homogeneous numerical capability calls.
+
+Each staged execution entry of ``ModelExecutor`` owns one ``InputBuffers``
+instance, whose subclass ``input_buffer_config`` selects from the entry's call
+kinds. The buffers allocate every device column once at its configured
+capacity, and ``prepare_inputs`` copies one call's rows into leading slices of
+those columns. Because the addresses never change, text graph buckets capture
+the staging columns themselves, and ``graph_inputs.pad_text`` can widen the
+staged slices in place to a bucket's capacity.
+
+Token staging copies its inputs into owned columns; diffusion staging does the
+same for attention metadata, positions and timesteps but borrows the rows'
+latents. Vision and latent-encoding staging and image-decode staging own only
+the request-slot column and borrow the rows' tensors. Borrowed tensors must
+already reside on the entry's device.
+"""
 
 from __future__ import annotations
 
@@ -54,7 +69,14 @@ class RowBufferConfig:
 
 @dataclass(frozen=True, slots=True)
 class AttentionBufferConfig(RowBufferConfig):
-    """Sequence and page-table capacities shared by attention computations."""
+    """Sequence and page-table capacities shared by attention computations.
+
+    ``positions`` has three axes so multimodal positions fit; staging
+    fills only the leading axis for one-axis positions. ``max_tokens`` bounds
+    the positions and write-index columns; ``input_buffer_config`` gives
+    text and diffusion staging built from one ``TokenBufferConfig`` the
+    same bound.
+    """
 
     max_tokens: int
     max_blocks_per_row: int
@@ -84,7 +106,13 @@ class AttentionBufferConfig(RowBufferConfig):
 
 @dataclass(frozen=True, slots=True)
 class TokenBufferConfig(AttentionBufferConfig):
-    """Token and optional embedding storage for a language model call."""
+    """Token and optional embedding storage for a language model call.
+
+    ``max_text_tokens`` bounds the token-ID and embedding columns and may be
+    smaller than ``max_tokens``, which also covers diffusion calls staged
+    from the same limits. A ``hidden_size`` of zero provisions no embedding
+    column.
+    """
 
     max_text_tokens: int
     hidden_size: int
@@ -132,7 +160,15 @@ class DiffusionBufferConfig(AttentionBufferConfig):
 
 
 class InputBuffers:
-    """Own request-slot staging and borrow already placed numerical views."""
+    """Own request-slot staging and borrow already placed numerical views.
+
+    ``max_inflight`` sets the depth of the host rings (pinned on CUDA) that
+    source asynchronous host-to-device copies; with a depth above one, the
+    host can fill the next call's values while earlier copies are still
+    pending. The device columns
+    themselves are single: successive calls reuse them in the order of the
+    stream that stages them.
+    """
 
     row_type: type[InputRow]
 
@@ -158,13 +194,33 @@ class InputBuffers:
         self._backing.close()
 
     def prepare_inputs(self, rows, *, forward_mode, **numerical):
-        """Stage one numerical call and retain its output request slots."""
+        """Stage one numerical call and retain its output request slots.
+
+        Copies are enqueued on the current CUDA stream, and the host ring's
+        reuse fence is recorded there; ``ModelExecutor`` stages under the
+        entry's lane stream, and consumers must order after that stream.
+        ``numerical`` is forwarded to ``_prepare_inputs``.
+
+        Returns:
+            An ``InputBatch`` whose tensors are views of this owner's fixed
+            columns or of the rows' borrowed tensors.
+
+        Raises:
+            ValueError: The row count is zero or exceeds capacity, the rows
+                mix computations, or subclass staging rejects the rows.
+            TypeError: A row is not this staging's ``row_type``, or token or
+                diffusion staging receives unsupported attention.
+            WorkerError: ``cache_pages`` rejects the rows while attention
+                is built from ``cache`` and ``tables``.
+        """
         if not 0 < len(rows) <= self.max_rows:
             raise ValueError("row count exceeds input-buffer capacity")
         if any(not isinstance(row, self.row_type) for row in rows):
             raise TypeError(
                 f"this staging requires {self.row_type.__name__} inputs"
             )
+        # Token rows of any ForwardMode share one staging layout; a media row
+        # must match the call kind exactly.
         if any(
             row.forward_mode != forward_mode
             and not (
@@ -174,11 +230,13 @@ class InputBuffers:
             for row in rows
         ):
             raise ValueError("one input call requires homogeneous computations")
+
         slot, host = self._request_host.acquire()
         fill_cpu_ints(host, tuple(row.request_pool_idx for row in rows))
         requests = self.request_pool_indices[: len(rows)]
         requests.copy_(host[: len(rows)], non_blocking=True)
         self._request_host.record_copy(slot)
+
         inputs, selections, finish = self._prepare_inputs(rows, **numerical)
         return InputBatch(forward_mode, inputs, requests, selections, finish)
 
@@ -216,12 +274,23 @@ class AttentionBuffers(InputBuffers):
         super().__init__(config=config, **options)
         self.max_tokens = config.max_tokens
         self.max_blocks_per_row = config.max_blocks_per_row
+        # -1 is the attention write-index sentinel for a token that writes no
+        # cache slot; unstaged capacity starts inert.
         self.write_indices.fill_(-1)
 
     def stage_attention(self, attention):
-        """Copy paged or segmented attention columns into the lane's fixed.
+        """Copy paged or segmented attention columns into the fixed buffers.
 
-        buffers.
+        Returns an attention input of the same type whose device tensors are
+        leading views of this owner's columns; host length metadata is
+        carried over unchanged. A segmented input is accepted only when its
+        current sequences are fully visible, and is rebuilt with each query
+        seeing its whole current sequence.
+
+        Raises:
+            TypeError: ``attention`` is neither paged nor segmented.
+            ValueError: A column exceeds capacity, or a segmented input is
+                not fully visible or lacks host query lengths.
         """
         if not isinstance(attention, (PagedInput, SegmentedInput)):
             raise TypeError(
@@ -324,6 +393,8 @@ class TokenBuffers(AttentionBuffers):
         self.max_text_tokens = config.max_text_tokens
         self.hidden_size = config.hidden_size
         self.image_builder = image_builder
+        # Unstaged token capacity holds ID 1, the same value request-indexed
+        # decode gathers into inactive rows.
         self.input_ids.fill_(1)
         self.input_embeddings = getattr(self, "input_embeddings", None)
         self._finish_host = HostBuffers(
@@ -341,6 +412,8 @@ class TokenBuffers(AttentionBuffers):
         self, rows, *, attention=None, cache=None, tables=None, states=None
     ):
         count = len(rows)
+        # The force-finish column feeds ``graph_inputs.greedy_decode``. It is
+        # staged only when every row carries a tagged device decode predicate.
         finish = None
         if all(
             row.decode_predicate is not None and row.decode_predicate_tagged
@@ -352,6 +425,9 @@ class TokenBuffers(AttentionBuffers):
             finish.copy_(host[:count], non_blocking=True)
             self._finish_host.record_copy(slot)
 
+        # Request-indexed decode rows carry no token views; their next token
+        # and position live in ``states`` at the row's request slot. Slot 0
+        # is the inactive sentinel and never a valid source.
         indexed = any(row.request_indexed_decode for row in rows)
         if indexed:
             if states is None or any(
@@ -369,6 +445,10 @@ class TokenBuffers(AttentionBuffers):
                     "indexed decode requires valid resident request slots"
                 )
 
+            # A fully indexed call on one CUDA device with its resident page
+            # tables gathers every input on device. ``cache_pages`` validates
+            # the rows' cache extents (including one KV group per call) and
+            # returns the staged table width.
             if (
                 attention is None
                 and cache is not None
@@ -381,8 +461,10 @@ class TokenBuffers(AttentionBuffers):
                 inputs = self._indexed(rows, width, cache, tables, states)
                 return inputs, tuple(row.selection for row in rows), finish
 
-            # Without a compatible resident CUDA cache, materialize one token
-            # and position per row and continue through the ordinary path.
+            # Otherwise (prepared attention supplied, not every row indexed,
+            # or cache, tables and states not all resident on this CUDA
+            # device), borrow each indexed row's token and position views
+            # from ``states`` and stage the ordinary path.
             rows = tuple(
                 replace(
                     row,
@@ -408,9 +490,20 @@ class TokenBuffers(AttentionBuffers):
         return inputs, tuple(row.selection for row in rows), finish
 
     def _text(self, rows, attention):
-        """Stage token IDs.
+        """Stage token IDs, positions and optional embeddings into columns.
 
-        positions and optional embeddings into the text columns.
+        Rows are packed back to back in row order. Positions keep one axis
+        unless a row supplies three axes or an image builder is bound, in
+        which case all three axes are returned. Embedding inputs are used
+        when any row supplies embeddings, and on a lane with an image
+        builder whenever a row is not a decode row; tokens without supplied
+        embeddings keep a false embedding mask.
+
+        Raises:
+            ValueError: A row lacks IDs, positions or a selection or has no
+                tokens, the call exceeds text capacity, positions or
+                embeddings have the wrong shape, or embeddings are required
+                on a lane without an embedding column.
         """
         if any(
             row.token_ids is None
@@ -427,6 +520,7 @@ class TokenBuffers(AttentionBuffers):
         if min(lengths) < 1 or total > self.max_text_tokens:
             raise ValueError("text token count exceeds input-buffer capacity")
 
+        # Clear axes and mask entries that rows below may leave unwritten.
         self.positions[:, :total].zero_()
         self.embedding_mask[:total].zero_()
 
@@ -443,14 +537,18 @@ class TokenBuffers(AttentionBuffers):
             if embeddings is None:
                 raise ValueError("the lane does not provision embedding inputs")
             embeddings[:total].zero_()
-        # Adjacent continuation rows already share backing. Preserve that
-        # layout; concatenate only disjoint columns on a common source device.
+
+        # When every row's IDs are on one device, copy them with one call:
+        # through their shared view when the rows are already adjacent in
+        # memory, otherwise after concatenating them. Mixed source devices
+        # fall back to per-row copies in the loop below.
         values = tuple(row.token_ids.reshape(-1) for row in rows)
         input_ids = None
         if len({value.device for value in values}) == 1:
             input_ids = adjacent_view(values)
             input_ids = torch.cat(values) if input_ids is None else input_ids
             self.input_ids[:total].copy_(input_ids, non_blocking=True)
+
         # Multimodal text uses one three-axis representation for prefill and
         # decode. Spatial coordinates of ordinary text stay zero; numerical
         # layers can consume the prepared axes directly on every replay.
@@ -472,7 +570,6 @@ class TokenBuffers(AttentionBuffers):
                     raise ValueError(
                         "input embeddings must match the hidden width"
                     )
-                # A row with embeddings makes the call use embedding inputs.
                 if embeddings is None:
                     raise ValueError(
                         "the lane does not provision embedding inputs"
@@ -505,7 +602,16 @@ class TokenBuffers(AttentionBuffers):
         )
 
     def _indexed(self, rows, width, cache, tables, states):
-        """Gather resident decode rows on device directly into paged staging."""
+        """Gather resident decode rows on device directly into paged staging.
+
+        One kernel reads the rows' request slots from
+        ``request_pool_indices`` (already copied by ``prepare_inputs`` on the
+        same stream) and fills token, position, table, length, offset and
+        write-index columns over the whole row capacity. Rows past
+        ``len(rows)`` are initialized as inert padding and their request
+        slots reset to 0, so a padded decode graph replays consistent inputs.
+        Every row decodes one query token.
+        """
         count = len(rows)
         gather_request_decode_inputs(
             request_pool_indices=self.request_pool_indices,
@@ -580,9 +686,12 @@ class DiffusionBuffers(AttentionBuffers):
         return self._images(rows, self.stage_attention(attention)), (), None
 
     def _images(self, rows, attention):
-        """Stage denoising positions and timesteps.
+        """Stage denoising positions and timesteps, then bind image inputs.
 
-        then bind the image inputs.
+        Positions and timesteps are copied into the fixed columns; each
+        row's latent is borrowed and must already be on this device. The
+        image builder binds them into the denoiser's typed input at step
+        index zero.
         """
         if self.image_builder is None:
             raise ValueError("image denoising requires its bound input builder")
@@ -664,7 +773,18 @@ class DecodeBuffers(InputBuffers):
 
 
 def input_buffer_config(kind, limits: TokenBufferConfig):
-    """Select only the backing consumed by this numerical capability."""
+    """Select only the backing consumed by this numerical capability.
+
+    ``limits`` is the entry's text staging configuration, derived from
+    ``bootstrap.capacity.input_buffer_config``; non-text kinds keep only the
+    fields their staging reads.
+
+    Returns:
+        The ``InputBuffers`` subclass and the configuration to build it.
+
+    Raises:
+        ValueError: ``kind`` has no fixed row staging.
+    """
     if isinstance(kind, ForwardMode):
         return TokenBuffers, limits
     if kind is MediaCall.DENOISING:
@@ -679,7 +799,11 @@ def input_buffer_config(kind, limits: TokenBufferConfig):
 
 
 def buffered_kinds(*, diffusion: bool):
-    """Numerical capabilities served by fixed row staging."""
+    """Numerical capabilities served by fixed row staging.
+
+    Denoising is included only when ``diffusion`` is set, which callers
+    derive from whether the model provides an image builder.
+    """
     kinds = {
         *ForwardMode,
         MediaCall.VISION_ENCODING,

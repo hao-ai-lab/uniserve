@@ -1,4 +1,12 @@
-"""Physical product publication and asynchronous read contracts."""
+"""Physical product publication and asynchronous read contracts.
+
+A producer publishes a product through a `Transport` and receives a `Locator`
+naming where its bytes are. The engine carries that locator to consumers,
+whose own transport of the same kind reads from it into a destination and
+returns a `TransferTicket`. The producer keeps the published storage
+unwritten until the publication's retirement future completes after the
+engine releases it.
+"""
 
 from __future__ import annotations
 
@@ -24,6 +32,7 @@ class TransportKind(StrEnum):
     CHANNEL = "channel"
 
 
+#: Every transport name a rank may bind, as `make_transports` accepts them.
 TRANSPORTS = tuple(kind.value for kind in TransportKind)
 
 
@@ -35,7 +44,12 @@ class Transport(ABC):
 
     @abstractmethod
     def endpoint(self) -> str:
-        """Return the publishing address-space incarnation."""
+        """Return this instance's unique endpoint name.
+
+        Every locator the instance publishes carries it: a release refuses a
+        locator from another instance, and a `local` or `cuda_vmm` read in
+        the publishing address space finds the owning instance by it.
+        """
 
     @abstractmethod
     def publish(
@@ -56,6 +70,10 @@ class Transport(ABC):
         mechanism that holds storage another process reads returns it once
         each has acknowledged; a mechanism whose consumers are in this process
         or hold their own copy has nothing to wait for and ignores them.
+
+        Every implementation reserves the publication's bytes against the
+        rank's shared `TransferCapacity` for as long as it holds the source,
+        and raises `resource_error` when that budget is exhausted.
         """
 
     def serves(self, consumers: Sequence[int]) -> bool:
@@ -83,14 +101,21 @@ class Transport(ABC):
         Spans must be writable, disjoint and cover the exact requested region
         without dtype conversion. Backend layout restrictions are checked before
         submission. One ticket and one completion fence cover the whole read.
-        An omitted destination lets the backend allocate or borrow.
+        An omitted destination lets the backend allocate one, or, for `local`,
+        borrow the published views themselves.
         """
 
     @abstractmethod
     def release(
         self, locator: Locator
     ) -> concurrent.futures.Future[None] | None:
-        """Retire a publication after its physical readers release ownership."""
+        """Revoke new reads of a publication and return its retirement.
+
+        The returned future completes once the owner may reuse the published
+        storage. `None` means this instance holds no registration for the
+        locator; `channel` always returns `None`, since it retains nothing
+        after publishing.
+        """
 
     @abstractmethod
     def publication_retirement(
@@ -123,4 +148,8 @@ class Transport(ABC):
 
     @abstractmethod
     def set_completion_wake(self, wake: Any) -> None:
-        """Connect asynchronous readiness to the worker controller."""
+        """Connect asynchronous readiness to the worker controller.
+
+        `wake` is a zero-argument callable (or None), which the transport
+        invokes when asynchronous work it owns, such as a read, completes.
+        """

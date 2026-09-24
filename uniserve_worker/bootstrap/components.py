@@ -1,4 +1,19 @@
-"""Bind public numerical capabilities to the worker's components."""
+"""Bind public numerical capabilities to the worker's components.
+
+A model declares its IPC-addressable components as ``ComponentEntry`` values:
+an owning module path and the ``EntryPoint`` methods serving ranks may invoke.
+This module resolves those declarations against a model instance into
+``Call`` values (``describe_components``), maps calls to the protocol call
+kinds they serve (``call_kinds``), validates a deployment's placement against
+them (``validate_components``), and attaches calls and communicator groups to
+each rank's ``ComponentBinding`` (``bind_components``). It also declares the
+host components, which own no numerical method.
+
+``prepare_worker_model`` validates placement on a meta-device skeleton before
+process groups exist; ``ModelExecutor`` binds the loaded model's components.
+The worker's capacity report derives its advertised calls and media routes
+from ``supported_calls`` and ``media_components``.
+"""
 
 from __future__ import annotations
 
@@ -45,7 +60,7 @@ HOST_COMPONENTS: Mapping[str, frozenset[MediaCall]] = {
     VIDEO_ENCODER_COMPONENT: frozenset({MediaCall.VIDEO_ENCODING}),
     MUXER_COMPONENT: frozenset({MediaCall.AUDIO_ENCODING, MediaCall.MUXING}),
 }
-#: The calls a host component serves, as a worker reports them.
+#: The muxer's calls, which ``bind_components`` records as its call kinds.
 MUXER_CALL_KINDS = HOST_COMPONENTS[MUXER_COMPONENT]
 
 #: Distinguishes an attribute a model never declared from one it cleared.
@@ -69,7 +84,10 @@ def holds_host_components(names: Iterable[str]) -> bool:
 def call_kinds(calls: Iterable[Call]) -> frozenset[CallKind]:
     """Resolve the call kinds a capability's type and method can execute.
 
-    The kind follows the declared numerical method.
+    The kind follows the module's capability type and the declared numerical
+    method. A call no rule matches contributes no kind. Host components have
+    no calls, so ``supported_calls`` and ``media_components`` take their
+    kinds from ``HOST_COMPONENTS``.
     """
     kinds: set[CallKind] = set()
     for call in calls:
@@ -92,6 +110,8 @@ def call_kinds(calls: Iterable[Call]) -> frozenset[CallKind]:
                 kinds.add(MediaCall.VISION_ENCODING)
             elif isinstance(module, PatchAutoencoder):
                 kinds.add(MediaCall.LATENT_ENCODING)
+            # ``TextEncoder`` and ``PatchEncoder`` subclass ``Encoder``, so
+            # the generic encoder is matched only after them.
             elif isinstance(module, Encoder):
                 kinds.add(MediaCall.LATENT_PREPARATION)
         elif method == "decode":
@@ -116,6 +136,27 @@ def describe_components(
     relative to that component, including nested methods such as
     ``conditioner.encode``. Numerical sharing does not imply placement
     ownership, so one component belongs to exactly one entry.
+
+    Args:
+        model: The model instance, which may be a meta-device skeleton or a
+            loaded pipeline stage.
+        entries: The model's entry declarations. When ``None``, they come from
+            the ``entry_points(config)`` function of the module that defines
+            ``type(model)``.
+
+    Returns:
+        Every declared entry name mapped to its calls in declaration order. A
+        call whose module a pipeline stage cleared on this rank is left out,
+        so an entry may map to no calls. When any call's module is a
+        ``VideoPostprocessor``, every host component is added with no calls.
+
+    Raises:
+        WorkerError: With ``UNSUPPORTED_SETUP`` when a (path, method) pair is
+            declared twice, a path names no module, a cleared module has no
+            ancestor with a ``DeviceMesh`` or is one this pipeline stage
+            participates in, a method is not callable, or the worker has no
+            call kind for a method other than a ``CausalLM``'s
+            ``embed_input_ids`` or ``compute_logits``.
     """
     if entries is None:
         entries = import_module(type(model).__module__).entry_points(
@@ -134,8 +175,12 @@ def describe_components(
             owners[key] = name
             module = _entry_module(model, path)
             if module is None:
-                # The full declaration remains available on ranks where a
-                # first/last-stage submodule has no resident numerical state.
+                # A pipeline stage cleared this module. Walk up to the nearest
+                # ancestor with a ``DeviceMesh`` and consult the entry point's
+                # stage: a first- or last-stage method is excused on the other
+                # stages (``break``). A cleared module on a stage that runs the
+                # method is refused, and with no meshed ancestor at all the
+                # ``while ... else`` refuses the declaration.
                 parent_path = path
                 while parent_path:
                     parent_path = parent_path.rpartition(".")[0]
@@ -186,13 +231,14 @@ def describe_components(
 
 
 def _entry_module(model: nn.Module, path: str) -> nn.Module | None:
-    """Resolve a declared entry path, or None where this rank holds no module.
+    """Resolve a declared entry path, or None where its attribute is cleared.
 
     A pipeline stage that does not participate in a submodule clears the
     attribute, and ``get_submodule`` reports a cleared attribute the same way
-    it reports a path the model never declared. The caller distinguishes the
-    two: a cleared attribute is answered by the stage rules, a missing one is
-    a model declaration this worker cannot serve.
+    it reports a path the model never declared. This function tells the two
+    apart: it returns None for a cleared attribute, which the caller answers
+    by the stage rules, and raises ``WorkerError`` for a missing one, a model
+    declaration this worker cannot serve.
     """
     try:
         return model.get_submodule(path)
@@ -218,6 +264,10 @@ def supported_calls(
     of its component cannot serve has nowhere to run. A worker given no
     placement holds every component the model declares, which is the undivided
     deployment.
+
+    ``TransferMode.TENSOR`` is always included; KV publish and install are
+    included when a held component contains a ``CausalLM`` call, and a held
+    host component contributes its ``HOST_COMPONENTS`` calls.
     """
     components = describe_components(model)
     names = set(held)
@@ -247,6 +297,11 @@ def media_components(
     component this placement does not hold is not reported, because this
     worker cannot serve it; the engine checks that the video graph is complete
     across the workers of a deployment.
+
+    Raises:
+        WorkerError: With ``UNSUPPORTED_SETUP`` when latent preparation and
+            denoising are routed to different components, or when
+            ``describe_components`` refuses the model.
     """
     components = describe_components(model)
     names = set(held)
@@ -293,7 +348,28 @@ def validate_components(
     entries: Mapping[str, ComponentEntry] | None = None,
     declarations: dict[str, tuple[Call, ...]] | None = None,
 ) -> dict[str, tuple[Call, ...]]:
-    """Validate physical placement before loading weights or creating groups."""
+    """Validate a component placement against the model's declarations.
+
+    ``prepare_worker_model`` calls this on a meta-device skeleton before
+    loading weights or creating process groups; ``bind_components`` repeats
+    it for the loaded model's bindings. Passing ``declarations`` reuses an
+    earlier ``describe_components`` result instead of resolving it again.
+
+    Returns:
+        The declarations the placement was validated against.
+
+    Raises:
+        WorkerError: With ``UNSUPPORTED_SETUP`` when ``describe_components``
+            refuses the model, the placement names an undeclared component, a
+            non-host component has no calls, or a component's
+            ``distribution`` does not fit its calls. The muxer is never
+            distributed; the video encoder and a component with a
+            ``VideoDecoder`` call require ``temporal_units`` with one unit per
+            rank; a component with an ``AudioDecoder`` call and no
+            ``VideoDecoder`` call accepts no distribution or
+            ``temporal_units`` with at least one unit per rank; every other
+            component accepts no distribution.
+    """
     declared = (
         describe_components(model, entries=entries)
         if declarations is None
@@ -359,7 +435,12 @@ def bind_components(
 ) -> None:
     """Borrow methods and communicator views for each local component.
 
-    Views are borrowed for every participating component.
+    Placement is validated first (see ``validate_components``). Every binding's
+    ``calls`` is then reset; a binding this rank owns and has a mesh for
+    receives the calls its pipeline stage runs and their call kinds. Each call
+    carries the communicator groups it exchanges tensors in, deduplicated by
+    backend handle. A temporally distributed ``VideoPostprocessor`` also has
+    its ``units`` ring assigned on the module itself.
     """
     declared = validate_components(
         model,
@@ -382,6 +463,9 @@ def bind_components(
             if stage == "last" and pipeline.rank != pipeline.size - 1:
                 continue
 
+            # Only an all-stage method keeps the module's communicators whose
+            # axes include ``pp``; a first- or last-stage method runs on one
+            # stage. Entry-point axes added below are not filtered.
             groups = {
                 group._require(): group
                 for group in communicators(call.module)

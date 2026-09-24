@@ -1,4 +1,20 @@
-"""Optional worker profiling spans and per-step capture."""
+"""Worker profiling: bounded trace capture, component timers, range names.
+
+`WorkerProfiler` captures a window of executed batches with the PyTorch
+profiler and, optionally, the CUDA profiler API, configured from
+``UNISERVE_TORCH_PROFILER_DIR``, the ``UNISERVE_PROFILE_*`` variables, and
+``UNISERVE_CUDA_PROFILER``. `Executor` enters `WorkerProfiler.step` once per
+batch that carries calls, so lifecycle-only batches do not count toward the
+window. The spans themselves come from `uniserve.profiling.profile_range`,
+which records a torch-profiler range only while a profiler is active and an
+NVTX range when ``UNISERVE_NVTX`` enables it on a CUDA host.
+
+The module also holds the per-batch component timers merged into
+`ForwardStats` (`record_component`, `_forward_stats`), the gate for CUDA
+timing events in `OutputBuffer` (`timing_events_enabled`), request failure
+logging for `Service` (`record_failure`), and rank-qualified range names
+(`worker_range_name`).
+"""
 
 from __future__ import annotations
 
@@ -54,9 +70,19 @@ _CUDA_PROFILER_ENV = "UNISERVE_CUDA_PROFILER"
 
 @dataclass(frozen=True)
 class WorkerProfileConfig:
-    """Configures torch-profiler activities and NVTX ranges.
+    """Capture window and trace options parsed by `WorkerProfiler.from_env`.
 
-    Also configures CUDA-profiler control, schedules, and trace output.
+    Attributes:
+        output_dir: Directory receiving trace and summary files.
+        prefix: Leading component of every trace file name.
+        activities: Canonical activity names, a subset of ``CPU`` and
+            ``GPU`` without repeats.
+        start_step: 1-based execution step that opens the window.
+        num_steps: Steps captured once the window opens.
+        with_stack: Whether the torch profiler records Python stacks.
+        record_shapes: Whether the torch profiler records operator shapes.
+        cuda_profiler: Whether the window also brackets
+            ``cudaProfilerStart``/``cudaProfilerStop``.
     """
 
     output_dir: Path
@@ -70,13 +96,19 @@ class WorkerProfileConfig:
 
 
 class WorkerProfiler:
-    """Small execution-step profiler for worker processes."""
+    """Captures one bounded window of execution steps per worker process.
+
+    Steps are counted from 1 in the order `step` is entered. The window opens
+    at the first step numbered at least ``start_step`` and closes after
+    ``num_steps`` steps or at `close`, whichever comes first. A window that
+    has closed, or failed to start, is never reopened. Without a
+    configuration every step only emits its ``profile_range``.
+
+    Not thread-safe: the worker thread that executes batches drives it.
+    """
 
     def __init__(self, config: WorkerProfileConfig | None) -> None:
-        """Initialize capture-window counters.
-
-        The profiler configuration is optional.
-        """
+        """Create a profiler; ``None`` disables window capture."""
         self.config = config
         self._seen_steps = 0
         self._profiled_steps = 0
@@ -87,9 +119,22 @@ class WorkerProfiler:
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> WorkerProfiler:
-        """Build a bounded step profiler.
+        """Build a profiler from the worker profiling environment.
 
-        Configuration comes from the worker profiling environment.
+        An unset or empty ``UNISERVE_TORCH_PROFILER_DIR`` disables capture.
+        Otherwise ``UNISERVE_PROFILE_ACTIVITIES`` (default ``CPU,GPU``),
+        ``UNISERVE_PROFILE_START_STEP`` and ``UNISERVE_PROFILE_STEPS`` (each
+        default 1, also for unparseable values, and raised to at least 1),
+        ``UNISERVE_PROFILE_PREFIX`` (default ``uniserve-worker``),
+        ``UNISERVE_PROFILE_WITH_STACK``, ``UNISERVE_PROFILE_RECORD_SHAPES``
+        and ``UNISERVE_CUDA_PROFILER`` fill the configuration.
+
+        Args:
+            env: Variables to read instead of ``os.environ``.
+
+        Raises:
+            ValueError: ``UNISERVE_PROFILE_ACTIVITIES`` names an activity
+                other than CPU or GPU.
         """
         env = os.environ if env is None else env
         output_dir = env.get(_TORCH_PROFILE_DIR_ENV)
@@ -119,18 +164,22 @@ class WorkerProfiler:
 
     @property
     def enabled(self) -> bool:
-        """Indicate whether this worker has an active profiling configuration.
+        """Whether a capture configuration is present.
 
-        Returns False when no profiling configuration was provided.
+        True does not mean a window is currently open.
         """
         return self.config is not None
 
     @contextmanager
     def step(self, debug_name: str) -> Iterator[None]:
-        """Profile one execution step.
+        """Count one execution step and capture it if it is in the window.
 
-        Profiling applies when the step falls inside the configured
-        capture window.
+        The body always runs inside ``profile_range(debug_name)``, which
+        records the step name in the torch trace while the profiler is
+        active and as an NVTX range when ``UNISERVE_NVTX`` enables it on a
+        CUDA host. Failures to start the torch or CUDA profiler, or to stop
+        and export them, are logged rather than raised; an error creating
+        ``output_dir`` propagates.
         """
         if self.config is None:
             with profile_range(debug_name):
@@ -138,6 +187,7 @@ class WorkerProfiler:
             return
 
         self._seen_steps += 1
+
         started_for_step = False
         if (
             not self._active
@@ -146,6 +196,8 @@ class WorkerProfiler:
         ):
             started_for_step = self._start(self._seen_steps)
 
+        # The window is checked in ``finally``, so the step that fills it is
+        # captured whole and a step that raises still counts.
         was_active = self._active
         try:
             with profile_range(debug_name):
@@ -159,12 +211,22 @@ class WorkerProfiler:
                 self._stop()
 
     def close(self) -> None:
-        """Finalize an active capture and write its trace artifacts."""
+        """Close an open window before it reaches ``num_steps`` and export it.
+
+        Orderly `Worker` shutdown calls this after synchronizing the model
+        runner.
+        """
         if self._active:
             self._stop()
 
     def _start(self, step_id: int) -> bool:
-        """Begin a bounded profiler window on the configured execution step."""
+        """Open the capture window at ``step_id``.
+
+        Returns:
+            True when the window opened. False when starting failed; the
+            failure is logged and the profiler is marked finished, so no later
+            step retries.
+        """
         assert self.config is not None
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         self._start_step = int(step_id)
@@ -180,6 +242,7 @@ class WorkerProfiler:
                     "with_stack": self.config.with_stack,
                     "record_shapes": self.config.record_shapes,
                 }
+                # Passed only when the installed torch accepts it.
                 if _accepts_torch_profiler_arg("acc_events"):
                     kwargs["acc_events"] = True
                 profiler = torch.profiler.profile(**kwargs)
@@ -207,9 +270,12 @@ class WorkerProfiler:
         return True
 
     def _stop(self) -> None:
-        """Stop the active profiler and export its trace.
+        """Close the window and export its trace and summary files.
 
-        Profiler state is released.
+        When a torch profiler ran, the files are ``<base>.trace.json.gz``
+        and ``<base>.summary.txt`` under ``output_dir``; a CUDA-profiler-only
+        window writes none. Stop and export errors are logged, not raised.
+        The profiler is released and marked finished on every path.
         """
         assert self.config is not None
         end_step = self._start_step + max(0, self._profiled_steps - 1)
@@ -246,7 +312,12 @@ class WorkerProfiler:
 
 
 def timing_events_enabled() -> bool:
-    """Return whether optional CUDA interval timing is configured."""
+    """Return whether `OutputBuffer` should record CUDA timing events.
+
+    True when ``UNISERVE_TORCH_PROFILER_DIR`` is non-empty or
+    ``UNISERVE_NVTX`` or ``UNISERVE_CUDA_PROFILER`` is a true flag. Reads
+    ``os.environ`` on every call.
+    """
     env = os.environ
     return bool(env.get(_TORCH_PROFILE_DIR_ENV)) or bool(
         flag_from_value(env.get(_NVTX_ENV))
@@ -255,7 +326,14 @@ def timing_events_enabled() -> bool:
 
 
 def _parse_activities(raw: str | None) -> tuple[str, ...]:
-    """Normalize profiler activity names into unique canonical values."""
+    """Parse comma- or space-separated activity names, case-insensitively.
+
+    Returns:
+        ``CPU`` and ``GPU`` in first-seen order without repeats.
+
+    Raises:
+        ValueError: A name is neither CPU nor GPU.
+    """
     values = []
     for piece in (raw or "").replace(",", " ").split():
         value = piece.strip().upper()
@@ -271,7 +349,11 @@ def _parse_activities(raw: str | None) -> tuple[str, ...]:
 def _trace_base(
     config: WorkerProfileConfig, start_step: int, end_step: int
 ) -> str:
-    """Build a process-, rank-, step-, and time-qualified trace basename."""
+    """Build a process-, rank-, step-, and time-qualified trace basename.
+
+    The rank comes from ``RANK``, else ``LOCAL_RANK``, and is omitted when
+    neither is set.
+    """
     stamp = time.strftime("%Y%m%d-%H%M%S")
     rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK")
     rank_part = f"-rank{rank}" if rank is not None else ""
@@ -282,9 +364,10 @@ def _trace_base(
 
 
 def _torch_profiler_activities(activities: tuple[str, ...]):
-    """Resolve configured activity names.
+    """Map activity names to `torch.profiler.ProfilerActivity` values.
 
-    Names map to supported PyTorch profiler activities.
+    ``GPU`` maps to ``CUDA`` and is dropped with a warning when CUDA is
+    unavailable. Returns an empty list without torch.
     """
     if torch is None:
         return []
@@ -328,7 +411,12 @@ def _cuda_profiler_stop() -> None:
 
 
 def _profiler_table(profiler, *, prefer_cuda: bool) -> str:
-    """Render a profiler summary sorted by CUDA or CPU self time."""
+    """Render the key-averages table for the summary file.
+
+    Sort keys are tried in order, CUDA totals first when ``prefer_cuda``;
+    a key that ``table`` rejects falls through to the next, and the unsorted
+    table is the last resort.
+    """
     sort_keys = (
         (
             "cuda_time_total",
@@ -355,9 +443,14 @@ def _profiler_table(profiler, *, prefer_cuda: bool) -> str:
 def record_component(
     component_us: dict[str, int], name: str, started_ns: int
 ) -> None:
-    """Accumulate component time in the owning completion group.
+    """Add the time since ``started_ns`` to a component's total.
 
-    The accumulated time is in microseconds.
+    Args:
+        component_us: Per-batch totals in microseconds, normally
+            ``BatchState.component_us``; merged into the batch's
+            `ForwardStats` by `_forward_stats`.
+        name: Component key, such as ``open_lane`` or ``commit_lane``.
+        started_ns: Start time from ``time.perf_counter_ns``.
     """
     elapsed_us = max(0, (time.perf_counter_ns() - int(started_ns)) // 1000)
     component_us[name] = component_us.get(name, 0) + elapsed_us
@@ -367,9 +460,11 @@ def _forward_stats(
     values: Sequence[ForwardStats],
     component_us: Mapping[str, int] | None = None,
 ) -> ForwardStats:
-    """Aggregate the original counters and local component times.
+    """Combine per-forward stats and add the batch's component timers.
 
-    Aggregation happens at completion.
+    ``values`` are the stats each model forward reported; they are summed
+    with `ForwardStats.combine`. Each ``component_us`` entry is clamped at
+    zero and added to the combined ``component_us`` under the same key.
     """
     from uniserve_worker.protocol.output import ForwardStats
 
@@ -385,9 +480,13 @@ def _forward_stats(
 def record_failure(
     raw_kind: object, error: WorkerError, *, unexpected: bool = False
 ) -> None:
-    """Log a classified request failure.
+    """Log a classified request failure at the severity its code requires.
 
-    The severity is the one required by the error code.
+    Failures the caller marks ``unexpected`` (`Service` marks errors not
+    raised as `WorkerError`) and codes for which `should_capture_trace`
+    holds are logged with ``logger.exception``; others as warnings without
+    a trace. Call it from inside the ``except`` block so the active
+    traceback is attached.
     """
     log = (
         logger.exception
@@ -409,7 +508,10 @@ def record_failure(
 def worker_range_name(
     boundary: str, *, rank: int, batch_id: int | None = None
 ) -> str:
-    """Build a rank- and batch-qualified profiler range name."""
+    """Build a rank- and batch-qualified profiler range name.
+
+    The batch is omitted when ``batch_id`` is None or negative.
+    """
     name = f"uniserve.worker.{boundary} rank={int(rank)}"
     return (
         f"{name} batch={batch_id}"

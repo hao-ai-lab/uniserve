@@ -1,4 +1,21 @@
-"""Validated descriptions of individual worker call kinds."""
+"""Call descriptors the engine submits to a worker rank.
+
+A `Call` is one computation for one request: its identity, the coordinates it
+executes at, its kind (`ForwardMode`, `MediaCall`, or `TransferMode`), the
+resource `Bounds` the scheduler reserved, its tensor dataflow, and its scalar
+side inputs. The wire contract and its validators live in the Rust
+`uniserve_worker_ipc` crate; the `validate` methods here are a separate Python
+implementation of call-local checks.
+
+Records reach Python on two paths. The PyO3 transport (`crates/worker-ipc-py`)
+decodes and validates a batch in Rust, then calls the constructors of `Call`,
+`CallCoordinates`, `Bounds`, `Rng`, and `SamplingState` positionally in
+field-declaration order, so their field order is part of that contract
+(`ImageParams` is built from keyword arguments). None of those five classes
+defines a `__post_init__`, so on that path `Call.validate`,
+`CallCoordinates.validate`, and `SamplingState.validate` never run; the Rust
+`Call::validate` covered them. `Call.from_mapping` runs all three.
+"""
 
 from __future__ import annotations
 
@@ -61,7 +78,8 @@ class TransferMode(StrEnum):
 
 CallKind: TypeAlias = ForwardMode | MediaCall | TransferMode
 
-# The media calls that produce a video, in execution order.
+# The media calls needed to produce a video with its audio track; mirrors the
+# Rust `MediaCall::VIDEO` set.
 VIDEO_CALLS = (
     MediaCall.TEXT_ENCODING,
     MediaCall.LATENT_PREPARATION,
@@ -73,6 +91,8 @@ VIDEO_CALLS = (
     MediaCall.MUXING,
 )
 
+# Every call kind a worker may execute, in the order of the Rust
+# `CallKind::ALL`. Worker reports list supported calls in this order.
 CALL_KINDS: tuple[CallKind, ...] = (
     ForwardMode.PREFILL,
     ForwardMode.DECODE,
@@ -83,7 +103,20 @@ CALL_KINDS: tuple[CallKind, ...] = (
 
 
 def computation(value: object, where: str) -> CallKind:
-    """Decode one concrete computation, excluding mixed model-batch metadata."""
+    """Decode a call kind from an enum member or its exact wire string.
+
+    Args:
+        value: A `ForwardMode`, `MediaCall`, or `TransferMode` member, or the
+            plain `str` value of one.
+        where: Field path used in the error message.
+
+    Returns:
+        The matching call-kind member.
+
+    Raises:
+        WorkerError: `value` is neither a call-kind member nor the exact wire
+            string of one.
+    """
     if (
         isinstance(value, (ForwardMode, MediaCall, TransferMode))
         and value in CALL_KINDS
@@ -97,9 +130,10 @@ def computation(value: object, where: str) -> CallKind:
 
 
 class CallStatus(StrEnum):
-    """Classifies a call result.
+    """Terminal status of one call's completion.
 
-    The result is successful, predicated away, or failed.
+    `PREDICATED` means the call's device predicate disabled it: the call did
+    not run and reports the request's accepted coordinates.
     """
 
     OK = "ok"
@@ -118,11 +152,15 @@ class ErrorCode(StrEnum):
 
 
 class DrawLayout(StrEnum):
-    """Assigns deterministic RNG coordinates to computation draws.
+    """Selects how a call's random draws map to semantic indices.
 
-    The draws cover sampling, speculation, and flow noise. Each draw consumes
-    one semantic position index within its layout so that replays and
-    recomputation reproduce identical random values.
+    Draws are keyed by the request seed and a semantic index rather than by
+    execution order, so replays and recomputation reproduce identical random
+    values. The meaning of `Rng.semantic_index_base` depends on the layout:
+    with `TARGET_SAMPLING` it is the first sampled position, and for
+    stochastic sampling the token executor requires one consecutive index per
+    sampled position; with `FLOW_NOISE` it is the positive image index the
+    engine assigns, from which the diffusion executor derives the noise seed.
     """
 
     TARGET_SAMPLING = "target_sampling"
@@ -130,9 +168,11 @@ class DrawLayout(StrEnum):
     FLOW_NOISE = "flow_noise"
 
 
-# Computations that advance a request's accepted progress; they mark visible
-# completion when they finish, and a rank chains each from the request's
-# latest state-advancing call.
+# Computations that advance a request's accepted progress; mirrors the Rust
+# `CallKind::advances_state`. `RequestPool.predecessors` chains a request's
+# calls from its latest state-advancing call (on the media path only
+# state-advancing calls join the chain), and `RequestPool.apply_result` moves
+# the request's `state_call_id` only on an OK result of one of these.
 _STATE_ADVANCING_WORK = frozenset(
     {
         ForwardMode.PREFILL,
@@ -149,9 +189,11 @@ _COMPUTATION_BY_VALUE = {member.value: member for member in CALL_KINDS}
 def _sampling_params_from_mapping(
     value: object, where: str = "sampling"
 ) -> sampling.SamplingParams:
-    """Decode wire sampling parameters.
+    """Decode wire sampling parameters, applying defaults for absent fields.
 
-    Maps validation errors to descriptors.
+    Raises:
+        WorkerError: A field is malformed or `SamplingParams` rejects the
+            combination.
     """
     data = _map(value, where)
     # Field decoders raise descriptor errors directly; only the parameter
@@ -261,10 +303,12 @@ def _sampling_params_to_mapping(
 
 @dataclass(frozen=True, slots=True)
 class ImageParams:
-    """Image-generation controls for an encode request.
+    """Image-generation controls carried by a request's admission.
 
     Covers the diffusion schedule (steps, timestep shift), classifier-free
     guidance scales and renormalization, output dimensions, and prompt inputs.
+    `NewRequest.image` holds one; `__post_init__` mirrors the limits of the
+    Rust `ImageParams::validate`.
     """
 
     steps: int = 50
@@ -283,9 +327,12 @@ class ImageParams:
     retain_images: bool = True
 
     def __post_init__(self) -> None:
-        """Validate generation step count and dimensions.
+        """Validate schedule, dimensions, guidance, image count, and seed.
 
-        Also validates guidance scale ranges.
+        Raises:
+            WorkerError: A field is out of range or not finite, a dimension
+                is not a multiple of 16, the CFG interval is unordered, or
+                the renorm type is blank.
         """
         if not 1 <= self.steps <= 1000:
             raise invalid_descriptor("image.steps must be in 1..=1000")
@@ -324,10 +371,7 @@ class ImageParams:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "image") -> ImageParams:
-        """Parse image-generation controls.
-
-        Applies defaults for omitted fields.
-        """
+        """Parse image-generation controls, applying defaults when omitted."""
         data = _map(value, where)
         interval = _pair(
             data.get("cfg_interval", (0.0, 1.0)), f"{where}.cfg_interval"
@@ -396,9 +440,12 @@ class ImageParams:
 
 @dataclass(frozen=True, slots=True)
 class Bounds:
-    """Scheduler-enforced resource ceilings for one call.
+    """Resource ceilings the scheduler reserves before a call runs.
 
-    Zero means the corresponding resource is not used by the call.
+    Zero means the call may use none of that resource. `Call.validate` checks
+    `max_tokens` against the input token ids and `max_latent_bytes` against
+    encoder, latent, and image outputs; `Batch.validate` checks
+    `max_transfer_bytes` against installed KV transfers.
     """
 
     max_tokens: int = 0
@@ -441,13 +488,16 @@ class Bounds:
 
 @dataclass(frozen=True, slots=True)
 class Rng:
-    """Defines the seed, semantic offset, and draw layout.
+    """Deterministic random-draw coordinates for one call.
 
-    The coordinates produce deterministic random values.
+    The engine derives them per call; see `DrawLayout` for how each layout
+    interprets `semantic_index_base`.
     """
 
+    # Request-level seed; executors that draw from it check it against the
+    # seed the request was admitted with.
     seed: int
-    # First semantic position index covered by this call's draws.
+    # First semantic index covered by this call's draws.
     semantic_index_base: int
     draw_layout: DrawLayout
 
@@ -480,7 +530,7 @@ class CallCoordinates:
 
     A rank would otherwise chain these from the calls that preceded it. The
     engine holds the request state they come from, so it sends them and the
-    rank asserts its own ledger agrees.
+    rank asserts its own ledger agrees. All lengths count tokens.
     """
 
     # Position of this call's first token in the request's logical sequence.
@@ -488,7 +538,7 @@ class CallCoordinates:
     # Tokens whose KV a numerical call may attend to at submission.
     kv_visible_len: int = 0
     # Tokens whose KV is initialized at submission; never below the visible
-    # extent, and above it only while a verifier's rejected drafts remain.
+    # extent, and above it while a verifier's rejected drafts stay initialized.
     kv_computed_len: int = 0
     # Denoising steps completed for this request at submission.
     flow_step: int = 0
@@ -533,10 +583,7 @@ class CallCoordinates:
 
 @dataclass(frozen=True, slots=True)
 class Call:
-    """One computation with its request identity and dependencies.
-
-    Also carries the computation's output limits.
-    """
+    """One immutable computation with its identity, dataflow, and limits."""
 
     request_key: identity.RequestKey
     call_id: identity.CallId
@@ -550,7 +597,10 @@ class Call:
     # Tensor dataflow: generic inputs/outputs plus role-specific endpoints.
     inputs: tuple[tensor.TensorRef, ...] = ()
     outputs: tuple[tensor.TensorRef, ...] = ()
+    # Source token scalar relayed between components by a tensor transfer.
     token_input: tensor.TensorRef | None = None
+    # Sampled token and continuation bit packed into one int64 scalar (see
+    # `tagged_token_values` in `uniserve_worker.sampling.sampler`).
     token_output: tensor.TensorRef | None = None
     vision_input: tensor.TensorRef | None = None
     latent_feature_input: tensor.TensorRef | None = None
@@ -559,7 +609,9 @@ class Call:
     latent_output: tensor.TensorRef | None = None
     image_input: tensor.TensorRef | None = None
     image_output: tensor.TensorRef | None = None
+    # Boolean device completion consumed by a dependent computation.
     completion_output: tensor.TensorRef | None = None
+    # Boolean device decision that selects an image transition.
     transition_output: tensor.TensorRef | None = None
     # Device-resident scalar that gates execution (u8 flag or packed i64
     # continuation).
@@ -567,7 +619,11 @@ class Call:
 
     # Scalar side-channel inputs carried on the wire rather than as tensors.
     rng: Rng | None = None
+    # Per-call sampler constraints. The token executor treats None as an empty
+    # `SamplingState` and merges these finish ids with the admission's.
     sampling_state: SamplingState | None = None
+    # Host-known prompt, draft, or decode input tokens in model input order;
+    # empty when a continuation reads its predecessor's device token.
     input_token_ids: tuple[int, ...] = ()
     # Encoded source image payload for a vision or latent encoding call.
     input_image: str | None = None
@@ -581,9 +637,9 @@ class Call:
     consumer_slots: tuple[int, ...] = ()
 
     def tensor_inputs(self) -> tuple[tensor.TensorRef, ...]:
-        """Return tensor inputs from the computation signature.
+        """Return the tensor inputs of the computation, excluding its predicate.
 
-        Excludes the call's predicate.
+        Includes the token and latent inputs, which `buffer_inputs` omits.
         """
         return (
             *self.inputs,
@@ -601,7 +657,11 @@ class Call:
         )
 
     def tensor_outputs(self) -> tuple[tensor.TensorRef, ...]:
-        """Return every tensor declaration owned by this computation."""
+        """Return every tensor output this computation produces.
+
+        Includes the device scalar outputs (token, completion, transition)
+        and the latent output, which `buffer_outputs` omits.
+        """
         return (
             *self.outputs,
             *(
@@ -634,7 +694,11 @@ class Call:
         )
 
     def buffer_outputs(self) -> tuple[tensor.TensorRef, ...]:
-        """Return outputs backed by scheduler-allocated persistent buffers."""
+        """Return outputs backed by scheduler-allocated persistent buffers.
+
+        `Batch.validate` requires a `BufferAllocation` for each of these that
+        is at least as large as the output's `max_bytes`.
+        """
         return (
             *self.outputs,
             *(
@@ -653,11 +717,16 @@ class Call:
         return self.kind in _STATE_ADVANCING_WORK
 
     def validate(self) -> None:
-        """Enforce call-family and bound invariants.
+        """Enforce the call's identity, bound, dataflow, and predicate rules.
 
-        Also enforces dataflow, predicate, and RNG invariants.
+        `from_mapping` calls this; records the PyO3 transport builds were
+        validated by the Rust `Call::validate` instead. `rng` is not checked
+        here: the executors that consume it validate it against the admission.
+
+        Raises:
+            WorkerError: Any rule is violated.
         """
-        # Identity and dependency ordering.
+        # Identity, coordinates, component, and kind.
         if self.call_id.batch_id < 1:
             raise invalid_descriptor("call id must be positive")
         self.coordinates.validate()
@@ -665,6 +734,7 @@ class Call:
             raise invalid_descriptor("call component must not be empty")
         if self.kind not in CALL_KINDS:
             raise invalid_descriptor("call requires a valid computation tag")
+
         # Token and sampling inputs.
         if len(self.input_token_ids) > self.bounds.max_tokens:
             raise invalid_descriptor(
@@ -691,7 +761,8 @@ class Call:
                 "image source"
             )
 
-        # KV cache transfer endpoints.
+        # KV cache transfer endpoints. A KV output's index shares the output
+        # index space with the tensor outputs checked below.
         output_indices: set[int] = set()
         publishes_kv = self.kind in {
             TransferMode.KV_PUBLISH,
@@ -758,7 +829,9 @@ class Call:
                     "capacity"
                 )
 
-        # Scalar relay endpoints: one int64 token, one uint8 completion flag.
+        # Scalar relay endpoints: the token input and output are each one
+        # int64 element (only a tensor transfer consumes a token input), and
+        # the completion and transition outputs are each one uint8 element.
         if self.token_input is not None and (
             self.kind is not TransferMode.TENSOR
             or self.token_input.dtype is not tensor.DType.I64
@@ -815,9 +888,10 @@ class Call:
         value: object,
         where: str = "call",
     ) -> Call:
-        """Parse and validate a computation and its identity.
+        """Parse a call mapping and run `validate` on the result.
 
-        Also validates its execution dependencies.
+        Raises:
+            WorkerError: A field is malformed or `validate` rejects the call.
         """
         data = _map(value, where)
         get = data.get
@@ -961,7 +1035,7 @@ class Call:
         return call
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode computation fields, including the request identity."""
+        """Encode every call field into its wire mapping."""
         return {
             "request_key": self.request_key.to_mapping(),
             "call_id": self.call_id.to_mapping(),
@@ -1029,6 +1103,8 @@ class Call:
 class SamplingState:
     """Canonical branch-local token processor inputs for one call.
 
+    Token ids in every field must be strictly increasing uint32 values; both
+    `validate` and the Rust `Call::validate` reject any other ordering.
     Penalty token counts are not carried here: they are a device-resident
     accepted base plus bounded deltas folded when sampling accepts tokens,
     so no host token history participates in a successor's sampling input.
@@ -1043,9 +1119,12 @@ class SamplingState:
     force_finish: bool = False
 
     def validate(self) -> None:
-        """Require canonical token sets.
+        """Require every token set to be strictly increasing within uint32.
 
-        Preserves an explicitly empty whitelist.
+        An empty `allowed_token_ids` is valid and distinct from None.
+
+        Raises:
+            WorkerError: A token id is out of range or a set is not canonical.
         """
         for ids in (
             self.allowed_token_ids,
@@ -1068,7 +1147,10 @@ class SamplingState:
 
     @classmethod
     def from_mapping(cls, value: object) -> SamplingState:
-        """Read direct sampler inputs from a computation mapping."""
+        """Parse sampler constraints without checking token range or order.
+
+        `Call.validate` runs `validate` on the call's sampling state.
+        """
         data = _map(value, "sampling_state")
         allowed = data.get("allowed_token_ids")
         return cls(
@@ -1090,10 +1172,7 @@ class SamplingState:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Serialize sampler constraints.
-
-        Does not assign a storage identity.
-        """
+        """Serialize sampler constraints into their wire mapping."""
         return {
             "allowed_token_ids": None
             if self.allowed_token_ids is None

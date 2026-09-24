@@ -1,10 +1,13 @@
 """Launch adapter for :class:`WorkerProcessArgs`.
 
-The engine writes one typed launch descriptor per rank and passes its location
-on the command line. Every tuning value lives in that descriptor, so the
-launching side is the single source of defaults and this module never restates
-one. Only the process identity travels on argv, which keeps a running worker
-identifiable from the process table.
+The engine writes one JSON launch descriptor per rank and passes its path on
+the command line as ``--launch-descriptor``. Every tuning value lives in that
+descriptor, so the launching side is the single source of defaults and this
+module never restates one. Only the process identity also travels on argv,
+which keeps a running worker identifiable from the process table.
+
+``uniserve_worker.main`` calls :func:`parse_worker_args` and hands the result
+to ``uniserve_worker.bootstrap.launch.run_worker``.
 """
 
 from __future__ import annotations
@@ -17,8 +20,10 @@ from pathlib import Path
 
 from uniserve_worker.config.deployment import WorkerProcessArgs
 
-# Values the descriptor must carry. A launch that omits one is a contract
-# violation rather than something to paper over with a local default.
+# Keys ``read_launch_descriptor`` requires the descriptor to carry. A launch
+# that omits one is a contract violation rather than something to paper over
+# with a local default. Optional keys such as ``checkpoint_identity`` are
+# absent when the launcher has no value for them.
 REQUIRED_FIELDS = (
     "registration_address",
     "channel_transport",
@@ -73,7 +78,15 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
 
 
 def read_launch_descriptor(path: Path) -> Namespace:
-    """Load one launch descriptor into the namespace the config consumes."""
+    """Load one launch descriptor into the namespace the config consumes.
+
+    The descriptor's keys become the namespace's attributes unchanged; value
+    validation belongs to ``WorkerProcessArgs.from_namespace``.
+
+    Raises:
+        ValueError: The file cannot be read, is not valid JSON, is not a JSON
+            object, or omits a key in ``REQUIRED_FIELDS``.
+    """
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except OSError as error:
@@ -96,7 +109,13 @@ def read_launch_descriptor(path: Path) -> Namespace:
 def parse_worker_args(
     arguments: Sequence[str] | None = None,
 ) -> WorkerProcessArgs:
-    """Resolve the validated worker-process configuration for this launch."""
+    """Resolve the validated worker-process configuration for this launch.
+
+    The argv identity flags are parsed but not consulted; the descriptor is
+    the authority. A ``ValueError`` from reading or validating the descriptor
+    becomes ``parser.error``, which prints usage and exits with status 2;
+    other exceptions, such as a ``WorkerError`` from validation, propagate.
+    """
     parser = create_worker_cli_parser()
     namespace = parser.parse_args(arguments)
     try:

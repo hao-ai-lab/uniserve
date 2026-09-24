@@ -28,7 +28,10 @@ from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.protocol.transfer import DESCRIPTOR_HANDLE_BYTES
 
 #: A request names one publication; a reply is either one descriptor or the
-#: refusal byte below.
+#: refusal byte below. `SOCK_SEQPACKET` delivers each as a single record.
+#:
+#: A publication id is `uuid.uuid4().hex` (`CudaVmmTransport.publish`), whose
+#: 32 characters fill a request exactly.
 _REQUEST_BYTES = 32
 _REFUSED = b"\x00"
 _GRANTED = b"\x01"
@@ -51,6 +54,9 @@ class DescriptorGrants:
     publications retire. The registered descriptor stays owned by whoever
     opened it: a direct export belongs to its publication, a pool handle to
     the pool, and this table only lends them out.
+
+    Requests are served one connection at a time on a daemon thread;
+    `register` and `release` may be called from any thread.
     """
 
     def __init__(self, endpoint: str) -> None:
@@ -99,6 +105,8 @@ class DescriptorGrants:
                 try:
                     self._reply(connection)
                 except OSError:
+                    # A consumer that disconnects or times out costs only its
+                    # own request; the listener keeps serving.
                     continue
 
     def _reply(self, connection: socket.socket) -> None:
@@ -135,6 +143,12 @@ def fetch(endpoint: str, publication_id: str) -> int:
 
     The returned descriptor belongs to this process; the caller closes it once
     the allocation has been imported, which holds its own reference.
+
+    Raises:
+        WorkerError: `invalid_descriptor` when the endpoint's socket cannot be
+            reached, or when the reply carries no descriptor, as for a
+            publication that is not, or no longer, registered.
+        OSError: A socket failure after connecting, such as a timeout.
     """
     address = address_of(endpoint)
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)

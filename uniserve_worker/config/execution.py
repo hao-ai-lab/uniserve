@@ -2,6 +2,15 @@
 
 Bootstrap resolves these stable execution settings before model materialization
 and passes the immutable value into every configured subsystem.
+
+The module also owns the default CUDA graph capture buckets and the storage
+reservations for captured graphs: ``graph_padding_block_count`` derives the KV
+pages that graph padding may occupy from the default buckets, and
+``graph_storage_budget_bytes`` sizes the device share for retained graph
+executables. Capacity planning in ``uniserve_worker.bootstrap.report``
+reserves both before it sizes the request pool, and
+``uniserve_worker.model_executor.graph_storage`` uses the graph budget as the
+default for a device whose budget has not been set.
 """
 
 from __future__ import annotations
@@ -84,8 +93,9 @@ DEFAULT_DECODE_GRAPH_BATCH_SIZES = (
     128,
 )
 
-# Token buckets grow geometrically so the captured-graph count stays bounded
-# while padding waste stays proportional to the bucket size.
+# Token buckets step linearly within each range, with a step that widens as the
+# counts grow. A prefill rounded up to a bucket gains less padding than the gap
+# below that bucket.
 DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS = (
     4,
     8,
@@ -163,13 +173,19 @@ DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS = (
     16384,
 )
 
+# Row (request) buckets for captured prefill graphs. They are not
+# configurable: ``ModelExecutor`` and bootstrap capacity planning read them
+# directly.
 DEFAULT_PREFILL_GRAPH_ROW_BUCKETS = (8, 16, 32)
 
 
 def graph_padding_block_count(block_size: int) -> int:
-    """Return the maximum additional KV pages.
+    """Return the most KV pages that padding a captured graph input can add.
 
-    The additional pages are required to pad a decode graph batch.
+    A decode batch padded up to the next captured batch size gains at most one
+    token per padding row, and a prefill padded up to the next token bucket
+    gains at most the widest gap between buckets. The count is derived from
+    the default buckets, not from the sizes a ``WorkerConfig`` configures.
     """
     block_size = max(1, int(block_size))
     decode_tokens = max(DEFAULT_DECODE_GRAPH_BATCH_SIZES) - 1
@@ -205,9 +221,10 @@ def graph_storage_budget_bytes(total_device_bytes: int) -> int:
     )
 
 
-# JSON lane selectors resolve at startup. Execution binds concrete
-# call kinds, so independent media calls never acquire a second
-# scheduling classification.
+# JSON lane selectors (the ``domains`` of a lane descriptor) resolve to call
+# kinds at startup. Execution binds concrete call kinds, so independent media
+# calls never acquire a second scheduling classification. The engine's lane
+# parser accepts the same three selector names.
 LANE_COMPUTATION_GROUPS: dict[str, tuple[CallKind, ...]] = {
     "prefill": (
         ForwardMode.PREFILL,
@@ -232,9 +249,14 @@ LANE_COMPUTATION_GROUPS: dict[str, tuple[CallKind, ...]] = {
 
 @dataclass(frozen=True, slots=True)
 class LaneConfig:
-    """Assigns call_kinds and SM budget to one execution lane.
+    """Assigns call kinds, an SM budget and capacity overrides to one lane.
 
-    Also assigns optional capacity overrides to the lane.
+    A lane is a partition of one device's streaming multiprocessors: the
+    executor creates one stream per lane from the lanes' ``sm_budget`` values,
+    so a lane configuration requires a single physical device. The batch
+    overrides cap the worker-wide batch limits for calls bound to this lane,
+    and ``max_inflight`` sizes the lane stream's event slots; ``None`` keeps
+    the worker-wide value.
     """
 
     lane_id: str
@@ -278,7 +300,14 @@ class LaneConfig:
 class WorkerConfig:
     """Canonical rank configuration for model execution.
 
-    Also configures bounded runtime resources.
+    Also configures bounded runtime resources. ``worker_config_from_namespace``
+    sets the launch fields; bootstrap later derives others with
+    ``dataclasses.replace``. For example, model loading resizes the batch and
+    request-slot bounds of a model with a ``VideoDecoder`` and clears its KV
+    capacity, attention backend and generation device; capacity fitting on a
+    CUDA device sets ``pool_storage_bytes`` from the device storage grant and
+    may shrink the request-slot and batch bounds; and a ``kv_cache_dtype`` in
+    the quantization config overrides the launch value.
     """
 
     device: str = "cpu"
@@ -318,9 +347,11 @@ class WorkerConfig:
     flashinfer: FlashInferConfig = FlashInferConfig()
 
     def __post_init__(self) -> None:
-        """Validate topology axes and device identity.
+        """Validate topology, device identity, batch bounds and dtypes.
 
-        Also validate batch bounds and dtype policies.
+        Raises:
+            WorkerError: With the invalid-descriptor code, naming the first
+                violated constraint.
         """
         if self.graph_policy not in {"off", "auto", "full"}:
             raise invalid_descriptor("graph policy must be off, auto, or full")
@@ -374,7 +405,19 @@ def worker_config_from_namespace(
 ) -> WorkerConfig:
     """Resolve the rank execution and resource configuration.
 
-    The complete configuration is resolved from parsed CLI values.
+    Args:
+        namespace: Parsed launch descriptor fields.
+        device: The rank device, already normalized by the caller.
+        generation_device: The separate generation-tower device, if any.
+
+    Returns:
+        The launch-time configuration; fields the descriptor does not carry
+        keep their ``WorkerConfig`` defaults.
+
+    Raises:
+        ValueError: If a descriptor value fails to parse or is out of range.
+        WorkerError: If the assembled configuration violates a
+            ``WorkerConfig`` invariant.
     """
     return WorkerConfig(
         device=device,
@@ -390,6 +433,8 @@ def worker_config_from_namespace(
         attention_backend=str(namespace.attention_backend),
         model_dtype=str(namespace.model_dtype),
         kv_cache_dtype=_none_if_empty(namespace.kv_cache_dtype),
+        # The launch value must be strictly below one even though
+        # ``WorkerConfig`` itself accepts a fraction of exactly one.
         kv_storage_fraction=_bounded_fraction(
             float(namespace.kv_memory_fraction),
             "kv-memory-fraction",
@@ -433,7 +478,11 @@ def worker_config_from_namespace(
 
 
 def _none_if_empty(value: object | None) -> str | None:
-    """Normalize empty optional configuration values to ``None``."""
+    """Strip an optional string setting, keeping ``None`` as unset.
+
+    Raises:
+        ValueError: If the value is present but blank.
+    """
     if value is None:
         return None
     text = str(value).strip()
@@ -459,7 +508,7 @@ def _positive_optional_int(value: object | None) -> int | None:
 def _bounded_fraction(value: float, name: str) -> float:
     """Validate a floating-point fraction.
 
-    The fraction must lie within the closed unit interval.
+    The fraction must lie strictly between zero and one.
     """
     if value <= 0.0 or value >= 1.0:
         raise ValueError(f"{name} must be greater than 0 and less than 1")
@@ -469,7 +518,10 @@ def _bounded_fraction(value: float, name: str) -> float:
 def _parse_positive_int_csv(
     raw: object | None, *, default: tuple[int, ...]
 ) -> tuple[int, ...]:
-    """Parse a comma-separated sequence of positive integer bucket sizes."""
+    """Parse a comma-separated sequence of positive integer bucket sizes.
+
+    ``None`` selects ``default``. A present value must be strictly increasing.
+    """
     if raw is None:
         return default
     parts = tuple(part.strip() for part in str(raw).split(","))
@@ -489,9 +541,9 @@ def _parse_positive_int_csv(
 
 
 def _parse_image_shapes(raw: object | None) -> tuple[tuple[int, int], ...]:
-    """Parse and validate image-height and image-width buckets.
+    """Parse ``HEIGHTxWIDTH`` image shapes, in pixels, for flow graphs.
 
-    The buckets must be unique and positive.
+    The shapes must be unique and positive; ``None`` selects the defaults.
     """
     if raw is None:
         return ((1152, 2048), (2048, 1152))
@@ -542,9 +594,15 @@ def _parse_video_shapes(raw: object | None) -> tuple[tuple[float, int], ...]:
 
 
 def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
-    """Normalize lane declarations.
+    """Resolve JSON lane descriptors into lane configurations.
 
-    Declarations become unique identifiers and positive capacities.
+    Each item is one JSON object string whose ``domains`` list names selectors
+    from ``LANE_COMPUTATION_GROUPS``; the selectors expand to concrete call
+    kinds.
+
+    Raises:
+        ValueError: If a descriptor is malformed, a lane id repeats, or a call
+            kind would bind to more than one lane.
     """
     result: list[LaneConfig] = []
     values = () if raw is None else raw

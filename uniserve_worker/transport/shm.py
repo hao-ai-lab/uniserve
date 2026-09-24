@@ -1,4 +1,14 @@
-"""POSIX segment publication, direct host borrowing, and acknowledgment."""
+"""POSIX segment publication, direct host borrowing, and acknowledgment.
+
+`ShmTransport` publishes a host product, or a device product copied to the
+host, into a fresh POSIX shared-memory segment per publication, laid out as
+`segment` describes. Readers on the producer's host open the segment by name:
+`fetch` copies the payload out on a `TransferPool` thread, and `borrow`
+exposes it in place to a reader such as a media unit encode task. Neither
+needs a connection to the producing rank: the producer sweeps the
+acknowledgment words when it reaps, and unlinks a retired segment once no
+named consumer is still reading it.
+"""
 
 from __future__ import annotations
 
@@ -55,6 +65,8 @@ class _ShmSource:
     shm: Any
     nbytes: int
     consumers: tuple[int, ...]
+    #: `StreamSignal` of an unfinished device-to-host copy into the segment,
+    #: cleared by the publication thread once the signal fires.
     signal: Any = None
     #: Address of the segment's mapping while it is registered with the
     #: CUDA driver, so a device-to-host copy lands in it directly.
@@ -65,8 +77,11 @@ def _register_segment(buffer: memoryview) -> int:
     """Page-lock a segment's mapping so device copies land in it directly.
 
     Returns the mapping's address, which the unregistration needs. The
-    mapping is page-aligned and page-sized, as every shared storage mapping
-    is, which the driver requires of a registered range.
+    registered range is the whole mapping, which starts on a page boundary
+    as every mmap does.
+
+    Raises:
+        WorkerError: `resource_error` when the driver refuses the range.
     """
     import torch
 
@@ -81,6 +96,7 @@ def _register_segment(buffer: memoryview) -> int:
 
 
 def _unregister_segment(address: int) -> None:
+    """Undo `_register_segment`; the driver's status is not checked."""
     import torch
 
     torch.cuda.cudart().cudaHostUnregister(address)
@@ -90,13 +106,17 @@ def _unregister_segment(address: int) -> None:
 class HostBorrow:
     """A consumer's direct view of a published segment's bytes.
 
-    The bytes stay in the producer's segment: a codec process maps them by
-    name and offset. ``release`` writes this rank's acknowledgment word once
-    every read of them is done, which lets the producer retire the segment.
+    The bytes stay in the producer's segment: a reader on this host, such as
+    a media unit encode task, maps them by name and offset. ``release``
+    writes this rank's acknowledgment word and closes this borrow's own
+    mapping, which lets the producer retire the segment; the caller calls it
+    once every read of the bytes is done. Later calls do nothing.
     """
 
     segment: str
     offset: int
+    #: Byte length of the borrowed span. `execution.host_media` narrows it to
+    #: one media unit's frames before handing the borrow to its encode task.
     nbytes: int
     _release: Callable[[], None]
 
@@ -107,7 +127,21 @@ class HostBorrow:
 
 @contextmanager
 def _shared_read(locator: Locator, slot: int, *, check=None):
-    """Own a mapping and claim through its last read, including failure."""
+    """Own a mapping and claim through its last read, including failure.
+
+    Opens the segment named by ``locator``, checks its digest, claims this
+    rank's ``slot`` and waits for readiness before yielding the mapping.
+    Leaving the context, normally or by an exception, acknowledges a claimed
+    slot and closes the mapping. ``check`` is forwarded to
+    `segment.await_ready`.
+
+    Raises:
+        WorkerError: `invalid_descriptor` when ``locator`` is not a shared
+            storage locator, or its segment is missing or holds another
+            view; `resource_error` when the producer failed or readiness
+            timed out. Whatever ``check`` raises, and any other error opening
+            the segment, propagates.
+    """
     handle = locator.transport
     if not isinstance(handle, PosixShmTransfer):
         raise invalid_descriptor("shared storage read requires a SHM locator")
@@ -167,6 +201,8 @@ class ShmTransport(Transport):
         # Slots of the ranks on this host: the only ones a segment named in
         # this host's namespace can reach.
         self._host_slots = frozenset(int(slot) for slot in host_slots)
+        # `_reclaim` completes a retirement before returning, so `close` has
+        # no in-flight reclamation to drain.
         self._publications = Publications[_ShmSource](
             capacity=256,
             reclaim=self._reclaim,
@@ -176,6 +212,9 @@ class ShmTransport(Transport):
         # This rank's own word in the header of every segment it reads.
         self._acknowledgment_slot = int(acknowledgment_slot)
         self.source = source or WorkerEndpoint.local()
+        # Device publications reach the publication thread through this
+        # queue; a byte on the socket pair wakes that thread's selector, and
+        # a None item asks it to exit once every queued copy has signaled.
         self._publication_queue: queue.Queue[
             tuple[Locator, _ShmSource] | None
         ] = queue.Queue()
@@ -219,6 +258,9 @@ class ShmTransport(Transport):
     def _reclaim(
         self, source: _ShmSource, retirement: concurrent.futures.Future[None]
     ) -> None:
+        # Called by `Publications` under its lock, once the publication is
+        # retired, its producer has completed and it is settled. The CUDA
+        # registration covers the mapping, so it is removed first.
         if source.registered is not None:
             _unregister_segment(source.registered)
             source.registered = None
@@ -258,7 +300,14 @@ class ShmTransport(Transport):
             pass
 
     def _complete_publications(self) -> None:
-        """Publish completed host bytes without waiting in the Worker thread."""
+        """Publish completed host bytes without waiting in the Worker thread.
+
+        Runs on the publication thread. Each queued device publication's
+        stream signal is watched until its device-to-host copy completes;
+        the segment's readiness word is then set and the publication marked
+        complete. After the exit request, the loop keeps running until every
+        watched signal has fired, so no segment is left pending.
+        """
         selector = selectors.DefaultSelector()
         selector.register(self._publication_control_rx, selectors.EVENT_READ)
         closing = False
@@ -325,7 +374,23 @@ class ShmTransport(Transport):
         offset: tuple[int, ...] | None = None,
         consumers: Sequence[int] = (),
     ) -> Locator:
-        """Publish into a segment whose header carries its readiness."""
+        """Publish into a segment whose header carries its readiness.
+
+        A host source is copied synchronously and the segment is ready on
+        return. A device source is copied into the page-locked segment on the
+        current stream; the publication thread marks the segment ready once
+        that copy completes, and the source is recorded on the stream so its
+        storage outlives the copy. ``consumers`` names the acknowledgment
+        slots whose words must settle before the segment is unlinked.
+
+        Raises:
+            WorkerError: `invalid_descriptor` when `publication_views`
+                refuses the source or the locator's identity is already
+                registered; `resource_error` when transfer bytes or
+                the publication table are exhausted, the table is closing,
+                or the CUDA driver refuses to register the segment.
+                Allocation and copy errors propagate.
+        """
         import torch
 
         source, shape, offset = publication_views(tensor, offset)
@@ -377,6 +442,9 @@ class ShmTransport(Transport):
                 signal = None
                 for target, value in copy_pairs(source, packed):
                     target.copy_(value)
+                # `target` views the segment's mapping. No such view may
+                # outlive the mapping: `SharedMemory.close` raises
+                # `BufferError` while any view of it is alive.
                 del target, value
                 segment.set_state(buffer, segment.READY)
 
@@ -406,6 +474,10 @@ class ShmTransport(Transport):
             del packed, payload
             return locator
         except BaseException:
+            # Once registered, the publication table owns the segment: the
+            # publication is retired, and a device publication is marked
+            # failed and complete so `_reclaim` can unlink it. Before that,
+            # the segment and bytes are returned here.
             if registered:
                 self._publications.release(locator)
                 if submitted:
@@ -433,8 +505,10 @@ class ShmTransport(Transport):
     ) -> None:
         """Copy the payload out of the segment, then acknowledge it.
 
-        The copy holds the segment only while it runs; the bytes are held
-        through the (possibly asynchronous) destination copy in this process.
+        The segment is mapped and claimed only until the payload has been
+        copied into a private buffer, and it is acknowledged as soon as that
+        copy ends. The private buffer, staged in pinned memory for a CUDA
+        destination, then feeds the possibly asynchronous destination copy.
         """
         import torch
 
@@ -475,6 +549,15 @@ class ShmTransport(Transport):
         destination: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
         region: tuple[slice, ...] | None = None,
     ) -> TransferTicket:
+        """Submit a read of a segment published on this node.
+
+        Raises:
+            WorkerError: `invalid_descriptor` when the publication lies on
+                another node or, with a `destination`, when `region` exceeds
+                the published view or `destination` does not match it;
+                without one, those errors fail the ticket instead. Errors
+                from `TransferPool.submit` propagate.
+        """
         if locator.source.node != self.source.node:
             raise invalid_descriptor(
                 "shared storage transport requires the source node"
@@ -504,6 +587,12 @@ class ShmTransport(Transport):
         mapping; the bytes are neither copied nor retained here. Readiness
         is awaited before returning, and releasing the borrow writes this
         rank's acknowledgment word.
+
+        Raises:
+            WorkerError: `invalid_descriptor` when ``locator`` is not a
+                shared storage locator on this node or `row_span` refuses
+                ``region``; otherwise as `_shared_read` raises when opening,
+                identifying or awaiting the segment.
         """
         handle = locator.transport
         if not isinstance(handle, PosixShmTransfer):
@@ -515,6 +604,8 @@ class ShmTransport(Transport):
                 "shared storage transport requires the source node"
             )
         start, nbytes = row_span(locator, region)
+        # On success the mapping's exit moves into the borrow's release; if
+        # the borrow cannot be built, the stack acknowledges and closes now.
         with ExitStack() as ownership:
             ownership.enter_context(
                 _shared_read(locator, self._acknowledgment_slot)
@@ -536,6 +627,10 @@ class ShmTransport(Transport):
         return self._publications.release(locator)
 
     def close(self) -> None:
+        # Reads drain first, then the publication thread exits once every
+        # pending device copy has signaled, and only then are the
+        # publications retired; `Publications.close` raises `resource_error`
+        # when any source is still retained.
         try:
             self._reads.close()
         finally:

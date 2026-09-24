@@ -1,4 +1,16 @@
-"""Resources and delivery facts owned by one in-flight scheduler submission."""
+"""Resources and delivery state owned by one in-flight scheduler submission.
+
+`Executor.submit` creates one `BatchState` per `Batch` and owns it until
+`Executor.poll` consumes its result, `submit` itself fails, or the worker
+closes. The execution modules fill it in stage order: `prepare_batch` and
+`prepare_inputs` record storage dependencies, input reservations and
+predicate captures; `reserve_outputs` binds one `PendingOutput` per call;
+`commit_batch` (or `execute_batch` on failure) records the final outputs.
+The `Executor` begins retiring the batch's commands at launch, materializes
+the outputs, and then completes that retirement. Readiness callbacks
+registered by `on_dependencies_ready` may run on a thread that completes a
+dependency rather than the worker thread.
+"""
 
 from __future__ import annotations
 
@@ -41,21 +53,25 @@ from uniserve_worker.transport.ticket import TransferTicket
 class BatchState:
     """Retain inputs, physical dependencies, outputs and delivery position.
 
-    Worker submits inputs, launches computation, and materializes results. This
-    object has no callback that can execute its batch or advance the worker.
+    The `Executor` submits inputs, launches computation, and materializes
+    results. This object has no callback that can execute its batch or
+    advance the worker.
 
     Every call has the same kind and component, so execution, publication,
     and failure belong to the batch as a whole. Physical retirement remains
-    distinct from making its outputs visible.
+    distinct from making its outputs visible: on a batch that completes
+    without error, ``materialized`` becomes true before ``complete``.
     """
 
     batch: Batch
     propagate_errors: bool = False
     # The call each of this batch's calls follows in its request, derived by
-    # the rank from its own request state; None for independent work.
+    # `RequestPool.predecessors` from this rank's request state; None for
+    # independent work.
     predecessors: dict[CallId, CallId | None] = field(default_factory=dict)
 
-    # Physical input reservations held until execution observes readiness.
+    # Physical input reservations keyed by input buffer id, held until
+    # `close_inputs` completes the reads and abandons unadopted imports.
     tensor_reads: dict[BufferId, TensorRead] = field(default_factory=dict)
     latent_imports: dict[BufferId, LatentImport] = field(default_factory=dict)
     cache_imports: dict[BufferId, CacheImport] = field(default_factory=dict)
@@ -63,28 +79,41 @@ class BatchState:
     # at execution; they are neither imported nor staged here.
     borrowed_inputs: set[BufferId] = field(default_factory=set)
 
-    # Completion predicates staged in a sealed buffer and read as booleans.
+    # Completion-valued (U8) predicates, one row each in a dedicated output
+    # buffer. An entry is (call identity, captured (offset, count) span,
+    # row). Transferred sources wait in ``predicate_transfers`` as
+    # (identity, source buffer, row) until `capture_predicates` captures them
+    # and seals the buffer; no capture is possible after sealing.
     predicate_buffer: OutputBuffer | None = None
     predicate_entries: list[tuple[CallIdentity, tuple[int, int], int]] = field(
         default_factory=list
     )
     predicate_transfers: tuple[tuple[CallIdentity, BufferId, int], ...] = ()
     predicates_sealed: bool = False
+    # Cache filled by the first successful `predicate_values` read.
     _predicate_values: dict[CallIdentity, bool] | None = None
 
-    # Declared physical inputs and their outstanding transfer dependencies.
+    # Set by `prepare_batch`: futures that must complete before this batch
+    # writes its target latent, cache-page and KV storage (they gate
+    # execution even without imports), and the products and KV transfers it
+    # imports.
     storage_dependencies: tuple[Future[None], ...] = ()
     input_products: tuple[TensorPublication, ...] = ()
     kv_inputs: tuple[KvTransfer, ...] = ()
 
-    # Lifecycle flags from input submission through terminal delivery.
+    # Lifecycle flags from input submission through terminal delivery. A
+    # batch is ``complete`` once its retirement finishes or `Executor` records
+    # its terminal ``error``; after ``inputs_closed``, pending readiness
+    # callbacks no longer fire.
     inputs_submitted: bool = False
     inputs_closed: bool = False
     launched: bool = False
     complete: bool = False
     error: WorkerError | None = None
 
-    # Final values addressed by original call index.
+    # Final values addressed by original call index: None until
+    # `bind_outputs`, then a `PendingOutput`, then the materialized
+    # `RequestOutput`.
     outputs: list[PendingOutput | RequestOutput | None] = field(
         default_factory=list
     )
@@ -92,15 +121,27 @@ class BatchState:
     # still be outstanding after this, so it is distinct from ``complete``.
     materialized: bool = False
 
+    # Completion storage leased by `reserve_outputs`; `record_outputs` drops
+    # this reference while the pending outputs keep their rows.
     buffer: OutputBuffer | None = None
+    # The first active call's capability stream (`ModelExecutor.call_stream`),
+    # or None to run on the current stream; see `scope`.
     stream: torch.cuda.Stream | None = None
+    # ``time.perf_counter_ns`` when `reserve_outputs` began binding outputs;
+    # `commit_batch` and the post-registration failure paths of
+    # `execute_batch` derive ``execution_us`` from it.
     started_ns: int = 0
+    # Per-execution scratch that `record_outputs` clears; `commit_batch`
+    # folds the forward stats and component timings into ``stats``.
     forward_stats: list[ForwardStats] = field(default_factory=list)
     component_us: dict[str, int] = field(default_factory=dict)
     forward_indices: dict[CallIdentity, tuple[int, ...]] = field(
         default_factory=dict
     )
+    # Set once `reserve_outputs` succeeds.
     registered: bool = False
+    # Set by `commit_batch` once resource commits begin; from then on the
+    # batch cannot be discarded and a failure is fatal.
     published: bool = False
     # Output index of each request's call. Looking up one request must not
     # scan the other calls of the batch.
@@ -109,7 +150,12 @@ class BatchState:
     stats: ForwardStats | None = None
     execution_us: int | None = None
 
-    # Resource retirement decided during execution, applied by the owner.
+    # Retirement of the batch's ``Finish`` and ``Free`` commands, recorded by
+    # `Executor._retire_commands` and advanced by
+    # `Executor._advance_retirement`. ``retirement_events`` fence the device
+    # writes each retirement stage submits, and ``retirement_cleaned`` is set
+    # once the stores have retired the closed requests and freed buffers (at
+    # once for a batch without such commands).
     retirement_requests: frozenset[RequestKey] = frozenset()
     retirement_local_requests: frozenset[RequestKey] = frozenset()
     retirement_buffers: frozenset[BufferId] = frozenset()
@@ -133,13 +179,23 @@ class BatchState:
         return self.predecessors.get(call.call_id)
 
     def scope(self):
-        """Keep numerical access and retirement fences on the batch stream."""
+        """Return a context that makes the batch stream current.
+
+        `reserve_outputs`, `dispatch_batch`, `commit_batch` and
+        `discard_batch` enter it, so the device work and fences they enqueue
+        land on the batch stream; with no batch stream the context changes
+        nothing.
+        """
         stream = self.stream
         return nullcontext() if stream is None else torch.cuda.stream(stream)
 
     @property
     def output_buffer(self) -> OutputBuffer:
-        """Borrow completion storage during execution, before publication."""
+        """Borrow completion storage during execution, before publication.
+
+        Raises:
+            RuntimeError: Before `bind_outputs` or after `record_outputs`.
+        """
         if self.buffer is None:
             raise RuntimeError("batch has no reserved output buffer")
         return self.buffer
@@ -150,7 +206,17 @@ class BatchState:
         buffer: OutputBuffer,
         started_ns: int,
     ) -> None:
-        """Bind reserved outputs to call indexes before preparing resources."""
+        """Bind reserved outputs to call indexes before preparing resources.
+
+        ``outputs`` is aligned with ``batch.calls``. Indexes bound before a
+        failing one stay bound, and ``buffer`` is retained only on success.
+
+        Raises:
+            RuntimeError: An index already holds an output.
+            WorkerError: ``invalid_descriptor`` when an output's request key
+                and call id differ from its call's.
+            ValueError: ``outputs`` and the calls differ in length.
+        """
         for index, (call, output) in enumerate(
             zip(self.batch.calls, outputs, strict=True)
         ):
@@ -169,14 +235,24 @@ class BatchState:
         self.started_ns = started_ns
 
     def pending_outputs(self) -> tuple[PendingOutput, ...]:
-        """Borrow the currently executing outputs of the batch's completion."""
+        """Borrow every call's `PendingOutput`, in call order.
+
+        Raises:
+            RuntimeError: Any output is unbound or already materialized.
+        """
         values = tuple(self.outputs)
         if any(not isinstance(value, PendingOutput) for value in values):
             raise RuntimeError("batch has no reserved pending outputs")
         return cast(tuple[PendingOutput, ...], values)
 
     def pending_output(self, request_id: int) -> PendingOutput:
-        """Borrow the reserved pending output of one request of the batch."""
+        """Borrow the reserved pending output of one request of the batch.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when no call of the batch
+                belongs to ``request_id``.
+            RuntimeError: That call's output is unbound or materialized.
+        """
         index = self.request_indexes.get(int(request_id))
         if index is None:
             raise invalid_descriptor(f"batch has no request {request_id}")
@@ -191,6 +267,11 @@ class BatchState:
 
     @property
     def request_ids(self) -> frozenset[int]:
+        """Ids of every request the batch's admissions, calls or commands name.
+
+        On a single rank, `Executor._can_start_batch` uses it to hold a batch
+        behind an unlaunched earlier batch that shares a request.
+        """
         return frozenset(
             key.request_id
             for key in (
@@ -201,7 +282,12 @@ class BatchState:
         )
 
     def inputs_ready(self) -> bool:
-        """Check readiness without submitting inputs or running the model."""
+        """Check readiness without submitting inputs or running the model.
+
+        True once inputs were submitted, every storage dependency, input
+        transfer and cache import is done, and completion predicates are
+        absent, already read, or sealed with their copies complete.
+        """
         return (
             self.inputs_submitted
             and all(
@@ -219,9 +305,19 @@ class BatchState:
         )
 
     def predicate_values(self) -> dict[CallIdentity, bool]:
-        """Read validated predicate scalars and index them by semantic product.
+        """Read each completion predicate as a boolean, keyed by call.
 
-        reference.
+        The first read validates every captured value, marks each row
+        observed, and caches the result; later calls return the cache. An
+        empty mapping means the batch has no completion-valued (U8)
+        predicates; I64 predicates are not read here.
+
+        Raises:
+            RuntimeError: The predicate buffer is not yet ready.
+            WorkerError: ``invalid_descriptor`` when a captured predicate is
+                not a single 0 or 1, or an `OutputBuffer` invariant
+                violation. The buffer is abandoned on any failure while
+                reading.
         """
         buffer = self.predicate_buffer
         if buffer is None:
@@ -254,9 +350,17 @@ class BatchState:
         return values
 
     def on_dependencies_ready(self, callback: Callable[[], None]) -> None:
-        """Wake the owner once physical dependencies permit its next.
+        """Wake the owner once physical dependencies permit its next step.
 
-        preparation step.
+        Waits on the input transfer tickets, the storage dependencies, the
+        cache import completions and, once sealed, the predicate buffer's
+        completion. With no such dependency, ``callback`` runs synchronously
+        and unconditionally. Otherwise it runs at most once, when all of them
+        are complete, and not after `close_inputs`: synchronously when they
+        already are at registration, else on a thread that completes one.
+        The dependency set is captured now, so the owner re-checks
+        `inputs_ready` when woken and registers again if the batch is still
+        not ready.
         """
         tickets = tuple(self.input_tickets())
         dependencies = self.storage_dependencies + tuple(
@@ -271,6 +375,8 @@ class BatchState:
         lock = Lock()
         fired = False
 
+        # Done callbacks may run concurrently on different completing
+        # threads; the lock lets at most one of them invoke ``callback``.
         def notify_if_ready() -> None:
             nonlocal fired
             if self.inputs_closed:
@@ -296,7 +402,8 @@ class BatchState:
     def input_tickets(self) -> Iterator[TransferTicket]:
         """Borrow physical transfers from their actual storage reservations."""
         for read in self.tensor_reads.values():
-            # Completed reads release their shared import. A callback registered
+            # `TensorStore.complete_reads` clears ``imported`` when a read
+            # completes and drops its shared import. A callback registered
             # after synchronous execution must not revive that retired
             # dependency.
             if read.imported is not None:
@@ -305,7 +412,11 @@ class BatchState:
             yield from write.transfers
 
     def input_ready(self, buffer: BufferId) -> bool:
-        """Query one reserved input without publishing or consuming it."""
+        """Query one reserved input without publishing or consuming it.
+
+        Inputs read in place and tensor reads without a pending import are
+        always ready. A buffer this batch has not reserved reports False.
+        """
         if buffer in self.borrowed_inputs:
             return True
         if (read := self.tensor_reads.get(buffer)) is not None:
@@ -324,12 +435,14 @@ class BatchState:
         latent_pool: LatentPool | None,
         kv_cache: KVCacheManager | None,
     ) -> None:
-        """Release this submission's readers and unadopted physical.
+        """Release this submission's readers and unadopted destinations.
 
-        destinations.
-
-        Shared tensor fills outlive cancellation while another read retains
-        them. Latent and cache owners retain cancelled writes until retirement.
+        Runs once, whether after execution, on a preparation failure, or when
+        the batch is closed; later calls do nothing, even when an earlier
+        release raised. Every release is attempted, and the first failure is
+        raised with later ones noted. Shared tensor fills outlive cancellation
+        while another read retains them. Latent and cache owners retain
+        cancelled writes until retirement.
         """
         if self.inputs_closed:
             return
@@ -353,6 +466,8 @@ class BatchState:
                 if not write.released
             )
 
+        # `predicate_values` observes every row it reads, so only an unread
+        # predicate buffer is abandoned here.
         if self.predicate_buffer is not None and self._predicate_values is None:
             actions.append(self.predicate_buffer.abandon)
 
@@ -379,9 +494,20 @@ class BatchState:
         execution_us: int,
         stats: ForwardStats,
     ) -> None:
-        """Retain original call outputs and statistics at their completion.
+        """Record the batch's final call outputs, products and statistics.
 
-        boundary.
+        Called once per batch, by `commit_batch` for a published batch or by
+        `execute_batch` with error completions. ``outputs`` is aligned with
+        ``batch.calls``, and a `PendingOutput` must be the one reserved at its
+        index. Clears the output buffer reference and the per-execution
+        scratch. Outputs stored before a failure stay stored.
+
+        Raises:
+            RuntimeError: Outputs were already recorded, or a pending output
+                replaces a different reserved one.
+            WorkerError: ``invalid_descriptor`` when an output or product does
+                not belong to a call of this batch.
+            ValueError: ``outputs`` and the calls differ in length.
         """
         if self.stats is not None:
             raise RuntimeError("batch was published more than once")
@@ -424,7 +550,11 @@ class BatchState:
         self.component_us.clear()
 
     def ready(self) -> bool:
-        """Query whether the batch's single result can be delivered."""
+        """Query whether the batch's single result can be delivered.
+
+        True once the batch is complete or has a terminal error, until
+        `take_output` or `take_error` consumes it.
+        """
         if self.result_sent:
             return False
         return self.error is not None or self.complete
@@ -434,6 +564,12 @@ class BatchState:
 
         A batch is one numerical call on one component, so every call it
         carries completes together and its retirement is already applied.
+        Only products of calls that completed with `CallStatus.OK` are
+        reported.
+
+        Raises:
+            RuntimeError: The batch has a terminal error (use `take_error`),
+                is not ready, or holds an unmaterialized output.
         """
         if self.error is not None:
             raise RuntimeError(
@@ -486,9 +622,11 @@ class BatchState:
         latent_pool: LatentPool | None,
         kv_cache: KVCacheManager | None,
     ) -> None:
-        """Abandon delivery while physical readers retain their own resource.
+        """Abandon delivery while physical readers retain their own leases.
 
-        leases.
+        Closes the inputs and abandons every output still pending. Every
+        release is attempted, and the first failure is raised with later ones
+        noted.
         """
         actions: list[Callable[[], object]] = [
             partial(self.close_inputs, tensor_store, latent_pool, kv_cache)

@@ -1,4 +1,12 @@
-"""Publish physical tensors through the mechanisms their consumers need."""
+"""Publish physical tensors through the mechanisms their consumers need.
+
+`publish_tensor` is how storage owners (the KV cache, and the latent,
+tensor-store and encoder-feature publications of `execution.transfer` and
+`execution.image`) expose a product to the ranks that read it. It
+selects backends from the rank's configured transports by the product's
+location and by which consumers each backend reaches, and returns one
+`Locator` per publication made.
+"""
 
 from __future__ import annotations
 
@@ -41,6 +49,30 @@ def publish_tensor(
     product. A partial failure revokes all preceding locations. Each backend
     continues to retain the source until its submitted device work and
     readers retire.
+
+    Args:
+        transports: The rank's configured backends, keyed by mechanism name.
+        source: The product, as one tensor or as ordered first-axis spans.
+        retain: Receives each publication's retirement future, which
+            completes once that backend has handed its storage back.
+        offset: The product's offset within the logical tensor it belongs
+            to, zero on every axis when omitted.
+        consumers: Acknowledgment slots of the ranks that read the product;
+            when empty, every bound mechanism for the product's location
+            serves.
+        host: Publish a device product as host bytes.
+
+    Returns:
+        One locator per publication, in the order they were made. It is
+        empty when no configured mechanism for the product's location serves
+        `consumers`, or when `cuda_vmm` is the only one, the product does not
+        fit its pool, and no host mechanism other than `local` serves
+        `consumers`.
+
+    Raises:
+        WorkerError: `unsupported_setup` when `transports` is empty. A
+            backend's publication error propagates after the locations
+            already made are released.
     """
     if not transports:
         raise unsupported_setup(
@@ -67,8 +99,10 @@ def publish_tensor(
                 )
             except PoolExhaustedError:
                 # The product does not fit its device's pool: it travels as
-                # host bytes instead, over every host mechanism this rank
-                # publishes on.
+                # host bytes instead, over every host mechanism that serves
+                # its consumers. `local` is skipped because it is also a
+                # device mechanism, listed before `cuda_vmm`, so when bound it
+                # has already published this product where it lies.
                 for fallback in HOST_MECHANISMS:
                     if (
                         fallback in transports

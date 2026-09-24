@@ -1,6 +1,28 @@
-"""Validate physical runs and reserve their input, request.
+"""Validate execution batches and reserve their input and output resources.
 
-and output resources.
+The executor (`uniserve_worker.execution.executor`) drives a batch through
+these stages, in order:
+
+1. `validate_batch` checks batch-level bounds, routing, and call support
+   after the batch's `Start` commands and before its other commands are
+   applied.
+2. `prepare_batch` runs after the batch's commands are applied. It adds cache
+   publications for KV installations and collects the futures
+   (`BatchState.storage_dependencies`) that must resolve before this batch's
+   writes.
+3. `prepare_inputs` runs once those dependencies are done when the batch has
+   transferred inputs, and immediately otherwise. It validates each
+   cross-call transfer against its declared product, reserves its
+   destination, starts the physical fetch, and captures completion-valued
+   predicates. Each later advance of the batch calls `capture_predicates`
+   until the transferred predicate sources are ready.
+4. `reserve_outputs` runs from `uniserve_worker.execution.step` once inputs
+   are ready. It creates the batch's `PendingOutput` records and completion
+   buffer, then reserves host tasks, cache tables, latent staging, and device
+   output writes, and publishes the transferred inputs into their stores.
+
+`prepare_inputs` and `reserve_outputs` release what they reserved when they
+fail partway.
 """
 
 from __future__ import annotations
@@ -95,6 +117,13 @@ def prepare_batch(
     calls receive a cache publication for their source, and every latent,
     cache-page, and KV write records the future that must complete before its
     target storage is written.
+
+    Sets `storage_dependencies`, `input_products`, and `kv_inputs` on
+    `prepared`; reserves nothing. Malformed batches raise
+    `invalid_descriptor` errors, for example a latent write without a
+    request slot, a KV installation whose source is neither supplied by the
+    batch nor resident in the cache, or, when the cache has pending
+    accesses, a KV installation without a request slot.
     """
     batch = prepared.batch
     storage_dependencies: list[Future[None]] = []
@@ -109,6 +138,10 @@ def prepare_batch(
             (call.request_key, call.call_id): call for call in batch.calls
         }
         for latent_params in batch.latent_params:
+            # Only preparation and denoising write trajectory pages.
+            # `LatentPool.write_dependencies` returns the retirements of the
+            # publications that hold those pages in the bank the write
+            # targets.
             call = scheduled[(latent_params.request_key, latent_params.call_id)]
             if call.kind not in {
                 MediaCall.LATENT_PREPARATION,
@@ -131,7 +164,8 @@ def prepare_batch(
             )
 
     # Install calls may reference sources without a scheduler-supplied
-    # publication; the cache materializes one for each missing source.
+    # publication; `KVCacheManager.publication` then supplies the source's
+    # resident publication and rejects a source that is not resident.
     entries = list(batch.input_products)
     kv_entries = list(batch.kv_inputs)
     supplied = {publication.source for publication in kv_entries}
@@ -151,6 +185,8 @@ def prepare_batch(
             kv_entries.append(kv_cache.publication(source))
             supplied.add(source)
 
+    # Without pending cache accesses there is nothing a write could wait for,
+    # so the page scan is skipped.
     cache = kv_cache
     tables = request_tables
     if cache is not None and tables is not None and cache.has_pending_accesses:
@@ -166,12 +202,15 @@ def prepare_batch(
             for table in batch.block_tables
         }
 
+        # A block table supplied by this batch takes precedence over the
+        # table installed by an earlier batch.
         def pages_for(slot: int, group: int) -> tuple[int, ...]:
             pages = assigned.get((slot, group))
             return tables.pages(slot, group) if pages is None else pages
 
-        # New pages are written from the start; ongoing rows append after the
-        # tokens already visible in their sequence.
+        # New pages are covered in full. A forward row that writes KV covers
+        # its `query_lens` tokens after the `seq_lens - query_lens` tokens
+        # already in its sequence, in group 0.
         for allocation in batch.new_cache_pages:
             storage_dependencies.extend(
                 cache.write_dependencies(
@@ -244,13 +283,22 @@ def prepare_inputs(
     transfer_backends: Mapping[str, Transport],
     config: WorkerConfig,
 ) -> None:
-    """Reserve transfer destinations and submit reads after their storage is.
+    """Reserve transfer destinations, start their fetches, and stage predicates.
 
-    available.
+    The executor calls this once per batch after `prepare_batch`; when the
+    batch has transferred inputs, the executor first waits for the batch's
+    storage dependencies. Each cross-call input descriptor is validated
+    against its declared product before a destination is reserved; on
+    failure, every input reserved so far is released before the error
+    propagates.
 
-    Each cross-call input descriptor is validated against its declared product
-    before a destination is reserved; on failure, every input reserved so far
-    is released before the error propagates.
+    Inputs read in place are recorded in `state.borrowed_inputs` instead of
+    imported: a video encode's input held in a shared-memory segment on this
+    node, and every transferred input of a mux call. Device and encoder
+    products are imported through `TensorStore.import_tensor` into
+    `state.tensor_reads`, latent products into reserved `LatentPool` pages
+    (`state.latent_imports`), and KV publications through
+    `KVCacheManager.prepare_install` (`state.cache_imports`).
     """
     from uniserve_worker.execution import transfer
 
@@ -265,8 +313,9 @@ def prepare_inputs(
     # A video encode borrows a local decoder's shared-storage segment in place.
     # A decoder on another host publishes through the rank channel instead;
     # that value must follow the ordinary import path so execution can stage a
-    # local codec input. Select from the physical publication rather than the
-    # GPU model or node name so the same path applies to every placement.
+    # local codec input. The choice is made from the publication's physical
+    # locations (a shared-memory location on this node), so the same path
+    # applies to every placement.
     borrowed_candidates = {
         product.buffer_id
         for call in batch.calls
@@ -295,7 +344,8 @@ def prepare_inputs(
             if entry.product.buffer_id in borrowed:
                 continue
 
-            # One transferred product must land on exactly one consumer device.
+            # One transferred product must land on exactly one consumer device:
+            # the compute device (`call_devices(...)[0]`) of its consumers.
             devices = {
                 model_runner.call_devices(call)[0]
                 for call in batch.calls
@@ -550,7 +600,9 @@ def prepare_inputs(
                     latent_units=value.latent_units,
                 )
 
-                # The actual reservation retains tickets before fetch can fail.
+                # Record the reservation before fetching so that `close_inputs`
+                # abandons it if `fetch_tensor` raises; each started copy is
+                # retained on the import through `retain_transfer`.
                 state.latent_imports[entry.product.buffer_id] = binding
                 from uniserve_worker.transport.fetch import fetch_tensor
 
@@ -631,6 +683,8 @@ def prepare_inputs(
                 if table is None
                 else table.allocated_tokens
             )
+            # New pages of the destination table are zeroed by the import
+            # itself before its copy; `_bind_cache_tables` skips them.
             initialized = tuple(
                 page
                 for allocation in batch.new_cache_pages
@@ -671,9 +725,15 @@ def _prepare_predicates(
     output_pool: OutputPool,
     model_runner: ModelExecutor,
 ) -> None:
-    """Capture completion-valued predicates from local products or prepared.
+    """Capture completion-valued (U8) predicates into one completion buffer.
 
-    transfers.
+    Each such call owns one row of the buffer. Local sources are
+    consumed and captured now; transferred sources (those with a prepared
+    `state.tensor_reads` import) are recorded in `state.predicate_transfers`
+    for `capture_predicates`. The buffer is sealed once every row is
+    captured, and `BatchState.predicate_values` reads it after the copies
+    complete. I64 relay predicates are not captured here; `_consume_predicates`
+    hands them to execution as device tensors.
     """
     # Predicate rows occupy one compact completion buffer regardless of whether
     # their source is already local or will arrive through a prepared transfer.
@@ -733,13 +793,15 @@ def _prepare_predicates(
                 )
             tensor_store.complete_reads(reads, device=device)
 
-        # No pending transfer can mutate the buffer once it is sealed.
+        # Sealing forbids further captures, so seal now only when no
+        # transferred row remains for `capture_predicates`.
         sealed = not pending
         if sealed:
             buffer.seal()
     except BaseException:
         # Every acquired read must receive a reader event even when preparation
-        # fails before all device groups are captured.
+        # fails before all device groups are captured; `complete_reads` skips
+        # reads already completed above.
         unrecorded = tuple(recorded)
         if unrecorded:
             tensor_store.complete_reads(unrecorded)
@@ -752,7 +814,12 @@ def _prepare_predicates(
 
 
 def capture_predicates(state: BatchState, tensor_store: TensorStore) -> None:
-    """Submit transferred predicate copies on the worker execution thread."""
+    """Submit transferred predicate copies on the worker execution thread.
+
+    Does nothing when there is no predicate buffer, it is already sealed, or
+    any transferred predicate source is not yet ready; the executor calls it
+    again on later advances. On failure the predicate buffer is abandoned.
+    """
     buffer = state.predicate_buffer
     if buffer is None or state.predicates_sealed:
         return
@@ -794,9 +861,21 @@ def reserve_outputs(
     transfer_backends: Mapping[str, Transport],
     config: WorkerConfig,
 ) -> None:
-    """Stage one batch's speculative state, resources, inputs.
+    """Bind one batch's outputs and execution resources before launch.
 
-    and completion storage.
+    `predicate_values` holds the resolved value of each completion-predicated
+    call. A call whose predicate is false is marked `CallStatus.PREDICATED`:
+    it keeps its aligned output row and binds its completion and transition
+    scalar outputs, which receive false sentinels, but reserves no host
+    tasks, cache tables, latent staging, inputs, or other outputs.
+
+    Resources are bound in dependency order: the completion buffer and
+    `PendingOutput` records, host-lane slots, cache block tables, latent
+    staging, device output writes, then transferred inputs and predicates.
+    Sets `state.registered` on success. If creating the records fails after
+    the completion buffer is acquired, the buffer is abandoned; a failure
+    after the records are bound to `state` discards the batch through
+    `discard_batch`. The error propagates in both cases.
     """
     scheduled = state.batch.calls
 
@@ -821,14 +900,18 @@ def reserve_outputs(
     if active_calls:
         stream = model_runner.call_stream(active_calls[0])
         if stream is not None:
-            # Request slots are initialized on the control stream. Independent
-            # components publish their own producer/consumer fences.
+            # A standalone capability's batch runs on the stream
+            # `ModelExecutor.call_stream` selects for its first active call.
+            # Request slots are initialized on the device's current stream,
+            # so the batch stream waits for it; independent components publish
+            # their own producer/consumer fences.
             stream.wait_stream(torch.cuda.current_stream(stream.device))
             state.stream = stream
 
     with state.scope():
-        # Restrict input payloads to identities declared by this batch.
         started = time.perf_counter_ns()
+
+        # Restrict input payloads to identities declared by this batch.
         declared_inputs = {
             reference.buffer_id
             for call in scheduled
@@ -850,9 +933,10 @@ def reserve_outputs(
 
         completion: OutputBuffer | None = None
         try:
-            # Candidate drafts and completion slots form a speculative ownership
-            # unit: either all later batch resources bind
-            # successfully or both are discarded.
+            # The completion buffer and the records bound to it are owned
+            # together: a failure before `state.bind_outputs` abandons any
+            # acquired buffer here, and a later one is handled by
+            # `discard_batch`.
             request_pool_indices = tuple(
                 int(
                     request_pool.get(
@@ -887,7 +971,7 @@ def reserve_outputs(
         state.bind_outputs(candidates, completion, started)
 
         try:
-            # Bind physical state in dependency order before decoding
+            # Bind physical state in dependency order before publishing
             # transferred inputs.
             _reserve_host_tasks(
                 active_calls,
@@ -930,8 +1014,9 @@ def reserve_outputs(
                 state=state,
             )
 
-            # Only live calls consume inputs; predicated outputs are
-            # published directly into their aligned completion rows.
+            # Only live calls consume inputs; predicated calls instead publish
+            # false into their completion and transition outputs
+            # (`_publish_predicated_outputs`).
             active_inputs = {
                 reference
                 for call in active_calls
@@ -982,8 +1067,10 @@ def reserve_outputs(
 
 def _completion_words(scheduled: tuple[Call, ...]) -> int:
     """Compute completion-word capacity for one batch."""
-    # Completion storage is addressed in 4-byte words; payload byte budgets
-    # round up to whole words.
+    # Capacity is counted in `OutputBuffer` elements (int64), matching the
+    # `OutputPool.max_words` bound set in `uniserve_worker.worker`: one
+    # sampling column of `SAMPLING_COMPLETION_FIELDS` elements per call, plus
+    # each call's `max_completion_bytes` rounded up at 4 bytes per element.
     return max(
         1,
         SAMPLING_COMPLETION_FIELDS * len(scheduled)
@@ -1006,7 +1093,13 @@ def _reserve_host_tasks(
 
     A media unit encode reserves one slot per unit this rank takes from the
     round; audio encoding, muxing and image decoding reserve one each. A
-    non-distributed component's host work belongs to its publication owner.
+    non-distributed component's encode and mux work belongs to its
+    publication owner (`WorkerInfo.output_rank`), so other ranks reserve
+    nothing for it; image decoding reserves on every rank that runs it.
+
+    The slots are stored in the call's `PendingOutput.host.tasks`. A failure
+    abandons the current call's reservations; those of earlier calls stay
+    with their records for `discard_batch` to release.
     """
     for call in scheduled:
         if call.kind not in {
@@ -1070,9 +1163,16 @@ def validate_batch(
     config: WorkerConfig,
     predecessors: Mapping[CallId, CallId | None],
 ) -> None:
-    """Validate batch identity, batch resources, routing.
+    """Validate batch resources, routing, and call support before staging.
 
-    and call support before staging.
+    Runs before the batch's `Finish` and `Free` commands are applied; `Start`
+    commands are applied first so that `predecessors` covers requests the
+    batch admits. Checks that buffer allocations fit the worker buffer pool,
+    that every call targets a component placed on this rank (when the worker
+    declares components) and a supported call kind, the batch call limit,
+    the upper bound of request-slot indices, and the video preparation
+    ordering checked by `uniserve_worker.execution.media.validate_batch`.
+    Violations raise `invalid_descriptor` or `unsupported_call` errors.
     """
     invalid_buffer = next(
         (
@@ -1141,11 +1241,21 @@ def _reserve_outputs(
     tensor_store: TensorStore,
     model_runner: ModelExecutor,
 ) -> None:
-    """Bind each declared device value to its concrete bounded owner."""
+    """Bind each declared device value to its concrete bounded owner.
+
+    Transfer, model, and image outputs form one group, encoder features are
+    reserved separately through `TensorStore.reserve_features`, and the
+    token, completion, and transition scalars are grouped by device, dtype,
+    and shape bound. `TensorStore.bind_output_groups` binds all groups or
+    none. Every bound write is appended to its record's `writes`, and the
+    token, transition, completion, and producer writes are also classified
+    onto the record.
+    """
     regions = {}
     shapes = {}
-    # Scalar outputs sharing device, dtype, and shape bound are co-allocated
-    # so one bounded allocation serves every compatible write.
+    # Scalar outputs are grouped by device, dtype, and shape bound. A group
+    # binds to scheduler buffer allocations or, without one, to request-relay
+    # slots, and `TensorStore.bind_outputs` rejects a group mixing the two.
     scalar_groups: dict[
         tuple[torch.device, DType, ShapeBound],
         list[tuple[TensorRef, torch.device | str]],
@@ -1155,6 +1265,7 @@ def _reserve_outputs(
     by_identity = {calls.call_identity(call): call for call in scheduled}
 
     for call in scheduled:
+        # Outputs are bound on the call's output device.
         device = model_runner.call_devices(call)[2]
         request = state.pending_output(call.request_key.request_id)
         predicated = request.status is CallStatus.PREDICATED
@@ -1184,8 +1295,12 @@ def _reserve_outputs(
                     decode,
                     len(request.request.admission.prompt_token_ids),
                 )
+                # None: this rank does not publish the output.
                 if layout is None:
                     continue
+
+                # A region is recorded only when this rank publishes part of
+                # the logical shape.
                 shapes[output] = layout.shape
                 if layout.local_slice != tuple(
                     slice(0, extent) for extent in layout.shape
@@ -1230,7 +1345,8 @@ def _reserve_outputs(
         buffer_allocations=allocations,
     )
 
-    # Retain each successful reservation before the next store call can fail.
+    # Record the bound writes before `reserve_features` can fail, so
+    # `discard_batch` abandons them with the rest of the batch.
     for binding in bound_groups:
         for write in binding:
             request = state.pending_output(
@@ -1246,6 +1362,11 @@ def _reserve_outputs(
         request.writes.append(write)
 
     # Classify each bound write against its producer's declared output roles.
+    # `producer_write` is the call's first write bound here other than its
+    # transition output; `_finish_device_reads` in
+    # `uniserve_worker.execution.commit` passes it to
+    # `TensorStore.complete_reads` as a fence candidate for the call's device
+    # reads.
     for write in (write for binding in bound_groups for write in binding):
         identity = (
             write.reference.request_key,
@@ -1278,9 +1399,12 @@ def _consume_predicates(
     tensor_store: TensorStore,
     model_runner: ModelExecutor,
 ) -> None:
-    """Resolve call predicates from local device products and register.
+    """Hand each active call its predicate tensor and register the reader.
 
-    their readers.
+    Reads are consumed from the `TensorStore` in one batch per compute
+    device. Each read is appended to the record's `device_reads`, which
+    `uniserve_worker.execution.commit` completes, and the tensor is stored in
+    `PendingOutput.predicate` with a flag marking an I64 relay tag.
     """
     grouped: dict[
         torch.device,
@@ -1328,9 +1452,10 @@ def _publish_predicated_outputs(
     state: BatchState,
     tensor_store: TensorStore,
 ) -> None:
-    """Publish inactive sentinel values for products of predicated.
+    """Publish false into the scalar outputs of predicated calls.
 
-    calls.
+    The completion and transition outputs of a call that does not run carry
+    the inactive decision to their consumers.
     """
     for call in scheduled:
         request = state.pending_output(call.request_key.request_id)
@@ -1349,7 +1474,12 @@ def _bind_latent_inputs(
 ) -> None:
     """Validate trajectory parameters and bind rank-local latent staging.
 
-    views.
+    Only the params of the given (active) calls are considered. With an
+    image builder, the params are checked against the admitted image
+    dimensions and the committed solver step, and every row receives a
+    `LatentPool.stage` view in `latent.staging`. Without one, the params are
+    validated by `_validate_sample_params` and only recorded. Raises
+    `invalid_descriptor` errors on any disagreement.
     """
     identities = {calls.call_identity(call) for call in scheduled}
     parameters = tuple(
@@ -1523,7 +1653,17 @@ def _bind_cache_tables(
     kv_cache: KVCacheManager | None,
     request_tables: BlockTables | None,
 ) -> None:
-    """Install scheduler tables and retain row-aligned forward coordinates."""
+    """Install scheduler tables and retain row-aligned forward coordinates.
+
+    For every slot the active calls read or write, including the
+    alternative-prefix slots of their forward rows, the batch's block tables
+    are validated and installed in `BlockTables`, and new cache pages that no
+    KV import initializes are zeroed. Each call's forward rows are then
+    recorded in `state.forward_indices`, the main row's prefix is checked
+    against the call's projected visible KV length, and the pages each row
+    accesses are retained in the `KVCacheManager` until the batch's output
+    buffer completes.
+    """
     cache = kv_cache
     page_tables = request_tables
     if cache is None or page_tables is None:
@@ -1583,8 +1723,9 @@ def _bind_cache_tables(
                 "new cache pages are outside the installed block table"
             )
 
-        # Pages a KV installation will fill are initialized on arrival; every
-        # other new page starts zeroed so stale cache content is never read.
+        # A KV import zeroes the new pages it covers before copying into them
+        # (`CacheImport.initialized_pages`); every other new page is zeroed
+        # here so stale cache content is never read.
         initialized = {
             page
             for write in state.cache_imports.values()
@@ -1597,8 +1738,9 @@ def _bind_cache_tables(
             tuple(page for page in pages if page not in initialized),
         )
 
-    # Indices refer to the original batch columns, including when
-    # inactive call kinds were filtered from the cache-registration view.
+    # Forward rows index `inputs.calls`, the full batch including predicated
+    # calls, so rows are mapped by call identity rather than by position in
+    # `scheduled`.
     rows_by_call: dict[CallIdentity, list[int]] = defaultdict(list)
     for row, index in enumerate(inputs.forward_call_indices):
         identity = calls.call_identity(inputs.calls[index])
@@ -1647,8 +1789,10 @@ def _bind_cache_tables(
             if slot != main_slot:
                 page_tables.retain_prefix(call.request_key, slot)
 
-            # Rows that write KV this step own only their committed prefix;
-            # read-only rows also cover the tokens they query.
+            # Rows that write KV retain their prefix plus the query tokens
+            # they write (`seq_lens`); read-only rows retain only the
+            # `seq_lens - query_lens` prefix. The retention lasts until the
+            # batch's completion future resolves.
             cache.retain_execution(
                 call.request_key,
                 pages,
@@ -1674,9 +1818,15 @@ def _stage_input_products(
     latent_pool: LatentPool | None,
     model_runner: ModelExecutor,
 ) -> None:
-    """Publish query-ready transferred values into their owning runtime.
+    """Publish query-ready transferred values into their owning stores.
 
-    stores.
+    Every KV import the batch consumes must be complete and agree with any
+    resident publication of its buffer, and every other non-borrowed input
+    must be query-ready; violations raise `invalid_descriptor`. A latent
+    import is adopted by the `LatentPool` as a live trajectory at its
+    transferred step, and the destination's projected `flow_step` moves to
+    that step. A device or encoder import is completed in the `TensorStore`.
+    Borrowed inputs are skipped.
     """
     # KV imports consumed by this batch must be complete and conflict-free
     # before any transferred product is published.
@@ -1702,13 +1852,13 @@ def _stage_input_products(
         product = entry.product
         if product.buffer_id in state.borrowed_inputs:
             continue
-        # Transfer metadata determines which runtime owns the imported value;
-        # each branch validates identity and shape before publication.
         if not state.input_ready(product.buffer_id):
             raise invalid_descriptor(
                 "cross-call input has no query-ready prepared transfer"
             )
 
+        # Transfer metadata determines which runtime owns the imported value;
+        # each branch validates identity and shape before publication.
         value = entry.value
         if isinstance(value, LatentTransferValue):
             consumers = tuple(
