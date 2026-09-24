@@ -1,10 +1,23 @@
 """Sparse-video QKV packing, tile selection, and output composition.
 
 The kernels transform row-major Q/K/V projections into head-major sparse
-attention inputs, pool fixed-size token tiles, select score-threshold
-candidates, and combine attended values with learned compression tokens.
+attention inputs, pool fixed-size 64-row token tiles into per-tile means,
+normalize tile-to-tile scores, write each query tile's selected key-tile list
+(the block map), and combine attended values with learned compression tokens.
 Composition can write one local result or route rank-local heads directly
-into exchange shards.
+into exchange shards. The VSA layer (``uniserve.nn.attention.vsa``) calls
+the pooling, block-map, softmax and composition entry points; the block map
+it writes is read by the runtime VSA providers.
+
+Tensors use ``[rows, heads, width]`` for projections and gates,
+``[tiles, heads, width]`` for pooled means, ``[heads, query_tiles,
+key_tiles]`` for scores and ``[heads, tiles, width]`` for compressed tiles.
+``valid_sizes`` holds the number of real rows in each 64-row tile; rows past
+it are padding. Pooling, block-map selection and tile softmax run through
+``torch.library`` custom operators (``uniserve::video_sparse_*``) that
+declare the tensors they mutate; their fake implementations do no work.
+Extents and strides are ``tl.constexpr`` kernel arguments, so every distinct
+combination compiles its own kernel specialization.
 """
 
 from __future__ import annotations
@@ -41,9 +54,10 @@ if triton is not None:
         width: tl.constexpr,
     ):
         """Average valid Q/K/V rows for one tile and attention head."""
-        # Sources are [rows, heads, width]; pooled outputs are
-        # [tiles, heads, width]. Rows beyond ``valid_sizes`` are masked out,
-        # and the clamped divisor keeps empty tiles finite.
+        # Sources are [rows, heads, width] with unit column stride; pooled
+        # outputs are [tiles, heads, width] indexed by local tile. Rows
+        # beyond ``valid_sizes`` are masked out, and the clamped divisor keeps
+        # empty tiles finite.
         tile = tl.program_id(0)
         head = tl.program_id(1)
         row_offsets = (tile * tile_rows + tl.arange(0, tile_rows)).to(tl.int64)
@@ -54,7 +68,10 @@ if triton is not None:
             tile * output_stride_tile + head * output_stride_head + columns
         )
 
-        # Query and key owners may cover different global tile intervals.
+        # Query and key owners may cover different global tile intervals: the
+        # grid spans the key tiles, and only the first ``query_tiles`` of them
+        # also pool a query tile, whose validity starts at
+        # ``query_tile_offset``.
         if tile < query_tiles:
             query_valid_rows = tl.load(valid_sizes + query_tile_offset + tile)
             query_values = tl.load(
@@ -121,11 +138,15 @@ if triton is not None:
         """Write one query tile's key-tile list and count for one head.
 
         A prefix query tile attends densely to every valid key tile. A video
-        query tile attends to the dense prefix, then to the ``selected`` video
+        query tile attends to the dense prefix, then to ``selected`` video
         tiles whose pooled scores clear a threshold found by interpolation
-        search; prefix ranks give threshold ties a deterministic order. A
-        padding tile attends to one tile so its count stays positive. Entries
-        past a row's count are left as they were; no consumer reads them.
+        search. When more than ``selected`` columns clear the final threshold
+        (ties, or a bracket not yet narrowed to one score after
+        ``iterations`` steps), the lowest-indexed ones are kept, so the list
+        is deterministic but can differ from an exact top-k. A padding tile
+        attends to key tile 0 so its count stays positive. Entries past a
+        row's count are not written and keep whatever the buffer held, so
+        readers must bound their reads by the count.
         """
         row = tl.program_id(0)
         head = row // tiles
@@ -168,7 +189,12 @@ if triton is not None:
 
             # Maintain score bounds and the number of candidates at each
             # bound. Interpolation converges toward a threshold with at least
-            # ``selected`` values while avoiding a full per-row sort.
+            # ``selected`` values while avoiding a full per-row sort. Invariant:
+            # at least ``selected`` valid values are ``>= lower``. It holds
+            # initially because ``lower`` is the row minimum and
+            # ``_write_block_map`` checks ``columns >= selected`` whenever
+            # video rows exist; ``lower`` then moves only to a threshold whose
+            # count is still at least ``selected``.
             lower = tl.min(tl.where(valid, values, float("inf")))
             upper = tl.max(tl.where(valid, values, -float("inf"))) + 1.0
             lower_count = tl.sum(valid.to(tl.int32), axis=0).to(tl.float32)
@@ -197,6 +223,9 @@ if triton is not None:
 
             # Selected score columns are video key tiles offset by the prefix,
             # stored after the prefix entries and capped at the selection.
+            # The running count ranks chosen columns in column order, and the
+            # invariant above guarantees at least ``selected`` of them, so the
+            # stored count is exact.
             chosen = (values >= lower) & valid
             positions = tl.cumsum(chosen.to(tl.int32), axis=0) - 1
             tl.store(
@@ -259,11 +288,7 @@ if triton is not None:
         width: tl.constexpr,
         block_rows: tl.constexpr,
     ):
-        """Pack row-major Q/K/V into contiguous storage.
-
-        Pack row-major Q/K/V into contiguous ``[3, heads, rows, width]``
-        storage.
-        """
+        """Pack row-major Q/K/V into contiguous ``[3, heads, rows, width]``."""
         row_offsets = (
             tl.program_id(0) * block_rows + tl.arange(0, block_rows)
         ).to(tl.int64)
@@ -334,11 +359,7 @@ if triton is not None:
         tile_rows: tl.constexpr,
         block_rows: tl.constexpr,
     ):
-        """Compose head-major attention output with compression.
-
-        Compose head-major attention output with per-tile compression
-        values.
-        """
+        """Compose head-major attention output with per-tile compression."""
         row_offsets = (
             tl.program_id(0) * block_rows + tl.arange(0, block_rows)
         ).to(tl.int64)
@@ -472,8 +493,9 @@ def _pack_qkv(
         device=query.device,
     )
 
-    # The output orders components before heads and rows, matching the sparse
-    # attention kernel while avoiding an intermediate permuted tensor.
+    # The output orders components before heads and rows, the head-major
+    # layout of ``vsa_rows.pack_sparse_input_rows`` without owner intervals
+    # or key masking, written without an intermediate permuted tensor.
     block_rows = 8
 
     _pack_qkv_kernel[(triton.cdiv(rows, block_rows), heads)](
@@ -511,7 +533,23 @@ def _pool_qkv_means(
     query_tile_offset: int = 0,
     key_tile_offset: int = 0,
 ) -> None:
-    """Average each Q/K/V head across fixed 64-row tiles into output buffers."""
+    """Average each Q/K/V head across fixed 64-row tiles into output buffers.
+
+    ``key`` and ``value`` cover ``tiles`` key tiles whose validity starts at
+    ``valid_sizes[key_tile_offset]``; ``query`` covers ``query_tiles <=
+    tiles`` query tiles whose validity starts at
+    ``valid_sizes[query_tile_offset]``. Pooled outputs are
+    ``[tiles, heads, width]`` indexed by local tile; only the first
+    ``query_tiles`` rows of ``pooled_query`` are written. All three outputs
+    are addressed with ``pooled_query``'s tile and head strides. Sources and
+    outputs need a unit column stride; neither stride condition is checked.
+
+    Raises:
+        RuntimeError: If Triton cannot launch on ``query``'s device.
+        ValueError: If row counts are not tile multiples, ``query`` has more
+            tiles than ``key``, shapes disagree, or the tile offsets fall
+            outside ``valid_sizes``.
+    """
     if not launchable(query.device):
         raise RuntimeError("sparse tile pooling requires Triton")
 
@@ -621,7 +659,13 @@ def _write_block_map(
     valid_tiles: int,
     selected: int,
 ) -> None:
-    """Write every query tile's key-tile list and count in one pass."""
+    """Write every query tile's key-tile list and count in one pass.
+
+    Raises:
+        RuntimeError: If Triton cannot launch on ``scores``'s device.
+        ValueError: If ``scores`` or the index storage do not match the
+            query-tile ranges and selection width.
+    """
     if not launchable(scores.device):
         raise RuntimeError("sparse block-map selection requires Triton")
 
@@ -640,7 +684,8 @@ def _write_block_map(
         raise ValueError("sparse block map does not match its score domain")
 
     # Each program writes one head/query row: a dense prefix row, a video row
-    # searched over a power-of-two score tile, or a padding row.
+    # searched over a power-of-two score tile, or a padding row. The final
+    # constant is the fixed number of interpolation-search iterations.
     _select_block_map_kernel[(heads * tiles,)](
         scores,
         prefix_key_indices,
@@ -734,7 +779,7 @@ def _tile_softmax(scores: torch.Tensor, valid_sizes: torch.Tensor) -> None:
         )
 
     # One program of two warps per head and query tile row, the fastest of
-    # the measured warp counts; the row fits one block.
+    # the measured warp counts; the whole row fits one power-of-two block.
     _tile_softmax_kernel[(rows, heads)](
         scores,
         valid_sizes,
@@ -769,9 +814,12 @@ def _unpack_add_compression(
     compressed: torch.Tensor,
     output: torch.Tensor,
 ) -> None:
-    """Write gated compression composition in row-major layout.
+    """Write ``attended + gate * compressed_tile`` in row-major layout.
 
-    Write ``attended + gate * compressed_tile`` in row-major output layout.
+    ``attended`` is addressed as ``[1, heads, rows, width]`` and
+    ``compressed`` as ``[heads, tiles, width]`` through their strides;
+    ``gate`` and ``output`` are ``[rows, heads, width]``. Every tensor needs
+    a unit column stride.
     """
     if not launchable(attended.device):
         raise RuntimeError("sparse output composition requires Triton")
@@ -811,7 +859,16 @@ def _compose_to_head_shards(
     outputs: tuple[torch.Tensor, ...],
     source_rank: int,
 ) -> None:
-    """Compose values and scatter this rank's heads into exchange shards."""
+    """Compose values and scatter this rank's heads into exchange shards.
+
+    ``gate`` holds this rank's ``local_heads`` for all ``rows`` rows, which
+    must equal ``len(outputs) * local_rows`` (not checked). Each output is a
+    contiguous ``[local_rows, global_heads, width]`` destination; output
+    ``d`` receives source rows ``[d * local_rows, (d + 1) * local_rows)`` at
+    heads ``[source_rank * local_heads, (source_rank + 1) * local_heads)``.
+    The kernel only issues stores; when the outputs are peer storage the
+    caller must fence them before the owners read.
+    """
     if not launchable(attended.device):
         raise RuntimeError("sparse head-shard composition requires Triton")
 
@@ -820,7 +877,8 @@ def _compose_to_head_shards(
     global_heads = int(outputs[0].shape[1])
 
     # The source row axis concatenates destination-rank segments. Each
-    # output receives one segment in the global head range owned by source_rank.
+    # output receives one segment in the global head range owned by
+    # source_rank.
     block_rows = 8
 
     _compose_to_head_shards_kernel[
@@ -852,11 +910,7 @@ def _compose_to_head_shards(
 def pack_qkv(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
 ) -> torch.Tensor:
-    """Return Q/K/V packed into component-head order.
-
-    Return Q/K/V packed from ``[rows, heads, width]`` to component-head
-    order.
-    """
+    """Return row-major Q/K/V repacked as ``[3, heads, rows, width]``."""
     return _pack_qkv(query, key, value)
 
 
@@ -904,7 +958,13 @@ def write_block_map(
     ``[heads, local_video - local_prefix, video_tiles]``. Query tiles before
     ``local_prefix`` attend to the ``valid_tiles`` dense key tiles, tiles
     before ``local_video`` to the prefix plus ``selected`` video tiles, and
-    later tiles to one tile.
+    later tiles to one tile. ``block_indices`` is ``[heads, tiles, width]``
+    and ``block_counts`` is ``[heads, tiles]`` over the call's local query
+    tiles; key-tile identifiers index the complete key domain, with video
+    score column ``j`` written as key tile ``prefix_tiles + j``.
+    ``prefix_key_indices`` and ``dense_key_indices`` list the key tiles
+    copied into prefix and dense rows; they must hold at least
+    ``prefix_tiles`` and ``valid_tiles`` entries, which is not checked.
     """
     _write_block_map_custom(
         scores,
@@ -936,10 +996,12 @@ def unpack_add_compression(
     compressed: torch.Tensor,
     output: torch.Tensor,
 ) -> None:
-    """Fill row-major output with gated compression.
+    """Fill row-major output with gated per-tile compression added to attention.
 
-    Fill row-major output with gated per-tile compression added to
-    attention.
+    ``attended`` is ``[1, heads, rows, width]`` (a transposed view of the
+    provider output), ``gate`` and ``output`` are ``[rows, heads, width]`` and
+    ``compressed`` is ``[heads, rows / 64, width]``; each row adds
+    ``gate * compressed`` of its 64-row tile, computed in fp32.
     """
     _unpack_add_compression(attended, gate, compressed, output)
 
@@ -951,10 +1013,13 @@ def compose_to_head_shards(
     outputs: tuple[torch.Tensor, ...],
     source_rank: int,
 ) -> None:
-    """Compose local heads into destination shards.
+    """Compose local heads into destination shards at ``source_rank``'s heads.
 
-    Compose local heads into destination shards at ``source_rank``'s head
-    range.
+    The Ulysses form of ``unpack_add_compression``: rows are split evenly
+    across ``outputs`` in order, and this rank's heads land at head offset
+    ``source_rank * local_heads`` of each destination. The caller must fence
+    the stores before destination owners read them; the VSA layer does so
+    with ``ParallelAttention.finish_output``.
     """
     _compose_to_head_shards(
         attended, gate, compressed, outputs, int(source_rank)

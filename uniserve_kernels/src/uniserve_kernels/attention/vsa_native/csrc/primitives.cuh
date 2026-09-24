@@ -5,6 +5,11 @@
 // forward: tcgen05 (alloc / mma / ld / st / commit / wait / fence), TMA load / store /
 // tensormap, mbarrier, cluster launch control, setmaxnreg, fast math, and the FMHA helpers.
 //
+// Most helpers are thin inline-PTX wrappers whose operand order follows the
+// PTX instruction. Shared-memory operands passed as uint32_t are 32-bit
+// shared-window addresses (see smem_ptr_u32), not generic pointers. The kernel
+// launches single-CTA clusters and uses CTA_GROUP 1; some helpers also carry
+// two-CTA variants.
 #pragma once
 #include <cstdint>
 #include <cstdio>
@@ -17,7 +22,6 @@
 #include <cassert>
 #include <cstring>
 #include <vector_types.h>
-
 
 __device__ __forceinline__
 uint64_t mbarrier_arrive(uint32_t mbar_smem) {
@@ -45,6 +49,10 @@ void mbarrier_arrive_expect_tx(uint32_t mbar_smem, uint32_t expected_bytes) {
                :: "r"(mbar_smem), "r"(expected_bytes) : "memory");
 }
 
+// mbarrier waits spin on try_wait until the barrier completes the phase with
+// the given parity. The suspend variant passes an explicit suspend-time hint
+// (in nanoseconds) for how long the waiting thread may be suspended; the other
+// uses the default time limit, and the MMA warp uses it for its pipeline waits.
 __device__ __forceinline__
 void mbarrier_wait_parity_suspend(uint32_t mbar_smem, uint32_t phase_parity) {
   asm volatile(
@@ -79,6 +87,9 @@ void fence_proxy_async_shared() {
   asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 }
 
+// Asks cluster launch control to cancel a not-yet-launched CTA. The 16-byte
+// response lands at smem_dst and completes a transaction on mbar_smem, whose
+// expected byte count the issuer must have set.
 __device__ __forceinline__ void clc_try_cancel_async(
     uint32_t smem_dst, uint32_t mbar_smem) {
   asm volatile(
@@ -95,6 +106,8 @@ __device__ __forceinline__ void clc_load_response(
                : "r"(smem_slot));
 }
 
+// Stage and phase bookkeeping for a ring of NUM_STAGES mbarriers, keeping one
+// parity per stage and flipping it each time that stage is passed.
 template <int NUM_STAGES>
 struct MbarrierPhaseTracker {
 
@@ -120,6 +133,9 @@ struct MbarrierPhaseTracker {
   int stage() const { return idx; }
 };
 
+// Starts at parity 0, so the first wait on a stage blocks until the barrier's
+// first phase completes. Used for "full" barriers and for "empty" barriers
+// whose first phase is completed by priming arrivals.
 template <int NUM_STAGES>
 struct PhaseTracker {
   int stage;
@@ -144,6 +160,8 @@ struct PhaseTracker {
   uint32_t get_phase() const { return phase; }
 };
 
+// Producer side of an "empty" barrier: starts at parity 1, which a freshly
+// initialized mbarrier reports as already complete, so every slot starts free.
 template <int NUM_STAGES>
 struct EmptyPhaseTracker {
   int stage;
@@ -178,6 +196,7 @@ void advance_stage_phase(int& stage, uint32_t& phase) {
   }
 }
 
+// Used only by the two-CTA release path (clc_consumer_release).
 static constexpr uint32_t SM100_CLC_PEER_MASK = 0xFEFFFFFF;
 
 struct ClcTileInfo {
@@ -206,10 +225,15 @@ void clc_consumer_release_cta(uint32_t clc_empty_local_addr) {
   mbarrier_arrive_nostate(clc_empty_local_addr);
 }
 
+// Decodes a try_cancel response as word 0 = cancelled CTA's x index, low 16
+// bits of word 1 = its y index, bit 0 of word 2 = success. An invalid response
+// means no CTA remained to cancel, so the caller's work loop ends.
 template <int CLUSTER_SHAPE_M, int CLUSTER_SHAPE_N, ClcRasterOrder ORDER>
 __device__ __forceinline__
 ClcTileInfo clc_parse_response(uint32_t resp_smem_addr) {
   uint32_t d0, d1, d2, d3;
+  // The response was written through the async proxy; fence before the
+  // generic-proxy load reads it.
   fence_proxy_async_shared_cta();
   clc_load_response(resp_smem_addr, d0, d1, d2, d3);
   const int  ctaid_x = static_cast<int>(d0);
@@ -229,6 +253,10 @@ ClcTileInfo clc_parse_response(uint32_t resp_smem_addr) {
   return info;
 }
 
+// Waits for the response in stage clc_cons_stage, decodes it and, when
+// do_release is set, arrives once on that stage's empty barrier. The kernel
+// passes do_release from elect_one_sync, so each warp releases a response
+// exactly once.
 template <int CLUSTER_SHAPE_M, int CLUSTER_SHAPE_N, ClcRasterOrder ORDER,
           int CTA_GROUP = 2, bool SUSPEND = false>
 __device__ __forceinline__
@@ -262,6 +290,12 @@ void clc_fetch_next_tile_advance(int& clc_cons_stage,
   advance_stage_phase<STAGES>(clc_cons_stage, clc_cons_phase);
 }
 
+// Division by a runtime constant through a host-precomputed fixed-point
+// multiplier.
+// make_magic packs the round-up multiplier m = ceil(2^p / d) in the low word
+// and the post-shift p - 32 in the high word, with p = 31 + floor(log2 d);
+// d <= 1 packs 0, which fdiv treats as the identity. The quotient is exact
+// for every dividend below 2^30.
 __device__ __forceinline__ unsigned fdiv(unsigned n, unsigned long long pk) {
   unsigned M = (unsigned)pk;
   if (M == 0u) return n;
@@ -275,6 +309,9 @@ __host__ inline unsigned long long make_magic(unsigned d) {
   return (m & 0xffffffffULL) | ((unsigned long long)(p - 32u) << 32);
 }
 
+// Named barriers. Barrier 0 is the one __syncthreads uses; the kernel reserves
+// 1-8 for the FULL_NAMED_BAR handshakes and 9 for the correction epilogue.
+// thread_count must be a multiple of 32 and cover every participating thread.
 template <int BARRIER_ID>
 __device__ __forceinline__
 void bar_sync(uint32_t thread_count) {
@@ -293,6 +330,8 @@ void bar_arrive(uint32_t thread_count) {
                :: "n"(BARRIER_ID), "r"(thread_count) : "memory");
 }
 
+// Pairs softmax warp `band` of query tile m_tile (arrive) with correction warp
+// `band` (sync) on named barrier 1 + 4 * m_tile + band: 32 + 32 threads.
 __device__ __forceinline__ void full_bar_arrive(int m_tile, int band) {
   switch (1 + m_tile * 4 + band) {
     case 1: bar_arrive<1>(64); break;
@@ -318,6 +357,9 @@ __device__ __forceinline__ void full_bar_wait(int m_tile, int band) {
   }
 }
 
+// Sets scores[j] to -inf for every j >= seqlen_k - k_offset in a K_TILE-wide
+// score row (and, when causal, for keys after q_pos), building one 32-bit keep
+// mask per 32 columns.
 template <bool IS_CAUSAL, int K_TILE>
 __device__ __forceinline__ void mask_s_row_r2p(float* scores, int k_offset, int q_pos, int seqlen_k) {
   int n_keep = seqlen_k - k_offset;
@@ -382,6 +424,10 @@ __device__ __forceinline__ void tcgen05_st_32x32b_x32(
                   "r"(r[28]),"r"(r[29]),"r"(r[30]),"r"(r[31]));
 }
 
+// The *_lead wrappers predicate the tcgen05 instruction on `lead`, so the
+// whole warp executes one instruction stream while only the elected thread
+// issues it. A commit makes the mbarrier track completion of every earlier
+// asynchronous tcgen05 operation issued by that thread, then arrive once.
 __device__ __forceinline__ void tcgen05_commit1_lead(uint32_t lead, uint32_t mbar_smem_addr) {
   asm volatile(
     "{\n\t"
@@ -400,6 +446,8 @@ __device__ __forceinline__ void tcgen05_fence_before_thread_sync() {
   asm volatile("tcgen05.fence::before_thread_sync;\n" ::: "memory");
 }
 
+// TMA tile loads complete their bytes as transactions on mbar_smem; the
+// producer's arrive with expect_tx sets the total bytes the phase waits for.
 __device__ __forceinline__
 void tma_load_2d(uint32_t smem_dst, const void* tensormap_ptr,
                  uint32_t mbar_smem, int coord_x, int coord_y) {
@@ -452,6 +500,8 @@ __device__ __forceinline__ void tcgen05_dealloc(uint32_t tmem_addr,
   }
 }
 
+// TMA tile stores join the current bulk group; see cp_async_bulk_commit_group
+// and cp_async_bulk_wait_group_read for when the source buffer may be reused.
 __device__ __forceinline__
 void tma_store_2d(const void* tensormap_ptr, int coord_x, int coord_y,
                   uint32_t smem_src) {
@@ -509,6 +559,8 @@ void cp_async_bulk_commit_group() {
   asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
 }
 
+// Waits until at most N committed bulk groups still read shared memory, so
+// the source buffers of the older groups may be overwritten.
 template <int N>
 __device__ __forceinline__
 void cp_async_bulk_wait_group_read() {
@@ -537,6 +589,9 @@ void fence_mbarrier_init_release_cluster() {
   asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
 }
 
+// D (TMEM) = A * B (+ D when enable_input_d). "ss" reads A and B through
+// shared-memory descriptors; "ts" reads A from TMEM. enable_input_d = false
+// overwrites D, which starts a fresh accumulation.
 __device__ __forceinline__ void tcgen05_mma_f16_ss_lead(uint32_t lead,
     uint32_t tmem_c, uint64_t desc_a, uint64_t desc_b, uint32_t idesc,
     bool enable_input_d) {
@@ -573,6 +628,11 @@ enum class SmemSwizzleBlackwell : uint32_t {
   B32  = 6,
 };
 
+// tcgen05 shared-memory matrix descriptor: start address, leading and stride
+// byte offsets in 16-byte units at bits 0, 16 and 32, the fixed version value
+// 1 at bit 46, the base offset at bit 49 and the swizzle layout at bit 61.
+// Because addresses are in 16-byte units, advancing a descriptor by N bytes
+// adds N >> 4 to its low word.
 __device__ __host__ __forceinline__ uint64_t build_smem_desc_blackwell(
     uint32_t smem_addr,
     uint32_t stride_byte_offset,
@@ -589,6 +649,7 @@ __device__ __host__ __forceinline__ uint64_t build_smem_desc_blackwell(
   return d;
 }
 
+// Returns 1 in exactly one lane of the full warp and 0 elsewhere.
 __device__ __forceinline__
 uint32_t elect_one_sync() {
   uint32_t elected;
@@ -615,6 +676,8 @@ uint32_t elect_one_sync(uint32_t membermask) {
   return elected;
 }
 
+// Per-thread register budget reallocation. All warps of a warpgroup execute
+// the same value; the kernel's role layout keeps each warpgroup uniform.
 template <int N>
 __device__ __forceinline__
 void setmaxnreg_dec() {
@@ -633,6 +696,8 @@ void setmaxnreg_inc() {
                :: "n"(N) : "memory");
 }
 
+// Packs a into the low and b into the high BF16 half (round to nearest). PTX
+// places the first source in the high half, hence the swapped operands.
 __device__ __forceinline__
 uint32_t cvt_f32x2_to_bf16x2(float a, float b) {
   uint32_t r;
@@ -650,6 +715,7 @@ __device__ __forceinline__ float2 f32x2_make(uint64_t b) {
 }
 }
 
+// Packed two-lane FP32 arithmetic (mul/add/fma.f32x2).
 __device__ __forceinline__ float2 fmul2(float2 a, float2 b) {
   uint64_t d;
   asm volatile("mul.f32x2 %0, %1, %2;\n" : "=l"(d) : "l"(f32x2_bits(a)), "l"(f32x2_bits(b)));
@@ -677,6 +743,11 @@ __device__ __forceinline__ float ex2_approx_f32(float z) {
   return d;
 }
 
+// exp2 of two values without the ex2 instruction, with the same constants and
+// polynomial as FlashAttention-4's exp2 emulation: clamp to -127, split into
+// floor and fraction by adding and subtracting 1.5 * 2^23 with round-down,
+// evaluate a degree-3 polynomial for 2^fraction, then add the floor into the
+// exponent field. Inputs must not exceed 127.
 __device__ __forceinline__ float2 ex2_emu_f32x2(float x, float y) {
   uint32_t ox, oy;
   asm volatile(
@@ -723,6 +794,10 @@ __device__ __forceinline__ float rcp_approx_ftz_f32(float x) {
   return d;
 }
 
+// tcgen05 kind::f16 instruction descriptor: D format at bit 4 (1 = F32), A
+// and B formats at bits 7 and 10 (1 = BF16), negate bits 13-14, major-ness
+// bits 15-16 (the transpose flags: 1 = MN-major), N >> 3 at bit 17 and M >> 4
+// at bit 24.
 __device__ __forceinline__ uint32_t make_idesc_table44(
     int M, int N,
     uint32_t dtype, uint32_t atype, uint32_t btype,
@@ -747,6 +822,9 @@ __device__ __forceinline__ uint32_t make_idesc_bf16_f32(
                               1,  1, ta, tb);
 }
 
+// 32x32b TMEM loads and stores: each thread of the warp moves N consecutive
+// 32-bit columns of one TMEM lane. The address carries the lane in bits 16+
+// and the column in bits 0-15.
 __device__ __forceinline__ void tcgen05_ld_32x32b_x16(
     uint32_t tmem_addr, uint32_t (&r)[16]) {
   asm volatile("tcgen05.ld.sync.aligned.32x32b.x16.b32 "

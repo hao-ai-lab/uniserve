@@ -1,9 +1,14 @@
 """Channel-scaled residuals followed by RMS or layer normalization.
 
 Projection bias, residual sums, statistics and affine transforms stay in FP32
-until the store. RMS variants update the residual in place while normalizing
-the unrounded sum; magnitude variants record one per-row absolute maximum of
-the stored output.
+until the store. ``scaled_residual_rms_norm_`` and ``scaled_residual_`` update
+the residual ``hidden`` in place; the RMS variant normalizes the unrounded sum.
+``scaled_residual_layer_norm`` leaves ``hidden`` unchanged. Magnitude
+variants, selected by passing ``partials``, record one per-row absolute maximum
+of the stored output; ``uniserve_kernels.reduction.absmax`` finishes them.
+
+``uniserve.nn.functional`` owns validation, output allocation and the
+tensor-operation fallback for these kernels.
 """
 
 from __future__ import annotations
@@ -57,11 +62,7 @@ if triton is not None:
         WIDTH: tl.constexpr,  # noqa: N803
         BLOCK: tl.constexpr,  # noqa: N803
     ):
-        """Normalize one row and publish its output magnitude.
-
-        Normalize one row while publishing its output magnitude for
-        reduction.
-        """
+        """Normalize one row and publish its output magnitude."""
         row = tl.program_id(0)
         columns = tl.arange(0, BLOCK)
 
@@ -73,13 +74,15 @@ if triton is not None:
         ).to(tl.float32)
 
         inverse_rms = tl.rsqrt(tl.sum(hidden * hidden, axis=0) / WIDTH + eps)
+        # Round before measuring so the magnitude describes the stored values.
         output = (hidden * inverse_rms * weight).to(output_ptr.dtype.element_ty)
         tl.store(
             output_ptr + row * WIDTH + columns, output, mask=columns < WIDTH
         )
 
-        # ``partials_ptr`` collects one magnitude per row; ``finish_absmax``
-        # reduces them to the published scalar after the launch.
+        # ``partials_ptr`` collects one FP32 magnitude per row; the caller
+        # reduces them to one scalar with ``uniserve_kernels.reduction.absmax``
+        # in a separate launch.
         tl.store(
             partials_ptr + row,
             tl.max(
@@ -128,8 +131,8 @@ if triton is not None:
             weight_ptr + columns, mask=columns < WIDTH, other=0.0
         ).to(tl.float32)
 
-        # The residual stream is written back before its normalized projection
-        # is rounded into the output dtype.
+        # ``hidden`` receives the sum rounded to its dtype; the normalized
+        # output derives from the unrounded FP32 sum.
         tl.store(hidden_ptr + offsets, residual, mask=columns < WIDTH)
         tl.store(
             output_ptr + offsets,
@@ -151,11 +154,7 @@ if triton is not None:
         WIDTH: tl.constexpr,  # noqa: N803
         BLOCK: tl.constexpr,  # noqa: N803
     ):
-        """Fuse residual update, RMS normalization, and magnitude capture.
-
-        Fuse residual update, RMS normalization, and rowwise magnitude
-        capture.
-        """
+        """Fuse residual update, RMS normalization, and magnitude capture."""
         row = tl.program_id(0)
         columns = tl.arange(0, BLOCK)
         offsets = row * WIDTH + columns
@@ -298,11 +297,7 @@ if triton is not None:
         WIDTH: tl.constexpr,  # noqa: N803
         BLOCK: tl.constexpr,  # noqa: N803
     ):
-        """Compute fused residual layer norm and output magnitude.
-
-        Compute fused residual layer normalization and rowwise output
-        magnitude.
-        """
+        """Compute fused residual layer norm and output magnitude."""
         row = tl.program_id(0)
         columns = tl.arange(0, BLOCK)
         offsets = row * WIDTH + columns
@@ -380,13 +375,19 @@ def weighted_rms_norm(
     out: torch.Tensor,
     partials: torch.Tensor | None = None,
 ) -> None:
-    """Store weighted RMS rows; ``partials`` receives per-row absmax."""
+    """Store weighted RMS rows; ``partials`` receives per-row absmax.
+
+    ``partials`` is a contiguous ``[rows]`` FP32 buffer; each entry is the
+    absolute maximum of that row after rounding to ``out``'s dtype.
+    """
     rows, width = _rows(hidden)
     kernel = (
         _weighted_rms_norm_kernel
         if partials is None
         else _weighted_rms_norm_absmax_kernel
     )
+    # The magnitude kernels take ``partials`` as an extra pointer after the
+    # output; the plain kernels have no such parameter.
     kernel[(rows,)](
         hidden,
         weight,
@@ -409,7 +410,12 @@ def scaled_residual_rms_norm_(
     out: torch.Tensor,
     partials: torch.Tensor | None = None,
 ) -> None:
-    """Add the scaled update into ``hidden`` and store its RMS rows."""
+    """Add the scaled update into ``hidden`` and store its RMS rows.
+
+    ``hidden`` receives ``hidden + (update + update_bias) * scale`` rounded to
+    its dtype; ``out`` receives the weighted RMS normalization of the
+    unrounded sum. ``partials`` behaves as in ``weighted_rms_norm``.
+    """
     rows, width = _rows(hidden)
     kernel = (
         _scaled_residual_rms_norm_kernel
@@ -464,7 +470,12 @@ def scaled_residual_layer_norm(
     out: torch.Tensor,
     partials: torch.Tensor | None = None,
 ) -> None:
-    """Store layer-normalized residual rows without updating ``hidden``."""
+    """Store layer-normalized residual rows without updating ``hidden``.
+
+    ``out`` receives the layer normalization of
+    ``hidden + (update + update_bias) * scale`` with affine ``weight`` and
+    ``bias``. ``partials`` behaves as in ``weighted_rms_norm``.
+    """
     rows, width = _rows(hidden)
     kernel = (
         _scaled_residual_layer_norm_kernel

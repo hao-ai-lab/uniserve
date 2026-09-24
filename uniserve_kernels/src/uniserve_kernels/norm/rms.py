@@ -1,4 +1,12 @@
-"""Row-wise RMS normalization and residual-add RMS normalization."""
+"""Row-wise RMS normalization and residual-add RMS normalization.
+
+These Triton kernels back ``uniserve.nn.functional.rms_norm`` and
+``add_rms_norm``, which check the weight, residual and outputs against ``x``,
+allocate outputs the caller does not supply, and evaluate the same formula
+with tensor operations whenever :func:`can_run` rejects a call. One program
+normalizes one contiguous last-axis row with FP32 statistics and rounds once
+when storing to the output dtype.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +16,8 @@ from uniserve_kernels.triton import launchable, tl, triton
 
 #: One program reduces a complete row, bounding the normalized width.
 MAX_WIDTH = 8192
+# Power-of-two row blocks at least this wide launch with 8 warps, narrower
+# blocks with 4 (see ``_launch``).
 _WIDE_BLOCK = 2048
 
 
@@ -23,6 +33,9 @@ if triton is not None:
         block: tl.constexpr,
     ):
         """Normalize one flattened hidden-state row per Triton program."""
+        # ``n_cols`` and ``eps`` are constexpr, so Triton compiles one kernel
+        # variant per distinct (width, eps) pair. Rows are addressed as
+        # ``row * n_cols``, which requires contiguous rows.
         row = tl.program_id(0)
         offs = tl.arange(0, block)
         mask = offs < n_cols
@@ -72,8 +85,13 @@ if triton is not None:
 def can_run(x: torch.Tensor, weight: torch.Tensor, *outputs) -> bool:
     """Return whether contiguous CUDA rows and outputs fit one program each.
 
-    Outputs share ``x``'s shape and may alias it: each program loads its
-    whole row before storing.
+    ``outputs`` lists every other row tensor the kernel touches: the result
+    buffers, and for ``add_rms_norm`` also the residual input. Each must share
+    ``x``'s shape and device and be contiguous. Outputs may alias the inputs:
+    each program loads its whole row before storing. Residual and output
+    dtypes are not checked here; the ``uniserve.nn.functional`` callers
+    enforce them. Returns False while grad mode is enabled; the kernels
+    define no autograd backward.
     """
     width = int(x.shape[-1]) if x.ndim else 0
     return (
@@ -96,6 +114,7 @@ def can_run(x: torch.Tensor, weight: torch.Tensor, *outputs) -> bool:
 
 
 def _launch(width: int) -> tuple[int, int]:
+    """Return the power-of-two row block covering ``width`` and its warps."""
     block = triton.next_power_of_2(width)
     return block, 8 if block >= _WIDE_BLOCK else 4
 

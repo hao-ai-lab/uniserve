@@ -1,4 +1,10 @@
-"""Token-to-raster rearrangement with explicit spatiotemporal patch shapes."""
+"""Token-to-raster rearrangement with explicit spatiotemporal patch shapes.
+
+The kernel backs ``uniserve.nn.functional.unpatchify_video_tokens``, which
+validates grid, patch, token and bias shapes, allocates the contiguous output
+and evaluates the same rearrangement with tensor operations whenever
+:func:`can_run` rejects a call.
+"""
 
 from __future__ import annotations
 
@@ -25,11 +31,11 @@ if triton is not None:
         HAS_BIAS: tl.constexpr,  # noqa: N803
         BLOCK: tl.constexpr,  # noqa: N803
     ):
-        """Unpack decoder patch channels into video coordinates.
-
-        Unpack decoder patch channels into planar channel-major video
-        coordinates.
-        """
+        """Unpack decoder patch channels into planar video coordinates."""
+        # Each program covers ``BLOCK`` consecutive output elements. Every
+        # shape parameter is constexpr, so Triton compiles one kernel variant
+        # per distinct combination of element count, token count, grid, patch
+        # and channel sizes.
         offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         mask = offsets < elements
 
@@ -68,7 +74,10 @@ if triton is not None:
             * PATCH_WIDTH
         ) + inner_column
 
-        # Source tokens are [batch, patch, channel-major patch volume].
+        # Source tokens are [batch, patch, channel-major patch volume], with
+        # ``sequence`` tokens per batch row; tokens past the grid are never
+        # read. The bias is indexed per token column (``patch_channel``), not
+        # per output channel.
         source_offsets = (batch * sequence + patch) * (
             CHANNELS * PATCH_FRAMES * PATCH_HEIGHT * PATCH_WIDTH
         ) + patch_channel
@@ -83,7 +92,12 @@ if triton is not None:
 
 
 def can_run(source: torch.Tensor, bias: torch.Tensor | None) -> bool:
-    """Return whether contiguous CUDA tokens and bias fit the kernel."""
+    """Return whether contiguous CUDA tokens and bias fit the kernel.
+
+    Shape agreement and the output buffer are not checked here: the caller
+    validates the grid, patch and bias shapes and passes a contiguous
+    ``out`` of the source dtype.
+    """
     return (
         launchable(source.device)
         and source.is_cuda
@@ -106,11 +120,16 @@ def unpatchify_video_tokens(
 ) -> None:
     """Store channel-major token patches into contiguous planar ``out``.
 
-    ``out`` has shape ``[batch, channels, frames * pt, height * ph,
-    width * pw]``; trailing padded tokens are ignored.
+    ``grid_shape`` is ``(frames, height, width)`` in patches and
+    ``patch_shape`` is ``(pt, ph, pw)``. ``out`` has shape ``[batch,
+    channels, frames * pt, height * ph, width * pw]``; trailing padded tokens
+    are ignored. The bias is added in FP32 and each element rounds once to
+    ``out``'s dtype.
     """
     frames, height, width = grid_shape
     patch_frames, patch_height, patch_width = patch_shape
+    # The grid size and the ``BLOCK`` argument must name the same element
+    # count per program.
     _unpatchify_video_tokens_kernel[(triton.cdiv(out.numel(), 1024),)](
         source,
         bias,

@@ -1,4 +1,11 @@
-"""Stable online-softmax combination of independently computed KV segments."""
+"""Stable online-softmax combination of independently computed KV segments.
+
+An attention state is a normalized output together with its log-sum-exp
+(LSE, natural log) over one KV segment. Merging two states over disjoint
+segments reproduces attention over their union. The FlashAttention-4 provider
+in ``uniserve.runtime.backends.attention.flash_attn_4`` merges its current
+window with its paged prefix this way.
+"""
 
 from __future__ import annotations
 
@@ -28,14 +35,13 @@ if triton is not None:
         block_rows: tl.constexpr,
         block_dim: tl.constexpr,
     ):
-        """Merge two normalized attention states.
-
-        Merge two independently normalized attention states with
-        online-softmax rescaling.
+        """Merge two independently normalized attention states.
 
         Rows index independent states (token, head); each row carries one LSE
-        scalar plus `head_dim` output values. An LSE of -inf marks an empty
-        segment whose output row contributes nothing.
+        scalar plus ``head_dim`` contiguous output values. An LSE of -inf
+        marks an empty segment whose output row receives zero weight. Each
+        program merges ``block_rows`` rows; outputs combine in FP32 and round
+        to the output dtype on store.
         """
         rows = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
         columns = tl.arange(0, block_dim)
@@ -48,6 +54,9 @@ if triton is not None:
             second_lse_ptr + rows, mask=row_mask, other=-float("inf")
         )
         maximum = tl.maximum(first_lse, second_lse)
+        # With both LSEs at -inf, ``lse - maximum`` is NaN; such rows get zero
+        # weights and a -inf merged LSE instead. One empty side alone already
+        # yields a zero weight through exp(-inf).
         both_empty = (first_lse == -float("inf")) & (
             second_lse == -float("inf")
         )
@@ -83,7 +92,14 @@ def merge_attention_states(
     """Merge independently evaluated KV segments with stable online softmax.
 
     Each state is an (output [..., head_dim], lse [...]) pair; returns the
-    merged pair in the same layouts. Empty segments carry an LSE of -inf.
+    merged pair in the same layouts, with the output in ``first_output``'s
+    dtype. Empty segments carry an LSE of -inf; when both segments are empty
+    the merged output is zero and the merged LSE is -inf. Contiguous CUDA
+    states that fit the fused kernel run it; other inputs evaluate the same
+    formula with tensor operations. Both paths allocate new result tensors.
+
+    Raises:
+        ValueError: If the two outputs or the two LSE tensors differ in shape.
     """
     if (
         first_output.shape != second_output.shape
@@ -116,6 +132,8 @@ def merge_attention_states(
         )
         return output, merged_lse
 
+    # nan_to_num zeroes the NaN weights that both-empty rows produce, matching
+    # the fused kernel.
     merged_lse = torch.logaddexp(first_lse, second_lse)
     first_weight = torch.exp(first_lse - merged_lse).nan_to_num(0.0)
     second_weight = torch.exp(second_lse - merged_lse).nan_to_num(0.0)
@@ -133,10 +151,11 @@ def _triton_merge_eligible(
     second_output: torch.Tensor,
     second_lse: torch.Tensor,
 ) -> bool:
-    """Check fused merge kernel eligibility.
+    """Return whether two attention states fit the fused merge kernel.
 
-    Return whether two attention states satisfy the fused merge kernel
-    requirements.
+    The kernel addresses rows as ``row * head_dim``, so every tensor must be
+    contiguous and the LSE shape must equal the output's leading dimensions.
+    Autograd must be disabled: the launch registers no autograd function.
     """
     tensors = (first_output, first_lse, second_output, second_lse)
     return bool(

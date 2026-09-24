@@ -1,9 +1,22 @@
 """Packed RoPE and fused QK normalization-plus-RoPE kernels.
 
-Launchers accumulate normalization and rotation in FP32 and store once into
-caller-supplied outputs. Eligibility checks are separate from launches so the
-numerical entry points can select a kernel
-from the explicit normalization domains and rotary axes of a call.
+These Triton kernels back the rotary entry points of
+``uniserve.nn.functional`` (``apply_rotary``, ``qk_norm_rope`` and
+``qk_bias_rms_norm_rope_``) and the factor tables of
+``uniserve.nn.rope.RotaryEmbedding``. Those callers validate the public
+contract and fall back to tensor operations when no kernel matches the call
+or its ``can_run_*`` check rejects the operands. ``qk_norm_rope`` selects a
+kernel from the explicit normalization domains and rotary axes of a call.
+
+Every launcher has a separate ``can_run_*`` eligibility check and does not
+revalidate its operands, so callers must run the check first. Launchers
+accumulate normalization and rotation in FP32 and round once into
+caller-supplied outputs.
+
+Rotary factors are compact: one ``[tokens, rotated / 2]`` cosine and sine
+table per rotary axis, shared by every head of a token. Rotation is split-half
+(GPT-NeoX layout): feature ``i`` of an axis pairs with feature
+``i + rotated / 2``.
 """
 
 from __future__ import annotations
@@ -35,12 +48,19 @@ if triton is not None:
         scale: tl.constexpr,
         block: tl.constexpr,
     ):
+        """Store scaled cosine and sine factors for strided positions.
+
+        ``offsets`` flatten the contiguous ``[*positions.shape, width]``
+        outputs. ``shape`` holds the trailing position extents and ``strides``
+        every position stride, both as compile-time tuples.
+        """
         offsets = tl.program_id(0) * block + tl.arange(0, block)
         rows = offsets // width
         position_offsets = tl.full((block,), 0, tl.int64)
 
-        # The leading extent only bounds the launch. Remaining dimensions
-        # describe the strided row layout; a new token count needs no kernel.
+        # The leading extent only bounds the launch through ``total``. The
+        # trailing extents and strides are compile-time constants, so a new
+        # leading extent with unchanged strides reuses the compiled kernel.
         for axis in tl.static_range(len(shape) - 1, -1, -1):
             position_offsets += (rows % shape[axis]) * strides[axis + 1]
             rows //= shape[axis]
@@ -75,7 +95,12 @@ if triton is not None:
         half: tl.constexpr,
         block: tl.constexpr,
     ):
-        """Rotate flattened packed token/head rows in GPT-NeoX half layout."""
+        """Rotate flattened packed token/head rows in GPT-NeoX half layout.
+
+        Input and output are contiguous ``[tokens, heads, dim]``; factors are
+        contiguous ``[tokens, half]``. ``total`` is excluded from Triton's
+        integer specialization, so a new token count reuses the kernel.
+        """
         # offs flattens the [tokens, heads, dim] layout of the input tensor.
         offs = tl.program_id(0) * block + tl.arange(0, block)
         mask = offs < total
@@ -212,10 +237,13 @@ if triton is not None:
         block: tl.constexpr,
         rows_per_program: tl.constexpr,
     ):
-        """Process Q/K tiles with live row bounds.
+        """Normalize and rotate Q rows, then K rows, over one program grid.
 
-        Process Q/K tiles with live row bounds and one normalization per
-        row.
+        Programs below ``cdiv(q_rows, rows_per_program)`` process query rows
+        and the remaining programs process key rows, ``rows_per_program``
+        flattened token/head rows each. ``q_rows`` and ``k_rows`` are runtime
+        arguments excluded from integer specialization; head counts, strides
+        and widths are compile-time constants.
         """
         pid = tl.program_id(0)
         query_programs = tl.cdiv(q_rows, rows_per_program)
@@ -287,7 +315,11 @@ if triton is not None:
         """Normalize Q/K in place and rotate an even prefix of each head.
 
         Compact factors hold one ``[rows, rotary_dim / 2]`` phase per rotated
-        feature pair.
+        feature pair. Each program owns a disjoint ``[block_rows, head_dim]``
+        tile of one head and loads every value it reads, including partner
+        features, before its stores, so updating in place is safe. ``rows`` is
+        a compile-time constant, so each distinct row count compiles its own
+        variant.
         """
         row_offsets = (
             tl.program_id(0) * block_rows + tl.arange(0, block_rows)
@@ -314,6 +346,8 @@ if triton is not None:
         key_values = tl.load(key + key_offsets, mask=valid, other=0.0).to(
             tl.float32
         )
+        # ``head_dim`` is the power-of-two tile width, so the weight loads
+        # need no feature mask.
         query_weights = tl.load(query_weight + columns)[None, :].to(tl.float32)
         key_weights = tl.load(key_weight + columns)[None, :].to(tl.float32)
 
@@ -456,8 +490,9 @@ if triton is not None:
         rot = tl.where(first_half, x1n * cos - x2n * sin, x2n * cos + x1n * sin)
         tl.store(out_ptr + out_base + offs_a, rot, mask=mask_a)
 
-        # The tail group has its own RMS reduction and weight. Its declared
-        # positions are zero, so normalized values pass through unrotated.
+        # The tail group has its own RMS reduction and weight. ``qk_norm_rope``
+        # selects this kernel only when the tail's rotary factors have zero
+        # width, so it reads no tail factors and stores the tail unrotated.
         offs_b = tl.arange(0, block_b)
         mask_b = (offs_b < tail_dim) & row_active
         xb = tl.load(
@@ -511,11 +546,15 @@ if triton is not None:
 
         The head group is stored before the tail group is read, and the two
         groups occupy disjoint features, so outputs may alias equal-stride
-        inputs.
+        inputs. ``q_rows`` and ``k_rows`` are compile-time constants, so each
+        distinct token count compiles its own variant.
         """
         pid = tl.program_id(0)
 
-        # Query rows occupy the leading program-id range.
+        # Query rows occupy the leading program-id range. Every program runs
+        # both row calls; ``q_active`` and ``k_active`` mask the source and
+        # factor loads and the stores of the call whose range does not
+        # contain ``pid``. Its weight loads stay in bounds regardless.
         q_active = pid < q_rows
         q_token = pid // q_heads
         q_head = pid - q_token * q_heads
@@ -592,10 +631,12 @@ if triton is not None:
         block_a: tl.constexpr,
         block_b: tl.constexpr,
     ):
-        """Normalize and rotate a head axis plus shared axes.
+        """Normalize and rotate a head axis plus two shared-domain axes.
 
-        Normalize and rotate a head axis plus two shared-normalization
-        axes.
+        The head axis (``dim0`` features) has its own RMS reduction, weight
+        and factor table. The two tail axes (``axis_dim`` features each, for
+        ``tail_dim`` in total) share one RMS reduction and weight but rotate
+        with separate factor tables, each pairing features within its axis.
         """
         # Axis zero has an independent RMS reduction and factor table.
         offs_a = tl.arange(0, block_a)
@@ -731,7 +772,9 @@ if triton is not None:
         inputs.
         """
         # Program ids select either a complete query or key row; the branch is
-        # uniform within a program and independent of tensor values.
+        # uniform within a program and independent of tensor values. The grid
+        # holds ``tokens * (q_heads + k_heads)`` programs, so the query row
+        # count follows from its size instead of a row-count argument.
         pid = tl.program_id(0)
         q_rows = tl.num_programs(0) // (q_heads + k_heads) * q_heads
         if pid < q_rows:
@@ -796,7 +839,12 @@ if triton is not None:
 def can_run_rotary_factors(
     positions: torch.Tensor, frequencies: torch.Tensor, dtype: torch.dtype
 ) -> bool:
-    """Return whether strided positions and frequencies fit the kernel."""
+    """Return whether strided positions and frequencies fit the kernel.
+
+    The check covers devices, layouts and dtypes. Callers of
+    :func:`rotary_factors` must also supply one-dimensional ``frequencies``
+    and contiguous outputs, which this check does not inspect.
+    """
     floating = {torch.float16, torch.bfloat16, torch.float32, torch.float64}
     return (
         launchable(positions.device)
@@ -843,10 +891,11 @@ def rotary_factors(
 
 
 def _resident(*tensors: torch.Tensor) -> bool:
-    """Check the conditions shared by every fused rotary launch.
+    """Check the conditions shared by the ``can_run_triton_*`` checks.
 
-    Triton kernels run without autograd on one CUDA device that holds every
-    operand.
+    Fused launches record no autograd graph, so these checks refuse them
+    while grad mode is enabled and callers use their tensor-operation
+    fallback. Every operand must reside on the first operand's CUDA device.
     """
     device = tensors[0].device
     return (
@@ -858,6 +907,7 @@ def _resident(*tensors: torch.Tensor) -> bool:
 
 
 def _shares_storage(first: torch.Tensor, second: torch.Tensor) -> bool:
+    """Return whether two tensors view one storage, overlapping or not."""
     return (
         first.untyped_storage().data_ptr()
         == second.untyped_storage().data_ptr()
@@ -874,6 +924,8 @@ def can_run_triton_rope(
 
     ``x`` and ``out`` are contiguous ``[..., heads, dim]`` tensors whose
     leading axes flatten to the rows of contiguous ``[..., dim / 2]`` factors.
+    Only the factor width is checked here; ``apply_rotary`` in
+    ``uniserve.nn.functional`` checks that the factor token axes match ``x``.
     Programs read partner features that other programs may already have
     written, so ``out`` must not share storage with ``x``.
     """
@@ -929,8 +981,9 @@ def can_run_triton_qk_rms_norm_rope_inplace(
 ) -> bool:
     """Check ``[rows, heads, head_dim]`` Q/K for in-place partial rotation.
 
-    One program reduces a power-of-two head width, so the head is bounded by
-    1024 features. Compact factors hold one row per token and cover an even
+    A program tiles the complete head with ``tl.arange(0, head_dim)`` and no
+    feature mask, so ``head_dim`` must be a power of two; it is also bounded
+    by 1024 features. Compact factors hold one row per token and cover an even
     prefix of the head.
     """
     head_dim = int(query.shape[-1]) if query.ndim == 3 else 0
@@ -974,7 +1027,9 @@ def triton_qk_rms_norm_rope_inplace(
 
     Query and key use ``[rows, heads, head_dim]`` layout; compact factors have
     shape ``[rows, rotary_dim / 2]``. Callers first check
-    :func:`can_run_triton_qk_rms_norm_rope_inplace`.
+    :func:`can_run_triton_qk_rms_norm_rope_inplace`. Registration as a
+    ``torch.library`` custom operator with ``mutates_args`` declares the
+    in-place update of ``query`` and ``key`` to PyTorch.
     """
     rows, heads, head_dim = (int(size) for size in query.shape)
 
@@ -1016,7 +1071,10 @@ def _triton_qk_rms_norm_rope_inplace_fake(
     sine: torch.Tensor,
     eps: float,
 ) -> None:
-    """Declare fake-tensor mutation for the custom operator."""
+    """Fake-tensor implementation: the operator returns nothing.
+
+    The mutation of ``query`` and ``key`` is declared by ``mutates_args``.
+    """
     del query, key, query_weight, key_weight, cosine, sine, eps
 
 
@@ -1043,7 +1101,11 @@ def _qk_rows(
 
 
 def _factors(cos: torch.Tensor, sin: torch.Tensor, tokens: int, width: int):
-    """Check contiguous compact factors for one fully rotated axis."""
+    """Check contiguous compact factors for one fully rotated axis.
+
+    ``tokens`` is the leading Q/K extent, so factor rows index tokens and are
+    shared across heads.
+    """
     return (
         cos.ndim == 2
         and sin.shape == cos.shape
@@ -1104,8 +1166,10 @@ def triton_qk_rms_norm_rope(
     q_rows, k_rows = tokens * q_heads, tokens * k_heads
 
     block = triton.next_power_of_2(dim)
-    # Small heads share a CTA; bounding the feature tile limits register growth
-    # for wider heads. At width 128, each of four warps reduces one head.
+    # Small heads share a CTA; wider heads get fewer rows per program, keeping
+    # the tile within 512 elements where one row allows it, to limit register
+    # growth. A program covers four heads up to width 128, two up to width
+    # 256 and one above that.
     rows_per_program = min(4, max(1, 512 // block))
     grid = (
         triton.cdiv(q_rows, rows_per_program)
@@ -1356,7 +1420,15 @@ if triton is not None:
         HEAD_BLOCK: tl.constexpr,  # noqa: N803
         ROW_BLOCK: tl.constexpr,  # noqa: N803
     ):
-        """Bias and normalize Q/K heads, then rotate leading coordinates."""
+        """Bias and normalize Q/K heads, then rotate leading coordinates.
+
+        Each program owns a disjoint ``[ROW_BLOCK, head]`` tile and loads all
+        Q/K values it reads, including partners, before storing in place.
+        ``HAS_BIAS`` covers both Q and K biases. With ``HAS_VALUE_BIAS`` the
+        value tile, which shares the Q/K strides, receives its bias here.
+        ``rows`` is a compile-time constant, so each distinct row count
+        compiles its own variant.
+        """
         row = tl.program_id(0) * ROW_BLOCK + tl.arange(0, ROW_BLOCK)
         head = tl.program_id(1)
         columns = tl.arange(0, HEAD_BLOCK)
@@ -1479,10 +1551,16 @@ def can_run_qk_bias_rms_norm_rope(
 
     Leading token axes must flatten affinely to rows whose heads own disjoint
     unit-strided coordinates, as merged projections lend them. Q, K and V
-    share one layout; factors and biases are contiguous.
+    share one layout; factors and biases are contiguous. This check covers
+    strides, contiguity, the head width bound and launchability only;
+    ``qk_bias_rms_norm_rope_`` in ``uniserve.nn.functional`` validates shapes,
+    dtypes, device agreement and factor token axes before calling it.
     """
     head_dim, heads = int(query.shape[-1]), int(query.shape[-2])
     row_stride, head_stride = int(query.stride(-3)), int(query.stride(-2))
+    # Each leading token axis of extent above one must have a stride of
+    # ``row_stride`` times the token extents after it, so the token axes
+    # flatten to rows addressed as ``row * row_stride``.
     row_span = row_stride
     for dimension in range(query.ndim - 4, -1, -1):
         row_span *= query.shape[dimension + 1]
@@ -1495,6 +1573,8 @@ def can_run_qk_bias_rms_norm_rope(
         and query.is_cuda
         and head_dim <= 256
         and query.stride(-1) == 1
+        # Disjoint (row, head) vectors keep the in-place per-tile update from
+        # reading coordinates that another program writes.
         and head_stride >= head_dim
         and row_stride >= (heads - 1) * head_stride + head_dim
         and all(tensor.stride() == query.stride() for tensor in projections)
@@ -1520,7 +1600,11 @@ def qk_bias_rms_norm_rope_(
 
     Heads are RMS-normalized without a learned weight; the leading
     ``2 * cosine.shape[-1]`` coordinates rotate split-half. The value bias is
-    applied in the same launch.
+    applied in the same launch. ``query_bias`` and ``key_bias`` must be both
+    present or both ``None`` because the kernel applies both when
+    ``query_bias`` is present; ``value`` and ``value_bias`` likewise pair,
+    keyed on ``value_bias``. ``qk_bias_rms_norm_rope_`` in
+    ``uniserve.nn.functional`` enforces both pairings.
     """
     head_dim, heads = int(query.shape[-1]), int(query.shape[-2])
     rows = query.numel() // (heads * head_dim)

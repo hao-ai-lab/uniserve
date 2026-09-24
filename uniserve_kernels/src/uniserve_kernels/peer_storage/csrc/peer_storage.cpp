@@ -1,5 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// CUDA driver virtual memory primitives for sharing tensor storage across
+// processes, plus strided asynchronous copies between pinned host and device
+// memory. The Python package uniserve_kernels.peer_storage compiles this file
+// on first use and wraps each binding.
+//
+// PeerAllocation owns one physical allocation created with cuMemCreate and
+// exports its shareable handle. PeerMapping owns one reserved virtual address
+// range, the segments mapped into it, and the allocation handles that keep the
+// mapped physical memory alive; every tensor this file returns holds its
+// PeerMapping through the tensor deleter, so the mapping lives exactly as long
+// as the tensor's storage. Handle transport between processes, grants, and
+// retirement ordering belong to the Python callers.
+
 #include <torch/extension.h>
 #include <ATen/core/CachingHostAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -20,6 +33,8 @@
 
 namespace {
 
+// Raises a TORCH_CHECK failure (RuntimeError in Python) naming the operation
+// when a driver call fails.
 void check_cuda(CUresult result, const char* operation) {
   const char* message = nullptr;
   if (result != CUDA_SUCCESS) {
@@ -102,6 +117,9 @@ bool exports_fabric_handles(int device) {
   return shareable_handle_type(device) == CU_MEM_HANDLE_TYPE_FABRIC;
 }
 
+// Properties of a device-resident CU_MEM_ALLOCATION_TYPE_PINNED allocation
+// requesting the device's probed handle type, shared by PeerAllocation and
+// allocation_granularity.
 CUmemAllocationProp allocation_properties(int device) {
   CUmemAllocationProp properties{};
   properties.type = CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -153,6 +171,12 @@ size_t allocation_granularity(int device) {
   return granularity;
 }
 
+// One virtual address range holding `mapped_segments` mapped segments of
+// `segment_bytes` each, plus the allocation handles that keep their physical
+// memory alive. The destructor also unwinds a partially built mapping: it
+// unmaps only the segments counted as mapped, frees the range only when one was
+// reserved, and releases every handle collected so far. Driver errors during
+// teardown are ignored.
 struct PeerMapping {
   CUdeviceptr address = 0;
   size_t total_bytes = 0;
@@ -162,8 +186,10 @@ struct PeerMapping {
   std::vector<CUmemGenericAllocationHandle> handles;
 
   ~PeerMapping() {
-    // The distributed runtime retires the tensor after dependent streams and
-    // graphs complete. Every imported handle retains its physical allocation.
+    // Teardown issues no synchronization of its own: the owner must drop the
+    // last tensor reference only after every stream and graph reading it has
+    // completed. Each handle keeps its physical allocation alive until it is
+    // released, which happens after the range is unmapped and freed.
     const c10::cuda::CUDAGuard guard(device);
     for (size_t index = 0; index < mapped_segments; ++index) {
       cuMemUnmap(address + index * segment_bytes, segment_bytes);
@@ -177,6 +203,11 @@ struct PeerMapping {
   }
 };
 
+// One physical allocation of `shape` elements of the prototype's dtype on the
+// prototype's device. The constructor requires the byte size to be an exact
+// multiple of the allocation granularity rather than rounding it up. The object
+// holds one reference to the allocation; mappings it creates hold their own,
+// so they outlive it.
 class PeerAllocation {
  public:
   PeerAllocation(torch::Tensor prototype, std::vector<int64_t> shape)
@@ -210,6 +241,8 @@ class PeerAllocation {
     return pybind11::bytes(export_handle_bytes(handle_, device_));
   }
 
+  // Maps this allocation into a new address range as a tensor of `shape_`,
+  // accessible from this device only.
   torch::Tensor map_local() const {
     const c10::cuda::CUDAGuard guard(device_);
     auto mapping = std::make_shared<PeerMapping>();
@@ -221,19 +254,24 @@ class PeerAllocation {
     check_cuda(cuMemMap(mapping->address, bytes_, 0, handle_, 0),
                 "map shared tensor allocation");
     mapping->mapped_segments = 1;
+
+    // The mapping retains the originating allocation handle rather than one
+    // imported from its exported handle: CUDA cannot re-export an imported
+    // handle, and export_handle() on this tensor must reach another reader.
+    // The retained reference also keeps the storage alive after this
+    // PeerAllocation is destroyed.
     CUmemGenericAllocationHandle retained;
     check_cuda(cuMemRetainAllocationHandle(
                    &retained, reinterpret_cast<void*>(mapping->address)),
                "retain shared tensor allocation");
     mapping->handles.push_back(retained);
+
     CUmemAccessDesc access{};
     access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     access.location.id = device_;
     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     check_cuda(cuMemSetAccess(mapping->address, bytes_, &access, 1),
                 "enable shared tensor access");
-    // Keep the originating allocation handle rather than importing its FD:
-    // CUDA imported handles cannot themselves be exported to another reader.
     return at::for_blob(reinterpret_cast<void*>(mapping->address), shape_)
         .deleter([mapping](void*) {})
         .options(options_)
@@ -241,6 +279,12 @@ class PeerAllocation {
         .make_tensor();
   }
 
+  // Imports one exported handle per owner and maps them back to back, in list
+  // order, into one tensor whose leading extent is shape_[0] times the number
+  // of handles. Each handle is mapped as one `bytes_` segment, so every owner
+  // must allocate the same shape and dtype. Access is enabled for this device
+  // only. A POSIX descriptor must stay open in this process until the call
+  // returns.
   torch::Tensor map_peers(const std::vector<std::string>& descriptors) const {
     const c10::cuda::CUDAGuard guard(device_);
     TORCH_CHECK(!descriptors.empty() &&
@@ -254,6 +298,7 @@ class PeerAllocation {
     for (const auto& exported : descriptors) {
       mapping->handles.push_back(import_handle_bytes(exported, device_));
     }
+
     check_cuda(cuMemAddressReserve(&mapping->address, mapping->total_bytes,
                                   allocation_granularity(device_), 0, 0),
                "reserve peer tensor address range");
@@ -262,6 +307,7 @@ class PeerAllocation {
       check_cuda(cuMemMap(destination, bytes_, 0, handle, 0), "map peer tensor rows");
       ++mapping->mapped_segments;
     }
+
     CUmemAccessDesc access{};
     access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     access.location.id = device_;
@@ -287,6 +333,11 @@ class PeerAllocation {
   CUmemGenericAllocationHandle handle_ = 0;
 };
 
+// Exports the allocation backing `tensor`'s storage as (handle bytes, storage
+// bytes, byte offset of the tensor's first element within the storage), or
+// nullopt when the driver rejects the storage base as a VMM allocation
+// (CUDA_ERROR_INVALID_VALUE) or the allocation was not created with this
+// device's probed handle type.
 std::optional<std::tuple<pybind11::bytes, size_t, size_t>> export_handle(
     torch::Tensor tensor) {
   TORCH_CHECK(tensor.is_cuda() && tensor.numel() > 0,
@@ -306,6 +357,7 @@ std::optional<std::tuple<pybind11::bytes, size_t, size_t>> export_handle(
     check_cuda(cuMemGetAllocationPropertiesFromHandle(&properties, handle),
                 "query shared allocation properties");
     const auto device = tensor.get_device();
+    // Only allocations created with the probed type can export it.
     if (!(properties.requestedHandleTypes & shareable_handle_type(device))) {
       cuMemRelease(handle);
       return std::nullopt;
@@ -322,6 +374,9 @@ std::optional<std::tuple<pybind11::bytes, size_t, size_t>> export_handle(
   }
 }
 
+// Maps the whole of one exported allocation as a flat tensor of the
+// prototype's dtype on the prototype's device. The caller applies the exported
+// byte offset.
 torch::Tensor import_handle(torch::Tensor prototype, const std::string& exported,
                         size_t allocation_bytes) {
   TORCH_CHECK(prototype.is_cuda() && allocation_bytes > 0 &&
@@ -354,6 +409,10 @@ torch::Tensor import_handle(torch::Tensor prototype, const std::string& exported
       .make_tensor();
 }
 
+// Records `stream` on the PyTorch pinned host allocator block backing `tensor`,
+// so the allocator does not reuse the block until work already enqueued on the
+// stream completes. Fails unless `tensor` is pinned host storage from that
+// allocator.
 void record_host_usage(torch::Tensor tensor, int64_t device, uint64_t stream_handle) {
   TORCH_CHECK(tensor.is_cpu() && tensor.is_pinned(),
               "native DMA lifetime tracking requires pinned host storage");
@@ -366,6 +425,10 @@ void record_host_usage(torch::Tensor tensor, int64_t device, uint64_t stream_han
               "native DMA source must belong to the PyTorch pinned allocator");
 }
 
+// Enqueues `source` -> `destination` on the raw CUDA stream `stream_handle`
+// with driver DMA calls, one per outer coordinate left after the layout is
+// reduced to a contiguous span and at most one pitched row axis. The copy does
+// not record either tensor for lifetime tracking.
 void copy_host_device(torch::Tensor destination, torch::Tensor source, uint64_t stream_handle) {
   TORCH_CHECK(source.is_cuda() != destination.is_cuda() &&
                   (source.is_cpu() || destination.is_cpu()),
@@ -384,6 +447,7 @@ void copy_host_device(torch::Tensor destination, torch::Tensor source, uint64_t 
   // Combine dimensions contiguous in both views, then use one pitched DMA
   // dimension. Only the remaining outer coordinates need separate copies.
   // No device tensor is allocated to pack a strided source or destination.
+  // Axes of extent one address nothing and are dropped.
   std::vector<int64_t> axes;
   for (int64_t axis = 0; axis < source.dim(); ++axis) {
     TORCH_CHECK(source.stride(axis) >= 0 && destination.stride(axis) >= 0,
@@ -392,6 +456,9 @@ void copy_host_device(torch::Tensor destination, torch::Tensor source, uint64_t 
       axes.push_back(axis);
     }
   }
+
+  // Grow the contiguous span `width` (in elements) by absorbing any axis whose
+  // stride equals the current width in both views, until none qualifies.
   int64_t width = 1;
   bool combined = true;
   while (combined) {
@@ -405,6 +472,12 @@ void copy_host_device(torch::Tensor destination, torch::Tensor source, uint64_t 
       }
     }
   }
+
+  // The pitched row axis must step at least one span in both views, since a
+  // 2D copy's pitch cannot be smaller than its row width, and its byte pitch
+  // must not exceed the device's maximum memcpy pitch. Among qualifying axes
+  // the largest extent is chosen, which minimizes the number of copies. With no
+  // qualifying axis each copy is one contiguous span.
   const auto item_bytes = source.element_size();
   int max_pitch = 0;
   check_cuda(cuDeviceGetAttribute(&max_pitch, CU_DEVICE_ATTRIBUTE_MAX_PITCH,
@@ -419,6 +492,8 @@ void copy_host_device(torch::Tensor destination, torch::Tensor source, uint64_t 
       row_axis = axis;
     }
   }
+
+  // Every remaining axis is iterated on the host, one DMA call per coordinate.
   std::vector<int64_t> outer_axes;
   int64_t copies = 1;
   for (const auto axis : axes) {
@@ -427,6 +502,7 @@ void copy_host_device(torch::Tensor destination, torch::Tensor source, uint64_t 
       copies *= source.size(axis);
     }
   }
+
   CUDA_MEMCPY2D copy{};
   copy.srcMemoryType = source.is_cuda() ? CU_MEMORYTYPE_DEVICE : CU_MEMORYTYPE_HOST;
   copy.dstMemoryType = destination.is_cuda() ? CU_MEMORYTYPE_DEVICE : CU_MEMORYTYPE_HOST;
@@ -435,6 +511,8 @@ void copy_host_device(torch::Tensor destination, torch::Tensor source, uint64_t 
   copy.srcPitch = (row_axis < 0 ? width : source.stride(row_axis)) * item_bytes;
   copy.dstPitch = (row_axis < 0 ? width : destination.stride(row_axis)) * item_bytes;
   for (int64_t index = 0; index < copies; ++index) {
+    // Decode `index` into outer coordinates, first outer axis fastest, and
+    // turn them into element offsets in each view.
     int64_t position = index;
     int64_t source_offset = 0;
     int64_t destination_offset = 0;
