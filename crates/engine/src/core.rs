@@ -2,6 +2,13 @@
 //!
 //! [`EngineCore`] owns the scheduler thread and worker lifecycle while exposing
 //! a transport-independent [`EngineHandle`] to request producers.
+//!
+//! [`WorkerConfig`] is the static deployment description: each WorkerGroup has
+//! an ordered list of physical [`WorkerRank`]s and named components whose
+//! `ranks` index into that list. [`EngineConfig`] adds scheduler budgets,
+//! transfer bindings, and rank launch defaults. `EngineCore::new` turns that
+//! configuration into launched worker processes; `EngineCore::with_executor`
+//! accepts an executor built elsewhere, such as the CPU simulation backend.
 
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(any(feature = "testing", test))]
@@ -36,7 +43,14 @@ use uniserve_worker_ipc::WorkerInfo;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerRank {
+    /// Host identity. The engine process spawns the ranks whose node equals
+    /// its own `WorkerProcessArgs::host`; a rank on another node is started by
+    /// that host's launcher.
     pub node: String,
+    /// Device string, such as `cuda:0` for a GPU rank or `cpu` for a host rank.
+    /// On the edges `TransferConfig::with_worker_defaults` derives, device
+    /// products use CUDA VMM only between distinct ranks whose devices both
+    /// start with `cuda:`.
     pub device: String,
 }
 
@@ -45,19 +59,34 @@ pub struct WorkerRank {
 #[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
     pub id: WorkerId,
+    /// Ordered physical members; a rank's position is its rank number within
+    /// the group.
     pub ranks: Vec<WorkerRank>,
+    /// Components keyed by name, each listing indices into `ranks`.
     pub components: BTreeMap<String, ComponentConfig>,
+    /// Maximum number of physical runs in flight per rank, launched as
+    /// `WorkerProcessArgs::queue_depth`.
     pub queue_depth: usize,
     /// Per-rank share of device storage available to this worker process.
     ///
+    /// When set, `EngineCore::new` launches the group's ranks with it as
+    /// `WorkerProcessArgs::kv_storage_fraction` instead of the engine-wide
+    /// default. Deployment files spell the field `memory_fraction`.
+    ///
     /// Distinct WorkerGroups may share one physical GPU. Their configured
-    /// shares must leave enough aggregate headroom for the device runtime.
+    /// shares must leave enough aggregate headroom for the device runtime;
+    /// validation checks each group alone, never the sum across groups.
     #[serde(default)]
     #[serde(rename = "memory_fraction")]
     pub storage_fraction: Option<f64>,
 }
 
 impl WorkerConfig {
+    /// Validates one WorkerGroup in isolation.
+    ///
+    /// Fails when the identity is not a valid `WorkerId`, `queue_depth` is
+    /// zero, `storage_fraction` is set outside (0, 1], or `validate_members`
+    /// rejects the ranks and components.
     pub fn validate(&self) -> anyhow::Result<()> {
         WorkerId::new(self.id.0.clone())?;
         anyhow::ensure!(
@@ -76,6 +105,19 @@ impl WorkerConfig {
         Ok(())
     }
 
+    /// Validates a group's rank list and its component membership.
+    ///
+    /// Ranks must be nonempty, name a node and a device, and not repeat a
+    /// `(node, device)` pair unless the device is `cpu`. Components must be
+    /// nonempty; each needs a nonempty name, a nonempty list of distinct
+    /// in-range rank indices, a `parallel_config` whose
+    /// `ParallelConfig::world_size` succeeds, and a positive `units_per_rank`.
+    /// A component without a distribution must have a parallel world size
+    /// equal to its rank count; one with a distribution must have world size
+    /// one.
+    ///
+    /// `WorkerGroup::spawn_all` calls this again for each group before
+    /// starting its ranks.
     pub fn validate_members(
         ranks: &[WorkerRank],
         components: &BTreeMap<String, ComponentConfig>,
@@ -87,6 +129,8 @@ impl WorkerConfig {
                 !rank.node.is_empty() && !rank.device.is_empty(),
                 "rank requires node and device"
             );
+            // Within a group a `(node, device)` pair names one rank, except
+            // `cpu`, which several ranks on one node may share.
             anyhow::ensure!(
                 devices.insert((&rank.node, &rank.device)) || rank.device == "cpu",
                 "worker repeats a physical device"
@@ -107,6 +151,8 @@ impl WorkerConfig {
                 "component {name} repeats members"
             );
             let degree = entry.parallel_config.world_size()?;
+            // A distributed component deals independent units to its ranks, so
+            // each rank runs the component unpartitioned.
             if entry.distribution.is_some() {
                 anyhow::ensure!(
                     degree == 1,
@@ -132,6 +178,9 @@ impl WorkerConfig {
     /// Component names may repeat across WorkerGroups. Repeated names are
     /// replicas of the same numerical component; the scheduler binds each
     /// request to one of them and keeps that affinity for the request lifetime.
+    ///
+    /// Physical devices may repeat across groups; only `validate_members`
+    /// checks device reuse, and it does so within one group.
     pub fn validate_all(workers: &[Self]) -> anyhow::Result<()> {
         anyhow::ensure!(!workers.is_empty(), "engine requires workers");
         let mut ids = BTreeSet::new();
@@ -142,21 +191,12 @@ impl WorkerConfig {
         Ok(())
     }
 
-    /// Expands the single-instance CLI shorthand into explicit device membership
-    /// across the named hosts, carrying the components the model declared.
+    /// One component tensor-parallel over every rank.
     ///
-    /// Ranks are assigned in blocks, so the lowest ranks stay on the first
-    /// host, and each host numbers its devices from zero. A placement on one
-    /// host is the same arithmetic with one block.
-    ///
-    /// Which components exist and how each one partitions is the model's to
-    /// state, so `components` arrives already resolved for this rank count. This
-    /// assigns rank identity and nothing else.
-    /// One component parallel over every rank.
-    ///
-    /// This is the whole placement a single-component model declares, and the
-    /// one a default or a simulation needs. A model with several components
-    /// states its own.
+    /// The `uniserve` CLI uses this placement when no `--workers` configuration
+    /// is given, and the default engine settings and the simulation use it. A
+    /// deployment with several components, or with other partitions, writes
+    /// its own configuration.
     pub fn single_component(name: &str, rank_count: usize) -> BTreeMap<String, ComponentConfig> {
         BTreeMap::from([(
             name.into(),
@@ -170,6 +210,19 @@ impl WorkerConfig {
         )])
     }
 
+    /// Expands the single-instance CLI shorthand into explicit device membership
+    /// across the named hosts, carrying the given components.
+    ///
+    /// Ranks are assigned in blocks, so the lowest ranks stay on the first
+    /// host, and each host numbers its devices from zero. A placement on one
+    /// host is the same arithmetic with one block. A `device` of `cuda` or
+    /// `gpu` becomes `cuda:<local index>`; any other string is used verbatim
+    /// for every rank.
+    ///
+    /// `components` must already be resolved for `rank_count`; this assigns
+    /// rank identity and nothing else. The group is named `model` and has no
+    /// storage fraction of its own. Nothing is validated here, and an empty
+    /// `hosts` yields no ranks.
     pub fn placed(
         hosts: &[String],
         device: &str,
@@ -233,10 +286,15 @@ pub struct EngineConfig {
     pub workers: Vec<WorkerConfig>,
     /// Per-edge data-plane transfer backend selection (`--transfer`), e.g.
     /// `encoder->prefill=shm,prefill->decode=cuda_vmm`. Participating worker
-    /// ranks receive the selected transport. Intra-WorkerGroup defaults are resolved
-    /// once from rank node/device coordinates before process launch.
+    /// ranks receive the selected transport. Before process launch,
+    /// `EngineCore::new` binds a default for every ordered rank pair, within
+    /// and across WorkerGroups, that no configured edge covers, derived from
+    /// rank node/device coordinates.
     pub transfer: TransferConfig,
     /// Rank launch defaults refined by each WorkerGroup configuration.
+    ///
+    /// Every constructor also reads the model identifier (`model`) and
+    /// `model_dtype` from here.
     pub worker_process: WorkerProcessArgs,
     /// Beginning-of-sequence token identifier.
     pub bos: u32,
@@ -288,9 +346,9 @@ impl EngineConfig {
             )],
             transfer: TransferConfig::default(),
             worker_process,
+            bos: 0,
             // `SimEngine` fabricates this fake EOS id after `text_len` tokens; the
             // scheduler must recognize it to finish a sim request.
-            bos: 0,
             eos: vec![151645],
             end_of_image: 0,
         }
@@ -317,20 +375,27 @@ pub struct EngineCore {
     generation_limits: GenerationLimits,
     max_model_len: u32,
     runtime_family: RuntimeFamily,
-    /// Engine-dead latch: set when the scheduler loop exits fatally (worker
-    /// death) or panics.
+    /// Engine-dead latch: set after `Scheduler::run` returns a fatal exit
+    /// (executor or worker failure). A scheduler thread panic does not set it.
     dead: Arc<AtomicBool>,
     next_id: AtomicU64,
     sched_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl EngineCore {
-    /// Builds the scheduler, spawn the forward-only worker, and start the
-    /// scheduler owner thread.
+    /// Launches every configured WorkerGroup, builds the scheduler, and starts
+    /// the scheduler owner thread.
     ///
-    /// Blocks until the worker has loaded the model and answered the
-    /// worker-info handshake, including model initialization.
+    /// Blocks until every rank has loaded the model and reported its
+    /// capabilities. Fails when `WorkerConfig::validate_all` rejects the
+    /// workers, a configured transfer edge names an unconfigured worker,
+    /// `WorkerGroup::spawn_all` fails to launch a group,
+    /// `WorkerExecutor::try_new` refuses the launched groups, or the scheduler
+    /// or its thread cannot be created.
     pub fn new(mut config: EngineConfig) -> anyhow::Result<Self> {
+        // Validates the workers and fills default edges; the edges it adds
+        // only name configured workers, so the check below covers the
+        // explicitly configured ones.
         config.transfer = config.transfer.with_worker_defaults(&config.workers)?;
         let instances = config
             .workers
@@ -349,6 +414,12 @@ impl EngineCore {
             .iter()
             .map(|worker| (worker.id.to_string(), worker.components.clone()))
             .collect::<std::collections::BTreeMap<_, _>>();
+
+        // Each group launches from the shared defaults with its own identity,
+        // placement, components, queue depth, and storage fraction, plus the
+        // resolved transfer edges and every group's components (`peers`),
+        // from which the group resolves the ranks, possibly in other groups,
+        // that read its products.
         let mut bindings = Vec::new();
         let mut arguments = Vec::new();
         for worker in &config.workers {
@@ -366,6 +437,9 @@ impl EngineCore {
             });
             bindings.push(worker.id.clone());
         }
+
+        // `spawn_all` returns groups in argument order, which pairs each group
+        // with its identity.
         let workers = bindings
             .into_iter()
             .zip(WorkerGroup::spawn_all(arguments)?)
@@ -376,6 +450,10 @@ impl EngineCore {
     }
 
     /// Builds the engine core from an executor supplied by a higher composition layer.
+    ///
+    /// The command waker is a no-op, so a command does not interrupt the
+    /// scheduler's idle park; `with_executor_and_waker` supplies a real one.
+    /// Neither constructor uses `config.workers` or `config.transfer`.
     pub fn with_executor(
         config: EngineConfig,
         executor: Box<dyn Executor>,
@@ -420,6 +498,8 @@ impl EngineCore {
         let generation_limits = sched.generation_limits().clone();
         let stats = sched.stats_handle();
 
+        // The scheduler thread owns the `Scheduler` and its executor; request
+        // producers reach it only through the command channel.
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let dead = Arc::new(AtomicBool::new(false));
         let sched_thread = {
@@ -457,6 +537,9 @@ impl EngineCore {
     }
 
     /// Returns the worker-reported runtime capabilities.
+    ///
+    /// With several WorkerGroups this is the executor's merged view
+    /// (`ExecutorInfo::runtime_info`), not any single group's report.
     pub fn info(&self) -> &WorkerInfo {
         &self.info
     }
@@ -466,7 +549,11 @@ impl EngineCore {
         self.generation_limits.clone()
     }
 
-    /// Returns whether the worker can sample autoregressive tokens.
+    /// Returns whether the reported capabilities include a decode or verify
+    /// forward; with several WorkerGroups, whether any group serves one.
+    ///
+    /// The server advertises request sampling controls only when this holds
+    /// (`EngineClient::served_sampling_controls`).
     pub fn supports_token_sampling(&self) -> bool {
         self.info.supported_calls.iter().any(|mode| {
             matches!(
@@ -503,6 +590,9 @@ impl EngineCore {
     }
 
     /// Allocates the next internal scheduler request id.
+    ///
+    /// Ids start at 1 and are unique for the lifetime of this core; `Relaxed`
+    /// suffices because only uniqueness is required.
     pub fn next_request_id(&self) -> RequestId {
         RequestId(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
@@ -513,6 +603,11 @@ impl EngineCore {
     }
 
     /// Submits one translated request to the scheduler.
+    ///
+    /// Returns `SubmitError::Dead` once the dead latch is set and
+    /// `SubmitError::Closed` when the command channel no longer accepts
+    /// commands. Submitting through a cloned `handle()` skips the latch check
+    /// and can only report `Closed`.
     pub fn submit(&self, request: Request) -> Result<EventRx, SubmitError> {
         if self.is_dead() {
             return Err(SubmitError::Dead);
@@ -522,6 +617,11 @@ impl EngineCore {
 
     /// Shuts down the scheduler, tears down its executor, and joins
     /// its thread. Idempotent.
+    ///
+    /// Blocks until the scheduler thread exits; on shutdown `Scheduler::run`
+    /// first finishes queued and running requests with `Aborted` and closes
+    /// the executor. A poisoned thread lock or a panicked scheduler thread is
+    /// logged, not propagated.
     pub fn shutdown(&self) {
         self.handle.shutdown();
         let thread = match self.sched_thread.lock() {
@@ -540,7 +640,7 @@ impl EngineCore {
 }
 
 impl Drop for EngineCore {
-    /// Releases resources owned by this value.
+    /// Runs `EngineCore::shutdown`, blocking until the scheduler thread exits.
     fn drop(&mut self) {
         self.shutdown();
     }
@@ -572,6 +672,8 @@ mod tests {
         components
     }
 
+    /// Groups of different sizes validate independently, and a group whose
+    /// component spans more ranks than the group holds is refused.
     #[test]
     fn static_components_validate_their_own_parallel_members() -> anyhow::Result<()> {
         let mut workers = Vec::new();
@@ -587,6 +689,7 @@ mod tests {
             workers.push(worker);
         }
         WorkerConfig::validate_all(&workers)?;
+
         workers[1].ranks.pop();
         assert!(WorkerConfig::validate_all(&workers).is_err());
         Ok(())
@@ -594,10 +697,11 @@ mod tests {
 
     #[test]
     fn the_shorthand_blocks_ranks_across_the_hosts_it_is_given() {
-        // Section 7's delivering configuration is eight devices over two
-        // four-device hosts, with muxing on rank zero of the head's host, so
-        // the lowest ranks must stay on the first host and each host must
-        // number its own devices from zero.
+        // Eight devices over two four-device hosts, the head's host first as
+        // the CLI lists them. `WorkerGroup` refuses a muxer off the head's
+        // host, so a deployment that places its muxer on rank zero needs the
+        // lowest ranks on the first host, and each host must number its own
+        // devices from zero.
         let hosts = ["rank-0".to_owned(), "rank-1".to_owned()];
         let worker = WorkerConfig::placed(&hosts, "cuda", 8, 2, mixed_components(8));
 
@@ -651,11 +755,14 @@ mod tests {
         assert_eq!(worker.ranks.len(), 8);
     }
 
+    /// Reordering a component's ranks is a valid placement; repeating a rank
+    /// is not.
     #[test]
     fn entry_geometry_uses_unique_ordered_rank_members() {
         let mut worker =
             WorkerConfig::placed(&["localhost".to_owned()], "cuda", 4, 2, mixed_components(4));
         assert!(worker.validate().is_ok());
+
         worker
             .components
             .get_mut("parallel")
@@ -663,6 +770,7 @@ mod tests {
             .ranks
             .swap(0, 3);
         assert!(worker.validate().is_ok());
+
         worker.components.get_mut("parallel").unwrap().ranks[1] = 3;
         assert!(worker.validate().is_err());
     }
@@ -678,8 +786,12 @@ mod tests {
         );
         let mut other = worker.clone();
         assert!(WorkerConfig::validate_all(&[worker.clone(), other.clone()]).is_err());
+
+        // Distinct identities on the same device validate, whether the groups
+        // replicate one component name or hold different ones.
         other.id = WorkerId("other".into());
         assert!(WorkerConfig::validate_all(&[worker.clone(), other.clone()]).is_ok());
+
         let entry = other.components.remove(DEFAULT_COMPONENT).unwrap();
         other.components.insert("divided".into(), entry);
         assert!(WorkerConfig::validate_all(&[worker, other]).is_ok());

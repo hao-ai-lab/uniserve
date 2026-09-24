@@ -17,8 +17,13 @@ use crate::openai::ApiError;
 /// checking performed by the latter is entirely determined by `T`'s `Validate`
 /// impl. Request types declare `#[validate(...)]` constraints for ranges and
 /// cross-parameter checks, while fallible request lowering enforces the
-/// configured serving features. When validation reports errors,
-/// this returns [`ApiError::InvalidRequest`] with the details.
+/// configured serving features.
+///
+/// Any rejection from axum's `Json` extractor, such as a missing JSON content
+/// type, malformed JSON, a schema mismatch, or a body over the size limit,
+/// becomes [`ApiError::JsonParseError`]. Validation errors become
+/// [`ApiError::InvalidRequest`] with the details and no `param`. Both map to
+/// `400 Bad Request`.
 pub(crate) struct ValidatedJson<T>(pub T);
 
 impl<S, T> FromRequest<S> for ValidatedJson<T>
@@ -28,7 +33,6 @@ where
 {
     type Rejection = ApiError;
 
-    /// Extracts and validates the value from an HTTP request.
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         let Json(mut data) = Json::<T>::from_request(req, state)
             .await
@@ -47,14 +51,12 @@ where
 impl<T> std::ops::Deref for ValidatedJson<T> {
     type Target = T;
 
-    /// Returns shared access to the wrapped value.
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> std::ops::DerefMut for ValidatedJson<T> {
-    /// Returns mutable access to the wrapped value.
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }

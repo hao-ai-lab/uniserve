@@ -2,6 +2,13 @@
 //!
 //! The crate resolves one configuration into shared application
 //! state and exposes OpenAI-compatible routes backed by the in-process engine.
+//!
+//! [`build_state`] is the startup path: it resolves the model's assets into a
+//! `profile::ModelConfig`, a tokenizer, and a chat renderer, derives the
+//! engine and worker-process settings from the model and the configuration,
+//! starts the engine (`engine_client`), and binds the model's input
+//! processing to the capabilities the engine reports (`serving`). The HTTP
+//! layer (`http`) serves requests from the resulting [`AppState`].
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod config;
@@ -34,7 +41,16 @@ use uniserve_engine::{EngineConfig, SpecialTokenIds, WorkerProcessArgs};
 pub use crate::http::{ApiError, build_router, serve};
 pub use crate::state::AppState;
 
-/// Resolves canonical model control tokens for the loaded model.
+/// Resolves the control tokens the engine uses for the loaded model.
+///
+/// `bos` and `end_of_image` come from the profile's `GenerationControls` and
+/// are `0` for profiles without them (`Qwen3` and `MiniMaxH3`). The EOS list
+/// is the model's complete EOS set with the primary EOS placed first (and
+/// added when the set lacks it). The order matters to the engine scheduler,
+/// which substitutes `eos[0]` for the token of a completion that commits
+/// none. The primary EOS is the nonzero `GenerationControls::eos` when
+/// present, otherwise `ModelConfig::primary_eos_token_id`; when neither
+/// exists the list keeps the set's ascending order.
 fn special_token_ids(model: &ModelConfig) -> SpecialTokenIds {
     let controls = model.generation_controls();
     let bos = controls.map_or(0, |value| value.bos);
@@ -56,6 +72,17 @@ fn special_token_ids(model: &ModelConfig) -> SpecialTokenIds {
 }
 
 /// Builds the shared application state for one resolved model and one engine client.
+///
+/// Starts the engine and its worker processes as a side effect, so the
+/// returned state owns a running engine.
+///
+/// # Errors
+///
+/// Fails when the model assets cannot be resolved, when the per-run call
+/// bound (`max_batch` clamped to `max_num_seqs`) or `max_num_batched_tokens`
+/// does not fit the worker's `u32` fields, when the engine fails to start, or
+/// when the model description cannot be bound to the capabilities the engine
+/// reports.
 pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let (model_config, tokenizer, renderer) = ModelConfig::load(config)
         .await
@@ -72,6 +99,9 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         queue_depth = config.engine.worker_process.queue_depth,
         "starting UniServe Rust engine"
     );
+
+    // The worker's per-run call bound is `max_batch` clamped to
+    // `max_num_seqs`, with both treated as at least one.
     let max_batch_calls = u32::try_from(
         config
             .engine
@@ -82,6 +112,11 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     .context("max_batch exceeds the worker field width")?;
     let max_batch_tokens = u32::try_from(config.engine.max_num_batched_tokens)
         .context("max_num_batched_tokens exceeds the worker field width")?;
+
+    // The model profile states the IPC payload its products need, and both
+    // directions of the worker channel must carry it: the request slot uses
+    // exactly that capacity, and the response slot uses the configured
+    // `resp_slot_cap` only when it is larger.
     let worker_process = WorkerProcessArgs {
         model: config.model.clone(),
         req_slot_cap: channel_payload_capacity,
@@ -117,6 +152,8 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         EngineClient::connect(engine_config).context("failed to start the UniServe engine")?;
 
     let engine = Arc::new(client);
+    // The served context limit never exceeds the length the engine reports,
+    // which is the `max_model_len` passed in `engine_config`.
     let route_max_model_len = effective_max_model_len.min(engine.max_model_len());
     let model = InputProcessor::new(
         model_config,

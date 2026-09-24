@@ -1,4 +1,11 @@
 //! Server, engine, worker, model, and listener configuration values.
+//!
+//! `Config` is the normalized server input that the `uniserve` CLI and the
+//! Dynamo worker binary build from their own arguments. `serve` validates it
+//! before building state; a caller of `build_state` alone, such as the Dynamo
+//! worker, calls `Config::validate` itself. `build_state` resolves model
+//! assets, derives the worker and engine configurations from it, and starts
+//! the engine.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -48,17 +55,20 @@ pub struct EngineSettings {
     pub max_num_seqs: usize,
     /// Per-request token ceiling for one prefill chunk.
     pub long_prefill_threshold: usize,
-    /// Per-step budget of text prefill tokens allowed to join a decode batch
-    /// as one mixed extend+decode forward. `0` disables mixing.
+    /// Per-step budget of text prefill tokens a decode pass may co-schedule.
+    /// The prefill tokens still travel as their own batch and numerical call.
+    /// `0` disables co-scheduling.
     pub mixed_prefill_tokens: usize,
     /// Waiting queue policy used by the scheduler.
     pub scheduler_policy: SchedulingPolicy,
-    /// Maximum model context length reported to the frontend. `None` means
-    /// "derive from the loaded model's real context length" (see
-    /// [`EngineSettings::DEFAULT_MAX_MODEL_LEN`] for the final fallback when the
-    /// model exposes no value).
+    /// Maximum model context length override. `None` derives the limit from
+    /// the loaded model: its `max_position_embeddings` for a model with a root
+    /// `config.json` (falling back to
+    /// [`EngineSettings::DEFAULT_MAX_MODEL_LEN`]), or the default prompt limit
+    /// of a diffusers pipeline.
     pub max_model_len: Option<u32>,
-    /// Largest request duration resident media state is sized to serve.
+    /// Largest request duration, in seconds, resident media state is sized to
+    /// serve. `InputProcessor::video_sampling` rejects longer video requests.
     pub max_video_seconds: f64,
     /// Static Worker configurations with ordered ranks and named computation components.
     pub workers: Vec<WorkerConfig>,
@@ -81,8 +91,9 @@ impl Default for EngineSettings {
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
             max_video_seconds: 15.0,
-            // One local rank running one component, which a serve invocation
-            // replaces with the placement the model being served declared.
+            // One local CUDA rank running `DEFAULT_COMPONENT`. The `uniserve`
+            // CLI and the Dynamo worker binary both replace this with a
+            // placement built from their own arguments.
             workers: vec![WorkerConfig::placed(
                 &["localhost".to_owned()],
                 "cuda",
@@ -104,9 +115,10 @@ impl Default for EngineSettings {
 pub struct Config {
     /// In-process UniServe Rust engine settings (the southbound boundary).
     pub engine: EngineSettings,
-    /// Backend model identifier used for engine loading.
+    /// Backend model identifier used for engine loading: a Hugging Face
+    /// repository ID or a local model directory. Empty by default; callers
+    /// must set it.
     pub model: String,
-    /// Validated checkpoint variant metadata resolved before worker loading.
     /// Single model name exposed to clients via the OpenAI API. When absent,
     /// the resolved model identifier is used.
     pub served_model_name: Option<String>,
@@ -135,6 +147,7 @@ pub struct Config {
     /// requests.
     pub max_concurrent_requests: Option<u64>,
     /// Maximum time to wait for active HTTP requests to drain on shutdown.
+    /// Zero aborts the server as soon as shutdown begins.
     pub shutdown_timeout: Duration,
     /// Whether the model description's reasoning parser separates
     /// `reasoning_content` from `content`. When `false`, reasoning delimiter
@@ -143,7 +156,8 @@ pub struct Config {
 }
 
 impl Default for Config {
-    /// Returns a local TCP server configuration with Qwen3 profile defaults.
+    /// Returns a configuration listening on TCP `127.0.0.1:8000` with an empty
+    /// `model`, which callers must set before use.
     fn default() -> Self {
         Self {
             engine: EngineSettings::default(),
@@ -170,7 +184,8 @@ impl Default for Config {
 
 impl Config {
     /// Validates frontend configuration that can be checked before engine
-    /// startup.
+    /// startup: the listener (`validate_listener`) and the engine settings
+    /// (`EngineSettings::validate`). Returns the first violation found.
     pub fn validate(&self) -> Result<()> {
         self.validate_listener()?;
         self.engine.validate()?;
@@ -204,12 +219,15 @@ impl EngineSettings {
     pub const DEFAULT_MAX_MODEL_LEN: u32 = 8192;
 
     /// Default response-ring slot capacity in bytes for the worker IPC
-    /// transport (64 MiB).
+    /// transport (64 MiB). `build_state` raises the configured capacity to the
+    /// model's channel payload capacity when that is larger.
     pub const DEFAULT_RESP_SLOT_CAP: usize = 64 << 20;
 
     /// Rejects numeric engine settings that are structurally required to be
     /// positive (they index, divide, or bound scheduling). This catches a `0`
-    /// override before it reaches the scheduler or KV sizing math.
+    /// override before it reaches the scheduler or KV sizing math. It also
+    /// rejects a `max_video_seconds` outside the supported frame range and any
+    /// worker placement `WorkerConfig::validate_all` refuses.
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             self.worker_process.block_size > 0,
@@ -233,6 +251,11 @@ impl EngineSettings {
             self.max_video_seconds.is_finite() && self.max_video_seconds > 0.0,
             "max_video_seconds must be finite and greater than 0"
         );
+        // Mirrors the frame arithmetic of `InputProcessor::video_sampling`:
+        // frames are counted at 24 fps, 6 is the smallest raw count that
+        // `align_num_frames` lifts to the 22-frame minimum `video_sampling`
+        // accepts, and the upper bound leaves room for the at most 16 frames
+        // alignment adds.
         let max_video_frames = (self.max_video_seconds * 24.0).round();
         anyhow::ensure!(
             max_video_frames >= 6.0 && max_video_frames <= f64::from(u32::MAX - 16),

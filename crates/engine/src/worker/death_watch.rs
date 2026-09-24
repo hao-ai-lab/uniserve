@@ -1,10 +1,16 @@
 //! Edge-triggered worker-exit notification for event-driven executors.
 //!
-//! A watcher signals [`WakeSender`] when a child exits, allowing the scheduler to
-//! share one wait boundary for results, commands, and worker death.
+//! A watcher fires the rank channel's death `Wake` (`RankChannel::death_wake`)
+//! when a child exits, allowing the scheduler to share one wait boundary for
+//! results, commands, and worker death.
 //!
-//! Linux uses `pidfd` readiness without reaping the child. Unsupported platforms
-//! rely on the executor's bounded liveness check.
+//! Only a rank process this engine spawned can have a watcher;
+//! `PendingRank::adopt` attempts to start one. Linux uses `pidfd` readiness
+//! without reaping the child; `RankProcess` reaps it later through
+//! `Child::try_wait` or `Child::wait`. Other platforms have no watcher, and a
+//! local rank's exit is then noticed by `RankProcess::check_worker`, which
+//! `RankProcess::poll_batch` runs at least once per `WORKER_CHECK_INTERVAL`
+//! while it waits.
 
 #[cfg(target_os = "linux")]
 mod imp {
@@ -19,6 +25,11 @@ mod imp {
     /// alive. Worker death itself wakes `poll()` immediately regardless.
     const POLL_TICK_MS: libc::c_int = 200;
 
+    /// A background thread that owns a `pidfd` for one child process.
+    ///
+    /// Dropping the watcher stops and joins the thread. `RankProcess` drops it
+    /// before it kills or shuts down the child, so an intentional exit is not
+    /// reported as a death.
     pub(crate) struct DeathWatcher {
         stop: Arc<AtomicBool>,
         handle: Option<JoinHandle<()>>,
@@ -26,9 +37,15 @@ mod imp {
 
     impl DeathWatcher {
         /// Starts a pidfd watcher that wakes the engine when the child exits.
+        ///
+        /// On exit the watcher also sets `startup_abort`, the startup
+        /// cancellation flag shared by the ranks launched together with this
+        /// one. Returns `None` when the descriptor cannot be opened or the
+        /// thread cannot be started.
         pub(crate) fn spawn(pid: u32, wake: Wake, startup_abort: Arc<AtomicBool>) -> Option<Self> {
-            // SAFETY: `pidfd_open` receives the PID of the child just spawned. A
-            // negative return leaves liveness monitoring to the caller's probe.
+            // SAFETY: `pidfd_open` receives the PID of a child this engine
+            // spawned and has not reaped. A negative return leaves exit
+            // detection to `RankProcess::check_worker`.
             let pidfd = unsafe {
                 libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0 as libc::c_uint)
             };
@@ -69,9 +86,13 @@ mod imp {
             if n > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
                 // Peers can be alive but waiting for this member during group
                 // initialization. Cancel that incomplete startup as one instance.
+                // The release store pairs with the acquire loads in
+                // `RankProcess::check_worker` and `RankProcess::close`. Once the
+                // group is ready its ranks stop consulting the flag, so a later
+                // exit only wakes.
                 startup_abort.store(true, Ordering::Release);
-                // The child has exited. Fire the death wake once and stop; the
-                // executor reaps the zombie via its own `try_wait`.
+                // The child has exited. Fire the death wake once and stop;
+                // `RankProcess` reaps the zombie.
                 wake.wake();
                 break;
             }
@@ -84,7 +105,8 @@ mod imp {
     }
 
     impl Drop for DeathWatcher {
-        /// Releases resources owned by this value.
+        /// Stops the thread and joins it, waiting at most about one
+        /// `POLL_TICK_MS` while the child is still alive.
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
             if let Some(handle) = self.handle.take() {
@@ -101,14 +123,14 @@ mod imp {
     pub(crate) struct DeathWatcher;
 
     impl DeathWatcher {
-        /// Spawns a watcher that reports unexpected worker termination.
+        /// Returns `None`: this platform has no watcher.
         pub(crate) fn spawn(
             _pid: u32,
             _wake: Wake,
             _startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
         ) -> Option<Self> {
-            // No pidfd equivalent off Linux; death is caught by the bounded
-            // liveness probe instead.
+            // No pidfd equivalent off Linux; `RankProcess::check_worker`
+            // notices the exit when it next runs.
             None
         }
     }

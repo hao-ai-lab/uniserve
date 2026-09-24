@@ -1,4 +1,10 @@
 //! HTTP request identification, load tracking, and metrics middleware.
+//!
+//! `routes::build_router` installs these as `axum::middleware` function layers
+//! around every route, the request-ID layer only when it is enabled. Load
+//! tracking and metrics must observe the whole response, including a streamed
+//! body that outlives the handler, so both wrap the response body in
+//! [`GuardedBody`] and do their accounting when that body is dropped.
 
 mod load;
 mod metrics;
@@ -14,6 +20,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 /// Keeps request accounting alive until its response body is dropped.
+///
+/// The body forwards every frame and hint to `inner` unchanged; `_guard` exists
+/// only for its `Drop`, which runs when the server finishes sending the body or
+/// drops it because the connection closed. For an SSE response that is the end
+/// of the stream, not the moment the handler returned.
 struct GuardedBody<G> {
     inner: Body,
     _guard: G,

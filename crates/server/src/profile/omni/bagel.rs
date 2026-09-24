@@ -1,4 +1,10 @@
 //! Bagel model parameters, prompt layout, and image configuration.
+//!
+//! Input images feed both the VAE and the ViT encoder, in that order;
+//! generated images feed back through the VAE only. The resize policies here
+//! fix the values the worker's Bagel `image_processor`
+//! (`uniserve_models/bagel/processing.py`) uses with the default vision
+//! `image_size` of 980 and `patch_size` of 14.
 
 use serde::{Deserialize, Serialize};
 use uniserve_core::{
@@ -14,8 +20,13 @@ use super::{
 use crate::profile::assets;
 use crate::profile::tokenizer::HuggingFaceTokenizer;
 
+/// System instruction used under `GenerationConstraint::Default` when the
+/// request supplies none.
 const DEFAULT_SYSTEM_PROMPT: &str = "You should first think about the planning process in the mind and then generate the image. \n     The planning process is enclosed within <think> </think> tags, i.e. <think> planning process here </think> image here";
 /// System instruction that establishes Bagel reasoning and answer delimiters.
+///
+/// `serving::omni` places it before the input images of an understanding-only
+/// text prompt, framed by [`BagelProfile::wrap_context_text`].
 pub const CONTEXT_SYSTEM_PROMPT: &str = "\nLet's think step by step to answer the question. For text-based thinking, enclose the process within <think> </think>, e.g. <think> thinking process here </think>. For visual thinking, enclose the content within <image_start> </image_end>, e.g. <image_start> thinking image here </image_end>. Finally conclude with the final answer wrapped in <answer></answer> tags, i.e.<answer> answer here </answer>.\n";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -46,8 +57,16 @@ impl BagelProfile {
     pub const ENCODER_CACHE_ENTRIES: usize = 256;
 
     /// Returns bounded runtime capabilities for the selected dtype.
+    ///
+    /// These are profile ceilings. The engine scheduler's
+    /// `resolve_generation_limits` clamps the latent, grid-token, feature-byte,
+    /// and encoder-cache limits to the capacities the loaded worker reports and
+    /// drops features whose calls the worker does not support.
     pub fn runtime_limits(model_dtype: ModelDtype) -> GenerationLimits {
         let dtype_bytes = model_dtype_bytes(model_dtype);
+        // `GenerationRequest::image_latent_bytes` divides the latent feature
+        // bytes by `max_vae_grid_tokens` to get the bytes per latent unit:
+        // 16 VAE latent channels over a 2x2 latent patch.
         GenerationLimits {
             features: GenerationFeatures::UNDERSTANDING
                 | GenerationFeatures::VISION_ENCODE
@@ -66,6 +85,10 @@ impl BagelProfile {
     }
 
     /// Resolves required control tokens from the loaded tokenizer.
+    ///
+    /// Encoder token counts stay unset here; the `*_for_dimensions` methods
+    /// return per-image copies with the counts set. Fails when the tokenizer
+    /// lacks any of the ChatML or vision delimiter tokens.
     pub fn resolve(tokenizer: &HuggingFaceTokenizer) -> assets::Result<Self> {
         let (start_of_image, start_of_image_text) =
             required_token(tokenizer, "<|vision_start|>", "Bagel start-of-image")?;
@@ -150,6 +173,17 @@ impl BagelProfile {
     }
 
     /// Renders and encodes the positive prompt for one request.
+    ///
+    /// - `Default` places the system instruction directly after
+    ///   `<|im_start|>`, with no role line, followed by a user turn and an open
+    ///   assistant turn.
+    /// - `UndOnly` without images renders a plain user turn and an open
+    ///   assistant turn.
+    /// - `UndOnly` with images encodes the prompt text alone.
+    /// - `GenOnly` wraps the prompt with [`Self::wrap_context_text`].
+    ///
+    /// `system_prompt` applies only under `Default`; `assistant_prefix`
+    /// applies only to the `Default` and image-free `UndOnly` layouts.
     pub fn render_prompt_ids(
         &self,
         tokenizer: &HuggingFaceTokenizer,
@@ -183,6 +217,8 @@ impl BagelProfile {
     }
 
     /// Renders and encodes classifier-free guidance context.
+    ///
+    /// An empty prompt yields no tokens rather than an empty framed turn.
     pub fn render_negative_prompt_ids(
         &self,
         tokenizer: &HuggingFaceTokenizer,
@@ -195,6 +231,9 @@ impl BagelProfile {
     }
 
     /// Wraps plain context text in the profile's required delimiters.
+    ///
+    /// The result is `bos`, the encoded text, then `eos`, with no role line or
+    /// newline.
     pub fn wrap_context_text(
         &self,
         tokenizer: &HuggingFaceTokenizer,
@@ -207,6 +246,10 @@ impl BagelProfile {
     }
 
     /// Builds the encoder inputs for an input image of the given dimensions.
+    ///
+    /// The VAE grid comes from the VAE resize; the ViT grid comes from the ViT
+    /// resize applied to that VAE canvas. Each adds two marker tokens. The
+    /// image count does not affect the result.
     pub fn image_encoders_for_dimensions(
         &self,
         width: u32,
@@ -236,6 +279,10 @@ impl BagelProfile {
     }
 
     /// Resolves the generated-image feedback KV contribution for the requested canvas.
+    ///
+    /// Fails when the canvas cannot be resized under the VAE policy, or when
+    /// the profile's feedback configuration has no feedback source or is not a
+    /// single VAE encoder.
     pub fn image_generation_for_dimensions(
         &self,
         width: u32,

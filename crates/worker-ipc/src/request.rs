@@ -1,4 +1,10 @@
 //! Worker request and response envelopes.
+//!
+//! One [`WorkerRequest`] or [`WorkerResponse`] travels as the payload of one
+//! transport frame. Each envelope's optional `message_id` is the
+//! request-response correlation identity that the transport copies into
+//! `Header::message_id` (`None` becomes zero); it is unrelated to the planned
+//! calls' [`CallId`] values inside a batch.
 
 use super::*;
 
@@ -16,6 +22,9 @@ pub enum RequestKind {
 
 impl RequestKind {
     /// Request kinds accepted by the worker endpoint.
+    ///
+    /// The codec resolves wire discriminants against this list, so a kind
+    /// missing here cannot be decoded.
     pub const ALL: [Self; 3] = [Self::Info, Self::Submit, Self::Close];
 
     /// Returns the stable wire name for this request kind.
@@ -61,7 +70,7 @@ impl WorkerRequest {
         }
     }
 
-    /// Returns the optional call correlation identifier.
+    /// Returns the optional request-response correlation identity.
     pub const fn message_id(&self) -> Option<u64> {
         match self {
             Self::Info { message_id }
@@ -70,7 +79,7 @@ impl WorkerRequest {
         }
     }
 
-    /// Replaces the call correlation identifier.
+    /// Replaces the request-response correlation identity (`message_id`).
     pub fn set_call_id(&mut self, value: Option<u64>) {
         match self {
             Self::Info { message_id }
@@ -91,6 +100,7 @@ impl WorkerRequest {
     pub fn info() -> Self {
         Self::Info { message_id: None }
     }
+
     /// Constructs a batch-submission request.
     pub fn submit(batch: Batch) -> Self {
         Self::Submit {
@@ -98,6 +108,7 @@ impl WorkerRequest {
             batch: Box::new(batch),
         }
     }
+
     /// Constructs a worker-shutdown request.
     pub fn close() -> Self {
         Self::Close { message_id: None }
@@ -187,7 +198,7 @@ impl WorkerResponse {
         }
     }
 
-    /// Returns the optional call correlation identifier.
+    /// Returns the optional request-response correlation identity.
     pub const fn message_id(&self) -> Option<u64> {
         match self {
             Self::Info { message_id, .. }
@@ -197,7 +208,7 @@ impl WorkerResponse {
         }
     }
 
-    /// Replaces the call correlation identifier.
+    /// Replaces the request-response correlation identity (`message_id`).
     pub fn set_call_id(&mut self, value: Option<u64>) {
         match self {
             Self::Info { message_id, .. }

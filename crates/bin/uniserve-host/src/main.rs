@@ -13,6 +13,10 @@
 //!
 //! It does nothing else. The head derives every launch value once, so a
 //! launcher's command line is the head's address and its own host identity.
+//!
+//! The connection carries newline-delimited JSON. The head's side is the
+//! engine's `LauncherRegistry`, whose instruction and report types these must
+//! stay field-compatible with.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -62,17 +66,21 @@ enum Instruction {
 /// Everything needed to start one rank.
 #[derive(Deserialize)]
 struct Spawn {
-    /// Global rank identity, which is also how exits are reported.
+    /// Rank within its worker group's process world, not host-relative.
+    /// Exits are reported by worker group and this rank.
     rank: u32,
     /// Worker group the rank belongs to.
     worker_id: String,
-    /// Ranks in the whole process world.
+    /// Ranks in the worker group's process world.
     world_size: u32,
     /// Interpreter that runs the worker module.
     python: String,
     /// The head's complete launch descriptor for this rank.
     descriptor: serde_json::Value,
-    /// Environment the rank's numerical libraries read.
+    /// Environment variables the head set on its own spawn command for this
+    /// rank. They are applied over the environment this launcher inherited; a
+    /// variable the head's command removes arrives with an empty value and is
+    /// set empty here rather than removed.
     environment: HashMap<String, String>,
 }
 
@@ -91,7 +99,8 @@ type RankKey = (String, u32);
 /// One rank this launcher owns.
 struct Rank {
     child: Child,
-    /// Retains the descriptor file until the rank has read it.
+    /// Retains the descriptor file until the rank has read it; dropping the
+    /// `Rank` deletes the directory.
     _descriptor: tempfile::TempDir,
 }
 
@@ -128,21 +137,30 @@ fn main() -> anyhow::Result<()> {
     let mut ranks: HashMap<RankKey, Rank> = HashMap::new();
     let outcome = supervise(&mut reader, &mut writer, &args, &mut ranks);
 
-    // A closed head connection terminates this host's ranks, whether it closed
-    // because the instance stopped or because the head was lost.
+    // However supervision ends (the head closing the connection because the
+    // instance stopped or the head was lost, a `Terminate`, or an error), this
+    // host's ranks are terminated before the launcher exits.
     terminate(&mut ranks);
     outcome
 }
 
-/// Follows the head's instructions until it closes the connection.
+/// Follows the head's instructions until it closes the connection or sends
+/// `Terminate`, reporting rank exits as they happen.
+///
+/// Fails when the read timeout cannot be set, on a read error other than a
+/// timeout or interruption, an undecodable instruction, a failed reservation
+/// or rank start, or a failed write to the head. The caller terminates the
+/// remaining ranks in every case.
 fn supervise(
     reader: &mut BufReader<TcpStream>,
     writer: &mut TcpStream,
     args: &Args,
     ranks: &mut HashMap<RankKey, Rank>,
 ) -> anyhow::Result<()> {
-    // Keep partial JSON across read timeouts. Exit reporting must not depend on
-    // another instruction arriving, including while that instruction is partial.
+    // The read timeout bounds how long an exit waits to be reported: exit
+    // reporting must not depend on another instruction arriving, including
+    // while that instruction is partial. `read_until` keeps the bytes it read
+    // before a timeout in `line`, so a partial instruction survives it.
     reader
         .get_ref()
         .set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
@@ -175,9 +193,10 @@ fn supervise(
         line.clear();
         match instruction {
             Instruction::Reserve { worker_id } => {
-                // The socket stays bound from here until the first rank that
-                // serves it exits, so no other process on this host, and no
-                // other group's reservation, can take the port meanwhile.
+                // This launcher holds the bound socket until it spawns the
+                // group's first rank, which inherits it, so no other process
+                // on this host, and no other group's reservation, can take the
+                // port meanwhile.
                 let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
                     .context("reserving a collective store address")?;
                 let port = listener.local_addr()?.port();
@@ -201,6 +220,9 @@ fn supervise(
                 tracing::info!(worker = %key.0, rank = key.1, "started a rank");
             }
             Instruction::Stop { worker_id } => {
+                // The group's ranks leave supervision before they are killed,
+                // so their exits are not reported. An unspawned reservation of
+                // the group is closed.
                 let stopped: Vec<RankKey> = ranks
                     .keys()
                     .filter(|(worker, _)| *worker == worker_id)
@@ -226,9 +248,9 @@ fn supervise(
 /// Starts one rank from the descriptor the head derived for it.
 ///
 /// `store_listener` is the group's reserved collective store socket when this
-/// rank serves the store. The rank inherits it, the descriptor names the
-/// number it inherits it at, which only this process knows, and this process
-/// keeps no copy once the rank is started.
+/// rank serves the store. The rank inherits it, and the launch descriptor
+/// records the file descriptor number it inherits it at, which only this
+/// process knows. This process keeps no copy once the rank is started.
 fn start_rank(
     args: &Args,
     mut spawn: Spawn,
@@ -279,7 +301,9 @@ fn start_rank(
     })
 }
 
-/// Reports every rank that has exited since the last report.
+/// Reports every rank that has exited since the last report and stops
+/// supervising it. A rank whose exit status cannot be read is reported as
+/// exited.
 fn report_exits(writer: &mut TcpStream, ranks: &mut HashMap<RankKey, Rank>) -> anyhow::Result<()> {
     let mut exited = Vec::new();
     for (key, owned) in ranks.iter_mut() {
@@ -305,7 +329,7 @@ fn report_exits(writer: &mut TcpStream, ranks: &mut HashMap<RankKey, Rank>) -> a
     Ok(())
 }
 
-/// Stops every rank in `ranks`.
+/// Kills every rank in `ranks`, then reaps each one, leaving `ranks` empty.
 fn terminate(ranks: &mut HashMap<RankKey, Rank>) {
     for ((worker_id, rank), owned) in ranks.iter_mut() {
         if let Err(error) = owned.child.kill() {

@@ -1,4 +1,9 @@
 //! Text tokenization, decoding, and stream errors.
+//!
+//! `decoded_text_event_stream` reports engine-protocol violations as
+//! [`Error::MalformedOutput`] and an engine admission rejection as
+//! [`Error::Rejected`]; `serving::assembly` turns the latter into a terminal
+//! rejection rather than an output-processing failure.
 
 use crate::engine_client::Error as GatewayError;
 use thiserror::Error;
@@ -9,8 +14,11 @@ pub enum Error {
     /// Admission rejected a validly framed request before model execution.
     #[error("request `{request_id}` rejected: {message}")]
     Rejected {
+        /// Identifier of the rejected request.
         request_id: String,
+        /// Engine classification of the rejection.
         kind: uniserve_core::RejectionKind,
+        /// Engine-supplied rejection detail.
         message: String,
     },
     /// The tokenizer cannot encode or decode model text.
@@ -44,7 +52,8 @@ pub enum Error {
     /// The lowered request violates the canonical engine request contract.
     #[error("invalid canonical generation request: {0}")]
     InvalidGenerationRequest(String),
-    /// The tokenized prompt fills or exceeds the model context window.
+    /// The tokenized prompt fills or exceeds the model context window, leaving
+    /// no room for a generated token.
     #[error(
         "this model's maximum context length is {max_model_len} tokens, \
          but the prompt contains {prompt_len} input tokens"
@@ -81,7 +90,7 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl From<crate::profile::tokenizer::TokenizerError> for Error {
-    /// Converts the source value into this type.
+    /// Keeps the tokenizer error's message as [`Error::Tokenizer`].
     fn from(error: crate::profile::tokenizer::TokenizerError) -> Self {
         Self::Tokenizer(error.0)
     }

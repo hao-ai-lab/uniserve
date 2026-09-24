@@ -1,4 +1,11 @@
 //! Logical submissions and their worker-local protocol projection.
+//!
+//! The scheduler builds an [`ExecutionBatch`] of calls, each paired with the
+//! [`RequestPlacement`] it chose, plus lifecycle commands, and hands it to an
+//! `Executor`. `WorkerExecutor` splits it into one `ExecutionBatch` per target
+//! worker and lowers each with `ExecutionBatch::into_protocol`, which gathers
+//! the per-call placement fields into the flat, call-indexed arrays of the
+//! wire `Batch`.
 
 use super::WorkerId;
 use uniserve_worker_ipc::{
@@ -15,12 +22,15 @@ pub struct RequestPlacement {
     /// Worker routing stays outside the computation sent across IPC.
     pub worker: WorkerId,
     /// Worker-local request row when a replicated route owns its own address
-    /// space. Unset placements retain the admission's canonical row.
+    /// space. Unset placements retain the admission's canonical row;
+    /// `WorkerExecutor` applies the override to the `Start` it sends the worker.
     pub request_pool_idx: Option<u32>,
     /// KV tables and newly acquired pages used by this computation.
     pub block_tables: Vec<BlockTable>,
     pub new_cache_pages: Vec<CachePageAllocation>,
-    /// Rows use a local call index until gathered into the physical batch.
+    /// Rows use a local call index until gathered into the physical batch:
+    /// `ExecutionBatch::validate` requires every row's index to be zero, and
+    /// `into_protocol` offsets it by the call's position.
     pub forward: ForwardBatch,
     pub latent: Option<LatentParams>,
     pub decode: Option<DecodeRange>,
@@ -30,6 +40,10 @@ pub struct RequestPlacement {
 }
 
 /// One logical executor submission. Its rank projections are derived only inside an executor.
+///
+/// `WorkerExecutor` also uses this type for the part of a logical batch routed
+/// to one worker; that part keeps the logical `id`, so completions from every
+/// worker correlate to the same batch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionBatch {
     /// Logical batch identity used to correlate partial completions.
@@ -41,6 +55,9 @@ pub struct ExecutionBatch {
     /// Published transfer descriptors supplied by an external storage owner.
     pub input_transfers: Vec<TensorPublication>,
     /// External cache publications consumed by explicit KV installation.
+    ///
+    /// `ExecutionBatch::new` leaves this empty; `WorkerExecutor` fills it on
+    /// the worker-local batches it builds.
     pub kv_inputs: Vec<uniserve_worker_ipc::KvTransfer>,
 }
 
@@ -69,9 +86,16 @@ impl ExecutionBatch {
         })
     }
 
-    /// Removes unstarted work for terminated epochs while preserving independent calls.
-    /// Their resource descriptions stay attached to the removed calls. Close commands
-    /// retain their physical retirement and reader obligations.
+    /// Removes unstarted work for terminated request epochs while preserving
+    /// independent calls.
+    ///
+    /// Drops the calls and `Start` commands of every request key in
+    /// `requests`, then the input transfers and KV inputs no remaining call
+    /// reads. The requests' `Finish` and `Free` commands stay, since they still
+    /// retire physical state and reader obligations on the workers. Returns the
+    /// removed calls with the placements describing their resources. The batch
+    /// may be left with neither calls nor commands; callers decide whether to
+    /// discard it.
     pub(crate) fn retire_requests(
         &mut self,
         requests: &std::collections::HashSet<RequestKey>,
@@ -102,6 +126,14 @@ impl ExecutionBatch {
     }
 
     /// Validates call identities, execution ownership, and command payloads.
+    ///
+    /// Requires at least one call or command; checks each call and its
+    /// placement, that call identities are unique and belong to this batch,
+    /// and that every `Start` is unique and names a request with a call in
+    /// this batch; and validates every command, input transfer, and KV input.
+    /// Wire-level constraints between calls (one kind and component per batch,
+    /// allocation tables matching their calls, non-overlapping spans) are left
+    /// to `Batch::validate`, which `into_protocol` runs.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.requests.is_empty() || !self.commands.is_empty(),
@@ -117,12 +149,17 @@ impl ExecutionBatch {
                 "computation identity belongs to another logical batch"
             );
             requests.insert(call.request_key);
+            // `WorkerId`'s public field admits any string; only its
+            // constructor checks the identifier syntax.
             WorkerId::new(placement.worker.0.clone())?;
             anyhow::ensure!(!call.component.is_empty(), "call requires a component");
             anyhow::ensure!(
                 identities.insert(call.call_id),
                 "logical batch repeats a call identity"
             );
+
+            // A placement describes one call, so its forward rows may only
+            // name local call index zero.
             placement.forward.validate(1)?;
             for table in &placement.block_tables {
                 table.validate()?;
@@ -184,6 +221,14 @@ impl ExecutionBatch {
 
 impl ExecutionBatch {
     /// Lowers a logical batch into a validated wire batch.
+    ///
+    /// Concatenates the placements' tables, pages, latent parameters, decode
+    /// ranges, and buffer allocations in call order, and rebases each
+    /// placement's forward rows onto the call's position in `calls`.
+    /// `collective_seq` is the worker's next collective sequence, which
+    /// `WorkerExecutor` commits only after the worker accepts the batch. Fails
+    /// when adding the call's position to a forward row's call index overflows
+    /// `u32` or `Batch::validate` rejects the result.
     pub(crate) fn into_protocol(self, collective_seq: u64) -> anyhow::Result<Batch> {
         let Self {
             id: batch_id,
@@ -199,6 +244,7 @@ impl ExecutionBatch {
         let mut decode_ranges = Vec::new();
         let mut buffer_allocations = Vec::new();
         let mut calls = Vec::with_capacity(requests.len());
+
         for (call_index, (call, placement)) in requests.into_iter().enumerate() {
             block_tables.extend(placement.block_tables);
             new_cache_pages.extend(placement.new_cache_pages);
@@ -208,6 +254,7 @@ impl ExecutionBatch {
             buffer_allocations.extend(placement.buffers);
             calls.push(call);
         }
+
         let batch = Batch {
             batch_id,
             collective_seq,

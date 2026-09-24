@@ -1,9 +1,22 @@
 //! Request residency and capability-based worker placement.
+//!
+//! The scheduler asks `Placement` which loaded worker replica executes a call.
+//! Candidates are the workers whose reported `supported_calls` and component
+//! bindings cover the call; once a request is placed on a replica for a
+//! component, its later calls for that component stay there.
 
 use super::*;
 
 #[derive(Default)]
 pub(super) struct Placement {
+    /// Replica that holds each request's state for one bound component name.
+    ///
+    /// Admission records the prefill worker of a token request and every route
+    /// of a media request; `select_worker` records an entry each time it places
+    /// a call, keyed by the name the worker binds (which may be
+    /// `DEFAULT_COMPONENT` rather than the requested name).
+    /// `Scheduler::refill_executor` prunes entries of requests that are no
+    /// longer running or retiring.
     pub(super) affinity: HashMap<(RequestKey, String), crate::WorkerId>,
 }
 
@@ -31,6 +44,13 @@ impl Placement {
         self.component_candidates(executor, kind, component)
     }
 
+    /// Enumerates workers that support `kind` and can serve `component`, with
+    /// the component name each one binds.
+    ///
+    /// A worker binding `component` by name serves it under that name. A
+    /// worker with no component bindings, or with a `DEFAULT_COMPONENT`
+    /// binding, serves any requested component under `DEFAULT_COMPONENT`.
+    /// Other workers are excluded.
     pub(super) fn component_candidates<'a>(
         &'a self,
         executor: &'a dyn Executor,
@@ -66,6 +86,13 @@ impl Placement {
     }
 
     /// Selects one replica while preserving request residency.
+    ///
+    /// Returns `None` when no worker can serve the component, when the replica
+    /// that already holds this request's component state is no longer a
+    /// candidate or has no submission capacity, when a replica already holding
+    /// another of the request's components has no capacity, or when no other
+    /// candidate has capacity. Records nothing; `select_worker` records the
+    /// choice.
     pub(super) fn component_target<'a>(
         &'a self,
         executor: &'a dyn Executor,
@@ -87,8 +114,8 @@ impl Placement {
         }
 
         // Prefer a worker already selected for another component of this
-        // request. This keeps a replicated H3 denoiser and its media decoders
-        // in one process and avoids publishing their large latent products.
+        // request. This keeps a replicated denoiser and its media decoders in
+        // one process and avoids publishing their large latent products.
         let resident = self
             .affinity
             .iter()
@@ -102,9 +129,11 @@ impl Placement {
             return executor.has_capacity(id).then_some((id, component));
         }
 
-        // A new request goes to the least-resident ready replica. Queue
-        // capacity remains a hard admission condition; residency breaks ties
-        // so a burst fans out instead of filling the first configured worker.
+        // Among replicas with queue capacity, a new request goes to the one
+        // holding the fewest distinct resident requests, so a burst fans out
+        // instead of filling the first configured worker. Queue capacity is a
+        // hard condition; ties go to the earliest worker in
+        // `ExecutorInfo::workers`.
         candidates
             .into_iter()
             .filter(|(id, _, _)| executor.has_capacity(id))
@@ -118,6 +147,8 @@ impl Placement {
             .map(|(id, component, _)| (id, component))
     }
 
+    /// Selects a replica for `kind` using the aggregate media routing in
+    /// `info`, as `worker_candidates` does, while preserving residency.
     pub(super) fn worker_target<'a>(
         &'a self,
         executor: &'a dyn Executor,
@@ -137,8 +168,8 @@ impl Placement {
 
     /// Binds planned work to its configured component and records request residency.
     ///
-    /// Returns `None`, recording nothing, when no loaded worker can execute the
-    /// call's component.
+    /// Returns `None`, recording nothing, when `component_target` finds no
+    /// eligible replica with submission capacity.
     pub(super) fn select_worker(
         &mut self,
         executor: &dyn Executor,
@@ -157,6 +188,10 @@ impl Placement {
     }
 
     /// Includes lifecycle commands in destination ordering, even when a batch has no compute.
+    ///
+    /// Returns each call's placed worker plus every worker holding residency
+    /// for a command's request. `Scheduler::dispatch_submissions` uses this
+    /// set to hold back later batches that share a blocked destination.
     pub(super) fn batch_workers(&self, batch: &ExecutionBatch) -> HashSet<crate::WorkerId> {
         let mut targets = batch
             .requests

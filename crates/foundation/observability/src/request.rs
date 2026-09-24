@@ -1,4 +1,8 @@
 //! Request latency, token, and completion metrics.
+//!
+//! Family names follow vLLM's `vllm:`-prefixed request metrics under a
+//! `uniserve:` prefix. Time histograms observe seconds; token histograms
+//! observe per-request token counts.
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
@@ -66,8 +70,9 @@ fn request_latency_histogram() -> Histogram {
 
 /// Builds the histogram used for per-request token counts.
 fn request_token_count_histogram() -> Histogram {
-    // Histogram upper bound is intentionally static; request-level context
-    // limits are enforced before metrics are recorded.
+    // The bounds are fixed at registration rather than derived from the served
+    // model's context length; counts above the last bound land only in the
+    // `+Inf` bucket.
     Histogram::new(build_1_2_5_buckets(131_072))
 }
 
@@ -103,7 +108,10 @@ pub(crate) type FinishedReasonCounterFamily = Family<FinishedReasonLabels, U64Co
 /// Prompt-token counter family keyed by token source.
 pub(crate) type PromptTokenSourceCounterFamily = Family<PromptTokenSourceLabels, U64Counter>;
 
-/// Request-lifecycle Prometheus families exported from the `llm` layer.
+/// Request-lifecycle Prometheus families.
+///
+/// The server's `StatsLogger` reads `prompt_tokens_by_source` (the
+/// `local_compute` series) and `generation_tokens` to log throughput.
 #[derive(MetricFamily)]
 pub struct RequestMetrics {
     // Request-derived counters.

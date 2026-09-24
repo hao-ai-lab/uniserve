@@ -1,8 +1,19 @@
 //! GPU-free executor for scheduler and frontend behavior.
 //!
-//! The simulator consumes the same typed admissions and calls as worker
-//! executors. It enforces request identity, lifecycle, and dependency invariants
-//! and reports accepted tokens, progress, and synthetic media.
+//! [`SimExecutor`] implements the `Executor` trait the scheduler drives, over
+//! a background thread that runs a [`SimEngine`]. It consumes the same typed
+//! admissions, lifecycle commands, and calls as `WorkerExecutor`, bounds the
+//! batches in flight by a queue depth, and tracks admitted requests and live
+//! products for `command_has_capacity`.
+//!
+//! [`SimEngine`] keeps the per-request progress a worker rank tracks:
+//! positions, KV extent, denoising step, and predicate values. It enforces
+//! request identity, lifecycle, call coordinates, and predicate dependencies,
+//! and reports deterministic tokens, KV extents, denoising progress, and
+//! synthetic media published through POSIX shared memory. The module is built
+//! only with the `testing` feature; engine and server tests and the engine's
+//! `control_plane` example drive the scheduler through it in place of GPU
+//! workers.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -28,11 +39,15 @@ use uniserve_worker_ipc::{
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
+/// Default EOS id the simulator samples after `text_len` tokens.
+/// `EngineConfig::sim` configures the same id so the scheduler finishes
+/// simulated requests.
 const FAKE_EOS_TOKEN: u32 = 151_645;
 const SYNTH_VOCAB_SIZE: usize = FAKE_EOS_TOKEN as usize + 1;
 const DEFAULT_DENOISE_STEPS: u16 = 50;
 const DEFAULT_IMAGE_HW: (u32, u32) = (512, 512);
 
+/// Work sent to the simulator thread.
 enum Job {
     Batch(ExecutionBatch),
     Shutdown,
@@ -41,9 +56,14 @@ enum Job {
 /// Runs the deterministic model simulator on a bounded asynchronous executor seam.
 pub struct SimExecutor {
     executor_info: ExecutorInfo,
+    /// Maximum batches submitted whose results `poll` has not yet returned.
     depth: usize,
     to_worker: Sender<Job>,
+    /// Each batch's result paired with the lifecycle commands it was submitted
+    /// with, which `poll` needs to interpret the command receipts.
     from_worker: Receiver<anyhow::Result<(BatchResult, Vec<uniserve_worker_ipc::BatchCommand>)>>,
+    /// Capacity-one wake channel: a `command_waker` post makes a blocked
+    /// `poll` return early, and posts beyond the first coalesce.
     progress_tx: Sender<()>,
     progress_rx: Receiver<()>,
     in_flight: usize,
@@ -51,8 +71,13 @@ pub struct SimExecutor {
     results_on_wait: bool,
     /// Where the boundary events go while a test observes them.
     observer: Option<Sender<BatchEvent>>,
+    /// The simulator thread; `None` once the executor is closed.
     handle: Option<JoinHandle<()>>,
+    /// Requests admitted by a submitted batch whose `Finish` has not been
+    /// acknowledged through `poll`.
     admissions: HashSet<uniserve_worker_ipc::RequestKey>,
+    /// Products declared by submitted calls that no acknowledged `Free` or
+    /// `Finish` has released yet.
     products: HashSet<TensorRef>,
 }
 
@@ -91,6 +116,10 @@ impl SimExecutor {
         let handle = std::thread::Builder::new()
             .name("uniserve-sim-executor".into())
             .spawn(move || {
+                // Batches execute one at a time in submission order. Each
+                // returns whole, as one terminal result carrying an `Applied`
+                // receipt for every command other than `Start`; an execution
+                // or output validation error is forwarded to `poll` instead.
                 while let Ok(job) = jobs.recv() {
                     match job {
                         Job::Batch(batch) => {
@@ -152,11 +181,18 @@ impl SimExecutor {
 }
 
 impl SimExecutor {
-    /// Returns the result of a submitted batch.
+    /// Waits up to `timeout` for the next batch result and the commands its
+    /// batch was submitted with.
+    ///
+    /// Returns `None` on timeout, on a command wake, after close, and for an
+    /// instantaneous poll when results are delivered only on wait. Returns
+    /// `Err` for a batch the simulator rejected or a disconnected channel.
     fn poll_batch(
         &mut self,
         timeout: Duration,
     ) -> anyhow::Result<Option<(BatchResult, Vec<uniserve_worker_ipc::BatchCommand>)>> {
+        // A closed simulator produces no results, but the poll still blocks
+        // until the timeout or a command wake, as an open one does.
         if self.handle.is_none() {
             let _ = self.progress_rx.recv_timeout(timeout);
             return Ok(None);
@@ -199,6 +235,12 @@ impl Executor for SimExecutor {
         self.is_ready(worker) && self.in_flight < self.depth
     }
 
+    /// Whether a lifecycle command can be submitted now.
+    ///
+    /// A command with no owner here (a `Free` of a buffer that holds no
+    /// tracked product, or any other command whose request is not admitted)
+    /// targets no physical state and always has capacity. A command with an
+    /// owner needs an open simulator with a free in-flight slot.
     fn command_has_capacity(&self, command: &uniserve_worker_ipc::BatchCommand) -> bool {
         use uniserve_worker_ipc::BatchCommand;
         let has_owner = match command {
@@ -210,6 +252,7 @@ impl Executor for SimExecutor {
         };
         !has_owner || (self.handle.is_some() && self.in_flight < self.depth)
     }
+
     fn is_ready(&self, worker: &WorkerId) -> bool {
         self.handle.is_some()
             && self
@@ -224,7 +267,13 @@ impl Executor for SimExecutor {
         &self.executor_info
     }
 
-    /// Lowers and submits a logical batch while preserving executor backpressure semantics.
+    /// Validates a logical batch and queues it for the simulator thread.
+    ///
+    /// Returns `WouldBlock` with the batch while `depth` batches are in
+    /// flight. Returns `Failed` when the executor is closed, a placement names
+    /// a worker other than the simulator, the batch fails validation, or the
+    /// simulator thread is gone. The batch's admissions and products are
+    /// recorded before it is queued and are not rolled back if queuing fails.
     fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
         if self.handle.is_none() {
             return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
@@ -242,6 +291,7 @@ impl Executor for SimExecutor {
             return Err(ExecutorSubmitError::WouldBlock(batch));
         }
         batch.validate().map_err(ExecutorSubmitError::Failed)?;
+
         self.admissions
             .extend(batch.admissions().map(|request| request.request_key));
         self.products.extend(
@@ -260,15 +310,19 @@ impl Executor for SimExecutor {
         Ok(())
     }
 
-    /// Polls for the next completed worker call.
+    /// Returns the next batch result and applies its acknowledged `Free` and
+    /// `Finish` commands to the ownership sets `command_has_capacity` reads.
     fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
         let Some((result, commands)) = self.poll_batch(timeout)? else {
             return Ok(None);
         };
         for receipt in &result.command_results {
+            // A failed command keeps its physical ownership.
             if receipt.outcome == crate::executor::CommandOutcome::Failed {
                 continue;
             }
+            // Receipts number lifecycle commands with `Start` admissions
+            // skipped, as `logical_result` assigns them.
             let command = commands
                 .iter()
                 .filter(|command| {
@@ -286,6 +340,8 @@ impl Executor for SimExecutor {
                     retained_buffers,
                     ..
                 } => {
+                    // A finished request keeps only the products in its
+                    // retained buffers.
                     self.admissions.remove(request_key);
                     self.products.retain(|product| {
                         product.request_key != *request_key
@@ -303,14 +359,14 @@ impl Executor for SimExecutor {
         Ok(Some(result))
     }
 
-    /// Closes the component and releases its resources.
+    /// Stops and joins the simulator thread; later submissions fail.
     fn close(&mut self) -> anyhow::Result<()> {
         self.shutdown()
     }
 }
 
 impl Drop for SimExecutor {
-    /// Releases resources owned by this value.
+    /// Stops and joins the simulator thread.
     fn drop(&mut self) {
         let _ = self.shutdown();
     }
@@ -320,15 +376,26 @@ impl Drop for SimExecutor {
 #[derive(Clone)]
 struct SimRequestState {
     admission: NewRequest,
+    /// Logical position the next chained call starts at.
     logical_position: u32,
     /// Whether the model, rather than this simulator, owns the request's
     /// logical positions. An image contributes positions through its rope
     /// advance, which the simulator does not implement, so once a request has
     /// ingested one it takes the position each call states.
     positions_from_model: bool,
+    /// Tokens resident in KV. The simulator reports it as both the visible
+    /// and the computed extent.
     kv_visible_len: u32,
+    /// Index of the next synthetic text token, as `synth_logits` takes it.
     emitted: usize,
+    /// Denoising steps completed. Image decoding resets it to zero, as it
+    /// does on a worker rank.
     flow_step: u16,
+    /// Boolean values of the request's resolved products that later calls
+    /// may name as predicates: a token output's continuation value, a
+    /// transition output's value (whether a sampled token is a transition
+    /// token, otherwise true), a completion output's `true`, and `false` for
+    /// every output of a call whose predicate was false.
     predicate_values: HashMap<TensorRef, bool>,
     /// Committed penalty counts in ascending token order.
     ///
@@ -399,16 +466,24 @@ impl SimRequestState {
 /// Deterministic local model engine that implements the worker lifecycle protocol.
 pub struct SimEngine {
     info: WorkerInfo,
+    /// Synthetic tokens sampled before `fake_eos` dominates.
     text_len: usize,
     fake_eos: u32,
+    /// Logit row length. It covers the synthetic text ids, `fake_eos`, and
+    /// every configured control token, and never shrinks.
     vocab: usize,
     results_on_wait: bool,
+    /// Admitted requests by id, removed when a `Finish` for the same request
+    /// key executes.
     requests: HashMap<RequestId, SimRequestState>,
 }
 
 impl SimEngine {
     /// Constructs a simulator with deterministic text and image capabilities.
     pub fn new() -> Self {
+        // Unset fields, including the KV cache and a queue depth of one, come
+        // from `WorkerInfo::default`. One latent page is the reserved sentinel
+        // page that `latent_capacity_units` excludes.
         let info = WorkerInfo {
             supported_calls: CallKind::ALL.to_vec(),
             latent_page_units: 64,
@@ -432,6 +507,11 @@ impl SimEngine {
     }
 
     /// Produces deterministic logits for one simulated autoregressive position.
+    ///
+    /// Before `text_len`, the peak is a natural token in `1_000..6_000`
+    /// derived from the request id and `index`; up to two lower-scoring
+    /// alternates in the same range and a weak EOS follow it. From `text_len`
+    /// on, EOS dominates. `vocab` must cover that range and `fake_eos`.
     fn synth_logits(
         vocab: usize,
         text_len: usize,
@@ -459,6 +539,13 @@ impl SimEngine {
     }
 
     /// Applies request sampling controls to deterministic simulated logits.
+    ///
+    /// Returns `None` when the sampling pipeline finds no valid distribution
+    /// (see `try_apply_sampling_counts`). Errors when a stochastic call has no
+    /// RNG coordinates, uses a draw layout other than `TargetSampling`, or
+    /// states a seed other than the admitted one (zero when unset). A request
+    /// admitted without an autoregressive branch takes the natural synthetic
+    /// token directly.
     fn sample(
         vocab: usize,
         text_len: usize,
@@ -507,9 +594,9 @@ impl SimEngine {
                 let suppress = state
                     .map(|value| value.suppressed_token_ids.as_slice())
                     .filter(|tokens| !tokens.is_empty());
-                // Processor step 2 forced-token constraint: a decode call
-                // samples a single span point, so its forced token is the first
-                // entry of the schedule and overrides any allowed-token mask.
+                // Forced-token constraint: every simulated sampling call samples
+                // a single span point, so its forced token is the first entry
+                // of the schedule and overrides any allowed-token mask.
                 let forced = sampling
                     .forced_token_ids
                     .first()
@@ -538,8 +625,16 @@ impl SimEngine {
         }
     }
 
-    /// Executes one call against its request, producing the terminal
-    /// [`RequestOutput`] and any resolved output-product values.
+    /// Executes one call against its request and returns its [`RequestOutput`].
+    ///
+    /// Advances the request's positions, KV extent, synthetic text index,
+    /// penalty counts, and denoising step as the call kind requires, and
+    /// records the boolean values of the call's products in
+    /// `predicate_values`. Errors when a chained call states coordinates other
+    /// than the request's own, when sampling rejects the call's RNG, or when
+    /// synthetic media encoding or publication fails. A sampling pipeline with
+    /// no valid distribution yields an `Error` record with `InvalidCall`
+    /// instead.
     fn execute_call(
         vocab: usize,
         text_len: usize,
@@ -595,6 +690,8 @@ impl SimEngine {
             work @ (CallKind::Forward(ForwardMode::Prefill)
             | CallKind::Forward(ForwardMode::Decode)
             | CallKind::Forward(ForwardMode::Verify)) => {
+                // A call that ingests vision or latent features extends KV by
+                // its token bound but leaves logical positions to the model.
                 let visual_state =
                     call.vision_input.is_some() || call.latent_feature_input.is_some();
                 let samples_token = call.token_output.is_some();
@@ -639,6 +736,9 @@ impl SimEngine {
                                 && !record.finish_flags.eos;
                         record.finish_flags.length = state.force_finish;
                     }
+                    // The token product's continuation predicate is false when
+                    // the token is an admitted or per-call finish token or the
+                    // call forces a finish.
                     let admitted_stops = request
                         .admission
                         .ar
@@ -666,6 +766,8 @@ impl SimEngine {
                             .insert(completion.clone(), transition);
                     }
                     record.position = 1;
+                    // Positions and KV advance by the query length: the whole
+                    // bound for a prefill, one token for decode and verify.
                     if !visual_state {
                         let query_tokens = match work {
                             CallKind::Forward(ForwardMode::Prefill) => call.bounds.max_tokens,
@@ -721,6 +823,8 @@ impl SimEngine {
             }
             CallKind::Media(MediaCall::LatentPreparation) => {}
             CallKind::Media(MediaCall::Denoising) => {
+                // A denoising call's token bound is the number of steps it
+                // runs.
                 let steps = call.bounds.max_tokens.max(1) as u16;
                 request.flow_step = request.flow_step.saturating_add(steps);
                 let total = request
@@ -753,6 +857,8 @@ impl SimEngine {
                 }
             }
             CallKind::Media(MediaCall::ImageDecoding) => {
+                // A worker rank's image decoding releases the request's
+                // latent and resets its denoising step to zero.
                 request.flow_step = 0;
                 if let Some(image) = request.image().cloned() {
                     let (height, width) = if image.height > 0 && image.width > 0 {
@@ -767,6 +873,8 @@ impl SimEngine {
             }
         }
 
+        // Completion and transition outputs the call did not resolve above
+        // resolve true.
         for completion in call
             .completion_output
             .iter()
@@ -781,7 +889,10 @@ impl SimEngine {
         Ok(record)
     }
 
-    /// Builds a completion for a call resolved entirely by its execution predicate.
+    /// Builds the `Predicated` completion of a call whose predicate is false.
+    ///
+    /// The completion carries no product generations and reports the
+    /// request's unchanged progress.
     fn predicated_completion(call: &Call, request: &SimRequestState) -> RequestOutput {
         RequestOutput {
             sampled_logprob: None,
@@ -945,7 +1056,7 @@ fn synthetic_png_b64(width: u32, height: u32) -> anyhow::Result<String> {
 }
 
 impl Default for SimEngine {
-    /// Returns the default value.
+    /// Equivalent to [`SimEngine::new`].
     fn default() -> Self {
         Self::new()
     }
@@ -957,9 +1068,23 @@ impl SimEngine {
         &self.info
     }
 
-    /// Executes selected call kinds in order against deterministic model state.
+    /// Executes a batch's calls in order against deterministic model state.
+    ///
+    /// Admissions register first, then `Free` commands release predicate
+    /// values, then calls execute, and `Finish` commands drop their requests
+    /// last, so calls in the same batch still execute against a finishing
+    /// request.
+    ///
+    /// Errors on a batch that fails validation, a readmission with a
+    /// different descriptor, a call for a request that is not admitted or
+    /// whose key differs from the admission, a predicate naming an unresolved
+    /// product, or any `execute_call` error. An error abandons the rest of
+    /// the batch and its `Finish` commands; admissions, `Free` commands,
+    /// earlier calls, and whatever the failing call applied before the error
+    /// keep their effects on request state.
     fn execute(&mut self, batch: ExecutionBatch) -> anyhow::Result<BatchOutput> {
         batch.validate()?;
+
         let batch_id = batch.id;
         let closed = batch
             .commands
@@ -969,6 +1094,7 @@ impl SimEngine {
                 _ => None,
             })
             .collect::<Vec<_>>();
+
         let admissions = batch.admissions().cloned().collect::<Vec<_>>();
         for admission in admissions {
             match self.requests.get(&admission.request_key.request_id) {
@@ -985,6 +1111,7 @@ impl SimEngine {
                 }
             }
         }
+
         for command in &batch.commands {
             if let uniserve_worker_ipc::BatchCommand::Free { buffer } = command
                 && let Some(request) = self.requests.get_mut(&buffer.owner.request_id)
@@ -994,6 +1121,7 @@ impl SimEngine {
                     .retain(|product, _| product.buffer_id() != *buffer);
             }
         }
+
         let vocab = self.vocab;
         let text_len = self.text_len;
         let fake_eos = self.fake_eos;
@@ -1027,9 +1155,11 @@ impl SimEngine {
                         })
                 })
                 .transpose()?;
-            // Binding the input captures its value. The producer relay then has
-            // no future acquisition owner, just as in the physical Worker,
-            // which releases the products of the call this one follows.
+
+            // As on a worker rank, a chained call releases the products of
+            // the call it follows, and a predicate is released once its
+            // consumer has read it. The predicate value is read above, before
+            // these releases, because it may be a product of the predecessor.
             if request.chained(&call) {
                 let predecessor = request.state_call_id;
                 request
@@ -1056,6 +1186,7 @@ impl SimEngine {
             }
             completions.push(completion);
         }
+
         let report = BatchOutput {
             batch_id,
             completions,
@@ -1064,6 +1195,8 @@ impl SimEngine {
             worker_exec_us: None,
             forward_stats: None,
         };
+        // A `Finish` for a stale request epoch leaves a readmitted request
+        // under the same id in place.
         for request_key in closed {
             if self
                 .requests
@@ -1120,6 +1253,8 @@ mod tests {
         }
     }
 
+    /// Builds a batch that admits `request_key()` and runs one two-token
+    /// prefill with a token output as call `(batch_id, request_index)`.
     fn batch(batch_id: u64, request_index: u32) -> ExecutionBatch {
         let request_key = request_key();
         let admission = admission();
@@ -1193,11 +1328,13 @@ mod tests {
             flow_step: 0,
         };
         selected.requests.push(successor);
+
         executor.submit(selected).expect("submit logical batch");
         let report = executor
             .poll(Duration::from_secs(5))
             .expect("poll")
             .expect("result");
+
         assert!(report.done);
         let outputs = report
             .results

@@ -1,7 +1,18 @@
 //! Chat request rendering, structured events, and output processing.
 //!
-//! Model profiles choose a renderer and request-scoped output processor while
-//! this module owns the common chat values and streaming contracts.
+//! This module owns the common chat values and streaming contracts. For a
+//! Qwen3 model, a chat request flows through it twice. Before submission,
+//! `InputProcessor` validates the [`ChatRequest`], builds a request-scoped
+//! [`Qwen3ChatOutputProcessor`], and renders the request into a prompt with
+//! [`HfChatRenderer`]. During generation, `assemble_chat_event_stream` feeds
+//! decoded text through that processor and assembles the resulting assistant
+//! events into public serving events. The omni models render chat requests
+//! with the same renderer, but their output bypasses this module's output
+//! processors.
+//!
+//! The template comes from the model files or [`ChatTemplateLoadOptions`], and
+//! the server's `reasoning_parsing` setting decides whether Qwen3 `<think>`
+//! sections become reasoning blocks.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -19,7 +30,7 @@ pub use template::ChatTemplateLoadOptions;
 pub use template::renderer::hf::{ChatTemplateContentFormatOption, HfChatRenderer};
 
 mod error;
-/// Structured assistant and chat lifecycle events.
+/// Structured assistant message content.
 pub mod event;
 /// Model-selected chat output processors.
 pub mod output;

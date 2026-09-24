@@ -1,4 +1,25 @@
-//! One frontend request record spanning preprocessing, engine receipt, and output.
+//! Registry of frontend requests spanning preprocessing, engine receipt, and output.
+//!
+//! `RequestRegistry` maps each external `ServeRequestId` to one record with
+//! two parts that have independent lifetimes:
+//!
+//! - The engine side (`engine_request_id`, `engine_pending`) is reserved by
+//!   `register`, claimed once by `claim_submission`, and released by
+//!   `release_engine`, which `EngineClient::submit_generation` and
+//!   `submit_media` run when submission fails after the claim, or when the
+//!   engine event stream ends or its receiver is dropped.
+//! - The statistics side (`stats`) exists only for requests registered with a
+//!   `ModelEventIdentity`, which `ServingRuntime` supplies for every request.
+//!   The serving layer updates it through `mark_submitting`, `accept`, and
+//!   `observe`, and its `LifecycleGuard` retires it through `complete` into a
+//!   bounded history of terminal snapshots.
+//!
+//! A record leaves the active map only when it holds neither statistics nor a
+//! claimed engine side, so an external identifier cannot be registered again
+//! while the engine receiver or the decoded response still holds it. Cancel
+//! and abort commands are recorded by `mark_control`; an abort overrides a
+//! pending cancellation, later lifecycle updates never clear a pending control
+//! state, and `complete` turns it into the matching terminal state.
 
 use crate::serving::{
     LifecycleTerminal, ModelEventIdentity, RequestLifecycleState, RequestOutput,
@@ -9,29 +30,41 @@ use std::sync::Mutex;
 use tokio::sync::Notify;
 
 struct RequestRecord {
+    // The engine identifier reserved by `register`; `release_engine` clears
+    // it. `engine_pending` is true from `claim_submission` until
+    // `release_engine`.
     engine_request_id: Option<uniserve_core::RequestId>,
     engine_pending: bool,
-    // Raw engine consumers (including retained video jobs) own their output
-    // accounting. Decoded responses retain these statistics until their final
-    // public event, independently of the engine receiver's lifetime.
+    // `None` for a request registered without a `ModelEventIdentity`; such a
+    // record tracks only the engine side. With an identity, the statistics
+    // stay here until `complete` moves them to the completed history,
+    // independently of the engine receiver's lifetime.
     stats: Option<RequestStatsSnapshot>,
 }
 
 #[derive(Default)]
 struct RequestRegistryState {
     active: HashMap<ServeRequestId, RequestRecord>,
+    // Terminal snapshots, bounded by `RequestRegistry::completed_retention`;
+    // `completed_order` lists their identifiers oldest first for eviction.
     completed: HashMap<ServeRequestId, RequestStatsSnapshot>,
     completed_order: VecDeque<ServeRequestId>,
 }
 
 pub(crate) struct RequestRegistry {
     state: Mutex<RequestRegistryState>,
+    // Signalled after an engine side is released, a request completes, or
+    // `mark_control` changes or removes a record. `notify_waiters` stores no
+    // permit, so every waiter creates its `Notified` future before checking
+    // the state it waits on.
     changed: Notify,
+    // Maximum number of terminal snapshots kept for `stats` lookups.
     completed_retention: usize,
 }
 
 impl Default for RequestRegistry {
-    /// Returns the default value.
+    /// Creates an empty registry that retains the most recent 1024 terminal
+    /// snapshots.
     fn default() -> Self {
         Self {
             state: Mutex::new(RequestRegistryState::default()),
@@ -50,6 +83,12 @@ impl RequestRegistry {
     }
 
     /// Reserves one external identity before preprocessing or engine submission.
+    ///
+    /// Returns `false` without changing anything when an active record already
+    /// holds `request_id`. Otherwise it discards any retained terminal snapshot
+    /// of an earlier request with the same identifier and inserts a record
+    /// whose engine side is reserved but unclaimed. With `identity`, the record
+    /// starts in `Compiling` with zero compile time until `mark_submitting`.
     pub(crate) fn register(
         &self,
         request_id: ServeRequestId,
@@ -84,6 +123,13 @@ impl RequestRegistry {
     }
 
     /// Attaches exactly one engine receiver to the reserved request incarnation.
+    ///
+    /// # Errors
+    ///
+    /// - `Error::UnknownRequestId` when no active record holds `request_id`,
+    ///   the record reserved a different engine identifier, or its engine side
+    ///   was already released.
+    /// - `Error::DuplicateRequestId` when the engine side is already claimed.
     pub(crate) fn claim_submission(
         &self,
         request_id: &str,
@@ -107,6 +153,11 @@ impl RequestRegistry {
     }
 
     /// Releases the engine receiver without retiring a still-live decoded response.
+    ///
+    /// Does nothing unless the active record still holds `engine_request_id`,
+    /// so a repeated release is harmless. Clearing the engine identifier stops
+    /// later control commands from reaching the engine and makes the
+    /// registration unclaimable. A record without statistics is removed.
     pub(crate) fn release_engine(
         &self,
         request_id: &str,
@@ -129,7 +180,10 @@ impl RequestRegistry {
         self.changed.notify_waiters();
     }
 
-    /// Marks the request as submitting.
+    /// Records the measured compile time and moves the request to `Submitting`.
+    ///
+    /// A pending cancellation or abort keeps its state. Does nothing for an
+    /// unknown request or one without statistics.
     pub(crate) fn mark_submitting(&self, request_id: &str, compile_us: u64) {
         if let Some(stats) = self
             .lock()
@@ -148,6 +202,11 @@ impl RequestRegistry {
     }
 
     /// Accepts an engine submission into lifecycle tracking.
+    ///
+    /// Returns `false` without changing anything when the request is unknown,
+    /// has no statistics, or has a pending cancellation or abort. The check and
+    /// the transition to `Accepted` happen under one registry lock, so no
+    /// control can be recorded between them.
     pub(crate) fn accept(&self, request_id: &str) -> bool {
         let mut registry = self.lock();
         let Some(stats) = registry
@@ -168,6 +227,14 @@ impl RequestRegistry {
     }
 
     /// Records control and resolves the matching engine identity under one lock.
+    ///
+    /// Returns the engine `RequestId` only while the engine side is claimed,
+    /// so the caller forwards the control to the engine exactly when a
+    /// submission exists; `None` also covers an unknown `request_id`. A record
+    /// with statistics moves to `requested`, except that `Aborting` is never
+    /// downgraded and a pending `Cancelling` is replaced only by `Aborting`.
+    /// A record without statistics records no control state; it is removed
+    /// when its engine side is unclaimed.
     pub(crate) fn mark_control(
         &self,
         request_id: &str,
@@ -177,7 +244,9 @@ impl RequestRegistry {
         let record = registry.active.get_mut(request_id)?;
         let engine_request_id = record.engine_request_id.filter(|_| record.engine_pending);
         let Some(stats) = record.stats.as_mut() else {
-            // A raw request cancelled before submission owns no output guard.
+            // A request without statistics that is controlled before submission
+            // owns no output guard, so the record is removed here; a later
+            // `claim_submission` then fails with `UnknownRequestId`.
             if !record.engine_pending {
                 registry.active.remove(request_id);
                 drop(registry);
@@ -202,7 +271,10 @@ impl RequestRegistry {
         engine_request_id
     }
 
-    /// Returns the accepted control command terminal event.
+    /// Returns the terminal outcome of a pending cancellation or abort.
+    ///
+    /// Returns `None` when no control is pending, including for an unknown
+    /// request, a request without statistics, or one already completed.
     pub(crate) fn control_terminal(&self, request_id: &str) -> Option<LifecycleTerminal> {
         match self
             .lock()
@@ -217,7 +289,11 @@ impl RequestRegistry {
         }
     }
 
-    /// Waits the for control.
+    /// Waits until a cancellation or abort is pending and returns its outcome.
+    ///
+    /// Stays pending while `control_terminal` reports nothing, which is
+    /// permanent for an unknown request, one without statistics, or one already
+    /// completed, so callers race it against the work it interrupts.
     pub(crate) async fn wait_for_control(&self, request_id: &str) -> LifecycleTerminal {
         loop {
             let changed = self.changed.notified();
@@ -228,7 +304,9 @@ impl RequestRegistry {
         }
     }
 
-    /// Returns the terminal event emitted when the guard is dropped.
+    /// Returns the terminal outcome recorded when a lifecycle guard is dropped
+    /// before a terminal event: `Aborted` when an abort is pending and
+    /// `Cancelled` otherwise.
     pub(crate) fn drop_terminal(&self, request_id: &str) -> LifecycleTerminal {
         match self
             .lock()
@@ -243,6 +321,11 @@ impl RequestRegistry {
     }
 
     /// Incorporates one serving event into request statistics and surfaces pending control.
+    ///
+    /// `elapsed_us` is measured from the request's lifecycle start. Returns the
+    /// pending control outcome, without applying `event`, when a cancellation
+    /// or abort is pending; returns `None` after applying the event otherwise,
+    /// and also for an unknown request or one without statistics.
     pub(crate) fn observe(
         &self,
         request_id: &str,
@@ -272,6 +355,8 @@ impl RequestRegistry {
                 stats.prompt_tokens = (*prompt_token_count).min(u32::MAX as usize) as u32;
                 stats.timings.compile_us = *compile_duration_us;
             }
+            // `queued_at` and `scheduled_at` are engine wall-clock UNIX
+            // seconds; a negative difference is clamped to zero.
             RequestOutput::Scheduled {
                 queued_at,
                 scheduled_at,
@@ -297,7 +382,9 @@ impl RequestRegistry {
                     .first_visible_output_us
                     .get_or_insert(elapsed_us);
             }
-            // Internal tokens affect usage but never establish visible-output latency.
+            // Internal tokens affect usage but never establish visible-output
+            // latency. The event carries no token identifiers, so this counts
+            // events until a `Usage` event overwrites the total.
             RequestOutput::InternalTextDelta { .. } => {
                 stats.state = RequestLifecycleState::Streaming;
                 stats.internal_tokens = stats.internal_tokens.saturating_add(1);
@@ -372,6 +459,13 @@ impl RequestRegistry {
     }
 
     /// Moves an active request into retained terminal history with final timing.
+    ///
+    /// Returns the recorded terminal state: a pending `Cancelling` or
+    /// `Aborting` becomes `Cancelled` or `Aborted` regardless of `terminal`.
+    /// `total_us` keeps the larger of any `Usage`-reported total and
+    /// `elapsed_us`. Returns `None` without recording anything for an unknown
+    /// request or one without statistics, including a second call. The record
+    /// stays active while its engine side is claimed.
     pub(crate) fn complete(
         &self,
         request_id: &str,
@@ -397,7 +491,9 @@ impl RequestRegistry {
         Some(actual_terminal)
     }
 
-    /// Inserts the completed.
+    /// Appends a terminal snapshot as the newest history entry, replacing any
+    /// entry with the same identifier, and evicts the oldest entries beyond
+    /// `retention`.
     fn insert_completed(
         state: &mut RequestRegistryState,
         stats: RequestStatsSnapshot,
@@ -414,7 +510,10 @@ impl RequestRegistry {
         }
     }
 
-    /// Returns a snapshot of the current statistics.
+    /// Returns the active statistics, or else the retained terminal snapshot.
+    ///
+    /// Returns `None` for a request without statistics, an unknown one, or one
+    /// whose snapshot was evicted from the bounded history.
     pub(crate) fn stats(&self, request_id: &str) -> Option<RequestStatsSnapshot> {
         let state = self.lock();
         state
@@ -425,7 +524,10 @@ impl RequestRegistry {
             .cloned()
     }
 
-    /// Returns the number of active requests.
+    /// Returns the number of requests whose statistics are still active.
+    ///
+    /// Records without statistics, including completed requests whose engine
+    /// side is still claimed, are not counted.
     pub(crate) fn active_count(&self) -> usize {
         self.lock()
             .active
@@ -435,6 +537,10 @@ impl RequestRegistry {
     }
 
     /// Waits for a request to leave the active registry and returns its final statistics.
+    ///
+    /// The record leaves only when it holds neither statistics nor a claimed
+    /// engine side. The result follows `stats`, so it is `None` for a request
+    /// without statistics or one already evicted from the history.
     pub(crate) async fn drain_request(&self, request_id: &str) -> Option<RequestStatsSnapshot> {
         loop {
             let changed = self.changed.notified();
@@ -445,7 +551,10 @@ impl RequestRegistry {
         }
     }
 
-    /// Drains completed entries from the tracker.
+    /// Waits until the active registry is empty.
+    ///
+    /// Unlike `active_count`, this also waits for records without statistics
+    /// and for completed requests whose engine side is still claimed.
     pub(crate) async fn drain(&self) {
         loop {
             let changed = self.changed.notified();

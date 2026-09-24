@@ -1,4 +1,10 @@
 //! Scheduler, cache, and worker execution metrics.
+//!
+//! The server's `record_scheduler_stats` writes every family here from one
+//! `SchedulerStats` snapshot per reporting interval: it sets gauges and
+//! lifetime values, and adds interval deltas to counters. The worker-local
+//! forward/kernel families, which come from `ForwardStats`, change only in
+//! intervals whose snapshot carries `worker_forward_stats`.
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
@@ -7,6 +13,9 @@ use uniserve_observability_derive::MetricFamily;
 use crate::{F64Gauge, U64Counter, U64Gauge};
 
 /// Labels identifying one model and engine instance.
+///
+/// The in-process engine client publishes its scheduler snapshots as engine
+/// `0`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct EngineLabels {
     /// Served model identity.
@@ -22,7 +31,7 @@ pub struct EnginePathLabels {
     pub model_name: String,
     /// Engine instance index.
     pub engine: u32,
-    /// Execution or verification path.
+    /// Speculative-verification resolution path reported by the worker.
     pub path: String,
 }
 
@@ -55,7 +64,7 @@ pub struct EngineDomainLabels {
     pub model_name: String,
     /// Engine instance index.
     pub engine: u32,
-    /// Scheduler execution domain.
+    /// Scheduler execution domain: `prefill`, `decode`, or `flow`.
     pub domain: String,
 }
 
@@ -66,9 +75,11 @@ pub struct EngineDomainKindLabels {
     pub model_name: String,
     /// Engine instance index.
     pub engine: u32,
-    /// Scheduler execution domain.
+    /// Scheduler execution domain: `prefill`, `decode`, or `flow`.
     pub domain: String,
-    /// Event or timing phase within the domain.
+    /// Call outcome (`launched`, `completed`, `predicated`, `error`) for
+    /// `scheduler_domain_calls`, or timing phase (`queue`, `launch`, `device`,
+    /// `completion`) for `scheduler_domain_time_us`.
     pub kind: String,
 }
 
@@ -95,6 +106,9 @@ pub struct WaitingReasonLabels {
 }
 
 /// Scheduler/batch-scoped Prometheus families exported from `SchedulerStats`.
+///
+/// The gauge, lifetime, or interval-delta semantics of each source value are
+/// documented on `SchedulerStats`, `DomainSchedulerStats`, and `ForwardStats`.
 #[derive(MetricFamily)]
 pub struct SchedulerMetrics {
     // Scheduler state gauges.
@@ -111,6 +125,9 @@ pub struct SchedulerMetrics {
     )]
     pub scheduler_waiting: Family<EngineLabels, U64Gauge>,
     /// Waiting requests grouped by the limiting condition.
+    ///
+    /// `record_scheduler_stats` reports every waiting request under the
+    /// `capacity` reason.
     #[metric(
         name = "uniserve:num_requests_waiting_by_reason",
         help = "Number of waiting requests by reason. \
@@ -119,7 +136,7 @@ pub struct SchedulerMetrics {
              blocked status). Sum of all reasons equals uniserve:num_requests_waiting."
     )]
     pub scheduler_waiting_by_reason: Family<WaitingReasonLabels, U64Gauge>,
-    /// Fraction of KV-cache capacity currently occupied.
+    /// Fraction of usable KV blocks that are not free; `1.0` means full.
     #[metric(
         name = "uniserve:kv_cache_usage_perc",
         help = "KV-cache usage. 1 means 100 percent usage"
@@ -137,7 +154,8 @@ pub struct SchedulerMetrics {
         help = "Total queue wait in microseconds for admitted requests."
     )]
     pub scheduler_queue_wait_us: Family<EngineLabels, U64Counter>,
-    /// Maximum observed admission queue time in microseconds.
+    /// Maximum admission queue time in microseconds observed since the
+    /// scheduler started.
     #[metric(
         name = "uniserve:request_queue_wait_max_us",
         help = "Maximum queue wait in microseconds observed by the scheduler."
@@ -186,7 +204,7 @@ pub struct SchedulerMetrics {
     )]
     pub scheduler_domain_time_us: Family<EngineDomainKindLabels, U64Counter>,
 
-    // Prefix-cache counters, including the connector-backed external cache path.
+    // Local prefix-cache counters, both in tokens.
     /// Prefix-cache query tokens.
     #[metric(
         name = "uniserve:prefix_cache_queries",
@@ -199,6 +217,7 @@ pub struct SchedulerMetrics {
         help = "Prefix cache hits, in terms of number of cached tokens."
     )]
     pub prefix_cache_hits: Family<EngineLabels, U64Counter>,
+
     // Worker-local forward/kernel counters.
     /// Attention kernel launches.
     #[metric(

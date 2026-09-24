@@ -1,4 +1,8 @@
-//! JSON repair and identifier helpers shared by tool parsers.
+//! Streaming lexical helpers shared by tool parsers.
+//!
+//! The parsing helpers are `winnow` parsers over `Partial` input: they return
+//! `Incomplete` when the buffered text cannot be classified yet, and
+//! `parse_buffered_event` turns that into "wait for the next chunk".
 
 use winnow::error::{ContextError, ErrMode, ModalResult, Needed, StrContext, StrContextValue};
 use winnow::stream::{Offset, Partial, Stream};
@@ -43,7 +47,12 @@ pub(super) fn partial_prefix_len(buffer: &str, token: &str) -> usize {
 
 /// Parses a safe text run before the next marker.
 ///
-/// Returns the text length in bytes, and advances the input.
+/// Safe text cannot be part of `marker`: everything before its first full
+/// occurrence or, without one, everything except a trailing partial-marker
+/// prefix. Returns the text length in bytes, and advances the input. Returns
+/// `Incomplete` when nothing can be emitted yet (empty input, or input that is
+/// entirely a possible marker prefix), and `Ok(0)` without consuming when the
+/// input starts with `marker`.
 pub(super) fn safe_text_len(input: &mut Partial<&str>, marker: &str) -> ModalResult<usize> {
     let text = **input;
     if text.is_empty() {
@@ -66,17 +75,27 @@ pub(super) fn safe_text_len(input: &mut Partial<&str>, marker: &str) -> ModalRes
 }
 
 /// Streaming lexical state for a top-level JSON object.
+///
+/// Carries the scan position across chunks so `take_json_object` resumes where
+/// the previous chunk ended. Object and array depths are counted
+/// independently rather than as a nesting stack, so the scan checks only
+/// balance, not correct interleaving.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct JsonObjectScanState {
     object_depth: usize,
     array_depth: usize,
+    /// Whether the scan is inside a string literal, where braces and brackets
+    /// are not structural.
     in_string: bool,
+    /// Whether the previous string byte was an unescaped backslash.
     escape: bool,
     phase: JsonObjectScanPhase,
 }
 
+/// Progress of one `take_json_object` scan.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum JsonObjectScanPhase {
+    /// No byte consumed; the next byte must be `{`.
     #[default]
     Initial,
     Scanning,
@@ -95,6 +114,12 @@ impl JsonObjectScanState {
 /// The returned length is safe to emit as raw argument text. This scans only
 /// lexical boundaries from `{` through the matching `}`, preserving
 /// malformed-but-balanced JSON without deserializing or normalizing it.
+///
+/// On success a call consumes either every buffered byte or the bytes through
+/// the closing `}`, which marks `state` complete. Returns `Incomplete` on empty
+/// input and a `Cut` error when `state` is already complete, when the first
+/// byte is not `{`, or when braces and brackets do not balance (an unmatched
+/// `]`, or the top-level object closing while an array is still open).
 pub(super) fn take_json_object(
     input: &mut Partial<&str>,
     state: &mut JsonObjectScanState,
@@ -123,6 +148,9 @@ pub(super) fn take_json_object(
         state.object_depth = 1;
     }
 
+    // Scanning bytes is UTF-8 safe: every structural byte is ASCII, which never
+    // occurs inside a multi-byte sequence, so each returned length ends on a
+    // character boundary.
     let mut index = usize::from(just_started);
 
     while index < bytes.len() {
@@ -181,7 +209,10 @@ pub(super) fn take_json_object(
     Ok(text.len())
 }
 
-/// Parses a JSON string literal.
+/// Parses a JSON string literal and returns its unescaped value.
+///
+/// Returns `Incomplete` until the closing quote is buffered, and a `Cut` error
+/// when the input does not start with `"` or `serde_json` rejects the literal.
 pub(super) fn json_str(input: &mut Partial<&str>) -> ModalResult<String> {
     let text = **input;
     if text.is_empty() {
@@ -227,7 +258,8 @@ pub(super) fn json_str(input: &mut Partial<&str>) -> ModalResult<String> {
     incomplete()
 }
 
-/// Builds a parser error at the current JSON scan position.
+/// Builds a non-backtracking (`Cut`) parser error labelled `label` that
+/// reports `expected` as the expected input.
 fn json_scan_error(label: &'static str, expected: StrContextValue) -> ErrMode<ContextError> {
     let mut error = ContextError::new();
     error.push(StrContext::Label(label));
@@ -242,6 +274,9 @@ fn json_scan_error(label: &'static str, expected: StrContextValue) -> ErrMode<Co
 ///   of bytes consumed from the buffer.
 /// - `Ok(None)` if the buffer does not contain a full event yet, and more data is needed.
 /// - `Err` if a parsing error occurred.
+///
+/// A parse that succeeds without consuming input also yields `Ok(None)`, so a
+/// caller looping until `Ok(None)` cannot spin on an empty event.
 pub(super) fn parse_buffered_event<E>(
     buffer: &str,
     parse: impl FnOnce(&mut Partial<&str>) -> ModalResult<E>,
@@ -252,7 +287,8 @@ pub(super) fn parse_buffered_event<E>(
         Ok(event) => event,
         Err(ErrMode::Incomplete(_)) => return Ok(None),
         Err(ErrMode::Backtrack(e) | ErrMode::Cut(e)) => {
-            // Keep the context compact here; callers add parser-specific detail.
+            // The message is the rendered winnow context chain that the
+            // grammar functions attach, such as a label and expected input.
             return Err(parsing_failed!("{}", e));
         }
     };
@@ -264,7 +300,7 @@ pub(super) fn parse_buffered_event<E>(
     Ok(Some((event, consumed_len)))
 }
 
-/// Returns an error indicating that we need more data to continue parsing.
+/// Returns the `Incomplete` error that asks for more input.
 pub(super) fn incomplete<T>() -> ModalResult<T> {
     Err(ErrMode::Incomplete(Needed::Unknown))
 }

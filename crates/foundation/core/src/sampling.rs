@@ -1,14 +1,23 @@
-//! Deterministic token sampling shared by simulated and model-worker execution.
+//! Deterministic token sampling for the engine's simulated runtime.
 //!
-//! The pipeline applies processors in this fixed order:
+//! [`try_apply_sampling_counts`] applies processors in this fixed order:
 //!
-//! allowed/forced-token mask → bad-word suppress → min-token suppress →
-//! penalties (repetition / frequency / presence over the recent window) →
-//! logit bias → temperature → top-k → top-p → min-p → typical →
-//! distribution validation → inverse-CDF draw → gather logprobs.
+//! input validation → allowed-token mask → suppression mask → penalties
+//! (repetition / frequency / presence over branch-local token counts) →
+//! logit bias → validation → temperature → top-k → top-p → min-p → typical →
+//! validation → argmax or inverse-CDF draw → gather logprobs.
 //!
 //! Sampling consumes logits, request parameters, recent-token counts, and token
 //! masks. It returns the selected token together with requested ranked scores.
+//! Callers build the masks: the engine scheduler's `build_token_masks` folds
+//! the minimum-token EOS floor, bad-word completions, and unavailable image
+//! triggers into the suppression list, and the simulator substitutes a forced
+//! token for the allowed list.
+//!
+//! The model worker applies the same processor order on device in
+//! `uniserve_worker.sampling.sampler` and draws from the same Philox mapping
+//! ([`crate::philox`]), so a change to processor semantics here needs the
+//! matching change there for simulated runs to stay representative.
 
 use crate::SamplingParams;
 
@@ -19,7 +28,10 @@ pub struct SampleOutput {
     pub token: u32,
     /// Natural-log probability of the selected token.
     pub logprob: f32,
-    /// Ranked sampled, top, and explicitly requested vocabulary candidates.
+    /// Ranked candidates as `(token_id, logprob, rank)`: the sampled token
+    /// first, then the top-N and explicitly requested tokens, without
+    /// duplicates. `rank` is the one-based competition rank. Empty when no
+    /// logprobs were requested.
     pub top: Vec<(u32, f32, u32)>,
 }
 
@@ -28,9 +40,24 @@ const NEG_INF: f32 = f32::NEG_INFINITY;
 /// Applies the full sampling pipeline from canonical branch-local token counts.
 ///
 /// `draw` is the canonical uniform in `[0, 1)` produced by
-/// [`crate::philox::sampling_uniform`] for one semantic sampling coordinate.
-/// `None` represents a deterministic invalid distribution: empty logits, NaNs,
-/// infinities, or a transform sequence that masks every vocabulary entry.
+/// [`crate::philox::sampling_uniform`] for one semantic sampling coordinate;
+/// it is ignored when `p.temperature` is zero or negative. `recent_counts`
+/// holds `(token_id, count)` pairs, `allowed` is an optional whitelist, and
+/// `suppress` lists tokens to mask. Token ids outside the vocabulary are
+/// ignored in every list, so a whitelist containing only such ids masks the
+/// whole row. Ranked candidates are gathered when `n_logprobs` is non-zero or
+/// `p` requests generated-token logprobs.
+///
+/// `None` represents a deterministic invalid distribution: empty logits, or a
+/// row that, at the input or after the bias or truncation stages, holds a NaN
+/// or positive-infinity entry (negative infinity is a mask) or no finite
+/// entry, such as when the masks exclude every vocabulary entry.
+///
+/// `logits` is modified in place: masked entries become negative infinity and
+/// surviving entries carry penalties, bias, and, when the temperature is
+/// positive, temperature scaling. On success it holds the final row the token
+/// was drawn from; after a `None` past the first check it may be partially
+/// transformed.
 pub fn try_apply_sampling_counts(
     logits: &mut [f32],
     p: &SamplingParams,
@@ -113,7 +140,8 @@ pub fn try_apply_sampling_counts(
         }
     }
 
-    // Retain the highest-scoring `top_k` candidates.
+    // Retain the highest-scoring `top_k` candidates. `sort_by` is stable, so
+    // tied logits keep ascending vocabulary order at the cutoff.
     if p.top_k > 0 && (p.top_k as usize) < v {
         let mut idx: Vec<usize> = (0..v).filter(|&i| logits[i] != NEG_INF).collect();
         idx.sort_by(|&a, &b| {
@@ -223,9 +251,15 @@ pub fn try_apply_sampling_counts(
 
 /// Scores one known token against a logits row and returns ranked candidates.
 ///
-/// The sampled token is first, followed by the highest-probability and explicit
-/// token requests without duplicates. Ranks use competition ranking, so tied
-/// log probabilities receive the same rank.
+/// Returns `(token_id, logprob, rank)` tuples. The sampled token is first,
+/// followed by the highest-probability and explicit token requests without
+/// duplicates. Ranks use competition ranking, so tied log probabilities
+/// receive the same rank.
+///
+/// Top-N candidates come only from finite (unmasked) entries, while an
+/// explicitly requested token is reported even when masked, with a log
+/// probability of negative infinity. Requested ids outside the vocabulary are
+/// skipped, and an out-of-vocabulary `token` yields an empty list.
 pub fn score_token_logprobs(
     logits: &[f32],
     token: u32,
@@ -234,7 +268,7 @@ pub fn score_token_logprobs(
 ) -> Vec<(u32, f32, u32)> {
     let logprobs = log_softmax(logits);
 
-    // Rank only candidates that survived the sampling masks.
+    // Draw top-N candidates only from entries that survived the sampling masks.
     let mut order: Vec<usize> = (0..logits.len())
         .filter(|&index| logits[index] != NEG_INF)
         .collect();
@@ -367,6 +401,8 @@ mod tests {
 
     use super::*;
 
+    /// Runs the pipeline with counts folded from the `recent` token history
+    /// and a zero draw, panicking when the distribution is invalid.
     fn sample_valid_fixture(
         logits: &mut [f32],
         params: &SamplingParams,
@@ -491,8 +527,9 @@ mod tests {
         let out = sample_valid_fixture(&mut l, &p, &[], None, None, 3);
         assert_eq!(out.token, 3);
         assert_eq!(out.top.len(), 3);
-        assert_eq!(out.top[0].0, 3); // highest-logprob token first
-        assert!(out.logprob <= 0.0); // a log-probability
+        // The sampled token leads the ranked list.
+        assert_eq!(out.top[0].0, 3);
+        assert!(out.logprob <= 0.0);
     }
 
     #[test]

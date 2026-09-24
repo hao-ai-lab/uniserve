@@ -1,6 +1,15 @@
 //! Checkpoint identity: the digest the head derives for a local checkpoint
 //! directory and every rank re-derives for the checkpoint it loads.
 //!
+//! This is the head's side: when the model is a local directory, no identity
+//! was supplied, and the launch is not a stub,
+//! `WorkerProcessArgs::derive_checkpoint_identity` calls
+//! [`checkpoint_identity`] once before any rank starts, and every launch
+//! descriptor carries the result. Each rank derives the identity of the
+//! checkpoint it resolves with the Python implementation in
+//! `uniserve_models.loading` and refuses a mismatch before loading weights;
+//! the head then compares the ranks' reports in `refuse_checkpoint_mismatch`.
+//!
 //! The rule is shared with the Python loader, which computes the same value,
 //! so the two must agree byte for byte. One SHA-256 is fed, per file in
 //! lexicographic byte order of its relative POSIX path: the path bytes, NUL,
@@ -104,6 +113,8 @@ fn walk(root: &Path) -> anyhow::Result<Vec<Entry>> {
 /// the directory or a covered sidecar cannot be read.
 pub(crate) fn checkpoint_identity(root: &Path) -> anyhow::Result<String> {
     let mut entries = walk(root)?;
+    // Raw byte order of the whole relative path, which is the order the
+    // Python side sorts by (`os.fsencode` of the path).
     entries.sort_by(|left, right| left.relative.cmp(&right.relative));
 
     let mut digest = Sha256::new();

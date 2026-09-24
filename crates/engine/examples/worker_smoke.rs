@@ -1,4 +1,14 @@
-//! Demonstrates worker startup, capability negotiation, and shared-storage execution.
+//! Demonstrates worker startup, capability negotiation, and execution over the
+//! worker IPC transport.
+//!
+//! One CPU rank is launched with `stub: true`, so the Python worker runs its
+//! deterministic test model without weights. The example prints the reported
+//! worker info, drives `Scheduler::step` on the main thread instead of a
+//! scheduler thread, and prints PASS when every request finished. Unlike
+//! `worker_run_smoke`, it exits successfully whether or not they finished.
+//!
+//! Set `PYTHONPATH` to the repository root before running the example.
+
 use std::collections::HashMap;
 
 use uniserve_core::EngineCoreOutput;
@@ -12,13 +22,15 @@ use uniserve_engine::{
 };
 
 fn main() -> anyhow::Result<()> {
+    // The handle keeps the sender alive, so `Scheduler::step` never sees a
+    // disconnected channel while the loop below runs.
     let (command_tx, commands) = crossbeam_channel::unbounded();
     let handle = uniserve_engine::EngineHandle::new(command_tx);
 
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
-    // queue_depth=2 exercises the descriptor ring with batches in flight.
+
     let worker_config = WorkerProcessArgs {
         worker_id: "local".into(),
         stub: true,
@@ -36,6 +48,7 @@ fn main() -> anyhow::Result<()> {
             uniserve_engine::WorkerConfig::single_component(uniserve_engine::DEFAULT_COMPONENT, 1),
         )
         .ranks,
+        // Allows two physical runs in flight on the rank at once.
         queue_depth: 2,
         req_slot_cap: 1 << 20,
         resp_slot_cap: 8 << 20,
@@ -57,7 +70,6 @@ fn main() -> anyhow::Result<()> {
     let mut sched = Scheduler::new(Box::new(engine), ctrl, 32)?;
 
     let mut rxs: HashMap<RequestId, (&str, uniserve_engine::EventRx)> = HashMap::new();
-    // we drive step directly here instead of the run thread
     let mut reqs = Vec::new();
     let mk = |id: u64, constraint: GenerationConstraint| generation_request(id, constraint);
     reqs.push((mk(1, GenerationConstraint::UndOnly), "text"));
@@ -68,12 +80,19 @@ fn main() -> anyhow::Result<()> {
         let rx = handle.submit(request)?;
         rxs.insert(id, (kind, rx));
     }
+
+    // Drive the scheduler on this thread instead of `Scheduler::run`. A step
+    // returns `false` when it makes no progress with no batch in flight, as
+    // after the requests finish, or when its bounded wait for an in-flight
+    // result times out; either ends the loop. The iteration bound caps a run
+    // that keeps progressing.
     for _ in 0..400 {
         if !sched.step(&commands) {
             break;
         }
     }
 
+    // Per request: text tokens, images, and whether `Finished` arrived.
     let mut counts: HashMap<RequestId, (usize, usize, bool)> = HashMap::new();
     for (id, (_k, rx)) in rxs.iter_mut() {
         while let Ok(ev) = rx.try_recv() {
@@ -116,7 +135,6 @@ fn generation_request(id: u64, constraint: GenerationConstraint) -> GenerationRe
         multimodal_inputs: Default::default(),
         negative_prompt_token_ids: Vec::new(),
         constraint,
-
         sampling: SamplingParams::default(),
         image: ImageParams {
             steps: 4,

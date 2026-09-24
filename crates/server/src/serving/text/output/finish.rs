@@ -18,7 +18,8 @@ impl FinishReason {
         }
     }
 
-    /// Attaches the token or string that caused termination.
+    /// Constructs a terminal reason with an optional concrete stop cause, the
+    /// matched stop token or string.
     pub fn with_stop_reason(
         reason: uniserve_core::FinishReason,
         stop_reason: Option<StopReason>,

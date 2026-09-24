@@ -8,6 +8,11 @@
 //!
 //! Socket readiness advances incoming and outgoing frames. Local process-death
 //! notifications use a separate descriptor.
+//!
+//! Both ends are non-blocking and make progress only when called: receive,
+//! wait and send calls flush queued writes as far as the socket accepts, so a
+//! frame larger than the kernel's send buffer finishes sending across later
+//! calls.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
@@ -22,7 +27,8 @@ use crate::codec::encode_request;
 use crate::iceoryx::{Frame, Header, IpcError, IpcResult, WakeEvents, header_for_request};
 use crate::request::WorkerRequest;
 
-/// Bytes of one encoded frame header.
+/// Bytes of one encoded frame header, the same size and field order as the
+/// `#[repr(C)]` [`Header`].
 const HEADER_BYTES: usize = 16;
 
 /// Encodes a header in a fixed little-endian layout.
@@ -71,7 +77,9 @@ impl FrameReader {
 
     /// Takes whatever the stream has without blocking, forming whole frames.
     ///
-    /// Returns whether the peer closed the connection.
+    /// Returns whether the peer closed the connection. Fails on a read error,
+    /// on a header that fails validation, and on a close that leaves a partial
+    /// frame; frames completed before the failure stay in `ready`.
     fn fill(&mut self, stream: &mut TcpStream, bound: usize) -> IpcResult<bool> {
         let mut chunk = [0u8; 64 * 1024];
         let mut closed = false;
@@ -115,6 +123,10 @@ impl FrameReader {
             head.copy_from_slice(&self.buffer[..HEADER_BYTES]);
             let header = decode_header(&head);
             let len = header.len as usize;
+
+            // Validate as soon as the header is complete, before waiting for its
+            // payload, so a foreign version or an over-bound length fails
+            // without buffering the bytes it announces.
             header.validate(bound)?;
             if self.buffer.len() < HEADER_BYTES + len {
                 return Ok(());
@@ -129,8 +141,11 @@ impl FrameReader {
 /// Retains partial writes until the socket becomes writable. Queue capacity is
 /// the channel's in-flight depth, so a stalled peer cannot grow storage use without bound.
 struct FrameWriter {
+    /// Encoded frames, header then payload, not yet fully written.
     pending: VecDeque<Vec<u8>>,
+    /// Bytes of the front frame already written.
     offset: usize,
+    /// Maximum queued frames, counting a partially written one.
     depth: usize,
 }
 
@@ -143,6 +158,11 @@ impl FrameWriter {
         }
     }
 
+    /// Queues one frame after stamping and checking its header.
+    ///
+    /// Fails with a transport error when the header is invalid or the payload
+    /// exceeds `bound`, and otherwise with [`IpcError::WouldBlock`] when
+    /// `depth` frames are already queued.
     fn enqueue(&mut self, header: Header, payload: &[u8], bound: usize) -> IpcResult<()> {
         let header = header.for_payload(payload.len(), bound)?;
         if self.pending.len() >= self.depth {
@@ -155,6 +175,7 @@ impl FrameWriter {
         Ok(())
     }
 
+    /// Writes queued bytes until the queue empties or the socket would block.
     fn flush(&mut self, stream: &mut TcpStream) -> IpcResult<()> {
         while let Some(frame) = self.pending.front() {
             match stream.write(&frame[self.offset..]) {
@@ -182,6 +203,9 @@ impl FrameWriter {
         Ok(())
     }
 
+    /// Poll interests for the stream: always readable, and writable only while
+    /// bytes are queued, since an idle writable socket would end every poll
+    /// at once.
     fn events(&self) -> i16 {
         libc::POLLIN
             | if self.pending.is_empty() {
@@ -193,10 +217,16 @@ impl FrameWriter {
 }
 
 /// Parks on current readiness interests, preserving the deadline across signals.
+///
+/// Returns `Ok(())` after any poll completes, whether it saw readiness or timed
+/// out; callers re-check their own state rather than reading `revents`.
 fn wait_ready(descriptors: &mut [libc::pollfd], timeout: Duration) -> IpcResult<()> {
     let deadline = Instant::now() + timeout;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
+
+        // Round up to whole milliseconds so poll does not return before the
+        // deadline.
         let millis = left.as_millis() + u128::from(!left.subsec_nanos().is_multiple_of(1_000_000));
         // SAFETY: poll borrows this live array only for the duration of the call.
         let result = unsafe {
@@ -223,7 +253,9 @@ fn wait_ready(descriptors: &mut [libc::pollfd], timeout: Duration) -> IpcResult<
 /// Process death and local worker completion can wake the owner independently
 /// of incoming network traffic.
 struct LocalWake {
+    /// Non-blocking end the owner polls and drains.
     reader: UnixStream,
+    /// Non-blocking end that senders write one byte to per coalesced wake.
     writer: UnixStream,
     /// Cleared when the reader drains, so repeated wakes coalesce.
     pending: Arc<AtomicBool>,
@@ -250,8 +282,9 @@ impl LocalWake {
     fn sender(&self) -> Arc<dyn Fn() + Send + Sync> {
         let writer = match self.writer.try_clone() {
             Ok(writer) => writer,
-            // A wake that cannot be cloned is one the engine will not fire;
-            // liveness then falls to the caller's bounded probe.
+            // Without a cloned writer the returned sender does nothing, so the
+            // owner observes the event only through its own re-checks after a
+            // wait returns.
             Err(_) => return Arc::new(|| {}),
         };
         let pending = Arc::clone(&self.pending);
@@ -267,6 +300,8 @@ impl LocalWake {
 
     /// Drains the descriptor and reports whether it had fired.
     fn take(&mut self) -> bool {
+        // Clear the pending bit before draining, so a wake fired during the
+        // drain sets it again and is reported by the next `take`.
         let fired = self.pending.swap(false, Ordering::AcqRel);
         let mut sink = [0u8; 64];
         while self.reader.read(&mut sink).is_ok_and(|read| read > 0) {}
@@ -280,6 +315,10 @@ pub struct SocketClient {
     reader: FrameReader,
     writer: FrameWriter,
     /// Responses read from the stream before the caller asked for them.
+    ///
+    /// Keyed by header identity, so outstanding requests need distinct
+    /// identities: a later response with the same identity replaces an
+    /// untaken one.
     inbox: HashMap<u64, Frame>,
     /// Largest payload either direction may carry.
     bound: usize,
@@ -291,6 +330,10 @@ pub struct SocketClient {
 
 impl SocketClient {
     /// Connects to the address a rank reported at registration.
+    ///
+    /// `bound` is the largest payload in bytes in either direction, `depth`
+    /// the number of frames the send queue holds, and `timeout` bounds the TCP
+    /// connect only.
     pub fn connect(
         address: &str,
         bound: usize,
@@ -302,6 +345,10 @@ impl SocketClient {
         })?;
         let stream = TcpStream::connect_timeout(&target, timeout)
             .map_err(|error| IpcError::Transport(format!("connecting to rank channel: {error}")))?;
+
+        // Disable Nagle so a small segment is sent without waiting for earlier
+        // data to be acknowledged, and make the stream non-blocking for the
+        // poll-driven reader and writer.
         stream
             .set_nodelay(true)
             .map_err(|error| IpcError::Transport(format!("disabling Nagle: {error}")))?;
@@ -330,6 +377,8 @@ impl SocketClient {
     }
 
     /// Encodes and sends one request, returning the identity of its response.
+    ///
+    /// See [`Self::send_raw`] for the queueing and failure behavior.
     pub fn send_request(&mut self, request: &WorkerRequest) -> IpcResult<u64> {
         let header = header_for_request(request);
         let payload = encode_request(request)?;
@@ -342,10 +391,19 @@ impl SocketClient {
     }
 
     /// Sends one frame and returns the identity its response will carry.
+    ///
+    /// The frame is queued and written as far as the socket accepts; the rest
+    /// is written by later send, receive and wait calls. Fails after a terminal
+    /// channel failure, when the header is invalid or the payload exceeds the
+    /// bound, with [`IpcError::WouldBlock`] when the send queue is full, and on
+    /// a write error.
     pub fn send_raw(&mut self, header: Header, payload: &[u8]) -> IpcResult<u64> {
         if let Some(error) = &self.failure {
             return Err(IpcError::Transport(error.clone()));
         }
+
+        // Flush first so frames the socket has since accepted free queue
+        // capacity before the depth check.
         self.writer.flush(&mut self.stream)?;
         self.writer.enqueue(header, payload, self.bound)?;
         self.writer.flush(&mut self.stream)?;
@@ -353,6 +411,9 @@ impl SocketClient {
     }
 
     /// Takes the response to one outstanding message, if it has arrived.
+    ///
+    /// A terminal channel failure is returned only once no received response
+    /// remains in the inbox, so complete responses are delivered first.
     pub fn try_recv_response(&mut self, message_id: u64) -> IpcResult<Option<Frame>> {
         if let Some(frame) = self.inbox.remove(&message_id) {
             return Ok(Some(frame));
@@ -370,6 +431,9 @@ impl SocketClient {
     }
 
     /// Waits for one outstanding response until the deadline passes.
+    ///
+    /// Returns `Ok(None)` at the deadline, and also once the channel has failed
+    /// while other responses still wait in the inbox.
     pub fn recv_response_timeout(
         &mut self,
         message_id: u64,
@@ -398,6 +462,9 @@ impl SocketClient {
     }
 
     /// Readiness interests include writes only while an accepted frame is pending.
+    ///
+    /// Returns the stream and the local wake descriptor. After either polls
+    /// ready, call [`Self::drain_wakes`], which also advances pending writes.
     pub fn progress_fds(&self) -> Vec<libc::pollfd> {
         vec![
             libc::pollfd {
@@ -428,6 +495,10 @@ impl SocketClient {
     }
 
     /// Moves every frame the stream holds into the inbox, keyed by identity.
+    ///
+    /// Also flushes queued writes while the stream remains open. Transport
+    /// failures are recorded in `failure` rather than returned, so this returns
+    /// `Ok` in every case.
     fn pump(&mut self) -> IpcResult<()> {
         if self.failure.is_none() {
             self.failure = match self.reader.fill(&mut self.stream, self.bound) {
@@ -451,11 +522,15 @@ impl SocketClient {
 
 /// A rank's end of a socket rank channel.
 pub struct SocketServer {
+    /// Listening socket until the engine's connection is accepted.
     listener: Option<TcpListener>,
+    /// The engine's connection once accepted; the channel accepts only one.
     stream: Option<TcpStream>,
     reader: FrameReader,
     writer: FrameWriter,
+    /// Largest payload either direction may carry.
     bound: usize,
+    /// Terminal IO failure, reported after buffered requests have been taken.
     failure: Option<String>,
     /// The address the engine connects to, as it travels in the registration.
     address: String,
@@ -567,6 +642,12 @@ impl SocketServer {
     }
 
     /// Takes one request, if the engine has sent one.
+    ///
+    /// Returns `Ok(None)` before the engine has connected; it does not accept a
+    /// waiting connection itself. When no request is already buffered and no
+    /// failure is recorded, it reads the stream and, unless the read fails or
+    /// finds the stream closed, flushes queued responses. A terminal failure
+    /// is returned once no complete request remains buffered.
     pub fn try_recv(&mut self) -> IpcResult<Option<Frame>> {
         let Some(stream) = self.stream.as_mut() else {
             return Ok(None);
@@ -595,11 +676,18 @@ impl SocketServer {
     }
 
     /// Waits until a request is readable, a completion fires, or time passes.
+    ///
+    /// Returns at once when a request is buffered or, failing that, when a
+    /// completion wake is already pending, which it consumes. Otherwise it
+    /// polls and then flushes queued responses; it never reads the stream,
+    /// which the caller's next [`Self::try_recv`] does. Before the engine
+    /// connects, the listener stands in for the stream.
     pub fn wait_incoming(&mut self, timeout: Duration) -> IpcResult<()> {
         self.accept_if_pending()?;
         if !self.reader.ready.is_empty() || self.local.take() {
             return Ok(());
         }
+
         let mut descriptors = vec![libc::pollfd {
             fd: self.local.reader.as_raw_fd(),
             events: libc::POLLIN,
@@ -619,6 +707,7 @@ impl SocketServer {
             });
         }
         wait_ready(&mut descriptors, timeout)?;
+
         self.accept_if_pending()?;
         if let Some(stream) = &mut self.stream {
             self.writer.flush(stream)?;
@@ -627,6 +716,12 @@ impl SocketServer {
     }
 
     /// Answers one request under the identity it carried.
+    ///
+    /// Queues the frame and writes as far as the socket accepts. Fails before
+    /// the engine has connected, when the header is invalid or the payload
+    /// exceeds the bound, with [`IpcError::WouldBlock`] when the send queue is
+    /// full, and on a write error. Unlike the shared-storage server, it does
+    /// not check `header.message_id` against received requests.
     pub fn respond_raw(&mut self, header: Header, payload: &[u8]) -> IpcResult<()> {
         let stream = self
             .stream
@@ -658,6 +753,9 @@ mod tests {
 
     #[test]
     fn completed_responses_survive_a_truncated_last_frame() {
+        // The peer writes one complete frame a byte at a time, then a frame cut
+        // short, then closes. The complete response must still be delivered;
+        // only the truncated one fails, and the channel then reports death.
         let (mut client, mut peer) = connected(1024, 2);
         let header = Header {
             message_id: 1,
@@ -675,6 +773,7 @@ mod tests {
         .unwrap();
         peer.write_all(b"partial").unwrap();
         peer.shutdown(std::net::Shutdown::Write).unwrap();
+
         let response = client
             .recv_response_timeout(1, Duration::from_secs(5))
             .unwrap()
@@ -700,6 +799,8 @@ mod tests {
                 ..Header::default()
             },
         ] {
+            // Only the header is sent: it must be refused before any payload
+            // arrives.
             let (mut client, mut peer) = connected(1024, 1);
             peer.write_all(&encode_header(&header)).unwrap();
             assert!(
@@ -728,6 +829,7 @@ mod tests {
             },
             0
         );
+        // With depth 1, the partially written first frame fills the queue.
         let payload = vec![7; size];
         client
             .send_raw(
@@ -748,6 +850,9 @@ mod tests {
             ),
             Err(IpcError::WouldBlock)
         ));
+
+        // Once the peer reads, driving the client's wait loop resumes the
+        // partial write until the whole frame arrives.
         let (tx, rx) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
             let mut bytes = vec![0; HEADER_BYTES + size];

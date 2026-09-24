@@ -1,4 +1,10 @@
 //! Streaming tool-call parsers and normalized tool descriptors.
+//!
+//! The Qwen3 chat output stage (`serving::chat::output::qwen3`) feeds visible
+//! assistant text to `Qwen3XmlToolParser` chunk by chunk. The parser splits
+//! each chunk into plain text and `ToolCallDelta` updates, holding back bytes
+//! it cannot classify yet, such as a partial marker or an incomplete tool-call
+//! header.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #[macro_use]
@@ -35,11 +41,16 @@ pub struct ToolCallDelta {
     pub tool_index: usize,
     /// Function name, present on the first update for one tool call.
     pub name: Option<String>,
-    /// Arguments text contributed by this update.
+    /// Arguments text contributed by this update. Concatenating every update
+    /// for one `tool_index` yields the arguments JSON exactly as the model
+    /// wrote it; the text is neither parsed as JSON nor normalized.
     pub arguments: String,
 }
 
 /// Result of advancing tool parsing with one assistant-text input.
+///
+/// Plain text and call deltas are reported in separate lists, so their
+/// relative order within one output is not recorded.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolParserOutput {
     /// Plain assistant text that is not part of any tool call.
@@ -61,10 +72,11 @@ impl ToolParserOutput {
 
     /// Merges multiple deltas for the same tool call into one complete item.
     ///
-    /// This is primarily used by the default `parse_complete` implementation,
-    /// which delegates through the incremental parser lifecycle and then
-    /// needs to collapse streaming-style argument fragments into one final
-    /// tool call.
+    /// Calls keep the order of their first delta. Each merged call takes the
+    /// first name any of its deltas carries and the concatenation of their
+    /// arguments. `Qwen3XmlToolParser::parse_complete` and the test helper
+    /// `collect_stream` use this to collapse streamed argument fragments into
+    /// final tool calls.
     pub fn coalesce_calls(mut self) -> Self {
         let mut merged = BTreeMap::<usize, ToolCallDelta>::new();
         let mut order = Vec::new();

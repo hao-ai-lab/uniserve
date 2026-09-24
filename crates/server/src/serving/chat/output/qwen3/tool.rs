@@ -1,4 +1,10 @@
 //! Converts Qwen3 assistant text into tool-call-aware updates.
+//!
+//! This is the second chat output stage. Visible `Text` deltas pass through
+//! `Qwen3XmlToolParser`; every other event is forwarded unchanged. A parser
+//! error does not fail the request: the stage logs it and forwards all later
+//! text unparsed. After a parse error the parser's unconsumed input is
+//! re-emitted as visible text; after a finalization error it is discarded.
 
 use asynk_strim_attr::{TryYielder, try_stream};
 use futures::{StreamExt as _, pin_mut};
@@ -11,9 +17,14 @@ use crate::serving::chat::output::processor::AssistantEvent;
 use crate::serving::chat::output::processor::generate_tool_call_id;
 use crate::serving::chat::{Error, Result};
 
+/// Tool-stage state for one request.
 struct ToolState {
     parser: Qwen3XmlToolParser,
+    /// Set after a parse or finalization error; later text bypasses the parser.
     parser_failed: bool,
+    /// Parser-local index of the tool call that later argument deltas extend.
+    /// Cleared when visible text or a non-`Text` delta follows the call, or
+    /// when the parser fails.
     open_call_index: Option<usize>,
 }
 
@@ -27,7 +38,12 @@ impl ToolState {
         }
     }
 
-    /// Feeds visible text through incremental tool parsing with lossless text fallback.
+    /// Feeds visible text through incremental tool parsing with a visible-text
+    /// fallback.
+    ///
+    /// On a parser error, the events parsed before the error are still
+    /// emitted, followed by the input the parser had not yet consumed as
+    /// visible text. Markers consumed by earlier events are not re-emitted.
     fn process_text_delta(
         &mut self,
         kind: AssistantBlockKind,
@@ -54,7 +70,12 @@ impl ToolState {
         Ok(events)
     }
 
-    /// Processes the parser output.
+    /// Emits one parser output in stream order.
+    ///
+    /// The parser reports normal text and call deltas in separate lists, so
+    /// their interleaving within one chunk is inferred from the state before
+    /// it: with no call open, text precedes the calls; with a call open, its
+    /// remaining deltas precede the text that follows it.
     fn process_parser_output(
         &mut self,
         kind: AssistantBlockKind,
@@ -117,7 +138,11 @@ impl ToolState {
         Ok(())
     }
 
-    /// Finishes incremental output processing.
+    /// Flushes the parser at end of generation.
+    ///
+    /// Buffered plain text is emitted as visible text. The parser fails to
+    /// finalize only while a tool call is still open; that error is logged,
+    /// and the buffered input is discarded without producing events.
     fn finish(&mut self) -> Result<Vec<AssistantEvent>> {
         if self.parser_failed {
             return Ok(Vec::new());
@@ -145,6 +170,10 @@ fn push_text_delta(events: &mut Vec<AssistantEvent>, kind: AssistantBlockKind, d
 
 #[try_stream]
 /// Converts assistant text events into tool-call-aware events.
+///
+/// Without a parser the input stream is forwarded unchanged. Errors are
+/// `Error::ToolCallStreamInvariant` from inconsistent parser output or errors
+/// propagated from the upstream stage.
 pub async fn tool_event_stream(
     stream: impl futures::Stream<Item = Result<AssistantEvent>> + Send,
     parser: Option<Qwen3XmlToolParser>,

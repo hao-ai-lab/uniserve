@@ -1,4 +1,13 @@
 //! Cancellation, terminal cleanup, and lifecycle handling.
+//!
+//! The scheduler thread applies each frontend `Command` (see `crate::handle`)
+//! here. Cancelling a queued request finishes it at once. A running request
+//! records a terminal intent and closes only after every submitted call has
+//! resolved: a media request with nothing in flight finishes immediately, and
+//! `reap_cancellations` finishes the rest once their calls drain. The
+//! acknowledgement commands keep the scheduler's view of the frontend decoder
+//! (`RequestOutput::tokens_acked` and `decoder_boundaries`) in step, and
+//! `abort_all_requests` ends every request when the control loop stops.
 
 use super::*;
 
@@ -22,8 +31,16 @@ impl Scheduler {
     }
 
     /// Aborts every queued/gated/running request with a terminal event.
+    ///
+    /// `Scheduler::run` calls this on shutdown and after engine-fatal, and
+    /// `Scheduler::step` on shutdown, each right before closing the executor.
+    /// Shutdown covers both a `Shutdown` command and a disconnected command
+    /// channel. Running requests finish immediately rather than waiting for
+    /// their in-flight calls, and batches assembled but not yet submitted are
+    /// dropped.
     pub(super) fn abort_all_requests(&mut self) {
         self.inflight.pending_submissions.clear();
+
         while let Some(submission) = self.waiting_media.pop_front() {
             let _ = submission.event_tx.send(EngineCoreOutput::Finished {
                 reason: FinishReason::Aborted,
@@ -37,6 +54,7 @@ impl Scheduler {
         for id in media {
             self.finish_media(id, DiffusionTerminal::Finished(FinishReason::Aborted));
         }
+
         let queued: Vec<RequestId> = {
             let mut ids = Vec::new();
             while let Some(st) = self.waiting.pop_front() {
@@ -59,6 +77,10 @@ impl Scheduler {
     }
 
     /// Applies one command; returns true on shutdown.
+    ///
+    /// A submission whose request family the runtime does not serve is
+    /// rejected here; every other submission is validated by `enqueue` or
+    /// `enqueue_media`, which report their own rejections.
     pub(super) fn handle_command(&mut self, cmd: Command) -> bool {
         match cmd {
             Command::Submit { request, event_tx } => {
@@ -104,6 +126,10 @@ impl Scheduler {
 
     /// Selects commands with available destinations without bypassing an older
     /// command for the same request. Other requests remain independently eligible.
+    ///
+    /// A command is deferred when `include` rejects it or
+    /// `Executor::command_has_capacity` reports a full destination; deferred
+    /// commands keep their relative order in `pending_commands`.
     pub(super) fn take_commands(
         &mut self,
         include: impl Fn(&BatchCommand) -> bool,
@@ -112,6 +138,8 @@ impl Scheduler {
         let mut selected = Vec::new();
         for command in std::mem::take(&mut self.inflight.pending_commands) {
             let request = command.request_key();
+            // Once one command of a request is deferred, every later command
+            // of that request is deferred with it.
             if blocked.contains(&request)
                 || !include(&command)
                 || !self.executor.command_has_capacity(&command)
@@ -126,6 +154,14 @@ impl Scheduler {
     }
 
     /// Records cancellation or abortion across queued, media, and running request states.
+    ///
+    /// A queued request finishes here with `Aborted` or `Cancelled`. A running
+    /// media request records the reason, keeping an earlier terminal intent,
+    /// and finishes here only when none of its calls are in flight. A running
+    /// token request records the reason as its terminal intent and is finished
+    /// by `reap_cancellations` once its calls drain; an `output_token_count`
+    /// beyond the tokens already sent schedules an error finish instead.
+    /// Unknown requests are ignored.
     pub(super) fn mark_cancelled(
         &mut self,
         id: RequestId,
@@ -181,7 +217,7 @@ impl Scheduler {
                 TerminalIntent::Finish(FinishReason::Cancelled)
             };
         }
-        // also drop from the waiting queue if not yet admitted (reporting the reason)
+        // A request not yet admitted leaves the waiting queue with its reason.
         if let Some(st) = self.remove_waiting(id) {
             let reason = if abort {
                 FinishReason::Aborted
@@ -199,6 +235,12 @@ impl Scheduler {
     }
 
     /// Releases output capacity for prefixes accepted by the frontend decoder.
+    ///
+    /// Acknowledging the current count is a no-op. A count below the current
+    /// acknowledgement or above the tokens already sent finishes the request
+    /// with an error once its in-flight calls drain. Otherwise every decoder
+    /// boundary the new prefix covers is resolved, which may apply a finish
+    /// deferred on those decisions. Requests that are not running are ignored.
     pub(super) fn acknowledge_output(&mut self, id: RequestId, output_token_count: usize) {
         let Some(current) = self.running.get(&id).map(|state| state.output.tokens_acked) else {
             return;
@@ -229,7 +271,14 @@ impl Scheduler {
         self.finish_pending_if_idle(id);
     }
 
-    /// Marks the lifecycle tracker as stopped.
+    /// Stops a running token request at the prefix where the frontend decoder
+    /// matched a stop string.
+    ///
+    /// Records that prefix as acknowledged, drops pending decoder decisions,
+    /// and sets a `Stop` terminal intent that `reap_cancellations` applies once
+    /// the request's calls drain. A count above the tokens already sent
+    /// instead finishes the request with an error once its in-flight calls
+    /// drain. Requests that are not running are ignored.
     pub(super) fn mark_stopped(&mut self, id: RequestId, output_token_count: usize) {
         let Some(state) = self.running.get_mut(&id) else {
             return;
