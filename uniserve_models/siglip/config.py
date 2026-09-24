@@ -8,7 +8,12 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class TransformerConfig:
-    """Widths, depth, and normalization epsilon of the SigLIP encoder stack."""
+    """Widths, depth, and normalization epsilon of the SigLIP encoder stack.
+
+    ``__post_init__`` rejects non-integer or non-positive sizes, a
+    ``hidden_size`` that ``num_attention_heads`` does not divide (the head
+    width is their quotient), and a non-finite or non-positive epsilon.
+    """
 
     hidden_size: int
     num_attention_heads: int
@@ -43,8 +48,16 @@ class TransformerConfig:
 class Config:
     """Patch geometry plus the encoder stack configuration for one SigLIP tower."""  # noqa: E501
 
+    # Pixel side of one square patch.
     patch_size: int
+
+    # Pixel side of the square resolution the learned position table covers:
+    # the table has ``(image_size // patch_size) ** 2`` entries, and
+    # ``Encoder.forward`` rejects grids with a larger side in patches.
     image_size: int
+
+    # Pixel channels; one patch row holds ``num_channels * patch_size**2``
+    # values.
     num_channels: int
     encoder: TransformerConfig
 

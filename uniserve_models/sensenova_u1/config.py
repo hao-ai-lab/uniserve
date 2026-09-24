@@ -1,4 +1,11 @@
-"""Immutable SenseNova U1 architecture and checkpoint metadata normalization."""
+"""Immutable SenseNova U1 architecture and checkpoint metadata normalization.
+
+``read_config`` resolves a checkpoint's ``llm_config``, ``vision_config`` and
+root fields, including keys that checkpoints duplicate across those maps,
+into one frozen ``Config`` tree of ``TransformerConfig``, ``vision.Config``
+and ``flow.Config``. Each dataclass validates its own fields on construction;
+typed rotary scaling recipes replace the checkpoint's rotary dictionaries.
+"""
 
 from __future__ import annotations
 
@@ -41,7 +48,21 @@ def _positive(value: object, name: str, *, integer: bool = False) -> None:
 
 @dataclass(frozen=True, slots=True)
 class TransformerConfig:
-    """Text/flow decoder dimensions, normalization, and multi-axis rotary math."""  # noqa: E501
+    """Text/flow decoder dimensions, normalization, and multi-axis rotary math.
+
+    One backbone serves both the text and flow routes, so these fields
+    describe both. ``transformer.TransformerLayer`` splits each head into a
+    temporal rotary half and height and width quarters: the temporal axis
+    uses ``rope_theta`` and ``max_position_embeddings``, the spatial axes
+    ``rope_theta_hw`` and ``max_position_embeddings_hw``, and all three share
+    ``rope_scaling`` and ``partial_rotary_factor``. ``layer_types`` and
+    ``sliding_window`` record the checkpoint's attention kinds, but
+    ``__post_init__`` rejects any ``sliding_attention`` layer.
+
+    Raises:
+        ValueError: From ``__post_init__`` when a field has the wrong type or
+            an invalid value.
+    """  # noqa: E501
 
     vocab_size: int
     hidden_size: int
@@ -156,7 +177,12 @@ class TransformerConfig:
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    """Compose the language, patch embedding, and image prediction networks."""
+    """Compose the language, patch embedding, and image prediction networks.
+
+    ``max_image_seq_len`` is the longest image token sequence the denoiser
+    accepts, which ``Denoiser.max_sequence_tokens`` reports. ``__post_init__``
+    requires RGB vision input whose output width equals the text hidden size.
+    """
 
     text: TransformerConfig
     vision: vision.Config
@@ -192,7 +218,11 @@ def _alias(
     aliases: tuple[Mapping[str, Any], ...],
     default: Any,
 ) -> Any:
-    """Return one value for a field that checkpoints may duplicate across maps."""  # noqa: E501
+    """Return one value for a field that checkpoints may duplicate across maps.
+
+    A ``None`` value counts as absent. Present values must all be equal, or
+    this raises ``ValueError``; with none present, ``default`` is returned.
+    """  # noqa: E501
     values = [
         source[name]
         for source in (primary, *aliases)
@@ -206,9 +236,20 @@ def _alias(
 
 
 def _normalize(raw: Mapping[str, Any]) -> Config:
-    """Resolve checkpoint aliases once, without allocating numerical resources."""  # noqa: E501
+    """Resolve checkpoint aliases once, without allocating numerical resources.
+
+    Raises:
+        RuntimeError: When the checkpoint requires a newer version of this
+            model implementation.
+        KeyError: When a required key is missing, such as ``llm_config``,
+            ``vision_config`` or a text dimension without a default.
+        ValueError: For malformed metadata, including conflicting aliases,
+            an unsupported rotary recipe or sparse MoE text model, and
+            fields that a rotary recipe or config dataclass rejects.
+    """  # noqa: E501
     from packaging.version import Version
 
+    # A checkpoint may name the minimum version of this model code it needs.
     required = raw.get("uniserve_sensenova_min_version")
     if required and Version("0.1.0") < Version(str(required)):
         raise RuntimeError(
@@ -226,8 +267,10 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
             "supported by the dual-route MoT decoder"
         )
 
-    # Rotary metadata appears under both rope_scaling and rope_parameters in
-    # different checkpoint generations; the two aliases must agree.
+    # Checkpoints may carry rotary metadata under rope_scaling,
+    # rope_parameters, or both; a field present in both must agree. The
+    # recipe name comes from rope_type, falling back to the type key, and
+    # every type key present must name the same recipe.
     scaling = text.get("rope_scaling") or {}
     parameters = text.get("rope_parameters") or {}
     if not isinstance(scaling, Mapping) or not isinstance(parameters, Mapping):
@@ -320,8 +363,9 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
         )
     layer_types = text.get("layer_types")
     if layer_types is None:
-        # Older checkpoints derive per-layer attention kinds from the
-        # window fields.
+        # Without layer_types, the window fields define the per-layer
+        # attention kinds: with use_sliding_window and a sliding_window set,
+        # layers from max_window_layers onward use sliding attention.
         layer_types = tuple(
             "sliding_attention"
             if use_window and window is not None and index >= boundary
@@ -338,6 +382,10 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
         raise ValueError(
             "SenseNova root and vision downsample_ratio must agree"
         )
+    # A head deeper than two layers is the deep adaptive head sized by
+    # fm_head_dim and fm_head_mlp_ratio. The shallow two-layer MLP has a
+    # fixed hidden width of 4096, and the checkpoint's head fields do not
+    # apply to it.
     head_layers = raw.get("fm_head_layers", 2)
     _positive(head_layers, "fm_head_layers", integer=True)
 
@@ -367,6 +415,7 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
                 text, "partial_rotary_factor", (parameters, scaling), 1.0
             ),
             sliding_window=window,
+            # The text map's pad_token_id takes precedence over the root's.
             pad_token_id=text.get("pad_token_id")
             if text.get("pad_token_id") is not None
             else raw.get("pad_token_id"),
@@ -394,6 +443,8 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
             add_noise_scale_embedding=raw.get(
                 "add_noise_scale_embedding", False
             ),
+            # The checkpoint's "dynamic" noise mode maps to NoiseScale's
+            # "resolution" mode; other mode names pass through unchanged.
             noise=NoiseScale(
                 raw.get("noise_scale", 1.0),
                 "resolution"
@@ -408,9 +459,15 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
 
 
 def read_config(root: Path, io: loading.Config) -> Config:
-    """Normalize checkpoint aliases and typed rotary recipes before construction."""  # noqa: E501
+    """Normalize checkpoint aliases and typed rotary recipes before construction.
+
+    ``io`` belongs to the package ``read_config`` contract; SenseNova reads
+    only the local ``config.json``. Metadata errors are those of ``_normalize``.
+    """  # noqa: E501
     return _normalize(json.loads((root / "config.json").read_text()))
 
 
-# Checkpoint headers needed to resolve architecture before module selection.
+# Checkpoint sources whose tensor headers read_config needs before module
+# selection. SenseNova derives every dimension from config.json, so it has
+# none.
 config_sources = ()

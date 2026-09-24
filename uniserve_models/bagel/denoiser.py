@@ -26,7 +26,16 @@ from .transformer import Transformer
 
 
 class Denoiser(ImageDenoiser[DenoiserInput]):
-    """Predict image-latent velocity through the shared text/flow backbone."""
+    """Predict image-latent velocity through the shared text/flow backbone.
+
+    Each image forms one framed sequence: the start-of-image marker, one row
+    per latent patch in raster order, and the end-of-image marker. Marker rows
+    run through the text expert and patch rows through the flow expert, and
+    the sequence attends to its guidance branch's cached token prefix through
+    the attention layers it shares with the text LM. With pipeline parallelism,
+    the first stage builds the input embeddings and only the last stage
+    returns predictions.
+    """
 
     # BAGEL frames each generated image with its start and end marker tokens,
     # and its image-unconditional branch reads the conditioning prefix.
@@ -52,8 +61,11 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
             (config.max_latent_size,) * 2, config.text.hidden_size
         )
         self.prediction = Linear(config.text.hidden_size, width)
-        # Derived marker IDs are numerical constants. Explicit CPU construction
-        # survives meta initialization; loading places their borrowed buffer.
+
+        # The marker IDs derive from the config, not the checkpoint. Explicit
+        # CPU construction keeps the buffer materialized when the model is
+        # built on the meta device; loading then moves it to the module's
+        # placement device.
         self.register_buffer(
             "markers",
             torch.tensor(
@@ -66,6 +78,7 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
 
     @property
     def max_sequence_tokens(self) -> int:
+        """Latent rows the learned position grid covers; markers not counted."""
         return self.config.max_latent_size**2
 
     def bind_inputs(
@@ -89,10 +102,12 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         )
 
     def noise_shape(self, modality: str, size: image.Config):
-        # BAGEL draws directly in canonical patch/channel order.
+        # BAGEL draws noise directly in the canonical [patch rows, patch
+        # values] shape, so ``prepare_latents`` scales it without patchifying.
         return self.latent_shape(modality, size)
 
     def make_schedules(self, steps, *, shift, device):
+        # Descending network time equals sigma, from one (noise) to zero.
         return {
             "image": make_schedule(
                 steps,
@@ -120,6 +135,8 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         if set(inputs.latents) != {"image"}:
             raise ValueError("BAGEL predicts the image latent modality")
 
+        # Without a pipeline axis the local group makes this rank both the
+        # first and the last stage.
         group = self.mesh.get_group("pp" if "pp" in self.mesh.axes else ())
         chunks: list[torch.Tensor] = []
         routes: list[RouteSpan] = []
@@ -137,6 +154,8 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
                     "BAGEL latents must cover their framed image sequence"
                 )
 
+            # Only the first stage embeds inputs; later stages receive hidden
+            # states from their predecessor but still need the route spans.
             if group.rank == 0:
                 # Frame latent features with embedded start/end-of-image
                 # markers; the marker rows route as text, the interior rows
@@ -144,6 +163,10 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
                 marker = self.backbone.embed_input_ids(self.markers).to(
                     torch.bfloat16
                 )
+                # Interior rows index the learned grid row-major. Rows and
+                # columns must stay below max_latent_size, which this method
+                # does not check; a column past it selects another grid row's
+                # embedding whenever the flat index stays inside the table.
                 coordinates = (
                     positions[1, 1:-1] * self.config.max_latent_size
                     + positions[2, 1:-1]
@@ -151,6 +174,7 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
                 features = self.input(
                     latent.tensor.to(torch.bfloat16)
                 )  # [latents, hidden]
+                # One timestep per image conditions every latent row.
                 features = (
                     features
                     + self.time_embedding(
@@ -172,12 +196,14 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         if not inputs.batch_size:
             return {"image": ()}
 
+        # Packed positions are [3, total tokens] across the batch.
         hidden = self.backbone(
             torch.cat(chunks) if group.rank == 0 else None,
             torch.cat(inputs.positions, dim=1),
             inputs.attention,
             routes=tuple(routes),
         )
+        # Only the last stage holds final hidden states.
         if group.rank != group.size - 1:
             return {"image": (None,) * inputs.batch_size}
 
@@ -188,6 +214,8 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
             # Strip the framing markers before predicting per-latent patches.
             prediction = self.prediction(hidden_row[1:-1].to(torch.bfloat16))
             shape = self.latent_shape("image", size)
+            # The backbone gathers every token on the last stage, so each
+            # output's local slice spans its complete shape.
             outputs.append(
                 TensorOutput(
                     prediction,

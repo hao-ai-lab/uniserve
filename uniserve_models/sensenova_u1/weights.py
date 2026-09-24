@@ -1,4 +1,12 @@
-"""SenseNova U1 checkpoint assignments and numerical precision presets."""
+"""SenseNova U1 checkpoint assignments and numerical precision presets.
+
+All tensors come from one ``primary`` source. Module parameter paths are
+translated into the checkpoint's names: the shared backbone under
+``language_model.model``, the denoiser's generation modules under
+``fm_modules`` and the input vision tower under ``vision_model``. The
+backbone mapping covers only the layers and terminal modules resident on this
+pipeline rank and declares the checkpoint names of the others nonresident.
+"""
 
 from __future__ import annotations
 
@@ -76,7 +84,13 @@ def _backbone_names(backbone: TransformerDecoder):
 
 
 def _mapped(module, names, *, nonresident=frozenset()):
-    """Build a primary-source mapping that skips tensors absent from the file."""  # noqa: E501
+    """Build a primary-source mapping that skips tensors absent from the file.
+
+    Every parameter named in ``names`` is required. A tensor missing from the
+    file yields no assignment, so the loader reports that parameter as
+    missing and fails with a load mismatch instead of a reader lookup error.
+    ``nonresident`` names checkpoint tensors intentionally left unused.
+    """  # noqa: E501
 
     def map_weights(reader):
         available = frozenset(reader.names())
@@ -103,6 +117,8 @@ def checkpoint_mappings(model: Model):
     names = _backbone_names(backbone)
 
     # PP omits only the source layers and terminal modules assigned elsewhere.
+    # Every layer has the same tensors, so the first resident layer's
+    # checkpoint names, minus the layer prefix, enumerate each absent layer.
     template = tuple(
         source.split(".", 4)[-1]
         for target, source in names.items()
@@ -114,6 +130,8 @@ def checkpoint_mappings(model: Model):
         if str(index) not in backbone.layers
         for tail in template
     }
+    # With tied embeddings the embedding tensor is never declared unused:
+    # on the last stage the tied head reads it as ``head_name``.
     if backbone.embedding is None and not model.config.text.tie_word_embeddings:
         nonresident.add("language_model.model.embed_tokens.weight")
     if backbone.norm is None:
@@ -160,8 +178,9 @@ def checkpoint_mappings(model: Model):
             }
         )
 
-    # The three checkpoint head variants store the same parameters under
-    # different name schemes; translate each into fm_modules.fm_head names.
+    # Each head variant has its own module structure and checkpoint naming
+    # under fm_modules.fm_head; translate the active variant's paths. The
+    # shallow MLP's nn.Sequential indices already match the checkpoint.
     for name, _ in model.denoiser.prediction.named_parameters():
         if model.config.flow.use_pixel_head:
             source = name.replace("decoder.blocks.1.", "conv1.").replace(
@@ -203,5 +222,7 @@ def checkpoint_mappings(model: Model):
 
 precisions = MappingProxyType({"bf16": weights.Config()})
 
-# Dense modules of a calibrated checkpoint keep its stored representation.
+# Base precision for a calibrated ModelOpt checkpoint:
+# ``uniserve_models.loading`` overlays the calibrated quantization, and every
+# other module stays BF16.
 checkpoint_precision = precisions["bf16"]

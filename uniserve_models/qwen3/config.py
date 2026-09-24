@@ -1,4 +1,10 @@
-"""Immutable Qwen3 architecture and checkpoint metadata normalization."""
+"""Immutable Qwen3 architecture and checkpoint metadata normalization.
+
+``read_config`` turns a checkpoint's ``config.json`` into the frozen
+``Config`` that ``Model`` and ``Transformer`` consume. ``Config`` validates
+its own fields on construction, so a config built directly, as the MiniMax H3
+text encoder does, receives the same checks as one read from a checkpoint.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +19,21 @@ from uniserve import loading
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    """Immutable numerical parameters for Qwen decoders and conditioners."""
+    """Immutable numerical parameters for Qwen decoders and conditioners.
+
+    Field names follow the checkpoint ``config.json`` keys that
+    ``read_config`` reads. ``head_dim`` may differ from
+    ``hidden_size // num_attention_heads``. A zero ``num_experts`` builds a
+    dense ``GatedMLP`` of width ``intermediate_size`` in every layer; a
+    positive value builds an ``MoE`` in every layer, routing each token to
+    ``num_experts_per_tok`` experts of width ``moe_intermediate_size``.
+
+    Raises:
+        ValueError: From ``__post_init__`` when a field has the wrong type or
+            an invalid value, including odd ``head_dim``, query heads not
+            divisible by KV heads, ``num_experts_per_tok`` above a nonzero
+            ``num_experts``, or an unsupported ``hidden_act``.
+    """
 
     vocab_size: int
     hidden_size: int
@@ -85,6 +105,8 @@ class Config:
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"Qwen3 {name} must be boolean")
 
+        # These are the aliases ``transformer._activation`` maps onto the
+        # gated MLP's activation kernels.
         if self.hidden_act not in {
             "silu",
             "swish",
@@ -128,7 +150,7 @@ def _optional_int(
 
 
 def _number(config: Mapping[str, object], name: str, default: float) -> float:
-    """Read a numeric model setting while rejecting boolean values."""
+    """Read a finite positive number with a default, rejecting booleans."""
     raw = config.get(name, default)
     if not isinstance(raw, (int, float)) or isinstance(raw, bool):
         raise ValueError(f"Qwen3 config field {name!r} must be numeric")
@@ -159,7 +181,23 @@ def _string(config: Mapping[str, object], name: str, default: str) -> str:
 
 
 def read_config(root: Path, io: loading.Config) -> Config:
-    """Normalize checkpoint metadata into immutable decoder configuration."""
+    """Normalize checkpoint metadata into immutable decoder configuration.
+
+    Args:
+        root: Local checkpoint directory containing ``config.json``.
+        io: Loading options of the package ``read_config`` contract; Qwen3
+            reads only the local ``config.json`` and does not use them.
+
+    Returns:
+        The validated ``Config``. Optional fields absent from the checkpoint
+        take this function's defaults.
+
+    Raises:
+        ValueError: For invalid metadata, including a missing required
+            field, a field of the wrong type or value, a ``rope_parameters``
+            recipe other than ``default``, and disagreeing ``rope_theta``
+            locations.
+    """
     config = json.loads((root / "config.json").read_text())
 
     rotary = config.get("rope_parameters") or {}
@@ -175,10 +213,12 @@ def read_config(root: Path, io: loading.Config) -> Config:
             raise ValueError(
                 "Qwen3 checkpoint has conflicting rope_theta aliases"
             )
-        # Current Transformers serializes this numerical field under
-        # rope_parameters. Constructors consume its single normalized value.
+        # Transformers may serialize rope_theta inside rope_parameters. The
+        # top-level key becomes the single normalized value Config receives.
         config["rope_theta"] = rotary["rope_theta"]
 
+    # Without an explicit head_dim, hidden_size must split exactly across the
+    # query heads; an explicit head_dim may differ from that split.
     hidden_size = _required_int(config, "hidden_size")
     num_attention_heads = _required_int(config, "num_attention_heads")
     if "head_dim" not in config and hidden_size % num_attention_heads:
@@ -225,5 +265,6 @@ def read_config(root: Path, io: loading.Config) -> Config:
     return cfg
 
 
-# Checkpoint headers needed to resolve architecture before module selection.
+# Checkpoint sources whose tensor headers read_config needs before module
+# selection. Qwen3 derives every dimension from config.json, so it has none.
 config_sources = ()

@@ -1,4 +1,15 @@
-"""H3's native latent packing, fixed schedules and sparse denoising computation."""  # noqa: E501
+"""H3's native latent packing, fixed schedules and sparse denoising computation.
+
+``Denoiser`` implements the ``VideoDenoiser`` capability for H3's joint
+video/audio transformer. One sample's text, audio and video tokens share one
+packed sequence (see ``packing.build_packing``), which is split into equal
+row shards across the sequence-parallel group. A modality's canonical sample
+on a rank is that rank's rows of the modality, in packed order.
+
+Sizes that share a layout (``layout_size``) share constants, workspace and
+captured graphs; the tables that depend on the exact prompt length are
+request state, filled by ``prepare_state``.
+"""  # noqa: E501
 
 from __future__ import annotations
 
@@ -31,10 +42,15 @@ from .transformer import Transformer, TransformerLayer
 def schedules(
     config: DiffusionConfig, *, device: torch.device | str
 ) -> Mapping[str, Schedule]:
-    """Materialize sigma before subtracting it from one in FP32.
+    """Build the video and audio schedules from the checkpoint's DMD ladder.
 
-    The analytical coordinates retain the checkpoint's trained ladder. Model
-    evaluations exclude the clean endpoint, which the solver still consumes.
+    Each rung, divided by ``time_scale`` to give ``t`` in (0, 1], is shifted
+    once with the modality's scheduler shift as
+    ``sigma = shift * t / (1 + (shift - 1) * t)``, and the clean endpoint
+    ``sigma = 0`` is appended. Sigma is materialized in FP32 before network
+    times are formed as ``1 - sigma`` in FP32; the analytical coordinates keep
+    the unrounded ``1 - sigma``. Model evaluations exclude the clean endpoint,
+    which the solver still consumes.
     """
     result = {}
     for name, shift in (
@@ -130,8 +146,10 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         )
 
     def _sequence_group(self):
-        # Resident layers are TransformerLayers whose merged attention
-        # branches are column-parallel linears.
+        # The sequence group spans the mesh axes that shard the token
+        # dimension of the attention input. Resident layers are
+        # TransformerLayers whose merged attention branches are
+        # column-parallel linears.
         layer = cast(
             TransformerLayer, next(iter(self.transformer.layers.values()))
         )
@@ -142,6 +160,9 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         return distribution.mesh.get_group(distribution.shard_axes(0))
 
     def _packing(self, size: DenoiserSize) -> Packing:
+        # The alignment is a multiple of both the default 256-row alignment
+        # and one 64-row tile per sequence rank, so every rank's shard holds
+        # whole tiles.
         return build_packing(
             num_text_tokens=size.num_text_tokens,
             num_frames=size.num_frames,
@@ -156,6 +177,8 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     def latent_shape(
         self, modality: str, size: DenoiserSize
     ) -> tuple[int, ...]:
+        # Complete canonical samples across all ranks; ``output_layout``
+        # selects this rank's rows.
         if modality == "video":
             # The 48x84 latent raster yields 24x42 tokens per frame at
             # patch 2x2.
@@ -199,6 +222,8 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         packing = self._packing(size)
         interval = self._token_slice(packing)
         result = {}
+        # Each modality's packed indices ascend, so the rows falling in this
+        # rank's token slice are one contiguous range of the sample.
         for name, indices in (
             ("video", packing.video_indices),
             ("audio", packing.audio_indices),
@@ -285,7 +310,12 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
 
     def _metadata(self, size: DenoiserSize) -> dict[str, torch.Tensor]:
         # Constants depend on the layout alone; the prompt-length tables are
-        # request state.
+        # request state. For each modality, ``local_{name}_indices`` holds
+        # its rows within this rank's shard. Text also records the global
+        # packed row, which ``forward`` uses to gather the text features.
+        # For video and audio, ``{name}_indices`` records, for each local row,
+        # the row of the complete native draw it takes: the video raster row,
+        # or the channel-major audio row.
         packing = self._packing(self.layout_size(size))
         interval = self._token_slice(packing)
         values = {}
@@ -306,8 +336,11 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 )
                 values[f"{name}_indices"] = raster[selected]
 
-        # Modulation rows are addressed by token tag, with audio offset past
-        # the video/text rows of the packed per-layer table.
+        # Each layer's modulation products form six rows: the video
+        # timestep's (video, text, audio) groups, then the audio timestep's.
+        # Video and text tokens read their group under the video timestep
+        # (rows 0 and 1); audio tokens read the audio group under the audio
+        # timestep (row 5).
         tags = packing.token_tags[interval]
         values["modulation_indices"] = (tags == AUDIO_TAG).long() * 3 + tags
 
@@ -329,6 +362,8 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     def constant_buffers(
         self, size: DenoiserSize
     ) -> Mapping[str, BufferConfig]:
+        # The native-draw indices stay on the host, where ``prepare_latents``
+        # gathers the CPU draws.
         return {
             name: BufferConfig(
                 tuple(value.shape),
@@ -369,7 +404,9 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     ) -> Mapping[str, BufferConfig]:
         packing = self._packing(size)
         interval = self._token_slice(packing)
-        # Resident layers are TransformerLayers whose merged attention
+        # Query rows are split across the group that shards the q
+        # projection's output tokens; keys cover every packed row. Resident
+        # layers are TransformerLayers whose merged attention
         # branches are column-parallel linears.
         layer = cast(
             TransformerLayer, next(iter(self.transformer.layers.values()))
@@ -403,6 +440,18 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     def prepare_latents(
         self, sizes, *, noise, state, constants, workspace
     ) -> None:
+        """Gather this rank's canonical sample rows from native CPU draws.
+
+        ``noise`` holds each modality's complete FP32 draw in
+        ``noise_shape`` with a leading sample axis of one; ``state`` holds
+        CPU FP32 views of the local samples. Video is patchified to raster
+        rows first; audio draws are already channel-major timeline rows.
+
+        Raises:
+            ValueError: A sample count other than one, a modality order
+                other than video/audio, or a draw, view or index table with
+                the wrong shape, device or dtype.
+        """
         if len(sizes) != 1 or tuple(noise) != self.modalities:
             raise ValueError(
                 "H3 preparation requires one ordered video/audio sample"
@@ -437,6 +486,15 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
 
     @torch.inference_mode()
     def forward(self, inputs: DenoiserInput, *, state, constants, workspace):
+        """Predict one layout sample's video and audio velocities.
+
+        The first pipeline stage scatters text and projected latents into the
+        local packed rows of ``workspace["hidden"]``; ``Transformer`` fills
+        it with the preceding stage's output on later stages. The final stage
+        maps each modality to a one-element tuple holding an FP32
+        ``TensorOutput`` of this rank's rows; every other stage maps each
+        modality to ``(None,)``.
+        """
         if inputs.batch_size != 1 or not 0 <= inputs.step_index < len(
             self.diffusion.ladder
         ):
@@ -489,9 +547,10 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 )
 
             # Scatter text and projected latents into the packed token rows;
-            # padding rows stay zero. Text features cover the layout's text
-            # rows, zero past the prompt, so every prompt length within one
-            # layout gathers the same rows.
+            # padding rows stay zero. Text occupies the leading packed rows,
+            # so a text row's global index is also its row in ``text``. Text
+            # features cover the layout's text rows, zero past the prompt, so
+            # every prompt length within one layout gathers the same rows.
             hidden.zero_()
             hidden.index_copy_(
                 0,

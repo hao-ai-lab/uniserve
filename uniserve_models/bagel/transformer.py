@@ -21,7 +21,13 @@ from .config import TransformerConfig
 
 
 class TransformerLayer(nn.Module):
-    """Route projection/MLP experts around one shared token-attention domain."""
+    """Route projection/MLP experts around one shared token-attention domain.
+
+    The ``text`` and ``flow`` routes each own an input norm, a QKV projection
+    with optional QK normalization, an attention output projection, a
+    post-attention norm and a gated MLP. One attention call covers the tokens
+    of both routes in their packed order.
+    """
 
     def __init__(self, config: TransformerConfig, index: int):
         super().__init__()
@@ -55,6 +61,8 @@ class TransformerLayer(nn.Module):
                 hidden, config.rms_norm_eps
             )
             self.mlps[route] = GatedMLP(hidden, config.intermediate_size)
+        # The denoiser shares this layer with the text LM, so both address the
+        # K/V cache entry named here.
         self.attention = Attention(
             config.num_attention_heads,
             config.num_key_value_heads,
@@ -72,11 +80,18 @@ class TransformerLayer(nn.Module):
         *,
         routes: tuple[RouteSpan, ...],
     ):
+        """Run one layer over routed tokens.
+
+        Returns:
+            The MLP output and the residual stream it has not yet been added
+            to, the pair ``TransformerDecoder`` carries between layers.
+        """
         hidden = hidden if residual is None else hidden.add(residual)
         normalized = hidden.apply(self.input_norms)
 
         # All routes share one temporal rotary domain; only the expert
-        # projections, outputs, and MLPs differ per route.
+        # projections, outputs, and MLPs differ per route. Positions are either
+        # 1-D or [3, tokens], of which RoPE uses only the temporal row.
         temporal = positions if positions.ndim == 1 else positions[0]
         cosine, sine = self.rotary(
             temporal, dtype=torch.float32, sequence_length=temporal.numel()
@@ -91,6 +106,7 @@ class TransformerLayer(nn.Module):
             )
             for route, value in normalized.values.items()
         }
+        # Repack per-route Q/K/V into token order for the shared attention.
         query, key, value = (
             RoutedTensor(
                 {route: values[index] for route, values in projected.items()}
@@ -134,6 +150,8 @@ class Transformer(TransformerDecoder):
                     for route in ("text", "flow")
                 }
             ),
+            # Calls without route spans run every token through the text
+            # expert.
             default_route="text",
         )
         self.config = config

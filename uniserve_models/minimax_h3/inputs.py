@@ -15,12 +15,20 @@ from .packing import Packing, video_latent_frames
 
 @dataclass(frozen=True, slots=True)
 class DenoiserSize:
-    """Describe one sample's output timeline and conditioning length."""
+    """Describe one sample's output timeline and conditioning length.
+
+    ``num_frames`` counts output video frames at 24 fps and must have the form
+    ``17 * n + 5`` with ``n`` positive; ``video_latent_frames`` raises
+    otherwise. ``num_text_tokens`` is either a request's exact prompt length
+    or, for a layout (see ``Denoiser.layout_size``), that length rounded up to
+    whole 64-row tiles.
+    """
 
     num_frames: int
     num_text_tokens: int
 
     def __post_init__(self):
+        # Raises ValueError for a frame count H3 does not generate.
         video_latent_frames(self.num_frames)
         if type(self.num_text_tokens) is not int or self.num_text_tokens < 1:
             raise ValueError(
@@ -32,6 +40,10 @@ class DenoiserSize:
 class DenoiserInput(BaseDenoiserInput[DenoiserSize]):
     """Carry ordered video/audio latents with one refined text tensor per sample."""  # noqa: E501
 
+    # Refined text from ``Conditioner.encode``, one [text rows, hidden_size]
+    # tensor per sample. On the first pipeline stage, ``Denoiser.forward``
+    # requires its rows to match the layout's text rows; callers zero the
+    # rows past the prompt.
     text_features: tuple[torch.Tensor, ...]
 
     def __post_init__(self):
@@ -48,7 +60,24 @@ class DenoiserInput(BaseDenoiserInput[DenoiserSize]):
 
 @dataclass(frozen=True, slots=True)
 class AttentionInput:
-    """Address one token shard within the complete mathematical packing."""
+    """Address one token shard within the complete mathematical packing.
+
+    ``__post_init__`` checks that ``token_slice`` is ``group``'s equal share of
+    the padded rows, that ``vsa`` describes the same row count, and that the
+    local index tables are 1-D int64.
+
+    Attributes:
+        packing: Complete packing of the layout being evaluated.
+        token_slice: Global packed rows this sequence rank holds.
+        group: Sequence-parallel group whose rank selects ``token_slice``.
+        vsa: Tile domains and borrowed index views shared by every layer's
+            sparse attention.
+        local_text_indices: Int64 shard rows, relative to
+            ``token_slice.start``, that hold text tokens.
+        local_video_indices: Int64 shard rows that hold video tokens, in
+            packed order.
+        local_audio_indices: Int64 shard rows that hold audio tokens.
+    """
 
     packing: Packing
     token_slice: slice

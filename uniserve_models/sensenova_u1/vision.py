@@ -1,4 +1,12 @@
-"""SenseNova's NEO patch projection, axial RoPE and dense spatial reduction."""
+"""SenseNova's NEO patch projection, axial RoPE and dense spatial reduction.
+
+``Encoder`` is the whole vision tower: a patch convolution, a 2D rotary
+rotation of the patch features and a strided convolution that merges each
+``factor x factor`` block of patches into one backbone token. The model
+instantiates it twice with separate weights: as the network wrapped by
+``Model.vision_encoder`` for input images, and as ``Denoiser.input`` for the
+image being denoised.
+"""
 
 import math
 from dataclasses import dataclass
@@ -13,6 +21,19 @@ from uniserve.nn.vision.position import build_abs_positions_from_grid_hw
 
 @dataclass(frozen=True)
 class Config:
+    """NEO vision tower dimensions.
+
+    Attributes:
+        hidden_size: Patch feature width; the rotary splits it into a column
+            half and a row half.
+        output_size: Token width after the dense reduction, which the model
+            config requires to equal the text hidden size.
+        downsample_ratio: Reciprocal of the dense reduction factor per axis.
+        patch_size: Input pixels per patch on each axis.
+        num_channels: Input image channels.
+        rope_theta: Base of the patch rotary frequencies.
+    """
+
     hidden_size: int
     output_size: int
     downsample_ratio: float
@@ -55,6 +76,15 @@ class Encoder(nn.Module):
     Columns rotate the first channel half and rows rotate the second, using
     interleaved pairs in FP32 before returning to the patch convolution dtype.
     Spatial reduction never crosses an image boundary.
+
+    ``pixels`` is either ``[images, channels, H, W]`` or packed patches
+    ``[patches, channels * patch_size**2]`` in CHW order, raster order within
+    each image. ``grids`` holds the same ``(rows, columns)`` patch grids as
+    the host ``grid_shapes``: the device copy yields rotary coordinates
+    without a host readback, which keeps that step capturable in a CUDA
+    graph, and the host copy drives validation and reshapes. Returns
+    ``[tokens, output_size]`` with each image's downsampled grid in raster
+    order, images concatenated.
     """
 
     def __init__(self, config: Config):

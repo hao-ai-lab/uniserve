@@ -1,4 +1,10 @@
-"""Qwen3 attention, experts and decoder layer composition."""
+"""Qwen3 attention, experts and decoder layer composition.
+
+``Transformer`` is the Qwen3 backbone: ``Model`` places it under a vocabulary
+head, and the MiniMax H3 text encoder uses it without the head. Traversal,
+pipeline exchange and the final norm belong to the shared
+``TransformerDecoder``; this module supplies the Qwen3 layer equations.
+"""
 
 from __future__ import annotations
 
@@ -32,6 +38,7 @@ def _activation(name: str) -> str:
         return "silu"
     if name in {"gelu", "gelu_and_mul", "geglu"}:
         return "gelu"
+    # Config accepts only the aliases above and the two tanh GELU spellings.
     return "gelu_pytorch_tanh"
 
 
@@ -78,14 +85,21 @@ class Attention(nn.Module):
             sequence_length=positions.numel(),
         )
 
-        # hidden: [tokens, hidden_size]; q/k/v: [tokens, heads, head_dim]
+        # hidden: [tokens, hidden_size]; q/k/v: [tokens, TP-local heads,
+        # head_dim]. Flattening the attended heads feeds the row-parallel
+        # output projection, which sums the TP shards.
         query, key, value = self.qkv(hidden, (cos,), (sin,))
         attended = self.attention(query, key, value, attention)
         return self.output(attended.flatten(1))
 
 
 class MoE(nn.Module):
-    """Top-k expert selection with a replicated mathematical router."""
+    """Top-k expert selection with a replicated mathematical router.
+
+    Expert weights are softmax probabilities renormalized over the selected
+    top-k. Every expert is a SiLU ``GatedMLP``, whatever
+    ``Config.hidden_act`` names; only the dense MLP reads it.
+    """
 
     def __init__(self, config: Config):
         super().__init__()
@@ -124,8 +138,9 @@ class TransformerLayer(nn.Module):
         )
 
     def forward(self, hidden, residual, positions, attention):
-        # The first layer has no incoming residual; later layers fuse the
-        # residual add into the norm to keep one kernel per normalization.
+        # Only the first layer of the first pipeline stage receives no
+        # residual; every other call fuses the residual add into the norm to
+        # keep one kernel per normalization.
         if residual is None:
             residual = hidden
             hidden = self.input_norm(hidden)
@@ -141,6 +156,10 @@ class TransformerLayer(nn.Module):
             self.post_attention_norm.weight,
             self.post_attention_norm.eps,
         )
+
+        # The MLP output stays unsummed: the next layer's input norm, possibly
+        # on the next pipeline stage, or ``TransformerDecoder.forward`` after
+        # the last layer adds the residual.
         return self.mlp(hidden), residual
 
 
@@ -148,6 +167,9 @@ class Transformer(TransformerDecoder):
     """Qwen3 decoder stack: embedding, pre-norm layers, and the final RMS norm."""  # noqa: E501
 
     def __init__(self, config: Config):
+        # Layer keys are global layer indices. Pipeline binding keeps the
+        # keys of its resident layers, so parameter paths still match the
+        # checkpoint names in ``weights.parameter_sources``.
         super().__init__(
             VocabParallelEmbedding(config.vocab_size, config.hidden_size),
             nn.ModuleDict(

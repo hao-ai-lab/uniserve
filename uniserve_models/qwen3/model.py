@@ -18,7 +18,13 @@ from .transformer import Transformer
 
 
 class Model(CausalLM):
-    """The same loaded Qwen computation for Python and serving callers."""
+    """The same loaded Qwen computation for Python and serving callers.
+
+    ``CausalLM`` supplies ``forward``, ``embed_input_ids`` and
+    ``compute_logits`` over the ``Transformer`` backbone and a
+    vocabulary-parallel head. Pipeline binding later drops the embedding
+    outside the first stage and the head outside the last one.
+    """
 
     def __init__(self, config: Config):
         super().__init__(
@@ -40,7 +46,12 @@ class Model(CausalLM):
 
 
 def entry_points(config: Config) -> Mapping[str, ComponentEntry]:
-    """Declare the numerical methods serving ranks may invoke on this model."""
+    """Declare the numerical methods serving ranks may invoke on this model.
+
+    Qwen3 exports the model root as its single component, whatever the
+    config. ``forward`` runs on every pipeline stage; token embedding runs
+    only on the first stage and logits only on the last.
+    """
     return MappingProxyType(
         {
             DEFAULT_COMPONENT: ComponentEntry(

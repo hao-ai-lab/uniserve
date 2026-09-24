@@ -1,4 +1,13 @@
-"""H3's learned Q/K normalization, partial RoPE and sparse tile compression."""
+"""H3's learned Q/K normalization, partial RoPE and sparse tile compression.
+
+``Attention`` owns the per-layer head projections and output projection and
+delegates the attention itself to ``uniserve.nn.attention.vsa``: text and
+audio query tiles attend every valid key tile, video query tiles attend the
+dense text/audio prefix plus a selected subset of video key tiles, and VSA
+adds a gated attention over mean-pooled tiles to that fine result. All token
+counts here are rows of the complete packing built by
+``packing.build_packing``.
+"""
 
 from __future__ import annotations
 
@@ -24,7 +33,12 @@ from .inputs import AttentionInput
 
 
 class Attention(nn.Module):
-    """Compose head projections and VSA over the complete visible key domain."""
+    """Compose head projections and VSA over the complete visible key domain.
+
+    The merged projection produces four branches: query, key, value, and
+    ``gate``, which weights VSA's compressed-tile attention elementwise before
+    it is added to the selected fine attention.
+    """
 
     def __init__(self, config: TransformerConfig):
         super().__init__()
@@ -49,6 +63,23 @@ class Attention(nn.Module):
     def workspace_buffers(
         self, num_tokens: int, num_query_tokens: int, *, dtype: torch.dtype
     ) -> Mapping[str, BufferConfig]:
+        """Describe the VSA scratch for one attention call.
+
+        Args:
+            num_tokens: Packed key rows, the complete padded token domain.
+            num_query_tokens: Query rows this rank attends for.
+            dtype: Dtype of the attention output; pooled statistics, tile
+                scores and compressed tiles are always FP32.
+
+        Returns:
+            Buffer declarations for this rank's local heads, keyed by the
+            ``vsa.Workspace`` field names ``forward_chunks`` reads.
+
+        Raises:
+            ValueError: Either count is not a positive multiple of the 64-row
+                tile, there are fewer than two key tiles, or the queries
+                exceed the keys.
+        """
         if (
             num_tokens < 128
             or num_query_tokens < 64
@@ -96,6 +127,14 @@ class Attention(nn.Module):
         *,
         workspace: Mapping[str, torch.Tensor],
     ) -> Iterator[tuple[slice, torch.Tensor]]:
+        """Attend this rank's token shard and yield projected output chunks.
+
+        ``hidden`` is the normalized shard, whole or as ``(global row slice,
+        rows)`` chunks. ``cos`` and ``sin`` hold the rotary factors of every
+        packed row, and ``workspace`` supplies the buffers
+        ``workspace_buffers`` declares. Yielded slices are global packed rows.
+        """
+
         def project():
             for interval, values in self.projection.forward_chunks(
                 hidden,
@@ -114,6 +153,8 @@ class Attention(nn.Module):
                 yield interval, (q, k, v, gate)
 
         batch = inputs.vsa
+        # Video key tiles each video query tile keeps beyond the dense prefix;
+        # VSA requires at least one.
         selected = max(1, math.ceil((1 - self.sparsity) * batch.video_tiles))
 
         buffers = vsa.Workspace(
