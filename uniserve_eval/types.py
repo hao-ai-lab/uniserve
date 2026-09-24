@@ -11,9 +11,13 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, TypeGuard
 
+# Endpoint paths. `send_request` in `uniserve_eval.transport.client` selects
+# the video and image-generations transports by path; any other endpoint uses
+# a chat transport.
 CHAT_COMPLETIONS = "/v1/chat/completions"
 IMAGES_GENERATIONS = "/v1/images/generations"
 VIDEOS_SYNC = "/v1/videos/sync"
+
 DEFAULT_I2T_QUESTION = "Describe this image in detail."
 
 MetricDirection = Literal["higher", "lower"]
@@ -32,7 +36,12 @@ class TaskName(StrEnum):
 
 @dataclass(frozen=True)
 class MetricDefinition:
-    """Selects a numeric summary metric and its preferred direction."""
+    """Selects a numeric summary metric and its preferred direction.
+
+    ``path`` addresses a value in the nested run-summary metrics mapping, one
+    key per element. The profile loader in ``uniserve_eval.config`` rejects
+    empty path segments; this type does not validate them.
+    """
 
     path: tuple[str, ...]
     direction: MetricDirection
@@ -49,7 +58,23 @@ class MetricDefinition:
 
 @dataclass(frozen=True)
 class LoadConfig:
-    """Configures warmup, arrivals, concurrency, and deterministic sampling."""
+    """Configures warmup, arrivals, concurrency, and deterministic sampling.
+
+    Attributes:
+        num_prompts: Number of measured rows; dataset loading fails unless
+            exactly this many rows resolve.
+        request_rate: Mean Poisson arrival rate in requests per second;
+            ``inf`` submits every request without delay.
+        max_concurrency: In-flight request limit shared by warmup and
+            measured requests, or ``None`` for no limit.
+        warmup_requests: Number of concurrent warmup requests, all built
+            from the first row and completed before measurement; ``0`` skips
+            warmup.
+        seed: Seeds row shuffling in the datasets that shuffle, arrival
+            intervals, and the image or video generation seed of rows that
+            carry none. The chat sampling ``seed`` comes from
+            ``SamplingConfig.sampling_seed`` instead.
+    """
 
     num_prompts: int = 1000
     request_rate: float = float("inf")
@@ -71,7 +96,22 @@ class LoadConfig:
 
 @dataclass(frozen=True)
 class SamplingConfig:
-    """Configures model sampling and endpoint-specific request extensions."""
+    """Configures model sampling and endpoint-specific request extensions.
+
+    Chat requests receive the sampling parameters and ``extra_body`` through
+    ``BenchmarkTask.apply_text_sampling``, which omits optional parameters
+    left as ``None`` and merges ``extra_body`` last. Image-generations
+    requests carry only ``extra_body``, and video requests carry no field of
+    this config.
+
+    ``max_tokens`` is the output limit of rows without their own; when both
+    are unset, the text task sends no limit and the i2t and interleave tasks
+    send 512. ``stream`` defaults to the task's ``default_stream`` when a
+    profile omits it; only the i2t task reads it, while the text and
+    interleave tasks always stream and the other tasks never do. With
+    ``ignore_eos`` set, the text and i2t tasks also validate fixed-length
+    output.
+    """
 
     temperature: float = 0.0
     top_p: float = 1.0
@@ -113,7 +153,13 @@ class ImageConfig:
 
 @dataclass(frozen=True)
 class VideoConfig:
-    """Configures generated duration and synthesized prompt length."""
+    """Configures generated duration and synthesized prompt length.
+
+    ``seconds`` is the requested duration of rows without a per-row override
+    and the duration ``VideoTask.validate_output`` checks every output
+    against. ``prompt_tokens`` is the tokenizer length of the prompts that
+    the MiniMax H3 dataset synthesizes.
+    """
 
     seconds: float = 5.0
     prompt_tokens: int = 1000
@@ -128,7 +174,14 @@ class VideoConfig:
 
 @dataclass(frozen=True)
 class Example:
-    """A dataset row with optional task-specific modality overrides."""
+    """A dataset row with optional task-specific modality overrides.
+
+    Populated override fields take precedence over the benchmark point's
+    configuration when a task builds the request. ``prompt_len`` and
+    ``output_len`` are dataset-side token counts that stand in for
+    server-reported usage when a chat response carries none; the text task
+    also uses ``output_len`` as its output limit.
+    """
 
     id: str
     prompt: str
@@ -165,7 +218,12 @@ class TaskRequest:
 
 @dataclass(frozen=True)
 class DecodedImage:
-    """Contains validated image bytes and content-derived metadata."""
+    """Contains validated image bytes and content-derived metadata.
+
+    Built by ``inspect_image_bytes`` in ``uniserve_eval.transport.images``:
+    ``mime`` is the detected format rather than the declared one, and
+    ``sample_filename`` is the SHA-256 digest plus the format's extension.
+    """
 
     data: bytes
     sha256: str
@@ -189,7 +247,12 @@ class DecodedImage:
 
 @dataclass(frozen=True)
 class DecodedVideo:
-    """Contains validated MP4 bytes and decoded stream metadata."""
+    """Contains validated MP4 bytes and decoded stream metadata.
+
+    Built by ``inspect_video_bytes``. The frame rate is the video stream's
+    average rate kept as an exact rational, and ``audio_samples`` counts
+    samples per channel.
+    """
 
     data: bytes
     sha256: str
@@ -246,7 +309,26 @@ class DecodedVideo:
 
 @dataclass
 class RequestRecord:
-    """Accumulates transport, timing, usage, and decoded-output observations."""
+    """Accumulates transport, timing, usage, and decoded-output observations.
+
+    ``send_request`` in ``uniserve_eval.transport.client`` creates one record
+    per request and calls ``begin`` before dispatch; the endpoint transports
+    then record the HTTP status, close the record, and classify it, and
+    ``send_request`` itself closes and classifies a record whose transport
+    raised an ``Exception``.
+
+    Absolute times are ``time.perf_counter()`` readings in seconds and are
+    comparable only with other readings of that clock in the same process.
+    ``scheduled_time`` is the arrival time assigned by the load generator,
+    or ``None`` for warmup; ``start_time`` is taken after any concurrency
+    queueing, so their difference is the client dispatch wait. ``latency``,
+    ``ttft``, and the image latencies are seconds from ``start_time``. All
+    durations become milliseconds only in ``record_dict``.
+
+    ``itl`` holds gaps in seconds between consecutive text-bearing stream
+    events, not per-token gaps, since one event may carry several tokens.
+    The streaming chat transport excludes gaps that span an image event.
+    """
 
     request_id: str
     task: str
@@ -313,7 +395,10 @@ class RequestRecord:
         self.latency = timestamp - self.start_time
 
     def mark_failure(self, classifier: str, error: str | None = None) -> None:
-        """Mark the request unsuccessful with a stable classifier."""
+        """Mark the request unsuccessful with a stable classifier.
+
+        An ``error`` of ``None`` keeps any previously recorded detail.
+        """
         self.success = False
         self.classifier = classifier
         if error is not None:
@@ -341,7 +426,14 @@ class RequestRecord:
             self.stop_reason = stop_reason
 
     def apply_usage(self, usage: dict[str, Any]) -> None:
-        """Apply authoritative token and image-step usage fields."""
+        """Apply authoritative token and image-step usage fields.
+
+        Reported token counts replace any earlier value and mark their source
+        as ``server_usage``, which ``apply_token_fallbacks`` does not
+        overwrite.
+        ``image_steps_per_image`` is recorded only when every entry is a
+        non-negative integer.
+        """
         if isinstance(usage.get("completion_tokens"), int):
             self.output_len = int(usage["completion_tokens"])
             self.output_len_source = "server_usage"
@@ -386,7 +478,20 @@ class RequestRecord:
         last_text_time: float | None,
         count_itl: bool,
     ) -> None:
-        """Append streamed text and update first-token or inter-token timing."""
+        """Append streamed text and update first-token or inter-token timing.
+
+        Args:
+            content: Text carried by one stream event.
+            timestamp: The event's client arrival time, or ``None`` when the
+                event is unstamped; unstamped text updates no timing.
+            last_text_time: Arrival time of the previous stamped text event,
+                owned by the caller; ``None`` makes this event the first
+                token for TTFT.
+            count_itl: Whether the gap since ``last_text_time`` is an
+                inter-token interval. The streaming chat transport passes
+                false after an image event so image generation time does not
+                enter ``itl``.
+        """
         self.token_timing_available = True
         self.generated_text += content
         if timestamp is None:
@@ -398,7 +503,10 @@ class RequestRecord:
             self.itl.append(timestamp - last_text_time)
 
     def add_image_arrival(self, count: int, timestamp: float | None) -> None:
-        """Record completion latency for newly observed image parts."""
+        """Record completion latency for newly observed image parts.
+
+        All ``count`` parts share the event's latency from ``start_time``.
+        """
         if timestamp is None:
             return
         latency = timestamp - self.start_time
@@ -410,7 +518,12 @@ class RequestRecord:
     def attach_images(
         self, decoded: list[DecodedImage], *, assign_json_latency: bool = False
     ) -> None:
-        """Attach validated images and optionally assign response latency to each."""  # noqa: E501
+        """Attach validated images and optionally assign response latency to each.
+
+        With ``assign_json_latency``, ``image_latencies`` is replaced by the
+        whole-request ``latency`` for every image, so the record must already
+        be closed.
+        """  # noqa: E501
         self.decoded_images = decoded
         self.images = len(decoded)
         if assign_json_latency and decoded:
@@ -439,7 +552,7 @@ class RequestRecord:
             "error": self.error,
             "warnings": list(self.warnings),
             "endpoint": self.endpoint,
-            # Absolute event timestamps support cross-process timeline joins.
+            # Absolute event timestamps are raw `time.perf_counter()` seconds.
             "scheduled_time": self.scheduled_time,
             "client_send_time": self.start_time,
             "http_response_time": self.http_response_time,
@@ -455,6 +568,9 @@ class RequestRecord:
             ),
             "e2e_ms": self.latency * 1000.0,
             "token_timing_available": self.token_timing_available,
+            # `ttft` stays 0.0 unless a stamped text event set it. TPOT divides
+            # the time from the first text event to the final event by the
+            # output tokens after the first.
             "ttft_ms": (
                 self.ttft * 1000.0
                 if self.token_timing_available and self.ttft
@@ -467,7 +583,8 @@ class RequestRecord:
             ),
             "itl_count": len(self.itl),
             # Token provenance distinguishes authoritative server counts from
-            # client-side fallbacks. Text remains available for paired analysis.
+            # client-side fallbacks. The full text is persisted along with its
+            # UTF-8 size and SHA-256 digest.
             "prompt_len": self.prompt_len,
             "output_len": self.output_len,
             "requested_output_len": self.requested_output_len,
@@ -531,6 +648,7 @@ class BenchmarkPoint:
 
     def __post_init__(self) -> None:
         """Normalize the task identifier and require protected metrics."""
+        # The dataclass is frozen, so normalization bypasses its __setattr__.
         object.__setattr__(self, "task", TaskName(self.task))
         if not self.metrics:
             raise ValueError(
@@ -540,6 +658,8 @@ class BenchmarkPoint:
     def workload_dict(self) -> dict[str, Any]:
         """Return the benchmark workload as a JSON-compatible mapping."""
         load = asdict(self.load)
+        # JSON has no infinity; "inf" is the spelling that
+        # `uniserve_eval.config` accepts for an unlimited request rate.
         load["request_rate"] = (
             "inf"
             if math.isinf(self.load.request_rate)
@@ -587,7 +707,14 @@ class ValidationResult:
         }
 
     def merged(self, other: ValidationResult) -> ValidationResult:
-        """Combine validation reports whose check names do not overlap."""
+        """Combine validation reports whose check names do not overlap.
+
+        Statistics are merged with ``other`` winning on duplicate keys, and
+        warnings are concatenated.
+
+        Raises:
+            ValueError: The two reports share a check name.
+        """
         overlap = set(self.checks) & set(other.checks)
         if overlap:
             raise ValueError(
@@ -614,7 +741,12 @@ def _is_token_count(value: Any) -> TypeGuard[int]:
 
 
 def selected_rows_identity(rows: list[Example]) -> dict[str, Any]:
-    """Return a deterministic count and digest for selected dataset rows."""
+    """Return a deterministic count and digest for selected dataset rows.
+
+    The digest covers each row's populated fields in row order, serialized
+    as canonical JSON, so the same rows in the same order yield the same
+    identity across runs.
+    """
     encoded = json.dumps(
         [row.as_dict() for row in rows],
         sort_keys=True,

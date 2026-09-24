@@ -1,4 +1,24 @@
-"""Executes one benchmark point and writes its complete result bundle."""
+"""Executes one benchmark point and writes its complete result bundle.
+
+`cli.run` calls `run_point` once per point while the point's server is up.
+The bundle in the output directory contains:
+
+- `run.json`: the lifecycle record, rewritten as the status moves from
+  `preparing` to `running` (once dataset rows are selected) and then to
+  `completed` or `failed`; a failure before row selection goes directly from
+  `preparing` to `failed`.
+- `warmup_requests.jsonl` and `requests.jsonl`: warmup and measured request
+  records; only measured records feed metrics and validation.
+- `gpu_samples.jsonl`: `GpuStorageSampler` telemetry snapshots.
+- `samples/`: decoded image and video outputs referenced by the records.
+- `summary.json` and `summary.md`: the validated summary, written only on the
+  completion path.
+
+`run.json` is written last on both the completion and failure paths, so a
+bundle is complete only when its `run.json` status is `completed`. If an
+artifact write on the failure path raises, `run.json` keeps its earlier
+status.
+"""
 
 from __future__ import annotations
 
@@ -32,7 +52,28 @@ async def run_point(
     launch: dict[str, Any] | None = None,
     timeout_s: float = 6 * 60 * 60.0,
 ) -> RunResult:
-    """Run dataset loading, warmup, measured load, validation, and persistence."""  # noqa: E501
+    """Run dataset loading, warmup, measured load, validation, and persistence.
+
+    Args:
+        base_url: The server origin, with or without a trailing slash.
+        point: The resolved benchmark point to execute.
+        output_dir: The bundle directory; it must be absent or empty.
+        launch: The `describe_launch` provenance record, if any.
+        timeout_s: The httpx timeout in seconds, applied to each connect,
+            read, write, and pool wait of a benchmark request; the
+            `/version` provenance fetch uses its own shorter timeout.
+
+    Returns:
+        The summary and bundle directory. A point whose validation fails
+        still returns normally, with `validation.valid` false.
+
+    Raises:
+        FileExistsError: If `output_dir` is not empty; nothing is written.
+        BaseException: Any error from task lookup, dataset loading, the load
+            run (including `WarmupFailure`), summarizing, or artifact writing
+            is re-raised after the failed `run.json` is written, provided the
+            failure path's own artifact writes succeed.
+    """  # noqa: E501
     output_path = Path(output_dir)
     if output_path.exists() and any(output_path.iterdir()):
         raise FileExistsError(f"result directory is not empty: {output_path}")
@@ -60,9 +101,9 @@ async def run_point(
     )
 
     try:
-        # Dataset selection and request construction are fixed before the
-        # measured window opens, and their identity is persisted with the
-        # running state.
+        # The task adapter and dataset rows are fixed before the measured
+        # window opens, and the rows' identity is persisted with the running
+        # state.
         task = get_task(point.task)(point)
         rows, tokenizer = load_examples(point)
         selection = selected_rows_identity(rows)
@@ -77,7 +118,14 @@ async def run_point(
             ),
         )
 
+        # `get_request` in `uniserve_eval.load.arrival` draws exponential
+        # inter-arrival gaps from the global NumPy generator, so seeding it
+        # makes a finite-rate arrival schedule reproducible.
         np.random.seed(point.load.seed)
+
+        # The connection pool is unbounded, so the only client-side limit on
+        # in-flight requests is `run_load`'s optional `max_concurrency`
+        # semaphore.
         limits = httpx.Limits(
             max_connections=None, max_keepalive_connections=None
         )
@@ -88,8 +136,16 @@ async def run_point(
             async def submit(
                 example: Example, scheduled: float | None
             ) -> RequestRecord:
-                """Build and send one task request with its timing fallbacks."""
+                """Build and send one task request with its token fallbacks.
+
+                `scheduled` is None for warmup requests and the measured
+                arrival time from `time.perf_counter` otherwise.
+                """
                 request = task.build_request(example)
+
+                # The fallback becomes the record's `requested_output_len`;
+                # it is 0 when neither the row nor `sampling.max_tokens`
+                # declares an output limit.
                 output_len_fallback = int(
                     example.output_len
                     if example.output_len is not None
@@ -106,6 +162,8 @@ async def run_point(
                     scheduled_time=scheduled,
                 )
 
+            # Sampling spans warmup, the settle pause, and the measured
+            # window.
             sampler = GpuStorageSampler()
             sampler.start()
 
@@ -118,6 +176,9 @@ async def run_point(
                     warmup_requests=point.load.warmup_requests,
                 )
             except WarmupFailure as error:
+                # `WarmupFailure` is the only `run_load` exception that
+                # carries outputs; keeping them lets the failure bundle
+                # persist the warmup records.
                 warmup_records = cast(list[RequestRecord], list(error.outputs))
                 raise
             finally:
@@ -130,6 +191,8 @@ async def run_point(
             )
             records = cast(list[RequestRecord], list(load_result.outputs))
             duration = load_result.duration_s
+
+            # Provenance is fetched after the measured window closes.
             server_version = await _fetch_server_version(client, base_url)
 
         summary = build_summary(
@@ -144,10 +207,11 @@ async def run_point(
             launch=launch_record,
         )
 
-        # The completed lifecycle record is written after every result
-        # artifact so it acts as the bundle's commit marker.
         if sampler.summary() is not None:
             summary["gpu_memory"] = sampler.summary()
+
+        # The completed lifecycle record is written after every result
+        # artifact so it acts as the bundle's commit marker.
         _write_records(writer, "warmup_requests.jsonl", warmup_records)
         _write_records(writer, "requests.jsonl", records)
         writer.write_jsonl("gpu_samples.jsonl", list(sampler.sample_records))
@@ -169,8 +233,11 @@ async def run_point(
         )
         return RunResult(summary, output_path)
     except BaseException as error:
-        # Failure artifacts preserve every record collected before the
-        # exception.
+        # `run_load` returns no partial results, so the streams hold warmup
+        # records from a `WarmupFailure`, both streams when the failure came
+        # after `run_load` returned, and nothing otherwise. `BaseException`
+        # also covers cancellation and KeyboardInterrupt. `stop` is
+        # idempotent, so a second call after the `finally` above is safe.
         if sampler is not None:
             sampler.stop()
         _write_records(writer, "warmup_requests.jsonl", warmup_records)
@@ -207,7 +274,16 @@ def _write_records(
     name: str,
     records: list[RequestRecord],
 ) -> None:
-    """Persist decoded media samples and their request records."""
+    """Persist decoded media samples and their request records.
+
+    Samples are written under `samples/` before the JSONL stream that
+    references them.
+
+    Raises:
+        ValueError: From `ArtifactWriter`, including `ImageOutputError` and
+            `VideoOutputError`, when sample bytes fail inspection, do not
+            match their recorded metadata, or collide with a different sample.
+    """
     for record in records:
         for image in record.decoded_images:
             writer.write_image_sample(image)
@@ -226,7 +302,12 @@ def _run_state(
     completed_at: float | None = None,
     valid: bool | None = None,
 ) -> dict[str, Any]:
-    """Build the lifecycle record for the benchmark's current state."""
+    """Build the lifecycle record for the benchmark's current state.
+
+    Optional fields are included only when provided, so a `preparing` record
+    carries no row identity and only terminal records carry `completed_at`
+    and `valid`.
+    """
     state: dict[str, Any] = {
         "status": status,
         "benchmark": point.name,
@@ -246,7 +327,15 @@ def _run_state(
 async def _fetch_server_version(
     client: httpx.AsyncClient, base_url: str
 ) -> dict[str, Any] | None:
-    """Fetch optional server provenance without affecting benchmark completion."""  # noqa: E501
+    """Fetch optional server provenance without affecting benchmark completion.
+
+    UniServe serves `GET /version`; any JSON object response is accepted.
+
+    Returns:
+        The response object, or None on a non-200 status, a body that is not
+        a JSON object, or any `Exception` raised by the request or decoding.
+    """  # noqa: E501
+    # The short per-call timeout overrides the client's request timeout.
     try:
         response = await client.get(
             base_url.rstrip("/") + "/version", timeout=15.0

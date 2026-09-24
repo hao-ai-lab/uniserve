@@ -1,4 +1,12 @@
-"""Defines synchronous text-to-video-with-audio benchmark behavior."""
+"""Defines synchronous text-to-video-with-audio benchmark behavior.
+
+Requests go to ``/v1/videos/sync``, whose response body is the encoded MP4
+itself; ``uniserve_eval.transport.video`` decodes it into the ``DecodedVideo``
+metadata that ``VideoTask.validate_output`` checks. The expected raster, frame
+rate, codecs, and audio clock are the fixed output contract of the MiniMax H3
+profile (``uniserve_models.minimax_h3`` and the worker's MP4 muxer in
+``uniserve_worker.media.container``).
+"""
 
 from __future__ import annotations
 
@@ -50,6 +58,12 @@ class VideoTask(BenchmarkTask):
         self, records: Sequence[RequestRecord]
     ) -> ValidationResult:
         """Validate fixed video geometry, codecs, audio, and duration alignment."""  # noqa: E501
+        # The expected frame count reproduces the server's duration resolution
+        # in `InputProcessor::video_sampling`: round seconds to the nearest
+        # frame at 24 fps, then round up to the form 17k + 5 (k media units of
+        # 17 frames plus a final 5-frame tail), as `align_num_frames` does.
+        # Rows that override `seconds` are still checked against the point's
+        # duration.
         raw_frames = math.floor(float(self.point.video.seconds) * 24.0 + 0.5)
         expected_frames = int(raw_frames + (5 - raw_frames) % 17)
         outputs = [record.decoded_video for record in records]
@@ -57,6 +71,9 @@ class VideoTask(BenchmarkTask):
             output is not None for output in outputs
         )
         videos = [output for output in outputs if output is not None]
+
+        # Audio and video stream durations may differ by at most one frame
+        # period.
         duration_tolerance_s = 1.0 / 24.0
         return ValidationResult(
             checks={
@@ -68,6 +85,8 @@ class VideoTask(BenchmarkTask):
                     video.width == 1344
                     and video.height == 768
                     and video.frame_count == expected_frames
+                    # The container frame rate is a rational; require exactly
+                    # 24 fps.
                     and video.fps_numerator == 24 * video.fps_denominator
                     for video in videos
                 ),

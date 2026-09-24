@@ -1,4 +1,16 @@
-"""Decodes and validates synchronous raw-MP4 responses."""
+"""Decodes and validates synchronous raw-MP4 responses.
+
+``/v1/videos/sync`` returns the encoded MP4 itself as the response body.
+``inspect_video_bytes`` checks the declared media type and stream layout,
+fully decodes both streams, and returns a ``DecodedVideo`` whose metadata is
+derived from the bytes and the normalized media type. Model-specific
+expectations such as codecs, raster, frame count, and audio format are
+checked by ``VideoTask.validate_output``, not here.
+
+``ArtifactWriter.write_video_sample`` inspects the sample bytes again before
+storing them and requires metadata equal to the transport's result, so the
+returned metadata must stay a deterministic function of those inputs.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +22,12 @@ from ..types import DecodedVideo
 
 
 class VideoOutputError(ValueError):
-    """Carries a stable classifier and detail for invalid video output."""
+    """Carries a stable classifier and detail for invalid video output.
+
+    The video transport in ``uniserve_eval.transport.client`` records
+    ``classifier`` on the ``RequestRecord``, and ``build_summary`` in
+    ``uniserve_eval.pipeline.report`` counts records per classifier.
+    """
 
     def __init__(self, classifier: str, message: str) -> None:
         """Initialize the error with its classifier and diagnostic detail."""
@@ -19,7 +36,26 @@ class VideoOutputError(ValueError):
 
 
 def inspect_video_bytes(data: bytes, *, declared_mime: str) -> DecodedVideo:
-    """Decode one video and audio stream and return verified media metadata."""
+    """Decode one video and audio stream and return verified media metadata.
+
+    Args:
+        data: The complete response body.
+        declared_mime: The response ``Content-Type``; parameters after ``;``
+            are ignored.
+
+    Returns:
+        The body with its metadata. Frame and sample counts come from full
+        decoding; ``sample_filename`` is named by the SHA-256 of ``data``.
+
+    Raises:
+        VideoOutputError: The body is empty, the media type is not
+            ``video/mp4``, the container does not hold exactly one video and
+            one audio stream, the audio channel count or sample rate changes
+            between frames, the video stream has no average frame rate,
+            either stream decodes nothing, or any other exception is raised
+            inside the decode block, including a failed ``av`` import, which
+            is wrapped with the ``response_undecodable_video`` classifier.
+    """
     # Validate the HTTP-level envelope before invoking the media decoder.
     if not data:
         raise VideoOutputError(
@@ -33,11 +69,14 @@ def inspect_video_bytes(data: bytes, *, declared_mime: str) -> DecodedVideo:
         )
 
     try:
+        # A missing av module is caught below and classified
+        # response_undecodable_video.
         import av
 
         with av.open(io.BytesIO(data), mode="r", format="mp4") as container:
-            # The public response contract requires exactly one stream of each
-            # modality so aggregate metadata is unambiguous.
+            # The metadata below describes one stream per modality, and
+            # `container.decode(video=0, audio=0)` reads only the first stream
+            # of each, so additional streams are rejected rather than ignored.
             video_streams = list(container.streams.video)
             audio_streams = list(container.streams.audio)
             if len(video_streams) != 1 or len(audio_streams) != 1:
@@ -60,6 +99,8 @@ def inspect_video_bytes(data: bytes, *, declared_mime: str) -> DecodedVideo:
                     frame_count += 1
                     continue
                 if isinstance(frame, av.AudioFrame):
+                    # `samples` counts samples per channel, so the total over
+                    # sample rate is the audio duration in seconds.
                     audio_samples += int(frame.samples)
                     channels = len(frame.layout.channels)
                     rate = int(frame.sample_rate)
@@ -94,6 +135,8 @@ def inspect_video_bytes(data: bytes, *, declared_mime: str) -> DecodedVideo:
                     "response_undecodable_video",
                     "video or audio stream decoded no frames",
                 )
+            # A positive sample count implies an audio frame set both values;
+            # this check narrows their types.
             if audio_channels is None or audio_sample_rate is None:
                 raise VideoOutputError(
                     "response_undecodable_audio",

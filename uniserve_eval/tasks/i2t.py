@@ -20,12 +20,25 @@ class I2TTask(BenchmarkTask):
 
     name: ClassVar[TaskName] = TaskName.I2T
     default_stream: ClassVar[bool] = True
+    # `accepts_image` gates the point's image-generation settings table, which
+    # does not apply to text output. The input image comes from the dataset
+    # row instead.
     accepts_image: ClassVar[bool] = False
     accepts_question: ClassVar[bool] = True
     image_count: ClassVar[ImageCountRule] = ImageCountRule.FORBIDDEN
 
     def build_request(self, example: Example) -> TaskRequest:
-        """Build a chat request containing text and an embedded input image."""
+        """Build a chat request containing text and an embedded input image.
+
+        The output limit is the row's ``max_tokens``, else the point's
+        ``sampling.max_tokens``, else 512. Unlike the text and interleave
+        tasks, this task honors ``sampling.stream`` and sends a non-streaming
+        request when it is false.
+
+        Raises:
+            ValueError: If the row has no base64 image or an invalid MIME
+                type.
+        """
         sampling = self.point.sampling
         max_tokens = int(
             example.max_tokens
@@ -52,6 +65,9 @@ class I2TTask(BenchmarkTask):
             "max_completion_tokens": max_tokens,
         }
         self.apply_text_sampling(payload)
+
+        # `validate_output` requires server-reported usage, which an
+        # OpenAI-compatible stream carries only when `include_usage` is set.
         if sampling.stream:
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}

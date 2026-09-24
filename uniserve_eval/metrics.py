@@ -1,4 +1,12 @@
-"""Computes request, token, image, and video benchmark metrics."""
+"""Computes request, token, image, and video benchmark metrics.
+
+``build_summary`` calls ``summarize`` on the measured ``RequestRecord`` list
+and the measured duration from ``run_load``. Record latencies (end-to-end,
+TTFT, image) are seconds measured from each request's client send time,
+which follows any client-side concurrency queueing. Reported latency
+distributions are in milliseconds. Throughputs and per-second rates divide by
+the measured window; the one-second peaks from ``_peak_per_second`` do not.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +18,10 @@ from .types import RequestRecord
 
 
 def percentile(values: list[float], p: float) -> float:
-    """Return a percentile, using zero for an empty population."""
+    """Return a percentile, using zero for an empty population.
+
+    Uses NumPy's default linear interpolation between order statistics.
+    """
     if len(values) == 0:
         return 0.0
     return float(np.percentile(values, p))
@@ -39,7 +50,12 @@ def _min(values: list[float]) -> float:
 def distribution(
     values: list[float], *, scale: float = 1.0
 ) -> dict[str, float | int]:
-    """Summarize a population with count, moments, extrema, and percentiles."""
+    """Summarize a population with count, moments, extrema, and percentiles.
+
+    Every statistic except ``count`` is multiplied by ``scale``, which callers
+    use to convert seconds to milliseconds. An empty population reports zero
+    for every statistic.
+    """
     return {
         "count": len(values),
         "mean": _mean(values) * scale,
@@ -59,7 +75,22 @@ def summarize(
     *,
     tokenizer: Any | None = None,
 ) -> dict[str, Any]:
-    """Build aggregate throughput and latency metrics from successful records."""  # noqa: E501
+    """Build aggregate throughput and latency metrics from successful records.
+
+    Args:
+        records: Measured request records; warmup records are excluded by the
+            caller.
+        dur_s: Measured wall-clock window in seconds, the denominator of
+            every throughput and of ``concurrency``.
+        tokenizer: Optional tokenizer for retokenized output counts. The
+            benchmark runner passes the dataset tokenizer, which is loaded
+            only for datasets that require one.
+
+    Returns:
+        A JSON-compatible metric mapping. Media keys are present only when
+        successful records produced that modality, and retokenized keys only
+        when ``tokenizer`` is given.
+    """  # noqa: E501
     # Failed requests remain validation inputs but do not contribute
     # service-rate or latency populations. Token metrics additionally
     # require stream timing.
@@ -72,6 +103,9 @@ def summarize(
     output_lens = [record.output_len for record in successful]
     total_input = sum(record.prompt_len for record in successful)
     ttfts = [record.ttft for record in timed if record.token_timing_available]
+    # TPOT spreads the time after the first token over the remaining output
+    # tokens, so it includes any delay between the last text event and the
+    # final stream event that closes ``latency``.
     tpots = [
         (record.latency - record.ttft) / (record.output_len - 1)
         for record in timed
@@ -86,6 +120,8 @@ def summarize(
     e2e = [record.latency for record in successful]
     total_output = sum(output_lens)
     duration = max(dur_s, 1e-9)
+
+    # Both peaks consider only records with stream timing.
     timed_success = [
         record for record in timed if record.token_timing_available
     ]
@@ -95,7 +131,8 @@ def summarize(
 
     # The measured wall-clock window is the shared denominator for
     # throughput and time-integrated concurrency; its floor only protects
-    # empty synthetic inputs.
+    # empty synthetic inputs. ``concurrency`` is the time-averaged number of
+    # in-flight successful requests: summed e2e latency over the window.
     summary: dict[str, Any] = {
         "completed": len(successful),
         "completed_requests": len(successful),
@@ -144,6 +181,8 @@ def summarize(
     ]
     total_images = sum(record.images for record in successful)
     if total_images:
+        # When no successful record carries per-image latencies, each image
+        # is assigned its request's end-to-end latency.
         if not image_latencies:
             image_latencies = [
                 record.latency
@@ -169,6 +208,7 @@ def summarize(
     if videos:
         summary["completed_videos"] = len(videos)
         summary["videos_per_second"] = len(videos) / duration
+        # Only MP4 bytes of returned videos count; images do not contribute.
         summary["media_bytes_per_second"] = (
             sum(video.byte_size for video in videos) / duration
         )
@@ -184,7 +224,17 @@ def summarize(
 
 
 def _peak_per_second(successful: list[RequestRecord]) -> tuple[float, int]:
-    """Return peak one-second token completions and overlapping requests."""
+    """Return peak one-second token completions and overlapping requests.
+
+    Time is divided into one-second buckets from the earliest request start.
+    Token arrivals are reconstructed as ``start_time + ttft`` followed by the
+    cumulative recorded ``itl`` gaps, so each streamed text event counts as
+    one token, and only text events whose gap ``RequestRecord.add_text``
+    records as an inter-token latency follow the first. A request counts toward
+    every bucket its start-to-end interval touches, so the request peak can
+    exceed the instantaneous maximum concurrency. The two peaks are
+    maximized independently and may come from different buckets.
+    """
     if not successful:
         return 0.0, 0
     start = min(record.start_time for record in successful)
@@ -192,6 +242,7 @@ def _peak_per_second(successful: list[RequestRecord]) -> tuple[float, int]:
     buckets = int(np.ceil(end - start)) + 1
     tokens = np.zeros(buckets)
     requests = np.zeros(buckets)
+
     for record in successful:
         token_times = [record.start_time + record.ttft]
         for latency in record.itl:
@@ -204,4 +255,5 @@ def _peak_per_second(successful: list[RequestRecord]) -> tuple[float, int]:
         last = int(record.start_time + record.latency - start)
         for index in range(first, min(last + 1, buckets)):
             requests[index] += 1
+
     return float(np.max(tokens)), int(np.max(requests))

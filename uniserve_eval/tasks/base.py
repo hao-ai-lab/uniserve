@@ -1,4 +1,11 @@
-"""Defines shared request construction and observable output validation."""
+"""Defines shared request construction and observable output validation.
+
+A task adapter maps a normalized dataset `Example` to an HTTP request and
+judges the resulting `RequestRecord`s. Profile parsing in `config` consults
+the adapter's class attributes and `check_*` class methods before a
+`BenchmarkPoint` exists; `run_point` then binds an instance to the point to
+build requests and validate the measured records.
+"""
 
 from __future__ import annotations
 
@@ -27,7 +34,22 @@ class ImageCountRule(StrEnum):
 
 
 class BenchmarkTask:
-    """Defines the endpoint, request, and validation contract for a task."""
+    """Defines the endpoint, request, and validation contract for a task.
+
+    `config` reads these attributes and runs the `check_*` class methods
+    while parsing a profile; request building does not recheck them.
+
+    Attributes:
+        name: The task identifier; `TASKS` registers each adapter under
+            this identifier's value.
+        allowed_endpoints: Endpoints `check_endpoint` accepts.
+        default_endpoint: Endpoint used when a point declares none.
+        default_stream: `sampling.stream` value used when a point declares
+            none.
+        accepts_image: Whether a point may declare an `image` settings table.
+        accepts_question: Whether a point may declare a dataset `question`.
+        image_count: How `check_image` treats `image.image_count`.
+    """
 
     name: ClassVar[TaskName]
     allowed_endpoints: ClassVar[tuple[str, ...]] = (CHAT_COMPLETIONS,)
@@ -42,11 +64,22 @@ class BenchmarkTask:
         self.point = point
 
     def build_request(self, example: Example) -> TaskRequest:
-        """Construct the endpoint request for one normalized example."""
+        """Construct the endpoint request for one normalized example.
+
+        Subclasses must implement this.
+        """
         raise NotImplementedError
 
     def validate(self, records: Sequence[RequestRecord]) -> ValidationResult:
-        """Combine request-level checks with task-specific output checks."""
+        """Combine request-level checks with task-specific output checks.
+
+        `declared_request_count` requires exactly `load.num_prompts` measured
+        records, and `all_requests_succeeded` fails on an empty record list.
+
+        Raises:
+            ValueError: If `validate_output` returns a check named
+                `declared_request_count` or `all_requests_succeeded`.
+        """
         common = ValidationResult(
             checks={
                 "declared_request_count": len(records)
@@ -66,7 +99,11 @@ class BenchmarkTask:
     def validate_output(
         self, records: Sequence[RequestRecord]
     ) -> ValidationResult:
-        """Validate output properties specific to the task."""
+        """Validate output properties specific to the task.
+
+        Subclasses may override this; the default requires only that records
+        exist.
+        """
         return ValidationResult(checks={"observable_output": bool(records)})
 
     @classmethod
@@ -108,7 +145,11 @@ class BenchmarkTask:
             )
 
     def apply_text_sampling(self, payload: dict[str, Any]) -> None:
-        """Add configured text-sampling fields to an endpoint payload."""
+        """Add configured text-sampling fields to an endpoint payload.
+
+        Optional fields are added only when configured. `extra_body` is merged
+        last, so its keys override every field set here.
+        """
         sampling = self.point.sampling
         payload["temperature"] = sampling.temperature
         payload["top_p"] = sampling.top_p
@@ -130,7 +171,23 @@ class BenchmarkTask:
     def image_fields(
         self, example: Example, *, include_count: bool
     ) -> dict[str, Any]:
-        """Resolve image settings by applying per-example overrides."""
+        """Resolve image settings by applying per-example overrides.
+
+        Example width, height, and steps override the point's image
+        settings, and an example seed overrides `load.seed`, the seed that
+        also drives arrival sampling. Width and height are emitted only as a
+        pair.
+
+        Args:
+            example: The example whose overrides apply.
+            include_count: Whether to add `num_images` from
+                `image.image_count` when it is set.
+
+        Returns:
+            Fields in the chat-completions `image_config` layout, which
+            `apply_image_generations_fields` maps onto the image-generations
+            schema.
+        """
         image = self.point.image
         width = example.width if example.width is not None else image.width
         height = example.height if example.height is not None else image.height
@@ -138,6 +195,7 @@ class BenchmarkTask:
         seed = (
             example.seed if example.seed is not None else self.point.load.seed
         )
+
         payload: dict[str, Any] = {"seed": int(seed)}
         if include_count and image.image_count is not None:
             payload["num_images"] = image.image_count
@@ -163,7 +221,11 @@ class BenchmarkTask:
     def apply_image_generations_fields(
         self, payload: dict[str, Any], example: Example
     ) -> None:
-        """Map resolved image settings onto the image-generations schema."""
+        """Map resolved image settings onto the image-generations schema.
+
+        Width and height become one `size` string of the form `WxH`; the
+        image count and `resolution` fields are not carried over.
+        """
         rendered = self.image_fields(example, include_count=False)
         width = rendered.get("width")
         height = rendered.get("height")
@@ -182,7 +244,14 @@ class BenchmarkTask:
                 payload[key] = rendered[key]
 
     def input_image_data_url(self, example: Example) -> str:
-        """Build a validated embedded data URL for an example image."""
+        """Build a validated embedded data URL for an example image.
+
+        The MIME type defaults to `image/png` when the row declares none.
+
+        Raises:
+            ValueError: If the row has no base64 payload or its MIME type is
+                not an image type.
+        """
         image_b64 = example.input_image_b64
         if not isinstance(image_b64, str) or not image_b64:
             raise ValueError("input image row has no base64 payload")
@@ -194,7 +263,12 @@ class BenchmarkTask:
     def image_integrity_checks(
         self, records: Sequence[RequestRecord]
     ) -> dict[str, bool]:
-        """Check decoded image counts and configured output geometry."""
+        """Check decoded image counts and configured output geometry.
+
+        Decoded sizes are compared with the point's configured width and
+        height, not per-example overrides; an unset dimension is not checked.
+        Both checks pass trivially for records without images.
+        """
         image = self.point.image
         decoded_counts = all(
             record.images == len(record.decoded_images) for record in records
@@ -211,7 +285,11 @@ class BenchmarkTask:
         }
 
     def server_usage_ok(self, records: Sequence[RequestRecord]) -> bool:
-        """Report whether every request uses server-reported token counts."""
+        """Report whether every request uses server-reported token counts.
+
+        Both prompt and output lengths must come from server usage rather than
+        request-side fallbacks. An empty record list fails.
+        """
         return bool(records) and all(
             record.output_len_source == "server_usage"
             and record.prompt_len_source == "server_usage"
@@ -219,7 +297,12 @@ class BenchmarkTask:
         )
 
     def fixed_output_length_ok(self, records: Sequence[RequestRecord]) -> bool:
-        """Report whether every completion reaches its requested token limit."""
+        """Report whether every completion reaches its requested token limit.
+
+        `requested_output_len` is the output limit `run_point` passed to the
+        transport, 0 when none was declared, so a point without an output
+        limit always fails. An empty record list fails.
+        """
         return bool(records) and all(
             record.requested_output_len > 0
             and record.output_len == record.requested_output_len

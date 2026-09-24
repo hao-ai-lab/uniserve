@@ -1,4 +1,10 @@
-"""Loads deterministic UEval prompts for interleaved generation."""
+"""Loads deterministic UEval prompts for interleaved generation.
+
+Rows come from a local file or from every split of the hosted dataset. Only
+a text prompt is taken from each row: the stripped value of the first field
+in ``_PROMPT_FIELDS`` that holds a non-blank string. Rows without one are
+dropped.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +18,7 @@ from ..types import BenchmarkPoint, Example
 from .base import Dataset
 
 UEVAL_HF_REPO = "zlab-princeton/UEval"
+# Candidate prompt fields in priority order.
 _PROMPT_FIELDS = ("prompt", "question", "instruction", "input", "query", "text")
 
 
@@ -21,7 +28,11 @@ class UEvalDataset(Dataset):
     name: ClassVar[str] = "ueval"
 
     def load(self, tokenizer: Any | None = None) -> list[Example]:
-        """Extract, shuffle, and select the declared number of prompts."""
+        """Extract, shuffle, and select the declared number of prompts.
+
+        Rows without a prompt are dropped before the seeded shuffle; example
+        ids number the selected prompts in shuffled order.
+        """
         point = self.point
         raw = (
             _load_local(point.dataset_path)
@@ -40,7 +51,13 @@ class UEvalDataset(Dataset):
 
 
 def _load_local(dataset_path: str) -> list[dict[str, Any]]:
-    """Load object rows from a local Parquet, JSON array, or JSON Lines file."""
+    """Load object rows from a local Parquet, JSON array, or JSON Lines file.
+
+    A ``.parquet`` suffix selects the ``datasets`` Parquet loader (its
+    ``train`` split). Otherwise text starting with ``[`` after leading
+    whitespace is parsed as one JSON array, and any other text as JSON
+    Lines. Rows that are not JSON objects are skipped.
+    """
     path = Path(dataset_path)
     if path.suffix.lower() == ".parquet":
         load_dataset = getattr(
@@ -48,6 +65,7 @@ def _load_local(dataset_path: str) -> list[dict[str, Any]]:
         )
         dataset = load_dataset("parquet", data_files=str(path), split="train")
         return [dict(row) for row in dataset]
+
     text = path.read_text(encoding="utf-8")
     stripped = text.lstrip()
     if stripped.startswith("["):
@@ -63,7 +81,13 @@ def _load_local(dataset_path: str) -> list[dict[str, Any]]:
 
 
 def _load_hf(point: BenchmarkPoint) -> list[dict[str, Any]]:
-    """Flatten all splits from the configured UEval hub revision."""
+    """Flatten all splits from the configured UEval hub revision.
+
+    Splits are concatenated in the order the loaded dataset lists them.
+
+    Raises:
+        ImportError: If the ``datasets`` package is not installed.
+    """
     try:
         load_dataset = getattr(
             importlib.import_module("datasets"), "load_dataset"
@@ -74,6 +98,8 @@ def _load_hf(point: BenchmarkPoint) -> list[dict[str, Any]]:
             "the 'datasets' package"
         ) from error
     dataset = load_dataset(UEVAL_HF_REPO, revision=point.dataset_revision)
+
+    # A split mapping exposes ``keys``; a single split is iterated directly.
     rows: list[dict[str, Any]] = []
     if hasattr(dataset, "keys"):
         for key in dataset.keys():
