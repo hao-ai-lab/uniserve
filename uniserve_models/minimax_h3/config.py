@@ -1,4 +1,12 @@
-"""Normalize the fixed FastH3 checkpoint architecture and diffusion recipe."""
+"""Normalize the fixed FastH3 checkpoint architecture and diffusion recipe.
+
+``read_config`` reads the export's seven JSON sidecars and ``_normalize``
+turns them into one typed ``Config`` before any module is constructed. The
+architecture is fixed: ``Config`` rejects any network or output field that
+differs from its default. Only the DMD ladder, the scheduler shifts, the VSA
+sparsity and the latent normalization statistics may differ between
+supported exports.
+"""
 
 from __future__ import annotations
 
@@ -177,6 +185,8 @@ class TransformerConfig:
             or not 0 <= self.vsa_sparsity < 1
         ):
             raise ValueError("H3 transformer VSA sparsity must lie in [0, 1)")
+        # Each of the three rotary axes (time, height, width) rotates
+        # 2 * rope_frequency_dim channels of a head; the rest stay unrotated.
         if (
             self.frequency_dim % 2
             or self.rope_frequency_dim * 6 > self.head_dim
@@ -245,7 +255,8 @@ class Config:
             raise ValueError("H3 audio latent channels must match the denoiser")
         # Packing, sparse attention, native reconstruction and checkpoint
         # identity implement this architecture. Typed configs do not imply
-        # arbitrary variants.
+        # arbitrary variants. The latent statistics and VSA sparsity come
+        # from each checkpoint and are exempt, as is ``diffusion``.
         for name, expected in (
             ("text_encoder", TextEncoderConfig()),
             ("denoiser", TransformerConfig()),
@@ -270,9 +281,10 @@ class Config:
                     )
 
 
-# Checkpoint field names differ from the mathematical modules' established
-# names.
-# The reader and native weight-name enumeration use this single correspondence.
+# Checkpoint config field names mapped to the typed config fields they fill.
+# ``_normalize`` reads the checkpoint through them, and ``weights`` maps back
+# through them to construct the native modules whose parameter names it
+# enumerates.
 TRANSFORMER_FIELDS = {
     "num_attention_heads": "num_attention_heads",
     "attention_head_dim": "head_dim",
@@ -363,7 +375,9 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
         "rope_type": "default",
     }:
         raise ValueError("unsupported FastH3 text encoder rope_scaling")
-    # These omitted visual blocks remain part of exact checkpoint name matching.
+    # The text encoder checkpoint also holds a vision tower that H3 never
+    # runs. ``weights`` enumerates checkpoint tensor names from this fixed
+    # vision layout, so the checkpoint must match it.
     vision = metadata["text_encoder"].get("vision_config")
     if (
         not isinstance(vision, dict)
@@ -430,7 +444,13 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
 
 
 def read_config(root: Path, io) -> Config:
-    """Read all architecture sidecars before any numerical module construction."""  # noqa: E501
+    """Read all architecture sidecars before any numerical module construction.
+
+    ``root`` is the checkpoint directory, whose sidecars the loader has
+    already fetched; ``io`` is part of the package interface and unused here.
+    An unreadable sidecar raises ``OSError``; invalid JSON or an unsupported
+    export raises ``ValueError``.
+    """  # noqa: E501
     metadata = {}
     for name, relative in (
         ("inference", "fastvideo_inference.json"),
@@ -451,5 +471,6 @@ def read_config(root: Path, io) -> Config:
     return _normalize(metadata)
 
 
-# Checkpoint headers needed to resolve architecture before module selection.
+# Checkpoint tensor headers needed to resolve architecture before module
+# selection. H3's architecture comes entirely from JSON sidecars.
 config_sources = ()

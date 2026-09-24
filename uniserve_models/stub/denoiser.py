@@ -1,4 +1,10 @@
-"""Deterministic image prediction and diffusion schedules."""
+"""Deterministic image prediction and diffusion schedules.
+
+``Denoiser`` predicts exactly zero for every image sample while using the
+library's real schedule, guidance and Euler solver. A zero prediction leaves
+each sample unchanged through every solver step, and the noise scale is the
+constant 1, so a generated image decodes to its initial normal noise draw.
+"""
 
 from __future__ import annotations
 
@@ -27,7 +33,12 @@ from .inputs import DenoiserInput
 
 
 class Denoiser(ImageDenoiser):
-    """Zero-valued image prediction over the real diffusion solver machinery."""
+    """Zero-valued image prediction over the real diffusion solver machinery.
+
+    Latents are canonical patch rows of ``patch_size**2 * 3`` values, one row
+    per ``patch_size`` pixel square: the layout ``Model.latent_encoder``
+    produces and ``Model.image_decoder`` consumes.
+    """
 
     framing_tokens = 2
 
@@ -45,7 +56,12 @@ class Denoiser(ImageDenoiser):
         sequence_lengths,
         attention,
     ) -> DenoiserInput:
-        """Assemble one denoising step's typed input from resident tensors."""
+        """Assemble one denoising step's typed input from resident tensors.
+
+        ``positions`` and ``sequence_lengths`` are accepted for the
+        ``ImageDenoiser`` contract and unused: the zero prediction depends on
+        neither.
+        """
         return DenoiserInput(
             latents=latents,
             sizes=sizes,
@@ -86,8 +102,8 @@ class Denoiser(ImageDenoiser):
         if set(inputs.latents) != {"image"}:
             raise ValueError("simulation predicts the image latent modality")
 
-        # Latent-feature prefill and image prediction share the scalar cache
-        # layer. Read-only attention inputs leave the prefix untouched.
+        # The host query token total sizes the K/V rows written below; dense
+        # inputs and inputs without host lengths cannot supply it.
         if (
             isinstance(inputs.attention, DenseInput)
             or inputs.attention.queries.num_tokens is None
@@ -95,9 +111,15 @@ class Denoiser(ImageDenoiser):
             raise ValueError(
                 "simulation denoising requires packed host query lengths"
             )
+        # [query tokens, kv heads, head dim] for the one-head, width-one cache.
         count = inputs.attention.queries.num_tokens
         reference = inputs.latents["image"][0].tensor
         values = reference.new_zeros((count, 1, 1))
+
+        # Paged or segmented inputs with write indices publish the step's zero
+        # K/V through the backbone's single attention layer, the cache
+        # ``model._Layer`` writes for text tokens; other inputs leave the
+        # cache untouched.
         if (
             isinstance(inputs.attention, (PagedInput, SegmentedInput))
             and inputs.attention.write_indices is not None

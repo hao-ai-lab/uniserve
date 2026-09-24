@@ -17,7 +17,14 @@ from .config import Config
 
 
 def image_processor(config: Config) -> ImageProcessor:
-    """Build the checkpoint architecture's caller-owned image transforms."""
+    """Build the checkpoint architecture's caller-owned image transforms.
+
+    These transforms prepare input images for ``Model.vision_encoder``; the
+    denoiser's generated images do not pass through them.
+    """
+    # The pixel bounds equal the reference preprocessing's per-image bounds
+    # for up to four input images; the reference lowers the upper bound for
+    # more.
     return ImageProcessor(
         vit=PatchTransform(
             patch_size=int(config.vision.patch_size),
@@ -61,6 +68,9 @@ _FLOW_SYSTEM_MESSAGE = (
 )
 
 
+# Chat framing of the guidance prefixes. The conditioned prompt closes an
+# empty think block, so generation starts in the system message's non-think
+# mode; both prompts end with the ``<img>`` token the image tokens follow.
 flow_prompt = FlowPrompt(
     user_prefix="<|im_start|>user\n",
     user_suffix="<|im_end|>\n",

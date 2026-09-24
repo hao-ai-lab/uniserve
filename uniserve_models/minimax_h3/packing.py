@@ -1,4 +1,12 @@
-"""Fixed-profile H3 audio/video packing and RoPE coordinates."""
+"""Fixed-profile H3 audio/video packing and RoPE coordinates.
+
+One sample's tokens form a single packed sequence of 64-row tiles:
+``[text | stereo audio | tiled video | padding]``. Text and audio form the
+dense prefix that every text, audio and video query attends; video rows are
+grouped into 4x4x4 spatiotemporal tiles for sparse attention. Every packed
+row carries a token tag and a (time, height, width) rotary coordinate. All
+tables are CPU tensors built on the host.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +30,8 @@ __all__ = [
     "video_latent_frames",
 ]
 
+# Token tags. A tag is also the token's group among each timestep's three
+# modulation rows (see ``Denoiser._metadata``).
 VIDEO_TAG = 0
 TEXT_TAG = 1
 AUDIO_TAG = 2
@@ -29,12 +39,22 @@ AUDIO_CHANNELS = 2
 FPS = 24
 AUDIO_LATENTS_PER_SECOND = 40
 ROPE_FRAME_RESCALE = 5.0 / 3.0
+# Output frames covered by each of the five latent frames of one 17-frame
+# clip: 1 + 4 * 4 = 17.
 ROPE_FRAMES_PER_LATENT = (1, 4, 4, 4, 4)
 _ROPE_SPATIAL_SCALE = 32.0
 
 
 def video_latent_frames(num_frames: int) -> int:
-    """Convert a valid H3 output-frame count into temporal video-VAE latents."""
+    """Convert a valid H3 output-frame count into temporal video-VAE latents.
+
+    Each 17-frame unit contributes five latent frames and the trailing
+    5-frame overlap two more.
+
+    Raises:
+        ValueError: ``num_frames`` is not an int of the form ``17 * n + 5``
+            with ``n`` positive.
+    """
     if type(num_frames) is not int or num_frames < 22 or num_frames % 17 != 5:
         raise ValueError("H3 frame count must have the form 17 * n + 5")
     return (num_frames - 5) // 17 * 5 + 2
@@ -52,6 +72,26 @@ class Packing:
 
     num_tokens counts valid tokens. padded_tokens also includes tile-boundary
     and partition alignment, whose validity is represented separately.
+
+    Attributes:
+        position_ids: [padded_tokens, 3] FP64 (time, height, width) rotary
+            coordinates of every packed row.
+        token_tags: [padded_tokens] int64 ``VIDEO_TAG``/``TEXT_TAG``/
+            ``AUDIO_TAG`` per row; rows past the video region carry
+            ``VIDEO_TAG``.
+        text_indices: Packed rows of the text tokens.
+        audio_indices: Packed rows of the audio tokens, channel-major.
+        video_indices: Packed rows of the video tokens, ascending.
+        video_raster_indices: Raster row of each entry of ``video_indices``.
+        video_untile_indices: Packed row of each video raster row, the
+            inverse of ``video_raster_indices``.
+        tile_valid_sizes: [padded_tokens // 64] int32 valid rows per tile.
+        prefix_tiles: Tiles of the dense text/audio prefix.
+        video_tiles: Tiles of the video region, including partial tiles.
+        video_frames: Temporal latent frames.
+        latent_height: Latent raster height before patching.
+        latent_width: Latent raster width before patching.
+        audio_frames: Audio latent frames per stereo channel.
     """  # noqa: D205
 
     num_tokens: int
@@ -73,7 +113,13 @@ class Packing:
 
 
 def _spatial_grid(dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
-    """Choose a patch-aligned spatial extent near the target square-root area."""  # noqa: E501
+    """Return rotary coordinates of the patches along one spatial axis.
+
+    The ``dim // patch`` coordinates are evenly spaced over an interval of
+    length ``dim / sqrt_area`` centered on 0.5, so both axes share the scale
+    of the raster's geometric-mean side, and are then multiplied by
+    ``_ROPE_SPATIAL_SCALE``.
+    """  # noqa: E501
     ratio = dim / sqrt_area
     left = (1.0 - ratio) / 2.0
     values = np.linspace(left, left + ratio, dim // patch, endpoint=False)
@@ -81,7 +127,11 @@ def _spatial_grid(dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
 
 
 def _temporal_grid(count: int, origin: float) -> torch.Tensor:
-    """Generate evenly spaced temporal coordinates from an origin."""
+    """Place ``count`` latent frames on the rotary time axis from ``origin``.
+
+    The gap after a latent frame is ``ROPE_FRAME_RESCALE`` times the output
+    frames it covers, cycling through ``ROPE_FRAMES_PER_LATENT``.
+    """
     spans = torch.tensor(
         [
             ROPE_FRAME_RESCALE
@@ -113,6 +163,24 @@ def build_packing(
 
     These host metadata values remain concrete during deferred parameter
     construction. Execution supplies device views for numerical kernels.
+
+    Args:
+        num_text_tokens: Text rows; the text region rounds up to whole tiles.
+        num_frames: Output video frames, of the form ``17 * n + 5``.
+        height: Output raster height; only 768 is supported.
+        width: Output raster width; only 1344 is supported.
+        patch_size: Transformer (time, height, width) patch on the latents.
+        token_multiple: Row alignment, a multiple of 64. ``padded_tokens``
+            rounds up to a multiple of ``max(token_multiple, 128)``, plus one
+            tile when that leaves an odd tile count.
+        audio_frames: Audio latent frames per channel; defaults to the
+            40 Hz timeline of ``num_frames``.
+
+    Raises:
+        ValueError: An unsupported raster, empty text, a frame count H3 does
+            not generate, a nonpositive audio length, an alignment that is
+            not a positive multiple of the 64-row tile, or a patch that does
+            not divide the latents.
     """
     if num_text_tokens < 1 or height != 768 or width != 1344:
         raise ValueError(
@@ -124,6 +192,7 @@ def build_packing(
         )
     text_rows = math.ceil(num_text_tokens / 64) * 64
     patch_t, patch_h, patch_w = patch_size
+    # Latents are 16x spatially compressed relative to the output raster.
     latent_height, latent_width = height // 16, width // 16
     video_frames = video_latent_frames(num_frames)
     audio_frames = (
@@ -143,7 +212,6 @@ def build_packing(
         )
 
     # Text and audio occupy dense 64-row tiles before the sparse video region.
-    # Latents are 16x spatially compressed relative to the output raster.
     rows_per_frame = latent_height // patch_h * (latent_width // patch_w)
     audio_rows = AUDIO_CHANNELS * audio_frames
     video_rows = video_frames // patch_t * rows_per_frame
@@ -162,6 +230,9 @@ def build_packing(
         for extent, tile in zip((grid_t, grid_h, grid_w), (4, 4, 4))
     )
     video_tiles = tiles_t * tiles_h * tiles_w
+    # Tiles are ordered time-major over the tile grid. Within a tile, row
+    # offset o addresses the (time, height, width) cell
+    # (o // 16, o // 4 % 4, o % 4) before boundary compaction.
     tile_ids = np.arange(video_tiles, dtype=np.int64)[:, None]
     offsets = np.arange(64, dtype=np.int64)[None, :]
     temporal_rows = tile_ids // (tiles_h * tiles_w) * tile_t + offsets // 16
@@ -229,6 +300,9 @@ def build_packing(
         ],
         dim=-1,
     )
+    # Both stereo channels share the audio timeline; the first channel sits
+    # at the leftmost video width coordinate and the second at the
+    # rightmost.
     audio_time = float(text_rows) + torch.arange(
         audio_frames, dtype=torch.float64, device="cpu"
     )
@@ -259,6 +333,9 @@ def build_packing(
         0, video_raster_indices
     )
 
+    # Move the media time origin from the tile-rounded text prefix to the
+    # exact prompt length, so the first audio frame and video latent frame
+    # sit at time num_text_tokens, right after the last prompt token.
     positions[text_rows:, 0].add_(num_text_tokens - text_rows)
 
     # Per-tile valid counts let sparse attention ignore audio, video-boundary,

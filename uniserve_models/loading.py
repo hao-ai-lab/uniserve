@@ -1,4 +1,21 @@
-"""Discover concrete models and normalize their public loading inputs."""
+"""Discover concrete models and normalize their public loading inputs.
+
+``read_config`` resolves a local checkpoint directory or a Hub repository to
+the model package named in ``_catalog``, reads the package's typed
+configuration, fetches the payload files the selected modules need (plus any
+the package reads to build its configuration), and returns an immutable
+``Config``. ``load_model`` then materializes the model
+through ``uniserve.loading.load_model``. The worker bootstrap
+(``uniserve_worker.bootstrap.model_loader``) and direct Python callers use the
+same two calls.
+
+A model package provides ``config_sources``, ``read_config``, ``Model``,
+``checkpoint_sources``, ``checkpoint_mappings``, ``entry_points``,
+``image_processor``, ``flow_prompt``, ``precisions`` and
+``checkpoint_precision``. This module also implements the Python side of the
+checkpoint identity that ranks compare against the head, and recognizes
+calibrated ModelOpt NVFP4 exports.
+"""
 
 from __future__ import annotations
 
@@ -60,6 +77,30 @@ class Config(Generic[ConfigT, ModelT]):
     No tokenizer, reader, resource context, or model instance is retained.
     Module selection uses actual module paths and also selects shared
     descendants by identity. Loading can narrow an already resolved selection.
+
+    Attributes:
+        model: The package's typed model configuration.
+        model_class: Constructor that builds the model from ``model``.
+        checkpoint: Resolved sources the selected modules read.
+        mapping: The package's ``checkpoint_mappings``.
+        entry_points: Component entry points the package declares.
+        weights: Default weight configuration for ``load_model``.
+        precisions: Named presets ``load_model`` accepts; empty for a
+            calibrated ModelOpt checkpoint.
+        checkpoint_format: ``"modelopt_nvfp4"`` for a calibrated ModelOpt
+            checkpoint, otherwise ``None``. The worker bootstrap refuses
+            launch quantization overrides when it is set.
+        io: Checkpoint IO policy used for resolution and loading.
+        tokenizer: Directory holding tokenizer files, or ``None``.
+        image_processor: Image processor the package builds from ``model``,
+            with its feature-injection token IDs resolved, or ``None``.
+        flow_prompt: The package's classifier-free-guidance prompt framing,
+            or ``None``.
+        modules: Selected module paths; ``None`` selects the whole model.
+        checkpoint_identity: Identity of the checkpoint, as defined by
+            ``checkpoint_identity``. Every rank of one instance must load the
+            same checkpoint, and the launching side derives the same value
+            for a local checkpoint directory.
     """  # noqa: D205
 
     model: ConfigT
@@ -75,15 +116,11 @@ class Config(Generic[ConfigT, ModelT]):
     image_processor: ImageProcessor | None
     flow_prompt: FlowPrompt | None
     modules: frozenset[str] | None
-    # Identity of the checkpoint files this closure reads, as defined by
-    # ``checkpoint_identity``. Every rank of one instance must load the same
-    # checkpoint, and the launching side derives the same value for a local
-    # checkpoint directory.
     checkpoint_identity: str
 
     def __post_init__(self):
-        # ``ComponentEntry`` is already immutable, so only the mapping needs
-        # freezing here.
+        # Freeze the caller's containers; ``ComponentEntry`` values are
+        # already immutable.
         object.__setattr__(
             self, "entry_points", MappingProxyType(dict(self.entry_points))
         )
@@ -95,6 +132,7 @@ class Config(Generic[ConfigT, ModelT]):
 
 
 def _json(path: Path) -> dict:
+    """Read a JSON object; invalid JSON or a non-object raises ValueError."""
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError(f"checkpoint metadata {path} must contain an object")
@@ -112,7 +150,11 @@ _IDENTITY_EXCLUDED_DIRECTORIES = frozenset({"optimizer", "original"})
 
 
 def _identity_includes(name: str) -> bool:
-    """Apply the identity's file exclusions to one relative POSIX path."""
+    """Apply the identity's file exclusions to one relative POSIX path.
+
+    A path is excluded when any component is hidden (starts with ``.``) or
+    when it lies under an excluded top-level directory.
+    """
     parts = PurePosixPath(name).parts
     if any(part.startswith(".") for part in parts):
         return False
@@ -182,6 +224,13 @@ def checkpoint_identity(root: Path) -> str:
     over every regular file under ``root``. The launching side derives the
     same value for the directory it names, so a rank that resolves a
     different checkpoint at the same path is refused by name.
+
+    When the head can read the directory, the engine computes the expected
+    value in Rust (``checkpoint_identity`` in the engine's
+    ``worker::checkpoint`` module), and
+    ``uniserve_worker.bootstrap.model_loader.verify_checkpoint_identity``
+    compares the two, so both implementations must agree byte for byte.
+    Their unit tests share one fixture and golden digest.
     """
     root = Path(root)
     return _identity_digest(
@@ -223,6 +272,13 @@ def _hub_checkpoint_identity(repository: str, revision: str, io) -> str:
 
 def _root(path: str | Path, io: loading.Config):
     """Resolve a local checkpoint directory or pin a Hub snapshot to a local snapshot root."""  # noqa: E501
+    # Returns ``(root, repository, revision)``. A local path yields its
+    # directory (the parent of a named file) with no repository or revision;
+    # a Hub repository yields its snapshot directory, the repository id and
+    # the snapshot's commit revision. A ``Path`` or absolute string that does
+    # not exist is never treated as a Hub repository id; it raises
+    # ``FileNotFoundError``, as does a repository publishing none of
+    # ``_metadata_files``.
     candidate = Path(path).expanduser()
     if candidate.exists():
         return (
@@ -281,8 +337,14 @@ def _inventory(root, repository, revision, io):
 
 
 def _fetch(root, names, repository, revision, io):
+    """Download the named files of a Hub revision into the cache.
+
+    A local checkpoint needs no fetch. Downloads run on ``io.num_threads``
+    threads (8 when unset); a download failure propagates to the caller.
+    """
     if repository is None:
         return
+
     from concurrent.futures import ThreadPoolExecutor
 
     from huggingface_hub import hf_hub_download
@@ -301,6 +363,12 @@ def _fetch(root, names, repository, revision, io):
 
 def _source_files(source, root, inventory, io):
     """Choose the declared file encoding before downloading checkpoint payloads."""  # noqa: E501
+    # This applies the selection rule of ``checkpoint.Config.resolve`` to the
+    # inventory before the payloads exist locally: explicit filenames first,
+    # then a sharded index, then every weight file of the format. The two
+    # must stay in agreement, or ``resolve`` looks for a file this function
+    # did not fetch. An index is read from ``root``, so the sidecar fetch
+    # must precede this call.
     directory = PurePosixPath(source.directory)
     available = {
         name for name in inventory if PurePosixPath(name).parent == directory
@@ -381,6 +449,9 @@ def _source_files(source, root, inventory, io):
 
 def _tokens(processor, root):
     """Fill declared start/end feature-injection token IDs from checkpoint tokenizer files."""  # noqa: E501
+    # Only tokens declared by text without an ID are resolved; a processor
+    # with nothing to resolve is returned unchanged. A declared token that no
+    # vocabulary source maps to a nonnegative integer raises ``ValueError``.
     if processor is None or processor.feature_injection is None:
         return processor
     injection = processor.feature_injection
@@ -400,6 +471,9 @@ def _tokens(processor, root):
     if path.is_file():
         data = _json(path)
         raw_vocab = data.get("model", {}).get("vocab", {})
+        # A dict vocabulary maps token text to ID; a list vocabulary holds one
+        # row per token whose first element is the text and whose position
+        # is the ID.
         vocabulary.update(
             raw_vocab
             if isinstance(raw_vocab, dict)
@@ -436,6 +510,12 @@ def _tokens(processor, root):
 
 
 def _selection(model, modules):
+    """Return the ``id`` of every module under the selected paths.
+
+    ``None`` selects the whole model. Identity rather than path membership
+    lets a module shared under several paths count as selected through any
+    of them. A path that does not name a submodule raises ``ValueError``.
+    """
     if modules is None:
         return {id(child) for child in model.modules()}
     try:
@@ -451,7 +531,18 @@ def _selection(model, modules):
 
 
 def _exclusions(model, declarations, sources, ignored, io):
-    """Translate checkpoint exclusions through the same explicit assignments."""
+    """Translate checkpoint exclusions through the same explicit assignments.
+
+    Each entry of ``ignored`` names either a model module path or a checkpoint
+    tensor prefix. The result maps every module path that directly owns an
+    excluded parameter to ``None``, which leaves that module unquantized in
+    ``uniserve.loading.weights.Config.quantization``. Opens each source in
+    ``sources`` to read its assignments.
+
+    Raises:
+        ValueError: ``ignored`` is not a tuple or list of strings, or an entry
+            matches neither a module path nor any assigned tensor.
+    """
     if not isinstance(ignored, (tuple, list)) or any(
         not isinstance(name, str) for name in ignored
     ):
@@ -503,6 +594,13 @@ def _component_quantization(
     A diffusers pipeline records each component's quantization in that
     component's config.json. Only ModelOpt exports are accepted there;
     runtime quantization is a deployment choice, not a component property.
+
+    Returns ``None`` for a source at the checkpoint root, whose quantization
+    the root metadata declares, and for a component folder without a
+    config.json or without a ``quantization_config``.
+
+    Raises:
+        ValueError: The component declares a non-ModelOpt quantization.
     """
     if not declaration.directory:
         return None
@@ -558,6 +656,24 @@ def _calibrated_quantization(model, declarations, sources, declared, io):
     calibrated static activation scale; every other module stays dense. The
     activation's per-block K16 encoding is computed at run time against that
     fixed tensor scale.
+
+    Args:
+        model: Meta-device model whose module paths receive the result.
+        declarations: The package's checkpoint mappings for ``model``.
+        sources: Resolved sources; only those named in ``declared`` are read.
+        declared: ModelOpt ``quantization_config`` per source name, each
+            checked against ``_require_static_nvfp4``.
+        io: Checkpoint IO policy for opening the sources.
+
+    Returns:
+        A ``QuantizationConfig`` for every module path that owns a packed
+        weight, aliases included.
+
+    Raises:
+        ValueError: A declared recipe is not static NVFP4 with 16-element
+            blocks, a packed weight lacks a positive finite input scale, maps
+            onto a non-``Linear`` module or gives one module conflicting
+            scales, or a read source stores no packed weight.
     """
     for name, value in declared.items():
         _require_static_nvfp4(name, value)
@@ -645,6 +761,22 @@ def read_config(
     Architecture sidecars are read for the complete model. Payload downloads
     follow the selected numerical modules; shared aliases retain the same
     source. Tokenizer files remain paths until the caller loads a tokenizer.
+
+    Args:
+        path: A local checkpoint directory, a file inside one, or a Hub
+            repository id, pinned to ``io.revision`` when it is set.
+        io: Checkpoint IO policy. With ``mode="dummy"`` no Hub payload is
+            downloaded.
+        modules: Module paths to resolve sources for; ``None`` selects the
+            whole model, and an empty set resolves no payload source.
+
+    Raises:
+        FileNotFoundError: The checkpoint, its metadata, or a declared
+            source's files cannot be found.
+        ValueError: The checkpoint metadata or selection is invalid or
+            unsupported, including an architecture outside the catalog, a
+            selected path that is not a module, and malformed index,
+            tokenizer or quantization metadata.
     """  # noqa: D205
     root, repository, revision = _root(path, io)
     metadata = _root_metadata(root)
@@ -658,8 +790,8 @@ def read_config(
 
     inventory = _inventory(root, repository, revision, io)
     # All architecture/index/tokenizer sidecars are small and required to
-    # normalize the same complete configuration on participating and remote
-    # ranks.
+    # normalize the same complete configuration on every rank, whatever its
+    # module selection.
     sidecars = {
         name
         for name in inventory
@@ -684,6 +816,11 @@ def read_config(
                 io,
             )
 
+    # A meta-device skeleton resolves module selection and the mappings
+    # without allocating weights. A source is needed when its mapping's
+    # module is selected or when the mapping names any selected parameter as
+    # required or optional, which covers parameters shared into an unselected
+    # mapping's module.
     model_config = package.read_config(root, io)
     with torch.device("meta"):
         model = package.Model(model_config)
@@ -745,6 +882,9 @@ def read_config(
         else None
     )
 
+    # The package's "default" preset, else its "bf16" preset, else the
+    # ``weights.Config`` defaults; the quantization metadata below refines
+    # this base or, for a ModelOpt export, replaces it.
     precision = package.precisions.get(
         "default", package.precisions.get("bf16", weight_options.Config())
     )
@@ -766,6 +906,7 @@ def read_config(
             for declaration in package.checkpoint_sources
         }
         quantization = None
+
     # Every rank of the checkpoint agrees that it is calibrated, including a
     # rank that loads none of the quantized components; only the resolved
     # sources contribute calibrated modules.
@@ -795,6 +936,11 @@ def read_config(
         precisions = MappingProxyType({})
         checkpoint_format = "modelopt_nvfp4"
 
+    # A non-ModelOpt root quantization_config with a supported method other
+    # than "unquantized" applies one quantizer to the weights and activations
+    # of every Linear (the empty prefix matches every module path).
+    # Independently of the method, its ignored_layers map the listed modules
+    # to no quantization.
     if quantization is not None:
         method = quantization.get("quant_method", "unquantized")
         if method != "unquantized":
@@ -846,7 +992,17 @@ def load_model(
     devices: Mapping[str, torch.device | str] | None = None,
     modules: frozenset[str] | None = None,
 ) -> loading.Result[ModelT]:
-    """Materialize the selected capability modules through the common loader."""
+    """Materialize the selected capability modules through the common loader.
+
+    ``precision`` names one of ``config.precisions`` and ``weights`` supplies
+    a weight configuration directly; with neither, ``config.weights``
+    applies. ``modules`` may narrow ``config.modules`` but not widen it.
+    The remaining arguments pass through to ``uniserve.loading.load_model``.
+
+    Raises:
+        ValueError: Both ``precision`` and ``weights`` are given, the
+            precision is unknown, or the selection exceeds ``config.modules``.
+    """
     if precision is not None and weights is not None:
         raise ValueError(
             "precision and weights are mutually exclusive numerical choices"

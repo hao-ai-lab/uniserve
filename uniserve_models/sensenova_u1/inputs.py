@@ -1,4 +1,10 @@
-"""Borrowed numerical inputs and conditioning for SenseNova U1 images."""
+"""Borrowed numerical inputs and conditioning for SenseNova U1 images.
+
+The worker's ``ImageBuilder`` supplies samples, positions and attention metadata
+to ``Denoiser.bind_inputs``, which derives the per-step image conditioning and
+returns a ``DenoiserInput``. These dataclasses hold borrowed tensors; they
+neither copy nor own them.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +19,19 @@ from uniserve.nn.attention import AttentionInput, DenseInput
 
 @dataclass(frozen=True)
 class ImageConditioning:
-    """Borrow the complete noisy NCHW image, input patch grid and noise scale."""  # noqa: E501
+    """Borrow the complete noisy NCHW image, input patch grid and noise scale.
+
+    ``__post_init__`` checks shapes only; dtypes and devices are the caller's
+    responsibility.
+
+    Attributes:
+        pixels: ``[1, 3, height, width]`` image in pixel space.
+        grid: ``[1, 2]`` integer vision patch grid ``(rows, columns)``, from
+            which ``vision.Encoder`` derives its rotary coordinates.
+        noise_scale: One-element scale of this image's initial noise, which
+            the denoiser normalizes and embeds when the checkpoint enables
+            the noise-scale embedding.
+    """  # noqa: E501
 
     pixels: torch.Tensor
     grid: torch.Tensor
@@ -38,6 +56,16 @@ class DenoiserInput(NumericalDenoiserInput[image.Config]):
 
     Temporal coordinates apply to every token through axial RoPE; height and
     width index each token's patch within its image grid.
+
+    Attributes:
+        images: Per-sample conditioning, which ``Denoiser.bind_inputs``
+            rebuilds from the current samples on every step.
+        positions: Per-sample ``[3, tokens]`` rotary coordinates.
+        sequence_lengths: Host token count of each sample; the denoiser
+            requires it to equal the sample's latent rows.
+        attention: Attention metadata for the packed image tokens. When it is
+            not dense and carries host query lengths, ``__post_init__``
+            requires them to equal ``sequence_lengths``.
     """
 
     images: tuple[ImageConditioning, ...]

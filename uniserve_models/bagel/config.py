@@ -16,6 +16,13 @@ from .weights import checkpoint_sources
 
 @dataclass(frozen=True)
 class TransformerConfig:
+    """Language backbone dimensions shared by the text and flow experts.
+
+    ``read_config`` builds it from the ``llm`` tower config. Both experts of
+    every ``TransformerLayer`` use these widths, and one attention module per
+    layer covers the tokens of both.
+    """
+
     hidden_size: int
     intermediate_size: int
     num_hidden_layers: int
@@ -63,6 +70,23 @@ class TransformerConfig:
 
 @dataclass(frozen=True)
 class Config:
+    """Complete BAGEL architecture composed from its tower configs.
+
+    Attributes:
+        text: Shared MoT backbone dimensions.
+        vision: SigLIP tower feeding understanding inputs.
+        vae: FLUX autoencoder mapping pixels to latents.
+        start_of_image_id: Token that opens each framed image sequence.
+        end_of_image_id: Token that closes each framed image sequence.
+        latent_patch_size: Autoencoder latent positions per flow token along
+            each spatial axis.
+        max_latent_size: Side of the learned square latent position grid, in
+            flow tokens; ``read_config`` takes it from the checkpoint table.
+        timestep_shift: Schedule shift ``Denoiser.make_schedules`` applies
+            when the caller passes none.
+        connector_act: Activation name of the vision connector MLP.
+    """
+
     text: TransformerConfig
     vision: siglip.Config
     vae: vae.Config
@@ -96,9 +120,22 @@ class Config:
 def read_config(root: Path, io: loading.Config) -> Config:
     """Read checkpoint metadata into typed configs before module construction.
 
-    Tower configs live either inline in ``config.json`` or in per-tower files.
-    The learned latent position grid is read from the checkpoint header, so its
-    table must be a square grid whose width matches the text hidden size.
+    Tower configs live either inline in ``config.json`` or in per-tower files;
+    absent optional fields take fixed defaults. The learned latent position
+    grid is read from the primary checkpoint's tensor header rather than from
+    ``config.json``, so its table must be a square grid whose width matches
+    the text hidden size.
+
+    Raises:
+        FileNotFoundError: If ``config.json``, a tower config that is not
+            inline, or the primary checkpoint's files are missing.
+        KeyError: If a required text dimension or the
+            ``latent_pos_embed.pos_embed`` tensor is absent.
+        ValueError: If the text head count is not a positive integer or,
+            without an explicit ``head_dim``, does not divide the hidden size;
+            if the latent position table is not a square grid at text width;
+            or if a config's ``__post_init__`` rejects a value. Malformed
+            JSON and checkpoint metadata also raise ``ValueError``.
     """
     raw = json.loads((root / "config.json").read_text())
 
@@ -112,6 +149,7 @@ def read_config(root: Path, io: loading.Config) -> Config:
     text, vision, latent = towers
 
     heads, hidden = text["num_attention_heads"], text["hidden_size"]
+    # Validate the head count before the default head_dim divides by it.
     if (
         type(heads) is not int
         or heads < 1
@@ -151,6 +189,8 @@ def read_config(root: Path, io: loading.Config) -> Config:
                 vision.get("hidden_size", 1152),
                 vision.get("num_attention_heads", 16),
                 vision.get("intermediate_size", 4304),
+                # BAGEL runs one fewer SigLIP layer than its tower config
+                # declares.
                 vision.get("num_hidden_layers", 27) - 1,
                 vision.get("layer_norm_eps", 1e-6),
             ),
@@ -176,5 +216,7 @@ def read_config(root: Path, io: loading.Config) -> Config:
     )
 
 
-# Checkpoint headers needed to resolve architecture before module selection.
+# ``read_config`` reads the latent position table from the primary checkpoint's
+# header, so the loader fetches that source for a Hub checkpoint before module
+# selection.
 config_sources = checkpoint_sources[:1]

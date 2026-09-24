@@ -1,4 +1,11 @@
-"""SigLIP checkpoint tower assignments."""
+"""SigLIP checkpoint tower assignments.
+
+Parameter names of ``Encoder`` translate to the Hugging Face
+``SiglipVisionModel`` naming below the vision tower's prefix (``embeddings``,
+``encoder.layers.N.self_attn``, ``post_layernorm``). The composing model
+supplies that prefix and owns the ``weights.ModuleMapping`` these assignments
+feed.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +24,10 @@ def assignments(
     result = []
     available = frozenset(reader.names())
     for name, parameter in model.named_parameters():
+        # The checkpoint's ``embeddings.patch_embedding.weight`` must already
+        # be a linear ``[hidden, patch_size**2 * channels]`` matrix whose
+        # columns follow ``patchify``'s (pixel row, pixel column, channel)
+        # order; this mapping applies no convolution-to-linear reshape.
         if name.startswith(("patch_embedding.", "position_embedding.")):
             source = "embeddings." + name
         elif name.startswith("encoder.norm."):
@@ -38,7 +49,9 @@ def assignments(
                 ".mlp.2.", ".mlp.fc2."
             )
 
-        # Parameters absent from this checkpoint reader keep their init values.
+        # Only names present in the reader become assignments. The caller's
+        # ``weights.ModuleMapping`` required set decides whether a parameter
+        # with no assignment fails the load.
         if prefix + source in available:
             result.append(
                 weights.Assignment(parameter, reader.get(prefix + source))

@@ -1,5 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""H3 video reconstruction with spatial tiling and fused residual arithmetic."""
+"""H3 video reconstruction with spatial tiling and fused residual arithmetic.
+
+The decoder is a non-causal ViT: ``Transformer`` turns every latent voxel into
+one token, appends learned register tokens and one zero token, and expands
+each latent token into an RGB patch. ``Decoder`` adds the 1x1x1
+``post_quant_conv`` and overlapping spatial tiles; ``Model`` denormalizes one
+native temporal window of latents. ``decoding.VideoDecoder`` owns ``Model``,
+and ``output.VideoPostprocessor`` stitches the decoded windows.
+
+With quantized projection weights, projections return their bias separately
+so the consuming fused kernel (residual update, Q/K normalization and RoPE,
+SwiGLU, or unpatchify) adds it, and the fused normalization before such a
+projection also returns the tensor-wide absmax that its input quantizer can
+reuse.
+"""
 
 from __future__ import annotations
 
@@ -206,6 +220,8 @@ class Config:
         rotary_width = (
             self.decoder_attention_head_dim * self.decoder_rope_dim_ratio
         )
+        # The rotary width splits evenly across (time, height, width), and
+        # RotaryEmbedding requires an even width per axis.
         if (
             self.decoder_rope_dim_ratio > 1
             or rotary_width != int(rotary_width)
@@ -221,6 +237,8 @@ class Config:
         }:
             raise ValueError("unsupported H3 video spatial padding mode")
 
+    # Each latent token decodes to a temporal_compression x
+    # spatial_compression x spatial_compression pixel patch.
     @property
     def spatial_compression(self) -> int:
         return math.prod(self.spatial_downsample_factors)
@@ -247,7 +265,13 @@ def _encoded_input(layer, hidden, maximum):
 
 
 def _project(layer, hidden, maximum=None):
-    """Keep encoded projection bias for the VAE's FP32 affine/residual equation."""  # noqa: E501
+    """Keep encoded projection bias for the VAE's FP32 affine/residual equation.
+
+    Returns ``(output, bias)``. A dense layer runs its own forward, bias
+    included, and returns None for the bias. A quantized layer's output
+    excludes its bias, which the caller must pass to the consuming fused
+    kernel; a row-parallel output is all-reduced before that bias is added.
+    """  # noqa: E501
     if not isinstance(layer.weight, QuantizedTensor):
         return layer(hidden), None
     inputs = _encoded_input(layer, hidden, maximum)
@@ -259,6 +283,13 @@ def _project(layer, hidden, maximum=None):
 
 
 def _project_branches(projection, hidden, maximum=None):
+    """Project every branch of a merged linear and defer quantized biases.
+
+    Returns ``(outputs, biases)`` keyed by branch name, with the same bias
+    convention as ``_project``. Branches with one common input quantizer, or
+    none at all, encode the input once and run as one merged call; otherwise
+    each branch projects on its own.
+    """
     branches = tuple(projection.projections.values())
     if len({branch.input_quantizer for branch in branches}) != 1:
         results = {
@@ -297,6 +328,10 @@ def _project_branches(projection, hidden, maximum=None):
 
 
 def _feed_forward(mlp, hidden, maximum=None):
+    """Apply the SwiGLU MLP and return ``(update, deferred down bias)``.
+
+    The bias is None when the down projection applied its own bias.
+    """
     projections = (*mlp.gate_up.projections.values(), mlp.down)
     if all(
         not isinstance(projection.weight, QuantizedTensor)
@@ -315,6 +350,8 @@ def _feed_forward(mlp, hidden, maximum=None):
         "value_bias": biases["up"],
         "gate_bias": biases["gate"],
     }
+    # SwiGLU's absmax is tensor-wide, so only a tensor-wide down-projection
+    # input quantizer (tensor-wide FP8 or NVFP4) can reuse it.
     quantizer = mlp.down.input_quantizer
     if (
         quantizer is not None
@@ -369,6 +406,15 @@ class TransformerLayer(nn.Module):
         return norm.weight, norm.eps
 
     def _advance(self, hidden, normalized, cos, sin, maximum=None):
+        """Apply attention and the MLP, deferring the MLP residual update.
+
+        ``hidden`` is the residual stream ``[batch, tokens, width]`` and
+        ``normalized`` its first normalization; ``maximum`` is the tensor-wide
+        absmax of ``normalized`` or None. Updates ``hidden`` in place with the
+        attention residual and returns ``(hidden, update, bias)``; the caller
+        adds ``(update + bias) * scales[1]`` to ``hidden``, which
+        ``Transformer.forward`` fuses with the following normalization.
+        """
         projections, biases = _project_branches(self.qkv, normalized, maximum)
         batch, sequence, _ = hidden.shape
         dim = self.qkv.head_dim
@@ -423,6 +469,9 @@ class TransformerLayer(nn.Module):
         return hidden, update, bias
 
     def forward(self, hidden, cos, sin):
+        # A standalone evaluation of one layer. Transformer.forward instead
+        # calls _advance directly so the MLP residual fuses into the next
+        # normalization.
         weight, eps = self._norm(0)
         if isinstance(self.qkv.projections["q"].weight, QuantizedTensor):
             normalized, maximum = weighted_rms_norm_absmax(
@@ -536,7 +585,11 @@ class Transformer(nn.Module):
             hidden, normalized, cos, sin, maximum
         )
         previous = first
-        # Keep the unrounded residual sum available to the next normalization.
+
+        # Each later layer folds the previous layer's deferred MLP update,
+        # scaled by ``previous.scales[1]``, into its first RMSNorm, which
+        # reads the unrounded FP32 residual sum. The final LayerNorm folds
+        # the last layer's update the same way.
         for layer in self.layers[1:]:
             layer = cast(TransformerLayer, layer)
             weight, eps = layer._norm(0)
@@ -585,6 +638,8 @@ class Transformer(nn.Module):
                 eps=self.norm.eps,
             )
             maximum = None
+        # Register and zero tokens trail the latent rows, so the unpatchify
+        # ignores them.
         hidden, bias = _project(self.output, hidden, maximum)
         return unpatchify_video_tokens(
             hidden,
@@ -604,6 +659,9 @@ class Decoder(SpatialDecoder):
     decoder: Transformer
 
     def __init__(self, config: Config):
+        # Tile extents and minimum overlaps are output pixels and match the
+        # native diffusers decoder's default tiling; LatentDecoder.forward
+        # always decodes through SpatialDecoder.decode with tiling enabled.
         super().__init__(
             Transformer(config),
             spatial_compression=config.spatial_compression,
@@ -657,6 +715,8 @@ class Model(LatentDecoder):
 
     @property
     def compute_dtype(self):
+        # The VAE transformer's input projection dtype, which
+        # precision.weight_config sets, selects the CUDA autocast dtype.
         return self.decoder.decoder.input.weight.dtype
 
     def forward(self, latents):
@@ -668,6 +728,9 @@ class Model(LatentDecoder):
             decoded = super().forward(latents)
         # The VAE left-pads each clip to a multiple of its temporal compression;
         # crop those leading frames from the decoded timeline.
+        # output.VideoPostprocessor drops the window's remaining padding
+        # frames and cross-fades its overlap tail with the next window. FP16
+        # matches the output layout that decoding.VideoDecoder declares.
         padding = (
             -self.decoder.config.clip_length
         ) % self.decoder.config.temporal_compression
@@ -715,6 +778,7 @@ def assignments(model: Decoder | Model, reader):
             continue
         value = reader.get(source)
 
+        # Value rows come first: the ``up`` branch reads the leading half.
         region = None
         if branch is not None:
             if value.shape[0] % 2:

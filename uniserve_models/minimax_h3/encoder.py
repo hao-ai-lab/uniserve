@@ -15,8 +15,10 @@ from uniserve_models import qwen3
 class TextEncoderConfig:
     """Define the H3 text encoder's vocabulary and tensor dimensions.
 
-    The configuration fixes hidden width, attention head counts, layer count,
-    and rotary settings.
+    ``num_checkpoint_layers`` is the checkpoint's decoder depth; the encoder
+    runs only the first ``num_retained_layers`` of them. ``read_config``
+    fills every other field from the checkpoint's ``text_config``, while
+    ``num_retained_layers`` always keeps its default.
     """
 
     vocab_size: int = 151_936

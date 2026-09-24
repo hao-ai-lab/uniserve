@@ -1,4 +1,4 @@
-"""Image transforms for the deterministic serving simulator."""
+"""Image transforms of the deterministic stub model."""
 
 from __future__ import annotations
 
@@ -16,7 +16,11 @@ from uniserve.processing import (
 
 
 def image_processor() -> ImageProcessor:
-    """Build the checkpoint architecture's caller-owned image transforms."""
+    """Build the stub model's caller-owned image transforms.
+
+    Patch sizes and resize strides are fixed at 16 pixels, matching the
+    default ``Config.patch_size`` the worker builds ``Model`` with.
+    """
     return ImageProcessor(
         vit=PatchTransform(
             patch_size=16,
@@ -31,6 +35,9 @@ def image_processor() -> ImageProcessor:
             )
         ),
         staging_dtype=torch.bfloat16,
+        # The direct layout has no start marker; a row that closes the image
+        # appends the end marker. ``model._Head`` maps 1007 to EOS, so logits
+        # read at that marker select EOS.
         feature_injection=FeatureInjection(
             layout=FeatureLayout.DIRECT,
             positions=PositionLayout.TEMPORAL_SPATIAL,
