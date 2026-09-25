@@ -6,9 +6,47 @@ import httpx
 import pytest
 
 from uniserve_eval.transport.client import send_request
-from uniserve_eval.types import CHAT_COMPLETIONS, TaskRequest
+from uniserve_eval.types import (
+    CHAT_COMPLETIONS,
+    IMAGES_GENERATIONS,
+    TaskRequest,
+)
 
 pytestmark = pytest.mark.unit
+
+
+def test_image_generation_error_body_is_classified_by_status() -> None:
+    # UniServe's OpenAI-compatible error body for a failed request.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            json={
+                "error": {
+                    "message": "engine failed",
+                    "type": "server_error",
+                    "param": None,
+                    "code": None,
+                }
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            record = await send_request(
+                client,
+                "http://server",
+                TaskRequest(IMAGES_GENERATIONS, {"model": "m"}, stream=False),
+                "req-1",
+                task="t2i",
+            )
+        assert record.success is False
+        assert record.status_code == 500
+        assert record.classifier == "transport_status_500"
+        assert record.images == 0
+
+    asyncio.run(run())
 
 
 def test_stream_request_rejects_a_json_response() -> None:
