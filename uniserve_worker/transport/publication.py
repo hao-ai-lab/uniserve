@@ -14,7 +14,7 @@ import concurrent.futures
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
-from uniserve_worker.errors import unsupported_setup
+from uniserve_worker.errors import resource_error, unsupported_setup
 from uniserve_worker.protocol.transfer import Locator
 from uniserve_worker.transport.interface import Transport
 from uniserve_worker.transport.vmm_pool import PoolExhaustedError
@@ -46,9 +46,11 @@ def publish_tensor(
     one of its named consumers: shared storage for a consumer on this host,
     the rank channel for one elsewhere. A device product that neither exports
     in place nor fits its device's pool falls back to host bytes for that
-    product. A partial failure revokes all preceding locations. Each backend
-    continues to retain the source until its submitted device work and
-    readers retire.
+    product. Whether a location reaches a consumer over that consumer's
+    transfer edge is decided by the engine when it binds the consuming call,
+    which fails the requests reading a product left without one. A partial
+    failure revokes all preceding locations. Each backend continues to retain
+    the source until its submitted device work and readers retire.
 
     Args:
         transports: The rank's configured backends, keyed by mechanism name.
@@ -65,14 +67,13 @@ def publish_tensor(
     Returns:
         One locator per publication, in the order they were made. It is
         empty when no configured mechanism for the product's location serves
-        `consumers`, or when `cuda_vmm` is the only one, the product does not
-        fit its pool, and no host mechanism other than `local` serves
         `consumers`.
 
     Raises:
-        WorkerError: `unsupported_setup` when `transports` is empty. A
-            backend's publication error propagates after the locations
-            already made are released.
+        WorkerError: `unsupported_setup` when `transports` is empty, and
+            `resource_error` when the product does not fit its device's pool
+            and no other mechanism published it. A backend's publication
+            error propagates after the locations already made are released.
     """
     if not transports:
         raise unsupported_setup(
@@ -97,7 +98,7 @@ def publish_tensor(
                 location = transport.publish(
                     source, offset=offset, consumers=consumers
                 )
-            except PoolExhaustedError:
+            except PoolExhaustedError as exhausted:
                 # The product does not fit its device's pool: it travels as
                 # host bytes instead, over every host mechanism that serves
                 # its consumers. `local` is skipped because it is also a
@@ -118,6 +119,14 @@ def publish_tensor(
                                 location
                             )
                         )
+                # A product with no location at all is unreadable by any
+                # consumer, so the exhaustion is reported as the resource
+                # failure it is rather than as an empty publication.
+                if not locations:
+                    raise resource_error(
+                        "device product does not fit its VMM pool and the "
+                        "rank binds no other mechanism that publishes it"
+                    ) from exhausted
                 continue
             locations.append(location)
             retain(transport.publication_retirement(location))

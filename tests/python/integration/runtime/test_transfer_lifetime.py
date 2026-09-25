@@ -91,6 +91,41 @@ def test_exhausted_vmm_pool_delivers_host_fallback_and_restores_quota():
         events.close()
 
 
+def test_exhausted_vmm_pool_without_another_mechanism_refuses_the_product():
+    from uniserve_kernels.peer_storage import allocation_granularity
+
+    from uniserve_worker.errors import ResourceError
+    from uniserve_worker.transport import make_transports
+    from uniserve_worker.transport.publication import publish_tensor
+
+    device = torch.device("cuda:0")
+    page = allocation_granularity(device)
+    events = EventPool()
+    # A rank whose only publication mechanism is CUDA VMM, as an edge that
+    # names only a device mechanism binds it.
+    transports = make_transports(
+        ("cuda_vmm",), byte_capacity=page, ticket_capacity=2, event_pool=events
+    )
+    # One physical page fits the payload but not also the chunk's header.
+    source = torch.arange(page // 4, dtype=torch.float32, device=device)
+    try:
+        # The refusal is backpressure on this product alone, and it returns
+        # the product's byte lease, so a second attempt is refused the same
+        # way rather than for an exhausted budget.
+        for _ in range(2):
+            with pytest.raises(ResourceError, match="does not fit its VMM"):
+                publish_tensor(
+                    transports,
+                    source,
+                    retain=lambda future: None,
+                    consumers=(1,),
+                )
+    finally:
+        for transport in transports.values():
+            transport.close()
+        events.close()
+
+
 @pytest.mark.parametrize("backend", ("local", "shm", "cuda_vmm"))
 def test_transfer_writes_only_the_reserved_destination(backend: str) -> None:
     device = torch.device("cuda:0")

@@ -18,8 +18,9 @@ acknowledgment: that belongs to the publication the chunk backs, which
 `CudaVmmTransport` owns, retires and sweeps.
 
 A product that does not fit the pool raises `PoolExhaustedError`, and
-`publication.publish_tensor` publishes that product as host bytes instead.
-The pool logs its exhaustion once rather than once per product.
+`publication.publish_tensor` publishes that product as host bytes instead,
+over whichever host mechanisms the rank binds for its consumers. The pool
+logs its exhaustion once rather than once per product.
 """
 
 from __future__ import annotations
@@ -200,7 +201,8 @@ class VmmPool:
                     self._reported_exhaustion = True
                     _LOG.warning(
                         "device %s VMM pool of %d bytes cannot fit a %d byte "
-                        "product; those products use host transport",
+                        "product; such products are published as host bytes "
+                        "where the rank binds a host mechanism for them",
                         self._device,
                         self._capacity,
                         nbytes,
