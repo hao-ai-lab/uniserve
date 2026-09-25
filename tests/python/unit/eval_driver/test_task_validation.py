@@ -5,8 +5,11 @@ import io
 import pytest
 from PIL import Image
 
+from uniserve_eval.tasks.base import BenchmarkTask
+from uniserve_eval.tasks.i2t import I2TTask
 from uniserve_eval.tasks.interleave import InterleaveTask
 from uniserve_eval.tasks.t2i import T2ITask
+from uniserve_eval.tasks.text import TextTask
 from uniserve_eval.transport.images import inspect_image_bytes
 from uniserve_eval.types import (
     BenchmarkPoint,
@@ -32,6 +35,41 @@ def _metric(
     path: str = "images_per_second", direction: str = "higher"
 ) -> MetricDefinition:
     return MetricDefinition(tuple(path.split(".")), direction)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("task_cls", "task_name"),
+    [
+        (TextTask, TaskName.TEXT),
+        (I2TTask, TaskName.I2T),
+        (InterleaveTask, TaskName.INTERLEAVE),
+    ],
+)
+def test_extra_body_overrides_the_output_limit_of_every_chat_task(
+    task_cls: type[BenchmarkTask], task_name: TaskName
+) -> None:
+    point = BenchmarkPoint(
+        name="point",
+        server="server",
+        task=task_name,
+        model="model",
+        dataset="jsonl",
+        metrics=(_metric("output_throughput"),),
+        sampling=SamplingConfig(
+            max_tokens=64, extra_body={"max_completion_tokens": 7}
+        ),
+    )
+    example = Example(
+        id="row",
+        prompt="hello",
+        output_len=42,
+        max_tokens=42,
+        input_image_b64="aW1hZ2U=",
+    )
+
+    request = task_cls(point).build_request(example)
+
+    assert request.payload["max_completion_tokens"] == 7
 
 
 def test_t2i_requests_and_validation_use_exact_image_count() -> None:

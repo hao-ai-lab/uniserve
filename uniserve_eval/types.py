@@ -100,9 +100,10 @@ class SamplingConfig:
 
     Chat requests receive the sampling parameters and ``extra_body`` through
     ``BenchmarkTask.apply_text_sampling``, which omits optional parameters
-    left as ``None`` and merges ``extra_body`` last. Image-generations
-    requests carry only ``extra_body``, and video requests carry no field of
-    this config.
+    left as ``None`` and merges ``extra_body`` last, so its keys override
+    any request field the task sets, including ``max_completion_tokens``.
+    Image-generations requests carry only ``extra_body``, and video requests
+    carry no field of this config.
 
     ``max_tokens`` is the output limit of rows without their own; when both
     are unset, the text task sends no limit and the i2t and interleave tasks

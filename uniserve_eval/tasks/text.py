@@ -30,7 +30,8 @@ class TextTask(BenchmarkTask):
         row's non-empty ``messages`` replace its ``prompt`` as the
         conversation. The output limit is the row's ``output_len``, else the
         point's ``sampling.max_tokens``; with neither,
-        ``max_completion_tokens`` is omitted.
+        ``max_completion_tokens`` is omitted. As in every chat task,
+        ``sampling.extra_body`` overrides any of these fields.
         """
         output_len = (
             example.output_len
@@ -44,12 +45,9 @@ class TextTask(BenchmarkTask):
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        self.apply_text_sampling(payload)
-
-        # Set after `apply_text_sampling`, so the row or point limit overrides
-        # an `extra_body` entry of the same name.
         if output_len is not None:
             payload["max_completion_tokens"] = int(output_len)
+        self.apply_text_sampling(payload)
         return TaskRequest(self.point.endpoint, payload, stream=True)
 
     def validate_output(
