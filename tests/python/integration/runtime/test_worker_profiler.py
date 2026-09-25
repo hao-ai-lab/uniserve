@@ -5,6 +5,7 @@ They are exposed by the worker diagnostic configuration.
 
 import gzip
 import json
+import logging
 
 import pytest
 import torch
@@ -12,6 +13,38 @@ import torch
 from uniserve_worker.profiling import WorkerProfiler
 
 pytestmark = pytest.mark.integration
+
+
+def test_uncreatable_output_directory_disables_capture_once(tmp_path, caplog):
+    """A trace directory that cannot be created never fails a step.
+
+    The window fails to start once, is logged once, and every step, including
+    those after the start step, still runs its body.
+    """
+    blocker = tmp_path / "regular-file"
+    blocker.write_text("")
+    profiler = WorkerProfiler.from_env(
+        {
+            "UNISERVE_TORCH_PROFILER_DIR": str(blocker / "traces"),
+            "UNISERVE_PROFILE_ACTIVITIES": "CPU",
+            "UNISERVE_PROFILE_START_STEP": "2",
+        }
+    )
+
+    executed = []
+    with caplog.at_level(logging.ERROR, logger="uniserve_worker.profiling"):
+        for step in range(1, 5):
+            with profiler.step(f"worker-step-{step}"):
+                executed.append(step)
+        profiler.close()
+
+    assert executed == [1, 2, 3, 4]
+    failures = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("failed to start")
+    ]
+    assert len(failures) == 1
 
 
 def test_worker_profiler_exports_only_the_selected_execution_window(tmp_path):
