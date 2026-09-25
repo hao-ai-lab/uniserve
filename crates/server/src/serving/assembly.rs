@@ -91,8 +91,10 @@ struct TerminalAccounting {
 /// Reasoning text is yielded before the visible `TextDelta` produced by the
 /// same update. A `TextDelta` is yielded whenever it carries visible text,
 /// token IDs, or logprobs, or when `finished` is set, so a terminal update
-/// always produces one even if its text is empty. Returns `finished` unchanged
-/// for the caller to pass to [`emit_terminal`].
+/// always produces one even if its text is empty. A terminal update also
+/// releases the text a SenseNova filter still holds back, because no later
+/// text can complete a delimiter. Returns `finished` unchanged for the caller
+/// to pass to [`emit_terminal`].
 #[allow(clippy::too_many_arguments)]
 async fn emit_text_update(
     context: &EmitContext<'_>,
@@ -105,7 +107,15 @@ async fn emit_text_update(
     y: &mut TryYielder<RequestOutput, ServeError>,
 ) -> Result<Option<crate::serving::text::Finished>> {
     let delta: SenseNovaTextDelta = match sink {
-        OutputSink::SenseNova(processor) => processor.push(&text),
+        OutputSink::SenseNova(processor) => {
+            let mut delta = processor.push(&text);
+            if finished.is_some() {
+                let held = processor.finish();
+                delta.reasoning.push_str(&held.reasoning);
+                delta.visible.push_str(&held.visible);
+            }
+            delta
+        }
         OutputSink::Raw => SenseNovaTextDelta {
             visible: text,
             reasoning: String::new(),
