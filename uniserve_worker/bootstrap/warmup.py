@@ -842,13 +842,18 @@ def _warmup_flow_tables(
 
     if alternative:
         # Prefix slots are taken downward from the highest slot while the
-        # flow scenario admits its requests upward from slot one.
+        # flow scenario admits its requests upward from slot one; the
+        # scenario's batch bound keeps the two apart.
         alternative_slot = requests._prefix_slots.setdefault(
             call.request_key,
             int(requests.worker.info.request_slots)
             - len(requests._prefix_slots),
         )
-        if alternative_slot == main_slot or alternative_slot < 1:
+        admitted_slots = {
+            requests.worker.requests.get(request_id).request_pool_idx
+            for request_id in requests.worker.requests.request_ids()
+        }
+        if alternative_slot < 1 or alternative_slot in admitted_slots:
             raise invalid_descriptor(
                 "warmup has no request slot for an alternative prefix"
             )
@@ -1106,10 +1111,12 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
     For each configured guidance-branch count, admits a batch of two-step
     image requests, publishes their conditioning KV, prepares their initial
     latents, runs both denoising steps as separate DENOISING calls, and
-    drops the requests. A shape whose row count exceeds the worker's request
-    slots is skipped. Returns without running when the worker lacks
-    LATENT_PREPARATION, DENOISING, or an image builder, or already holds
-    requests. Image decoding is not exercised.
+    drops the requests. A batch admits at most as many requests as the
+    worker's request slots hold: every slot for single-branch generation,
+    half of them for guided generation, whose requests each also hold a slot
+    for their alternative guidance prefix. Returns without running when the
+    worker lacks LATENT_PREPARATION, DENOISING, or an image builder, or
+    already holds requests. Image decoding is not exercised.
     """
     from uniserve_worker.protocol.batch import NewRequest
     from uniserve_worker.protocol.call import (
@@ -1159,12 +1166,23 @@ def _warmup_flow(requests: _WarmupRequests) -> None:
     # startup sequence.
     next_request_id = 1
     next_generation = 1
+    request_slots = int(requests.worker.info.request_slots)
     for bucket in configured:
-        batch_size = bucket.rows
         height = bucket.height
         width = bucket.width
         cfg_branches = bucket.cfg_branches
-        if batch_size > int(requests.worker.info.request_slots):
+        # The engine leases every guided request a second slot for its
+        # alternative prefix (``ensure_flow_prefix``), so no guided batch it
+        # forms holds more than half the slots. The scenario is bounded the
+        # same way: its prefix slots, taken downward from the highest slot,
+        # then stay clear of the rows' slots taken upward from slot one. A
+        # capture bucket with more rows is warmed at the largest batch the
+        # slots hold; serving never replays it with more.
+        batch_size = min(
+            bucket.rows,
+            request_slots // 2 if cfg_branches > 1 else request_slots,
+        )
+        if batch_size < 1:
             continue
 
         request_ids = tuple(
