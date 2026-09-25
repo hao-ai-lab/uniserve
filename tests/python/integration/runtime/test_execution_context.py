@@ -3,7 +3,7 @@
 They do so without shared mutable prefix state.
 """
 
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 
 import pytest
@@ -12,7 +12,7 @@ from torch import nn
 
 from uniserve.cache import Config, mha
 from uniserve.model import TextSize
-from uniserve.nn import Linear
+from uniserve.nn import Linear, MergedColumnParallelLinear
 from uniserve.nn.attention import Attention, PagedInput
 from uniserve.quantization import Quantizer
 from uniserve.runtime import (
@@ -20,6 +20,7 @@ from uniserve.runtime import (
     CUDAStream,
     ExecutionContext,
     PrefixCache,
+    Scratch,
 )
 from uniserve.tensors import BufferConfig
 
@@ -415,3 +416,97 @@ def test_caller_exception_releases_backing_only_after_its_work_finished(
     # Released backing returns to the allocator; storage an unfinished access
     # may still read stays owned until process exit.
     assert retained >= (16 << 20) if pending else retained == 0
+
+
+@pytest.mark.gpu
+@torch.inference_mode()
+def test_contexts_sharing_scratch_replay_their_own_values():
+    """Contexts on one stream borrow one ``Scratch`` across sizes and graphs.
+
+    The merged projection stages its branches in a scratch output area. The
+    smaller context captures first, so the larger one grows the shared area
+    after that capture; both graphs then replay alternately with new inputs
+    and each matches eager evaluation of its own input.
+    """
+    device = torch.device("cuda:0")
+    generator = torch.Generator(device=device).manual_seed(29)
+    layer = MergedColumnParallelLinear(
+        128,
+        {"gate": 64, "up": 64},
+        bias=False,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    for branch in layer.projections.values():
+        branch.weight.copy_(
+            torch.randn(
+                branch.weight.shape,
+                device=device,
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            / 16
+        )
+
+    def reference(x):
+        return {
+            name: (x.float() @ branch.weight.float().T).bfloat16()
+            for name, branch in layer.projections.items()
+        }
+
+    sizes = (16, 96)
+    inputs = {
+        rows: torch.randn(
+            rows, 128, device=device, dtype=torch.bfloat16, generator=generator
+        )
+        for rows in sizes
+    }
+    outputs = {
+        rows: {
+            name: torch.empty(rows, 64, device=device, dtype=torch.bfloat16)
+            for name in layer.projections
+        }
+        for rows in sizes
+    }
+    scratch = Scratch()
+    torch.cuda.synchronize(device)
+    with (
+        CUDAStream.external(torch.cuda.Stream(device=device)) as stream,
+        ExitStack() as scope,
+    ):
+        graphs = {}
+        for rows in sizes:
+            context = scope.enter_context(
+                ExecutionContext(layer, stream=stream, scratch=scratch)
+            )
+            context.prepare(TextSize(rows, 1))
+            graph = scope.enter_context(CUDAGraph(context=context))
+            with context.activate():
+                layer(inputs[rows], out=outputs[rows])
+            graph.capture(
+                lambda rows=rows: layer(inputs[rows], out=outputs[rows])
+            )
+            graphs[rows] = graph
+
+        # FP32 accumulation over K=128, rounded once to BF16.
+        for _ in range(2):
+            for rows in (*sizes, sizes[0]):
+                inputs[rows].copy_(
+                    torch.randn(
+                        rows,
+                        128,
+                        device=device,
+                        dtype=torch.bfloat16,
+                        generator=generator,
+                    )
+                )
+                # Inputs are written on the default stream; the graph
+                # replays on the context's.
+                torch.cuda.synchronize(device)
+                graphs[rows].replay()
+                torch.cuda.synchronize(device)
+                for name, value in reference(inputs[rows]).items():
+                    torch.testing.assert_close(
+                        outputs[rows][name], value, rtol=2**-7, atol=2**-10
+                    )
+    scratch.close()

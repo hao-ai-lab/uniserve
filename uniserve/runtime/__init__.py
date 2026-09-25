@@ -7,7 +7,7 @@ if TYPE_CHECKING:
     from .cuda import CUDAError
     from .cuda_graph import CUDAGraph, CUDAGraphError
     from .events import EventPool, EventPoolError
-    from .execution import ExecutionContext
+    from .execution import ExecutionContext, Scratch
     from .prefix_cache import PrefixCache
     from .process_groups import (
         ProcessGroups,
@@ -24,6 +24,7 @@ __all__ = [
     "Rendezvous",
     "initialize_process_groups",
     "ExecutionContext",
+    "Scratch",
     "EventPool",
     "EventPoolError",
     "CUDAGraph",
@@ -44,6 +45,7 @@ def __getattr__(name):
         "Rendezvous": "process_groups",
         "initialize_process_groups": "process_groups",
         "ExecutionContext": "execution",
+        "Scratch": "execution",
         "EventPool": "events",
         "EventPoolError": "events",
         "CUDAGraph": "cuda_graph",
