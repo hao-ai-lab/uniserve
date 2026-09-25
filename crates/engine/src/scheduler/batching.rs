@@ -237,11 +237,10 @@ impl Scheduler {
                     continue;
                 }
             }
-            // The denoiser is an exclusive lane: the oldest request holds it
-            // for its whole step sequence, and a younger request's denoising
-            // dispatches only once that sequence has completed. Denoising
-            // steps of different requests are therefore never in flight
-            // together, in any lane.
+            // The denoiser is an exclusive lane: a request holds it while one
+            // of its denoising calls is in flight, so denoising steps of
+            // different requests are never in flight together, in any lane.
+            // Between two steps of one request, another request may take it.
             if next_type == Some(CallKind::Media(MediaCall::Denoising))
                 && (self.inflight.denoiser_lane_held_by_other(id)
                     || !self.flow_prefix_is_schedulable(id))
@@ -257,12 +256,11 @@ impl Scheduler {
             if let Some(mut call) = self.next_generation_computation(id, call_budget) {
                 let planned_us = uniserve_core::now_monotonic_us();
 
-                // The budget is charged before storage is reserved, so a call
-                // that finds no storage still consumes its share of the pass.
-                if mixed_prefill {
-                    mixed_left = mixed_left.saturating_sub(self.computation_token_cost(&call));
-                }
-                budget = budget.saturating_sub(self.computation_token_cost(&call));
+                // Only a call that obtains its storage is charged to the
+                // pass. A call that cannot run now leaves the budget to later
+                // requests; in particular, requests waiting for the flow-prefix
+                // row must not spend the pass before the request that holds
+                // the row, which is the one whose steps release it.
                 let Some(reserved_buffers) = self.reserve_generation_resources(&call) else {
                     self.record_domain_backpressure(call.code);
                     // Planning a forward advanced `num_kv_blocks_sent` past its
@@ -278,6 +276,11 @@ impl Scheduler {
                     );
                     continue;
                 };
+                let cost = self.computation_token_cost(&call);
+                if mixed_prefill {
+                    mixed_left = mixed_left.saturating_sub(cost);
+                }
+                budget = budget.saturating_sub(cost);
 
                 // Identify the call by its batch and row, and stamp the
                 // coordinates projected through the request's in-flight calls.
