@@ -765,8 +765,9 @@ def read_config(
     Args:
         path: A local checkpoint directory, a file inside one, or a Hub
             repository id, pinned to ``io.revision`` when it is set.
-        io: Checkpoint IO policy. With ``mode="dummy"`` no Hub payload is
-            downloaded.
+        io: Checkpoint IO policy. With ``mode="dummy"`` the only Hub
+            payloads downloaded are the sources the package's
+            ``config_sources`` names.
         modules: Module paths to resolve sources for; ``None`` selects the
             whole model, and an empty set resolves no payload source.
 
@@ -804,9 +805,11 @@ def read_config(
         if repository is None
         else _hub_checkpoint_identity(repository, revision, io)
     )
-    if repository is not None and io.mode != "dummy":
+    if repository is not None:
         # Some architectures derive dimensions from checkpoint tensor headers.
         # The package declares those sources before module selection is known.
+        # Dummy loading fetches them too: it synthesizes tensor values, not the
+        # headers that define the architecture.
         for declaration in package.config_sources:
             _fetch(
                 root,

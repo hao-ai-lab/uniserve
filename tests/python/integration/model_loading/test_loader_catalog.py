@@ -62,6 +62,44 @@ def _sense_config() -> dict[str, object]:
     }
 
 
+def _bagel_config() -> dict[str, object]:
+    return {
+        "architectures": ["BagelForConditionalGeneration"],
+        "llm_config": {
+            "hidden_size": 32,
+            "intermediate_size": 48,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "vocab_size": 37,
+        },
+        "vit_config": {
+            "hidden_size": 32,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 2,
+            "patch_size": 2,
+            "image_size": 8,
+        },
+        "vae_config": {
+            "ch": 32,
+            "ch_mult": [1, 1],
+            "downsample": 2,
+            "z_channels": 2,
+        },
+        "start_of_image_id": 35,
+        "end_of_image_id": 36,
+    }
+
+
+def _write_bagel_checkpoint(root: Path, metadata: dict[str, object]) -> None:
+    """Write BAGEL metadata and the primary shard's 3x3 position table."""
+    (root / "config.json").write_text(json.dumps(metadata))
+    save_file(
+        {"latent_pos_embed.pos_embed": torch.zeros(9, 32)},
+        root / "ema.safetensors",
+    )
+
+
 def _write_input_tokenizer(root: Path, *, has_markers: bool = True) -> None:
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -181,45 +219,20 @@ def test_image_processing_metadata_has_resolved_token_identities(
     assert load_tokenizer(config.tokenizer).convert_tokens_to_ids("<img>") == 1
 
 
+@pytest.mark.parametrize("mode", ("eager", "dummy"))
 def test_remote_image_architecture_resolves_checkpoint_dimensions_and_transforms(  # noqa: E501
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, mode
 ):
     remote = tmp_path / "remote"
     snapshot = tmp_path / "snapshots" / ("b" * 40)
     remote.mkdir()
-    metadata = {
-        "architectures": ["BagelForConditionalGeneration"],
-        "llm_config": {
-            "hidden_size": 32,
-            "intermediate_size": 48,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "vocab_size": 37,
-        },
-        "vit_config": {
-            "hidden_size": 32,
-            "num_attention_heads": 4,
-            "num_hidden_layers": 2,
-            "patch_size": 2,
-            "image_size": 8,
-        },
-        "vae_config": {
-            "ch": 32,
-            "ch_mult": [1, 1],
-            "downsample": 2,
-            "z_channels": 2,
-        },
-        "start_of_image_id": 35,
-        "end_of_image_id": 36,
-    }
-    (remote / "config.json").write_text(json.dumps(metadata))
-    save_file(
-        {"latent_pos_embed.pos_embed": torch.zeros(9, 32)},
-        remote / "ema.safetensors",
-    )
+    _write_bagel_checkpoint(remote, _bagel_config())
+    # An unselected payload source stays on the Hub in every mode.
+    save_file({"weight": torch.zeros(1)}, remote / "ae.safetensors")
+    downloaded = set()
 
     def download(*, repo_id, filename, revision, cache_dir):
+        downloaded.add(filename)
         target = snapshot / filename
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(remote / filename, target)
@@ -235,8 +248,12 @@ def test_remote_image_architecture_resolves_checkpoint_dimensions_and_transforms
     monkeypatch.setattr("huggingface_hub.HfApi.list_repo_files", files)
     monkeypatch.setattr("huggingface_hub.HfApi.list_repo_tree", tree)
     # Architecture inspection still needs the learned position-table extent,
-    # even when no numerical module is selected for loading.
-    config = models.read_config("owner/bagel", modules=frozenset())
+    # even when no numerical module is selected for loading, and dummy
+    # loading cannot synthesize the header that extent comes from.
+    config = models.read_config(
+        "owner/bagel", io=loading.Config(mode=mode), modules=frozenset()
+    )
+    assert downloaded == {"config.json", "ema.safetensors"}
     assert config.model.max_latent_size == 3
     assert config.image_processor.vit.resize.stride == 2
     assert config.image_processor.vit.resize.max_size == 8
