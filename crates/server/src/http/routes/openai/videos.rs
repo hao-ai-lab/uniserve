@@ -10,6 +10,10 @@
 //!   read, delete (cancelling a running job), and download jobs held in
 //!   `crate::video_jobs::VideoJobs`.
 //!
+//! Both submission routes take one of the job slots of `VideoJobs` before
+//! submitting, so `MAX_VIDEO_JOBS` bounds retained jobs and in-flight
+//! synchronous requests together.
+//!
 //! `GET /v1/capabilities` (`capabilities`) reports the model's video limits
 //! and the job-store bounds.
 //!
@@ -28,9 +32,10 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt as _;
-use uniserve_core::RejectionKind;
+use uniserve_core::{RejectionKind, SharedMedia};
 
 use crate::AppState;
+use crate::video_jobs::JobSlot;
 
 use crate::http::utils::resolve_request_id;
 use crate::openai::ApiError;
@@ -39,7 +44,10 @@ use crate::openai::ApiError;
 ///
 /// Responds with the artifact bytes, its content type, and a `Server-Timing`
 /// `generation` entry in milliseconds from handler entry (after body
-/// extraction) until the runtime reported completion. Submission errors,
+/// extraction) until the runtime reported completion. The request holds one
+/// of the job slots the asynchronous route uses from before submission until
+/// its response body has been sent or dropped, so a full job store answers
+/// `429 Too Many Requests` exactly as `videos_create` does. Submission errors,
 /// stream errors, and engine rejections map through `ApiError` (`400` or `503`
 /// for a rejection); a failed or non-`Stop` finish, an unexpected event, a
 /// closed stream, or a missing artifact is a `500`.
@@ -52,6 +60,15 @@ pub(crate) async fn videos_sync(
 
     let base_id = resolve_request_id(&headers);
     let request_id = crate::serving::ServeRequestId::new(format!("vid-{base_id}"));
+
+    // As in `videos_create`, the slot is claimed before submission; it is
+    // released on any early return and otherwise moves into the response
+    // body with the artifact.
+    let slot = match state.videos.reserve() {
+        Ok(slot) => slot,
+        Err(message) => return job_capacity_exceeded(message),
+    };
+
     let mut stream = match state.runtime().generate_video(request_id, body).await {
         Ok(stream) => stream,
         Err(error) => return error.into_response(),
@@ -110,8 +127,11 @@ pub(crate) async fn videos_sync(
             .into_response();
     };
 
-    let media = artifact.media;
-    let length = media.len();
+    let length = artifact.media.len();
+    let media = Arc::new(SlottedMedia {
+        media: artifact.media,
+        _slot: slot,
+    });
 
     let generation_ms = started_at.elapsed().as_secs_f64() * 1_000.0;
     Response::builder()
@@ -492,11 +512,27 @@ pub(crate) async fn videos_content(
         .into_response()
 }
 
+/// A synchronous response's video together with the job slot its request
+/// holds.
+///
+/// The response body owns it (through `media_body`), so the slot, like the
+/// mapping, is released once the body has been sent or dropped.
+struct SlottedMedia {
+    media: Arc<SharedMedia>,
+    _slot: JobSlot,
+}
+
+impl AsRef<[u8]> for SlottedMedia {
+    fn as_ref(&self) -> &[u8] {
+        self.media.as_bytes()
+    }
+}
+
 /// Streams `media` as a body of copied chunks of at most 64 KiB.
 ///
 /// The stream state owns the `Arc`, so the backing mapping, and for
-/// `RetainedMedia` its retained-byte permit, lives until the body completes or
-/// is dropped.
+/// `RetainedMedia` its retained-byte permit or for `SlottedMedia` its job
+/// slot, lives until the body completes or is dropped.
 fn media_body<M: AsRef<[u8]> + Send + Sync + 'static>(media: Arc<M>) -> Body {
     let chunks = futures::stream::try_unfold((media, 0_usize), |(media, offset)| async move {
         let bytes = media.as_ref().as_ref();
@@ -529,7 +565,51 @@ pub(crate) async fn capabilities(State(state): State<Arc<AppState>>) -> Response
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::test_support::{SERVED_MODEL, post_json, send, sim_state};
+    use crate::profile::ModelParameters;
     use axum::extract::FromRequest;
+
+    fn video_state() -> AppState {
+        sim_state(ModelParameters::MiniMaxH3 {
+            max_video_seconds: 15.0,
+            num_inference_steps: 4,
+        })
+    }
+
+    fn video_request() -> serde_json::Value {
+        serde_json::json!({"model": SERVED_MODEL, "prompt": "A river", "seconds": 5})
+    }
+
+    /// Both video submission routes draw on the same job slots: with every
+    /// slot taken, each answers with the same `429`, and a synchronous request
+    /// gives its slot back once its response is complete.
+    #[tokio::test]
+    async fn synchronous_videos_share_the_job_slot_bound() {
+        let state = Arc::new(video_state());
+        let router = crate::http::build_router(Arc::clone(&state));
+        let slots = (0..crate::video_jobs::MAX_VIDEO_JOBS)
+            .map(|_| state.videos.reserve().unwrap())
+            .collect::<Vec<_>>();
+
+        let (async_status, _, async_body) =
+            send(&router, post_json("/v1/videos", &video_request())).await;
+        let (sync_status, _, sync_body) =
+            send(&router, post_json("/v1/videos/sync", &video_request())).await;
+
+        assert_eq!(async_status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(async_body["error"]["code"], "video_job_capacity_exceeded");
+        assert_eq!((sync_status, sync_body), (async_status, async_body));
+
+        // With a slot free the request reaches the engine, which refuses it
+        // because the simulator has no video media components.
+        drop(slots);
+        let (status, _, _) = send(&router, post_json("/v1/videos/sync", &video_request())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let slots = (0..crate::video_jobs::MAX_VIDEO_JOBS)
+            .map(|_| state.videos.reserve())
+            .collect::<Vec<_>>();
+        assert!(slots.iter().all(Result::is_ok));
+    }
 
     #[tokio::test]
     async fn json_and_multipart_normalize_to_the_same_request() {

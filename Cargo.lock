@@ -9598,6 +9598,7 @@ dependencies = [
  "tokenizers 0.22.2",
  "tokio",
  "tokio-util",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-futures",
