@@ -66,18 +66,19 @@ async def get_request(
     """Yield rows with exponential inter-arrival delays at a finite rate.
 
     An infinite rate yields every row without delay. Otherwise the first row
-    is yielded immediately and each yield, including the last, is followed
-    by an exponential delay with mean ``1 / request_rate`` seconds, so the
-    caller's loop ends one delay after the final arrival. Delays draw from
+    is yielded immediately and every later row after an exponential delay
+    with mean ``1 / request_rate`` seconds, so ``len(rows) - 1`` delays are
+    drawn and the generator finishes at the final arrival. Delays draw from
     the process-global NumPy generator, which ``run_point`` seeds with the
     load seed.
     """
-    for row in rows:
+    for index, row in enumerate(rows):
+        # A delay separates consecutive arrivals only; none follows the last
+        # row, whose arrival ends the schedule.
+        if index > 0 and request_rate != float("inf"):
+            interval = float(np.random.exponential(1.0 / request_rate))
+            await asyncio.sleep(interval)
         yield row
-        if request_rate == float("inf"):
-            continue
-        interval = float(np.random.exponential(1.0 / request_rate))
-        await asyncio.sleep(interval)
 
 
 async def run_load(
@@ -150,12 +151,11 @@ async def run_load(
     outputs = await asyncio.gather(*tasks)
     benchmark_end_time = time.perf_counter()
 
-    # Duration runs from the start of arrival generation until both the
-    # arrival loop and every measured request have finished. With a finite
-    # rate the loop ends one delay after the final arrival (see
-    # ``get_request``), so the duration covers that delay even when every
-    # request finishes before it elapses. ``metrics.summarize`` divides its
-    # throughputs by this duration.
+    # Duration runs from the first arrival until every measured request has
+    # finished. The arrival loop ends at the final arrival (see
+    # ``get_request``), so the window closes at the last completion and
+    # holds no inter-arrival delay beyond it. ``metrics.summarize`` divides
+    # its throughputs by this duration.
     return LoadResult(
         tuple(warmup_outputs),
         tuple(outputs),
