@@ -793,10 +793,7 @@ def execute(
                     raise invalid_descriptor(
                         "conditioning module has no input Tensor"
                     )
-                result = model_runner.run_encoder(
-                    "conditioning",
-                    encoded,
-                )
+                result = model_runner.encode_conditioning(encoded)
                 if result.stats is None:
                     raise RuntimeError(
                         "module output has no execution statistics"
