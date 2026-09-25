@@ -10,6 +10,8 @@
 
 pub mod config;
 pub mod error;
+#[cfg(test)]
+mod hub_stub;
 pub mod model_files;
 pub mod pipeline_index;
 
