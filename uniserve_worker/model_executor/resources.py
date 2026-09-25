@@ -205,9 +205,11 @@ def output_layouts(
     )
     if isinstance(component, Denoiser):
         # Only a video denoiser shares the media timeline the builder sizes.
+        # Its rows on this rank follow the capacity layout the request
+        # evaluates in.
         if not isinstance(component, VideoDenoiser):
             raise ValueError("a media timeline's denoiser is a video denoiser")
-        return component.output_layout(size)
+        return component.output_layout(builder.layout(size))
 
     # Audio length follows from the video frame count at the declared rates.
     if clock is None:

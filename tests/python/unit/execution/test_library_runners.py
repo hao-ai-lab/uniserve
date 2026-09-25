@@ -65,7 +65,7 @@ def test_denoising_runner_advances_prepared_samples() -> None:
             state={"image": state["image"].unsqueeze(0)},
         )
         # The linear denoiser's state is its samples alone.
-        runner.prepare_state((size,), out={})
+        runner.prepare_state((size,), layouts=(size,), out={})
         for step in range(2):
             timestep = schedules["image"].timesteps[step]
             runner.step(

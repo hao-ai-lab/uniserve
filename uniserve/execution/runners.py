@@ -141,11 +141,12 @@ class DenoisingRunner(
 ):
     """Prepare a request's state and run its denoising steps.
 
-    The context is prepared for a layout (``Denoiser.layout_size``), and
-    steps evaluate that layout. ``prepare_latents`` fills the samples from
-    native draws and ``prepare_state`` the request's remaining state fields
-    from its exact size; the caller stages both into the state views it passes
-    to ``step``. The runner holds no request policy.
+    The context is prepared for a layout, any size that holds the request
+    (``Denoiser.holds``; ``Denoiser.layout_size`` is the smallest), and steps
+    evaluate that layout. ``prepare_latents`` fills the samples from native
+    draws and ``prepare_state`` the request's remaining state fields from its
+    exact size in that layout; the caller stages both into the state views it
+    passes to ``step``. The runner holds no request policy.
     """
 
     def __init__(
@@ -177,10 +178,15 @@ class DenoisingRunner(
         self,
         sizes: tuple[SizeT, ...],
         *,
+        layouts: tuple[SizeT, ...],
         out: Mapping[str, torch.Tensor],
     ) -> None:
-        """Fill host views of the state fields other than the samples."""
-        self.model.prepare_state(sizes, out=out)
+        """Fill host views of the state fields other than the samples.
+
+        Each size is evaluated in the aligned layout, which must hold it
+        (``Denoiser.holds``).
+        """
+        self.model.prepare_state(sizes, layouts=layouts, out=out)
 
     def step(
         self,

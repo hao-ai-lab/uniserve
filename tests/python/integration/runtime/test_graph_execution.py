@@ -71,7 +71,7 @@ def _pool(slots, *, device):
 
 def _runner(model, size, *, device, stream, pool, devices=(), slots=2):
     """Prepare the linear denoiser's diffusion runner for one size."""
-    return DiffusionRunner.for_layout(
+    runner = DiffusionRunner.for_layouts(
         "denoiser",
         Call("denoiser", model, EntryPoint("forward")),
         size,
@@ -84,6 +84,8 @@ def _runner(model, size, *, device, stream, pool, devices=(), slots=2):
         pool=pool,
         pages=1,
     )
+    runner.prepare(size, pages=1)
+    return runner
 
 
 def _committed(pool, bank, slot, size):
@@ -110,6 +112,7 @@ def _bind(runner, schedules, size, steps, slot):
     """Bind a slot's ladder over the runner's samples."""
     sample = runner.samples.view(-1)[: size.width]
     return runner.bind(
+        size,
         _inputs(schedules, sample, size, steps),
         schedules,
         state={},
@@ -177,11 +180,9 @@ def test_denoising_steps_read_the_committed_bank_and_write_the_other(
             try:
                 sample = runner.samples.view(-1)[:width]
                 sample.copy_(reference)
-                runner.warmup(
-                    _inputs(schedules, sample, size, 1)[0], schedules, state={}
-                )
-                torch.testing.assert_close(sample, reference, rtol=0, atol=0)
                 ladder = _bind(runner, schedules, size, 2, slot)
+                runner.warmup(ladder)
+                torch.testing.assert_close(sample, reference, rtol=0, atol=0)
                 if graphs:
                     for step in (0, 1):
                         runner.capture(ladder, step)
@@ -265,6 +266,7 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
     try:
         _committed(pool, 1, 1, size).fill_(7.0)
         bound = _bind(runner, schedules, size, steps, 1)
+        runner.warmup(bound)
         for step in range(steps):
             runner.capture(bound, step)
         # Capture must leave the slot's committed samples where it found them.
@@ -289,12 +291,11 @@ def test_captured_ladders_replay_on_every_slot_with_eager_values():
 
 
 @torch.inference_mode()
-def test_steps_without_a_captured_ladder_run_eagerly():
-    """Stepping never captures: a step replays only after ``capture``.
+def test_a_capturing_runner_serves_only_startup_captured_steps():
+    """Serving never evaluates a capturing runner's steps eagerly.
 
-    On a capturing runner a request's steps run eagerly, with the eager
-    values, until startup capture makes their graphs resident; the same
-    ladder then replays with the same values.
+    A step whose graph startup did not capture is refused rather than run
+    without graphs, so every served step replays a captured graph.
     """
     device = torch.device("cuda:0")
     model = LinearDenoiser().to(device)
@@ -314,21 +315,15 @@ def test_steps_without_a_captured_ladder_run_eagerly():
     )
     try:
         bound = _bind(runner, schedules, size, steps, 1)
-        for expected_path in ("eager", "graph_replay"):
-            _committed(pool, 1, 1, size).fill_(7.0)
-            bank, paths = 1, []
-            for step in range(steps):
-                paths.append(runner.step(bound, step, bank)[1])
-                bank = 1 - bank
-            assert paths == [expected_path] * steps
-            torch.testing.assert_close(
-                _committed(pool, bank, 1, size),
-                _advanced(size, steps, device=device),
-                rtol=1e-6,
-                atol=1e-6,
-            )
-            for step in range(steps):
-                runner.capture(bound, step)
+        _committed(pool, 1, 1, size).fill_(7.0)
+        with pytest.raises(RuntimeError, match="no graph"):
+            runner.step(bound, 0, 1)
+
+        runner.warmup(bound)
+        runner.capture(bound, 0)
+        assert runner.step(bound, 0, 1)[1] == "graph_replay"
+        with pytest.raises(RuntimeError, match="no graph"):
+            runner.step(bound, 1, 0)
     finally:
         torch.cuda.current_stream(device).synchronize()
         runner.close()

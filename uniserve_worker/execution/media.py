@@ -22,6 +22,8 @@ when it applies a diffusion request's start command.
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -29,6 +31,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from uniserve.model import AudioDecoder, VideoDecoder, VideoPostprocessor
+from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.tensors import TensorOutput, concatenate_views
 from uniserve_worker.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.execution import calls
@@ -50,6 +53,8 @@ from uniserve_worker.protocol.call import Call, CallStatus, MediaCall
 from uniserve_worker.protocol.identity import CallId
 from uniserve_worker.protocol.output import FinishFlags
 from uniserve_worker.storage.latent_pool import LatentUpdate
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -218,9 +223,10 @@ def prepare_call(
     constants and workspace and may be retired after their dependent graphs
     drain.
 
-    Returns the request's slot views for the call and the execution context
-    whose constants and workspace it uses: the ``"denoising"`` views and the
-    layout runner's context for preparation and denoising, the
+    Returns the request's slot views for the call and the prepared
+    resources whose constants and workspace it uses: the ``"denoising"``
+    views and the request layout's ``LayoutEntry`` for preparation and
+    denoising, the
     ``"video_overlap"`` views and the decoder's context for a video decode
     round (which also prepares the post-processor's context), and no views
     for an audio decode round. Other kinds return ``({}, None)``. Slot views
@@ -244,9 +250,7 @@ def prepare_call(
                 runner.media_builder.buffers(size)
             )
         layout = runner.media_builder.layout(size)
-        return slot.tensors["denoising"], runner.diffusion_runner(
-            layout
-        ).context
+        return slot.tensors["denoising"], runner.diffusion.layout(layout)
 
     if kind is MediaCall.VIDEO_DECODING:
         # A decode round also converts its media unit to RGB, cross-faded with
@@ -275,104 +279,123 @@ def prepare_call(
     return {}, None
 
 
-def _stage_placeholder(builder, size, views, samples, context) -> None:
+def _stage_placeholder(builder, size, views, samples, diffusion, layout):
     """Fill a slot and samples with a request's inputs for startup calls.
 
-    Warmup and capture run the numerical calls a request of ``size`` runs,
-    with a fixed seed and no prompt. Their results are discarded, and the
-    first real request stages its own draw, tables and conditioning.
+    Warmup and capture run the numerical calls a request of ``size`` runs in
+    ``layout``, with a fixed seed and no prompt. Their results are
+    discarded, and the first real request stages its own draw, tables and
+    conditioning.
     """
+    entry = diffusion.layout(layout)
     builder.stage_request(size, views, seed=0)
     staged = builder.initialize(
         size,
         views,
         samples,
-        constants=context.constants,
-        workspace=context.workspace,
+        constants=entry.constants,
+        workspace=entry.workspace,
     )
-    with context.activate():
+    with diffusion.context.activate():
         for destination, source in staged:
             destination.copy_(source)
         views["text_condition"].zero_()
 
 
 @torch.inference_mode()
-def warmup_denoising(
+def prepare_denoising(
     runner: ModelExecutor, storage: tuple[TensorBuffers, ...]
 ) -> None:
-    """Compile representative tile boundaries without advancing samples."""
+    """Make every capacity layout's steps ready before the worker serves.
+
+    Each layout of ``MediaBuilder.layouts`` is prepared, largest first, so
+    the first allocates the storage every other layout shares. A placeholder
+    request filling the layout's text capacity on slot one runs one eager
+    step, which prepares the layout's kernels, plans and scratch; once every
+    layout is warm, a capturing runner captures every step of every
+    layout's ladder. The graphs
+    serve every request slot, since they reach a slot's storage and pages
+    through device indices, and every prompt length the layout holds, since
+    the lengths differ only in the state a graph gathers from the slot.
+    Collective across the component's ranks, which hold each other in
+    lockstep here; serving never prepares a layout or captures.
+
+    Raises:
+        RuntimeError: The request storage or input builder is missing, or
+            the layouts' resident storage does not fit the device, with the
+            layout count and the settings that bound it.
+    """
     builder = runner.media_builder
     if not runner.denoises:
         return
     if builder is None or not storage:
         raise RuntimeError(
-            "denoising warmup requires its input builder and request storage"
+            "denoising preparation requires its input builder and request "
+            "storage"
         )
 
-    maximum = builder.maximum
-    decoder = runner.video_decoder
-    final_window = decoder.frame_slices(maximum.num_frames)[-1]
-    minimum = final_window.stop - final_window.start
-    # Representative (frames, text tokens) tile boundaries to compile. Sizes
-    # sharing a layout are warmed once, and lengths beyond the worker's text
-    # capacity are skipped.
-    shapes = (
-        (maximum.num_frames, 65),
-        (minimum, 1),
-        *((maximum.num_frames, tokens) for tokens in (129, 193, 257)),
-        (maximum.num_frames, maximum.num_text_tokens),
-    )
+    started = time.perf_counter()
+    try:
+        layouts = runner.prepare_layouts()
+        diffusion = runner.diffusion
+        schedules = open_state(runner, builder.maximum).schedules
 
-    schedules, prepared = open_state(runner, builder.maximum).schedules, set()
-    for frames, tokens in shapes:
-        if tokens > maximum.num_text_tokens:
-            continue
-        size = builder.size(frames, tokens)
-        layout = builder.layout(size)
-        if layout in prepared:
-            continue
-        prepared.add(layout)
-        diffusion = runner.diffusion_runner(layout)
-        # ``storage[0]`` is request slot one's tensors; no request owns a
-        # slot while these passes run.
-        views = storage[0].view(builder.buffers(size))
-        samples = builder.sample_views(size, diffusion.samples)
-        _stage_placeholder(builder, size, views, samples, diffusion.context)
-        diffusion.warmup(
-            builder.bind(size, views, samples, schedules, 0),
-            schedules,
-            state=views,
+        def ladder(layout):
+            # A placeholder request filling the layout's text capacity on
+            # slot one. ``storage[0]`` is slot one's tensors; no request
+            # owns a slot while this pass runs.
+            size = builder.size(
+                layout.num_frames,
+                min(layout.num_text_tokens, builder.maximum.num_text_tokens),
+            )
+            views = storage[0].view(builder.buffers(size))
+            samples = builder.sample_views(size, diffusion.samples)
+            _stage_placeholder(builder, size, views, samples, diffusion, layout)
+            return diffusion.bind(
+                layout,
+                tuple(
+                    builder.bind(size, views, samples, schedules, index)
+                    for index in range(builder.num_steps)
+                ),
+                schedules,
+                state=views,
+                slot=1,
+                pages=builder.slot_pages(1),
+            )
+
+        # Every layout warms before any captures. A warm step allocates the
+        # layout's persistent plans and scratch from the runner's pool, and
+        # the captured steps of every layout share that pool's free blocks
+        # as their intermediates; a persistent allocation made after a
+        # capture could land in a block an earlier graph rewrites.
+        for layout in layouts:
+            diffusion.warmup(ladder(layout))
+        if diffusion.captures:
+            for layout in layouts:
+                bound = ladder(layout)
+                for index in range(builder.num_steps):
+                    diffusion.capture(bound, index)
+        runner.graph_storage.check()
+        resident = sum(runner.graph_storage.resident_bytes().values())
+        logger.info(
+            "prepared %d denoiser layouts (%d frame counts x %d text "
+            "capacities, %d step graphs) in %.1f s; graph storage %.2f GiB",
+            len(layouts),
+            len(builder.frame_counts),
+            len(builder.text_capacities),
+            len(layouts) * builder.num_steps if diffusion.captures else 0,
+            time.perf_counter() - started,
+            resident / 2**30,
         )
-
-
-def declared_sizes(runner: ModelExecutor) -> tuple:
-    """Resolve the worker's declared video shapes into numerical sizes.
-
-    A declared shape names the duration and prompt length of the requests a
-    deployment serves. Admission converts a duration at the output sampling
-    clock and rounds it up to the next complete native window, so a declared
-    duration resolves to the frame count its requests carry.
-    """
-    builder = runner.media_builder
-    if builder is None:
-        return ()
-
-    frame_rate = runner.video_postprocessor.frame_rate
-    sizes = []
-    for seconds, num_text_tokens in runner.worker_config.video_graph_shapes:
-        frames = builder.denoiser.legal_frame_count(
-            int(seconds * frame_rate + 0.5)
-        )
-        try:
-            size = builder.size(frames, num_text_tokens)
-        except ValueError as error:
-            raise invalid_descriptor(
-                f"declared video graph shape {seconds} s x "
-                f"{num_text_tokens} tokens exceeds worker capacity: {error}"
-            ) from error
-        if size not in sizes:
-            sizes.append(size)
-    return tuple(sizes)
+    except (CUDAGraphError, torch.OutOfMemoryError) as error:
+        raise RuntimeError(
+            f"the denoiser's {len(builder.layouts())} capacity layouts "
+            f"({len(builder.frame_counts)} frame counts x "
+            f"{len(builder.text_capacities)} text capacities) do not fit "
+            "this device: lower --max-video-seconds or --max-model-len, use "
+            "fewer --video-text-capacities, raise --mem-fraction-static, or "
+            f"serve with --graph-policy off ({error})"
+        ) from error
 
 
 def decoded_units(runner: ModelExecutor, name: str, count: int) -> tuple:
@@ -395,83 +418,16 @@ def decoded_units(runner: ModelExecutor, name: str, count: int) -> tuple:
 
 
 @torch.inference_mode()
-def capture_denoising(
-    runner: ModelExecutor, storage: tuple[TensorBuffers, ...]
-) -> None:
-    """Make every declared video shape's denoising ladder resident.
-
-    A denoising graph is captured per ladder step for the layout each
-    declared size occupies. It serves every request slot, since it reaches a
-    slot's storage and pages through device indices rather than through
-    their addresses, and every prompt length within the layout, since the
-    lengths differ only in the state the graph gathers from the slot. The
-    layouts stay pinned with their ladders. Capture is collective across the
-    component's ranks and belongs here, where warmup holds them in lockstep;
-    serving never captures, and a request whose layout no declared shape
-    covers runs its steps eagerly.
-    """
-    builder = runner.media_builder
-    sizes = declared_sizes(runner)
-    if (
-        not runner.denoises
-        or not sizes
-        or runner.worker_config.graph_policy == "off"
-    ):
-        return
-    if builder is None or not storage:
-        raise RuntimeError(
-            "denoising capture requires its input builder and request storage"
-        )
-
-    schedules = open_state(runner, builder.maximum).schedules
-    captured = set()
-    for size in sizes:
-        layout = builder.layout(size)
-        if layout in captured:
-            continue
-        captured.add(layout)
-        # Whether a runner captures depends on its stream and the graph
-        # policy, which every layout shares, so one non-capturing runner ends
-        # the pass.
-        if not runner.diffusion_runner(layout).captures:
-            return
-        diffusion = runner.diffusion_runner(layout, pin=True)
-        # Any slot's rows and pages serve the capture; slot one's do, held in
-        # ``storage[0]`` and named to the ladder below.
-        views = storage[0].view(builder.buffers(size))
-        samples = builder.sample_views(size, diffusion.samples)
-        _stage_placeholder(builder, size, views, samples, diffusion.context)
-
-        ladder = diffusion.bind(
-            tuple(
-                builder.bind(size, views, samples, schedules, index)
-                for index in range(builder.num_steps)
-            ),
-            schedules,
-            state=views,
-            slot=1,
-            pages=builder.slot_pages(1),
-        )
-        for index in range(builder.num_steps):
-            diffusion.capture(ladder, index)
-
-
-@torch.inference_mode()
 def warmup_decoders(runner: ModelExecutor) -> None:
-    """Prepare reconstruction kernels for the admitted and declared extents.
+    """Prepare reconstruction kernels for the admitted maximum duration.
 
     A decoder's prepared context and captured graph follow its frame count and,
-    for video, the media unit it reconstructs, so a declared duration warms
-    every unit this rank decodes at that duration. The admitted maximum stays
-    covered so an undeclared duration still meets compiled kernels.
+    for video, the media unit it reconstructs, so warming the maximum warms
+    every unit this rank decodes at that duration and compiles the kernels
+    every shorter duration shares.
     """
     builder = runner.media_builder
-    frames = tuple(
-        dict.fromkeys(
-            size.num_frames
-            for size in (builder.maximum, *declared_sizes(runner))
-        )
-    )
+    frames = (builder.maximum.num_frames,)
     for (name, _, method), (binding, call) in runner._module_calls.items():
         if method != "decode":
             continue
@@ -511,29 +467,6 @@ def warmup_decoders(runner: ModelExecutor) -> None:
 
 
 @torch.inference_mode()
-def warmup_conditioning(runner: ModelExecutor) -> None:
-    """Compile and capture the conditioning path at every declared length.
-
-    The text encoder and the denoiser's conditioning encoder each prepare one
-    context and capture one graph per exact token count. Running them in their
-    serving order gives the conditioning encoder the same input the request
-    path hands it, so a declared prompt length is warmed here rather than on
-    the first request that carries it.
-    """
-    kinds = runner.encoder_kinds
-    if "text" not in kinds:
-        return
-    for length in dict.fromkeys(
-        size.num_text_tokens for size in declared_sizes(runner)
-    ):
-        encoded = runner.run_encoder(
-            "text", runner.prepare_text_tokens((0,) * length)
-        )
-        if "conditioning" in kinds:
-            runner.run_encoder("conditioning", *encoded.values)
-
-
-@torch.inference_mode()
 def warmup_postprocess(
     runner: ModelExecutor, storage: tuple[TensorBuffers, ...]
 ) -> None:
@@ -541,7 +474,7 @@ def warmup_postprocess(
 
     One post-processing call converts the media unit this rank reconstructed, so
     its prepared context follows the frame count. Every rank of the ring
-    prepares every declared duration even where it holds no unit in a round,
+    prepares the maximum duration even where it holds no unit in a round,
     because preparing a context binds the ring's communication resources and
     that binding spans the whole ring.
     """
@@ -561,9 +494,7 @@ def warmup_postprocess(
     device = binding.device
     position = binding.config.ranks.index(binding.process_group.global_rank)
     units_per_round = len(binding.config.ranks)
-    for frames in dict.fromkeys(
-        size.num_frames for size in (builder.maximum, *declared_sizes(runner))
-    ):
+    for frames in (builder.maximum.num_frames,):
         runner.prepare_module(name, frames, method="forward")
         windows = decoder.frame_slices(frames)
         layout = decoder.output_layout(frames)["video"]
@@ -908,16 +839,16 @@ def execute(
             width=params.width,
         )
 
-        # The ladder is bound over the request's slot views and the samples
-        # of its layout's runner once, and replayed by every later step. It
-        # views that runner's samples, so it is bound again when the layout's
-        # runner has been retired and replaced since.
+        # The ladder is bound over the request's slot views and the
+        # runner's samples once, in the request's capacity layout, and
+        # replayed by every later step.
         slot_state = slot_ladder(trajectory)
         layout = builder.layout(numerical_shape)
-        diffusion = model_runner.diffusion_runner(layout)
+        diffusion = model_runner.diffusion
         if slot_state.ladder is None or not diffusion.binds(slot_state.ladder):
             samples = builder.sample_views(numerical_shape, diffusion.samples)
             slot_state.ladder = diffusion.bind(
+                layout,
                 tuple(
                     builder.bind(
                         numerical_shape,
@@ -934,7 +865,7 @@ def execute(
                 pages=params.page_table,
             )
         result = model_runner.run_denoising(
-            layout, slot_state.ladder, start_step, source
+            slot_state.ladder, start_step, source
         )
         if result.stats is None:
             raise RuntimeError("module output has no execution statistics")

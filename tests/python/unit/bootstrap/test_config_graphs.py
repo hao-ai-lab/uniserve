@@ -1,4 +1,4 @@
-"""Graph residency declarations carried by a worker launch."""
+"""Video capacity settings carried by a worker launch."""
 
 from __future__ import annotations
 
@@ -9,28 +9,30 @@ from tests.python.fixtures.launch import worker_args
 pytestmark = pytest.mark.unit
 
 
-def test_declared_video_shapes_carry_duration_and_prompt_length(tmp_path):
+def test_video_capacities_carry_text_capacities_and_the_admitted_floor(
+    tmp_path,
+):
     config = worker_args(
         tmp_path,
         max_batch_tokens=8192,
-        video_graph_shapes="5x1000,15.0x10000",
+        video_text_capacities="1024,4096,8192",
+        min_video_seconds=4.0,
     )
-    assert config.execution.video_graph_shapes == (
-        (5.0, 1000),
-        (15.0, 10000),
-    )
+    assert config.execution.video_text_capacities == (1024, 4096, 8192)
+    assert config.execution.min_video_seconds == 4.0
 
 
-def test_a_worker_declares_no_video_shapes_by_default(tmp_path):
+def test_a_worker_uses_default_video_capacities_without_settings(tmp_path):
     config = worker_args(tmp_path, max_batch_tokens=8192)
-    assert config.execution.video_graph_shapes == ()
+    assert config.execution.video_text_capacities == ()
+    assert config.execution.min_video_seconds is None
 
 
-@pytest.mark.parametrize("declaration", ["5", "5x0", "0x1000", "5x1000,5x1000"])
-def test_malformed_video_shape_declarations_are_refused(declaration, tmp_path):
+@pytest.mark.parametrize("capacities", ["0,1024", "4096,1024", "1024,1024"])
+def test_malformed_text_capacities_are_refused(capacities, tmp_path):
     with pytest.raises(SystemExit):
         worker_args(
             tmp_path,
             max_batch_tokens=8192,
-            video_graph_shapes=declaration,
+            video_text_capacities=capacities,
         )

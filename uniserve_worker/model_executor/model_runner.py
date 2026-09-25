@@ -10,8 +10,10 @@ serves two call paths:
   through ``capture_batch``; once ``ModelExecutor.complete_startup`` seals
   the runner, no batch graph is captured.
 - Standalone invocations: ``execute_model`` evaluates one module call from
-  ``ModelExecutor.run_module`` and, when graph pools exist, captures a graph
-  per exact input signature on first use, at any time.
+  ``ModelExecutor.run_module``. When graph pools exist, startup captures a
+  graph per exact input signature on first use; once startup is sealed, a
+  resident signature replays and any other runs eagerly, so serving never
+  captures.
 """
 
 from __future__ import annotations
@@ -156,8 +158,10 @@ class ModelRunner(Execution, ABC):
     def execute_model(self, *args, **kwargs):
         """Evaluate numerical arguments and return owned results.
 
-        The first call with a given input signature captures a graph when
-        pools exist; later calls replay it. The lane stream, when present,
+        When pools exist, the first call with a given input signature during
+        startup captures a graph and later calls replay it; after startup is
+        sealed, a signature without a resident graph runs eagerly rather
+        than capturing on the request path. The lane stream, when present,
         waits for the caller's current stream before the call, and after a
         successful call the caller's stream waits for the lane. The returned
         output is a clone that does not alias graph storage. Its statistics
@@ -175,9 +179,10 @@ class ModelRunner(Execution, ABC):
         graph = None if bucket is None else bucket.graphs[None]
         resources = self.resources()
         with context.activate():
-            if self.pools:
-                # A component's ranks run the same calls with the same input
-                # signatures, so they find the same graph resident.
+            # A component's ranks run the same calls with the same input
+            # signatures and seal startup together, so they find the same
+            # graph resident or all evaluate eagerly.
+            if self.pools and (graph is not None or not self._startup_complete):
                 if graph is None:
                     self.close_bucket(key)
                     with self.graph_storage.allocate(self):

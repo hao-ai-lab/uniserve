@@ -3,9 +3,7 @@
 The prompt length is a workload dimension (``VideoConfig.prompt_tokens``)
 alongside the video duration. This adapter synthesizes one prompt whose token
 count under the model's tokenizer equals the target exactly, and every
-example repeats that prompt with the same seed. Server profiles that pass
-``--video-graph-shapes`` name shapes as seconds by prompt tokens; requests
-outside a captured shape's layout denoise without graphs.
+example repeats that prompt with the same seed.
 """
 
 from __future__ import annotations

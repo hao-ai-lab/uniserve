@@ -1,9 +1,9 @@
 """Stage numerical media inputs for the worker's admitted requests.
 
 ``MediaBuilder`` wraps a standalone ``VideoDenoiser`` for serving: it bounds
-admitted sizes, maps each size to the layout whose prepared context and
-captured ladder it shares, describes a request slot's storage, and places a
-request's solver samples in latent pool pages (``SamplePages``).
+admitted sizes, maps each size to the capacity layout whose prepared
+constants and captured ladder it shares, describes a request slot's storage,
+and places a request's solver samples in latent pool pages (``SamplePages``).
 """
 
 from __future__ import annotations
@@ -26,6 +26,10 @@ REQUEST_PAGES = 8
 
 #: Element alignment of each modality's samples within a request's pages.
 SAMPLE_ALIGNMENT = 256
+
+#: Spacing, in prompt tokens, of the default text capacities: a request's
+#: layout holds at most this many padding rows beyond its prompt's tiles.
+TEXT_CAPACITY_STEP = 2048
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,10 +66,13 @@ class MediaBuilder:
     views required for one invocation, and states its own native window and
     size descriptor.
 
-    A request's storage, constants and denoising calls follow the layout its
-    exact size occupies, so every request of one layout binds the same shapes
-    and replays the same captured ladder. What distinguishes the request
-    within its layout is state the builder stages with its samples.
+    Serving evaluates a bounded set of capacity layouts (``layouts``): every
+    frame count the worker admits, each with every text capacity. A request
+    evaluates in the smallest capacity layout that holds it (``layout``), so
+    every request of one layout binds the same shapes and replays the same
+    captured ladder, and no admitted size needs a layout of its own. What
+    distinguishes the request within its layout is state the builder stages
+    with its samples.
 
     The samples a solver step rewrites live in the worker's latent pool (see
     ``sample_pages``); the request's slot holds only state written once: the
@@ -73,29 +80,78 @@ class MediaBuilder:
     """
 
     def __init__(
-        self, denoiser: VideoDenoiser, *, max_frames: int, max_text_tokens: int
+        self,
+        denoiser: VideoDenoiser,
+        *,
+        max_frames: int,
+        max_text_tokens: int,
+        min_frames: int = 1,
+        text_capacities: tuple[int, ...] = (),
     ) -> None:
+        """Bound admitted sizes and fix the capacity layouts.
+
+        Admitted frame counts are the legal counts from ``min_frames`` up to
+        ``max_frames`` rounded up to complete native windows. Text
+        capacities are prompt token counts; the largest must hold
+        ``max_text_tokens``, and without any the capacities step by
+        ``TEXT_CAPACITY_STEP`` up to it.
+
+        Raises:
+            ValueError: No frame count is admitted, or a text capacity is
+                not positive or none holds ``max_text_tokens``.
+        """
         # Admission advertises complete native windows, including the final
         # overlap. Cover the configured duration with the next legal input.
         frames = denoiser.legal_frame_count(max_frames)
         self.maximum = denoiser.make_size(frames, max_text_tokens)
         self.denoiser = denoiser
         self.num_steps = denoiser.num_steps
+
+        counts = [denoiser.legal_frame_count(max(1, int(min_frames)))]
+        while counts[-1] < frames:
+            counts.append(denoiser.legal_frame_count(counts[-1] + 1))
+        if counts[-1] != frames:
+            raise ValueError("media input admits no frame count")
+        self.frame_counts = tuple(counts)
+
+        requested = tuple(int(value) for value in text_capacities) or tuple(
+            range(TEXT_CAPACITY_STEP, max_text_tokens, TEXT_CAPACITY_STEP)
+        ) + (max_text_tokens,)
+        if min(requested) < 1 or max(requested) < max_text_tokens:
+            raise ValueError(
+                "text capacities must be positive and hold the prompt capacity"
+            )
+        # Each capacity is the text region of the layout that holds it,
+        # capped at the one that holds the prompt capacity.
+        largest = denoiser.layout_size(self.maximum).num_text_tokens
+        self.text_capacities = tuple(
+            sorted(
+                {
+                    min(
+                        largest,
+                        denoiser.layout_size(
+                            denoiser.make_size(frames, value)
+                        ).num_text_tokens,
+                    )
+                    for value in requested
+                }
+            )
+        )
         # State descriptions per layout. Describing one builds the layout's
-        # packing on the host, so each is cached; layouts are a small finite
-        # set bounded by the admitted frame and prompt capacity.
+        # packing on the host, so each is cached; layouts are the bounded set
+        # ``layouts`` lists.
         self._states: dict[object, Mapping[str, BufferConfig]] = {}
 
     def size(self, num_frames: int, num_text_tokens: int):
         """Return the denoiser's exact size for an admitted request.
 
         Raises:
-            ValueError: The size exceeds the admitted maximum frame count or
-                prompt length.
+            ValueError: The frame count is not one the worker admits, or the
+                prompt exceeds its conditioning capacity.
         """
         size = self.denoiser.make_size(num_frames, num_text_tokens)
         if (
-            size.num_frames > self.maximum.num_frames
+            size.num_frames not in self.frame_counts
             or size.num_text_tokens > self.maximum.num_text_tokens
         ):
             raise ValueError(
@@ -104,12 +160,37 @@ class MediaBuilder:
         return size
 
     def layout(self, size):
-        """Return the size whose numerical layout ``size`` occupies.
+        """Return the capacity layout a request of ``size`` evaluates in.
 
-        Requests of one layout share its prepared context and captured
-        graphs; see ``Denoiser.layout_size``.
+        It is the smallest text capacity at the request's frame count that
+        holds the request (``Denoiser.holds``). Requests of one layout share
+        its prepared constants and captured graphs.
+
+        Raises:
+            ValueError: ``size`` is not an admitted frame count, or no
+                capacity holds it.
         """
-        return self.denoiser.layout_size(size)
+        if size.num_frames not in self.frame_counts:
+            raise ValueError("media input has no admitted capacity layout")
+        for capacity in self.text_capacities:
+            layout = self.denoiser.layout_size(
+                self.denoiser.make_size(size.num_frames, capacity)
+            )
+            if self.denoiser.holds(layout, size):
+                return layout
+        raise ValueError("media input has no admitted capacity layout")
+
+    def layouts(self) -> tuple:
+        """List every capacity layout, the largest first.
+
+        The first holds every admitted size and bounds every other layout's
+        shapes dimension by dimension.
+        """
+        return tuple(
+            self.denoiser.layout_size(self.denoiser.make_size(frames, capacity))
+            for frames in reversed(self.frame_counts)
+            for capacity in reversed(self.text_capacities)
+        )
 
     def _state(self, size) -> Mapping[str, BufferConfig]:
         layout = self.layout(size)
@@ -249,6 +330,7 @@ class MediaBuilder:
         )
         self.denoiser.prepare_state(
             (size,),
+            layouts=(self.layout(size),),
             out={name: tensors[f"{name}_source"] for name in self.tables(size)},
         )
 

@@ -6,7 +6,9 @@ packed sequence (see ``packing.build_packing``), which is split into equal
 row shards across the sequence-parallel group. A modality's canonical sample
 on a rank is that rank's rows of the modality, in packed order.
 
-Sizes that share a layout (``layout_size``) share constants, workspace and
+A layout is a frame count and a text region of whole 64-row tiles. Every
+request whose frame count matches and whose prompt fits the text region
+(``holds``) evaluates in that layout and shares its constants, workspace and
 captured graphs; the tables that depend on the exact prompt length are
 request state, filled by ``prepare_state``.
 """  # noqa: E501
@@ -94,16 +96,30 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         return DenoiserSize(num_frames, num_text_tokens)
 
     def layout_size(self, size: DenoiserSize) -> DenoiserSize:
-        """Return the size whose packing ``size`` occupies.
+        """Return the smallest layout that holds ``size``.
 
-        Text occupies whole 64-row tiles, so every prompt length within one
-        tile has the same packed shapes, index tables and captured graphs.
-        Within a tile only the valid count of the last text tile and the
-        rotary coordinates after the text prefix differ, which the request's
-        state carries.
+        Text occupies whole 64-row tiles, so the smallest text region is the
+        prompt's own tiles.
         """
         return DenoiserSize(
             size.num_frames, math.ceil(size.num_text_tokens / 64) * 64
+        )
+
+    def holds(self, layout: DenoiserSize, size: DenoiserSize) -> bool:
+        """Whether ``layout`` evaluates a request of ``size``.
+
+        A layout holds every prompt that fits its text region at its own frame
+        count. The packed shapes, the audio and video regions and every index
+        table depend on the layout alone; only the validity of the text tiles
+        and the rotary coordinates, whose media timeline starts at the exact
+        prompt length, differ within a layout, and the request's state carries
+        them. Frame counts are not padded: the video tile domain sets the
+        sparse selection budget and the audio timeline.
+        """
+        return (
+            layout == self.layout_size(layout)
+            and layout.num_frames == size.num_frames
+            and layout.num_text_tokens >= size.num_text_tokens
         )
 
     @property
@@ -159,14 +175,18 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         distribution = query.input_distribution
         return distribution.mesh.get_group(distribution.shard_axes(0))
 
-    def _packing(self, size: DenoiserSize) -> Packing:
-        # The alignment is a multiple of both the default 256-row alignment
-        # and one 64-row tile per sequence rank, so every rank's shard holds
-        # whole tiles.
+    def _packing(
+        self, size: DenoiserSize, layout: DenoiserSize | None = None
+    ) -> Packing:
+        # Packs ``size``'s prompt in ``layout``'s text region (its own tiles
+        # by default). The alignment is a multiple of both the default
+        # 256-row alignment and one 64-row tile per sequence rank, so every
+        # rank's shard holds whole tiles.
         return build_packing(
             num_text_tokens=size.num_text_tokens,
             num_frames=size.num_frames,
             token_multiple=64 * math.lcm(4, self._sequence_group().size),
+            text_rows=None if layout is None else layout.num_text_tokens,
         )
 
     def _token_slice(self, packing: Packing) -> slice:
@@ -219,6 +239,13 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         return schedules(self.diffusion, device=device)
 
     def output_layout(self, size: DenoiserSize) -> Mapping[str, OutputLayout]:
+        """Locate this rank's predicted rows for requests of one layout.
+
+        ``size`` is the layout the request is evaluated in: its text region
+        fixes where the audio and video regions start, hence which of their
+        rows fall in this rank's shard. Every request the layout holds shares
+        the result.
+        """
         packing = self._packing(size)
         interval = self._token_slice(packing)
         result = {}
@@ -244,8 +271,10 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
 
         The state is each modality's local canonical sample and the tables
         that depend on the exact prompt length within its layout: every
-        tile's valid row count and the rotary ``cos``/``sin`` of every packed
-        row. Their shapes follow the layout alone.
+        tile's valid row count, the rotary ``cos``/``sin`` of every packed
+        row, and the live dense prefix tiles (``vsa.Input``): the prefix key
+        list, the dense key list and the live prefix count. Their shapes
+        follow the layout alone.
         """
         size = self.layout_size(size)
         samples = {
@@ -255,13 +284,21 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             )
             for name, layout in self.output_layout(size).items()
         }
-        rows = self._packing(size).padded_tokens
+        packing = self._packing(size)
+        rows = packing.padded_tokens
         width = self._rotary_width()
         return {
             **samples,
             "tile_valid_sizes": BufferConfig((rows // 64,), torch.int32),
             "cos": BufferConfig((rows, width), torch.float32),
             "sin": BufferConfig((rows, width), torch.float32),
+            "prefix_key_indices": BufferConfig(
+                (packing.prefix_tiles,), torch.int32
+            ),
+            "dense_key_indices": BufferConfig(
+                (packing.prefix_tiles + packing.video_tiles,), torch.int32
+            ),
+            "prefix_count": BufferConfig((1,), torch.int32),
         }
 
     def _rotary_width(self) -> int:
@@ -278,29 +315,67 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         self,
         sizes: tuple[DenoiserSize, ...],
         *,
+        layouts: tuple[DenoiserSize, ...],
         out: Mapping[str, torch.Tensor],
     ) -> None:
         """Fill the prompt-length tables of one request on the host.
 
-        The packing of the exact prompt length has its layout's shapes; its
-        last text tile holds only the prompt's remaining rows, and every row
-        after the text prefix sits at the prompt's exact length on the
-        rotary timeline.
+        The prompt is packed in its layout's text region: text tiles past the
+        prompt hold no valid rows, the tile holding the prompt's end holds
+        only its remaining rows, and every row after the text region sits at
+        the prompt's exact length on the rotary timeline. The dense prefix
+        key lists name only the prefix tiles holding valid rows, so no query
+        attends to the empty tiles of the text region.
         """
-        if len(sizes) != 1 or set(out) != {"tile_valid_sizes", "cos", "sin"}:
+        if (
+            len(sizes) != 1
+            or len(layouts) != 1
+            or not self.holds(layouts[0], sizes[0])
+            or set(out)
+            != {
+                "tile_valid_sizes",
+                "cos",
+                "sin",
+                "prefix_key_indices",
+                "dense_key_indices",
+                "prefix_count",
+            }
+        ):
             raise ValueError(
-                "H3 request state covers one sample's prompt-length tables"
+                "H3 request state covers one sample's prompt-length tables "
+                "in a layout that holds it"
             )
-        packing = self._packing(sizes[0])
+        packing = self._packing(sizes[0], layouts[0])
         cosine, sine = self.rotary(
             packing.position_ids,
             dtype=torch.float32,
             sequence_length=packing.padded_tokens,
         )
+        # Live prefix tiles first; the unread tail of each list repeats key
+        # tile 0 so every entry names a tile of the domain.
+        prefix = packing.tile_valid_sizes[: packing.prefix_tiles]
+        live = torch.nonzero(prefix).flatten().to(torch.int32)
+        video = torch.arange(
+            packing.prefix_tiles,
+            packing.prefix_tiles + packing.video_tiles,
+            dtype=torch.int32,
+        )
+        prefix_keys = torch.zeros(packing.prefix_tiles, dtype=torch.int32)
+        prefix_keys[: live.numel()] = live
+        dense_keys = torch.zeros(
+            packing.prefix_tiles + packing.video_tiles, dtype=torch.int32
+        )
+        dense_keys[: live.numel() + video.numel()] = torch.cat((live, video))
         for name, value in (
             ("tile_valid_sizes", packing.tile_valid_sizes),
             ("cos", cosine.flatten(1)),
             ("sin", sine.flatten(1)),
+            ("prefix_key_indices", prefix_keys),
+            ("dense_key_indices", dense_keys),
+            (
+                "prefix_count",
+                torch.tensor([live.numel()], dtype=torch.int32),
+            ),
         ):
             if out[name].shape != value.shape or out[name].dtype != value.dtype:
                 raise ValueError(
@@ -343,20 +418,6 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         # timestep (row 5).
         tags = packing.token_tags[interval]
         values["modulation_indices"] = (tags == AUDIO_TAG).long() * 3 + tags
-
-        values.update(
-            prefix_key_indices=torch.arange(
-                packing.prefix_tiles, dtype=torch.int32, device="cpu"
-            ),
-            dense_key_indices=torch.arange(
-                packing.prefix_tiles + packing.video_tiles,
-                dtype=torch.int32,
-                device="cpu",
-            ),
-            prefix_count=torch.tensor(
-                packing.prefix_tiles, dtype=torch.int32, device="cpu"
-            ),
-        )
         return values
 
     def constant_buffers(
@@ -519,9 +580,9 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 packing.video_tiles,
                 packing.prefix_tiles + packing.video_tiles,
                 state["tile_valid_sizes"],
-                constants["prefix_key_indices"],
-                constants["dense_key_indices"],
-                constants["prefix_count"],
+                state["prefix_key_indices"],
+                state["dense_key_indices"],
+                state["prefix_count"],
             ),
             constants["local_text_indices"],
             constants["local_video_indices"],

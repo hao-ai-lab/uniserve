@@ -219,6 +219,7 @@ def _run(rank, rendezvous, directory, source):
                 )
                 model.prepare_state(
                     (size,),
+                    layouts=(layout,),
                     out={
                         name: value
                         for name, value in staged.items()
@@ -428,6 +429,7 @@ def _stage(factory, latents, size, slot, views, context, *, seed, features):
 
     The request's tables and conditioning go to its slot views and its
     initial samples to the bank of its pages a fresh trajectory starts in.
+    ``context`` supplies the request layout's constants and workspace.
     """
     factory.stage_request(size, views, seed=seed)
     for target, value in factory.initialize(
@@ -445,6 +447,7 @@ def _ladder(factory, runner, size, views, schedules, slot):
     """Bind a slot's ladder over the runner's samples and the slot's pages."""
     samples = factory.sample_views(size, runner.samples)
     return runner.bind(
+        factory.layout(size),
         tuple(
             factory.bind(size, views, samples, schedules, index)
             for index in range(factory.num_steps)
@@ -456,17 +459,18 @@ def _ladder(factory, runner, size, views, schedules, slot):
     )
 
 
-def _diffusion(model, factory, layout, latents, *, device, stream, bank=None):
-    """Prepare the denoiser's runner for one layout over two request slots."""
+def _diffusion(model, factory, latents, *, device, stream, bank=None):
+    """Prepare the denoiser's runner for every layout over two slots."""
     from uniserve.model import EntryPoint
     from uniserve_worker.model_executor.component_binding import Call
     from uniserve_worker.model_executor.diffusion_runner import DiffusionRunner
     from uniserve_worker.model_executor.graph_storage import GraphStorage
 
-    return DiffusionRunner.for_layout(
+    layouts = factory.layouts()
+    runner = DiffusionRunner.for_layouts(
         "denoiser",
         Call("denoiser", model, EntryPoint("forward")),
-        layout,
+        layouts[0],
         device=device,
         stream=stream,
         storage=GraphStorage(),
@@ -474,8 +478,11 @@ def _diffusion(model, factory, layout, latents, *, device, stream, bank=None):
         bank=bank,
         slots=2,
         pool=latents,
-        pages=factory.layout_pages(layout),
+        pages=factory.sample_pages.pages,
     )
+    for layout in layouts:
+        runner.prepare(layout, pages=factory.layout_pages(layout))
+    return runner
 
 
 @torch.inference_mode()
@@ -509,14 +516,13 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
         runner = _diffusion(
             model,
             factory,
-            layout,
             latents,
             device=device,
             stream=stream,
             bank=pool.storage.bank,
         )
         try:
-            context = runner.context
+            context = runner.layout(layout)
             with pool.storage.tensors(1) as storage:
                 views = storage.view(factory.buffers(size))
                 samples = factory.sample_views(size, runner.samples)
@@ -537,13 +543,12 @@ def test_worker_owns_noise_and_replays_one_solver_update(tmp_path):
                     initial = _committed(factory, latents, size, 1, 1)
                     for name in model.modalities:
                         samples[name].copy_(initial[name])
-                    inputs = factory.bind(size, views, samples, schedules, 0)
-                    runner.warmup(inputs, schedules, state=views)
+                    ladder = _ladder(factory, runner, size, views, schedules, 1)
+                    runner.warmup(ladder)
                     for name in model.modalities:
                         torch.testing.assert_close(
                             samples[name], initial[name], rtol=0, atol=0
                         )
-                    ladder = _ladder(factory, runner, size, views, schedules, 1)
                     # Startup captures the first request's ladder; the second
                     # request, with its own schedules, replays it.
                     if seed == 31:
@@ -677,10 +682,10 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
         latents = _latents(factory, device=device)
         try:
             eager = _diffusion(
-                model, factory, layout, latents, device=device, stream=None
+                model, factory, latents, device=device, stream=None
             )
             try:
-                expected, paths = denoise(eager, pool, eager.context)
+                expected, paths = denoise(eager, pool, eager.layout(layout))
                 assert set(paths) == {"eager"}
             finally:
                 torch.cuda.current_stream(device).synchronize()
@@ -690,14 +695,13 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
             runner = _diffusion(
                 model,
                 factory,
-                layout,
                 latents,
                 device=device,
                 stream=stream,
                 bank=pool.storage.bank,
             )
             try:
-                context = runner.context
+                context = runner.layout(layout)
                 views = pool.storage.tensors(1).view(
                     factory.buffers(placeholder)
                 )
@@ -722,6 +726,7 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                 ladder = _ladder(
                     factory, runner, placeholder, views, schedules, 1
                 )
+                runner.warmup(ladder)
                 for index in range(4):
                     runner.capture(ladder, index)
 
@@ -742,3 +747,162 @@ def test_prompt_lengths_of_one_layout_replay_its_ladder_exactly(tmp_path):
                 )
         # The two prompt lengths are distinct computations.
         assert not torch.equal(expected[1]["video"], expected[2]["video"])
+
+
+@torch.inference_mode()
+def test_text_capacity_padding_leaves_a_prompt_trajectory_unchanged(tmp_path):
+    """A prompt replayed in a larger text capacity follows its own trajectory.
+
+    Each prompt is denoised eagerly in its smallest layout, then replayed from
+    graphs captured in a layout whose text region has capacity for four
+    times as many tokens, so most of its text tiles are empty. Empty tiles
+    are masked out of every attention and never listed as keys, so the final
+    samples agree within the denoiser's numerical contract: the larger
+    layout changes GEMM row counts and reduction lengths, not the math.
+    """
+    from uniserve_worker.model_executor.media_inputs import MediaBuilder
+
+    config = _config()
+    source = _native_weights()
+    for index in range(config.num_hidden_layers):
+        source[f"transformer_blocks.{index}.attn.to_gate_compress.weight"] = (
+            torch.randn(
+                config.num_attention_heads * config.head_dim,
+                config.hidden_size,
+            )
+            * 0.1
+        )
+    save_file(source, tmp_path / "model.safetensors")
+    device = torch.device("cuda", 0)
+    with initialize_process_groups(
+        rank=0, local_rank=0, world_size=1, device=device
+    ) as groups:
+        model = _load(groups, tmp_path, device)
+        exact = MediaBuilder(
+            model,
+            max_frames=22,
+            max_text_tokens=256,
+            text_capacities=(64, 128, 256),
+        )
+        padded = MediaBuilder(
+            model, max_frames=22, max_text_tokens=256, text_capacities=(256,)
+        )
+        requests = {1: exact.size(22, 40), 2: exact.size(22, 100)}
+        assert [exact.layout(size) for size in requests.values()] == [
+            DenoiserSize(22, 64),
+            DenoiserSize(22, 128),
+        ]
+        assert {padded.layout(size) for size in requests.values()} == {
+            DenoiserSize(22, 256)
+        }
+        generator = torch.Generator().manual_seed(11)
+        features = {
+            slot: torch.randn(
+                size.num_text_tokens,
+                model.config.hidden_size,
+                generator=generator,
+            ).to(device, torch.bfloat16)
+            for slot, size in requests.items()
+        }
+
+        def denoise(factory, runner, pool):
+            samples, paths = {}, []
+            for slot, size in requests.items():
+                views = pool.storage.tensors(slot).view(factory.buffers(size))
+                _stage(
+                    factory,
+                    latents,
+                    size,
+                    slot,
+                    views,
+                    runner.layout(factory.layout(size)),
+                    seed=300 + slot,
+                    features=features[slot],
+                )
+                schedules = model.make_schedules(
+                    factory.num_steps, shift=None, device=device
+                )
+                ladder = _ladder(factory, runner, size, views, schedules, slot)
+                bank = 1
+                for index in range(factory.num_steps):
+                    result, path = runner.step(ladder, index, bank)
+                    paths.append(path)
+                    bank = 1 - bank
+                samples[slot] = {
+                    name: values[0].clone() for name, values in result.items()
+                }
+            return samples, paths
+
+        pool = RequestPool(
+            2, state_buffers=padded.capacity_buffers(), device=device
+        )
+        latents = _latents(padded, device=device)
+        try:
+            eager = _diffusion(
+                model, exact, latents, device=device, stream=None
+            )
+            try:
+                expected, paths = denoise(exact, eager, pool)
+                assert set(paths) == {"eager"}
+            finally:
+                torch.cuda.current_stream(device).synchronize()
+                eager.close()
+
+            stream = CUDAStream.external(torch.cuda.Stream(device=device))
+            runner = _diffusion(
+                model,
+                padded,
+                latents,
+                device=device,
+                stream=stream,
+                bank=pool.storage.bank,
+            )
+            try:
+                placeholder = padded.size(22, 256)
+                layout = padded.layout(placeholder)
+                views = pool.storage.tensors(1).view(
+                    padded.buffers(placeholder)
+                )
+                _stage(
+                    padded,
+                    latents,
+                    placeholder,
+                    1,
+                    views,
+                    runner.layout(layout),
+                    seed=0,
+                    features=torch.zeros(
+                        256,
+                        model.config.hidden_size,
+                        dtype=torch.bfloat16,
+                        device=device,
+                    ),
+                )
+                schedules = model.make_schedules(
+                    padded.num_steps, shift=None, device=device
+                )
+                ladder = _ladder(
+                    padded, runner, placeholder, views, schedules, 1
+                )
+                runner.warmup(ladder)
+                for index in range(padded.num_steps):
+                    runner.capture(ladder, index)
+                actual, paths = denoise(padded, runner, pool)
+                assert set(paths) == {"graph_replay"}
+            finally:
+                torch.cuda.current_stream(device).synchronize()
+                runner.close()
+                stream.close()
+        finally:
+            latents.close()
+            pool.close()
+
+        for slot in requests:
+            for name in model.modalities:
+                assert actual[slot][name].isfinite().all()
+                torch.testing.assert_close(
+                    actual[slot][name],
+                    expected[slot][name],
+                    rtol=2e-2,
+                    atol=2e-2,
+                )
