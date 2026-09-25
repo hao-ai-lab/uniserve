@@ -249,27 +249,27 @@ LANE_COMPUTATION_GROUPS: dict[str, tuple[CallKind, ...]] = {
 
 @dataclass(frozen=True, slots=True)
 class LaneConfig:
-    """Assigns call kinds, an SM budget and capacity overrides to one lane.
+    """Assigns call kinds, an SM budget and batch limits to one lane.
 
     A lane is a partition of one device's streaming multiprocessors: the
     executor creates one stream per lane from the lanes' ``sm_budget`` values,
     so a lane configuration requires a single physical device. The batch
     overrides cap the worker-wide batch limits for calls bound to this lane,
     and ``max_inflight`` sizes the lane stream's event slots; ``None`` keeps
-    the worker-wide value.
+    the worker-wide value. A lane partitions compute only: its calls share the
+    worker-wide KV and latent pools, whose placement the engine scheduler
+    owns, so a lane has no storage capacity of its own.
     """
 
     lane_id: str
     sm_budget: int
     call_kinds: tuple[CallKind, ...]
-    kv_capacity_tokens: int | None = None
-    latent_capacity_units: int | None = None
     max_batch_calls: int | None = None
     max_batch_tokens: int | None = None
     max_inflight: int | None = None
 
     def __post_init__(self) -> None:
-        """Validate lane call kinds and validate SM and capacity overrides."""
+        """Validate lane call kinds, the SM budget and the batch limits."""
         if not self.lane_id or any(
             character.isspace() for character in self.lane_id
         ):
@@ -283,8 +283,6 @@ class LaneConfig:
         if any(kind not in CALL_KINDS for kind in self.call_kinds):
             raise ValueError("lane must bind concrete call kinds")
         for name in (
-            "kv_capacity_tokens",
-            "latent_capacity_units",
             "max_batch_calls",
             "max_batch_tokens",
             "max_inflight",
@@ -621,8 +619,6 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
             "lane_id",
             "sm_budget",
             "domains",
-            "kv_capacity_tokens",
-            "latent_capacity_units",
             "max_batch_calls",
             "max_batch_tokens",
             "max_inflight",
@@ -652,12 +648,6 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
                     kind
                     for name in domains
                     for kind in LANE_COMPUTATION_GROUPS[name]
-                ),
-                kv_capacity_tokens=_json_optional_int(
-                    data, "kv_capacity_tokens"
-                ),
-                latent_capacity_units=_json_optional_int(
-                    data, "latent_capacity_units"
                 ),
                 max_batch_calls=_json_optional_int(data, "max_batch_calls"),
                 max_batch_tokens=_json_optional_int(data, "max_batch_tokens"),

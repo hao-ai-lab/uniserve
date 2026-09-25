@@ -82,10 +82,6 @@ pub struct LaneConfig {
     /// Lane selectors (`prefill`, `decode`, `flow`) that worker startup
     /// resolves to call kinds through `LANE_COMPUTATION_GROUPS`.
     pub domains: Vec<String>,
-    /// Optional lane-local KV capacity in tokens.
-    pub kv_capacity_tokens: Option<u64>,
-    /// Optional lane-local latent capacity in allocation units.
-    pub latent_capacity_units: Option<u64>,
     /// Optional call-count limit per batch.
     pub max_batch_calls: Option<u32>,
     /// Optional token-count limit per batch.
@@ -103,8 +99,8 @@ impl std::str::FromStr for LaneConfig {
     /// Refuses invalid JSON, a field outside the lane schema, an empty
     /// `lane_id`, a zero `sm_budget`, and an empty domain list or one with an
     /// unknown or repeated selector. The worker validates the remaining
-    /// constraints, such as positive capacity overrides, when it reads the
-    /// lane.
+    /// constraints, such as positive batch and in-flight limits, when it
+    /// reads the lane.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let lane: Self = serde_json::from_str(value)
             .map_err(|error| format!("invalid execution lane JSON: {error}"))?;
@@ -134,8 +130,6 @@ impl LaneConfig {
             "lane_id": self.lane_id,
             "sm_budget": self.sm_budget,
             "domains": self.domains,
-            "kv_capacity_tokens": self.kv_capacity_tokens,
-            "latent_capacity_units": self.latent_capacity_units,
             "max_batch_calls": self.max_batch_calls,
             "max_batch_tokens": self.max_batch_tokens,
             "max_inflight": self.max_inflight,
@@ -1335,6 +1329,22 @@ mod tests {
         for misspelled in [r#""max_batch_token":4096"#, r#""max_inflght":2"#] {
             let parsed = format!("{lane},{misspelled}}}").parse::<LaneConfig>();
             assert!(parsed.is_err(), "{misspelled} must be refused");
+        }
+    }
+
+    /// A lane partitions compute only: its calls share the worker-wide KV
+    /// and latent pools, whose placement the scheduler owns, so a lane
+    /// naming a capacity of its own is refused rather than accepted without
+    /// effect.
+    #[test]
+    fn a_lane_naming_a_pool_capacity_is_refused() {
+        let lane = r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]"#;
+        for capacity in [
+            r#""kv_capacity_tokens":4096"#,
+            r#""latent_capacity_units":8"#,
+        ] {
+            let parsed = format!("{lane},{capacity}}}").parse::<LaneConfig>();
+            assert!(parsed.is_err(), "{capacity} must be refused");
         }
     }
 }
