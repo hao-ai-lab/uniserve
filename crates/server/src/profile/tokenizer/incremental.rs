@@ -150,8 +150,8 @@ impl IncrementalDecoder<'_> {
     ///
     /// Returns 0 when nothing is appended, as while new text is held back.
     /// The first call also seeds the prompt context. Errors are tokenizer
-    /// decode failures, such as an unknown token ID on the byte-level decode
-    /// path.
+    /// decode failures, which only a decoder other than a single byte-level
+    /// step can report; an ID outside the vocabulary decodes to no text.
     pub fn push_token(&mut self, token_id: u32) -> Result<usize> {
         if !self.prompt_seeded {
             self.prompt_seeded = true;

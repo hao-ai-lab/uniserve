@@ -32,25 +32,23 @@ fn is_byte_level_only(decoder: &FastokensDecoder) -> bool {
 /// Decodes token IDs by looking up each vocabulary piece and unescaping the
 /// pieces with `decode_byte_level`.
 ///
-/// For known IDs the result matches `fastokens` decoding with the same
-/// byte-level decoder. Unlike `fastokens`, which silently drops IDs missing
-/// from the vocabulary, this path fails with a tokenizer error naming the
-/// unknown ID.
+/// The result matches `fastokens` decoding with the same byte-level decoder.
+/// IDs missing from the vocabulary contribute no text, as in Hugging Face
+/// `tokenizers` and vLLM: a model's vocabulary dimension can exceed its
+/// tokenizer vocabulary (Qwen3 and BAGEL checkpoints pad it), so sampling or
+/// a logprob candidate can produce an ID in that gap, and one such ID must
+/// not fail the whole response.
 fn decode_fastokens_byte_level(
     tokenizer: &FastokensTokenizer,
     token_ids: &[u32],
     skip_special_tokens: bool,
-) -> Result<String> {
+) -> String {
     let tokens: Vec<&str> = token_ids
         .iter()
         .filter(|&&id| !(skip_special_tokens && tokenizer.is_special_token(id)))
-        .map(|&id| {
-            tokenizer
-                .id_to_token(id)
-                .ok_or_else(|| tokenizer_error!("decoding failed: unknown token ID: {id}"))
-        })
-        .collect::<Result<_>>()?;
-    Ok(decode_tokens_byte_level(tokens))
+        .filter_map(|&id| tokenizer.id_to_token(id))
+        .collect();
+    decode_tokens_byte_level(tokens)
 }
 
 /// Tokenizer loaded from a Hugging Face `tokenizer.json` file.
@@ -103,13 +101,17 @@ impl HuggingFaceTokenizer {
 
     /// Decodes token identifiers with optional special-token filtering.
     ///
-    /// A tokenizer whose decoder is a single byte-level step decodes through
-    /// `decode_fastokens_byte_level` and fails on an ID outside the
-    /// vocabulary. Any other tokenizer decodes through `fastokens`, which skips
-    /// such IDs and fails only when its decoder does.
+    /// IDs outside the vocabulary contribute no text. A tokenizer whose
+    /// decoder is a single byte-level step decodes through
+    /// `decode_fastokens_byte_level`, which cannot fail. Any other tokenizer
+    /// decodes through `fastokens`, which fails only when its decoder does.
     pub fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String> {
         if self.byte_level {
-            decode_fastokens_byte_level(&self.tokenizer, token_ids, skip_special_tokens)
+            Ok(decode_fastokens_byte_level(
+                &self.tokenizer,
+                token_ids,
+                skip_special_tokens,
+            ))
         } else {
             self.tokenizer
                 .decode(token_ids, skip_special_tokens)
@@ -257,11 +259,11 @@ mod tests {
         (directory, configured, provider)
     }
 
-    /// The byte-level fast path must reproduce `fastokens` decoding for known
-    /// IDs, with and without special-token skipping. The cases cover the
-    /// empty input, `Ġ` (an escaped space), the special `<|endoftext|>` at
-    /// several positions, and `｜`, which lies outside GPT-2's byte alphabet and
-    /// passes through unchanged.
+    /// The byte-level fast path must reproduce `fastokens` decoding, with and
+    /// without special-token skipping. The cases cover the empty input, `Ġ`
+    /// (an escaped space), the special `<|endoftext|>` at several positions,
+    /// `｜`, which lies outside GPT-2's byte alphabet and passes through
+    /// unchanged, and IDs 999 and 1000, which the vocabulary lacks.
     #[test]
     fn configured_byte_level_decode_matches_provider() {
         let (_directory, configured, provider) = byte_level_tokenizers();
@@ -271,6 +273,7 @@ mod tests {
             &[1, 2, 3, 3, 4, 8, 5, 4, 6, 3, 7],
             &[0, 1, 2, 3, 3, 4, 0, 9, 0],
             &[10, 1, 2, 3, 3, 4, 10],
+            &[999, 1, 2, 1000, 3, 3, 4, 999],
         ];
         for ids in cases {
             for &skip_special_tokens in &[false, true] {
@@ -285,12 +288,13 @@ mod tests {
         }
     }
 
+    /// Models sample over a vocabulary dimension that can exceed the tokenizer
+    /// vocabulary, so an ID in that gap can reach decoding. Like Hugging Face
+    /// `tokenizers`, decoding skips it instead of failing.
     #[test]
-    fn configured_byte_level_decode_rejects_unknown_token_id() {
+    fn configured_byte_level_decode_skips_unknown_token_ids() {
         let (_directory, configured, _provider) = byte_level_tokenizers();
-        let error = configured
-            .decode(&[999], false)
-            .expect_err("unknown token ID must fail");
-        assert!(error.to_string().contains("999"));
+        assert_eq!(configured.decode(&[999], false).unwrap(), "");
+        assert_eq!(configured.decode(&[1, 999, 2], false).unwrap(), "He");
     }
 }
