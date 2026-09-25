@@ -9,8 +9,9 @@ than one per product.
 
 Because the pool is reserved outside the PyTorch caching allocator,
 publication never needs exportable allocator segments, and the engine enables
-expandable segments on every rank unless the environment already configures
-the allocator.
+expandable segments on every rank unless the head's environment already
+configures the allocator, in which case every rank receives the head's
+setting.
 
 A chunk carries its own acknowledgment header but does not track who owes an
 acknowledgment: that belongs to the publication the chunk backs, which
