@@ -13,7 +13,7 @@ use futures::{StreamExt as _, pin_mut};
 use thiserror_ext::AsReport as _;
 use tracing::warn;
 
-use crate::profile::tools::{Qwen3XmlToolParser, ToolCallDelta, ToolParserOutput};
+use crate::profile::tools::{Qwen3XmlToolParser, ToolCallDelta, ToolParserItem, ToolParserOutput};
 use crate::serving::chat::AssistantBlockKind;
 use crate::serving::chat::output::processor::AssistantEvent;
 use crate::serving::chat::output::processor::generate_tool_call_id;
@@ -73,71 +73,66 @@ impl ToolState {
         Ok(events)
     }
 
-    /// Emits one parser output in stream order.
+    /// Emits one parser output's items in their input order.
     ///
-    /// The parser reports normal text and call deltas in separate lists, so
-    /// their interleaving within one chunk is inferred from the state before
-    /// it: with no call open, text precedes the calls; with a call open, its
-    /// remaining deltas precede the text that follows it.
+    /// The parser resumes text only after a call's end delimiter, so a text
+    /// item closes the open call.
     fn process_parser_output(
         &mut self,
         kind: AssistantBlockKind,
         output: ToolParserOutput,
         events: &mut Vec<AssistantEvent>,
     ) -> Result<()> {
-        if self.open_call_index.is_none() {
-            push_text_delta(events, kind, output.normal_text);
-            self.process_tool_items(output.calls, events)?;
-        } else {
-            self.process_tool_items(output.calls, events)?;
-            if !output.normal_text.is_empty() {
-                self.open_call_index = None;
-                push_text_delta(events, kind, output.normal_text);
+        for item in output.items {
+            match item {
+                ToolParserItem::Text(text) => {
+                    self.open_call_index = None;
+                    push_text_delta(events, kind, text);
+                }
+                ToolParserItem::Call(call) => self.process_tool_item(call, events)?,
             }
         }
         Ok(())
     }
 
-    /// Converts parser deltas into ordered tool-call start and argument events.
-    fn process_tool_items(
+    /// Converts one parser delta into tool-call start and argument events.
+    fn process_tool_item(
         &mut self,
-        items: Vec<ToolCallDelta>,
+        item: ToolCallDelta,
         events: &mut Vec<AssistantEvent>,
     ) -> Result<()> {
-        for item in items {
-            if let Some(name) = item.name
-                && self.open_call_index != Some(item.tool_index)
-            {
-                self.open_call_index = Some(item.tool_index);
-                events.push(AssistantEvent::ToolCallStart {
-                    id: generate_tool_call_id(),
-                    name,
-                });
-            }
-
-            if item.arguments.is_empty() {
-                continue;
-            }
-            let Some(open_call_index) = self.open_call_index else {
-                return Err(Error::ToolCallStreamInvariant {
-                    message: format!(
-                        "received arguments for tool index {} before any tool-call start",
-                        item.tool_index
-                    ),
-                });
-            };
-            if open_call_index != item.tool_index {
-                return Err(Error::ToolCallStreamInvariant {
-                    message: format!(
-                        "received arguments for tool index {} while tool index {} is open",
-                        item.tool_index, open_call_index
-                    ),
-                });
-            }
-            events.push(AssistantEvent::ToolCallArgumentsDelta {
-                delta: item.arguments,
+        if let Some(name) = item.name
+            && self.open_call_index != Some(item.tool_index)
+        {
+            self.open_call_index = Some(item.tool_index);
+            events.push(AssistantEvent::ToolCallStart {
+                id: generate_tool_call_id(),
+                name,
             });
         }
+
+        if item.arguments.is_empty() {
+            return Ok(());
+        }
+        let Some(open_call_index) = self.open_call_index else {
+            return Err(Error::ToolCallStreamInvariant {
+                message: format!(
+                    "received arguments for tool index {} before any tool-call start",
+                    item.tool_index
+                ),
+            });
+        };
+        if open_call_index != item.tool_index {
+            return Err(Error::ToolCallStreamInvariant {
+                message: format!(
+                    "received arguments for tool index {} while tool index {} is open",
+                    item.tool_index, open_call_index
+                ),
+            });
+        }
+        events.push(AssistantEvent::ToolCallArgumentsDelta {
+            delta: item.arguments,
+        });
         Ok(())
     }
 

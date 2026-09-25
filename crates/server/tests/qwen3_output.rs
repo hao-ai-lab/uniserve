@@ -147,6 +147,126 @@ async fn qwen3_processor_emits_reasoning_text_and_tool_calls()
     Ok(())
 }
 
+/// Assistant output in stream order, with adjacent text deltas merged and
+/// each call's argument deltas joined, so the comparison does not depend on
+/// how deltas are split.
+#[derive(Debug, PartialEq, Eq)]
+enum OrderedOutput {
+    Text(String),
+    Call { name: String, arguments: String },
+}
+
+/// Text and tool calls keep their stream order when one decoded delta spans
+/// call boundaries, both when the delta starts outside a call and when it
+/// starts inside a call's arguments.
+#[tokio::test]
+async fn qwen3_processor_keeps_text_and_tool_call_order_within_a_delta()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut request = ChatRequest::for_test();
+    request.tools = vec![Tool {
+        name: "lookup".to_string(),
+        description: None,
+        parameters: serde_json::json!({"type": "object"}),
+        strict: None,
+    }];
+    request.tool_choice = ChatToolChoice::Auto;
+    let processor = Qwen3ChatOutputProcessor::new(&mut request, qwen_tokenizer()?, false)?;
+
+    let text_delta = |delta: &str, finished: Option<Finished>| {
+        Ok(DecodedTextEvent::TextDelta {
+            delta: delta.to_string(),
+            token_ids: Vec::new(),
+            logprobs: None,
+            finished,
+        })
+    };
+    // The first delta starts outside any call and ends inside the second
+    // call's arguments; the second delta starts inside those arguments.
+    let decoded = stream::iter([
+        Ok(DecodedTextEvent::Start {
+            queued_at: None,
+            scheduled_at: None,
+            prompt_token_ids: Vec::new().into(),
+            prompt_logprobs: None,
+        }),
+        text_delta(
+            concat!(
+                "before",
+                "<tool_call>\n",
+                r#"{"name":"lookup","arguments":{"q":"x"}}"#,
+                "\n</tool_call>",
+                "between",
+                "<tool_call>\n",
+                r#"{"name":"lookup","arguments":{"q":"#,
+            ),
+            None,
+        ),
+        text_delta(
+            concat!(
+                r#""y"}}"#,
+                "\n</tool_call>",
+                "after",
+                "<tool_call>\n",
+                r#"{"name":"lookup","arguments":{"q":"z"}}"#,
+                "\n</tool_call>",
+            ),
+            Some(Finished {
+                prompt_token_count: 0,
+                output_token_count: 2,
+                internal_token_count: 0,
+                finish_reason: FinishReason::stop_eos(),
+            }),
+        ),
+    ]);
+
+    let output = processor.parse(decoded);
+    futures::pin_mut!(output);
+    let mut ordered = Vec::<OrderedOutput>::new();
+    let mut finished = false;
+    while let Some(event) = output.next().await {
+        match event? {
+            AssistantEvent::TextDelta { kind, delta } => {
+                assert_eq!(kind, AssistantBlockKind::Text);
+                if let Some(OrderedOutput::Text(text)) = ordered.last_mut() {
+                    text.push_str(&delta);
+                } else {
+                    ordered.push(OrderedOutput::Text(delta));
+                }
+            }
+            AssistantEvent::ToolCallStart { name, .. } => ordered.push(OrderedOutput::Call {
+                name,
+                arguments: String::new(),
+            }),
+            AssistantEvent::ToolCallArgumentsDelta { delta } => {
+                let Some(OrderedOutput::Call { arguments, .. }) = ordered.last_mut() else {
+                    panic!("arguments delta {delta:?} does not follow its tool call");
+                };
+                arguments.push_str(&delta);
+            }
+            AssistantEvent::Done { .. } => finished = true,
+            _ => {}
+        }
+    }
+
+    let call = |q: &str| OrderedOutput::Call {
+        name: "lookup".to_string(),
+        arguments: format!(r#"{{"q":"{q}"}}"#),
+    };
+    assert!(finished);
+    assert_eq!(
+        ordered,
+        vec![
+            OrderedOutput::Text("before".to_string()),
+            call("x"),
+            OrderedOutput::Text("between".to_string()),
+            call("y"),
+            OrderedOutput::Text("after".to_string()),
+            call("z"),
+        ]
+    );
+    Ok(())
+}
+
 /// With reasoning parsing disabled, `<think>` delimiters stream verbatim as
 /// assistant content instead of opening a reasoning block, including when the
 /// delimiters arrive in separate deltas.
