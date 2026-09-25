@@ -399,6 +399,10 @@ def test_component_bindings_release_cancelled_requests(
         "16384",
         "--max-video-seconds",
         max_video_seconds,
+        # Two text capacities bound the startup capture of every admitted
+        # duration; the requests below exercise both.
+        "--video-text-capacities",
+        "1024,16384",
         # One and two device layouts hold the whole denoiser on each of their
         # ranks and split the 15-second sequence over fewer of them, so their
         # warmup reaches a larger share of the device than the four-device
@@ -517,6 +521,10 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         "FastH3",
         "--port",
         str(port),
+        # Two text capacities bound the startup capture of every admitted
+        # duration.
+        "--video-text-capacities",
+        "1024,16384",
         "--graph-policy",
         "full",
     ]

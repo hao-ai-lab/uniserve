@@ -241,11 +241,20 @@ class Execution:
     treat as eager-only execution.
     """
 
-    def __init__(self, context: ExecutionContext, *, devices=(), storage=None):
+    def __init__(
+        self,
+        context: ExecutionContext,
+        *,
+        devices=(),
+        storage=None,
+        share=None,
+    ):
+        # ``share`` names another owner whose pools this one borrows; see
+        # ``GraphStorage.reserve``.
         self.context = context
         self.buckets: OrderedDict[object, GraphBucket] = OrderedDict()
         self.storage = storage if storage is not None else GraphStorage()
-        self.pools = self.storage.reserve(self, devices)
+        self.pools = self.storage.reserve(self, devices, share=share)
 
     def close_bucket(self, key):
         """Retire one bucket, first synchronizing the context stream if any."""

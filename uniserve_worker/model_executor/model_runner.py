@@ -75,8 +75,9 @@ class ModelRunner(Execution, ABC):
         cache=None,
         predicates=None,
         rank=0,
+        share=None,
     ):
-        super().__init__(context, storage=storage, devices=devices)
+        super().__init__(context, storage=storage, devices=devices, share=share)
         self.name, self.call, self.device = name, call, device
         self.model = call.module
         self.call_kinds, self.cuda_stream = tuple(kinds), stream
@@ -196,7 +197,6 @@ class ModelRunner(Execution, ABC):
                         pools=self.pools,
                     )
                     self.buckets[key] = GraphBucket({None: graph})
-                    self.graph_storage.check()
                     path = "graph_capture"
                 else:
                     path = "graph_replay"

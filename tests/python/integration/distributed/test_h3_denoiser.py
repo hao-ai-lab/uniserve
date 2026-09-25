@@ -372,12 +372,25 @@ def test_partitioned_denoising_and_feedback(tmp_path):
     )
 
 
-def _load(groups, directory, device):
-    """Load the tiny denoiser on one device as a worker binds it."""
-    mesh = groups.bind(
-        DeviceMesh(ranks=(0,), shape=(1, 1), axes=("pp", "tp"), rank=0),
-        device=device,
-    )
+def _load(groups, directory, device, topology=None, attention=None):
+    """Load the tiny denoiser as a worker binds it.
+
+    Without ``topology`` the model occupies one device; otherwise it is
+    partitioned over ``topology`` with the ``attention`` layout.
+    """
+    if topology is None:
+        mesh = groups.bind(
+            DeviceMesh(ranks=(0,), shape=(1, 1), axes=("pp", "tp"), rank=0),
+            device=device,
+        )
+    else:
+        with torch.device("meta"):
+            description = Denoiser(_config(), diffusion=DiffusionConfig())
+        mesh = groups.bind(
+            topology,
+            device=device,
+            axes=communication_axes(description, topology, attention=attention),
+        )
     return loading.load_model(
         partial(Denoiser, diffusion=DiffusionConfig()),
         _config(),
@@ -389,6 +402,7 @@ def _load(groups, directory, device):
         mapping=_mapping,
         device=device,
         meshes={"": mesh},
+        **({} if attention is None else {"attention": {"": attention}}),
         weights=weights.Config(
             dtypes={
                 f"transformer.{name}": torch.float32
@@ -906,3 +920,202 @@ def test_text_capacity_padding_leaves_a_prompt_trajectory_unchanged(tmp_path):
                     rtol=2e-2,
                     atol=2e-2,
                 )
+
+
+def _gated_weights(tmp_path):
+    """Save native weights whose sparse attention gate is live."""
+    config = _config()
+    source = _native_weights()
+    for index in range(config.num_hidden_layers):
+        source[f"transformer_blocks.{index}.attn.to_gate_compress.weight"] = (
+            torch.randn(
+                config.num_attention_heads * config.head_dim,
+                config.hidden_size,
+            )
+            * 0.1
+        )
+    save_file(source, tmp_path / "model.safetensors")
+
+
+@torch.inference_mode()
+def _capacity_prediction(rank, rendezvous, directory, cases, output):
+    """Predict each case's first velocity in its smallest and a capacity layout.
+
+    Both evaluations start from the same native draw and text features, and
+    each saves this rank's rows of the prediction with their offset in the
+    canonical sample.
+    """
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    groups = initialize_process_groups(
+        rank=rank,
+        local_rank=rank,
+        world_size=4,
+        device=device,
+        init_method=rendezvous,
+    )
+    model = _load(
+        groups,
+        directory,
+        device,
+        topology=DeviceMesh(
+            ranks=(3, 1, 0, 2),
+            shape=(1, 1, 4),
+            axes=("pp", "tp", "heads"),
+            rank=rank,
+        ),
+        attention=AttentionParallelConfig(heads=Ulysses("heads")),
+    )
+    schedules = model.make_schedules(4, shift=None, device=device)
+    for index, (frames, tokens, capacity) in enumerate(cases):
+        size = DenoiserSize(frames, tokens)
+        generator = torch.Generator().manual_seed(60 + index)
+        features = torch.randn(
+            tokens, model.config.hidden_size, generator=generator
+        ).to(device, torch.bfloat16)
+        for name, layout in (
+            ("smallest", model.layout_size(size)),
+            ("capacity", DenoiserSize(frames, capacity)),
+        ):
+            assert model.holds(layout, size)
+            requirements = model.state_buffers(layout)
+            with (
+                ExecutionContext(model) as context,
+                TensorBuffers.allocate(requirements, device="cpu") as host,
+                TensorBuffers.allocate(requirements, device=device) as backing,
+            ):
+                context.prepare(layout)
+                request, staged = (
+                    backing.view(requirements),
+                    host.view(requirements),
+                )
+                noise = {
+                    modality: torch.empty(
+                        (1, *model.noise_shape(modality, layout)),
+                        dtype=torch.float32,
+                    )
+                    for modality in model.modalities
+                }
+                normal_noise((700 + index,), out=tuple(noise.values()))
+                model.prepare_latents(
+                    (layout,),
+                    noise=noise,
+                    state={
+                        modality: staged[modality].unsqueeze(0)
+                        for modality in model.modalities
+                    },
+                    constants=context.constants,
+                    workspace=context.workspace,
+                )
+                model.prepare_state(
+                    (size,),
+                    layouts=(layout,),
+                    out={
+                        field: value
+                        for field, value in staged.items()
+                        if field not in model.modalities
+                    },
+                )
+                for field, value in request.items():
+                    value.copy_(staged[field])
+                # The prompt's features lead a text region of the layout's
+                # capacity; the rows past it are padding.
+                conditioning = torch.zeros(
+                    layout.num_text_tokens,
+                    model.config.hidden_size,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                conditioning[:tokens].copy_(features)
+                state = {
+                    modality: request[modality] for modality in model.modalities
+                }
+                predictions = model(
+                    DenoiserInput(
+                        {
+                            modality: (
+                                LatentInput(
+                                    value, schedules[modality].timesteps[0]
+                                ),
+                            )
+                            for modality, value in state.items()
+                        },
+                        (layout,),
+                        0,
+                        (conditioning,),
+                    ),
+                    state=request,
+                    constants=context.constants,
+                    workspace=context.workspace,
+                )
+                torch.save(
+                    {
+                        modality: {
+                            "start": value[0].layout.local_slice[0].start,
+                            "value": value[0].tensor.cpu(),
+                        }
+                        for modality, value in predictions.items()
+                    },
+                    output / f"case-{index}-{name}-rank-{rank}.pt",
+                )
+            torch.cuda.synchronize(device)
+    # Exceptions leave teardown to multiprocessing, so a failing rank can
+    # report its numerical error without waiting for another rank's collective.
+    groups.close()
+
+
+def test_capacity_layouts_predict_like_the_smallest_layout_across_ranks(
+    tmp_path,
+):
+    """A text capacity changes no real row of a Ulysses-4 prediction.
+
+    Each prompt's first velocity is predicted in its smallest layout and in a
+    layout whose text region holds many more tokens. The larger region moves
+    every rank's shard boundary, and a 3072-row region leaves the first rank
+    of the mesh with text rows only. Padding rows are invalid in every tile
+    they occupy, so the canonical predictions agree within the denoiser's
+    numerical contract. The prediction, not the solver's successor, is
+    compared: the successor scales it by the step's sigma change, which
+    would hide a padding row's contribution below that contract.
+    """
+    _gated_weights(tmp_path)
+    cases = ((22, 40, 3072), (22, 100, 1024))
+    output = tmp_path / "predictions"
+    output.mkdir()
+    mp.spawn(
+        _capacity_prediction,
+        args=((tmp_path / "rendezvous").as_uri(), tmp_path, cases, output),
+        nprocs=4,
+        join=True,
+    )
+    for index in range(len(cases)):
+        joined, rows = {}, {}
+        for name in ("smallest", "capacity"):
+            shards = sorted(
+                (
+                    torch.load(path, weights_only=True)
+                    for path in output.glob(f"case-{index}-{name}-rank-*.pt")
+                ),
+                key=lambda entry: entry["video"]["start"],
+            )
+            rows[name] = [entry["video"]["value"].shape[0] for entry in shards]
+            joined[name] = {
+                modality: torch.cat(
+                    [
+                        entry[modality]["value"]
+                        for entry in sorted(
+                            shards, key=lambda entry: entry[modality]["start"]
+                        )
+                    ]
+                )
+                for modality in ("video", "audio")
+            }
+        if index == 0:
+            # The long text region holds the first rank's whole shard.
+            assert 0 in rows["capacity"] and 0 not in rows["smallest"]
+        for modality in ("video", "audio"):
+            actual = joined["capacity"][modality]
+            assert actual.isfinite().all()
+            torch.testing.assert_close(
+                actual, joined["smallest"][modality], rtol=2e-2, atol=2e-2
+            )
