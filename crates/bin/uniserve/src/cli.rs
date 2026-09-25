@@ -229,7 +229,10 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long = "log-requests")]
     pub enable_log_requests: bool,
 
-    /// If specified, API server will add an X-Request-Id header to responses.
+    /// If specified, API server will add an X-Request-Id header to responses,
+    /// carrying the ID the request ran under: the client's X-Request-Id when
+    /// accepted (1 to 128 visible ASCII characters without spaces), otherwise a
+    /// generated one.
     #[arg(long, default_missing_value = "true", num_args = 0..=1)]
     pub enable_request_id_headers: bool,
 
