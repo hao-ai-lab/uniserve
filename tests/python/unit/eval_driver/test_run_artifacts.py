@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from uniserve_eval.datasets.jsonl import JsonlDataset
 from uniserve_eval.load import WarmupFailure
 from uniserve_eval.pipeline.run import run_point
+from uniserve_eval.transport.images import inspect_image_bytes
 from uniserve_eval.types import (
+    IMAGES_GENERATIONS,
     BenchmarkPoint,
+    ImageConfig,
     LoadConfig,
     MetricDefinition,
     SamplingConfig,
@@ -203,4 +209,78 @@ def test_interrupted_measurement_persists_the_finished_requests(
     ]
     assert [record["request_id"] for record in measured] == ["row-0", "row-1"]
     assert all(record["success"] for record in measured)
+    assert not (output / "summary.json").exists()
+
+
+def _png() -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (2, 3), (10, 20, 30)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_failed_sample_persistence_still_records_the_failed_run(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "result"
+    png = _png()
+    sample = output / "samples" / inspect_image_bytes(png).sample_filename
+
+    class ImageHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib handler method name.
+            length = int(self.headers.get("content-length", "0"))
+            self.rfile.read(length)
+            # A directory occupying the sample's path makes every attempt to
+            # persist the returned image fail the same way.
+            sample.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(
+                {"data": [{"b64_json": base64.b64encode(png).decode("ascii")}]}
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    dataset = tmp_path / "rows.jsonl"
+    dataset.write_text(
+        json.dumps({"id": "row", "prompt": "draw"}) + "\n", encoding="utf-8"
+    )
+    point = BenchmarkPoint(
+        name="t2i",
+        server="server",
+        task=TaskName.T2I,
+        model="model",
+        dataset="jsonl",
+        dataset_path=str(dataset),
+        endpoint=IMAGES_GENERATIONS,
+        metrics=(MetricDefinition(("images_per_second",), "higher"),),
+        load=LoadConfig(num_prompts=1, warmup_requests=0),
+        sampling=SamplingConfig(stream=False),
+        image=ImageConfig(image_count=1, width=2, height=3),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ImageHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(IsADirectoryError):
+            asyncio.run(
+                run_point(
+                    f"http://127.0.0.1:{server.server_port}",
+                    point,
+                    output,
+                )
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    state = json.loads((output / "run.json").read_text(encoding="utf-8"))
+    assert state["status"] == "failed"
+    assert state["valid"] is False
+    assert state["error"]["type"] == "IsADirectoryError"
+    assert state["artifact_error"]["type"] == "IsADirectoryError"
     assert not (output / "summary.json").exists()

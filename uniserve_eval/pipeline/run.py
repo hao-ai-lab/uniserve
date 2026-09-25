@@ -18,9 +18,9 @@ The bundle in the output directory contains:
   completion path.
 
 `run.json` is written last on both the completion and failure paths, so a
-bundle is complete only when its `run.json` status is `completed`. If an
-artifact write on the failure path raises, `run.json` keeps its earlier
-status.
+bundle is complete only when its `run.json` status is `completed`. The failed
+`run.json` is written even when the failure path cannot persist the record
+streams; it then carries that persistence error as `artifact_error`.
 """
 
 from __future__ import annotations
@@ -75,8 +75,10 @@ async def run_point(
         BaseException: Any error from task lookup, dataset loading, the load
             run (including `WarmupFailure` and cancellation), summarizing, or
             artifact writing is re-raised after the records collected so far
-            and the failed `run.json` are written, provided the failure
-            path's own artifact writes succeed.
+            and the failed `run.json` are written. An error while persisting
+            the records there is recorded in `run.json` rather than raised;
+            only a failure to write `run.json` itself replaces the original
+            error.
     """  # noqa: E501
     output_path = Path(output_dir)
     if output_path.exists() and any(output_path.iterdir()):
@@ -255,12 +257,6 @@ async def run_point(
         # so a second call after the `finally` above is safe.
         if sampler is not None:
             sampler.stop()
-        _write_records(writer, "warmup_requests.jsonl", warmup_records)
-        _write_records(writer, "requests.jsonl", records)
-        writer.write_jsonl(
-            "gpu_samples.jsonl",
-            list(sampler.sample_records) if sampler is not None else [],
-        )
         failure = _run_state(
             "failed",
             point,
@@ -273,6 +269,24 @@ async def run_point(
         failure["error"] = {"type": type(error).__name__, "message": str(error)}
         if sampler is not None and sampler.summary() is not None:
             failure["gpu_memory"] = sampler.summary()
+
+        # Persisting the streams fails again when the original error came
+        # from persisting them, e.g. a media sample that cannot be written
+        # or fails its checks. That second error is recorded instead of
+        # replacing the original one, so the failed state is still written
+        # and the original error, including a cancellation, propagates.
+        try:
+            writer.write_jsonl(
+                "gpu_samples.jsonl",
+                list(sampler.sample_records) if sampler is not None else [],
+            )
+            _write_records(writer, "warmup_requests.jsonl", warmup_records)
+            _write_records(writer, "requests.jsonl", records)
+        except Exception as artifact_error:
+            failure["artifact_error"] = {
+                "type": type(artifact_error).__name__,
+                "message": str(artifact_error),
+            }
         writer.write_json("run.json", failure)
         raise
 
