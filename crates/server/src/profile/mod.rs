@@ -194,18 +194,23 @@ pub struct ModelConfig {
 impl ModelConfig {
     /// Resolves vocabulary, checkpoint defaults, and model-specific settings once.
     ///
-    /// The family comes from the `model_type` of `files.config_path`; a
-    /// configured `max_model_tokens` takes precedence over the checkpoint's
-    /// `max_position_embeddings`.
+    /// The family comes from the `model_type` of `files.config_path`, which
+    /// were resolved for the checkpoint `model` (a local directory or Hub
+    /// repository id). Bagel also reads its latent position grid side from
+    /// the checkpoint's safetensors header (see
+    /// `BagelProfile::read_max_latent_size`). A configured `max_model_tokens`
+    /// takes precedence over the checkpoint's `max_position_embeddings`.
     ///
     /// # Errors
     ///
     /// Fails when a present metadata file cannot be read or parsed, when
     /// `model_type` is missing or names no family served from a root
-    /// configuration, or when a multimodal profile cannot resolve its control
-    /// tokens from `tokenizer`.
-    pub fn from_files(
-        model_id: &str,
+    /// configuration, when a multimodal profile cannot resolve its control
+    /// tokens from `tokenizer`, or when Bagel's latent position table cannot
+    /// be read.
+    pub async fn from_files(
+        served_name: &str,
+        model: &str,
         files: &ResolvedModelFiles,
         max_model_tokens: Option<u32>,
         tokenizer: &HuggingFaceTokenizer,
@@ -233,7 +238,10 @@ impl ModelConfig {
             ModelDescription::SenseNova => {
                 ModelParameters::SenseNova(SenseNovaProfile::resolve(tokenizer)?)
             }
-            ModelDescription::Bagel => ModelParameters::Bagel(BagelProfile::resolve(tokenizer)?),
+            ModelDescription::Bagel => ModelParameters::Bagel(BagelProfile::resolve(
+                tokenizer,
+                BagelProfile::read_max_latent_size(model).await?,
+            )?),
             // `from_model_type` resolves only families described by a root
             // configuration; a pipeline family resolves through `from_pipeline`.
             ModelDescription::MiniMaxH3 => {
@@ -244,7 +252,7 @@ impl ModelConfig {
         };
 
         Ok(Self {
-            served_name: model_id.to_owned(),
+            served_name: served_name.to_owned(),
             parameters,
             sampling_defaults: generation_defaults(&generation_config),
             max_model_tokens: max_model_tokens.or(model_config.max_position_embeddings()),
@@ -356,8 +364,9 @@ mod tests {
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
     use uniserve_core::{GenerationConstraint, ImageIngestStep};
 
-    use super::{ModelConfig, ModelDescription, ModelParameters};
+    use super::{BagelProfile, ModelConfig, ModelDescription, ModelParameters};
     use crate::profile::assets::ResolvedModelFiles;
+    use crate::profile::assets::checkpoint::bf16_safetensors;
     use crate::profile::tokenizer::HuggingFaceTokenizer;
 
     const SPECIAL_TOKENS: &[&str] = &[
@@ -425,20 +434,51 @@ mod tests {
             chat_template_path: None,
             config_path: Some(config_path),
         };
+        // Bagel reads its latent position grid from the primary checkpoint:
+        // a 64x64 table, as in the published checkpoint.
+        if model_type == "bagel" {
+            fs::write(
+                directory.path().join("ema.safetensors"),
+                bf16_safetensors(&[("latent_pos_embed.pos_embed", &[4096, 8])]),
+            )
+            .expect("write checkpoint");
+        }
         (directory, files)
     }
 
-    #[test]
-    fn configured_descriptions_resolve_their_serving_behavior() {
+    /// Resolves `served_name` over the checkpoint [`configured_files`] writes
+    /// for `model_type`.
+    async fn resolved_config(
+        served_name: &str,
+        model_type: &str,
+    ) -> (
+        tempfile::TempDir,
+        HuggingFaceTokenizer,
+        crate::profile::assets::Result<ModelConfig>,
+    ) {
+        let (directory, files) = configured_files(model_type);
+        let tokenizer = HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap();
+        let config = ModelConfig::from_files(
+            served_name,
+            directory.path().to_str().unwrap(),
+            &files,
+            None,
+            &tokenizer,
+        )
+        .await;
+        (directory, tokenizer, config)
+    }
+
+    #[tokio::test]
+    async fn configured_descriptions_resolve_their_serving_behavior() {
         for (description, model_type) in [
             (ModelDescription::Qwen3, "qwen3"),
             (ModelDescription::SenseNova, "neo_chat"),
             (ModelDescription::Bagel, "bagel"),
         ] {
-            let (_directory, files) = configured_files(model_type);
-            let tokenizer = HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap();
-            let profile =
-                ModelConfig::from_files(description.id(), &files, None, &tokenizer).unwrap();
+            let (_directory, _tokenizer, profile) =
+                resolved_config(description.id(), model_type).await;
+            let profile = profile.unwrap();
             assert_eq!(profile.description(), description);
             assert_eq!(profile.max_model_tokens, Some(4096));
             assert_eq!(profile.sampling_defaults.max_output_tokens, Some(512));
@@ -463,6 +503,8 @@ mod tests {
                 ModelParameters::Bagel(profile) => {
                     assert_eq!(description, ModelDescription::Bagel);
                     assert!(profile.resolution_policy.allow_custom);
+                    // 64 latent patches of 16 pixels per canvas side.
+                    assert_eq!(profile.resolution_policy.max_side, Some(1024));
                     assert_eq!(
                         profile
                             .image_encoders
@@ -494,24 +536,38 @@ mod tests {
         assert_eq!(profile.max_model_tokens, Some(16_384));
     }
 
-    #[test]
-    fn unsupported_repository_model_type_is_rejected() {
-        let (_directory, files) = configured_files("llama");
-        let tokenizer = HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap();
-        let error =
-            ModelConfig::from_files("configured-model", &files, None, &tokenizer).unwrap_err();
+    /// A Bagel latent position table whose rows do not form a square grid
+    /// yields no per-axis bound and is refused.
+    #[tokio::test]
+    async fn a_non_square_bagel_position_table_is_invalid() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("ema.safetensors"),
+            bf16_safetensors(&[("latent_pos_embed.pos_embed", &[4000, 8])]),
+        )
+        .unwrap();
+
+        let error = BagelProfile::read_max_latent_size(directory.path().to_str().unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, crate::profile::assets::Error::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn unsupported_repository_model_type_is_rejected() {
+        let (_directory, _tokenizer, config) = resolved_config("configured-model", "llama").await;
+        let error = config.unwrap_err();
         assert!(matches!(
             error,
             crate::profile::assets::Error::UnsupportedModelType { actual } if actual == "llama"
         ));
     }
 
-    #[test]
-    fn omni_descriptions_define_prompt_framing_and_image_geometry() {
-        let (_directory, files) = configured_files("neo_chat");
-        let tokenizer = HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap();
-        let config = ModelConfig::from_files("sensenova", &files, None, &tokenizer).unwrap();
-        let ModelParameters::SenseNova(profile) = config.parameters else {
+    #[tokio::test]
+    async fn omni_descriptions_define_prompt_framing_and_image_geometry() {
+        let (_directory, tokenizer, config) = resolved_config("sensenova", "neo_chat").await;
+        let ModelParameters::SenseNova(profile) = config.unwrap().parameters else {
             unreachable!()
         };
         let prompt = profile
@@ -554,10 +610,8 @@ mod tests {
             vec![Some(2305)]
         );
 
-        let (_directory, files) = configured_files("bagel");
-        let tokenizer = HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap();
-        let config = ModelConfig::from_files("bagel", &files, None, &tokenizer).unwrap();
-        let ModelParameters::Bagel(profile) = config.parameters else {
+        let (_directory, tokenizer, config) = resolved_config("bagel", "bagel").await;
+        let ModelParameters::Bagel(profile) = config.unwrap().parameters else {
             unreachable!()
         };
         let prompt = profile
@@ -598,8 +652,8 @@ mod tests {
     /// Bagel KV-token predictions equal the worker's resize for images whose
     /// resize scale is not one. The cases are shared with the worker's image
     /// staging test, so both sides are checked against the same numbers.
-    #[test]
-    fn bagel_image_tokens_follow_the_worker_resize() {
+    #[tokio::test]
+    async fn bagel_image_tokens_follow_the_worker_resize() {
         #[derive(serde::Deserialize)]
         struct Fixture {
             cases: Vec<Case>,
@@ -616,10 +670,8 @@ mod tests {
         ))
         .unwrap();
 
-        let (_directory, files) = configured_files("bagel");
-        let tokenizer = HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap();
-        let config = ModelConfig::from_files("bagel", &files, None, &tokenizer).unwrap();
-        let ModelParameters::Bagel(profile) = config.parameters else {
+        let (_directory, _tokenizer, config) = resolved_config("bagel", "bagel").await;
+        let ModelParameters::Bagel(profile) = config.unwrap().parameters else {
             unreachable!()
         };
         for case in fixture.cases {

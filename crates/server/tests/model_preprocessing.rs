@@ -116,6 +116,21 @@ fn try_resolved_model(
         chat_template_path: None,
         config_path: Some(config_path),
     };
+    // Bagel reads its latent position grid side from the primary checkpoint's
+    // safetensors header; a header-only file declaring the published 64x64
+    // table suffices.
+    if description == ModelDescription::Bagel {
+        let header = serde_json::to_vec(&serde_json::json!({
+            "latent_pos_embed.pos_embed": {
+                "dtype": "BF16", "shape": [4096, 1], "data_offsets": [0, 8192]
+            }
+        }))
+        .unwrap();
+        let mut checkpoint = (header.len() as u64).to_le_bytes().to_vec();
+        checkpoint.extend(header);
+        checkpoint.resize(checkpoint.len() + 8192, 0);
+        fs::write(directory.path().join("ema.safetensors"), checkpoint).unwrap();
+    }
 
     let tokenizer: DynTokenizer =
         Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap());
@@ -132,7 +147,17 @@ fn try_resolved_model(
         ModelDescription::MiniMaxH3 => {
             ModelConfig::from_pipeline(description.id(), description, 15.0, Some(4096)).unwrap()
         }
-        _ => ModelConfig::from_files(description.id(), &files, None, tokenizer.as_ref()).unwrap(),
+        _ => tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(ModelConfig::from_files(
+                description.id(),
+                directory.path().to_str().unwrap(),
+                &files,
+                None,
+                tokenizer.as_ref(),
+            ))
+            .unwrap(),
     };
     let model = InputProcessor::new(
         config,
@@ -503,6 +528,48 @@ fn image_api_preserves_requested_dimensions_seed_and_guidance() {
         assert_eq!(generation.sampling.seed, Some(17));
         assert_eq!(generation.image.cfg_text_scale, 7.5);
         assert_eq!(generation.image.negative_prompt, "blur");
+    }
+}
+
+/// Bagel's learned latent position table covers 64 latent patches per side
+/// in the synthetic checkpoint, 1024 pixels at the 16-pixel latent stride. A
+/// canvas with a longer side, which would index past a table row or past the
+/// table, is an invalid request like other unsupported sizes, while a side
+/// of exactly 64 patches is accepted.
+#[test]
+fn bagel_rejects_a_canvas_side_beyond_its_latent_position_table() {
+    let (_directory, _tokenizer, processor) = resolved_model(ModelDescription::Bagel, "bagel");
+    let request = |size: &str| -> uniserve_server::openai::ImageGenerationRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "bagel",
+            "prompt": "a banner",
+            "size": size
+        }))
+        .unwrap()
+    };
+
+    for size in ["1040x16", "16x1040"] {
+        let Err(error) =
+            processor.preprocess_image_request(ServeRequestId::new("latent-side"), request(size))
+        else {
+            panic!("{size} was admitted");
+        };
+        assert!(
+            matches!(
+                error,
+                uniserve_server::openai::ApiError::InvalidRequest { .. }
+            ),
+            "{size}: {error:?}"
+        );
+    }
+    for size in ["1024x16", "16x1024"] {
+        let (generation, _) = processor
+            .preprocess_image_request(ServeRequestId::new("latent-side"), request(size))
+            .unwrap();
+        assert_eq!(
+            format!("{}x{}", generation.image.width, generation.image.height),
+            size
+        );
     }
 }
 

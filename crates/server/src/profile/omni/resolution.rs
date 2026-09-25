@@ -113,6 +113,9 @@ pub struct ResolutionPolicy {
     pub buckets: Vec<ResolutionBucket>,
     /// Whether arbitrary positive pixel dimensions are accepted.
     pub allow_custom: bool,
+    /// Longest accepted side of the resolved canvas in pixels, when the
+    /// model bounds each axis; `None` leaves the sides unbounded here.
+    pub max_side: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,40 +133,52 @@ pub struct ResolvedResolution {
 /// given, `requested` is ignored, both must be present and positive, and they
 /// must match a bucket exactly unless the policy allows custom dimensions.
 /// Otherwise the named bucket, or the policy default, must exist in
-/// `buckets`.
+/// `buckets`. Either way, no side of the result may exceed
+/// `policy.max_side`.
 pub fn resolve_resolution(
     policy: &ResolutionPolicy,
     requested: Option<ResolutionName>,
     width: Option<u32>,
     height: Option<u32>,
 ) -> Result<ResolvedResolution, ResolutionError> {
-    if width.is_some() || height.is_some() {
+    let resolved = if width.is_some() || height.is_some() {
         let width = width.ok_or(ResolutionError::MissingWidth)?;
         let height = height.ok_or(ResolutionError::MissingHeight)?;
         if width == 0 || height == 0 {
             return Err(ResolutionError::NonPositiveDimensions);
         }
-        if policy.allow_custom
-            || policy
+        if !policy.allow_custom
+            && !policy
                 .buckets
                 .iter()
                 .any(|bucket| bucket.width == width && bucket.height == height)
         {
-            return Ok(ResolvedResolution { width, height });
+            return Err(ResolutionError::UnsupportedDimensions { width, height });
         }
-        return Err(ResolutionError::UnsupportedDimensions { width, height });
-    }
+        ResolvedResolution { width, height }
+    } else {
+        let requested = requested.unwrap_or(policy.default.name);
+        let bucket = policy
+            .buckets
+            .iter()
+            .find(|bucket| bucket.name == requested)
+            .ok_or_else(|| ResolutionError::UnsupportedName(requested.as_str().to_owned()))?;
+        ResolvedResolution {
+            width: bucket.width,
+            height: bucket.height,
+        }
+    };
 
-    let requested = requested.unwrap_or(policy.default.name);
-    let bucket = policy
-        .buckets
-        .iter()
-        .find(|bucket| bucket.name == requested)
-        .ok_or_else(|| ResolutionError::UnsupportedName(requested.as_str().to_owned()))?;
-    Ok(ResolvedResolution {
-        width: bucket.width,
-        height: bucket.height,
-    })
+    if let Some(max_side) = policy.max_side
+        && resolved.width.max(resolved.height) > max_side
+    {
+        return Err(ResolutionError::SideExceedsLimit {
+            width: resolved.width,
+            height: resolved.height,
+            max_side,
+        });
+    }
+    Ok(resolved)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -189,11 +204,23 @@ pub enum ResolutionError {
     /// A named resolution is not present in the profile policy.
     #[error("unsupported image resolution {0:?}")]
     UnsupportedName(String),
+    /// A side of the resolved canvas exceeds the model's per-axis limit.
+    #[error("image dimensions {width}x{height} exceed the model's {max_side}-pixel side limit")]
+    SideExceedsLimit {
+        /// Resolved width in pixels.
+        width: u32,
+        /// Resolved height in pixels.
+        height: u32,
+        /// Longest accepted side in pixels.
+        max_side: u32,
+    },
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolutionBucket, ResolutionName, ResolutionPolicy, resolve_resolution};
+    use super::{
+        ResolutionBucket, ResolutionError, ResolutionName, ResolutionPolicy, resolve_resolution,
+    };
 
     fn policy(allow_custom: bool) -> ResolutionPolicy {
         let default = ResolutionBucket {
@@ -205,7 +232,30 @@ mod tests {
             default: default.clone(),
             buckets: vec![default],
             allow_custom,
+            max_side: None,
         }
+    }
+
+    /// A per-axis limit rejects custom dimensions with either side above it
+    /// and accepts a side equal to it.
+    #[test]
+    fn side_limit_bounds_each_axis() {
+        let bounded = ResolutionPolicy {
+            max_side: Some(1024),
+            ..policy(true)
+        };
+        for (width, height) in [(1040, 16), (16, 1040)] {
+            assert_eq!(
+                resolve_resolution(&bounded, None, Some(width), Some(height)),
+                Err(ResolutionError::SideExceedsLimit {
+                    width,
+                    height,
+                    max_side: 1024
+                })
+            );
+        }
+        let edge = resolve_resolution(&bounded, None, Some(1024), Some(16)).unwrap();
+        assert_eq!((edge.width, edge.height), (1024, 16));
     }
 
     /// A fixed policy accepts its bucket by name or by exact dimensions and

@@ -269,10 +269,12 @@ impl ModelConfig {
         let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path)?);
         let mut model = Self::from_files(
             &served_name,
+            &config.model,
             &files,
             config.engine.max_model_len,
             tokenizer.as_ref(),
-        )?;
+        )
+        .await?;
         model.max_model_tokens = Some(
             config
                 .engine
