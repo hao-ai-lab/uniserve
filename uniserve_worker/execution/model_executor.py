@@ -59,6 +59,7 @@ from uniserve.profiling import profile_range
 from uniserve.runtime import (
     CUDAStream,
     ExecutionContext,
+    Scratch,
     partition_streams,
 )
 from uniserve.runtime.backends.attention import resolve as attention_backend
@@ -271,6 +272,9 @@ class ModelExecutor:
         # resident.
         self._startup_modules: set[tuple] = set()
         self._module_streams: dict[tuple[str, str, str], CUDAStream] = {}
+        # Transient work areas the startup contexts of one (entry, path,
+        # method) borrow on that entry's stream; see ``prepare_module``.
+        self._module_scratch: dict[tuple[str, str, str], Scratch] = {}
 
         self._lane_streams: list[tuple[LaneConfig | None, CUDAStream]] = []
         self._preparation_stream: torch.cuda.Stream | None = None
@@ -394,10 +398,16 @@ class ModelExecutor:
 
         Prepared contexts are keyed by the input signature of ``size`` per
         (entry, path, method). Contexts prepared during startup stay resident
-        for the worker's lifetime; the ones prepared while serving are kept
-        in an LRU whose bound is the request pool size, and reaching it
-        retires the least recently used context and the graphs that borrow
-        it. Returns the prepared runner.
+        for the worker's lifetime and capture into one graph pool per
+        (entry, path, method), whose calls run one at a time on their shared
+        stream and borrow one ``Scratch``. A caller warming several sizes of
+        one entry prepares all of them before its first capture, since a
+        later persistent allocation could land in a block an earlier graph
+        reuses, and evaluates the largest first, since call sites bind their
+        scratch at their first eager call and a later, larger size would
+        grow it. Contexts prepared while serving never capture and are kept
+        in an LRU whose bound is the request pool size; reaching it retires
+        the least recently used one. Returns the prepared runner.
         """
         binding, call = self._module_call(name, method)
         key = (name, call.path, call.entry_point.method, input_signature(size))
@@ -420,10 +430,28 @@ class ModelExecutor:
                 # alone, so its preparation opens no binding over a group the
                 # other stages never reach.
                 groups=call.groups,
+                # Every context of one entry runs on its one stream, so its
+                # startup contexts borrow one set of transient work areas. A
+                # shared set keeps each backing it grows, so a context
+                # prepared while serving owns its own and retires it with
+                # the context.
+                scratch=None
+                if self._startup_complete
+                else self._module_scratch.setdefault(key[:3], Scratch()),
             )
             # An entry given graph devices captures a graph the first time it
-            # executes each input signature (``ModelRunner.execute_model``); a
-            # video post-processor is given none and always runs eagerly.
+            # executes each input signature during startup
+            # (``ModelRunner.execute_model``); a video post-processor, and
+            # any entry prepared while serving, is given none and always runs
+            # eagerly. Startup entries of one call share its graph pool.
+            share = next(
+                (
+                    self._module_entries[value]
+                    for value in self._startup_modules
+                    if value[:3] == key[:3]
+                ),
+                None,
+            )
             entry = self._runner_types[id(call)](
                 name,
                 call,
@@ -436,7 +464,9 @@ class ModelExecutor:
                 if stream is not None
                 and self.worker_config.graph_policy != "off"
                 and not isinstance(call.module, VideoPostprocessor)
+                and not self._startup_complete
                 else (),
+                share=share,
             )
             try:
                 if stream is not None:
@@ -770,28 +800,40 @@ class ModelExecutor:
             return
         # The conditioning encoder refines the text encoder's features.
         text = capability(self.model, TextEncoder)
-        for capacity in reversed(builder.text_capacities):
+        encoders = {
+            self._encoder_kind(call.module): name
+            for (name, _, method), (_, call) in self._module_calls.items()
+            if method == "encode"
+        }
+        capacities = tuple(reversed(builder.text_capacities))
+        dtype = getattr(torch, self.worker_config.model_dtype)
+
+        def features(capacity):
+            layout = text.output_layout(capacity, dtype)["conditioning"]
+            return torch.zeros(
+                layout.shape,
+                dtype=layout.dtype,
+                device=self.bindings[encoders["conditioning"]].device,
+            )
+
+        # Every capacity's context precedes the first capture into each
+        # encoder's shared graph pool (``prepare_module``).
+        for capacity in capacities:
+            if "text" in kinds:
+                self.prepare_module(
+                    encoders["text"], TextSize(capacity, 1), method="encode"
+                )
+            if "conditioning" in kinds and text is not None:
+                self.prepare_module(
+                    encoders["conditioning"],
+                    (features(capacity).shape,),
+                    method="encode",
+                )
+        for capacity in capacities:
             if "text" in kinds:
                 self.encode_text((0,) * capacity)
             if "conditioning" in kinds and text is not None:
-                name = next(
-                    name
-                    for (name, _, method), (_, call) in (
-                        self._module_calls.items()
-                    )
-                    if method == "encode"
-                    and self._encoder_kind(call.module) == "conditioning"
-                )
-                layout = text.output_layout(
-                    capacity, getattr(torch, self.worker_config.model_dtype)
-                )["conditioning"]
-                self.encode_conditioning(
-                    torch.zeros(
-                        layout.shape,
-                        dtype=layout.dtype,
-                        device=self.bindings[name].device,
-                    )
-                )
+                self.encode_conditioning(features(capacity))
 
     @torch.inference_mode()
     def run_module(self, name, *args, method=None, size=None, **kwargs):
@@ -1357,6 +1399,36 @@ class ModelExecutor:
         ``CUDAError`` when a lane stream has lost its SM partition.
         """
         self.graph_storage.check()
+        # Resident storage by device and, for graph pools, by runner kind,
+        # for sizing. Transient scratch and prepared contexts of module
+        # entries live outside the pools, so the process total is reported
+        # alongside them.
+        for device, pooled in sorted(
+            self.graph_storage.resident_bytes().items(), key=str
+        ):
+            logger.info(
+                "device storage on %s: %.2f GiB reserved by this process at "
+                "startup, %.2f GiB of it in graph pools",
+                device,
+                torch.cuda.memory_reserved(device) / 2**30,
+                pooled / 2**30,
+            )
+        totals: dict = {}
+        for (owner, device), used in self.graph_storage.owner_bytes().items():
+            method = getattr(getattr(owner, "call", None), "entry_point", None)
+            label = f"{getattr(owner, 'name', type(owner).__name__)}" + (
+                f".{method.method}" if method is not None else ""
+            )
+            totals[device, label] = totals.get((device, label), 0) + used
+        for (device, label), used in sorted(
+            totals.items(), key=lambda item: (str(item[0][0]), item[0][1])
+        ):
+            logger.info(
+                "graph storage on %s: %s holds %.2f GiB at startup",
+                device,
+                label,
+                used / 2**30,
+            )
 
         for _, stream in self._lane_streams:
             stream.verify()
@@ -1456,6 +1528,9 @@ class ModelExecutor:
         actions = [self.synchronize]
         actions.append(self.close_graphs)
         actions.extend(entry.close for entry in self._module_entries.values())
+        actions.extend(
+            scratch.close for scratch in self._module_scratch.values()
+        )
         if self._diffusion is not None:
             actions.append(self._diffusion.close)
         for entry in self.entries.values():
@@ -1478,6 +1553,7 @@ class ModelExecutor:
         finally:
             self.entries.clear()
             self._module_entries.clear()
+            self._module_scratch.clear()
             self._diffusion = None
             self.graph_storage.close()
             self._module_streams.clear()

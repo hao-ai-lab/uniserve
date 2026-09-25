@@ -340,17 +340,22 @@ def prepare_denoising(
         diffusion = runner.diffusion
         schedules = open_state(runner, builder.maximum).schedules
 
-        def ladder(layout):
+        def ladder(layout, *, staged):
             # A placeholder request filling the layout's text capacity on
             # slot one. ``storage[0]`` is slot one's tensors; no request
-            # owns a slot while this pass runs.
+            # owns a slot while this pass runs. Capture records the step
+            # without evaluating it, so only the warm step needs the
+            # placeholder's inputs staged.
             size = builder.size(
                 layout.num_frames,
                 min(layout.num_text_tokens, builder.maximum.num_text_tokens),
             )
             views = storage[0].view(builder.buffers(size))
             samples = builder.sample_views(size, diffusion.samples)
-            _stage_placeholder(builder, size, views, samples, diffusion, layout)
+            if staged:
+                _stage_placeholder(
+                    builder, size, views, samples, diffusion, layout
+                )
             return diffusion.bind(
                 layout,
                 tuple(
@@ -369,10 +374,10 @@ def prepare_denoising(
         # as their intermediates; a persistent allocation made after a
         # capture could land in a block an earlier graph rewrites.
         for layout in layouts:
-            diffusion.warmup(ladder(layout))
+            diffusion.warmup(ladder(layout, staged=True))
         if diffusion.captures:
             for layout in layouts:
-                bound = ladder(layout)
+                bound = ladder(layout, staged=False)
                 for index in range(builder.num_steps):
                     diffusion.capture(bound, index)
         runner.graph_storage.check()
@@ -419,19 +424,29 @@ def decoded_units(runner: ModelExecutor, name: str, count: int) -> tuple:
 
 @torch.inference_mode()
 def warmup_decoders(runner: ModelExecutor) -> None:
-    """Prepare reconstruction kernels for the admitted maximum duration.
+    """Prepare and capture reconstruction at every admitted duration.
 
-    A decoder's prepared context and captured graph follow its frame count and,
-    for video, the media unit it reconstructs, so warming the maximum warms
-    every unit this rank decodes at that duration and compiles the kernels
-    every shorter duration shares.
+    A decoder's prepared context and captured graph follow its frame count
+    and, for video, the media unit it reconstructs, so each admitted
+    duration warms every unit this rank decodes at that duration. Every
+    duration's context is prepared before the first capture into the
+    decoder's shared graph pool (``ModelExecutor.prepare_module``).
     """
     builder = runner.media_builder
-    frames = (builder.maximum.num_frames,)
+    frames = tuple(reversed(builder.frame_counts))
     for (name, _, method), (binding, call) in runner._module_calls.items():
         if method != "decode":
             continue
         module = call.module
+        for num_frames in frames:
+            if isinstance(module, VideoDecoder):
+                runner.prepare_module(name, num_frames, method="decode")
+            elif isinstance(module, AudioDecoder):
+                runner.prepare_module(
+                    name,
+                    module.latent_frames(audio_samples(runner, num_frames)),
+                    method="decode",
+                )
         for num_frames in frames:
             size = builder.size(num_frames, builder.maximum.num_text_tokens)
             if isinstance(module, VideoDecoder):
@@ -473,10 +488,10 @@ def warmup_postprocess(
     """Exercise real output windows through the public numerical interface.
 
     One post-processing call converts the media unit this rank reconstructed, so
-    its prepared context follows the frame count. Every rank of the ring
-    prepares the maximum duration even where it holds no unit in a round,
-    because preparing a context binds the ring's communication resources and
-    that binding spans the whole ring.
+    its prepared context follows the frame count, and every admitted duration
+    is prepared. Every rank of the ring prepares each duration even where it
+    holds no unit in a round, because preparing a context binds the ring's
+    communication resources and that binding spans the whole ring.
     """
     entries = [
         (name, call)
@@ -494,7 +509,7 @@ def warmup_postprocess(
     device = binding.device
     position = binding.config.ranks.index(binding.process_group.global_rank)
     units_per_round = len(binding.config.ranks)
-    for frames in (builder.maximum.num_frames,):
+    for frames in reversed(builder.frame_counts):
         runner.prepare_module(name, frames, method="forward")
         windows = decoder.frame_slices(frames)
         layout = decoder.output_layout(frames)["video"]

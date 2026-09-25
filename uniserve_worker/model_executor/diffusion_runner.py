@@ -299,11 +299,13 @@ class DiffusionRunner(ModelRunner):
         if entry is not None:
             return entry
         samples, pool = self.samples, self.pool
+        # A rank whose token shard holds no audio or video rows, such as
+        # the first rank under a long text region, has no sample pages.
         if (
             samples is None
             or pool is None
             or self._workspace is None
-            or not 0 < pages * pool.page_units <= samples.shape[0]
+            or not 0 <= pages * pool.page_units <= samples.shape[0]
         ):
             raise ValueError("a layout's samples exceed the runner's pages")
         if not self.layouts and layout != self._maximum:
@@ -643,17 +645,18 @@ class DiffusionRunner(ModelRunner):
         scatters the successor samples. Eager steps and captured graphs run
         this same computation.
         """
-        rows = cast("LatentPool", self.pool).page_rows
-        indices = entry.rows
         pool = cast("LatentPool", self.pool)
+        rows, indices = pool.page_rows, entry.rows
         staged = cast(torch.Tensor, self.samples)[
             : entry.pages * pool.page_units
-        ].view(entry.pages, -1)
-        torch.index_select(rows, 0, indices[0], out=staged)
+        ].view(entry.pages, pool.page_units * pool.latent_width)
+        if entry.pages:
+            torch.index_select(rows, 0, indices[0], out=staged)
         for bank_rows, stage in gathers:
             torch.index_select(bank_rows, 0, slot_index, out=stage)
         samples = call()
-        rows.index_copy_(0, indices[1], staged)
+        if entry.pages:
+            rows.index_copy_(0, indices[1], staged)
         return samples
 
     def _slot_value(self, slot):
@@ -678,7 +681,7 @@ class DiffusionRunner(ModelRunner):
         has the same structure replays it. Capture is collective across the
         component's ranks and belongs to startup, while no request owns the
         ladder's pages; the owner retains a capturing runner for the worker's
-        lifetime.
+        lifetime and checks the graph storage budget once its captures end.
         """
         if not self.captures:
             raise RuntimeError("denoising graph capture requires a stream")
@@ -752,7 +755,6 @@ class DiffusionRunner(ModelRunner):
                 restore=restore_samples(live),
                 warm=False,
             )
-            self.graph_storage.check()
 
     @torch.inference_mode()
     def step(self, ladder: Ladder, index: int, bank: int):

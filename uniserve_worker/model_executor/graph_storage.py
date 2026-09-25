@@ -34,21 +34,33 @@ class GraphStorage:
         if any(amount < 0 for amount in self._budgets.values()):
             raise ValueError("graph storage budgets must be nonnegative")
 
-    def reserve(self, owner, devices):
+    def reserve(self, owner, devices, *, share=None):
         """Create ``owner``'s private pools and return them by device.
 
-        Non-CUDA devices are skipped, so the result may be empty. A device
-        without a budget gets the default share of its total memory from
-        ``graph_storage_budget_bytes``.
+        With ``share``, a registered owner, ``owner`` borrows that owner's
+        pools on the devices both name instead. Owners sharing pools must
+        never replay their graphs concurrently, and every allocation they
+        make outside capture that outlives it must precede the first capture
+        into the shared pools: captured graphs reuse free pool blocks as
+        their intermediates. Non-CUDA devices are skipped, so the result may
+        be empty. A device without a budget gets the default share of its
+        total memory from ``graph_storage_budget_bytes``.
 
         Raises:
-            RuntimeError: If ``owner`` already holds pools here.
+            RuntimeError: If ``owner`` already holds pools here, or ``share``
+                holds none.
         """
         if owner in self._pools:
             raise RuntimeError("graph storage owner is already registered")
+        if share is not None and share not in self._pools:
+            raise RuntimeError("shared graph storage owner is not registered")
         pools = {}
         for device in dict.fromkeys(map(canonical_device, devices)):
             if device.type != "cuda":
+                continue
+            shared = None if share is None else self._pools[share].get(device)
+            if shared is not None:
+                pools[device] = shared
                 continue
             with torch.cuda.device(device):
                 pools[device] = torch.cuda.MemPool()
@@ -103,22 +115,32 @@ class GraphStorage:
         segments report zero.
         """
         sizes = dict.fromkeys(self._budgets, 0)
-        ids = {
-            (device.index, tuple(pool.id)): device
-            for pools in self._pools.values()
-            for device, pool in pools.items()
-        }
+        for (_, device), used in self.owner_bytes().items():
+            sizes[device] += used
+        return sizes
+
+    def owner_bytes(self):
+        """Return reserved pool bytes by (owner, device).
+
+        Owners without pooled segments on a device are omitted.
+        """
+        # A pool several owners share is attributed to the first of them.
+        ids = {}
+        for owner, pools in self._pools.items():
+            for device, pool in pools.items():
+                ids.setdefault((device.index, tuple(pool.id)), (owner, device))
+        sizes: dict = {}
         if not ids:
             return sizes
         for segment in torch.cuda.memory_snapshot():
-            device = ids.get(
+            key = ids.get(
                 (
                     segment["device"],
                     tuple(segment.get("segment_pool_id", ())),
                 )
             )
-            if device is not None:
-                sizes[device] += segment["total_size"]
+            if key is not None:
+                sizes[key] = sizes.get(key, 0) + segment["total_size"]
         return sizes
 
     def release(self, owner):
