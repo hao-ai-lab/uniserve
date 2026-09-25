@@ -94,6 +94,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 8000)]
     pub port: u16,
     /// Unix domain socket path. If set, host and port arguments are ignored.
+    /// A stale socket file no server listens on is replaced, and the socket
+    /// file is removed at shutdown.
     #[arg(long)]
     pub uds: Option<String>,
 
