@@ -76,10 +76,10 @@ class ShareGPTDataset(Dataset):
             for data in dataset
         ]
 
-        # The shuffle reseeds and draws from the process-global ``random``
-        # generator rather than a private ``random.Random``.
-        random.seed(point.load.seed)
-        random.shuffle(dataset)
+        # A private generator seeded by the load seed keeps the selection
+        # deterministic without reseeding the process-global ``random``
+        # generator other code in the process may draw from.
+        random.Random(point.load.seed).shuffle(dataset)
 
         rows: list[Example] = []
         for prompt, completion in dataset:
