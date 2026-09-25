@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
+from typing import Any
 
 import torch
 
 from tests.python.fixtures.worker_config import stub_worker_config
 from uniserve.distributed.mesh import Communicator
+from uniserve.processing import FlowPrompt
 from uniserve_models.stub import Model, image_processor
 from uniserve_worker.config.deployment import ComponentConfig
 from uniserve_worker.config.execution import WorkerConfig
@@ -31,6 +33,8 @@ def execution_worker(
     components: tuple[tuple[str, ComponentConfig], ...] = (),
     bindings: Mapping[str, ComponentBinding] | None = None,
     host_slots: tuple[int, ...] = (0, 1),
+    flow_prompt: FlowPrompt | None = None,
+    tokenizer: Any | None = None,
 ) -> Worker:
     ready = Model().to(device) if model is None else model
     worker_config = replace(
@@ -75,7 +79,7 @@ def execution_worker(
         sampling_group=Communicator(device=torch.device(device)),
         worker_config=worker_config,
         attention="torch",
-        tokenizer=None,
+        tokenizer=tokenizer,
         allowed_calls=None,
         transfer_backends=transfer_backends,
         publication_backends=transfer_backends,
@@ -86,6 +90,7 @@ def execution_worker(
         queue_depth=queue_depth,
         completion_payload_bytes=1 << 16,
         components=components,
+        flow_prompt=flow_prompt,
     )
     from .depth_one import configure_physical_pool, submitted_batch
 
