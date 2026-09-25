@@ -245,12 +245,14 @@ class TextRunner(ModelRunner):
         )
 
     def select_graph_shape(self, batch, *, eligible):
-        """Choose a text graph bucket and pad the batch to it.
+        """Choose a captured text graph bucket and pad the batch to it.
 
-        Single-token decode batches may use decode buckets even when prefill
-        graphs are disabled. Returns ``None`` for eager execution, otherwise
-        ``(key, padded_batch, True)``; ``ModelRunner._run_batch`` reads
-        ``key[1]`` as the ``text_shape`` tuple.
+        Only buckets that startup captures are candidates, so after startup
+        a batch either selects a resident graph or runs eagerly. Single-token
+        decode batches may use decode buckets even when prefill graphs are
+        disabled. Returns ``None`` for eager execution, otherwise ``(key,
+        padded_batch, True)``; ``ModelRunner._run_batch`` reads ``key[1]`` as
+        the ``text_shape`` tuple.
         """
         if not eligible or not self.pools:
             return None
@@ -259,13 +261,26 @@ class TextRunner(ModelRunner):
             batch.forward_mode is ForwardMode.DECODE
             and batch.inputs.attention.queries.host == (1,) * batch.row_count
         )
-        if not decode and not self.prefill_graph:
+
+        # Startup captures prefill buckets only with prefill graphs enabled,
+        # and stages them without a force-finish column
+        # (``startup.prepare_prefill``), so a batch carrying one, such as a
+        # device-continuation decode, keys a variant no capture produced. Such
+        # batches, and every batch without prefill graphs, choose among decode
+        # buckets alone; a decode batch wider than every decode size then runs
+        # eagerly.
+        prefill_shapes = (
+            self.prefill_shapes
+            if self.prefill_graph and batch.decode_force_finish is None
+            else ()
+        )
+        if not decode and not prefill_shapes:
             return None
 
         shape = text_shape(
             batch,
             decode_sizes=self.decode_shapes,
-            prefill_shapes=self.prefill_shapes,
+            prefill_shapes=prefill_shapes,
             context_blocks=self.decode_context_blocks,
         )
         if shape is None:

@@ -690,6 +690,81 @@ def test_computation_identity_preserves_homogeneous_decode():
     )
 
 
+@pytest.mark.parametrize(
+    ("prefill_graphs", "continuation"),
+    ((False, False), (False, True), (True, True)),
+)
+def test_decode_beyond_every_decode_graph_runs_eagerly(
+    prefill_graphs, continuation
+):
+    """A decode batch that no captured graph fits runs eagerly.
+
+    Only the configured decode sizes are captured for decode, and prefill
+    buckets are captured only with prefill graphs and without a device
+    continuation's force-finish column. A decode batch wider than every
+    decode size must therefore run eagerly and commit its tokens.
+    """
+    policy = WorkerConfig(
+        graph_policy="full",
+        prefill_cuda_graph=prefill_graphs,
+        decode_graph_batch_sizes=(1,),
+        flow_graph_batch_sizes=(1,),
+        flow_graph_shapes=((16, 16),),
+    )
+    admissions = (ar_params(43, block_ids=(0,)), ar_params(44, block_ids=(1,)))
+    with execution_worker(execution=policy) as worker:
+        worker.warmup()
+        prefills = tuple(
+            token_call(
+                admission.request_key,
+                call_id=CallId(1, index),
+                predecessor=root_parent(admission),
+                mode=ForwardMode.PREFILL,
+                tokens=(3 + 4 * index, 4 + 4 * index),
+            )
+            for index, admission in enumerate(admissions)
+        )
+        prefilled = finalized_report(
+            worker,
+            worker.submit(
+                execution_batch(
+                    batch_id=1, admissions=admissions, calls=prefills
+                )
+            ),
+        )
+
+        # CPU owns no CUDA graph pools, so the runner runs every batch eagerly
+        # without selecting a graph. A non-empty mapping stands in for a CUDA
+        # device's pools so the decode batch selects its graph as on that
+        # device; startup is sealed, so nothing is captured into it.
+        for entry in worker.runner.entries.values():
+            if ForwardMode.DECODE in entry.call_kinds:
+                entry.pools = {torch.device("cuda", 0): None}
+
+        decodes = tuple(
+            token_call(
+                prefill.request_key,
+                call_id=CallId(2, index),
+                predecessor=record_completion(prefill, prefilled).call_id,
+                mode=ForwardMode.DECODE,
+                tokens=(prefilled.completions[index].committed_tokens[0],),
+                predicate=prefill.token_output if continuation else None,
+            )
+            for index, prefill in enumerate(prefills)
+        )
+        decoded = finalized_report(
+            worker,
+            worker.submit(execution_batch(batch_id=2, calls=decodes)),
+        )
+
+    assert tuple(
+        record.committed_tokens for record in decoded.completions
+    ) == tuple(
+        (expected_successor(expected_successor(4 + 4 * index)),)
+        for index in range(len(admissions))
+    )
+
+
 @pytest.mark.gpu
 def test_failed_lane_keeps_kv_pages_until_submitted_device_work_finishes() -> (
     None
