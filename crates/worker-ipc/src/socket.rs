@@ -20,7 +20,6 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::codec::encode_request;
@@ -252,13 +251,17 @@ fn wait_ready(descriptors: &mut [libc::pollfd], timeout: Duration) -> IpcResult<
 ///
 /// Process death and local worker completion can wake the owner independently
 /// of incoming network traffic.
+///
+/// The descriptor's unread bytes are the wake's only state. Every fire writes
+/// one byte and a drain consumes them all, so a wake is reported exactly when
+/// its byte is read: one fired while the owner drains is either read and
+/// reported by that drain or left readable for the owner's next poll. Wakes
+/// fired between two drains coalesce into the one drain that reads them.
 struct LocalWake {
     /// Non-blocking end the owner polls and drains.
     reader: UnixStream,
-    /// Non-blocking end that senders write one byte to per coalesced wake.
+    /// Non-blocking end that senders write one byte to per wake.
     writer: UnixStream,
-    /// Cleared when the reader drains, so repeated wakes coalesce.
-    pending: Arc<AtomicBool>,
 }
 
 impl LocalWake {
@@ -271,11 +274,7 @@ impl LocalWake {
         writer.set_nonblocking(true).map_err(|error| {
             IpcError::Transport(format!("making a local wake pollable: {error}"))
         })?;
-        Ok(Self {
-            reader,
-            writer,
-            pending: Arc::new(AtomicBool::new(false)),
-        })
+        Ok(Self { reader, writer })
     }
 
     /// Returns a sender that fires this wake from any thread.
@@ -287,24 +286,22 @@ impl LocalWake {
             // wait returns.
             Err(_) => return Arc::new(|| {}),
         };
-        let pending = Arc::clone(&self.pending);
         Arc::new(move || {
-            if pending.swap(true, Ordering::AcqRel) {
-                return;
-            }
             // A shared reference writes because a wake fires from arbitrary
-            // frontend and watcher threads.
+            // frontend, watcher and completion threads. A write refused
+            // because the buffer is full loses nothing: the descriptor
+            // already holds unread bytes, so it is readable.
             let _ = (&writer).write(&[1]);
         })
     }
 
-    /// Drains the descriptor and reports whether it had fired.
+    /// Drains the descriptor and reports whether any wake had fired.
     fn take(&mut self) -> bool {
-        // Clear the pending bit before draining, so a wake fired during the
-        // drain sets it again and is reported by the next `take`.
-        let fired = self.pending.swap(false, Ordering::AcqRel);
+        let mut fired = false;
         let mut sink = [0u8; 64];
-        while self.reader.read(&mut sink).is_ok_and(|read| read > 0) {}
+        while self.reader.read(&mut sink).is_ok_and(|read| read > 0) {
+            fired = true;
+        }
         fired
     }
 }
@@ -808,6 +805,42 @@ mod tests {
                     .recv_response_timeout(0, Duration::from_secs(5))
                     .is_err()
             );
+        }
+    }
+
+    /// A local wake is reported by the first drain after it fires, wakes
+    /// fired before one drain are reported by it together, and a wake fired
+    /// after a drain leaves the wake descriptor readable for the owner's next
+    /// poll.
+    #[test]
+    fn a_local_wake_is_reported_once_and_rearms_after_each_drain() {
+        let (mut client, _peer) = connected(1024, 1);
+        let wake = client.death_wake();
+        let readable = |client: &SocketClient| {
+            let mut descriptor = [libc::pollfd {
+                fd: client.local_wake_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            wait_ready(&mut descriptor, Duration::ZERO).unwrap();
+            descriptor[0].revents & libc::POLLIN != 0
+        };
+
+        assert!(!readable(&client));
+        assert!(!client.drain_wakes().unwrap().death);
+
+        wake();
+        wake();
+        assert!(readable(&client));
+        assert!(client.drain_wakes().unwrap().death);
+        assert!(!readable(&client));
+        assert!(!client.drain_wakes().unwrap().death);
+
+        // Every drain rearms the wake, however many drains preceded it.
+        for _ in 0..3 {
+            wake();
+            assert!(readable(&client), "a wake after a drain must be pollable");
+            assert!(client.drain_wakes().unwrap().death);
         }
     }
 
