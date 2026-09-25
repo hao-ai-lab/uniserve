@@ -595,6 +595,37 @@ enum OutstandingKind {
     Batch { batch_id: u64 },
 }
 
+/// Caching-allocator variables PyTorch reads, the first taking precedence.
+const ALLOCATOR_VARIABLES: [&str; 2] = ["PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"];
+
+/// Returns the caching-allocator variables every rank is launched with,
+/// given a lookup into the head's environment.
+///
+/// Every rank serves varying shapes from expandable allocator segments,
+/// unless the head's environment already configures the allocator under
+/// either name, in which case each rank receives exactly the head's
+/// variables. Publication never depends on the caching allocator: a device
+/// product is exported from the rank's own VMM arena or copied into its
+/// bounded VMM pool, both reserved outside the allocator.
+///
+/// The variables are set explicitly on each rank's command, even where a
+/// local child would inherit them, because a launcher on another host
+/// receives only the variables the command sets and applies them over its
+/// own environment.
+fn allocator_environment(
+    head: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    let configured: Vec<_> = ALLOCATOR_VARIABLES
+        .into_iter()
+        .filter_map(|name| head(name).map(|value| (name, value)))
+        .collect();
+    if configured.is_empty() {
+        vec![("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True".into())]
+    } else {
+        configured
+    }
+}
+
 impl PendingRank {
     /// Spawns one rank, which reports its endpoint to `registration`.
     ///
@@ -650,17 +681,10 @@ impl PendingRank {
             .env("LOCAL_RANK", local_rank.to_string())
             .env("LOCAL_WORLD_SIZE", local_world_size.to_string());
 
-        // Every rank serves varying shapes from expandable allocator segments.
-        // Publication never depends on the caching allocator: a device product
-        // is exported from the rank's own VMM arena or copied into its bounded
-        // VMM pool, both reserved outside the allocator. A rank spawned here
-        // inherits an allocator setting already in this process's
-        // environment unchanged.
-        if std::env::var_os("PYTORCH_ALLOC_CONF").is_none()
-            && std::env::var_os("PYTORCH_CUDA_ALLOC_CONF").is_none()
-        {
-            cmd.env("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True");
-        }
+        // The allocator setting is stated even for a local child, which would
+        // inherit it, so that a remote launch carries it as well.
+        cmd.envs(allocator_environment(|name| std::env::var_os(name)));
+
         // The engine's working directory leads the worker's import path.
         if let Ok(cwd) = std::env::current_dir() {
             let pp = std::env::var("PYTHONPATH").unwrap_or_default();
@@ -1316,7 +1340,9 @@ impl Drop for RankProcess {
 
 #[cfg(test)]
 mod tests {
-    use super::LaneConfig;
+    use super::{LaneConfig, allocator_environment};
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
 
     /// `--lane` accepts only the fields the worker applies, so a misspelled
     /// optional limit fails at argument parsing instead of leaving the lane
@@ -1345,6 +1371,44 @@ mod tests {
         ] {
             let parsed = format!("{lane},{capacity}}}").parse::<LaneConfig>();
             assert!(parsed.is_err(), "{capacity} must be refused");
+        }
+    }
+
+    /// Every rank runs with the head's allocator configuration, under
+    /// whichever names the head sets, or with expandable segments when the
+    /// head configures none. The result names each variable, since a remote
+    /// launch carries only the variables its command sets.
+    #[test]
+    fn ranks_run_with_the_heads_allocator_configuration() {
+        let resolve = |head: &[(&'static str, &str)]| {
+            let head: BTreeMap<_, _> = head.iter().copied().collect();
+            allocator_environment(|name| head.get(name).map(OsString::from))
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()
+        };
+        let expected = |variables: &[(&'static str, &str)]| {
+            variables
+                .iter()
+                .map(|&(name, value)| (name, OsString::from(value)))
+                .collect::<BTreeMap<_, _>>()
+        };
+
+        assert_eq!(
+            resolve(&[]),
+            expected(&[("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")])
+        );
+        for head in [
+            vec![(
+                "PYTORCH_CUDA_ALLOC_CONF",
+                "garbage_collection_threshold:0.6",
+            )],
+            vec![("PYTORCH_ALLOC_CONF", "backend:cudaMallocAsync")],
+            vec![
+                ("PYTORCH_ALLOC_CONF", "backend:cudaMallocAsync"),
+                ("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False"),
+            ],
+        ] {
+            assert_eq!(resolve(&head), expected(&head));
         }
     }
 }
