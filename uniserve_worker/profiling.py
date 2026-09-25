@@ -177,9 +177,10 @@ class WorkerProfiler:
         The body always runs inside ``profile_range(debug_name)``, which
         records the step name in the torch trace while the profiler is
         active and as an NVTX range when ``UNISERVE_NVTX`` enables it on a
-        CUDA host. Failures to start the torch or CUDA profiler, or to stop
-        and export them, are logged rather than raised; an error creating
-        ``output_dir`` propagates.
+        CUDA host. Capture is diagnostic, so it never fails a step: failures
+        to create ``output_dir`` or to start the torch or CUDA profiler are
+        logged once and disable capture, and failures to stop and export
+        are logged.
         """
         if self.config is None:
             with profile_range(debug_name):
@@ -228,11 +229,11 @@ class WorkerProfiler:
             step retries.
         """
         assert self.config is not None
-        self.config.output_dir.mkdir(parents=True, exist_ok=True)
         self._start_step = int(step_id)
         self._profiled_steps = 0
         self._active = True
         try:
+            self.config.output_dir.mkdir(parents=True, exist_ok=True)
             torch_activities = _torch_profiler_activities(
                 self.config.activities
             )
