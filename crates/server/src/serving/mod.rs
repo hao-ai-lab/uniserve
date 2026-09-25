@@ -30,7 +30,7 @@ mod omni;
 mod preprocessing;
 mod sampling;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 /// Text tokenization, decoding, and sampling utilities.
 pub mod text;
 
@@ -1632,6 +1632,63 @@ mod tests {
             events.last(),
             Some(Ok(RequestOutput::Finished {
                 reason: FinishStatus::Length,
+                ..
+            }))
+        ));
+    }
+
+    /// A request that finishes without publishing a text token (the engine
+    /// withholds an EOS or excluded stop token, and image-only generation
+    /// publishes none) returns no text. The prompt seeds decoding only.
+    #[tokio::test]
+    async fn assembler_emits_no_text_when_no_token_was_generated() {
+        let tokenizer = crate::serving::test_support::configured_tokenizer();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.try_send(EngineCoreOutput::Scheduled {
+            queued_at: 1.0,
+            scheduled_at: 2.0,
+        })
+        .unwrap();
+        tx.try_send(EngineCoreOutput::Finished {
+            reason: uniserve_core::FinishReason::Eos,
+            stop_reason: None,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            images: 0,
+        })
+        .unwrap();
+        drop(tx);
+
+        let events = assemble_event_stream(
+            StreamInput {
+                request_id: "eos-first".into(),
+                event_context: event_context(),
+                prompt_token_ids: vec![b'p' as u32],
+                tokenizer,
+                prompt_logprobs_requested: false,
+                generated_logprobs_requested: false,
+                emit_token_ids: false,
+                decode_options: TextDecodeOptions::default(),
+                stream: EventRx::from_receiver(rx),
+            },
+            OutputProcessorPolicy::None,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert!(events.iter().all(std::result::Result::is_ok));
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(RequestOutput::TextDelta { text, .. }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "");
+        assert!(matches!(
+            events.last(),
+            Some(Ok(RequestOutput::Finished {
+                reason: FinishStatus::Stop { .. },
                 ..
             }))
         ));

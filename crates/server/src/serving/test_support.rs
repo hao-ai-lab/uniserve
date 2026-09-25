@@ -1,4 +1,4 @@
-//! Deterministic tokenizer fixtures shared by serving tests.
+//! Deterministic tokenizer fixtures shared by the crate's unit tests.
 
 use std::sync::Arc;
 
