@@ -307,16 +307,16 @@ class Executor:
     ) -> None:
         """Record a classified failure, close the batch and mark it complete.
 
-        A batch that is already complete is left unchanged. A cleanup failure
-        is attached as a note to the recorded error.
+        A batch that is already complete is left unchanged. The recorded
+        error reports the batch's call kind as its route unless the raiser set
+        one; a lifecycle-only batch has none. A cleanup failure is attached as
+        a note to the recorded error.
         """
         if batch.complete:
             return
-        batch.error = (
-            error
-            if isinstance(error, WorkerError)
-            else classify(error, context=context)
-        )
+        # ``classify`` returns a ``WorkerError`` itself and fills only its
+        # unset fields, so ``context`` applies to other exceptions alone.
+        batch.error = classify(error, context=context, route=batch.route)
         try:
             self._close_batch(batch)
         except BaseException as cleanup_error:
