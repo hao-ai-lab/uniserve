@@ -232,6 +232,23 @@ mod tests {
         assert!(output.calls.is_empty());
     }
 
+    /// JSON whitespace between the arguments object and the wrapper's closing
+    /// brace is insignificant, as it is anywhere else inside the wrapper.
+    #[test]
+    fn qwen_xml_accepts_whitespace_before_wrapper_close() {
+        let mut parser = Qwen3XmlToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(
+                "<tool_call>\n{\"name\": \"add\", \"arguments\": {\"x\": 1} \n}\n</tool_call>",
+            )
+            .unwrap();
+
+        assert_eq!(output.normal_text, "");
+        assert_eq!(output.calls.len(), 1);
+        assert_eq!(output.calls[0].name.as_deref(), Some("add"));
+        assert_eq!(output.calls[0].arguments, r#"{"x": 1}"#);
+    }
+
     #[test]
     fn qwen_xml_requires_newline_before_tool_call_end() {
         let mut parser = Qwen3XmlToolParser::new(&test_tools());
