@@ -22,10 +22,17 @@ class NoiseScale:
     maximum: float
 
     def __post_init__(self):
-        if self.mode not in {"constant", "resolution", "dynamic_sqrt"}:
+        if not isinstance(self.mode, str) or self.mode not in {
+            "constant",
+            "resolution",
+            "dynamic_sqrt",
+        }:
             raise ValueError("unknown numerical noise scale mode")
         if any(
-            not math.isfinite(value) or value <= 0
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
             for value in (self.value, self.base_tokens, self.maximum)
         ):
             raise ValueError(

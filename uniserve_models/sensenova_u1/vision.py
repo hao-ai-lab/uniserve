@@ -19,6 +19,15 @@ from uniserve.nn.rope import RotaryEmbedding
 from uniserve.nn.vision.position import build_abs_positions_from_grid_hw
 
 
+def _finite(value: object) -> bool:
+    """Return whether ``value`` is a finite real number other than a bool."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
 @dataclass(frozen=True)
 class Config:
     """NEO vision tower dimensions.
@@ -59,14 +68,14 @@ class Config:
                 "width divisible by four"
             )
         if (
-            not math.isfinite(self.downsample_ratio)
+            not _finite(self.downsample_ratio)
             or not 0 < self.downsample_ratio <= 1
             or round(1 / self.downsample_ratio) * self.downsample_ratio != 1
         ):
             raise ValueError(
                 "NEO downsampling must be the reciprocal of a positive integer"
             )
-        if not math.isfinite(self.rope_theta) or self.rope_theta <= 0:
+        if not _finite(self.rope_theta) or self.rope_theta <= 0:
             raise ValueError("NEO rotary theta must be finite and positive")
 
 
