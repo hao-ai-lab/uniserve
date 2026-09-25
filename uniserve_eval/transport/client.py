@@ -92,14 +92,21 @@ async def _send_images(
     """Execute an image-generations request and validate embedded outputs.
 
     Latency closes when the complete body has arrived, before parsing. A
-    non-JSON body is classified ``transport_status_<code>`` at any status.
-    For a JSON body, structural and image-decoding classifiers take
-    precedence; only an otherwise valid body with a status of 400 or above
-    is classified ``transport_status_<code>``.
+    status of 400 or above is classified ``transport_status_<code>``
+    whatever the body holds, since error bodies such as UniServe's
+    ``{"error": {...}}`` do not follow the images schema; so is a non-JSON
+    body at any status. Otherwise structural and image-decoding classifiers
+    apply, and every image of a successful response is assigned the
+    whole-response latency.
     """
     response = await client.post(url, json=payload)
     record.note_http(response.status_code)
     record.close_now()
+    if response.status_code >= 400:
+        record.mark_failure(
+            f"transport_status_{response.status_code}", response.text[:500]
+        )
+        return
     try:
         data = response.json()
     except Exception:
@@ -108,29 +115,19 @@ async def _send_images(
         )
         return
     body_ok, classifier = _classify_images(data)
-    transport_ok = response.status_code < 400
-    if not transport_ok and classifier == "ok":
-        classifier = f"transport_status_{response.status_code}"
+    if not body_ok:
+        record.mark_failure(classifier)
+        return
+
     # `_classify_images` inspects only the first entry; every entry is
     # checked here and decoded by `_attach_images`, which records its own
     # failure classifier.
-    images = data.get("data") if isinstance(data, dict) else None
-    image_error: str | None = None
-    if body_ok and isinstance(images, list):
-        if not all(isinstance(image, dict) for image in images):
-            image_error = "invalid_image_part"
-            record.mark_failure(image_error, image_error)
-        else:
-            image_error = _attach_images(
-                record, images, assign_json_latency=False
-            )
-    # Images are decoded without latencies above; only a successful response
-    # re-attaches them with the whole-response latency for every image.
-    if image_error is None and body_ok and transport_ok:
+    images = data["data"]
+    if not all(isinstance(image, dict) for image in images):
+        record.mark_failure("invalid_image_part", "invalid_image_part")
+        return
+    if _attach_images(record, images, assign_json_latency=True) is None:
         record.mark_success()
-        record.attach_images(record.decoded_images, assign_json_latency=True)
-    elif image_error is None:
-        record.mark_failure(classifier)
 
 
 async def _send_chat(
