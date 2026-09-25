@@ -337,6 +337,7 @@ def prepare_denoising(
     started = time.perf_counter()
     try:
         layouts = runner.prepare_layouts()
+        prepared = time.perf_counter()
         diffusion = runner.diffusion
         schedules = open_state(runner, builder.maximum).schedules
 
@@ -375,6 +376,7 @@ def prepare_denoising(
         # capture could land in a block an earlier graph rewrites.
         for layout in layouts:
             diffusion.warmup(ladder(layout, staged=True))
+        warmed = time.perf_counter()
         if diffusion.captures:
             for layout in layouts:
                 bound = ladder(layout, staged=False)
@@ -382,14 +384,19 @@ def prepare_denoising(
                     diffusion.capture(bound, index)
         runner.graph_storage.check()
         resident = sum(runner.graph_storage.resident_bytes().values())
+        finished = time.perf_counter()
         logger.info(
             "prepared %d denoiser layouts (%d frame counts x %d text "
-            "capacities, %d step graphs) in %.1f s; graph storage %.2f GiB",
+            "capacities, %d step graphs) in %.1f s (contexts %.1f s, warm "
+            "steps %.1f s, capture %.1f s); graph storage %.2f GiB",
             len(layouts),
             len(builder.frame_counts),
             len(builder.text_capacities),
             len(layouts) * builder.num_steps if diffusion.captures else 0,
-            time.perf_counter() - started,
+            finished - started,
+            prepared - started,
+            warmed - prepared,
+            finished - warmed,
             resident / 2**30,
         )
     except (CUDAGraphError, torch.OutOfMemoryError) as error:
