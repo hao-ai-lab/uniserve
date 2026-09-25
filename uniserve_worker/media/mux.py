@@ -162,8 +162,16 @@ class MuxSession:
     """One request epoch's container and encoded audio on the muxer rank.
 
     Lane tasks hold ``lock`` while they touch the container. A request that
-    ends early is marked discarded, and whichever of the discard and a task
-    in progress releases the lock last closes the container.
+    ends early is marked discarded, and the container is closed only while
+    ``lock`` is held, so never under a task that is using it.
+
+    The discard runs on the executor thread and must not wait for a task, so
+    it closes the container only if ``lock`` is free. Each task checks the
+    mark again after releasing ``lock`` and closes a discarded container
+    the same way. A side that finds ``lock`` held leaves the close to the
+    holder, which checks the mark after its release, so the container is
+    closed once the discard and every task have finished; more than one
+    side may close it, which `AvMuxSession.close` permits.
 
     ``audio_scheduled`` and ``finalized`` are set by `MediaMux` when it
     schedules the corresponding task, before the task runs; ``audio`` is
@@ -181,18 +189,25 @@ class MuxSession:
     @contextmanager
     def held(self) -> Iterator[AvMuxSession]:
         """Hold the container for one task, refusing a discarded session."""
-        with self.lock:
-            try:
+        try:
+            with self.lock:
                 if self.discarded:
                     raise invalid_descriptor("media assembly was discarded")
                 yield self.container
-            finally:
-                if self.discarded:
-                    self.container.close()
+        finally:
+            # A discard that ran while this task held the lock could not
+            # close the container; checking after the release also covers a
+            # discard that lands between the task's last use and the release.
+            if self.discarded:
+                self._close_if_free()
 
     def discard(self) -> None:
         """Close the container now, or after the task that holds it."""
         self.discarded = True
+        self._close_if_free()
+
+    def _close_if_free(self) -> None:
+        """Close the container unless another side holds it and will close."""
         if self.lock.acquire(blocking=False):
             try:
                 self.container.close()
