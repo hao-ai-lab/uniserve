@@ -5,8 +5,8 @@ An evaluator profile is a TOML file with optional `root` (default `.`) and
 `[servers.<name>]` describes how to launch a server, `[benchmarks.<name>]`
 describes one measured workload against a named server, and `[suites.<name>]`
 lists benchmark names in execution order. `load_config` turns the file into
-an `EvaluationConfig`, rejecting unknown keys in every server, benchmark, and
-suite table; unknown top-level keys are ignored. The adapters that
+an `EvaluationConfig`, rejecting unknown keys at the top level and in every
+server, benchmark, and suite table. The adapters that
 `tasks.get_task` and `datasets.get_dataset` return validate the parts of a
 benchmark that depend on its task and dataset.
 
@@ -44,6 +44,9 @@ DEFAULT_CONFIG = Path(__file__).resolve().parent / "profiles.toml"
 # ends at the first `}` and cannot itself contain one.
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _ENV_DEFAULT_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-(.*?)\}")
+
+# Keys accepted at the top level of a profile.
+_PROFILE_FIELDS = {"root", "artifact_root", "servers", "benchmarks", "suites"}
 
 # Keys accepted in a `[benchmarks.<name>]` table. The nested load, sampling,
 # image, and video tables accept exactly the fields of their dataclasses.
@@ -160,6 +163,9 @@ def load_config(path: Path = DEFAULT_CONFIG) -> EvaluationConfig:
     with config_path.open("rb") as handle:
         raw = tomllib.load(handle)
 
+    # A misspelled top-level key would otherwise leave its setting at the
+    # default without notice.
+    _reject_unknown(raw, _PROFILE_FIELDS, str(config_path))
     root = (config_path.parent / str(raw.get("root", "."))).resolve()
 
     # Benchmarks refer to servers and suites refer to benchmarks, so each
