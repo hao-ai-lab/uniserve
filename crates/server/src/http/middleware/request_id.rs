@@ -1,10 +1,10 @@
-//! Request-ID validation, generation, propagation, and response headers.
+//! Request-ID resolution, propagation, and the `X-Request-Id` response header.
 //!
-//! This middleware only decides the `X-Request-Id` response header. The ID a
-//! handler uses to identify the request to the serving runtime is resolved
-//! separately by `crate::http::utils::resolve_request_id`, which accepts a
-//! wider character set, so a client ID can be used as the runtime ID while the
-//! response header carries a generated one.
+//! [`resolve_request_id`] decides each request's ID exactly once, before the
+//! handler runs. Handlers read it as `Extension<RequestId>` to build their
+//! serving-runtime request ID, and the same value is echoed in the
+//! `X-Request-Id` response header when that header is enabled, so the header
+//! always names the request the server ran.
 
 use axum::extract::Request;
 use axum::http::HeaderValue;
@@ -15,92 +15,126 @@ use uuid::Uuid;
 
 const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
-/// Maximum length of a client-supplied request id that is echoed back.
+/// Maximum accepted length, in bytes, of a client-supplied request ID.
 ///
-/// A generated `uuid4` simple form is 32 chars; legitimate correlation ids are
-/// short. Capping the length bounds how much attacker-controlled data is
-/// reflected into the response and downstream logs.
+/// A generated ID (a `uuid4` in simple form) is 32 characters and legitimate
+/// correlation IDs are short. The cap bounds how much client-controlled data
+/// enters the runtime request ID, logs, and the echoed response header.
 const MAX_REQUEST_ID_LEN: usize = 128;
 
-/// Echoes the request's `X-Request-Id` on the response, or generates a fresh
-/// `uuid4` hex if the request did not provide a usable one.
+/// The request's base ID, inserted into the request extensions by
+/// [`resolve_request_id`].
 ///
-/// `routes::build_router` installs this layer only when
-/// `AppState::enable_request_id_headers` is set. The incoming value is
-/// attacker-controlled, so it is echoed only when it is a short, non-empty
-/// token of safe visible-ASCII characters (`A-Za-z0-9` plus the separators
-/// `-`, `_`, `.`). Anything outside that — empty, over-long, or containing
-/// opaque/non-visible bytes that a `HeaderValue` is otherwise permitted to
-/// hold — is discarded in favor of a freshly generated id rather than
-/// reflected unvalidated.
+/// Route handlers prefix it per API (`chatcmpl-`, `img-`, `vid-`) and use the
+/// result as the serving-runtime request ID, which the engine client registers
+/// as the request's external ID. Reusing the ID of a request that is still
+/// live therefore fails that registration as a duplicate.
+#[derive(Clone, Debug)]
+pub(crate) struct RequestId(pub(crate) String);
+
+/// Resolves the request's ID and, when `echo` is set, returns it in the
+/// `X-Request-Id` response header.
 ///
-/// The generated id is not shared with the generation handlers, which resolve
-/// their own request id from the same header.
-pub(crate) async fn set_request_id_header(req: Request, next: Next) -> Response {
-    let incoming = req
+/// The client's `X-Request-Id` is used when it is acceptable (see
+/// `is_acceptable_request_id`); otherwise a fresh ID is generated. The ID is
+/// inserted as [`RequestId`] before the inner service runs. `routes::build_router`
+/// installs this layer on every route, with `echo` set from
+/// `AppState::enable_request_id_headers`; a response that never reached a
+/// handler, such as a load-shedding `503`, still carries the header.
+pub(crate) async fn resolve_request_id(echo: bool, mut request: Request, next: Next) -> Response {
+    let id = request
         .headers()
         .get(&X_REQUEST_ID)
-        .filter(|value| is_safe_request_id(value))
-        .cloned();
-    let mut response = next.run(req).await;
-    let value = incoming.unwrap_or_else(generate_request_id);
-    response.headers_mut().insert(X_REQUEST_ID, value);
+        .and_then(|value| value.to_str().ok())
+        .filter(|id| is_acceptable_request_id(id))
+        .map_or_else(generate_request_id, ToOwned::to_owned);
+    request.extensions_mut().insert(RequestId(id.clone()));
+
+    let mut response = next.run(request).await;
+
+    // An accepted or generated ID is visible ASCII without whitespace, which
+    // is always a valid header value.
+    if echo && let Ok(value) = HeaderValue::from_str(&id) {
+        response.headers_mut().insert(X_REQUEST_ID, value);
+    }
     response
 }
 
-/// Returns `true` if a client-supplied `X-Request-Id` is safe to echo verbatim.
-fn is_safe_request_id(value: &HeaderValue) -> bool {
-    let bytes = value.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= MAX_REQUEST_ID_LEN
-        && bytes
-            .iter()
-            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+/// Returns whether a client-supplied request ID (already visible ASCII) is
+/// used as the request's ID.
+///
+/// Rejects empty and over-long values and any value containing whitespace or
+/// a control character, which would otherwise allow log injection.
+fn is_acceptable_request_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_REQUEST_ID_LEN
+        && id.chars().all(|c| !c.is_control() && !c.is_whitespace())
 }
 
-/// Generates a fresh `uuid4` hex request id.
-///
-/// The simple form is 32 lowercase hex digits, which is always a valid header
-/// value, so the all-zero fallback is not expected to be reached.
-fn generate_request_id() -> HeaderValue {
-    HeaderValue::from_str(&Uuid::new_v4().simple().to_string())
-        .unwrap_or_else(|_| HeaderValue::from_static("00000000000000000000000000000000"))
+/// Generates a fresh request ID: a full (untruncated) `uuid4` in simple form,
+/// so IDs stay collision-resistant under high request volume.
+fn generate_request_id() -> String {
+    Uuid::new_v4().simple().to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_REQUEST_ID_LEN, generate_request_id, is_safe_request_id};
-    use axum::http::HeaderValue;
+    use std::sync::Arc;
 
-    #[test]
-    fn accepts_uuid_and_common_correlation_ids() {
-        assert!(is_safe_request_id(&HeaderValue::from_static(
-            "0123456789abcdef0123456789abcdef"
-        )));
-        assert!(is_safe_request_id(&HeaderValue::from_static(
-            "req-123_abc.def"
-        )));
-        // A freshly generated id must itself pass validation.
-        assert!(is_safe_request_id(&generate_request_id()));
+    use axum::http::StatusCode;
+
+    use crate::http::test_support::{SERVED_MODEL, post_json, send, sim_state};
+    use crate::profile::ModelParameters;
+
+    /// Sends a two-token chat completion with `request_id` as its
+    /// `X-Request-Id` and returns the response header and the body's
+    /// completion `id`.
+    async fn chat(request_id: Option<&str>) -> (String, String) {
+        let state = sim_state(ModelParameters::Qwen3).with_request_id_headers(true);
+        let router = crate::http::build_router(Arc::new(state));
+        let mut request = post_json(
+            "/v1/chat/completions",
+            &serde_json::json!({
+                "model": SERVED_MODEL,
+                "messages": [{"role": "user", "content": "prompt"}],
+                "max_completion_tokens": 2,
+                "temperature": 0,
+                "allowed_token_ids": [u32::from(b'a')],
+            }),
+        );
+        if let Some(request_id) = request_id {
+            request
+                .headers_mut()
+                .insert("x-request-id", request_id.parse().unwrap());
+        }
+
+        let (status, headers, body) = send(&router, request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let header = headers["x-request-id"].to_str().unwrap().to_owned();
+        (header, body["id"].as_str().unwrap().to_owned())
     }
 
-    #[test]
-    fn rejects_empty_overlong_and_unsafe_values() {
-        assert!(!is_safe_request_id(&HeaderValue::from_static("")));
+    /// The response header names the request the server ran: the completion
+    /// `id` is the header value behind the `chatcmpl-` prefix.
+    #[tokio::test]
+    async fn the_response_header_carries_the_runtime_request_id() {
+        let (header, id) = chat(None).await;
+        assert_eq!(id, format!("chatcmpl-{header}"));
 
-        let too_long = "a".repeat(MAX_REQUEST_ID_LEN + 1);
-        assert!(!is_safe_request_id(
-            &HeaderValue::from_str(&too_long).unwrap()
-        ));
+        let (header, id) = chat(Some("client/42")).await;
+        assert_eq!(header, "client/42");
+        assert_eq!(id, "chatcmpl-client/42");
+    }
 
-        // Spaces and other visible-but-unsafe chars are rejected.
-        assert!(!is_safe_request_id(&HeaderValue::from_static("has space")));
-        assert!(!is_safe_request_id(&HeaderValue::from_static("a/b")));
-        assert!(!is_safe_request_id(&HeaderValue::from_static("<script>")));
-
-        // Opaque non-visible bytes a HeaderValue may legally hold are rejected.
-        assert!(!is_safe_request_id(
-            &HeaderValue::from_bytes(&[0x80, 0x81]).unwrap()
-        ));
+    /// A client ID the server refuses (empty, containing whitespace, or longer
+    /// than 128 bytes) is replaced by one generated ID, used for both the
+    /// header and the request.
+    #[tokio::test]
+    async fn a_refused_client_id_is_replaced_by_one_generated_id() {
+        for refused in [String::new(), "has space".to_owned(), "a".repeat(129)] {
+            let (header, id) = chat(Some(&refused)).await;
+            assert_ne!(header, refused);
+            assert_eq!(id, format!("chatcmpl-{header}"));
+        }
     }
 }

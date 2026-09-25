@@ -7,17 +7,17 @@ use crate::openai::chat_completions::{
     ChatResponseContext, chat_completion_chunk_stream, chat_completion_sse_stream,
     collect_chat_completion,
 };
-use axum::Json;
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
 use tracing::info;
 use tracing_futures::Instrument as _;
 
 use crate::AppState;
+use crate::http::middleware::RequestId;
 use crate::http::routes::openai::utils::validated_json::ValidatedJson;
-use crate::http::utils::{resolve_request_id, unix_timestamp};
+use crate::http::utils::unix_timestamp;
 
 /// Validates one chat completion request and runs it through the serving runtime.
 ///
@@ -27,13 +27,13 @@ use crate::http::utils::{resolve_request_id, unix_timestamp};
 /// are reported inside the stream.
 pub(crate) async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(RequestId(base_id)): Extension<RequestId>,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     // `body` moves into the runtime below, so every option that shapes the
     // response is captured first. Responses report the served model name.
     let stream = body.stream;
-    let request_id = format!("chatcmpl-{}", resolve_request_id(&headers));
+    let request_id = format!("chatcmpl-{base_id}");
     let response =
         ChatResponseContext::from_request(&body, request_id.clone(), state.served_model_name());
     let request_span = tracing::info_span!(

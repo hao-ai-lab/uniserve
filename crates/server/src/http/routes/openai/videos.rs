@@ -27,9 +27,10 @@ use std::sync::Arc;
 use crate::openai::VideoGenerationRequest;
 use crate::openai::serve_error_to_api;
 use crate::serving::{FinishStatus, RequestOutput};
+use axum::Extension;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt as _;
 use uniserve_core::SharedMedia;
@@ -37,7 +38,7 @@ use uniserve_core::SharedMedia;
 use crate::AppState;
 use crate::video_jobs::JobSlot;
 
-use crate::http::utils::resolve_request_id;
+use crate::http::middleware::RequestId;
 use crate::openai::ApiError;
 
 /// Validates and streams one completed video artifact synchronously.
@@ -53,12 +54,11 @@ use crate::openai::ApiError;
 /// closed stream, or a missing artifact is a `500`.
 pub(crate) async fn videos_sync(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(RequestId(base_id)): Extension<RequestId>,
     VideoBody(body): VideoBody,
 ) -> Response {
     let started_at = std::time::Instant::now();
 
-    let base_id = resolve_request_id(&headers);
     let request_id = crate::serving::ServeRequestId::new(format!("vid-{base_id}"));
 
     // As in `videos_create`, the slot is claimed before submission; it is
@@ -270,12 +270,11 @@ impl<S: Send + Sync> axum::extract::FromRequest<S> for VideoBody {
 /// dropped.
 pub(crate) async fn videos_create(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(RequestId(base_id)): Extension<RequestId>,
     VideoBody(body): VideoBody,
 ) -> Response {
     use crate::video_jobs::{VideoFailure, VideoJob, timestamp};
 
-    let base_id = resolve_request_id(&headers);
     let request_id = crate::serving::ServeRequestId::new(format!("vid-{base_id}"));
     let (requested_seconds, sampling) =
         match state

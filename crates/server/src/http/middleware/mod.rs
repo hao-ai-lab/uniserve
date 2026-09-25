@@ -1,10 +1,11 @@
 //! HTTP request identification, load tracking, and metrics middleware.
 //!
 //! `routes::build_router` installs these as `axum::middleware` function layers
-//! around every route, the request-ID layer only when it is enabled. Load
-//! tracking and metrics must observe the whole response, including a streamed
-//! body that outlives the handler, so both wrap the response body in
-//! [`GuardedBody`] and do their accounting when that body is dropped.
+//! around every route; the request-ID layer sets its response header only when
+//! that header is enabled. Load tracking and metrics must observe the whole
+//! response, including a streamed body that outlives the handler, so both wrap
+//! the response body in [`GuardedBody`] and do their accounting when that body
+//! is dropped.
 
 mod load;
 mod metrics;
@@ -12,7 +13,7 @@ mod request_id;
 
 pub(crate) use load::track_server_load;
 pub(crate) use metrics::track_http_metrics;
-pub(crate) use request_id::set_request_id_header;
+pub(crate) use request_id::{RequestId, resolve_request_id};
 
 use axum::body::{Body, Bytes, HttpBody};
 use http_body::{Frame, SizeHint};
