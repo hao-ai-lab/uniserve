@@ -57,6 +57,26 @@ def test_storage_fraction_outside_the_unit_interval_is_refused(
         worker_args(tmp_path, kv_memory_fraction=fraction)
 
 
+@pytest.mark.parametrize(
+    ("device", "mesh", "option"),
+    [
+        ("gpu0", None, "--device"),
+        ("cuda:x", None, "--device"),
+        ("cuda:0", "tower=text:cpu:x;gen:cuda:1", "--mesh tower text"),
+        ("cuda:0", "tower=gen:bogus", "--mesh tower gen"),
+    ],
+)
+def test_a_malformed_device_string_is_a_usage_error(
+    device, mesh, option, tmp_path, capsys
+):
+    # argparse reports a usage error with exit status 2.
+    with pytest.raises(SystemExit) as exit_info:
+        worker_args(tmp_path, device=device, mesh=mesh)
+
+    assert exit_info.value.code == 2
+    assert option in capsys.readouterr().err
+
+
 def test_quantization_config_defaults_to_model_policy(tmp_path) -> None:
     config = worker_args(
         tmp_path,

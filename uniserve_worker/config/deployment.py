@@ -466,7 +466,7 @@ class WorkerProcessArgs:
                 a ``WorkerConfig`` invariant.
         """
         supported_calls = _parse_supported_calls(namespace.supported_calls)
-        device = _normalize_device(namespace.device)
+        device = _normalize_device(namespace.device, option="--device")
         generation_device = _parse_mesh(
             str(namespace.mesh or ""),
             device=device,
@@ -710,18 +710,22 @@ def _parse_expert_device(value: str, *, device: str) -> str:
     if "gen" not in parameters:
         raise ValueError("tower params requires gen:<device>")
 
-    understanding_device = _normalize_device(parameters.get("text") or device)
+    understanding_device = _normalize_device(
+        parameters.get("text") or device, option="--mesh tower text"
+    )
     if understanding_device != device:
         raise ValueError("text expert device must match the Worker rank device")
 
-    generation_device = _normalize_device(parameters["gen"])
+    generation_device = _normalize_device(
+        parameters["gen"], option="--mesh tower gen"
+    )
     if understanding_device == generation_device:
         raise ValueError("tower text and gen devices must be different")
 
     return generation_device
 
 
-def _normalize_device(value: object) -> str:
+def _normalize_device(value: object, *, option: str) -> str:
     """Pin an unindexed CUDA device to the concrete index the rank owns.
 
     A worker scoped by ``CUDA_VISIBLE_DEVICES`` to one GPU sees it as device 0,
@@ -731,10 +735,21 @@ def _normalize_device(value: object) -> str:
     device would reject every forward; it therefore resolves to ``cuda:0``.
     Every other value, including an indexed CUDA device, is returned
     unchanged. The ``tower`` devices pass through the same normalization.
+
+    Raises:
+        ValueError: ``value`` is not a device string torch accepts; the
+            message names the launch ``option`` that carried it.
     """
     import torch
 
-    device = torch.device(str(value))
+    # torch reports a malformed device string as RuntimeError; it is a
+    # launch value error like every other rejected setting.
+    try:
+        device = torch.device(str(value))
+    except RuntimeError as error:
+        raise ValueError(
+            f"{option} must name a torch device, got {value!r}: {error}"
+        ) from error
     if device.type == "cuda" and device.index is None:
         return "cuda:0"
     return str(value)
