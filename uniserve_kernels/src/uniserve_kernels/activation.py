@@ -72,8 +72,10 @@ if triton is not None:
 
         One program owns one complete ``[gate, value]`` row, with ``block``
         at least ``n_cols``, so the row maximum is a single block reduction.
+        Row offsets are int64, so one launch covers every row of a packed
+        input past ``2**31`` elements.
         """
-        row = tl.program_id(0)
+        row = tl.program_id(0).to(tl.int64)
         cols = tl.arange(0, block)
         mask = cols < n_cols
         base = row * (n_cols * 2)
@@ -308,7 +310,8 @@ def silu_and_mul_fp8(
 
     ``x`` packs ``[gate, value]`` rows like :func:`silu_and_mul`. ``out`` is
     contiguous float8_e4m3fn ``[rows, width]`` and ``scale`` is FP32; one
-    program handles each complete row.
+    program handles each complete row. The kernel indexes rows in int64, so
+    a single launch needs no row chunking.
     """
     width = int(x.shape[-1]) // 2
     block = triton.next_power_of_2(width)
