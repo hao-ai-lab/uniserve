@@ -29,9 +29,9 @@ if TYPE_CHECKING:
     from .vision import Encoder
 
 
-# ``config.read_config`` opens ``checkpoint_sources[0]`` to size the latent
-# position grid from a tensor header, and ``config.config_sources`` is the
-# first entry, so the primary source must stay first.
+# ``config.read_config`` sizes the latent position grid from a tensor header
+# of ``checkpoint_sources[0]``, which ``config.config_sources`` declares as
+# its first entry, so the primary source must stay first.
 checkpoint_sources = (
     checkpoint.Config(
         "primary", filenames=("ema.safetensors", "model.safetensors")

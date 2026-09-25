@@ -3,8 +3,9 @@
 ``uniserve_models.loading`` maps the one architecture a checkpoint declares to
 a package here and reads that package's module-level interface:
 ``read_config`` normalizes checkpoint metadata into a typed config and may
-read tensor headers from the sources ``config_sources`` names, which the
-loader fetches first for a Hub checkpoint; ``Model`` builds the module tree
+read tensor headers through ``sources``, the loader's resolution of the
+sources ``config_sources`` names (downloaded for a Hub checkpoint, or
+header-only for a dummy Hub load); ``Model`` builds the module tree
 from that config; ``checkpoint_sources`` and ``checkpoint_mappings`` place
 checkpoint tensors into the tree; ``precisions`` names weight precision
 presets and ``checkpoint_precision`` is the base configuration for a

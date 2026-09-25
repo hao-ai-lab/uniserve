@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from uniserve import loading
+from uniserve.loading import checkpoint
 from uniserve_models import siglip
 
 from . import vae
@@ -141,18 +142,30 @@ def _required(text: Mapping[str, Any], name: str) -> Any:
     return text[name]
 
 
-def read_config(root: Path, io: loading.Config) -> Config:
+def read_config(
+    root: Path,
+    io: loading.Config,
+    *,
+    sources: Mapping[str, checkpoint.Source],
+) -> Config:
     """Read checkpoint metadata into typed configs before module construction.
 
     Tower configs live either inline in ``config.json`` or in per-tower files;
     absent optional fields take fixed defaults. The learned latent position
-    grid is read from the primary checkpoint's tensor header rather than from
+    grid is read from a tensor header of the primary source rather than from
     ``config.json``, so its table must be a square grid whose width matches
     the text hidden size.
 
+    Args:
+        root: Local checkpoint directory containing ``config.json``.
+        io: Checkpoint IO policy for opening the primary source.
+        sources: The resolved ``config_sources`` by name; only the primary
+            source's tensor metadata is read, so a header-only source of a
+            dummy load suffices.
+
     Raises:
-        FileNotFoundError: If ``config.json``, a tower config that is not
-            inline, or the primary checkpoint's files are missing.
+        FileNotFoundError: If ``config.json`` or a tower config that is not
+            inline is missing.
         ValueError: If a tower config is not an object; if a required text
             dimension or the ``latent_pos_embed.pos_embed`` tensor is
             absent; if the text width or head count is not a positive
@@ -190,7 +203,7 @@ def read_config(root: Path, io: loading.Config) -> Config:
             "BAGEL checkpoint requires compatible text width and heads"
         )
 
-    with checkpoint_sources[0].resolve(root, io=io).open(io=io) as reader:
+    with sources[checkpoint_sources[0].name].open(io=io) as reader:
         if "latent_pos_embed.pos_embed" not in reader.names():
             raise ValueError(
                 "BAGEL primary checkpoint lacks latent_pos_embed.pos_embed"
@@ -262,7 +275,7 @@ def read_config(root: Path, io: loading.Config) -> Config:
     )
 
 
-# ``read_config`` reads the latent position table from the primary checkpoint's
-# header, so the loader fetches that source for a Hub checkpoint before module
-# selection.
+# ``read_config`` reads the latent position table from the primary source's
+# tensor header, so the loader resolves that source before module selection:
+# downloaded for a Hub checkpoint, or header-only for a dummy Hub load.
 config_sources = checkpoint_sources[:1]

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from uniserve import loading
+from uniserve.loading import checkpoint
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,13 +181,20 @@ def _string(config: Mapping[str, object], name: str, default: str) -> str:
     return raw
 
 
-def read_config(root: Path, io: loading.Config) -> Config:
+def read_config(
+    root: Path,
+    io: loading.Config,
+    *,
+    sources: Mapping[str, checkpoint.Source],
+) -> Config:
     """Normalize checkpoint metadata into immutable decoder configuration.
 
     Args:
         root: Local checkpoint directory containing ``config.json``.
         io: Loading options of the package ``read_config`` contract; Qwen3
             reads only the local ``config.json`` and does not use them.
+        sources: The resolved ``config_sources`` of the package contract;
+            Qwen3 declares none.
 
     Returns:
         The validated ``Config``. Optional fields absent from the checkpoint
