@@ -414,7 +414,9 @@ impl Scheduler {
     /// Returns `true` if the engine died (executor or worker failure) rather
     /// than shutting down on a `Shutdown` command or command-channel
     /// disconnect. Either way, every queued or running request is finished with
-    /// `Aborted` and the executor is closed before returning.
+    /// `Aborted`, every receiver still open can read its complete event stream
+    /// through its terminal event, and the executor is closed before
+    /// returning.
     pub fn run(mut self, rx: Receiver<Command>) -> bool {
         loop {
             if self.drain_commands(&rx) {
@@ -442,8 +444,8 @@ impl Scheduler {
             }
         }
         // Finish everything still queued or running with `Aborted` before
-        // closing the executor, so a consumer whose channel has room receives
-        // a terminal event rather than only a closed channel.
+        // closing the executor, so every open consumer receives a terminal
+        // event rather than only a closed channel.
         self.abort_all_requests();
         let _ = self.executor.close();
         false
