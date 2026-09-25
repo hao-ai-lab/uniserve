@@ -295,9 +295,11 @@ fn resolution_policy() -> ResolutionPolicy {
     .collect::<Vec<_>>();
     // Index 1 is the 16:9 bucket, matching `image_defaults.resolution` in
     // `SenseNovaProfile::resolve`; reordering the list changes the default.
+    // The fixed buckets already bound every side.
     ResolutionPolicy {
         default: buckets[1].clone(),
         buckets,
         allow_custom: false,
+        max_side: None,
     }
 }

@@ -167,6 +167,8 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
                 # columns must stay below max_latent_size, which this method
                 # does not check; a column past it selects another grid row's
                 # embedding whenever the flat index stays inside the table.
+                # Serving admission (the server's Bagel profile) rejects a
+                # canvas side beyond max_latent_size latent patches.
                 coordinates = (
                     positions[1, 1:-1] * self.config.max_latent_size
                     + positions[2, 1:-1]
