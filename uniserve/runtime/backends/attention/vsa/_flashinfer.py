@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,6 +15,7 @@ from uniserve_kernels.triton import launchable
 
 from uniserve.distributed.chunks import ChunkProducer
 from uniserve.nn.attention.vsa.inputs import Pattern
+from uniserve.tensors import BufferConfig
 
 try:  # pragma: no cover - worker_config-only CUDA provider.
     import flashinfer as _flashinfer
@@ -82,6 +84,9 @@ class SparseExecutionState:
         default_factory=dict
     )
     workspaces: dict[torch.device, torch.Tensor] = field(default_factory=dict)
+    # Lends the owning context's shared per-call work areas (see
+    # ``ExecutionContext.scratch``), or ``None`` to allocate them per plan.
+    transient: Callable[..., Mapping[str, torch.Tensor]] | None = None
 
 
 def uses_row_major_inputs(device: torch.device) -> bool:
@@ -98,12 +103,14 @@ if triton is not None:
     @triton.jit
     def _fill_flattened_bsr_kernel(
         source_indices,
+        source_counts,
         valid_sizes,
         indptr,
         destination_indices,
         packed_mask,
         source_stride_head: tl.constexpr,
         source_stride_tile: tl.constexpr,
+        count_stride_head: tl.constexpr,
         query_tiles: tl.constexpr,
         key_tiles: tl.constexpr,
         source_width: tl.constexpr,
@@ -116,7 +123,9 @@ if triton is not None:
         """Populate head-flattened indices and key validity bits.
 
         Populate head-flattened indices and exact little-endian key
-        validity bits.
+        validity bits. The plan reserves each row's declared count bound;
+        entries past the row's live count in ``source_counts`` address key
+        tile 0 with every validity bit clear, so they contribute nothing.
         """
         # Each program owns one (head, local query tile) row of the
         # flattened BSR.
@@ -130,6 +139,9 @@ if triton is not None:
         )
         destination = tl.load(indptr + row)
         selected_count = tl.load(indptr + row + 1) - destination
+        live_count = tl.load(
+            source_counts + head * count_stride_head + query_tile
+        )
 
         # Copy the selected key-tile IDs, rebasing them into this head's slice
         # of the head-flattened key domain.
@@ -143,7 +155,7 @@ if triton is not None:
                 + head * source_stride_head
                 + query_tile * source_stride_tile
                 + offsets,
-                mask=mask,
+                mask=mask & (offsets < live_count),
                 other=0,
             )
             tl.store(
@@ -160,16 +172,17 @@ if triton is not None:
             byte_offsets = begin + tl.arange(0, 1024)
             active = byte_offsets < mask_bytes
             selected = (byte_offsets // bytes_per_tile_row) % selected_count
+            live = active & (selected < live_count)
             selected_blocks = tl.load(
                 source_indices
                 + head * source_stride_head
                 + query_tile * source_stride_tile
                 + selected,
-                mask=active,
+                mask=live,
                 other=0,
             )
             valid_rows = tl.load(
-                valid_sizes + selected_blocks, mask=active, other=0
+                valid_sizes + selected_blocks, mask=live, other=0
             )
             bits = tl.minimum(
                 tl.maximum(
@@ -401,18 +414,28 @@ def _native_plan_for(
         + local_tiles % interval_tiles
     )
 
+    # Each call selects its live maps into these right before its launch,
+    # which the stream orders before any later call rewrites them, so every
+    # plan of a context can share them.
+    requirements = {
+        "indices": BufferConfig(
+            (1, heads, owners * interval_tiles, index_width), torch.int32
+        ),
+        "counts": BufferConfig(
+            (1, heads, owners * interval_tiles), torch.int32
+        ),
+    }
+    device = source_indices.device
+    maps = (
+        {
+            name: torch.empty(config.shape, dtype=config.dtype, device=device)
+            for name, config in requirements.items()
+        }
+        if state.transient is None
+        else state.transient("vsa_native_rows", requirements, device)
+    )
     plan = _NativeSparsePlan(
-        query_tiles.to(source_indices.device),
-        torch.empty(
-            (1, heads, owners * interval_tiles, index_width),
-            dtype=torch.int32,
-            device=source_indices.device,
-        ),
-        torch.empty(
-            (1, heads, owners * interval_tiles),
-            dtype=torch.int32,
-            device=source_indices.device,
-        ),
+        query_tiles.to(device), maps["indices"], maps["counts"]
     )
     state.native_plans[cache_key] = plan
     return plan
@@ -421,6 +444,7 @@ def _native_plan_for(
 def _fill_flattened_bsr(
     plan: _SparsePlan,
     source_indices: torch.Tensor,
+    source_counts: torch.Tensor,
     valid_sizes: torch.Tensor,
 ) -> None:
     """Populate a cached plan's indices.
@@ -437,12 +461,14 @@ def _fill_flattened_bsr(
         )
     _fill_flattened_bsr_kernel[(heads * plan.query_tiles,)](
         source_indices,
+        source_counts,
         valid_sizes,
         wrapper_indptr,
         plan.indices,
         plan.packed_mask,
         int(source_indices.stride(0)),
         int(source_indices.stride(1)),
+        int(source_counts.stride(0)),
         plan.query_tiles,
         plan.key_tiles,
         int(source_indices.shape[2]),
@@ -611,7 +637,9 @@ def prepare_rows(
             row_start=start,
             row_count=count,
         )
-        _fill_flattened_bsr(plan, mask_block_indices, valid_sizes)
+        _fill_flattened_bsr(
+            plan, mask_block_indices, mask_block_count, valid_sizes
+        )
 
         output = attention_output.view(-1)[:elements].view(
             heads * members * count, 1, width

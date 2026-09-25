@@ -24,7 +24,16 @@ class Operator:
 
     kernel: Callable[..., object]
 
-    def __init__(self, pattern, *, num_heads, head_dim, dtype, workspace):
+    def __init__(
+        self,
+        pattern,
+        *,
+        num_heads,
+        head_dim,
+        dtype,
+        workspace,
+        transient=None,
+    ):
         if min(num_heads, head_dim) < 1 or len(pattern.row_counts) not in (
             1,
             num_heads,
@@ -40,6 +49,10 @@ class Operator:
             dtype,
         )
         self.workspace, self._closed = workspace, False
+        # ``transient(role, requirements, device)`` lends per-call work areas
+        # that every operator of the owning context shares; without it the
+        # operator allocates its own.
+        self.transient = transient
         # Row producers own the query maps they plan, one per softmax scale.
         self._rows: dict[float, _Rows] = {}
 
@@ -137,7 +150,7 @@ class Operator:
         producer = self._rows.get(scale)
         if producer is None:
             producer = self._rows[scale] = _Rows(
-                partial(self.row_kernel, scale=scale)
+                partial(self.row_kernel, scale=scale), self.transient
             )
         return producer.prepare(
             q,
@@ -189,11 +202,13 @@ class Backend:
         head_dim: int,
         dtype: torch.dtype,
         workspace,
+        transient=None,
     ):
         """Build an operator bound to one pattern.
 
         Build an operator bound to one pattern, dtype, and borrowed
-        workspace.
+        workspace. ``transient`` lends the owning context's shared per-call
+        work areas (see ``ExecutionContext.scratch``).
         """
         return self.operator_class(
             pattern,
@@ -201,6 +216,7 @@ class Backend:
             head_dim=head_dim,
             dtype=dtype,
             workspace=workspace,
+            transient=transient,
         )
 
 

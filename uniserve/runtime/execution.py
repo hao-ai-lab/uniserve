@@ -129,19 +129,13 @@ class ExecutionContext(Generic[SizeT]):
         self.constants: Mapping[str, torch.Tensor] = MappingProxyType({})
         self.workspace: Mapping[str, torch.Tensor] = self.constants
         self._allocations: list[TensorBuffers] = []
-        # Work areas are keyed by device and their buffer requirements.
-        self._scratch: dict[tuple[object, ...], torch.Tensor] = {}
-        self._matmul_scratch: dict[
-            tuple[object, ...], Mapping[str, torch.Tensor]
-        ] = {}
+        # Transient work areas by role (see ``scratch``), largest first.
+        self._capacities: dict[tuple[object, ...], list[TensorBuffers]] = {}
 
         self._operators: dict[int, MatmulBinding] = {}
         self._merged: dict[int | _binding.MergedKey, MatmulBinding] = {}
         self._attention: dict[int, AttentionBinding] = {}
         self._vsa: dict[int, VsaBinding] = {}
-        self._vsa_backing: dict[
-            tuple[object, ...], Mapping[str, torch.Tensor]
-        ] = {}
         self._vsa_output: dict[ParallelAttention, OutputBuffers] = {}
         self._vsa_context: dict[ParallelAttention, AttentionBuffers] = {}
         self._context_backing: dict[tuple[object, ...], AttentionBuffers] = {}
@@ -168,16 +162,52 @@ class ExecutionContext(Generic[SizeT]):
         self._allocations.append(allocation)
         return allocation.view(requirements)
 
+    def scratch(self, role, requirements, device):
+        """Borrow transient work areas shared by every call of ``role``.
+
+        A role names storage whose contents one call writes before reading
+        and no later call reads, so every call site and every size this
+        context evaluates on its serialized stream can share one backing.
+        The backing is allocated at the first request's shapes; a later
+        request whose every extent fits borrows compact leading views of it,
+        and a larger one allocates a new backing outside capture. Earlier
+        backings stay alive for the views and graphs that address them, so
+        callers that evaluate several sizes prepare the largest first.
+
+        Raises:
+            RuntimeError: A request exceeds every backing while a graph is
+                being captured.
+        """
+        key = (
+            role,
+            device,
+            tuple(
+                (name, config.dtype, config.host, len(config.shape))
+                for name, config in requirements.items()
+            ),
+        )
+        backings = self._capacities.setdefault(key, [])
+        for backing in backings:
+            try:
+                return backing.view(requirements)
+            except ValueError:
+                continue
+        if capturing(device):
+            raise RuntimeError(
+                f"prepare {role!r} scratch for this size before capture"
+            )
+        backing = TensorBuffers.allocate(requirements, device=device)
+        self._allocations.append(backing)
+        backings.insert(0, backing)
+        return backing.view(requirements)
+
     def _matmul_workspace(self, requirements, device):
         # GEMM work areas are consumed entirely within one operator call. The
         # provider copies its merged result into caller-owned outputs before
         # returning, so subsequent layers on this serialized context can reuse
         # the same backing. Plans and weights retain their own call-site
         # binding.
-        key = (device, tuple(requirements.items()))
-        if key not in self._matmul_scratch:
-            self._matmul_scratch[key] = self._allocate(requirements, device)
-        return self._matmul_scratch[key]
+        return self.scratch("matmul", requirements, device)
 
     def _attention_workspace(self, requirements, device):
         # Native attention scratch is consumed on this context's serialized
@@ -195,35 +225,46 @@ class ExecutionContext(Generic[SizeT]):
             )
         )
         if shared is not None:
-            key = (device, shared)
-            if key not in self._scratch:
-                self._scratch[key] = self._allocate(
-                    {"scratch": shared}, device
-                )["scratch"]
-            views["scratch"] = self._scratch[key]
+            views["scratch"] = self.scratch(
+                "attention", {"scratch": shared}, device
+            )["scratch"]
         return views
 
     def _vsa_buffers(self, slot, requirements, device):
         # Two projection slots permit one layer's output consumption to overlap
         # the next layer's input preparation. Each context owns its own pair.
-        key = (slot, device, tuple(requirements.items()))
-        if key not in self._vsa_backing:
-            self._vsa_backing[key] = self._allocate(requirements, device)
-        return self._vsa_backing[key]
+        return self.scratch(("vsa", slot), requirements, device)
 
     def _vsa_exchange(self, layer, rows, heads, head_dim, dtype):
         parallel = getattr(layer, "parallel", None)
         if parallel is None:
             return None
 
-        key = (
-            parallel.ulysses_group,
-            parallel.context_group,
-            parallel.key_group,
-            rows,
-            heads,
-            head_dim,
-            dtype,
+        # Exchange storage serves every query length up to its rows
+        # (``ParallelAttention`` borrows compact leading views), so a
+        # transport prepared for more rows serves this call too.
+        key = next(
+            (
+                key
+                for key in self._vsa_transport
+                if key[:3]
+                == (
+                    parallel.ulysses_group,
+                    parallel.context_group,
+                    parallel.key_group,
+                )
+                and key[3] >= rows
+                and key[4:] == (heads, head_dim, dtype)
+            ),
+            (
+                parallel.ulysses_group,
+                parallel.context_group,
+                parallel.key_group,
+                rows,
+                heads,
+                head_dim,
+                dtype,
+            ),
         )
         if key not in self._vsa_transport:
             if capturing(self._device):
@@ -442,7 +483,7 @@ class ExecutionContext(Generic[SizeT]):
                 if isinstance(child, BlockAttention):
                     self._vsa[id(child)] = VsaBinding(
                         self._vsa_backend,
-                        self._allocate,
+                        self.scratch,
                         self._attention_workspace,
                         partial(self._vsa_buffers, vsa_slot % 2),
                         self._vsa_exchange,
@@ -627,7 +668,6 @@ class ExecutionContext(Generic[SizeT]):
                 self._merged,
                 self._attention,
                 self._vsa,
-                self._vsa_backing,
                 self._vsa_output,
                 self._vsa_context,
                 self._context_backing,
@@ -638,8 +678,7 @@ class ExecutionContext(Generic[SizeT]):
             ):
                 values.clear()
             self._allocations.clear()
-            self._scratch.clear()
-            self._matmul_scratch.clear()
+            self._capacities.clear()
             # Communicators and registered windows outlive this context: they
             # belong to its stream, and a later context on the same stream
             # reuses them rather than issuing a bootstrap its peers have no

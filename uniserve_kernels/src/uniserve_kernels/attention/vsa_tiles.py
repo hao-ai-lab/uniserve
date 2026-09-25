@@ -117,8 +117,11 @@ if triton is not None:
         scores,
         prefix_key_indices,
         dense_key_indices,
+        prefix_count,
+        valid_sizes,
         block_indices,
         block_counts,
+        query_tile_offset: tl.constexpr,
         score_stride_head: tl.constexpr,
         score_stride_row: tl.constexpr,
         index_stride_head: tl.constexpr,
@@ -137,15 +140,18 @@ if triton is not None:
     ):
         """Write one query tile's key-tile list and count for one head.
 
-        A prefix query tile attends densely to every valid key tile. A video
-        query tile attends to the dense prefix, then to ``selected`` video
-        tiles whose pooled scores clear a threshold found by interpolation
-        search. When more than ``selected`` columns clear the final threshold
-        (ties, or a bracket not yet narrowed to one score after
-        ``iterations`` steps), the lowest-indexed ones are kept, so the list
-        is deterministic but can differ from an exact top-k. A padding tile
-        attends to key tile 0 so its count stays positive. Entries past a
-        row's count are not written and keep whatever the buffer held, so
+        ``prefix_count`` holds how many leading entries of
+        ``prefix_key_indices`` are live prefix tiles; ``dense_key_indices``
+        lists those tiles followed by every video tile. A prefix query tile
+        with valid rows attends densely to that live list; one without valid
+        rows attends to key tile 0, as a padding tile does, so its count stays
+        positive. A video query tile attends to the live prefix, then to
+        ``selected`` video tiles whose pooled scores clear a threshold found
+        by interpolation search. When more than ``selected`` columns clear the
+        final threshold (ties, or a bracket not yet narrowed to one score
+        after ``iterations`` steps), the lowest-indexed ones are kept, so the
+        list is deterministic but can differ from an exact top-k. Entries past
+        a row's count are not written and keep whatever the buffer held, so
         readers must bound their reads by the count.
         """
         row = tl.program_id(0)
@@ -155,25 +161,33 @@ if triton is not None:
             block_indices + head * index_stride_head + tile * index_stride_row
         )
         count_row = block_counts + head * count_stride_head + tile
+        live = tl.load(prefix_count)
 
         if tile < local_prefix:
+            # The prefix query tile's own rows decide whether it attends.
+            occupied = tl.load(valid_sizes + query_tile_offset + tile) > 0
+            count = tl.where(occupied, live + valid_tiles - prefix_tiles, 1)
             offsets = tl.arange(0, dense_block)
             dense = tl.load(
-                dense_key_indices + offsets, mask=offsets < valid_tiles, other=0
+                dense_key_indices + offsets, mask=offsets < count, other=0
             )
-            tl.store(index_row + offsets, dense, mask=offsets < valid_tiles)
-            tl.store(count_row, valid_tiles)
+            tl.store(
+                index_row + offsets,
+                tl.where(occupied, dense, 0),
+                mask=offsets < count,
+            )
+            tl.store(count_row, count)
         elif tile < local_video:
             prefix_offsets = tl.arange(0, dense_block)
             prefix = tl.load(
                 prefix_key_indices + prefix_offsets,
-                mask=prefix_offsets < prefix_tiles,
+                mask=prefix_offsets < live,
                 other=0,
             )
             tl.store(
                 index_row + prefix_offsets,
                 prefix,
-                mask=prefix_offsets < prefix_tiles,
+                mask=prefix_offsets < live,
             )
 
             offsets = tl.arange(0, block)
@@ -222,18 +236,18 @@ if triton is not None:
                 upper_count = tl.where(enough, upper_count, count)
 
             # Selected score columns are video key tiles offset by the prefix,
-            # stored after the prefix entries and capped at the selection.
-            # The running count ranks chosen columns in column order, and the
-            # invariant above guarantees at least ``selected`` of them, so the
-            # stored count is exact.
+            # stored after the live prefix entries and capped at the
+            # selection. The running count ranks chosen columns in column
+            # order, and the invariant above guarantees at least ``selected``
+            # of them, so the stored count is exact.
             chosen = (values >= lower) & valid
             positions = tl.cumsum(chosen.to(tl.int32), axis=0) - 1
             tl.store(
-                index_row + prefix_tiles + positions,
+                index_row + live + positions,
                 (offsets + prefix_tiles).to(tl.int32),
                 mask=chosen & (positions < selected),
             )
-            tl.store(count_row, prefix_tiles + selected)
+            tl.store(count_row, live + selected)
         else:
             tl.store(index_row, 0)
             tl.store(count_row, 1)
@@ -651,8 +665,11 @@ def _write_block_map(
     scores: torch.Tensor,
     prefix_key_indices: torch.Tensor,
     dense_key_indices: torch.Tensor,
+    prefix_count: torch.Tensor,
+    valid_sizes: torch.Tensor,
     block_indices: torch.Tensor,
     block_counts: torch.Tensor,
+    query_tile_offset: int,
     local_prefix: int,
     local_video: int,
     prefix_tiles: int,
@@ -680,6 +697,9 @@ def _write_block_map(
         or block_indices.shape[2] < prefix_tiles + selected
         or not 0 <= local_prefix <= local_video <= tiles
         or (local_video > local_prefix and columns < selected)
+        or prefix_count.numel() != 1
+        or query_tile_offset < 0
+        or query_tile_offset + local_prefix > valid_sizes.numel()
     ):
         raise ValueError("sparse block map does not match its score domain")
 
@@ -690,8 +710,11 @@ def _write_block_map(
         scores,
         prefix_key_indices,
         dense_key_indices,
+        prefix_count,
+        valid_sizes,
         block_indices,
         block_counts,
+        query_tile_offset,
         int(scores.stride(0)),
         int(scores.stride(1)),
         int(block_indices.stride(0)),
@@ -720,8 +743,11 @@ def _write_block_map_custom(
     scores: torch.Tensor,
     prefix_key_indices: torch.Tensor,
     dense_key_indices: torch.Tensor,
+    prefix_count: torch.Tensor,
+    valid_sizes: torch.Tensor,
     block_indices: torch.Tensor,
     block_counts: torch.Tensor,
+    query_tile_offset: int,
     local_prefix: int,
     local_video: int,
     prefix_tiles: int,
@@ -733,8 +759,11 @@ def _write_block_map_custom(
         scores,
         prefix_key_indices,
         dense_key_indices,
+        prefix_count,
+        valid_sizes,
         block_indices,
         block_counts,
+        query_tile_offset,
         local_prefix,
         local_video,
         prefix_tiles,
@@ -748,8 +777,11 @@ def _write_block_map_fake(
     scores: torch.Tensor,
     prefix_key_indices: torch.Tensor,
     dense_key_indices: torch.Tensor,
+    prefix_count: torch.Tensor,
+    valid_sizes: torch.Tensor,
     block_indices: torch.Tensor,
     block_counts: torch.Tensor,
+    query_tile_offset: int,
     local_prefix: int,
     local_video: int,
     prefix_tiles: int,
@@ -757,8 +789,8 @@ def _write_block_map_fake(
     selected: int,
 ) -> None:
     """Declare fake-tensor mutation for the block-map custom operator."""
-    del scores, prefix_key_indices, dense_key_indices
-    del block_indices, block_counts
+    del scores, prefix_key_indices, dense_key_indices, prefix_count
+    del valid_sizes, block_indices, block_counts, query_tile_offset
     del local_prefix, local_video, prefix_tiles, valid_tiles, selected
 
 
@@ -943,9 +975,12 @@ def write_block_map(
     scores: torch.Tensor,
     prefix_key_indices: torch.Tensor,
     dense_key_indices: torch.Tensor,
+    prefix_count: torch.Tensor,
+    valid_sizes: torch.Tensor,
     block_indices: torch.Tensor,
     block_counts: torch.Tensor,
     *,
+    query_tile_offset: int,
     local_prefix: int,
     local_video: int,
     prefix_tiles: int,
@@ -955,23 +990,34 @@ def write_block_map(
     """Fill the block map of every query tile of one call.
 
     ``scores`` holds the video query rows' scores over the video key tiles,
-    ``[heads, local_video - local_prefix, video_tiles]``. Query tiles before
-    ``local_prefix`` attend to the ``valid_tiles`` dense key tiles, tiles
-    before ``local_video`` to the prefix plus ``selected`` video tiles, and
-    later tiles to one tile. ``block_indices`` is ``[heads, tiles, width]``
-    and ``block_counts`` is ``[heads, tiles]`` over the call's local query
-    tiles; key-tile identifiers index the complete key domain, with video
-    score column ``j`` written as key tile ``prefix_tiles + j``.
-    ``prefix_key_indices`` and ``dense_key_indices`` list the key tiles
-    copied into prefix and dense rows; they must hold at least
-    ``prefix_tiles`` and ``valid_tiles`` entries, which is not checked.
+    ``[heads, local_video - local_prefix, video_tiles]``. Key-tile identifiers
+    index the complete key domain, with video score column ``j`` written as
+    key tile ``prefix_tiles + j``. ``block_indices`` is ``[heads, tiles,
+    width]`` and ``block_counts`` is ``[heads, tiles]`` over the call's local
+    query tiles, the first of which is complete-domain tile
+    ``query_tile_offset``.
+
+    The dense prefix spans ``prefix_tiles`` tiles, of which the device scalar
+    ``prefix_count`` are live: ``prefix_key_indices`` lists them first, and
+    ``dense_key_indices`` lists them followed by every video tile. Prefix
+    tiles without valid rows are listed by neither, so no query spends work
+    on them. Query tiles before ``local_prefix`` attend to the live dense
+    list when ``valid_sizes`` gives them valid rows and to key tile 0
+    otherwise; tiles before ``local_video`` attend to the live prefix plus
+    ``selected`` video tiles; later tiles attend to key tile 0. The index
+    tables must hold at least ``prefix_tiles`` and ``valid_tiles`` entries,
+    which is not checked; the counts ``prefix_tiles`` and ``valid_tiles``
+    bound what a row can hold.
     """
     _write_block_map_custom(
         scores,
         prefix_key_indices,
         dense_key_indices,
+        prefix_count,
+        valid_sizes,
         block_indices,
         block_counts,
+        int(query_tile_offset),
         int(local_prefix),
         int(local_video),
         int(prefix_tiles),

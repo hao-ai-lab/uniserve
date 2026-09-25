@@ -19,7 +19,7 @@ class _Operator(BaseOperator):
         super().__init__(*args, **kwargs)
         scratch = self.workspace["scratch"]
         self._state = _flashinfer.SparseExecutionState(
-            workspaces={scratch.device: scratch}
+            workspaces={scratch.device: scratch}, transient=self.transient
         )
 
     def __call__(self, q, k, v, batch, *, scale, out):
@@ -34,7 +34,7 @@ class _Operator(BaseOperator):
             scale=scale,
         )
         _flashinfer._fill_flattened_bsr(
-            plan, batch.block_indices, batch.valid_sizes
+            plan, batch.block_indices, batch.block_counts, batch.valid_sizes
         )
 
         # Equal Q/K extents share one packed row domain; unequal extents need

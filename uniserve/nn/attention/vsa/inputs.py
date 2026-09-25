@@ -11,9 +11,12 @@ import torch
 class Pattern:
     """Immutable selection cardinalities, independent of mutable selected IDs.
 
-    Counts describe either one shared head or every head. A dense prefix has
-    exactly the keys ``range(dense_key_tiles)``. Backends may specialize this
-    declared mathematical domain without inspecting device data on the host.
+    Counts describe either one shared head or every head. Each bounds its
+    query tile's key tiles: the block map's device counts, which backends
+    read, may be lower where prefix key tiles hold no valid rows. A dense
+    prefix has at most the keys ``range(dense_key_tiles)``. Backends may
+    specialize this declared mathematical domain without inspecting device
+    data on the host.
     """
 
     row_counts: tuple[tuple[int, ...], ...]
@@ -115,6 +118,15 @@ class BlockInput:
 class Input:
     """Dense tile-64 prefix and video domains that selection and compression
     share.
+
+    The dense prefix spans ``prefix_tiles`` tiles, but a prefix tile may hold
+    no valid rows, as when a text region has capacity for a longer prompt.
+    ``prefix_count`` (int32 device scalar) counts the live prefix tiles, those
+    with valid rows; ``prefix_key_indices`` lists them first, and
+    ``dense_key_indices`` lists them followed by every video tile. Entries
+    past the live ones are unread. Every static count here is an upper bound
+    that fixes shapes; the device tables fix which tiles attend, so one
+    captured call serves every validity pattern of its domain.
     """  # noqa: D205
 
     padded_tokens: int
@@ -159,11 +171,13 @@ class Input:
         selected_tiles: int,
         query_tile_offset: int = 0,
     ) -> Pattern:
-        """Key-tile counts per query tile for a window of the token domain.
+        """Key-tile count bounds per query tile for a window of the domain.
 
-        Prefix query tiles see every dense key tile; video query tiles see the
-        dense prefix plus their selected video tiles; trailing padding tiles
-        attend to a single tile so their count stays positive.
+        Prefix query tiles see at most every dense key tile; video query
+        tiles see at most the dense prefix plus their selected video tiles;
+        trailing padding tiles attend to a single tile so their count stays
+        positive. The block map's device counts never exceed these; they are
+        lower where prefix tiles are empty.
         """
         if (
             not 1 <= selected_tiles <= self.video_tiles

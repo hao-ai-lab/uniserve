@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 import torch
@@ -10,6 +10,8 @@ from uniserve_kernels.attention.vsa_rows import (
     compose_attention,
     pack_sparse_input_rows,
 )
+
+from uniserve.tensors import BufferConfig
 
 _TILE = 64
 
@@ -22,9 +24,12 @@ class _Rows:
     """
 
     fine_attention: Callable[..., object]
-    plans: dict[
-        tuple[object, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    ] = field(default_factory=dict)
+    # Lends the owning context's shared per-call work areas, or ``None`` to
+    # allocate them per plan.
+    transient: Callable[..., Mapping[str, torch.Tensor]] | None = None
+    # Owner-local query tile map per signature; it depends on the shape
+    # alone, so it outlives every call of that shape.
+    plans: dict[tuple[object, ...], torch.Tensor] = field(default_factory=dict)
 
     def prepare(
         self,
@@ -110,8 +115,8 @@ class _Rows:
                 chunk_rows,
                 mask_block_indices.shape[-1],
             )
-            plan = self.plans.get(signature)
-            if plan is None:
+            selected = self.plans.get(signature)
+            if selected is None:
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError(
                         "prepare VSA query intervals before graph capture"
@@ -127,22 +132,27 @@ class _Rows:
                     tiles += start // _TILE + local % (count // _TILE)
                     segment_tiles.append(tiles)
                 selected = torch.cat(segment_tiles).to(device=query.device)
-                plan = (
-                    selected,
-                    torch.empty(
-                        (heads, rows // _TILE, mask_block_indices.shape[-1]),
-                        device=query.device,
-                        dtype=torch.int32,
-                    ),
-                    torch.empty(
-                        (heads, rows // _TILE),
-                        device=query.device,
-                        dtype=torch.int32,
-                    ),
-                )
-                self.plans[signature] = plan
+                self.plans[signature] = selected
 
-            selected, indices, counts = plan
+            # The reordered block maps are read only by this launch, which
+            # the stream orders before any later call rewrites them.
+            requirements = {
+                "indices": BufferConfig(
+                    (heads, rows // _TILE, mask_block_indices.shape[-1]),
+                    torch.int32,
+                ),
+                "counts": BufferConfig((heads, rows // _TILE), torch.int32),
+            }
+            if self.transient is None:
+                maps = {
+                    name: torch.empty(
+                        config.shape, dtype=config.dtype, device=query.device
+                    )
+                    for name, config in requirements.items()
+                }
+            else:
+                maps = self.transient("vsa_rows", requirements, query.device)
+            indices, counts = maps["indices"], maps["counts"]
             torch.index_select(mask_block_indices, 1, selected, out=indices)
             torch.index_select(mask_block_count, 1, selected, out=counts)
             output = attention_output.view(-1)[: rows * heads * width]
