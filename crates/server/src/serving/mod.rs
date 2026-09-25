@@ -58,7 +58,7 @@ pub use input::{
 };
 pub use model::{
     InputProcessor, ModelSupport, ServedEndpoint, ServedFeature, ServedModality,
-    ServedSamplingControl, WorkerCapabilities,
+    ServedSamplingControl, WorkerCapabilities, default_video_seconds,
 };
 
 use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, Qwen3ChatOutputProcessor};
