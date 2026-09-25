@@ -252,12 +252,15 @@ fn stride_resize(
 
 /// Scales both dimensions and rounds them to positive stride multiples.
 ///
-/// Each rounding is half-to-even, the tie rule of Python's `round`, which the
-/// worker's `_stride_shape` uses.
+/// Each edge is rounded once, from the unrounded scaled length straight to
+/// the nearest stride multiple, as the worker's `_stride_shape` does; rounding
+/// the scaled length to whole pixels first moves an edge within half a pixel
+/// of an odd half-stride to the other multiple. Ties round half-to-even, the
+/// rule of Python's `round`.
 fn scale_to_stride(width: u32, height: u32, scale: f64, stride: u32) -> (u32, u32) {
     let scale_one = |value: u32| {
-        let scaled = (f64::from(value) * scale).round_ties_even();
-        let aligned = (scaled / f64::from(stride)).round_ties_even() * f64::from(stride);
+        let aligned =
+            (f64::from(value) * scale / f64::from(stride)).round_ties_even() * f64::from(stride);
         stride.max(aligned.max(f64::from(stride)) as u32)
     };
     (scale_one(width), scale_one(height))

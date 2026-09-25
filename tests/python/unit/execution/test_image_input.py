@@ -2,6 +2,8 @@
 
 import base64
 import io
+import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -14,6 +16,8 @@ from uniserve.processing import (
     StrideResize,
     TowerTransform,
 )
+from uniserve_models import bagel, siglip
+from uniserve_models.bagel import vae
 from uniserve_worker.model_executor.image_inputs import (
     prepare_image,
     prepare_tensor_image,
@@ -21,6 +25,13 @@ from uniserve_worker.model_executor.image_inputs import (
 from uniserve_worker.protocol.call import MediaCall
 
 pytestmark = pytest.mark.unit
+
+# Resize cases shared with the server's Bagel KV-token prediction test.
+_BAGEL_RESIZE_CASES = json.loads(
+    (
+        Path(__file__).parents[2] / "fixtures" / "bagel_image_resize.json"
+    ).read_text()
+)["cases"]
 
 
 @pytest.mark.parametrize("normalization", ("signed_unit", "imagenet"))
@@ -119,3 +130,53 @@ def test_image_sources_preserve_the_same_model_canvas(kind):
         == resident.pixels.shape
         == (3, expected_size, expected_size)
     )
+
+
+def _bagel_processor() -> ImageProcessor:
+    """Build BAGEL's image processor at the published vision tower size."""
+    config = bagel.Config(
+        bagel.TransformerConfig(
+            32, 48, 2, 4, 2, 37, 1e-6, 1_000_000.0, 8, True, 64
+        ),
+        siglip.Config(14, 980, 3, siglip.TransformerConfig(32, 4, 48, 1, 1e-6)),
+        vae.Config(8, 3, 2, 32, 3, (1, 1), 1, 2, 0.5, 0.25),
+        35,
+        36,
+        2,
+        64,
+        1.0,
+        "gelu_pytorch_tanh",
+    )
+    return bagel.image_processor(config)
+
+
+@pytest.mark.parametrize(
+    "case",
+    _BAGEL_RESIZE_CASES,
+    ids=lambda case: f"{case['width']}x{case['height']}",
+)
+def test_bagel_resize_matches_the_shared_fixture(case):
+    encoded = io.BytesIO()
+    Image.new("RGB", (case["width"], case["height"]), (90, 120, 150)).save(
+        encoded, format="PNG"
+    )
+    payload = base64.b64encode(encoded.getvalue()).decode()
+    processor = _bagel_processor()
+
+    # Both encoders stage the VAE canvas; the ViT tower resizes it again.
+    for kind, tower in (
+        (MediaCall.LATENT_ENCODING, "vae"),
+        (MediaCall.VISION_ENCODING, "vit"),
+    ):
+        result = prepare_image(
+            processor, kind, payload, device=torch.device("cpu")
+        )
+        assert (result.height, result.width) == (
+            case["vae_height"],
+            case["vae_width"],
+        )
+        assert tuple(result.pixels.shape) == (
+            3,
+            case[f"{tower}_height"],
+            case[f"{tower}_width"],
+        )
