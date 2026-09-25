@@ -432,6 +432,90 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
     assert_eq!(second_images, 1);
 }
 
+/// Image requests waiting for the one flow-prefix request row do not starve
+/// the younger request that holds it.
+///
+/// With four request slots, three requests run and one row is left for a
+/// multi-branch guidance prefix. The younger request 3 has a short prompt, so
+/// it reaches denoising first and takes that row while the older requests 1
+/// and 2 are still prefilling their chunked prompts. When those reach
+/// denoising, neither can allocate a prefix until request 3 finishes and
+/// releases the row. One denoising step costs 1024 latent units times two
+/// guidance branches, so the two waiting requests together cost the whole
+/// pass budget. At queue depth one every step of request 3 resolves before
+/// its next step is planned, so each pass finds the denoiser free and tries
+/// the older requests first.
+#[test]
+fn flow_prefix_holder_progresses_while_older_images_wait() {
+    const STEPS: u16 = 12;
+
+    let mut sim = SimEngine::new();
+    sim.set_queue_depth(1);
+    sim.mut_info_for_test().request_slots = 4;
+    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
+    scheduler.set_token_budget(4096);
+    scheduler.set_long_prefill_threshold(64);
+    assert_eq!(scheduler.config().max_num_seqs, 3);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let thread = thread::spawn(move || scheduler.run(rx));
+
+    let image = ImageParams {
+        steps: STEPS,
+        ..Default::default()
+    };
+    assert_eq!(image.cfg_branch_count(), 2);
+    let long_prompt: Vec<u32> = (0..640).map(|index| 10 + index % 500).collect();
+    let prompts = [
+        (RequestId(1), long_prompt.clone()),
+        (RequestId(2), long_prompt),
+        (RequestId(3), vec![4, 5, 6]),
+    ];
+    let mut receivers = Vec::new();
+    for (id, prompt) in prompts {
+        let events = handle
+            .submit(generation_request(
+                id,
+                text_input(prompt),
+                SamplingParams::default(),
+                image.clone(),
+                GenerationConstraint::GenOnly,
+                0,
+            ))
+            .unwrap();
+        receivers.push((id, events));
+    }
+
+    let mut reasons = HashMap::new();
+    let mut images = HashMap::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while reasons.len() < receivers.len() && Instant::now() < deadline {
+        for (id, receiver) in receivers.iter_mut() {
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    EngineCoreOutput::ImageDone { .. } => *images.entry(*id).or_insert(0) += 1,
+                    EngineCoreOutput::Finished { reason, .. } => {
+                        reasons.insert(*id, reason);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    handle.shutdown();
+    let _ = thread.join();
+
+    for (id, _) in &receivers {
+        assert_eq!(
+            reasons.get(id),
+            Some(&FinishReason::ImageDone),
+            "request {id:?} did not finish its image"
+        );
+        assert_eq!(images.get(id), Some(&1));
+    }
+}
+
 /// Image generation exposes every declared denoise step in order before one committed image and terminal completion.
 #[test]
 fn image_events_cover_declared_denoise_steps() {
