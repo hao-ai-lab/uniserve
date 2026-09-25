@@ -181,7 +181,7 @@ The first startup compiles the native GPU providers and captures shapes on first
 
 ## Generate a video
 
-Only `model`, `prompt`, `seconds`, and `seed` are accepted, as JSON or as `multipart/form-data`. `seconds` is a finite number of seconds from 4 to 15 inclusive, fractional values included; it defaults to 5, and `seed` defaults to 0. `--max-video-seconds` sets the deployment's capacity within that range (default 15); a request longer than the capacity is rejected, and `GET /v1/capabilities` reports the capacity as `max_seconds` next to the API range `min_seconds` and `model_max_seconds`.
+Only `model`, `prompt`, `seconds`, and `seed` are accepted, as JSON or as `multipart/form-data`. `seconds` is a finite number of seconds from 4 to 15 inclusive, fractional values included; it defaults to 5 seconds, or to `--max-video-seconds` when that is shorter, and `seed` defaults to 0. `--max-video-seconds` sets the deployment's capacity within that range (default 15); a request longer than the capacity is rejected, and `GET /v1/capabilities` reports the capacity as `max_seconds` next to the API range `min_seconds` and `model_max_seconds`.
 
 ```bash
 curl --fail-with-body --max-time 600 \
