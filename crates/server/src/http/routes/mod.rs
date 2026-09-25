@@ -121,10 +121,11 @@ async fn enforce_timeout(timeout: Duration, request: Request, next: Next) -> Res
 ///
 /// Each `layer` call wraps everything added before it, so a request passes the
 /// layers in this order: API-key check (when a key is configured), request-ID
-/// header (when enabled), body-size limit, tracing, HTTP metrics, load
-/// tracking, request timeout (when configured), then the handler. Consequences
-/// of this order: `401` responses carry no `X-Request-Id` and are not counted in
-/// HTTP metrics, while `503` load-shedding and `504` timeout responses are.
+/// resolution (which also sets the `X-Request-Id` response header when
+/// enabled), body-size limit, tracing, HTTP metrics, load tracking, request
+/// timeout (when configured), then the handler. Consequences of this order:
+/// `401` responses carry no `X-Request-Id` and are not counted in HTTP
+/// metrics, while `503` load-shedding and `504` timeout responses are.
 pub fn build_router(state: Arc<AppState>) -> Router {
     let enable_request_id_headers = state.enable_request_id_headers();
     let request_timeout = state.request_timeout();
@@ -156,17 +157,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         }));
     }
 
+    // The request-ID layer is unconditional: every generation handler reads
+    // the `RequestId` it resolves.
     let mut router = router
         .layer(from_fn_with_state(state, middleware::track_server_load))
         .layer(from_fn(middleware::track_http_metrics))
         .layer(TraceLayer::new_for_http())
         // Sets the limit that axum's body extractors (`Json`, `Multipart`)
         // apply; it does not cap bodies read by other means.
-        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(from_fn(move |request: Request, next: Next| {
+            middleware::resolve_request_id(enable_request_id_headers, request, next)
+        }));
 
-    if enable_request_id_headers {
-        router = router.layer(from_fn(middleware::set_request_id_header));
-    }
     if api_key.is_some() {
         router = router.layer(from_fn(move |request: Request, next: Next| {
             require_api_key(api_key.clone(), request, next)
