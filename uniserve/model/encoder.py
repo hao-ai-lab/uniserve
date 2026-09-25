@@ -56,6 +56,62 @@ class Encoder(nn.Module, Generic[InputT]):
         return tuple(result[index] for index in range(len(inputs)))
 
 
+class TextConditioner(Encoder[tuple[torch.Tensor, ...]]):
+    """Refine the feature rows of text samples, padded or exact.
+
+    ``encode`` takes ``[rows, width]`` samples. Without ``lengths`` every row
+    is text, and samples of equal shape are refined together. With
+    ``lengths``, an int32 device tensor holding each sample's text row count,
+    every sample has the same shape and holds its text in its leading rows.
+    Rows past a sample's length are padding: they may hold any finite
+    values, and the network keeps every text row's output independent of
+    them, as masking them out of attention does. Padding every text length
+    to a shared row count lets one prepared or captured call serve all of
+    them; the outputs of padding rows are unspecified. The network receives
+    stacked samples ``[samples, rows, width]`` and their lengths or None.
+    """
+
+    def encode(
+        self,
+        inputs: tuple[torch.Tensor, ...],
+        *,
+        lengths: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...] | None:
+        if any(value.ndim != 2 for value in inputs):
+            raise ValueError("text conditioning samples are [rows, width]")
+        if lengths is None:
+            groups: defaultdict[torch.Size, list[int]] = defaultdict(list)
+            for index, value in enumerate(inputs):
+                groups[value.shape].append(index)
+        else:
+            if (
+                lengths.shape != (len(inputs),)
+                or lengths.dtype != torch.int32
+                or any(value.shape != inputs[0].shape for value in inputs)
+            ):
+                raise ValueError(
+                    "padded text conditioning requires samples of one shape "
+                    "and one int32 length per sample"
+                )
+            groups = defaultdict(
+                list, {inputs[0].shape: list(range(len(inputs)))}
+            )
+
+        result: dict[int, torch.Tensor] = {}
+        for indices in groups.values():
+            values = self.network(
+                torch.stack(tuple(inputs[index] for index in indices)),
+                lengths,
+            )
+            if values.shape[0] != len(indices):
+                raise ValueError(
+                    "encoder network must preserve the sample dimension"
+                )
+            for index, value in zip(indices, values.unbind(), strict=True):
+                result[index] = value
+        return tuple(result[index] for index in range(len(inputs)))
+
+
 class PatchEncoder(Encoder[VisionInput]):
     """Pack image samples and split their spatially downsampled features.
 

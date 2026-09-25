@@ -4,7 +4,9 @@ The ``Conditioner`` projects the text encoder's Qwen hidden states to the
 denoiser width and refines each prompt with dense bidirectional attention.
 It runs once per request through the denoiser's ``conditioner.encode``
 entry; the worker retains the result and supplies it to every denoising
-step as ``DenoiserInput.text_features``.
+step as ``DenoiserInput.text_features``. A prompt may be padded to a row
+capacity (``TextConditioner``): its padding rows are masked out of every
+attention, so they never reach the prompt's rows.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import torch
 from torch import nn
 
 from uniserve.loading import weights
-from uniserve.model import Encoder
+from uniserve.model import TextConditioner
 from uniserve.nn import (
     ColumnParallelLinear,
     GatedMLP,
@@ -64,8 +66,12 @@ class RefinerBlock(nn.Module):
         )
         self.mlp = GatedMLP(config.hidden_size, config.intermediate_size)
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # hidden is [batch, tokens, hidden_size]; one document per batch row.
+        # ``mask`` is a [batch, 1, 1, tokens] boolean of the keys each
+        # document's queries attend to, or None when every row is text.
         batch, tokens, _ = hidden.shape
         projections = self.qkv(self.norms[0](hidden))
         q, k, v = (
@@ -78,7 +84,7 @@ class RefinerBlock(nn.Module):
             q.transpose(1, 2),  # [batch, heads, tokens, head_dim]
             k.transpose(1, 2),
             v.transpose(1, 2),
-            DenseInput(causal=False, mask=None),
+            DenseInput(causal=False, mask=mask),
         )
         hidden = hidden + self.output(
             attended.transpose(1, 2).reshape(batch, tokens, -1)
@@ -97,33 +103,39 @@ class TokenRefiner(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, config.norm_eps)
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden: torch.Tensor, lengths: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Refine ``[documents, rows, text_dim]`` features.
+
+        ``lengths`` holds each document's text rows as int32; the rows past
+        it are masked out as keys, so every text row's output ignores them.
+        """
+        mask = None
+        if lengths is not None:
+            rows = torch.arange(hidden.shape[1], device=hidden.device)
+            mask = (rows < lengths.unsqueeze(1)).view(hidden.shape[0], 1, 1, -1)
         hidden = self.input(hidden.to(self.input.weight.dtype))
         for block in self.blocks:
-            hidden = block(hidden)
+            hidden = block(hidden, mask)
         return self.norm(hidden)
 
 
-class Conditioner(Encoder[tuple[torch.Tensor, ...]]):
-    """Batch equal-length documents through one learned conditioning projection.
+class Conditioner(TextConditioner):
+    """Refine documents, padded to one row count, through the text refiner.
 
-    The public refiner is the numerical module in the projection sequence;
-    neither property registers a second copy of its parameters. Encoder owns
-    homogeneous batching and restores the caller's sample order.
+    ``TextConditioner`` owns homogeneous batching, the padding contract and
+    the caller's sample order.
     """
 
-    network: nn.Sequential
+    network: TokenRefiner
 
     def __init__(self, config: TransformerConfig):
-        super().__init__(nn.Sequential(TokenRefiner(config)))
-
-    @property
-    def projection(self) -> nn.Sequential:
-        return self.network
+        super().__init__(TokenRefiner(config))
 
     @property
     def refiner(self) -> TokenRefiner:
-        return cast(TokenRefiner, self.network[0])
+        return self.network
 
 
 def assignments(model: Conditioner, reader):

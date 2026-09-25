@@ -47,6 +47,7 @@ from uniserve.model import (
     Denoiser,
     ImageDenoiser,
     PatchEncoder,
+    TextConditioner,
     TextEncoder,
     TextSize,
     VideoDecoder,
@@ -266,6 +267,9 @@ class ModelExecutor:
         self._runner_types = {}
         self._calls_by_kind = defaultdict(list)
         self._module_entries: OrderedDict[tuple, ModelRunner] = OrderedDict()
+        # Keys of the module entries prepared during startup, which stay
+        # resident.
+        self._startup_modules: set[tuple] = set()
         self._module_streams: dict[tuple[str, str, str], CUDAStream] = {}
 
         self._lane_streams: list[tuple[LaneConfig | None, CUDAStream]] = []
@@ -388,16 +392,20 @@ class ModelExecutor:
     def prepare_module(self, name, size, *, method=None):
         """Prepare one exact numerical size before dependent media calls.
 
-        Prepared contexts are kept in an LRU per (entry, path, method), keyed
-        by the input signature of ``size``; when the residency bound, the
-        request pool size, is reached, the least recently used context and the
-        graphs that borrow it are retired. Returns the prepared runner.
+        Prepared contexts are keyed by the input signature of ``size`` per
+        (entry, path, method). Contexts prepared during startup stay resident
+        for the worker's lifetime; the ones prepared while serving are kept
+        in an LRU whose bound is the request pool size, and reaching it
+        retires the least recently used context and the graphs that borrow
+        it. Returns the prepared runner.
         """
         binding, call = self._module_call(name, method)
         key = (name, call.path, call.entry_point.method, input_signature(size))
         if key not in self._module_entries:
             resident = tuple(
-                value for value in self._module_entries if value[:3] == key[:3]
+                value
+                for value in self._module_entries
+                if value[:3] == key[:3] and value not in self._startup_modules
             )
             if len(resident) >= self.worker_config.max_request_pool_size:
                 self._retire_module(resident[0])
@@ -442,6 +450,8 @@ class ModelExecutor:
 
             # An entry prepared while serving never captures.
             entry._startup_complete = self._startup_complete
+            if not self._startup_complete:
+                self._startup_modules.add(key)
             self._module_entries[key] = entry
 
         self._module_entries.move_to_end(key)
@@ -622,6 +632,7 @@ class ModelExecutor:
         The entry's stream is drained first, so no queued work still uses
         what the entry releases.
         """
+        self._startup_modules.discard(key)
         entry = self._module_entries.pop(key)
         if entry.context.stream is not None:
             entry.context.stream.synchronize()
@@ -646,12 +657,14 @@ class ModelExecutor:
             return "latent"
         return "conditioning"
 
-    def run_encoder(self, kind, *values):
+    def run_encoder(self, kind, *values, **options):
         """Run this rank's encoder of ``kind``.
 
         ``kind`` is ``"text"``, ``"vision"``, ``"latent"`` or
-        ``"conditioning"`` (see ``encoder_kinds``). Raises ``InputError``
-        unless exactly one bound encoder has that kind.
+        ``"conditioning"`` (see ``encoder_kinds``); ``options`` are the
+        encoder's keyword inputs, such as a ``TextConditioner``'s
+        ``lengths``. Raises ``InputError`` unless exactly one bound encoder
+        has that kind.
         """
         found = [
             (name, call)
@@ -675,7 +688,110 @@ class ModelExecutor:
             if kind == "text"
             else tuple(value.shape for value in inputs)
         )
-        return self.run_module(name, inputs, method="encode", size=size)
+        return self.run_module(
+            name, inputs, method="encode", size=size, **options
+        )
+
+    def _text_capacity(self, num_tokens: int) -> int:
+        """Rows a text of ``num_tokens`` tokens is padded to before encoding.
+
+        A worker with a media builder encodes every text in the smallest
+        text capacity of its denoiser layouts that holds it, the rows
+        startup prepared; any other worker encodes exact lengths.
+        """
+        builder = self.media_builder
+        if builder is None:
+            return num_tokens
+        return min(
+            capacity
+            for capacity in builder.text_capacities
+            if capacity >= num_tokens
+        )
+
+    def encode_text(self, token_ids) -> ExecutionOutput:
+        """Encode one prompt's tokens at its text capacity.
+
+        The tokens are followed by padding up to ``_text_capacity``. The text
+        encoder attends causally, so the padding never reaches the prompt's
+        rows, whose features are returned.
+        """
+        count = len(token_ids)
+        capacity = self._text_capacity(count)
+        # Token 0 fills the padding; any vocabulary token serves.
+        tokens = self.prepare_text_tokens(
+            (*token_ids, *(0,) * (capacity - count))
+        )
+        result = self.run_encoder("text", tokens)
+        return replace(
+            result, values=tuple(value[:count] for value in result.values)
+        )
+
+    def encode_conditioning(self, features: torch.Tensor) -> ExecutionOutput:
+        """Refine one prompt's ``[tokens, width]`` text features.
+
+        A ``TextConditioner`` refines them in the prompt's text capacity,
+        with the padding rows masked out, and returns the prompt's rows; any
+        other conditioning encoder refines the exact rows.
+        """
+        found = [
+            call.module
+            for (_, _, method), (_, call) in self._module_calls.items()
+            if method == "encode"
+            and self._encoder_kind(call.module) == "conditioning"
+        ]
+        count = features.shape[0]
+        capacity = self._text_capacity(count)
+        if not isinstance(found[0] if found else None, TextConditioner):
+            return self.run_encoder("conditioning", features)
+        padded = features.new_zeros((capacity, *features.shape[1:]))
+        padded[:count].copy_(features)
+        lengths = torch.full(
+            (1,), count, dtype=torch.int32, device=features.device
+        )
+        result = self.run_encoder("conditioning", padded, lengths=lengths)
+        return replace(
+            result, values=tuple(value[:count] for value in result.values)
+        )
+
+    @torch.inference_mode()
+    def prepare_text_capacities(self) -> None:
+        """Prepare the text path at every text capacity before serving.
+
+        A placeholder prompt filling each capacity, the largest first, runs
+        through this rank's text encoder and conditioning encoder, which
+        prepares their contexts and, while graphs may be captured, their
+        graphs. Every admitted prompt is padded to one of these capacities,
+        so serving finds its text path prepared. Collective across each
+        encoder's ranks.
+        """
+        builder = self.media_builder
+        kinds = self.encoder_kinds
+        if builder is None or not kinds & {"text", "conditioning"}:
+            return
+        # The conditioning encoder refines the text encoder's features.
+        text = capability(self.model, TextEncoder)
+        for capacity in reversed(builder.text_capacities):
+            if "text" in kinds:
+                self.encode_text((0,) * capacity)
+            if "conditioning" in kinds and text is not None:
+                name = next(
+                    name
+                    for (name, _, method), (_, call) in (
+                        self._module_calls.items()
+                    )
+                    if method == "encode"
+                    and self._encoder_kind(call.module) == "conditioning"
+                )
+                layout = text.output_layout(
+                    capacity, getattr(torch, self.worker_config.model_dtype)
+                )["conditioning"]
+                self.encode_conditioning(
+                    torch.zeros(
+                        layout.shape,
+                        dtype=layout.dtype,
+                        device=self.bindings[name].device,
+                    )
+                )
 
     @torch.inference_mode()
     def run_module(self, name, *args, method=None, size=None, **kwargs):
@@ -1187,6 +1303,7 @@ class ModelExecutor:
             )
 
             prepare_denoising(self, storage)
+            self.prepare_text_capacities()
             warmup_decoders(self)
             warmup_postprocess(self, storage)
         self.synchronize()
@@ -1379,8 +1496,12 @@ class ModelExecutor:
         runner = self.prepare_module(
             name, TextSize(len(tokens), 1), method="encode"
         )
+        # The token buffer holds the longest prompt at its text capacity.
         return runner.prepare_tokens(
-            tokens, capacity=self.worker_config.max_sequence_tokens
+            tokens,
+            capacity=self._text_capacity(
+                self.worker_config.max_sequence_tokens
+            ),
         )
 
     @contextmanager

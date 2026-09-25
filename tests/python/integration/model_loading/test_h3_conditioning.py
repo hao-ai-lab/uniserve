@@ -107,6 +107,24 @@ def test_conditioning_loader_preserves_variable_documents(tmp_path, dtype):
             result, value, rtol=tolerance[0], atol=tolerance[1]
         )
 
+    # Documents padded to one row count, with large values in their padding
+    # rows, refine their text rows as the unpadded documents do.
+    padded = torch.randn(len(features), 10, config.text_dim, dtype=dtype) * 100
+    for index, value in enumerate(features):
+        padded[index, : value.shape[0]] = value
+    lengths = torch.tensor(
+        [value.shape[0] for value in features], dtype=torch.int32
+    )
+    with torch.no_grad():
+        refined = model.encode(tuple(padded.unbind()), lengths=lengths)
+    for value, result in zip(expected, refined, strict=True):
+        torch.testing.assert_close(
+            result[: value.shape[0]],
+            value,
+            rtol=tolerance[0],
+            atol=tolerance[1],
+        )
+
 
 def test_timestep_projection_preserves_both_modality_coordinates():
     config = _config()

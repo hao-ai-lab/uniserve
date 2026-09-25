@@ -104,11 +104,7 @@ def text(
             "text encoder outputs must declare conditioning tensors"
         )
 
-    tokens = model_runner.prepare_text_tokens(admission.prompt_token_ids)
-    result = model_runner.run_encoder(
-        "text",
-        tokens,
-    )
+    result = model_runner.encode_text(admission.prompt_token_ids)
     if len(result.values) != len(call.outputs):
         raise invalid_descriptor(
             "text encoder output declarations disagree with the loaded entry"
