@@ -36,11 +36,13 @@ if TYPE_CHECKING:
 class PendingResponse:
     """An IPC correlation envelope and its optional execution handle.
 
-    ``submission`` is None for responses that are complete when accepted:
-    INFO replies and admission errors.
+    ``kind`` is the kind field of the request the response answers, as
+    received, which a failure log names. ``submission`` is None for responses
+    that are complete when accepted: INFO replies and admission errors.
     """
 
     response: dict[str, Any]
+    kind: object
     submission: Submission | None = None
 
 
@@ -119,25 +121,31 @@ class Service:
                 gc.enable()
 
     def _error(
-        self, request: dict[str, Any], error: BaseException
+        self,
+        kind: object,
+        correlation: dict[str, Any],
+        error: BaseException,
     ) -> dict[str, Any]:
-        """Log a failure and encode it as an error response.
+        """Log a failed ``kind`` request and encode it as an error response.
 
-        ``request`` may be a request or a pending response envelope; either
-        supplies the ``message_id`` that correlates the error. Errors that are
-        not already `WorkerError` are classified and logged as unexpected.
+        ``correlation`` is the request or its pending response envelope;
+        either supplies the ``message_id`` that correlates the error. Errors
+        that are not already `WorkerError` are classified and logged as
+        unexpected.
         """
         classified = (
             error
             if isinstance(error, WorkerError)
-            else classify(error, context=str(request.get("kind", "unknown")))
+            else classify(
+                error, context="unknown" if kind is None else str(kind)
+            )
         )
         record_failure(
-            request.get("kind"),
+            kind,
             classified,
             unexpected=not isinstance(error, WorkerError),
         )
-        return messages.error_response(classified, request)
+        return messages.error_response(classified, correlation)
 
     def _accept(self, request: dict[str, Any]) -> None:
         """Admit one request, queueing its response envelope.
@@ -173,11 +181,18 @@ class Service:
                 response = messages.response(ResponseKind.RESULT)
             self._pending.append(
                 PendingResponse(
-                    messages.with_message_id(response, request), submission
+                    messages.with_message_id(response, request),
+                    request.get("kind"),
+                    submission,
                 )
             )
         except BaseException as error:
-            self._pending.append(PendingResponse(self._error(request, error)))
+            self._pending.append(
+                PendingResponse(
+                    self._error(request.get("kind"), request, error),
+                    request.get("kind"),
+                )
+            )
 
     def _send_ready(self) -> bool:
         """Send the first ready pending response, if any.
@@ -199,7 +214,9 @@ class Service:
                         continue
                     response["result"] = result
                 except BaseException as error:
-                    response = self._error(response, error)
+                    # The error answers the request, so it is logged under
+                    # the request's kind rather than the envelope's.
+                    response = self._error(pending.kind, response, error)
 
             self._pending.remove(pending)
             with profile_range(
