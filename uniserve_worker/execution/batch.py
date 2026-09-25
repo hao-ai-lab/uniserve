@@ -266,6 +266,16 @@ class BatchState:
         return int(self.batch.batch_id)
 
     @property
+    def route(self) -> str | None:
+        """The call kind every call executes, which failures report as route.
+
+        None for a lifecycle-only batch, which has no calls and so no
+        execution route.
+        """
+        calls = self.batch.calls
+        return calls[0].kind.value if calls else None
+
+    @property
     def request_ids(self) -> frozenset[int]:
         """Ids of every request the batch's admissions, calls or commands name.
 

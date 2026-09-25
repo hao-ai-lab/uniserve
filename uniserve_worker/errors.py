@@ -123,7 +123,11 @@ class WorkerError(Exception):
 
     Attributes:
         phase: Worker phase that failed, such as ``"batch registration"``.
-        route: Execution route that failed.
+        route: Call kind of the failed batch, such as ``"prefill"``, or the
+            forward mode of the failed numerical call within it. None when
+            the failure belongs to no batch with calls: an undecodable
+            request, a submission refused at admission, or a lifecycle-only
+            batch.
         calls: Affected calls as ``(engine_id, request_id, request_epoch,
             call_id)`` tuples.
     """
