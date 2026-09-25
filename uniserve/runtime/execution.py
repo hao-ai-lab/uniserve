@@ -62,6 +62,69 @@ def _representation(module, inherited):
     return inherited
 
 
+class Scratch:
+    """Role-keyed transient work areas for calls serialized on one stream.
+
+    A role names storage whose contents one call writes before reading and
+    no later call reads, so every call site, size and context borrowing a
+    role from one ``Scratch`` can share one backing, provided their calls
+    run one after another: contexts sharing a ``Scratch`` execute on the same
+    stream (without one, the same device's current stream from one thread).
+    A backing is allocated at the first request's shapes; a later request
+    whose every extent fits borrows compact leading views of it, and a
+    larger one allocates a new backing outside capture. Earlier backings stay
+    alive for the views and graphs that address them, so callers evaluating
+    several sizes prepare the largest first.
+    """
+
+    def __init__(self):
+        # Backings by (role, device, requirement schema), largest first.
+        self._backings: dict[tuple[object, ...], list[TensorBuffers]] = {}
+
+    def view(
+        self,
+        role: object,
+        requirements: Mapping[str, BufferConfig],
+        device: torch.device,
+    ) -> Mapping[str, torch.Tensor]:
+        """Borrow views of ``role``'s backing sized to ``requirements``.
+
+        Raises:
+            RuntimeError: A request exceeds every backing while a graph is
+                being captured.
+        """
+        key = (
+            role,
+            device,
+            tuple(
+                (name, config.dtype, config.host, len(config.shape))
+                for name, config in requirements.items()
+            ),
+        )
+        backings = self._backings.setdefault(key, [])
+        for backing in backings:
+            try:
+                return backing.view(requirements)
+            except ValueError:
+                continue
+        if capturing(device):
+            raise RuntimeError(
+                f"prepare {role!r} scratch for this size before capture"
+            )
+        backing = TensorBuffers.allocate(requirements, device=device)
+        backings.insert(0, backing)
+        return backing.view(requirements)
+
+    def close(self) -> None:
+        """Release every backing once its borrowing calls and graphs retire."""
+        try:
+            for backings in self._backings.values():
+                for backing in backings:
+                    backing.close()
+        finally:
+            self._backings.clear()
+
+
 class ExecutionContext(Generic[SizeT]):
     """Own one independent invocation domain for shared numerical modules.
 
@@ -75,6 +138,9 @@ class ExecutionContext(Generic[SizeT]):
     ``stream`` is a borrowed :class:`CUDAStream`. Its communication owner
     holds the communicators, registered windows and window storage every
     context on the stream shares; this context never retires them.
+    ``scratch``, when given, is a borrowed :class:`Scratch` whose other
+    borrowers run on the same stream; the caller closes it after every
+    borrower retires. Without it the context owns a private one.
     """
 
     def __init__(
@@ -87,6 +153,7 @@ class ExecutionContext(Generic[SizeT]):
         vsa="auto",
         matmul="auto",
         groups=None,
+        scratch: Scratch | None = None,
     ):
         # Close releases the module; a closed context never executes again.
         self.module: nn.Module | None = module
@@ -129,8 +196,10 @@ class ExecutionContext(Generic[SizeT]):
         self.constants: Mapping[str, torch.Tensor] = MappingProxyType({})
         self.workspace: Mapping[str, torch.Tensor] = self.constants
         self._allocations: list[TensorBuffers] = []
-        # Transient work areas by role (see ``scratch``), largest first.
-        self._capacities: dict[tuple[object, ...], list[TensorBuffers]] = {}
+        # Transient work areas by role (see ``scratch``); a private owner is
+        # released with this context's preparation, a borrowed one is not.
+        self._owns_scratch = scratch is None
+        self._scratch = Scratch() if scratch is None else scratch
 
         self._operators: dict[int, MatmulBinding] = {}
         self._merged: dict[int | _binding.MergedKey, MatmulBinding] = {}
@@ -165,41 +234,11 @@ class ExecutionContext(Generic[SizeT]):
     def scratch(self, role, requirements, device):
         """Borrow transient work areas shared by every call of ``role``.
 
-        A role names storage whose contents one call writes before reading
-        and no later call reads, so every call site and every size this
-        context evaluates on its serialized stream can share one backing.
-        The backing is allocated at the first request's shapes; a later
-        request whose every extent fits borrows compact leading views of it,
-        and a larger one allocates a new backing outside capture. Earlier
-        backings stay alive for the views and graphs that address them, so
-        callers that evaluate several sizes prepare the largest first.
-
-        Raises:
-            RuntimeError: A request exceeds every backing while a graph is
-                being captured.
+        Every call site and every size this context evaluates on its
+        serialized stream shares one backing per role, as do the other
+        borrowers of a shared ``Scratch``; see ``Scratch.view``.
         """
-        key = (
-            role,
-            device,
-            tuple(
-                (name, config.dtype, config.host, len(config.shape))
-                for name, config in requirements.items()
-            ),
-        )
-        backings = self._capacities.setdefault(key, [])
-        for backing in backings:
-            try:
-                return backing.view(requirements)
-            except ValueError:
-                continue
-        if capturing(device):
-            raise RuntimeError(
-                f"prepare {role!r} scratch for this size before capture"
-            )
-        backing = TensorBuffers.allocate(requirements, device=device)
-        self._allocations.append(backing)
-        backings.insert(0, backing)
-        return backing.view(requirements)
+        return self._scratch.view(role, requirements, device)
 
     def _matmul_workspace(self, requirements, device):
         # GEMM work areas are consumed entirely within one operator call. The
@@ -212,7 +251,8 @@ class ExecutionContext(Generic[SizeT]):
     def _attention_workspace(self, requirements, device):
         # Native attention scratch is consumed on this context's serialized
         # device stream. Plans and metadata remain specific to each call site.
-        # Separate contexts never share these mutable work areas.
+        # Separate contexts share these mutable work areas only through one
+        # ``Scratch``, whose borrowers run on the same stream.
         shared = requirements.get("scratch")
         views = dict(
             self._allocate(
@@ -656,6 +696,7 @@ class ExecutionContext(Generic[SizeT]):
                     allocation.close
                     for allocation in reversed(self._allocations)
                 ),
+                *((self._scratch.close,) if self._owns_scratch else ()),
                 *(
                     (self._transfers.reset,)
                     if self._transfers is not None
@@ -678,7 +719,6 @@ class ExecutionContext(Generic[SizeT]):
             ):
                 values.clear()
             self._allocations.clear()
-            self._capacities.clear()
             # Communicators and registered windows outlive this context: they
             # belong to its stream, and a later context on the same stream
             # reuses them rather than issuing a bootstrap its peers have no
