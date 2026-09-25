@@ -428,11 +428,13 @@ pub async fn chat_completion_chunk_stream(
     let mut image_step_counts = HashMap::<String, u32>::new();
     let mut completed_image_ids = Vec::<String>::new();
     // Token metadata arrives after all semantic deltas of one decoded update
-    // (see the module docs). `inside_hidden_reasoning` stays set across
-    // updates while a hidden reasoning block is open.
-    // `suppress_current_update_metadata` is set by the reasoning arms below,
-    // including for a delimiter-only block start or end, and is cleared when
-    // the current update's metadata arrives.
+    // (see the module docs). If that update contains hidden reasoning,
+    // including a delimiter-only start or end of a hidden reasoning block,
+    // its metadata is omitted along with the reasoning text; with reasoning
+    // visible, every update keeps its metadata. `inside_hidden_reasoning`
+    // stays set across updates while a hidden reasoning block is open.
+    // `suppress_current_update_metadata` marks the current update as touching
+    // hidden reasoning and is cleared when its metadata arrives.
     let mut inside_hidden_reasoning = false;
     let mut suppress_current_update_metadata = false;
 
@@ -531,10 +533,11 @@ pub async fn chat_completion_chunk_stream(
                     suppress_current_update_metadata = true;
                 }
             }
-            Ok(RequestOutput::OutputBlockEnd { block, .. }) => {
+            Ok(RequestOutput::OutputBlockEnd { .. }) => {
                 debug!("ending current block");
-                if inside_hidden_reasoning || matches!(block.kind(), AssistantBlockKind::Reasoning)
-                {
+                // Every block end follows its own start, so this is the end
+                // of the hidden reasoning block that the start arm opened.
+                if inside_hidden_reasoning {
                     inside_hidden_reasoning = false;
                     suppress_current_update_metadata = true;
                 }
@@ -1138,5 +1141,130 @@ fn finish_status_stop_reason(status: &FinishStatus) -> Option<Value> {
         | FinishStatus::Abort
         | FinishStatus::Error
         | FinishStatus::Repetition => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::{StreamExt as _, stream};
+
+    use super::chat_completion_chunk_stream;
+    use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock};
+    use crate::serving::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
+    use crate::serving::{FinishStatus, RequestOutput};
+
+    /// Single-candidate logprobs for one generated token.
+    fn logprobs(token_id: u32) -> Option<DecodedLogprobs> {
+        Some(DecodedLogprobs {
+            positions: vec![DecodedPositionLogprobs {
+                entries: vec![DecodedTokenLogprob {
+                    token_id,
+                    token: format!("t{token_id}"),
+                    logprob: -0.1,
+                    rank: 1,
+                }],
+            }],
+        })
+    }
+
+    /// Serving events of a Qwen3 thinking response, in the order the chat
+    /// assembler emits them: the update of token 10 produces reasoning, and
+    /// the update of token 11 closes the reasoning block and starts the
+    /// answer before its metadata `TextDelta` arrives.
+    fn thinking_response() -> Vec<crate::serving::Result<RequestOutput>> {
+        vec![
+            Ok(RequestOutput::Accepted {
+                request_id: "r".into(),
+                served_name: "m".to_string(),
+                description: "qwen3".to_string(),
+                compile_duration_us: 0,
+                prompt_token_count: 1,
+                prompt_token_ids: vec![1],
+                prompt_logprobs: None,
+            }),
+            Ok(RequestOutput::OutputBlockStart {
+                index: 0,
+                kind: AssistantBlockKind::Reasoning,
+            }),
+            Ok(RequestOutput::ReasoningDelta {
+                text: "think".to_string(),
+            }),
+            Ok(RequestOutput::TextDelta {
+                text: String::new(),
+                token_ids: vec![10],
+                logprobs: logprobs(10),
+            }),
+            Ok(RequestOutput::OutputBlockEnd {
+                index: 0,
+                block: AssistantContentBlock::Reasoning {
+                    text: "think".to_string(),
+                },
+            }),
+            Ok(RequestOutput::OutputBlockStart {
+                index: 1,
+                kind: AssistantBlockKind::Text,
+            }),
+            Ok(RequestOutput::TextDelta {
+                text: "Hi".to_string(),
+                token_ids: Vec::new(),
+                logprobs: None,
+            }),
+            Ok(RequestOutput::TextDelta {
+                text: String::new(),
+                token_ids: vec![11],
+                logprobs: logprobs(11),
+            }),
+            Ok(RequestOutput::Finished {
+                reason: FinishStatus::Stop { cause: None },
+                finish_detail: None,
+            }),
+        ]
+    }
+
+    /// Streams `thinking_response` with logprobs and token IDs requested and
+    /// returns the streamed token IDs and the number of logprob positions.
+    async fn streamed_metadata(include_reasoning: bool) -> (Vec<u32>, usize) {
+        let chunks = chat_completion_chunk_stream(
+            stream::iter(thinking_response()),
+            "r".to_string(),
+            "m".to_string(),
+            0,
+            false,
+            false,
+            true,
+            include_reasoning,
+            true,
+            false,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        let mut token_ids = Vec::new();
+        let mut logprob_positions = 0;
+        for chunk in chunks {
+            for choice in chunk.unwrap().choices {
+                token_ids.extend(choice.token_ids.unwrap_or_default());
+                logprob_positions += choice
+                    .logprobs
+                    .and_then(|logprobs| logprobs.content)
+                    .map_or(0, |content| content.len());
+            }
+        }
+        (token_ids, logprob_positions)
+    }
+
+    /// With reasoning visible, the stream carries the metadata of every
+    /// generated token, like the buffered response, including the update
+    /// that closes the reasoning block.
+    #[tokio::test]
+    async fn visible_reasoning_streams_metadata_of_every_update() {
+        assert_eq!(streamed_metadata(true).await, (vec![10, 11], 2));
+    }
+
+    /// With reasoning hidden, updates that contain hidden reasoning, including
+    /// the update that only closes the hidden block, stream no metadata.
+    #[tokio::test]
+    async fn hidden_reasoning_streams_no_metadata_of_reasoning_updates() {
+        assert_eq!(streamed_metadata(false).await, (Vec::new(), 0));
     }
 }
