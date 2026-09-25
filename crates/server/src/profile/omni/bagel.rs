@@ -55,6 +55,44 @@ impl BagelProfile {
     pub const LATENT_DOWNSAMPLE: u32 = 16;
     /// Maximum reusable encoder products tracked by the profile.
     pub const ENCODER_CACHE_ENTRIES: usize = 256;
+    /// Primary checkpoint files in the order the worker's loader tries them
+    /// (`uniserve_models/bagel/weights.py`); the first present one holds the
+    /// latent position table.
+    pub const PRIMARY_CHECKPOINT: [&'static str; 2] = ["ema.safetensors", "model.safetensors"];
+    /// Learned latent position table, `[side * side, hidden]` for a square
+    /// grid of `side` latent patches per axis.
+    pub const LATENT_POSITION_TABLE: &'static str = "latent_pos_embed.pos_embed";
+
+    /// Reads the side of the learned latent position grid, in latent patches.
+    ///
+    /// The side comes from the latent position table's row count in the
+    /// primary checkpoint header, as the worker's `read_config` derives it.
+    /// `config.json`'s `max_latent_size` is not used: the published
+    /// BAGEL-7B-MoT config declares 32 for its 64x64 table.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`assets::resolve_tensor_shape`] errors, and
+    /// [`assets::Error::Invalid`] when the table is not two-dimensional with
+    /// a square, nonzero row count.
+    pub async fn read_max_latent_size(model: &str) -> assets::Result<u32> {
+        let shape = assets::resolve_tensor_shape(
+            model,
+            &Self::PRIMARY_CHECKPOINT,
+            Self::LATENT_POSITION_TABLE,
+        )
+        .await?;
+        let side = match shape.as_slice() {
+            [rows, _hidden] => Some(rows.isqrt()).filter(|side| *side > 0 && side * side == *rows),
+            _ => None,
+        };
+        side.and_then(|side| u32::try_from(side).ok())
+            .ok_or_else(|| {
+                assets::Error::invalid(format!(
+                    "Bagel latent position table must be a square grid, found shape {shape:?}"
+                ))
+            })
+    }
 
     /// Returns bounded runtime capabilities for the selected dtype.
     ///
@@ -87,9 +125,12 @@ impl BagelProfile {
     /// Resolves required control tokens from the loaded tokenizer.
     ///
     /// Encoder token counts stay unset here; the `*_for_dimensions` methods
-    /// return per-image copies with the counts set. Fails when the tokenizer
-    /// lacks any of the ChatML or vision delimiter tokens.
-    pub fn resolve(tokenizer: &HuggingFaceTokenizer) -> assets::Result<Self> {
+    /// return per-image copies with the counts set. `max_latent_size` is the
+    /// checkpoint's latent position grid side (see
+    /// [`Self::read_max_latent_size`]) and bounds each side of a generated
+    /// canvas. Fails when the tokenizer lacks any of the ChatML or vision
+    /// delimiter tokens.
+    pub fn resolve(tokenizer: &HuggingFaceTokenizer, max_latent_size: u32) -> assets::Result<Self> {
         let (start_of_image, start_of_image_text) =
             required_token(tokenizer, "<|vision_start|>", "Bagel start-of-image")?;
         let (end_of_image, end_of_image_text) =
@@ -152,10 +193,15 @@ impl BagelProfile {
                 max_images: 1,
                 max_images_limit: 16,
             },
+            // The denoiser reads a latent patch's position embedding from
+            // table row `row * max_latent_size + col`, so a canvas wider than
+            // the grid reads another row's embedding and a taller one indexes
+            // past the table.
             resolution_policy: ResolutionPolicy {
                 default: default_resolution.clone(),
                 buckets: vec![default_resolution],
                 allow_custom: true,
+                max_side: Some(max_latent_size.saturating_mul(Self::LATENT_DOWNSAMPLE)),
             },
             output_filter: OutputFilterPolicy {
                 reasoning: None,

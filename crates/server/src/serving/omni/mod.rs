@@ -702,6 +702,14 @@ fn bagel_context_image_params(
     }
     let max_images = image.max_images.unwrap_or(2);
     validate_max_images(max_images, profile.image_defaults.max_images_limit)?;
+    // The fixed canvas still passes the profile's per-axis latent bound.
+    let resolution = resolve_resolution(
+        &profile.resolution_policy,
+        None,
+        Some(context_image_defaults::RESOLUTION),
+        Some(context_image_defaults::RESOLUTION),
+    )
+    .map_err(|error| error.to_string())?;
     Ok(ImageParams {
         steps,
         cfg_text_scale: context_image_defaults::CFG_TEXT_SCALE,
@@ -712,8 +720,8 @@ fn bagel_context_image_params(
         timestep_shift: image
             .timestep_shift
             .unwrap_or(profile.image_defaults.timestep_shift),
-        height: context_image_defaults::RESOLUTION,
-        width: context_image_defaults::RESOLUTION,
+        height: resolution.height,
+        width: resolution.width,
         seed: sampling_seed.or(Some(0)),
         negative_prompt: String::new(),
         max_images,
