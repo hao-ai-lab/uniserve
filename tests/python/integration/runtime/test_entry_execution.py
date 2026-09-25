@@ -185,6 +185,40 @@ def test_decoder_call_preserves_values_across_independent_execution_owners(
             runner.close()
 
 
+def test_module_call_statistics_count_the_call_without_tokens():
+    """A standalone module call has no query tokens to count.
+
+    It reports one call of its mode and no token count for it.
+    """
+    model = DecodedModel()
+    components = (
+        (
+            "reconstruction",
+            ComponentConfig((0,), distribution="temporal_units"),
+        ),
+    )
+    runner = ModelExecutor(
+        model,
+        WorkerConfig(device="cpu"),
+        bindings=_encoder_bindings(model, components),
+    )
+    try:
+        output = runner.run_module(
+            "reconstruction",
+            (torch.zeros(4, 3),),
+            method="decode",
+            size=4,
+            frames=(slice(0, 4),),
+            num_frames=(4,),
+        )
+    finally:
+        runner.close()
+
+    assert output.stats is not None
+    assert sum(output.stats.mode_counts.values()) == 1
+    assert output.stats.mode_tokens == {}
+
+
 @pytest.mark.parametrize("rank", [0, 1])
 def test_conditioning_executes_only_on_its_declared_pipeline_stage(rank):
     model = EncodedModel()

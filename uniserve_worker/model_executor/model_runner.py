@@ -160,7 +160,9 @@ class ModelRunner(Execution, ABC):
         pools exist; later calls replay it. The lane stream, when present,
         waits for the caller's current stream before the call, and after a
         successful call the caller's stream waits for the lane. The returned
-        output is a clone that does not alias graph storage.
+        output is a clone that does not alias graph storage. Its statistics
+        count one call of this runner's mode and no tokens, since module
+        arguments carry no query-token notion.
         """
         context, stream = self.context, self.context.stream
         if stream is not None:
@@ -205,7 +207,6 @@ class ModelRunner(Execution, ABC):
             output,
             stats=ForwardStats(
                 mode_counts={self.name: 1},
-                mode_tokens={self.name: 1},
                 mode_us={self.name: elapsed},
                 component_us={"forward": elapsed},
                 cuda_graph_runtime_mode_counts={path: 1},

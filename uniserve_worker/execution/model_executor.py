@@ -142,11 +142,14 @@ logger = logging.getLogger(__name__)
 
 
 def _observations(name, started, path):
-    """Build single-call forward statistics for one module, in microseconds."""
+    """Build single-call forward statistics for one module, in microseconds.
+
+    A module invocation takes opaque numerical arguments with no query-token
+    notion, so it reports its call and time under ``name`` and no tokens.
+    """
     elapsed = (time.perf_counter_ns() - started) // 1000
     return ForwardStats(
         mode_counts={name: 1},
-        mode_tokens={name: 1},
         mode_us={name: elapsed},
         component_us={"forward": elapsed},
         cuda_graph_runtime_mode_counts={path: 1},
@@ -1667,10 +1670,16 @@ class ModelExecutor:
                     raise RuntimeError(
                         "entry forward lost its execution statistics"
                     )
+                # The mode's token counter counts the query tokens the group
+                # computed; encoder and decoder groups have none and report
+                # only their call and time.
+                tokens = batch.query_tokens
                 stats = replace(
                     output.stats,
                     mode_counts={forward_mode.value: 1},
-                    mode_tokens={forward_mode.value: len(tasks)},
+                    mode_tokens={}
+                    if tokens is None
+                    else {forward_mode.value: tokens},
                     mode_us={forward_mode.value: duration_us},
                     component_us={"forward": duration_us},
                 )

@@ -249,10 +249,11 @@ pub struct SchedulerMetrics {
         help = "Worker forward calls by forward mode."
     )]
     pub worker_forward_mode_counts: Family<EngineModeLabels, U64Counter>,
-    /// Forward tokens grouped by runtime mode.
+    /// Forward query tokens grouped by runtime mode; modes without a token
+    /// notion (encoders, decoders, module calls) have no series.
     #[metric(
         name = "uniserve:worker_forward_mode_tokens",
-        help = "Worker forward tokens by forward mode."
+        help = "Worker forward query tokens by forward mode."
     )]
     pub worker_forward_mode_tokens: Family<EngineModeLabels, U64Counter>,
     /// Forward wall time grouped by runtime mode.
