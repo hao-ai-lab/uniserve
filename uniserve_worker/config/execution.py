@@ -453,10 +453,7 @@ def worker_config_from_namespace(
         flow_graph_shapes=_parse_image_shapes(namespace.flow_graph_shapes),
         video_graph_shapes=_parse_video_shapes(namespace.video_graph_shapes),
         flashinfer=FlashInferConfig(
-            workspace_size=max(
-                1,
-                int(namespace.flashinfer_workspace_size),
-            ),
+            workspace_size=int(namespace.flashinfer_workspace_size),
             use_tensor_core=_parse_optional_bool(
                 namespace.flashinfer_use_tensor_core
             ),

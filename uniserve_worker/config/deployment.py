@@ -552,6 +552,7 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
         "--ipc-payload-cap": namespace.ipc_payload_cap,
         "--world-size": namespace.world_size,
         "--max-model-len": namespace.max_model_len,
+        "--flashinfer-workspace-size": namespace.flashinfer_workspace_size,
     }
     for option, value in positive_fields.items():
         if int(value) <= 0:
