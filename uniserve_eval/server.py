@@ -7,6 +7,7 @@ per-point log file.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import socket
@@ -17,6 +18,9 @@ from types import TracebackType
 from typing import IO, Self
 
 from .config import ServerLaunch, ServerProfile
+
+# Seconds a stopped server group has to exit after SIGTERM before SIGKILL.
+_STOP_GRACE_S = 10.0
 
 
 class ManagedServer:
@@ -87,19 +91,34 @@ class ManagedServer:
     def stop(self) -> None:
         """Terminate the server process group and release process resources.
 
-        The group receives SIGTERM, then SIGKILL if the leader has not exited
-        within 10 seconds. Clearing `process` first makes a repeated call a
-        no-op.
+        The group receives SIGTERM whether or not the server itself is still
+        running: the workers it starts inherit its group, and after an abrupt
+        server exit (SIGKILL, an OOM kill) nothing else stops them. If any
+        member, the server included, remains `_STOP_GRACE_S` seconds later,
+        the group receives SIGKILL. Clearing `process` first makes a repeated
+        call a no-op.
         """
         process = self.process
         self.process = None
-        if process is not None and process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+        if process is not None:
+            # The server's pid names the group. The kernel does not reuse it
+            # while any member remains, so signalling it after the server has
+            # exited reaches exactly the surviving members.
+            group = process.pid
+            _signal_group(group, signal.SIGTERM)
+
+            # `poll` reaps an exited server, whose zombie would otherwise
+            # keep the group non-empty. A member that exited but awaits
+            # reaping by its new parent still counts, which bounds this wait
+            # at the grace period.
+            deadline = time.monotonic() + _STOP_GRACE_S
+            while (
+                process.poll() is None or _group_exists(group)
+            ) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if process.poll() is None or _group_exists(group):
+                _signal_group(group, signal.SIGKILL)
+            process.wait()
         if self.log is not None:
             self.log.close()
             self.log = None
@@ -131,3 +150,18 @@ class ManagedServer:
             f"{self.profile.host}:{self.profile.port} "
             f"within {self.timeout_s}s"
         )
+
+
+def _signal_group(group: int, signum: int) -> None:
+    """Signal a process group, which may already have no members."""
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(group, signum)
+
+
+def _group_exists(group: int) -> bool:
+    """Report whether any process, including a zombie, is in the group."""
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return False
+    return True
