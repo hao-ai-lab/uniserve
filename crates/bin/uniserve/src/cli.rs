@@ -132,7 +132,9 @@ pub(crate) struct SharedRuntimeArgs {
     /// context length (`max_position_embeddings`) is used.
     #[arg(long = "max-model-len")]
     pub max_model_len: Option<u32>,
-    /// Maximum request duration provisioned by a media configuration.
+    /// Longest video duration, in seconds, a media deployment provisions and
+    /// admits: a capacity within the video API's [4, 15] second range,
+    /// advertised as `max_seconds`.
     #[arg(long = "max-video-seconds", default_value_t = 15.0)]
     pub max_video_seconds: f64,
     /// Optional explicit KV token capacity override for the worker.

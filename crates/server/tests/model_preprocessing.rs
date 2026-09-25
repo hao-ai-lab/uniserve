@@ -356,29 +356,48 @@ fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
     let (_directory, tokenizer, model) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
     let prompt = "exact token sequence";
     let expected = tokenizer.encode(prompt, false).unwrap();
-
-    let request = model
-        .preprocess_video_request(
+    let request = |seconds: f64| {
+        model.preprocess_video_request(
             &ServeRequestId::new("video"),
             uniserve_server::openai::VideoGenerationRequest {
                 model: "minimax_h3".to_string(),
                 prompt: prompt.to_string(),
-                seconds: Some(1.0),
+                seconds: Some(seconds),
                 seed: 17,
             },
         )
-        .unwrap();
+    };
 
-    // The prompt is tokenized without chat framing. One second is 24 frames
-    // at 24 fps, which rounds up to the next count of the form `5 + 17k`:
-    // 39 frames, decoded as two 17-frame video units plus a 5-frame tail.
-    assert_eq!(request.prompt_token_ids, expected);
-    assert_eq!(request.sampling.seed, 17);
-    assert_eq!(request.sampling.num_frames, 39);
-    assert_eq!(request.sampling.video_units, 2);
+    // The prompt is tokenized without chat framing. Five seconds are 120
+    // frames at 24 fps, which extend upward to the next count of the form
+    // `17n + 5`: 124 frames, decoded as seven 17-frame units plus a tail.
+    let accepted = request(5.0).unwrap();
+    assert_eq!(accepted.prompt_token_ids, expected);
+    assert_eq!(accepted.sampling.seed, 17);
+    assert_eq!(accepted.sampling.num_frames, 124);
+    assert_eq!(accepted.sampling.video_units, 7);
+
+    // The admitted interval is [4, 15] seconds inclusive. Fractional
+    // durations round half to even before alignment: 5.1875 s is 124.5
+    // frames, which rounds to 124 and keeps 124 output frames, where rounding
+    // away from zero would reach 125 and extend to 141. 7.3 s is 175.2 frames
+    // and 175 is already aligned.
+    for (seconds, frames) in [
+        (4.0, 107),
+        (4.25, 107),
+        (5.1875, 124),
+        (7.3, 175),
+        (10.0, 243),
+        (14.0, 345),
+        (15.0, 362),
+    ] {
+        let sampling = request(seconds).unwrap().sampling;
+        assert_eq!(sampling.num_frames, frames, "{seconds} s");
+        assert_eq!(sampling.video_units, (frames - 5) / 17, "{seconds} s");
+    }
 
     // Rejections: a model name other than the served one, a whitespace-only
-    // prompt, and a duration that is not finite and positive.
+    // prompt, and a duration outside the finite [4, 15] second range.
     let invalid = |model_name: &str, prompt: &str, seconds| {
         model
             .preprocess_video_request(
@@ -393,24 +412,68 @@ fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
             .unwrap_err()
     };
     assert_eq!(
-        invalid("another-model", prompt, 1.0),
+        invalid("another-model", prompt, 5.0),
         uniserve_server::openai::ApiError::ModelNotFound {
             model: "another-model".to_string()
         },
     );
     assert!(matches!(
-        invalid("minimax_h3", "  ", 1.0),
+        invalid("minimax_h3", "  ", 5.0),
         uniserve_server::openai::ApiError::InvalidRequest {
             param: Some("prompt"),
             ..
         },
     ));
-    for seconds in [0.0, -1.0, f64::NAN] {
-        assert!(matches!(
-            invalid("minimax_h3", prompt, seconds),
-            uniserve_server::openai::ApiError::InvalidRequest { .. },
-        ));
+    for seconds in [0.0, -1.0, 1.0, 3.99, 15.01, 16.0, f64::NAN, f64::INFINITY] {
+        assert!(
+            matches!(
+                invalid("minimax_h3", prompt, seconds),
+                uniserve_server::openai::ApiError::InvalidRequest { .. },
+            ),
+            "{seconds} s"
+        );
     }
+}
+
+/// A deployment capacity below 15 seconds bounds the admitted durations and
+/// is advertised next to the API's own range; a capacity outside [4, 15]
+/// seconds is refused when the model is loaded.
+#[test]
+fn video_duration_capacity_is_a_deployment_limit() {
+    let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
+    let processor = |max_video_seconds: f64| {
+        let mut config = loaded.config().clone();
+        config.parameters = uniserve_server::profile::ModelParameters::MiniMaxH3 {
+            max_video_seconds,
+            num_inference_steps: 8,
+        };
+        InputProcessor::new(
+            config,
+            std::sync::Arc::clone(&tokenizer),
+            None,
+            uniserve_server::serving::WorkerCapabilities {
+                limits: runtime_limits(),
+                sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
+                max_model_tokens: 4096,
+                denoise_steps: 8,
+            },
+            true,
+        )
+    };
+    for capacity in [0.0, 3.5, 15.5, f64::NAN] {
+        assert!(processor(capacity).is_err(), "{capacity} s");
+    }
+
+    let model = processor(10.0).unwrap();
+    let capabilities = model.video_capabilities();
+    assert_eq!(capabilities["min_seconds"], 4.0);
+    assert_eq!(capabilities["max_seconds"], 10.0);
+    assert_eq!(capabilities["model_max_seconds"], 15.0);
+    assert_eq!(capabilities["fps"], 24);
+    let id = ServeRequestId::new("capacity");
+    let (seconds, sampling) = model.video_sampling(&id, Some(10.0), 3).unwrap();
+    assert_eq!((seconds, sampling.num_frames), (10.0, 243));
+    assert!(model.video_sampling(&id, Some(10.5), 3).is_err());
 }
 
 /// `InputProcessor::new` replaces the checkpoint's context length with the
@@ -730,13 +793,13 @@ fn sampling_controls_have_the_same_meaning_across_token_models() {
 
 /// An omitted duration resolves to the default advertised by
 /// `video_capabilities` (the lesser of 5 seconds and the configured maximum,
-/// here 2 seconds) and yields the same sampling as requesting it explicitly.
+/// here 4.5 seconds) and yields the same sampling as requesting it explicitly.
 #[test]
 fn omitted_video_duration_uses_the_advertised_model_default() {
     let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
     let mut config = loaded.config().clone();
     config.parameters = uniserve_server::profile::ModelParameters::MiniMaxH3 {
-        max_video_seconds: 2.0,
+        max_video_seconds: 4.5,
         num_inference_steps: 4,
     };
     let model = InputProcessor::new(
@@ -758,14 +821,14 @@ fn omitted_video_duration_uses_the_advertised_model_default() {
             "model": "minimax_h3", "prompt": "a river"
         }))
         .unwrap();
-    assert_eq!(model.video_capabilities()["default_seconds"], 2.0);
+    assert_eq!(model.video_capabilities()["default_seconds"], 4.5);
     let id = ServeRequestId::new("duration");
     let implicit = model.preprocess_video_request(&id, input.clone()).unwrap();
     let explicit = model
         .preprocess_video_request(
             &id,
             uniserve_server::openai::VideoGenerationRequest {
-                seconds: Some(2.0),
+                seconds: Some(4.5),
                 ..input
             },
         )

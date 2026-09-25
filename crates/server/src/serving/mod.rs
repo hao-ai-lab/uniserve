@@ -57,8 +57,9 @@ pub use input::{
     TextPromptRequest,
 };
 pub use model::{
-    InputProcessor, ModelSupport, ServedEndpoint, ServedFeature, ServedModality,
-    ServedSamplingControl, WorkerCapabilities, default_video_seconds,
+    InputProcessor, MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, ModelSupport, ServedEndpoint,
+    ServedFeature, ServedModality, ServedSamplingControl, VIDEO_FPS, WorkerCapabilities,
+    default_video_seconds, validate_video_capacity, video_frame_count,
 };
 
 use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, Qwen3ChatOutputProcessor};

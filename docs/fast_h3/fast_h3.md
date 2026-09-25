@@ -182,7 +182,7 @@ The first startup compiles the native GPU providers and captures shapes on first
 
 ## Generate a video
 
-Only `model`, `prompt`, `seconds`, and `seed` are accepted, as JSON or as `multipart/form-data`. `seconds` defaults to 5, or to `--max-video-seconds` when that is shorter, and `seed` defaults to 0.
+Only `model`, `prompt`, `seconds`, and `seed` are accepted, as JSON or as `multipart/form-data`. `seconds` is a finite number of seconds from 4 to 15 inclusive, fractional values included; it defaults to 5, and `seed` defaults to 0. `--max-video-seconds` sets the deployment's capacity within that range (default 15); a request longer than the capacity is rejected, and `GET /v1/capabilities` reports the capacity as `max_seconds` next to the API range `min_seconds` and `model_max_seconds`.
 
 ```bash
 curl --fail-with-body --max-time 600 \
@@ -192,7 +192,7 @@ curl --fail-with-body --max-time 600 \
   --output forest.mp4
 ```
 
-The synchronous endpoint returns MP4 bytes. H3 rounds the requested duration to whole frames and then up to its temporal geometry of `17n + 5` frames: a 5-second request produces 124 frames (about 5.17 seconds), and a 15-second request produces 362 frames (about 15.08 seconds). The shortest geometry is 22 frames, so any accepted request produces at least about 0.92 seconds; a duration that rounds to five frames or fewer, below about 0.23 seconds, is rejected.
+The synchronous endpoint returns MP4 bytes at 24 frames per second. H3 converts the requested duration to `seconds * 24` frames, rounded half to even, and extends that count up to its next complete temporal window of `17n + 5` frames, so the video can last slightly longer than requested. A 4-second request produces 107 frames (about 4.46 seconds), a 5-second request 124 frames (about 5.17 seconds), and a 15-second request 362 frames (about 15.08 seconds). A fixed output resolution therefore has exactly 16 frame counts: 107, 124, 141, 158, 175, 192, 209, 226, 243, 260, 277, 294, 311, 328, 345, and 362.
 
 ## Use asynchronous jobs
 
@@ -215,7 +215,7 @@ curl --fail-with-body http://127.0.0.1:8000/v1/videos
 curl --fail-with-body -X DELETE "http://127.0.0.1:8000/v1/videos/$VIDEO_ID"
 ```
 
-Job states are `queued`, `in_progress`, `completed`, and `failed`. A running job also reports `phase` (`encoding`, `preparing`, `denoising`, `decoding`, then `finalizing`), `completed_steps` against `total_steps`, and `actual_seconds` for the aligned frame count. Jobs and retained MP4s live in the server process, expire after one hour, and disappear on restart. The server retains at most 1 GiB of artifacts, and retained jobs and in-flight synchronous requests share 128 job slots. Deleting a queued or running job cancels it.
+Job states are `queued`, `in_progress`, `completed`, and `failed`. A running job also reports `phase` (`encoding`, `preparing`, `denoising`, `decoding`, then `finalizing`), `completed_steps` against `total_steps`, and both the requested `seconds` and the generated `num_frames` with their duration `actual_seconds`. Jobs and retained MP4s live in the server process, expire after one hour, and disappear on restart. The server retains at most 1 GiB of artifacts, and retained jobs and in-flight synchronous requests share 128 job slots. Deleting a queued or running job cancels it.
 
 A request to either endpoint while all 128 job slots are taken returns HTTP 429 with code `video_job_capacity_exceeded`. A failed job reports `error.code`: `invalid_request_error` when the deployment cannot serve the request as specified, `server_overloaded` when the engine's waiting queue was full and the same request may be resubmitted, and `generation_failed` when execution failed. The synchronous endpoint returns the same conditions as HTTP 400, 503, and 500.
 

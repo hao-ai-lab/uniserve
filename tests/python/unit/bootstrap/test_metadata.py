@@ -276,3 +276,34 @@ def test_text_worker_reports_exact_cache_capacity(storage):
     assert (
         cache.bytes_per_token == (payload + scales + initialization + 63) // 64
     )
+
+
+def test_h3_video_capacity_rounds_half_frames_to_even():
+    """A capacity sizes the frames its longest admitted request resolves to.
+
+    5.1875 seconds is 124.5 frames at 24 fps. The server rounds that half to
+    even, to 124 frames, which is already a complete temporal window;
+    rounding away from zero would reach 125 and extend to 141 frames.
+    """
+    from uniserve_models.minimax_h3 import Config, Model
+    from uniserve_models.minimax_h3.packing import video_latent_frames
+    from uniserve_worker.bootstrap.outputs import resolve_outputs
+    from uniserve_worker.config.execution import WorkerConfig
+
+    with torch.device("meta"):
+        model = Model(Config())
+    config = WorkerConfig(
+        device="cpu",
+        max_sequence_tokens=65,
+        max_video_seconds=5.1875,
+        max_request_pool_size=2,
+        min_request_pool_size=2,
+    )
+    products = {
+        value.name: value
+        for values in resolve_outputs(model, config).values()
+        for value in values
+    }
+    assert products["video_latents"].shape_bound.max_elements == (
+        video_latent_frames(124) * 24 * 42 * 96
+    )

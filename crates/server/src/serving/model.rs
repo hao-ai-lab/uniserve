@@ -430,10 +430,13 @@ impl InputProcessor {
         // Bind the actual worker ceilings once before sharing immutable model facts.
         config.max_model_tokens = Some(max_model_tokens);
         if let ModelParameters::MiniMaxH3 {
+            max_video_seconds,
             num_inference_steps,
-            ..
         } = &mut config.parameters
         {
+            validate_video_capacity(*max_video_seconds).map_err(|message| {
+                ServeError::ModelResolution(ModelResolutionError::MediaContract(message))
+            })?;
             // The denoise-step count belongs to the loaded numerical plan, so
             // the worker handshake is its only authority.
             if denoise_steps == 0 {
@@ -469,8 +472,10 @@ impl InputProcessor {
     /// Public duration, geometry and prompt limits from the serving description.
     ///
     /// Returns `Value::Null` for a model that serves no video; the Dynamo worker uses that to
-    /// refuse a non-MiniMax H3 checkpoint. The 22-frame minimum, 24 fps, and default duration
-    /// (the lesser of 5 seconds and the configured maximum) match `video_sampling`.
+    /// refuse a non-MiniMax H3 checkpoint. `min_seconds` and `model_max_seconds` are the API's
+    /// explicit-duration range; `max_seconds` is the deployment's configured capacity, which is
+    /// a deployment limit whenever it is below `model_max_seconds`. The frame rate and default
+    /// duration (the lesser of 5 seconds and the capacity) match `video_sampling`.
     pub fn video_capabilities(&self) -> serde_json::Value {
         match &self.config.parameters {
             ModelParameters::MiniMaxH3 {
@@ -484,9 +489,11 @@ impl InputProcessor {
                 serde_json::json!({
                     "tasks": ["t2va"],
                     "default_seconds": default_seconds,
+                    "min_seconds": MIN_VIDEO_SECONDS,
                     "max_seconds": *max_video_seconds,
+                    "model_max_seconds": MAX_VIDEO_SECONDS,
                     "suggested_seconds": suggested_seconds,
-                    "min_frames": 22, "fps": 24, "width": 1344, "height": 768,
+                    "fps": VIDEO_FPS, "width": 1344, "height": 768,
                     "max_prompt_tokens": self.config.max_model_tokens(),
                     "request_fields": ["model", "prompt", "seconds", "seed"],
                 })
@@ -555,14 +562,15 @@ impl InputProcessor {
 
     /// Resolves the advertised duration default and the model's frame alignment.
     ///
-    /// Returns the effective duration in seconds and the diffusion sampling parameters. The
-    /// asynchronous video route calls this directly to learn the duration before submission.
+    /// Returns the requested duration in seconds (the default when omitted) and the diffusion
+    /// sampling parameters, whose frame count is the aligned output length `video_frame_count`
+    /// derives. The asynchronous video route calls this directly to learn both before
+    /// submission.
     ///
     /// # Errors
     ///
-    /// Returns an API error when the model serves no video, or when the duration is not finite,
-    /// not positive, above the configured maximum, not representable as a frame count, or
-    /// resolves to fewer than 22 frames.
+    /// Returns an API error when the model serves no video, or when the duration is not a
+    /// finite number of seconds within `[MIN_VIDEO_SECONDS, max_video_seconds]`.
     pub fn video_sampling(
         &self,
         request_id: &crate::serving::ServeRequestId,
@@ -583,37 +591,12 @@ impl InputProcessor {
             ));
         };
         let seconds = seconds.unwrap_or_else(|| default_video_seconds(*max_video_seconds));
-        // Duration is a public floating-point input and must be finite before
-        // conversion to the fixed-width frame protocol.
-        if !seconds.is_finite() || seconds <= 0.0 || seconds > *max_video_seconds {
-            return Err(crate::openai::serve_error_to_api(ServeError::Tokenize {
+        let frame_count = video_frame_count(seconds, *max_video_seconds).map_err(|message| {
+            crate::openai::serve_error_to_api(ServeError::Tokenize {
                 request_id: request_id.clone(),
-                source: crate::serving::TokenizeError::Invalid(format!(
-                    "video duration must be finite, positive, and at most {} seconds",
-                    *max_video_seconds
-                )),
-            }));
-        }
-        // Frames are counted at 24 fps. The upper bound leaves room for the at most 16 frames
-        // `align_num_frames` adds.
-        let raw_frames = (seconds * 24.0).round();
-        if raw_frames < 1.0 || raw_frames > f64::from(u32::MAX - 16) {
-            return Err(crate::openai::serve_error_to_api(ServeError::Tokenize {
-                request_id: request_id.clone(),
-                source: crate::serving::TokenizeError::Invalid(
-                    "video duration cannot be represented by the configuration".to_string(),
-                ),
-            }));
-        }
-        let frame_count = align_num_frames(raw_frames as u32);
-        if frame_count < 22 {
-            return Err(crate::openai::serve_error_to_api(ServeError::Tokenize {
-                request_id: request_id.clone(),
-                source: crate::serving::TokenizeError::Invalid(
-                    "video duration is shorter than the supported media geometry".to_string(),
-                ),
-            }));
-        }
+                source: crate::serving::TokenizeError::Invalid(message),
+            })
+        })?;
         // Each H3 video media unit consumes a temporal latent window and emits its
         // non-overlapping frame interval; the model owns overlap reconstruction.
         let video_units = (frame_count - 5) / 17;
@@ -967,24 +950,68 @@ impl InputProcessor {
     }
 }
 
+/// Shortest explicit video duration, in seconds, the MiniMax H3 API admits.
+pub const MIN_VIDEO_SECONDS: f64 = 4.0;
+
+/// Longest explicit video duration, in seconds, the MiniMax H3 API admits. A deployment may
+/// configure a lower `max_video_seconds` capacity, never a higher one.
+pub const MAX_VIDEO_SECONDS: f64 = 15.0;
+
+/// Frame rate, in frames per second, of every MiniMax H3 video.
+pub const VIDEO_FPS: u32 = 24;
+
 /// Returns the duration, in seconds, of a video request that omits `seconds`.
 ///
 /// The default is 5 seconds, capped at the deployment's `max_video_seconds` so an omitted
-/// duration is always within bounds. `InputProcessor::video_sampling` resolves omitted
-/// durations with it and `InputProcessor::video_capabilities` advertises it; any other video
-/// entry point into the same engine must resolve omitted durations with it too.
+/// duration is always within bounds (`validate_video_capacity` keeps the capacity at or above
+/// `MIN_VIDEO_SECONDS`). `InputProcessor::video_sampling` resolves omitted durations with it
+/// and `InputProcessor::video_capabilities` advertises it; any other video entry point into
+/// the same engine must resolve omitted durations with it too.
 pub fn default_video_seconds(max_video_seconds: f64) -> f64 {
     max_video_seconds.min(5.0)
 }
 
-/// Rounds a frame count up to the next value of the form `5 + 17k`.
+/// Checks a deployment's video duration capacity against the API range.
 ///
-/// The worker-side MiniMax H3 model decodes such a video as `k` media units of 17 frames plus
-/// a final 5-frame tail, and rejects any other count. The result is 5 for inputs up to 5, which
-/// `video_sampling` rejects as shorter than the 22-frame minimum. The caller checks that
-/// adding at most sixteen frames cannot overflow.
-fn align_num_frames(num_frames: u32) -> u32 {
-    num_frames + (22 - num_frames % 17) % 17
+/// # Errors
+///
+/// Returns a message when `max_video_seconds` is not finite or lies outside
+/// `[MIN_VIDEO_SECONDS, MAX_VIDEO_SECONDS]`: a smaller capacity admits no request, and a
+/// larger one exceeds what the API accepts.
+pub fn validate_video_capacity(max_video_seconds: f64) -> std::result::Result<(), String> {
+    if max_video_seconds.is_finite()
+        && (MIN_VIDEO_SECONDS..=MAX_VIDEO_SECONDS).contains(&max_video_seconds)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "max_video_seconds must lie in [{MIN_VIDEO_SECONDS}, {MAX_VIDEO_SECONDS}], got \
+             {max_video_seconds}"
+        ))
+    }
+}
+
+/// Converts an explicit MiniMax H3 duration into its output frame count.
+///
+/// The requested frame count is `seconds * 24` rounded half to even, as the reference
+/// implementations round with Python's `round`, and the output extends it upward to the next
+/// complete native temporal window, a count of the form `17n + 5`. The output may therefore
+/// last longer than requested: 4 seconds yields 107 frames and 15 seconds 362.
+///
+/// # Errors
+///
+/// Returns a message when `seconds` is not finite or lies outside
+/// `[MIN_VIDEO_SECONDS, max_video_seconds]`.
+pub fn video_frame_count(seconds: f64, max_video_seconds: f64) -> std::result::Result<u32, String> {
+    if !seconds.is_finite() || !(MIN_VIDEO_SECONDS..=max_video_seconds).contains(&seconds) {
+        return Err(format!(
+            "video duration must be a finite number of seconds in [{MIN_VIDEO_SECONDS}, \
+             {max_video_seconds}]"
+        ));
+    }
+    // The range bounds the product to [96, 360], so the conversion is exact.
+    let requested = (seconds * f64::from(VIDEO_FPS)).round_ties_even() as u32;
+    Ok(requested + (22 - requested % 17) % 17)
 }
 
 /// Returns the multimodal resources required by the active profile.

@@ -55,8 +55,12 @@ pub(crate) struct VideoJob {
     /// Requested duration in seconds, or the model default when the request
     /// omits it.
     pub seconds: f64,
-    /// Duration in seconds of the frames the model generates.
+    /// Duration in seconds of the frames the model generates, `num_frames`
+    /// at the model's frame rate. It may exceed `seconds`, since the model
+    /// extends a duration to a complete native temporal window.
     pub actual_seconds: f64,
+    /// Frames the model generates for the requested duration.
+    pub num_frames: u32,
     pub status: &'static str,
     /// `queued`, then the phases the generation task reports from runtime
     /// events, then `completed` or `failed`.
@@ -352,6 +356,7 @@ mod tests {
             expires_at: None,
             seconds: 5.0,
             actual_seconds: 124.0 / 24.0,
+            num_frames: 124,
             status: "queued",
             phase: "queued".to_owned(),
             completed_steps: 0,

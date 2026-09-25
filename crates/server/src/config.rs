@@ -231,7 +231,8 @@ impl EngineSettings {
     /// Rejects numeric engine settings that are structurally required to be
     /// positive (they index, divide, or bound scheduling). This catches a `0`
     /// override before it reaches the scheduler or KV sizing math. It also
-    /// rejects a `max_video_seconds` outside the supported frame range and any
+    /// rejects a `max_video_seconds` outside the video API's [4, 15] second
+    /// range (`validate_video_capacity`) and any
     /// worker placement `WorkerConfig::validate_all` refuses.
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
@@ -252,20 +253,8 @@ impl EngineSettings {
             self.max_model_len.map(|len| len > 0).unwrap_or(true),
             "max_model_len must be greater than 0"
         );
-        anyhow::ensure!(
-            self.max_video_seconds.is_finite() && self.max_video_seconds > 0.0,
-            "max_video_seconds must be finite and greater than 0"
-        );
-        // Mirrors the frame arithmetic of `InputProcessor::video_sampling`:
-        // frames are counted at 24 fps, 6 is the smallest raw count that
-        // `align_num_frames` lifts to the 22-frame minimum `video_sampling`
-        // accepts, and the upper bound leaves room for the at most 16 frames
-        // alignment adds.
-        let max_video_frames = (self.max_video_seconds * 24.0).round();
-        anyhow::ensure!(
-            max_video_frames >= 6.0 && max_video_frames <= f64::from(u32::MAX - 16),
-            "max_video_seconds must resolve to supported media geometry"
-        );
+        crate::serving::validate_video_capacity(self.max_video_seconds)
+            .map_err(anyhow::Error::msg)?;
         anyhow::ensure!(
             self.worker_process.resp_slot_cap > 0,
             "resp_slot_cap must be greater than 0"
@@ -290,6 +279,22 @@ mod tests {
         let mut config = Config::default();
         config.engine.worker_process.block_size = 0;
         assert!(config.validate().is_err());
+    }
+
+    /// A video capacity must lie within the API's [4, 15] second range.
+    #[test]
+    fn max_video_seconds_outside_the_api_range_is_rejected() {
+        for (seconds, valid) in [
+            (4.0, true),
+            (15.0, true),
+            (3.9, false),
+            (15.5, false),
+            (f64::NAN, false),
+        ] {
+            let mut config = Config::default();
+            config.engine.max_video_seconds = seconds;
+            assert_eq!(config.validate().is_ok(), valid, "{seconds} s");
+        }
     }
 
     #[test]
