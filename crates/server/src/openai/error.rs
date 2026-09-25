@@ -178,7 +178,10 @@ impl IntoResponse for ApiError {
 ///
 /// Unsupported output counts or features, context limits, duplicate request
 /// IDs, and tokenization failures become invalid requests; model-resolution,
-/// engine, and output-processing failures become server errors.
+/// engine, and output-processing failures become server errors. A
+/// tokenization failure's message appends its cause (the violated field or
+/// limit), which `ServeError::Tokenize` carries as its error source rather
+/// than in its own `Display`.
 pub fn serve_error_to_api(error: ServeError) -> ApiError {
     match error {
         ServeError::UnsupportedOutputCount { requested, .. } => ApiError::invalid_request(
@@ -188,8 +191,12 @@ pub fn serve_error_to_api(error: ServeError) -> ApiError {
         error @ (ServeError::UnsupportedFeature { .. }
         | ServeError::ContextLengthExceeded { .. }
         | ServeError::ContextCapacityExceeded { .. }
-        | ServeError::DuplicateRequestId { .. }
-        | ServeError::Tokenize { .. }) => ApiError::invalid_request(error.to_string(), None),
+        | ServeError::DuplicateRequestId { .. }) => {
+            ApiError::invalid_request(error.to_string(), None)
+        }
+        ServeError::Tokenize { ref source, .. } => {
+            ApiError::invalid_request(format!("{error}: {source}"), None)
+        }
         ServeError::ModelResolution(source) => {
             ApiError::server_error(format!("model resolution error: {source}"))
         }
@@ -254,5 +261,21 @@ mod tests {
 
         let invalid = ApiError::rejected(RejectionKind::Invalid, "unsupported");
         assert_eq!(invalid.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A preprocessing rejection must tell the caller which limit or field it
+    /// violated, not only that the request was refused.
+    #[test]
+    fn a_tokenize_rejection_reports_its_cause() {
+        let cause = "video duration must be finite, positive, and at most 15 seconds";
+        let error = serve_error_to_api(ServeError::Tokenize {
+            request_id: crate::serving::ServeRequestId::new("vid-1"),
+            source: crate::serving::TokenizeError::Invalid(cause.to_string()),
+        });
+
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+        let message = error.to_error_response().error.message;
+        assert!(message.contains("vid-1"), "{message}");
+        assert!(message.contains(cause), "{message}");
     }
 }
