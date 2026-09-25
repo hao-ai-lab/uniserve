@@ -120,7 +120,7 @@ Each image response entry carries `b64_json`, pixel `height` and `width`, and th
 | Positional `MODEL` | Required | Local model directory or Hugging Face repository |
 | `--served-model-name` | Resolved model ID | Single public model ID |
 | `--host`, `--port` | `127.0.0.1`, `8000` | TCP listener |
-| `--uds` | Unset | Unix-domain listener instead of TCP |
+| `--uds` | Unset | Unix-domain listener instead of TCP; a stale socket file is replaced and the socket file is removed at shutdown |
 | `--device` | `cuda` | Worker device |
 | `--worker-ranks` | `1` | Ranks in the default Worker instance when `--workers` is omitted |
 | `--workers` | One `model` entry over every rank | Path to a JSON deployment configuration: Worker instances, node/device ranks, and the components placed on them |

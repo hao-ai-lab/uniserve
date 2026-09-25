@@ -30,7 +30,9 @@ pub enum HttpListenerMode {
         /// TCP port, with zero requesting an OS-assigned ephemeral port.
         port: u16,
     },
-    /// Bind a fresh Unix domain listener on the given filesystem path.
+    /// Bind a fresh Unix domain listener on the given filesystem path,
+    /// replacing a stale socket file no server listens on. The socket file is
+    /// removed when the listener is dropped at shutdown.
     BindUnix {
         /// Filesystem path for the Unix domain socket.
         path: String,
