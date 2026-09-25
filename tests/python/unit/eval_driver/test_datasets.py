@@ -7,8 +7,11 @@ import random
 from pathlib import Path
 from types import SimpleNamespace
 
+import huggingface_hub
 import pytest
 
+from uniserve_eval.datasets.base import Dataset
+from uniserve_eval.datasets.mjhq import MJHQDataset
 from uniserve_eval.datasets.sharegpt import ShareGPTDataset
 from uniserve_eval.types import (
     BenchmarkPoint,
@@ -21,6 +24,20 @@ pytestmark = pytest.mark.unit
 
 # Counts whitespace-separated words as tokens.
 _TOKENIZER = SimpleNamespace(encode=str.split)
+
+
+class _HubDownloadError(Exception):
+    """Raised in place of downloading a dataset file from the hub."""
+
+
+@pytest.fixture(autouse=True)
+def no_hub(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace the hub download so no test here can reach the network."""
+
+    def download(**kwargs: object) -> str:
+        raise _HubDownloadError(str(kwargs.get("repo_id")))
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
 
 
 def _point(dataset: str, dataset_path: str, num_prompts: int) -> BenchmarkPoint:
@@ -64,3 +81,28 @@ def test_sharegpt_leaves_the_global_random_generator_untouched(
 
     assert len(rows) == 3
     assert random.random() == expected
+
+
+@pytest.mark.parametrize("source", ["directory", "missing.json"])
+@pytest.mark.parametrize(
+    "dataset_cls", [MJHQDataset, ShareGPTDataset], ids=["mjhq", "sharegpt"]
+)
+def test_an_unusable_dataset_path_is_not_replaced_by_the_hub(
+    tmp_path: Path, source: str, dataset_cls: type[Dataset]
+) -> None:
+    path = tmp_path if source == "directory" else tmp_path / source
+    point = _point(dataset_cls.name, str(path), num_prompts=1)
+
+    with pytest.raises(OSError):
+        dataset_cls(point).load(_TOKENIZER)
+
+
+def test_sharegpt_rejects_a_local_file_that_is_not_json(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "sharegpt.json"
+    path.write_text('[{"conversations": [', encoding="utf-8")
+    point = _point("sharegpt", str(path), num_prompts=1)
+
+    with pytest.raises(json.JSONDecodeError):
+        ShareGPTDataset(point).load(_TOKENIZER)
