@@ -26,7 +26,7 @@ use std::time::Duration;
 use super::{BatchSubmitError, WorkerGroup};
 use crate::executor::{
     BatchResult, CommandOutcome, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
-    RequestPlacement, TransferConfig, WorkerFailure, WorkerId, logical_result,
+    RequestPlacement, TransferConfig, UnroutableInputs, WorkerFailure, WorkerId, logical_result,
 };
 use anyhow::Context;
 use uniserve_core::CommandWaker;
@@ -128,6 +128,18 @@ impl WorkerSubmission {
             dependencies,
         }
     }
+}
+
+/// What became of one queued submission offered to its worker.
+enum Dispatch {
+    /// The group accepted the submission.
+    Submitted,
+    /// The group had no free slot; nothing was recorded.
+    Deferred,
+    /// The group refused inputs that no configured edge carries to the rank
+    /// reading them; nothing was recorded. The failure names the requests
+    /// whose calls read those inputs.
+    Refused(Box<WorkerFailure>),
 }
 
 /// The worker and component whose call produces a buffer.
@@ -518,7 +530,8 @@ impl WorkerExecutor {
     /// A failure is one of two kinds. With endpoints it is a loss: the
     /// `WorkerGroup` terminated its ranks and holds none of its resident
     /// requests, buffers, or publications. Without endpoints the group is
-    /// intact and only the named calls or batch failed.
+    /// intact and only the named calls, requests or batch failed; the calls
+    /// of a named request still queued are retired here.
     ///
     /// Returns the failure extended to everything it invalidates: `requests`
     /// and `buffers` include the dependents found here, and `retired` lists
@@ -907,18 +920,19 @@ impl WorkerExecutor {
     /// Prepends the `Start` of every request among its calls that the worker
     /// has not yet admitted, attaches the publications of the submission's
     /// dependencies, which the caller has checked are published, and lowers
-    /// the batch to the wire. Returns `Ok(false)` when the group refuses it
-    /// with `WouldBlock` (not ready, or no free slot); nothing is recorded and
-    /// the caller requeues the submission. `Ok(true)` records the submission,
-    /// its collective sequence, and the admissions it carried. Errors come
-    /// from resolving admissions, from building or validating the wire batch,
-    /// or from the group; a group that replaced its ranks reports a
-    /// `WorkerFailure`.
+    /// the batch to the wire. Returns `Deferred` when the group refuses it
+    /// with `WouldBlock` (not ready, or no free slot), and `Refused` when the
+    /// group cannot bind inputs to the ranks reading them; in both cases
+    /// nothing is recorded and the caller requeues the submission.
+    /// `Submitted` records the submission, its collective sequence, and the
+    /// admissions it carried. Errors come from resolving admissions, from
+    /// building or validating the wire batch, or from the group; a group that
+    /// replaced its ranks reports a `WorkerFailure`.
     fn submit_worker(
         &mut self,
         worker_index: usize,
         submission: &WorkerSubmission,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Dispatch> {
         let batch = &submission.batch;
         let admissions = self.admissions_for(worker_index, &batch.requests)?;
         let request_keys = admissions
@@ -1038,8 +1052,14 @@ impl WorkerExecutor {
 
         match self.workers[worker_index].1.submit_batch(wire) {
             Ok(()) => {}
-            Err(BatchSubmitError::WouldBlock(_)) => return Ok(false),
-            Err(BatchSubmitError::Failed(error)) => return Err(error),
+            Err(BatchSubmitError::WouldBlock(_)) => return Ok(Dispatch::Deferred),
+            Err(BatchSubmitError::Failed(error)) => {
+                // Only an input refusal leaves the group intact; every other
+                // failure propagates unchanged.
+                let refusal = error.downcast::<UnroutableInputs>()?;
+                let failure = self.refused_inputs(worker_index, batch, refusal)?;
+                return Ok(Dispatch::Refused(Box::new(failure)));
+            }
         }
         self.worker_collective_seqs[worker_index] = collective_seq;
         let pending = self
@@ -1054,7 +1074,52 @@ impl WorkerExecutor {
         worker.submitted = true;
         self.admitted_workers
             .extend(request_keys.into_iter().map(|key| (worker_index, key)));
-        Ok(true)
+        Ok(Dispatch::Submitted)
+    }
+
+    /// The failure of the requests whose calls read inputs a worker refused.
+    ///
+    /// A product with no location on an edge to its consumer is a property of
+    /// that product and that edge, such as a device product that fell back to
+    /// host bytes crossing an edge that carries only a device mechanism. It
+    /// leaves both instances and the batch's other calls intact, so the
+    /// failure invalidates no endpoint or buffer and names only the requests
+    /// reading the refused products. Reconciliation retires those requests'
+    /// calls from the requeued submission, whose remaining calls and
+    /// commands dispatch later.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no call of `batch` reads a refused product: nothing could
+    /// then be retired, and the requeued submission would be refused again.
+    fn refused_inputs(
+        &self,
+        worker_index: usize,
+        batch: &ExecutionBatch,
+        refusal: UnroutableInputs,
+    ) -> anyhow::Result<WorkerFailure> {
+        let requests = batch
+            .requests
+            .iter()
+            .filter(|(call, _)| {
+                call.input_buffers()
+                    .any(|buffer| refusal.buffers.contains(&buffer))
+            })
+            .map(|(call, _)| call.request_key)
+            .collect::<HashSet<_>>();
+        anyhow::ensure!(
+            !requests.is_empty(),
+            "refused input products are read by no call: {refusal}"
+        );
+        Ok(WorkerFailure {
+            worker_id: self.workers[worker_index].0.clone(),
+            endpoints: Vec::new(),
+            requests: requests.into_iter().collect(),
+            retired: Vec::new(),
+            buffers: Vec::new(),
+            execution: None,
+            message: refusal.to_string(),
+        })
     }
 
     /// Dispatches each worker's queued runs in order, as far as they are ready.
@@ -1082,11 +1147,19 @@ impl WorkerExecutor {
                 let submission = self.worker_submissions[worker_index]
                     .pop_front()
                     .ok_or_else(|| anyhow::anyhow!("ready worker submission disappeared"))?;
-                if !self.submit_worker(worker_index, &submission)? {
-                    self.worker_submissions[worker_index].push_front(submission);
-                    continue;
+                match self.submit_worker(worker_index, &submission)? {
+                    Dispatch::Submitted => progressed = true,
+                    Dispatch::Deferred => {
+                        self.worker_submissions[worker_index].push_front(submission);
+                    }
+                    Dispatch::Refused(failure) => {
+                        // The refused submission keeps its place, so the
+                        // reconciliation of this failure retires the named
+                        // requests' calls from it.
+                        self.worker_submissions[worker_index].push_front(submission);
+                        return Err((*failure).into());
+                    }
                 }
-                progressed = true;
             }
             if !progressed {
                 return Ok(());

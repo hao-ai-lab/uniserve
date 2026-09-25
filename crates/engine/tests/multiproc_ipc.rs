@@ -1006,6 +1006,203 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
 }
 
 #[test]
+fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<()> {
+    use uniserve_engine::{ExecutionBatch, RequestPlacement, WorkerExecutor, WorkerId};
+    use uniserve_worker_ipc::{BufferAllocation, TensorTransfer, WorkerEndpoint};
+
+    // Two one-rank instances whose products cross only over shared storage.
+    // A product whose one location is in its producer's own address space
+    // therefore has no way to the other instance.
+    let edges = "producer->consumer=shm,consumer->producer=shm";
+    let spawn = |worker_id: &str| -> anyhow::Result<WorkerGroup> {
+        let mut args = rank_group_args(1 << 20, 8 << 20);
+        let binding = WorkerConfig::placed(
+            &["localhost".to_owned()],
+            "cpu",
+            1,
+            QUEUE_DEPTH,
+            stub_components(1),
+        );
+        args.ranks = binding.ranks.clone();
+        args.components = binding.components;
+        args.worker_id = worker_id.into();
+        args.transfer = uniserve_engine::TransferConfig::parse(edges)?;
+        WorkerGroup::spawn(args)
+    };
+    let mut executor = WorkerExecutor::try_new(
+        vec![
+            (WorkerId("producer".into()), spawn("producer")?),
+            (WorkerId("consumer".into()), spawn("consumer")?),
+        ],
+        uniserve_engine::TransferConfig::parse(edges)?,
+    )?;
+    let producer: WorkerEndpoint = executor
+        .info()
+        .workers
+        .iter()
+        .find(|(id, _)| id.0 == "producer")
+        .map(|(_, info)| info.endpoint.clone())
+        .context("producer instance is not bound")?;
+    let bind = |mut batch: Batch, input_products: Vec<TensorPublication>| {
+        let call = batch.calls.remove(0);
+        ExecutionBatch::new(
+            batch.batch_id,
+            vec![(
+                call,
+                RequestPlacement {
+                    worker: WorkerId("consumer".into()),
+                    request_pool_idx: None,
+                    block_tables: batch.block_tables,
+                    new_cache_pages: batch.new_cache_pages,
+                    forward: batch.forward,
+                    latent: batch.latent_params.into_iter().next(),
+                    decode: batch.decode_ranges.into_iter().next(),
+                    buffers: batch.buffer_allocations,
+                },
+            )],
+            batch.commands,
+            input_products,
+        )
+    };
+
+    let admission = text_admission(81, 1, 1)?;
+    let key = admission.request_key;
+    let value = TensorRef {
+        request_key: key,
+        producer_call_id: CallId::new(1, 0),
+        output_index: 0,
+        generation: 1,
+        dtype: DType::F32,
+        shape_bound: ShapeBound {
+            dims: vec![DimBound::Static(1)],
+        },
+    };
+    // The producer's own address space is the product's only location.
+    let local_only = TensorPublication {
+        product: value.clone(),
+        value: TransferHandle::DeviceProduct {
+            height: 0,
+            width: 0,
+            value_range: String::new(),
+            tensor: TensorTransfer {
+                shape: vec![1],
+                locations: vec![Locator {
+                    source: producer.clone(),
+                    transport: TransferTransport::Local {
+                        endpoint: producer.incarnation.clone(),
+                        key: 1,
+                    },
+                    nbytes: 4,
+                    dtype: "float32".to_owned(),
+                    shape: vec![1],
+                    offset: vec![0],
+                    device: "cpu".to_owned(),
+                }],
+            },
+        },
+    };
+    let copied = TensorRef {
+        producer_call_id: CallId::new(2, 0),
+        generation: 2,
+        ..value.clone()
+    };
+    let consume = Call {
+        consumer_slots: Vec::new(),
+        coordinates: CallCoordinates::default(),
+        token_input: None,
+        token_output: None,
+        vision_input: None,
+        latent_feature_input: None,
+        encoder_output: None,
+        latent_input: None,
+        latent_output: None,
+        image_input: None,
+        image_output: None,
+        completion_output: None,
+        transition_output: None,
+        input_image: None,
+        kv_input: None,
+        kv_output: None,
+        input_token_ids: Vec::new(),
+        sampling_state: None,
+        request_key: key,
+        call_id: CallId::new(2, 0),
+        component: "vision_encoder".into(),
+        code: CallKind::Transfer(TransferMode::Tensor),
+        bounds: Bounds {
+            max_transfer_bytes: value.max_bytes(),
+            ..Bounds::default()
+        },
+        inputs: vec![value.clone()],
+        outputs: vec![copied.clone()],
+        predicate: None,
+        rng: None,
+    };
+    let mut refused = Batch::new(2, vec![admission], vec![consume]);
+    refused.buffer_allocations.push(BufferAllocation {
+        buffer: copied.buffer_id(),
+        offset: 0,
+        bytes: copied.max_bytes(),
+    });
+
+    // The refusal fails the one request reading the product; the instance
+    // keeps its allocations and stays usable.
+    executor.submit(bind(refused, vec![local_only]))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut failed = false;
+    let mut retired = false;
+    while std::time::Instant::now() < deadline && !(failed && retired) {
+        match executor.poll(Duration::from_millis(100)) {
+            Err(error) => {
+                let loss = error.downcast::<WorkerFailure>()?;
+                assert!(!failed, "one refusal must fail its request once");
+                assert_eq!(loss.worker_id.0, "consumer");
+                assert!(loss.endpoints.is_empty());
+                assert_eq!(loss.requests, vec![key]);
+                assert_eq!(loss.retired, vec![(2, key, CallId::new(2, 0))]);
+                assert!(
+                    loss.message
+                        .contains("no location on a configured transfer edge"),
+                    "{}",
+                    loss.message
+                );
+                failed = true;
+            }
+            Ok(Some(result)) => {
+                assert_eq!(result.batch_id, 2);
+                assert!(result.results.is_empty(), "the refused call never ran");
+                retired |= result.done;
+            }
+            Ok(None) => {}
+        }
+    }
+    assert!(failed && retired);
+
+    let independent = text_admission(82, 1, 2)?;
+    let independent_key = independent.request_key;
+    let independent = token_batch(
+        3,
+        3,
+        independent_key,
+        Some(independent),
+        CallId::new(3, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[9],
+        BlockId(2),
+        0,
+    );
+    executor.submit(bind(independent, Vec::new()))?;
+    let completed = poll_logical(&mut executor)?.context("independent work did not complete")?;
+    assert!(completed.done);
+    assert_eq!(completed.results.len(), 1);
+    assert_eq!(completed.results[0].output.status, CallStatus::Ok);
+    assert_eq!(completed.results[0].output.committed_tokens, vec![1000]);
+
+    executor.close()?;
+    Ok(())
+}
+
+#[test]
 fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
