@@ -1,10 +1,10 @@
 //! Streaming tool-call parsers and normalized tool descriptors.
 //!
 //! The Qwen3 chat output stage (`serving::chat::output::qwen3`) feeds visible
-//! assistant text to `Qwen3XmlToolParser` chunk by chunk. The parser splits
-//! each chunk into plain text and `ToolCallDelta` updates, holding back bytes
-//! it cannot classify yet, such as a partial marker or an incomplete tool-call
-//! header.
+//! assistant text to `Qwen3XmlToolParser` chunk by chunk. The parser turns
+//! each chunk into an ordered sequence of plain text and `ToolCallDelta`
+//! updates, holding back bytes it cannot classify yet, such as a partial
+//! marker or an incomplete tool-call header.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #[macro_use]
@@ -13,8 +13,6 @@ mod json;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_utils;
 mod utils;
-
-use std::collections::{BTreeMap, btree_map};
 
 pub use error::{Result, ToolParserError};
 pub use json::Qwen3XmlToolParser;
@@ -47,60 +45,107 @@ pub struct ToolCallDelta {
     pub arguments: String,
 }
 
-/// Result of advancing tool parsing with one assistant-text input.
+/// One piece of parser output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolParserItem {
+    /// Plain assistant text that is not part of any tool call.
+    Text(String),
+    /// One tool-call update.
+    Call(ToolCallDelta),
+}
+
+/// Result of advancing tool parsing with one or more assistant-text inputs.
 ///
-/// Plain text and call deltas are reported in separate lists, so their
-/// relative order within one output is not recorded.
+/// Items follow the order of the input they were parsed from, so text written
+/// before a tool call precedes that call's deltas and text written after it
+/// follows them. Adjacent text is merged into one nonempty item. A call's
+/// deltas are contiguous, because text resumes only after its end delimiter.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolParserOutput {
-    /// Plain assistant text that is not part of any tool call.
-    pub normal_text: String,
-    /// Tool-call updates extracted from this input.
-    pub calls: Vec<ToolCallDelta>,
+    /// Text runs and tool-call updates in input order.
+    pub items: Vec<ToolParserItem>,
 }
 
 impl ToolParserOutput {
-    /// Appends another parser output onto this one.
+    /// Appends plain text, merging it into a trailing text item.
     ///
-    /// Note that this does not attempt to merge multiple deltas for the same
-    /// tool call into one complete item. Call `coalesce_calls` after if
-    /// that behavior is desired.
-    pub fn append(&mut self, mut other: Self) {
-        self.normal_text.push_str(&other.normal_text);
-        self.calls.append(&mut other.calls);
+    /// Empty text is ignored, so every text item is nonempty.
+    fn push_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        match self.items.last_mut() {
+            Some(ToolParserItem::Text(last)) => last.push_str(text),
+            _ => self.items.push(ToolParserItem::Text(text.to_string())),
+        }
     }
 
-    /// Merges multiple deltas for the same tool call into one complete item.
+    /// Appends one tool-call update after the existing items.
+    fn push_call(&mut self, call: ToolCallDelta) {
+        self.items.push(ToolParserItem::Call(call));
+    }
+
+    /// Appends another parser output onto this one, keeping item order.
     ///
-    /// Calls keep the order of their first delta. Each merged call takes the
-    /// first name any of its deltas carries and the concatenation of their
-    /// arguments. `Qwen3XmlToolParser::parse_complete` and the test helper
+    /// Text on both sides of the boundary is merged. Deltas for the same tool
+    /// call are not; call `coalesce_calls` afterwards to merge them.
+    pub fn append(&mut self, other: Self) {
+        for item in other.items {
+            match item {
+                ToolParserItem::Text(text) => self.push_text(&text),
+                ToolParserItem::Call(call) => self.push_call(call),
+            }
+        }
+    }
+
+    /// Returns the concatenation of every text item.
+    pub fn normal_text(&self) -> String {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                ToolParserItem::Text(text) => Some(text.as_str()),
+                ToolParserItem::Call(_) => None,
+            })
+            .collect()
+    }
+
+    /// Returns the tool-call updates in order.
+    pub fn calls(&self) -> impl Iterator<Item = &ToolCallDelta> {
+        self.items.iter().filter_map(|item| match item {
+            ToolParserItem::Call(call) => Some(call),
+            ToolParserItem::Text(_) => None,
+        })
+    }
+
+    /// Merges consecutive deltas for the same tool call into one item.
+    ///
+    /// Each merged call takes the first name any of its deltas carries and the
+    /// concatenation of their arguments. A call's deltas are contiguous in
+    /// parser output, so this yields one item per call there.
+    /// `Qwen3XmlToolParser::parse_complete` and the test helper
     /// `collect_stream` use this to collapse streamed argument fragments into
     /// final tool calls.
-    pub fn coalesce_calls(mut self) -> Self {
-        let mut merged = BTreeMap::<usize, ToolCallDelta>::new();
-        let mut order = Vec::new();
+    pub fn coalesce_calls(self) -> Self {
+        let mut coalesced = Self::default();
 
-        for call in self.calls {
-            match merged.entry(call.tool_index) {
-                btree_map::Entry::Vacant(entry) => {
-                    order.push(call.tool_index);
-                    entry.insert(call);
-                }
-                btree_map::Entry::Occupied(mut entry) => {
-                    let existing = entry.get_mut();
-                    if existing.name.is_none() {
-                        existing.name = call.name;
+        for item in self.items {
+            match item {
+                ToolParserItem::Text(text) => coalesced.push_text(&text),
+                ToolParserItem::Call(call) => match coalesced.items.last_mut() {
+                    Some(ToolParserItem::Call(existing))
+                        if existing.tool_index == call.tool_index =>
+                    {
+                        if existing.name.is_none() {
+                            existing.name = call.name;
+                        }
+                        existing.arguments.push_str(&call.arguments);
                     }
-                    existing.arguments.push_str(&call.arguments);
-                }
+                    _ => coalesced.push_call(call),
+                },
             }
         }
 
-        self.calls = order
-            .into_iter()
-            .filter_map(|tool_index| merged.remove(&tool_index))
-            .collect();
-        self
+        coalesced
     }
 }

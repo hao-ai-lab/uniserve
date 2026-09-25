@@ -11,5 +11,5 @@ use uniserve_server::profile::tools::test_utils::collect_stream;
 /// next stream. A parser error panics inside `collect_stream`.
 pub(super) fn feed_parser(parser: &mut Qwen3XmlToolParser, chunks: &[&str]) -> (String, usize) {
     let result = collect_stream(parser, chunks);
-    (result.normal_text, result.calls.len())
+    (result.normal_text(), result.calls().count())
 }
