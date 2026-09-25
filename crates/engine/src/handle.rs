@@ -5,7 +5,9 @@
 //! the handle's `CommandWaker`, which wakes a parked scheduler unless it is
 //! the no-op waker.
 //! Each accepted request receives a bounded event channel ([`EventTx`] and
-//! [`EventRx`], [`EVENT_BUFFER_CAPACITY`] events).
+//! [`EventRx`], [`EVENT_BUFFER_CAPACITY`] events). A scheduler that stops
+//! while a request's channel is full hands the events it could not send to
+//! the receiver, which yields them after the channel's buffered events.
 //!
 //! [`EventRx`] also drives output acknowledgement. It counts received
 //! `TextToken` events and reports consumed prefixes as
@@ -17,8 +19,15 @@
 //! request at its acknowledged prefix.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, PoisonError};
+
 use tokio::sync::mpsc;
 use uniserve_core::{EngineCoreOutput, Request, RequestId};
+
+/// Events a closing sender hands to its receiver, shared by the two ends of
+/// one request's event channel.
+type Handoff = Arc<Mutex<VecDeque<EngineCoreOutput>>>;
 
 /// Pollable command ingress whose lifetime is independent of Worker membership.
 ///
@@ -130,9 +139,28 @@ pub enum SubmitError {
 #[derive(Clone)]
 pub struct EventTx {
     inner: mpsc::Sender<EngineCoreOutput>,
+    handoff: Handoff,
 }
 
 impl EventTx {
+    /// Closes this sender and hands `events`, which did not fit into the
+    /// channel, to the receiver.
+    ///
+    /// The receiver yields them in order once it has drained the channel and
+    /// every sender has closed, so only a request's last publisher uses this.
+    /// Nothing is kept when the receiver has already closed.
+    pub(crate) fn close_with(self, events: VecDeque<EngineCoreOutput>) {
+        if events.is_empty() || self.inner.is_closed() {
+            return;
+        }
+        // The events are in place before this sender drops, so a receiver
+        // that observes the closed channel also observes them.
+        self.handoff
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(events);
+    }
+
     /// Attempts to publish an event without waiting for channel capacity.
     ///
     /// Never blocks. The scheduler keeps an event rejected as `Full` in the
@@ -159,8 +187,13 @@ impl EventTx {
 /// Bounded engine-to-caller event receiver. Releasing one channel slot wakes
 /// the scheduler so an output-capacity-stalled request becomes runnable without
 /// polling.
+///
+/// After the channel closes and drains, the receiver yields the events its
+/// sender handed over on closing (`EventTx::close_with`), and only then
+/// reports the stream closed.
 pub struct EventRx {
     inner: mpsc::Receiver<EngineCoreOutput>,
+    handoff: Handoff,
     waker: uniserve_core::CommandWaker,
     cancellation: Option<EventCancellation>,
     text_tokens_received: usize,
@@ -187,6 +220,7 @@ impl EventRx {
     pub fn from_receiver(inner: mpsc::Receiver<EngineCoreOutput>) -> Self {
         Self {
             inner,
+            handoff: Handoff::default(),
             waker: uniserve_core::CommandWaker::noop(),
             cancellation: None,
             text_tokens_received: 0,
@@ -204,10 +238,13 @@ impl EventRx {
 
     /// Receives the next event and advances output acknowledgement state.
     ///
-    /// Returns `None` once the channel is closed and empty, which also runs
-    /// the completion callback.
+    /// Returns `None` once the channel is closed and empty and every handed
+    /// over event has been yielded, which also runs the completion callback.
     pub async fn recv(&mut self) -> Option<EngineCoreOutput> {
-        let event = self.inner.recv().await;
+        let event = match self.inner.recv().await {
+            Some(event) => Some(event),
+            None => self.take_handoff(),
+        };
         match event.as_ref() {
             Some(event) => {
                 self.observe(event);
@@ -226,13 +263,29 @@ impl EventRx {
     }
 
     /// Attempts to receive an event without waiting.
+    ///
+    /// Reports `Disconnected` only after every handed over event has been
+    /// yielded.
     pub fn try_recv(&mut self) -> Result<EngineCoreOutput, mpsc::error::TryRecvError> {
-        let event = self.inner.try_recv();
+        let event = match self.inner.try_recv() {
+            Err(mpsc::error::TryRecvError::Disconnected) => self
+                .take_handoff()
+                .ok_or(mpsc::error::TryRecvError::Disconnected),
+            event => event,
+        };
         if let Ok(event) = event.as_ref() {
             self.observe(event);
             self.waker.wake();
         }
         event
+    }
+
+    /// Removes the next event a closed sender handed over.
+    fn take_handoff(&self) -> Option<EngineCoreOutput> {
+        self.handoff
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
     }
 
     /// Updates acknowledgement and completion state for a received event.
@@ -336,10 +389,15 @@ fn event_channel_with_waker(
     cancellation: Option<EventCancellation>,
 ) -> (EventTx, EventRx) {
     let (tx, rx) = mpsc::channel(EVENT_BUFFER_CAPACITY);
+    let handoff = Handoff::default();
     (
-        EventTx { inner: tx },
+        EventTx {
+            inner: tx,
+            handoff: Arc::clone(&handoff),
+        },
         EventRx {
             inner: rx,
+            handoff,
             waker,
             cancellation,
             text_tokens_received: 0,
@@ -658,6 +716,53 @@ mod tests {
             Command::Abort(id) => assert_eq!(id, RequestId(2)),
             _ => panic!("expected Abort command"),
         }
+    }
+
+    /// Events a closing sender hands over follow every event already buffered
+    /// in the full channel, in order, and the stream reports closed only after
+    /// the last of them.
+    #[tokio::test]
+    async fn receiver_yields_handed_over_events_after_the_channel_drains() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = EngineHandle::new(tx);
+        let mut events = handle.submit(test_request(13)).unwrap();
+        let event_tx = match rx.recv().unwrap() {
+            Command::Submit { event_tx, .. } => event_tx,
+            _ => panic!("expected Submit command"),
+        };
+
+        let token = |id| EngineCoreOutput::TextToken { id, logprob: None };
+        for id in 0..EVENT_BUFFER_CAPACITY as u32 {
+            event_tx.send(token(id)).unwrap();
+        }
+        let capacity = EVENT_BUFFER_CAPACITY as u32;
+        assert!(matches!(
+            event_tx.send(token(capacity)),
+            Err(EventSendError::Full(_))
+        ));
+        let terminal = EngineCoreOutput::Finished {
+            reason: uniserve_core::FinishReason::Aborted,
+            stop_reason: None,
+            prompt_tokens: 3,
+            completion_tokens: EVENT_BUFFER_CAPACITY + 1,
+            images: 0,
+        };
+        event_tx.close_with(VecDeque::from([token(capacity), terminal]));
+
+        for expected in 0..=capacity {
+            match events.recv().await {
+                Some(EngineCoreOutput::TextToken { id, .. }) => assert_eq!(id, expected),
+                other => panic!("expected token {expected}, received {other:?}"),
+            }
+        }
+        assert!(matches!(
+            events.recv().await,
+            Some(EngineCoreOutput::Finished {
+                reason: uniserve_core::FinishReason::Aborted,
+                ..
+            })
+        ));
+        assert!(events.recv().await.is_none());
     }
 
     /// After the scheduler side of the channel is dropped, `submit` reports an
