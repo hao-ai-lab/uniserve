@@ -9,7 +9,6 @@ it becomes ``Example.output_len``, which the text task requests as
 from __future__ import annotations
 
 import json
-import os
 import random
 from typing import Any, ClassVar
 
@@ -29,13 +28,14 @@ class ShareGPTDataset(Dataset):
     def load(self, tokenizer: Any | None = None) -> list[Example]:
         """Return seeded, non-empty prompt and completion pairs.
 
-        ``dataset_path`` is used only when it names a file that parses as
-        JSON; otherwise the file is downloaded from the hub at
-        ``dataset_revision``. Pairs whose prompt or completion encodes to
-        fewer than two tokens are skipped. Token counts use
-        ``tokenizer.encode`` defaults, so they include any special tokens the
-        tokenizer adds. Errors from downloading and parsing the file
-        propagate.
+        A set ``dataset_path`` must name the conversation file: a missing
+        path, a directory, or a file that does not parse as JSON raises the
+        error from opening or parsing it rather than substituting the hub
+        copy for the intended input. Only an unset path downloads the file
+        from the hub at ``dataset_revision``, and download errors propagate.
+        Pairs whose prompt or completion encodes to fewer than two tokens
+        are skipped. Token counts use ``tokenizer.encode`` defaults, so they
+        include any special tokens the tokenizer adds.
 
         Raises:
             ValueError: If no tokenizer is supplied.
@@ -43,8 +43,8 @@ class ShareGPTDataset(Dataset):
         if tokenizer is None:
             raise ValueError("dataset 'sharegpt' requires a tokenizer")
         point = self.point
-        path = point.dataset_path or ""
-        if not _is_file_valid_json(path):
+        path = point.dataset_path
+        if not path:
             from huggingface_hub import hf_hub_download
 
             path = hf_hub_download(
@@ -98,18 +98,3 @@ class ShareGPTDataset(Dataset):
                 )
             )
         return rows
-
-
-def _is_file_valid_json(path: str) -> bool:
-    """Report whether a path names a readable JSON document.
-
-    The whole document is parsed, so a valid local file is read twice.
-    """
-    if not path or not os.path.isfile(path):
-        return False
-    try:
-        with open(path, encoding="utf-8") as handle:
-            json.load(handle)
-        return True
-    except (ValueError, OSError):
-        return False

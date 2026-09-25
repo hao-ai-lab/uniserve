@@ -7,7 +7,6 @@ each value carries a ``prompt``. Only prompts are used; no images are loaded.
 from __future__ import annotations
 
 import json
-import os
 import random
 from typing import Any, ClassVar
 
@@ -26,16 +25,17 @@ class MJHQDataset(Dataset):
     def load(self, tokenizer: Any | None = None) -> list[Example]:
         """Select seeded prompt entries from local or downloaded metadata.
 
-        ``dataset_path`` is used only when it names an existing file; any
-        other value, including a directory or a missing path, falls back to
-        downloading the metadata from the hub at ``dataset_revision``.
-        Entries without a non-empty ``prompt`` are dropped, the rest are
-        shuffled with a private generator seeded by the load seed, and the
-        first ``num_prompts`` are kept.
+        A set ``dataset_path`` must name the metadata file: a missing path,
+        a directory, or an unparseable file raises the error from opening or
+        parsing it rather than substituting the hub copy for the intended
+        input. Only an unset path downloads the metadata from the hub at
+        ``dataset_revision``. Entries without a non-empty ``prompt`` are
+        dropped, the rest are shuffled with a private generator seeded by
+        the load seed, and the first ``num_prompts`` are kept.
         """
         point = self.point
-        path = point.dataset_path or ""
-        if not (path and os.path.isfile(path)):
+        path = point.dataset_path
+        if not path:
             from huggingface_hub import hf_hub_download
 
             path = hf_hub_download(
