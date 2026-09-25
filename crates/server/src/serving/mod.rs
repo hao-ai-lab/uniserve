@@ -559,6 +559,12 @@ impl ServingRuntime {
     /// submission, after submission, and atomically when the request is accepted. A control
     /// found at any checkpoint yields an immediate terminal stream in place of engine output.
     /// A submission failure with no pending control records `Failed` and returns the error.
+    ///
+    /// A control found after a successful submission reaches the engine by dropping the
+    /// unpolled output stream: its `EventRx` sends the engine a cancel at the acknowledged
+    /// prefix, which releases the engine request for a cancel and an abort alike, and then
+    /// releases the registry's engine side. The client's `Cancelled` or `Aborted` event comes
+    /// from the registry's recorded control, not from the engine.
     async fn submit_and_stream(
         &self,
         prepared: Prepared,
@@ -655,14 +661,14 @@ impl ServingRuntime {
             }
         };
 
-        // A control recorded while submission was in flight may not have reached the engine.
-        // Dropping the unpolled stream drops its `EventRx`, which sends the engine a cancel at
-        // the acknowledged prefix and releases the registry's engine side.
+        // A control recorded before `claim_submission` was not forwarded to the engine (one
+        // recorded after it was). Dropping the unpolled stream drops its `EventRx`, which
+        // delivers it as a cancel at the acknowledged prefix and releases the registry's
+        // engine side. A failed submission has no engine request to control.
         if let Some(terminal) = self.engine.requests.control_terminal(&request_id) {
             if let Ok(stream) = stream_result {
                 drop(stream);
             }
-            self.apply_engine_control(&request_id, terminal).await;
             return Ok(self.control_event_stream(request_id, terminal, lifecycle));
         }
         let stream = match stream_result {
@@ -677,7 +683,9 @@ impl ServingRuntime {
         };
 
         // `accept` refuses under the registry lock when a control was recorded after the
-        // previous check or when the request has no lifecycle record.
+        // previous check or when the request has no lifecycle record. Such a control was
+        // already forwarded to the engine when it was recorded; dropping the stream cancels
+        // the engine request in any case.
         if !self.engine.requests.accept(&request_id) {
             let terminal = self
                 .engine
@@ -685,7 +693,6 @@ impl ServingRuntime {
                 .control_terminal(&request_id)
                 .unwrap_or(LifecycleTerminal::Cancelled);
             drop(stream);
-            self.apply_engine_control(&request_id, terminal).await;
             return Ok(self.control_event_stream(request_id, terminal, lifecycle));
         }
 
@@ -744,23 +751,6 @@ impl ServingRuntime {
         let request_id = request_id.into();
         self.engine.abort_request(&request_id).await?;
         Ok(())
-    }
-
-    /// Reissues a control through `EngineClient::abort_request` (for `Aborted`) or
-    /// `cancel_request` (for any other terminal). These signal the engine only while the
-    /// registry still holds the request's claimed engine side. Failures are logged, not
-    /// returned.
-    async fn apply_engine_control(&self, request_id: &str, terminal: LifecycleTerminal) {
-        let result = match terminal {
-            LifecycleTerminal::Aborted => self.engine.abort_request(request_id).await,
-            LifecycleTerminal::Cancelled
-            | LifecycleTerminal::Finished
-            | LifecycleTerminal::Rejected
-            | LifecycleTerminal::Failed => self.engine.cancel_request(request_id).await,
-        };
-        if let Err(error) = result {
-            tracing::warn!(%request_id, %error, "failed to apply pending request control after submission");
-        }
     }
 
     /// Drains requests and shuts down the backing engine.
