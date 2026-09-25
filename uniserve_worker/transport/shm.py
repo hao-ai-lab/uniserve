@@ -259,18 +259,30 @@ class ShmTransport(Transport):
         self, source: _ShmSource, retirement: concurrent.futures.Future[None]
     ) -> None:
         # Called by `Publications` under its lock, once the publication is
-        # retired, its producer has completed and it is settled. The CUDA
-        # registration covers the mapping, so it is removed first.
-        if source.registered is not None:
-            _unregister_segment(source.registered)
-            source.registered = None
-        source.shm.close()
+        # retired, its producer has completed and it is settled.
+        self._free_segment(source.shm, source.nbytes, source.registered)
+        source.registered = None
+        retirement.set_result(None)
+
+    def _free_segment(
+        self, shm: Any, nbytes: int, registered: int | None
+    ) -> None:
+        """Hand one segment and its bytes back.
+
+        The CUDA registration covers the mapping, so it is removed first;
+        the mapping is then closed, the name unlinked and the bytes returned
+        to the rank's budget. The caller must hold no view of the mapping:
+        `SharedMemory.close` raises `BufferError` while one is alive, which
+        would leave the segment linked and its bytes reserved.
+        """
+        if registered is not None:
+            _unregister_segment(registered)
+        shm.close()
         try:
-            source.shm.unlink()
+            shm.unlink()
         except FileNotFoundError:
             pass
-        self._bytes.release(source.nbytes)
-        retirement.set_result(None)
+        self._bytes.release(nbytes)
 
     @staticmethod
     def _settled(source: _ShmSource) -> bool:
@@ -401,8 +413,16 @@ class ShmTransport(Transport):
         self._bytes.acquire(nbytes)
 
         shm = None
+        address = None
         registered = False
         submitted = False
+        # Views of the segment's mapping. A failure drops them before any
+        # cleanup: `SharedMemory.close` raises `BufferError` while one is
+        # alive, which would replace the original error and leave the
+        # segment linked and its bytes reserved.
+        payload: memoryview | None = None
+        packed: torch.Tensor | None = None
+        target: torch.Tensor | None = None
         try:
             shm = allocate_shared_storage(segment.HEADER_BYTES + max(1, nbytes))
             buffer = shm.buf
@@ -429,7 +449,6 @@ class ShmTransport(Transport):
             payload = buffer[segment.HEADER_BYTES :]
 
             packed = torch.frombuffer(payload, dtype=first.dtype).reshape(shape)
-            address = None
             if first.is_cuda:
                 # Device bytes land in the segment itself: its mapping is
                 # page-locked for the copy, and the stream signal marks the
@@ -442,10 +461,6 @@ class ShmTransport(Transport):
                 signal = None
                 for target, value in copy_pairs(source, packed):
                     target.copy_(value)
-                # `target` views the segment's mapping. No such view may
-                # outlive the mapping: `SharedMemory.close` raises
-                # `BufferError` while any view of it is alive.
-                del target, value
                 segment.set_state(buffer, segment.READY)
 
             publication = _ShmSource(
@@ -471,13 +486,18 @@ class ShmTransport(Transport):
                     value.record_stream(stream)
                 signal.schedule(int(stream.cuda_stream))
                 self._queue_publication((locator, publication))
-            del packed, payload
             return locator
         except BaseException:
+            # The table may reclaim the segment synchronously below, and the
+            # unregistered path closes it here, so no view of the mapping
+            # may outlive this point.
+            payload = packed = target = None
+
             # Once registered, the publication table owns the segment: the
             # publication is retired, and a device publication is marked
             # failed and complete so `_reclaim` can unlink it. Before that,
-            # the segment and bytes are returned here.
+            # the segment, its CUDA registration and its bytes are returned
+            # here.
             if registered:
                 self._publications.release(locator)
                 if submitted:
@@ -488,10 +508,9 @@ class ShmTransport(Transport):
                     assert buffer is not None
                     segment.set_state(buffer, segment.FAILED)
                     self._publications.complete(locator)
+            elif shm is not None:
+                self._free_segment(shm, nbytes, address)
             else:
-                if shm is not None:
-                    shm.close()
-                    shm.unlink()
                 self._bytes.release(nbytes)
             raise
 
