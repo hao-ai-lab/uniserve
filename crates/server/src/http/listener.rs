@@ -4,11 +4,18 @@
 //! a Unix-domain listener, obtained according to `HttpListenerMode`.
 //! `crate::http::serve` binds it, logs its inherent `local_addr` string, and
 //! wraps it with `tap_io` to enable `TCP_NODELAY` on TCP connections only.
+//!
+//! A Unix-domain socket bound at a path leaves its file behind when the socket
+//! closes. The listener therefore owns the file of a socket it binds: binding
+//! first removes a stale socket file nobody listens on, and dropping the
+//! listener (at shutdown) removes the file again.
 
-use std::io::Result;
+use std::io::{ErrorKind, Result};
 use std::net::TcpListener as StdTcpListener;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::os::unix::net::UnixListener as StdUnixListener;
+use std::path::{Path, PathBuf};
 
 use socket2::Socket;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
@@ -21,23 +28,69 @@ use crate::HttpListenerMode;
 #[derive(Debug)]
 pub(crate) enum Listener {
     Tcp(TcpListener),
-    Unix(UnixListener),
+    Unix {
+        listener: UnixListener,
+        /// The socket's file when this process bound it at a path; `None` for
+        /// an inherited socket, whose file belongs to its supplier.
+        _socket_file: Option<SocketFile>,
+    },
+}
+
+/// The filesystem entry of a Unix-domain socket this process bound, removed
+/// when dropped.
+///
+/// The entry is identified by device and inode, so removal is skipped when the
+/// path no longer names the bound socket, for example after the file was
+/// deleted and another server bound the same path.
+#[derive(Debug)]
+pub(crate) struct SocketFile {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl Drop for SocketFile {
+    fn drop(&mut self) {
+        let bound = std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode);
+        if bound {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 impl Listener {
     /// Binds or adopts the listener described by the frontend configuration.
     ///
     /// For inherited sockets, the concrete listener kind is detected from the
-    /// socket family of the supplied file descriptor. `BindUnix` fails when a
-    /// file already exists at the socket path.
+    /// socket family of the supplied file descriptor. `BindUnix` first removes
+    /// a stale socket file at its path (see `remove_stale_socket`); it fails
+    /// with `EADDRINUSE` when the path holds a live server's socket or a file
+    /// that is not a socket. The bound socket's file is removed when the
+    /// listener is dropped.
     pub(crate) async fn bind(mode: &HttpListenerMode) -> Result<Self> {
         match mode {
             HttpListenerMode::BindTcp { host, port } => {
                 Ok(Self::Tcp(TcpListener::bind((host.as_str(), *port)).await?))
             }
-            HttpListenerMode::BindUnix { path } => Ok(Self::Unix(UnixListener::bind(path)?)),
+            HttpListenerMode::BindUnix { path } => Self::bind_unix(Path::new(path)).await,
             HttpListenerMode::InheritedFd { fd } => Self::from_inherited_fd(*fd),
         }
+    }
+
+    /// Binds a Unix-domain listener at `path` and takes ownership of its file.
+    async fn bind_unix(path: &Path) -> Result<Self> {
+        remove_stale_socket(path).await?;
+        let listener = UnixListener::bind(path)?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        Ok(Self::Unix {
+            listener,
+            _socket_file: Some(SocketFile {
+                path: path.to_owned(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }),
+        })
     }
 
     /// Returns a log-friendly local address string for either TCP or Unix
@@ -45,7 +98,7 @@ impl Listener {
     pub(crate) fn local_addr(&self) -> Result<String> {
         match self {
             Self::Tcp(listener) => Ok(listener.local_addr()?.to_string()),
-            Self::Unix(listener) => Ok(match listener.local_addr()?.as_pathname() {
+            Self::Unix { listener, .. } => Ok(match listener.local_addr()?.as_pathname() {
                 Some(path) => format!("unix:{}", path.display()),
                 None => "unix:<unnamed>".to_string(),
             }),
@@ -87,12 +140,40 @@ impl Listener {
         // `Socket`'s ownership, so the std listener becomes the only owner.
         if socket.local_addr()?.is_unix() {
             let std_listener = unsafe { StdUnixListener::from_raw_fd(socket.into_raw_fd()) };
-            Ok(Self::Unix(UnixListener::from_std(std_listener)?))
+            Ok(Self::Unix {
+                listener: UnixListener::from_std(std_listener)?,
+                _socket_file: None,
+            })
         } else {
             let std_listener = unsafe { StdTcpListener::from_raw_fd(socket.into_raw_fd()) };
             Ok(Self::Tcp(TcpListener::from_std(std_listener)?))
         }
     }
+}
+
+/// Removes the socket file at `path` when no server listens on it.
+///
+/// A socket whose connection attempt is refused was left behind by a server
+/// that exited without removing it, such as a crashed or killed one. Anything
+/// else at `path` (a live server's socket, a file that is not a socket, or a
+/// socket that cannot be probed) is left in place for `bind` to refuse.
+async fn remove_stale_socket(path: &Path) -> Result<()> {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if !metadata.file_type().is_socket() {
+        return Ok(());
+    }
+    let refused = UnixStream::connect(path)
+        .await
+        .is_err_and(|error| error.kind() == ErrorKind::ConnectionRefused);
+    if refused {
+        match std::fs::remove_file(path) {
+            Err(error) if error.kind() != ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Allows the unified listener to plug directly into `axum::serve(...)`.
@@ -112,7 +193,7 @@ impl axum::serve::Listener for Listener {
                 let (io, addr) = listener.accept().await;
                 (Either::Left(io), Either::Left(addr))
             }
-            Self::Unix(listener) => {
+            Self::Unix { listener, .. } => {
                 let (io, addr) = listener.accept().await;
                 (Either::Right(io), Either::Right(addr))
             }
@@ -123,7 +204,7 @@ impl axum::serve::Listener for Listener {
     fn local_addr(&self) -> Result<Self::Addr> {
         match self {
             Self::Tcp(listener) => listener.local_addr().map(Either::Left),
-            Self::Unix(listener) => listener.local_addr().map(Either::Right),
+            Self::Unix { listener, .. } => listener.local_addr().map(Either::Right),
         }
     }
 }
@@ -168,8 +249,72 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(listener, Listener::Unix(_)));
+        assert!(matches!(listener, Listener::Unix { .. }));
         let _ = std::fs::remove_file(path);
+    }
+
+    /// A socket file left by a server that exited without unlinking it (a
+    /// crash, or a kill) does not prevent a restart on the same path.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_socket_file_is_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("uniserve.sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(path.exists());
+
+        let listener = Listener::bind(&HttpListenerMode::BindUnix {
+            path: path.to_str().unwrap().to_owned(),
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(listener, Listener::Unix { .. }));
+        std::os::unix::net::UnixStream::connect(&path).unwrap();
+    }
+
+    /// Dropping a bound Unix listener, as a clean shutdown does, removes its
+    /// socket file.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_a_unix_listener_removes_its_socket_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("uniserve.sock");
+        let mode = HttpListenerMode::BindUnix {
+            path: path.to_str().unwrap().to_owned(),
+        };
+
+        let listener = Listener::bind(&mode).await.unwrap();
+        assert!(path.exists());
+        drop(listener);
+
+        assert!(!path.exists());
+    }
+
+    /// Only a socket nobody listens on is replaced: a live server's socket and
+    /// a file that is not a socket are left in place and the bind fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_live_socket_or_another_file_is_not_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let live = directory.path().join("live.sock");
+        let server = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        let error = Listener::bind(&HttpListenerMode::BindUnix {
+            path: live.to_str().unwrap().to_owned(),
+        })
+        .await
+        .expect_err("a live server's socket must not be taken over");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        std::os::unix::net::UnixStream::connect(&live).unwrap();
+        drop(server);
+
+        let file = directory.path().join("data.sock");
+        std::fs::write(&file, b"not a socket").unwrap();
+        let error = Listener::bind(&HttpListenerMode::BindUnix {
+            path: file.to_str().unwrap().to_owned(),
+        })
+        .await
+        .expect_err("a regular file must not be replaced");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(std::fs::read(&file).unwrap(), b"not a socket");
     }
 
     #[tokio::test(flavor = "current_thread")]
