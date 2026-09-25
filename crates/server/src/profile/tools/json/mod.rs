@@ -9,8 +9,9 @@
 //!   optional JSON whitespace, emits the call's first delta (name, empty
 //!   arguments), and switches to `Arguments`.
 //! - `Arguments` streams the raw arguments object lexically as argument
-//!   deltas. After the object closes, it expects the wrapper's `}` immediately,
-//!   then the marker whitespace and end marker, and returns to `Text`.
+//!   deltas. After the object closes, it expects the wrapper's `}` after
+//!   optional JSON whitespace, then the marker whitespace and end marker, and
+//!   returns to `Text`.
 //!
 //! Any other header shape, such as reordered or extra keys, is a parse error.
 
@@ -352,12 +353,13 @@ fn argument_delta_event(
 
 /// Parses the wrapper object's `}` and the end marker after the arguments.
 ///
-/// No whitespace is accepted between the arguments object and this `}`.
+/// JSON whitespace may separate the arguments object from this `}`, as it may
+/// separate every other token of the wrapper object.
 fn tool_call_close_event(
     input: &mut JsonToolInput<'_>,
     config: JsonToolCallConfig,
 ) -> ModalResult<JsonToolCallEvent> {
-    let _ = literal("}").parse_next(input)?;
+    let _ = (ws0, literal("}")).parse_next(input)?;
 
     tool_call_end_event(input, config)
 }
