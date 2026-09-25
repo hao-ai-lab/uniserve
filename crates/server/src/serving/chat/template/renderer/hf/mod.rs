@@ -293,6 +293,12 @@ pub(super) struct TemplateTool {
     function: TemplateToolDefinition,
 }
 
+/// Function definition in the shape of an OpenAI request tool.
+///
+/// `None` fields are omitted rather than serialized as null, so a template
+/// that renders the tool with `tojson` sees only the fields a client sets,
+/// as Hugging Face `apply_chat_template` renders the client's tool objects.
+#[serde_with::skip_serializing_none]
 #[derive(Debug, Serialize)]
 struct TemplateToolDefinition {
     name: String,
@@ -978,6 +984,53 @@ mod tests {
         .unwrap();
 
         assert_eq!(rendered, "get_weather|city");
+    }
+
+    /// Tools reach the template in the shape of the client's tool objects:
+    /// optional fields the tool leaves unset are absent rather than null.
+    #[test]
+    fn chat_template_omits_unset_optional_tool_fields() {
+        let parameters = serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+        });
+        let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
+        request.tools = vec![
+            Tool {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: parameters.clone(),
+                strict: None,
+            },
+            Tool {
+                name: "get_time".to_string(),
+                description: Some("Get time".to_string()),
+                parameters: parameters.clone(),
+                strict: Some(true),
+            },
+        ];
+        request.tool_choice = ChatToolChoice::Auto;
+
+        let rendered = render(Some("{{ tools | tojson }}"), &request).unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&rendered).unwrap(),
+            serde_json::json!([
+                {
+                    "type": "function",
+                    "function": {"name": "get_weather", "parameters": parameters},
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_time",
+                        "description": "Get time",
+                        "parameters": parameters,
+                        "strict": true,
+                    },
+                },
+            ])
+        );
     }
 
     #[test]
