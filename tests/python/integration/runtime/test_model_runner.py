@@ -690,6 +690,57 @@ def test_computation_identity_preserves_homogeneous_decode():
     )
 
 
+def test_forward_statistics_count_query_tokens_per_mode():
+    """Forward mode token counters count the query tokens each mode computed.
+
+    A prefill computes every prompt token of every row, and a decode computes
+    one token per row.
+    """
+    prompts = ((3, 4), (7, 8, 9))
+    admissions = (ar_params(45, block_ids=(0,)), ar_params(46, block_ids=(1,)))
+    with execution_worker() as worker:
+        prefills = tuple(
+            token_call(
+                admission.request_key,
+                call_id=CallId(1, index),
+                predecessor=root_parent(admission),
+                mode=ForwardMode.PREFILL,
+                tokens=prompt,
+            )
+            for index, (admission, prompt) in enumerate(
+                zip(admissions, prompts, strict=True)
+            )
+        )
+        prefilled = finalized_report(
+            worker,
+            worker.submit(
+                execution_batch(
+                    batch_id=1, admissions=admissions, calls=prefills
+                )
+            ),
+        )
+        decodes = tuple(
+            token_call(
+                prefill.request_key,
+                call_id=CallId(2, index),
+                predecessor=record_completion(prefill, prefilled).call_id,
+                mode=ForwardMode.DECODE,
+                tokens=(prefilled.completions[index].committed_tokens[0],),
+            )
+            for index, prefill in enumerate(prefills)
+        )
+        decoded = finalized_report(
+            worker,
+            worker.submit(execution_batch(batch_id=2, calls=decodes)),
+        )
+
+    assert prefilled.forward_stats is not None
+    assert prefilled.forward_stats.mode_counts == {"prefill": 1}
+    assert prefilled.forward_stats.mode_tokens == {"prefill": 5}
+    assert decoded.forward_stats is not None
+    assert decoded.forward_stats.mode_tokens == {"decode": 2}
+
+
 @pytest.mark.parametrize(
     ("prefill_graphs", "continuation"),
     ((False, False), (False, True), (True, True)),

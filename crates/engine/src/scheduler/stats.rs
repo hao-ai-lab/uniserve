@@ -184,7 +184,8 @@ impl ExecutionDomainStats {
 pub struct WorkerStats {
     /// Forward invocation counts keyed by worker runtime mode.
     pub forward_mode_counts: Mutex<BTreeMap<String, u64>>,
-    /// Forward token counts keyed by worker runtime mode.
+    /// Forward query-token counts keyed by worker runtime mode; modes without
+    /// a token notion have no entry.
     pub forward_mode_tokens: Mutex<BTreeMap<String, u64>>,
     /// Forward execution time keyed by worker runtime mode, in microseconds.
     pub forward_mode_us: Mutex<BTreeMap<String, u64>>,

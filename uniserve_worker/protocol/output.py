@@ -439,6 +439,11 @@ class ForwardStats:
     (`forward_stats_from_py` in `crates/worker-ipc-py`) requires each counter
     of the Rust `ForwardStats`, so a field renamed or removed here fails the
     whole batch result.
+
+    ``mode_counts`` and ``mode_us`` count calls and their time by forward
+    mode. ``mode_tokens`` counts the query tokens those calls computed, so a
+    mode without a token notion (encoder and decoder calls, standalone module
+    invocations) has no entry there.
     """
 
     mode_counts: Mapping[str, int] = field(default_factory=dict)

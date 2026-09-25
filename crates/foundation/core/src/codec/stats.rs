@@ -80,7 +80,9 @@ pub struct ForwardStats {
     /// Forward executions grouped by runtime mode.
     #[serde(default)]
     pub mode_counts: BTreeMap<String, u64>,
-    /// Tokens processed by runtime mode.
+    /// Query tokens computed by runtime mode. Modes without a token notion
+    /// (encoder and decoder calls, standalone module invocations) have no
+    /// entry, while `mode_counts` and `mode_us` still count them.
     #[serde(default)]
     pub mode_tokens: BTreeMap<String, u64>,
     /// Forward time in microseconds by runtime mode.

@@ -39,6 +39,20 @@ class InputBatch(Generic[InputT]):
     def row_count(self) -> int:
         return self.request_pool_indices.numel()
 
+    @property
+    def query_tokens(self) -> int | None:
+        """Query tokens the batch computes, including any padding sequences.
+
+        The sum of the attention input's host query lengths: every token a
+        text row appends after its cached prefix, or every latent token a
+        denoising row attends from. None when the input carries no attention
+        sequences with host lengths, as encoder and decoder inputs do not.
+        """
+        attention = getattr(self.inputs, "attention", None)
+        queries = getattr(attention, "queries", None)
+        lengths = None if queries is None else queries.host
+        return None if lengths is None else sum(lengths)
+
     def __post_init__(self):
         if self.request_pool_indices.ndim != 1 or self.row_count < 1:
             raise ValueError(
