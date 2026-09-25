@@ -148,7 +148,9 @@ class BenchmarkTask:
         """Add configured text-sampling fields to an endpoint payload.
 
         Optional fields are added only when configured. `extra_body` is merged
-        last, so its keys override every field set here.
+        last, so its keys override every field set here. Chat tasks call this
+        after setting their own fields, such as the output limit, so
+        `extra_body` overrides those as well.
         """
         sampling = self.point.sampling
         payload["temperature"] = sampling.temperature
