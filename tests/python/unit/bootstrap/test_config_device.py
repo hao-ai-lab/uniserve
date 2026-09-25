@@ -39,6 +39,24 @@ def test_expert_devices_reject_inconsistent_rank_or_repeated_devices(
         )
 
 
+def test_storage_fraction_may_grant_the_whole_device(tmp_path) -> None:
+    # The fraction is a share of each device's total storage that the grant
+    # also bounds by the storage free at startup, so one is a valid share.
+    config = worker_args(tmp_path, kv_memory_fraction=1.0)
+
+    assert config.execution.kv_storage_fraction == 1.0
+
+
+@pytest.mark.parametrize(
+    "fraction", [0.0, -0.5, 1.5, float("nan"), float("inf")]
+)
+def test_storage_fraction_outside_the_unit_interval_is_refused(
+    fraction, tmp_path
+) -> None:
+    with pytest.raises(SystemExit):
+        worker_args(tmp_path, kv_memory_fraction=fraction)
+
+
 def test_quantization_config_defaults_to_model_policy(tmp_path) -> None:
     config = worker_args(
         tmp_path,

@@ -75,7 +75,8 @@ pub struct WorkerConfig {
     ///
     /// Distinct WorkerGroups may share one physical GPU. Their configured
     /// shares must leave enough aggregate headroom for the device runtime;
-    /// validation checks each group alone, never the sum across groups.
+    /// validation checks each group alone, never the sum across groups, and
+    /// accepts the range [`WorkerConfig::validate_storage_fraction`] states.
     #[serde(default)]
     #[serde(rename = "memory_fraction")]
     pub storage_fraction: Option<f64>,
@@ -85,8 +86,8 @@ impl WorkerConfig {
     /// Validates one WorkerGroup in isolation.
     ///
     /// Fails when the identity is not a valid `WorkerId`, `queue_depth` is
-    /// zero, `storage_fraction` is set outside (0, 1], or `validate_members`
-    /// rejects the ranks and components.
+    /// zero, `validate_storage_fraction` refuses a set `storage_fraction`, or
+    /// `validate_members` rejects the ranks and components.
     pub fn validate(&self) -> anyhow::Result<()> {
         WorkerId::new(self.id.0.clone())?;
         anyhow::ensure!(
@@ -95,13 +96,27 @@ impl WorkerConfig {
             self.id
         );
         if let Some(fraction) = self.storage_fraction {
-            anyhow::ensure!(
-                fraction.is_finite() && fraction > 0.0 && fraction <= 1.0,
-                "worker {} storage fraction must be finite and in (0, 1]",
-                self.id
-            );
+            Self::validate_storage_fraction(fraction)
+                .map_err(|error| anyhow::anyhow!("worker {}: {error}", self.id))?;
         }
         Self::validate_members(&self.ranks, &self.components)?;
+        Ok(())
+    }
+
+    /// Checks a per-process device storage fraction: a group's
+    /// `storage_fraction` or the engine-wide
+    /// `WorkerProcessArgs::kv_storage_fraction` default.
+    ///
+    /// Each rank grants itself this share of every device's total storage,
+    /// less what its process already holds and never more than the device
+    /// has free, so any finite value in (0, 1] is meaningful, 1 granting the
+    /// whole device. The worker refuses any other value at startup; checking
+    /// here refuses it before a rank is launched.
+    pub fn validate_storage_fraction(fraction: f64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            fraction.is_finite() && fraction > 0.0 && fraction <= 1.0,
+            "storage fraction {fraction} must be finite and in (0, 1]"
+        );
         Ok(())
     }
 
