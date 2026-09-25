@@ -146,8 +146,9 @@ pub struct Config {
     /// Optional timeout until a request's response head is returned; streamed
     /// response bodies (chat SSE and video downloads) are not bounded by it.
     pub request_timeout: Option<Duration>,
-    /// Optional front-door HTTP admission limit for in-flight inference
-    /// requests.
+    /// Optional HTTP admission limit for in-flight chat completion and image
+    /// generation requests. Video requests are bounded by the video job slots
+    /// instead.
     pub max_concurrent_requests: Option<u64>,
     /// Maximum time to wait for active HTTP requests to drain on shutdown.
     /// Zero aborts the server as soon as shutdown begins.

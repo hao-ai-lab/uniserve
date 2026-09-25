@@ -7,9 +7,11 @@
 //!
 //! Three bounds apply, each advertised by the video `capabilities` route:
 //!
-//! - `MAX_VIDEO_JOBS` job slots. A slot is taken by `VideoJobs::reserve` before
-//!   submission and stays taken while either the record or its generation task
-//!   exists.
+//! - `MAX_VIDEO_JOBS` job slots, shared by both video submission routes. A
+//!   slot is taken by `VideoJobs::reserve` before submission. An asynchronous
+//!   job keeps it while either its record or its generation task exists; a
+//!   synchronous request keeps it until its response body has been sent or
+//!   dropped.
 //! - `MAX_VIDEO_BYTES` of artifact bytes, counting artifacts retained by a job
 //!   and artifacts held by an unfinished download.
 //! - `VIDEO_RETENTION`, after which a completed or failed job's record is
@@ -87,7 +89,8 @@ struct RetainedJob {
 /// A job slot acquired before submission and not yet bound to a record.
 ///
 /// Dropping it releases the slot, so a caller that abandons a request between
-/// admission and job creation leaves no record behind.
+/// admission and job creation leaves no record behind. The synchronous video
+/// route never binds its slot to a record; its response body holds the slot.
 pub(crate) struct JobSlot(OwnedSemaphorePermit);
 
 /// A job's cancellation token together with its job slot.
@@ -173,7 +176,7 @@ impl VideoJobs {
             .try_acquire_owned()
             .map(JobSlot)
             .map_err(|_| {
-                "video job limit reached; delete retained jobs or wait for cancellations to drain"
+                "video job limit reached; delete retained jobs or wait for running video requests to finish"
             })
     }
 
