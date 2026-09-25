@@ -6,7 +6,9 @@
 //! visible output with a `DelimitedReasoningParser`, then strips the profile's
 //! visible-wrapper delimiters from the visible part. Both stages match
 //! delimiters as text and hold back a trailing fragment that may begin a
-//! delimiter split across pushes.
+//! delimiter split across pushes; the assembler calls
+//! [`SenseNovaOutputProcessor::finish`] at the end of the stream to release
+//! it.
 
 use crate::profile::omni::{DelimitedTextPolicy, OutputFilterPolicy};
 use crate::profile::reasoning::DelimitedReasoningParser;
@@ -57,7 +59,7 @@ impl SenseNovaOutputProcessor {
     /// Applies one decoded text fragment and returns semantic deltas.
     ///
     /// Either part of the delta may be empty while a possible delimiter prefix
-    /// is held back.
+    /// is held back until a later push or `finish` releases it.
     pub(crate) fn push(&mut self, text: &str) -> SenseNovaTextDelta {
         let (content, reasoning) = if let Some(parser) = self.reasoning.as_mut() {
             let delta = parser.push(text);
@@ -72,6 +74,29 @@ impl SenseNovaOutputProcessor {
             visible: self.visible_wrappers.push(&content),
             reasoning,
         }
+    }
+
+    /// Releases every held-back fragment at the end of the stream.
+    ///
+    /// Call once, after the final `push`. No later text can complete a
+    /// delimiter, so a held fragment is ordinary text of its current region:
+    /// the reasoning parser's buffered partial delimiter becomes reasoning or
+    /// visible text (`DelimitedReasoningParser::finish`), visible text still
+    /// passes the wrapper filter, and the filter's held partial wrapper
+    /// delimiter is emitted as visible text.
+    pub(crate) fn finish(&mut self) -> SenseNovaTextDelta {
+        let (content, reasoning) = if let Some(parser) = self.reasoning.as_mut() {
+            let delta = parser.finish();
+            (
+                delta.content.unwrap_or_default(),
+                delta.reasoning.unwrap_or_default(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        let mut visible = self.visible_wrappers.push(&content);
+        visible.push_str(&self.visible_wrappers.finish());
+        SenseNovaTextDelta { visible, reasoning }
     }
 }
 
@@ -120,6 +145,14 @@ impl VisibleWrapperFilter {
         }
 
         visible
+    }
+
+    /// Returns the held trailing fragment at the end of the stream.
+    ///
+    /// The fragment is a proper prefix of a delimiter that can no longer
+    /// complete, so it is visible text.
+    fn finish(&mut self) -> String {
+        std::mem::take(&mut self.pending)
     }
 
     /// Returns all configured output markers.
