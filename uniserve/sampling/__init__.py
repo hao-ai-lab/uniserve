@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from .categorical import sample_categorical
 from .greedy import greedy
 from .top_k import sample_top_k
 
@@ -77,4 +78,4 @@ class SamplingParams:
             raise ValueError("seed must be a nonnegative integer")
 
 
-__all__ = ["SamplingParams", "greedy", "sample_top_k"]
+__all__ = ["SamplingParams", "greedy", "sample_categorical", "sample_top_k"]
