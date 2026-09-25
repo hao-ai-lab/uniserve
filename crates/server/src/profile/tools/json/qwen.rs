@@ -3,11 +3,13 @@
 use super::{JsonToolCallConfig, JsonToolCallParser};
 use crate::profile::tools::{Result, Tool, ToolParserOutput};
 
+/// The newlines belong to the delimiters, as in the format the Qwen3 chat
+/// template instructs and SGLang's Qwen detector matches, so a bare
+/// `<tool_call>` tag in prose stays plain text.
 const QWEN_XML_CONFIG: JsonToolCallConfig = JsonToolCallConfig {
     parser_name: "Qwen XML",
-    start_marker: "<tool_call>",
-    end_marker: "</tool_call>",
-    marker_whitespace: "\n",
+    start_delimiter: "<tool_call>\n",
+    end_delimiter: "\n</tool_call>",
     name_key: "name",
     arguments_key: &["arguments"],
 };
@@ -219,7 +221,7 @@ mod tests {
     }
 
     /// Without the newline after `<tool_call>` the block is not a tool call,
-    /// and `finish` returns the whole input as plain text.
+    /// and the whole input is plain text.
     #[test]
     fn qwen_xml_requires_newline_after_tool_call_start() {
         let mut parser = Qwen3XmlToolParser::new(&test_tools());
@@ -230,6 +232,37 @@ mod tests {
 
         assert_eq!(output.normal_text, input);
         assert!(output.calls.is_empty());
+    }
+
+    /// A `<tool_call>` tag that does not start a tool call streams out as
+    /// text with its chunk instead of holding back all later text.
+    #[test]
+    fn qwen_xml_streams_text_after_tag_without_newline() {
+        let mut parser = Qwen3XmlToolParser::new(&test_tools());
+
+        let first = parser.parse_chunk("Use the <tool_call> tag.").unwrap();
+        let second = parser.parse_chunk(" More.").unwrap();
+
+        assert_eq!(first.normal_text, "Use the <tool_call> tag.");
+        assert_eq!(second.normal_text, " More.");
+    }
+
+    /// A tag that does not start a tool call leaves later well-formed calls
+    /// in the same response parseable.
+    #[test]
+    fn qwen_xml_parses_tool_call_after_tag_without_newline() {
+        let mut parser = Qwen3XmlToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(&format!(
+                "<tool_call> x\n{}",
+                build_tool_call("add", r#"{"x":1}"#)
+            ))
+            .unwrap();
+
+        assert_eq!(output.normal_text, "<tool_call> x\n");
+        assert_eq!(output.calls.len(), 1);
+        assert_eq!(output.calls[0].name.as_deref(), Some("add"));
+        assert_eq!(output.calls[0].arguments, r#"{"x":1}"#);
     }
 
     /// JSON whitespace between the arguments object and the wrapper's closing
