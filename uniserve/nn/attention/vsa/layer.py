@@ -229,16 +229,20 @@ class Attention(nn.Module):
         local_prefix = max(0, min(tiles, prefix - query_tile_offset))
         local_video = max(0, min(tiles, valid - query_tile_offset))
 
-        # One pass writes every query tile's key-tile list: prefix tiles
-        # attend densely, video tiles to the prefix plus their top-scoring
-        # video tiles, padding tiles to one tile.
+        # One pass writes every query tile's key-tile list: occupied prefix
+        # tiles attend densely to the live key tiles, video tiles to the live
+        # prefix plus their top-scoring video tiles, and empty or padding
+        # tiles to one tile.
         indices, counts = workspace.block_indices, workspace.block_counts
         vsa_tiles.write_block_map(
             scores[:, local_prefix:local_video, prefix:valid],
             inputs.prefix_key_indices,
             inputs.dense_key_indices,
+            inputs.prefix_count,
+            inputs.valid_sizes,
             indices,
             counts,
+            query_tile_offset=query_tile_offset,
             local_prefix=local_prefix,
             local_video=local_video,
             prefix_tiles=prefix,

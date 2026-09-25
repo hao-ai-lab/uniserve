@@ -268,3 +268,112 @@ def test_row_production_over_many_intervals_matches_one_call(stream):
         torch.testing.assert_close(
             produced[live], expected[live], rtol=2e-2, atol=2e-2
         )
+
+
+@pytest.mark.parametrize("provider", ["sm100", "cute", "flashinfer", "triton"])
+@torch.inference_mode()
+def test_empty_prefix_tiles_leave_live_rows_unchanged(provider, stream):
+    """A prefix tile without valid rows changes no live row's attention.
+
+    The capacity domain holds a text region of two tiles for a prompt that
+    fills one: its second text tile has no valid rows and carries large
+    values, and the live prefix lists name only the text and audio tiles.
+    Every live row must attend exactly as in the domain without that tile.
+    """
+    from uniserve.runtime.backends.attention import vsa as providers
+
+    if not import_module(f"{providers.__name__}.{provider}").available(
+        torch.device("cuda")
+    ):
+        pytest.skip(f"VSA provider {provider} is unavailable on this device")
+
+    torch.manual_seed(4211)
+    device = torch.device("cuda")
+    heads = 3
+    # Exact domain: text, audio, four video tiles, two padding tiles.
+    exact_valid = [40, 30, 64, 64, 64, 50, 0, 0]
+    # Capacity domain: text, empty text, audio, four video tiles, padding.
+    capacity_valid = [40, 0, 30, 64, 64, 64, 50, 0]
+    live_rows = torch.cat(
+        [
+            torch.arange(tile * 64, tile * 64 + count)
+            for tile, count in enumerate(exact_valid)
+        ]
+    ).to(device)
+    capacity_tiles = torch.tensor([0, 2, 3, 4, 5, 6], device=device)
+    capacity_rows = torch.cat(
+        [
+            torch.arange(tile * 64, tile * 64 + capacity_valid[tile])
+            for tile in capacity_tiles.tolist()
+        ]
+    ).to(device)
+
+    exact = torch.randn(512, heads, 4, 128, device=device, dtype=torch.bfloat16)
+    capacity = torch.full_like(exact, 100.0)
+    capacity[capacity_rows] = exact[live_rows]
+
+    def domain(valid, prefix_tiles, live_prefix):
+        valid = torch.tensor(valid, device=device, dtype=torch.int32)
+        prefix = torch.zeros(prefix_tiles, device=device, dtype=torch.int32)
+        prefix[: len(live_prefix)] = torch.tensor(live_prefix)
+        dense = torch.zeros(prefix_tiles + 4, device=device, dtype=torch.int32)
+        dense[: len(live_prefix) + 4] = torch.tensor(
+            [*live_prefix, *range(prefix_tiles, prefix_tiles + 4)]
+        )
+        inputs = vsa.Input(
+            padded_tokens=512,
+            prefix_tiles=prefix_tiles,
+            video_tiles=4,
+            valid_tiles=prefix_tiles + 4,
+            valid_sizes=valid,
+            prefix_key_indices=prefix,
+            dense_key_indices=dense,
+            prefix_count=torch.tensor(
+                [len(live_prefix)], device=device, dtype=torch.int32
+            ),
+        )
+
+        def tensor(shape, dtype=torch.float32):
+            return torch.empty(shape, device=device, dtype=dtype)
+
+        workspace = vsa.Workspace(
+            attention_output=tensor((512, heads, 128), torch.bfloat16),
+            tile_scores=tensor((heads, 8, 8)),
+            block_counts=tensor((heads, 8), torch.int32),
+            block_indices=tensor((heads, 8, 8), torch.int32),
+            pooled_query=tensor((8, heads, 128)),
+            pooled_key=tensor((8, heads, 128)),
+            pooled_value=tensor((8, heads, 128)),
+            compressed_tiles=tensor((heads, 8, 128)),
+        )
+        return inputs, workspace
+
+    module = vsa.Attention(vsa.BlockAttention(128**-0.5))
+    stream.wait(torch.cuda.current_stream())
+    with ExecutionContext(module, stream=stream, vsa=provider) as context:
+        context.prepare(None)
+        results = []
+        for projections, (inputs, workspace) in (
+            (exact, domain(exact_valid, 2, (0, 1))),
+            (capacity, domain(capacity_valid, 3, (0, 2))),
+        ):
+            q, k, v, gate = projections.unbind(2)
+            result = torch.empty_like(q)
+            chunks = (
+                (
+                    slice(start, stop),
+                    tuple(value[start:stop] for value in (q, k, v, gate)),
+                )
+                for start, stop in ((0, 256), (256, 512))
+            )
+            for interval, output in module.forward_chunks(
+                chunks, inputs, selected_tiles=2, workspace=workspace
+            ):
+                result[interval].copy_(output)
+            results.append(result)
+        torch.testing.assert_close(
+            results[1][capacity_rows],
+            results[0][live_rows],
+            rtol=2e-2,
+            atol=2e-2,
+        )

@@ -14,8 +14,11 @@ class VsaBinding:
     backing.
     """
 
-    def __init__(self, backend, allocate, scratch, shared_buffers, exchange):
-        self.backend, self.allocate, self.scratch = backend, allocate, scratch
+    def __init__(self, backend, transient, scratch, shared_buffers, exchange):
+        # ``transient(role, requirements, device)`` lends the context's
+        # shared per-call work areas (``ExecutionContext.scratch``);
+        # ``scratch`` allocates the operators' own workspace.
+        self.backend, self.transient, self.scratch = backend, transient, scratch
         self._shared_buffers, self.exchange = shared_buffers, exchange
         self.operators, self._buffers = {}, {}
 
@@ -39,6 +42,7 @@ class VsaBinding:
                 pattern,
                 **options,
                 workspace=self.scratch(requirements, q.device),
+                transient=self.transient,
             )
 
         return self.operators[key]
