@@ -5,6 +5,7 @@ The ownership covers concrete execution and completion resources.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
@@ -161,6 +162,43 @@ def test_failed_submissions_cannot_be_reused_and_allow_shutdown() -> None:
         3,
     ]
     assert responses[3]["kind"] == "ok"
+
+
+def test_execution_failure_is_logged_under_the_submit_request(
+    caplog,
+) -> None:
+    """A batch accepted for execution and failed there names its request.
+
+    The failure reaches the engine as an error response to the submission and
+    is logged as a failed ``submit`` request.
+    """
+    with execution_worker(queue_depth=1) as worker:
+        # The admission is decoded and accepted, then refused when execution
+        # installs it into a request slot the worker does not have.
+        admission = replace(
+            ar_params(92), request_pool_idx=worker.info.request_slots + 1
+        )
+        endpoint = QueuedWorkerIpc(
+            (
+                _request(
+                    1, execution_batch(batch_id=1, admissions=(admission,))
+                ),
+                {"kind": "close", "message_id": 2},
+            )
+        )
+        with caplog.at_level(logging.WARNING, logger="uniserve_worker"):
+            worker.bind(endpoint).run()
+
+    responses = _by_call(endpoint)
+    assert responses[1]["kind"] == "error"
+    assert responses[1]["code"] == "InvalidDescriptor"
+    failures = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("worker request ")
+    ]
+    assert len(failures) == 1
+    assert failures[0].startswith("worker request 'submit' failed")
 
 
 def test_a_batch_id_that_does_not_advance_is_refused_before_new_admission() -> (
