@@ -68,7 +68,7 @@ impl AppState {
         self
     }
 
-    /// Configures the per-request HTTP timeout.
+    /// Configures the HTTP timeout until a response head is returned.
     pub fn with_request_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.request_timeout = timeout;
         self

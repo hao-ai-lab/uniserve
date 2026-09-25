@@ -236,7 +236,9 @@ pub(crate) struct SharedRuntimeArgs {
     /// Bearer token accepted by public serving API routes.
     #[arg(long = "api-key")]
     pub api_key: Option<String>,
-    /// Per-request wall-clock timeout, in seconds.
+    /// Timeout, in seconds, until a request's response head is sent; an
+    /// expired request is answered with 504. Streamed bodies (chat completion
+    /// SSE streams and video downloads) are not bounded by it.
     #[arg(long = "request-timeout", value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
     pub request_timeout: Option<u64>,
     /// Front-door HTTP admission limit for in-flight inference requests.
