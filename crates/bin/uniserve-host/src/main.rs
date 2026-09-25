@@ -5,11 +5,11 @@
 //! so a launcher connects out to the head, presents its host identity, receives
 //! the launch descriptors of the ranks placed on its host, of every worker
 //! group the deployment places there, spawns them, reports their exits by
-//! worker and rank, stops one group's ranks on instruction ahead of that
-//! group's relaunch, and terminates them all when the head's connection
-//! closes. For a group whose first rank it runs, it also holds the bound
-//! socket that rank serves the group's collective store on, from the head's
-//! reservation until the rank inherits it at spawn.
+//! worker, generation and rank, stops one group's ranks on instruction ahead
+//! of that group's relaunch, and terminates them all when the head's
+//! connection closes. For a group whose first rank it runs, it also holds the
+//! bound socket that rank serves the group's collective store on, from the
+//! head's reservation until the rank inherits it at spawn.
 //!
 //! It does nothing else. The head derives every launch value once, so a
 //! launcher's command line is the head's address and its own host identity.
@@ -17,6 +17,12 @@
 //! The connection carries newline-delimited JSON. The head's side is the
 //! engine's `LauncherRegistry`, whose instruction and report types these must
 //! stay field-compatible with.
+//!
+//! Every spawn names the generation of its worker group that the head is
+//! launching, and the rank's exit report echoes it. The head relaunches a
+//! group under a new generation after stopping it, so an exit this launcher
+//! reported just before it read the stop is recognized as the stopped
+//! generation's rather than the relaunch's.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -67,10 +73,13 @@ enum Instruction {
 #[derive(Deserialize)]
 struct Spawn {
     /// Rank within its worker group's process world, not host-relative.
-    /// Exits are reported by worker group and this rank.
+    /// Exits are reported by worker group, generation and this rank.
     rank: u32,
     /// Worker group the rank belongs to.
     worker_id: String,
+    /// The group generation the head is launching; the rank's exit report
+    /// carries it back.
+    generation: u64,
     /// Ranks in the worker group's process world.
     world_size: u32,
     /// Interpreter that runs the worker module.
@@ -88,6 +97,8 @@ struct Spawn {
 #[derive(Serialize)]
 struct Exit<'a> {
     worker_id: &'a str,
+    /// The group generation the rank's spawn named.
+    generation: u64,
     rank: u32,
     /// Exit status text, or the reason the status could not be read.
     status: &'a str,
@@ -99,6 +110,8 @@ type RankKey = (String, u32);
 /// One rank this launcher owns.
 struct Rank {
     child: Child,
+    /// The group generation the rank's spawn named.
+    generation: u64,
     /// Retains the descriptor file until the rank has read it; dropping the
     /// `Rank` deletes the directory.
     _descriptor: tempfile::TempDir,
@@ -297,6 +310,7 @@ fn start_rank(
     tracing::debug!(rank = spawn.rank, host = %args.host_identity, "spawned");
     Ok(Rank {
         child,
+        generation: spawn.generation,
         _descriptor: directory,
     })
 }
@@ -307,16 +321,18 @@ fn start_rank(
 fn report_exits(writer: &mut TcpStream, ranks: &mut HashMap<RankKey, Rank>) -> anyhow::Result<()> {
     let mut exited = Vec::new();
     for (key, owned) in ranks.iter_mut() {
-        match owned.child.try_wait() {
-            Ok(Some(status)) => exited.push((key.clone(), status.to_string())),
-            Ok(None) => {}
-            Err(error) => exited.push((key.clone(), format!("exit status unreadable: {error}"))),
-        }
+        let status = match owned.child.try_wait() {
+            Ok(Some(status)) => status.to_string(),
+            Ok(None) => continue,
+            Err(error) => format!("exit status unreadable: {error}"),
+        };
+        exited.push((key.clone(), owned.generation, status));
     }
-    for ((worker_id, rank), status) in exited {
+    for ((worker_id, rank), generation, status) in exited {
         ranks.remove(&(worker_id.clone(), rank));
         let report = serde_json::to_string(&Exit {
             worker_id: &worker_id,
+            generation,
             rank,
             status: &status,
         })?;
@@ -324,7 +340,7 @@ fn report_exits(writer: &mut TcpStream, ranks: &mut HashMap<RankKey, Rank>) -> a
             .write_all(format!("{report}\n").as_bytes())
             .context("reporting a rank exit to the head")?;
         writer.flush().context("flushing a rank exit report")?;
-        tracing::warn!(worker = %worker_id, rank, status = %status, "a rank exited");
+        tracing::warn!(worker = %worker_id, generation, rank, status = %status, "a rank exited");
     }
     Ok(())
 }

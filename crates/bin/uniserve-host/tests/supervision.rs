@@ -85,16 +85,19 @@ fn groups_reserve_distinct_ports_and_exits_arrive_without_another_instruction() 
         stream,
         "{}",
         serde_json::json!({"spawn": {
-            "rank": 0, "worker_id": "first", "world_size": 1,
+            "rank": 0, "worker_id": "first", "generation": 3, "world_size": 1,
             "python": "/bin/false", "descriptor": {}, "environment": {}
         }})
     )
     .unwrap();
 
     // No further instruction is sent: the report must come from the
-    // launcher's own polling of its ranks.
+    // launcher's own polling of its ranks. It names the generation the
+    // rank's spawn carried, which is how the head tells it from an exit of
+    // the same rank before its group was relaunched.
     let exit = receive(&mut reader);
     assert_eq!(exit["worker_id"], "first");
+    assert_eq!(exit["generation"], 3);
     assert_eq!(exit["rank"], 0);
     assert_eq!(exit["status"], "exit status: 1");
 }
@@ -131,7 +134,7 @@ fn the_first_rank_serves_its_store_on_the_reserved_port() {
         stream,
         "{}",
         serde_json::json!({"spawn": {
-            "rank": 0, "worker_id": "group", "world_size": 2,
+            "rank": 0, "worker_id": "group", "generation": 0, "world_size": 2,
             "python": "python3", "descriptor": {},
             "environment": {"PYTHONPATH": modules.path()}
         }})
@@ -150,8 +153,12 @@ fn the_first_rank_serves_its_store_on_the_reserved_port() {
 
     let exit = receive(&mut reader);
     assert_eq!(
-        (exit["worker_id"].as_str(), exit["rank"].as_u64()),
-        (Some("group"), Some(0))
+        (
+            exit["worker_id"].as_str(),
+            exit["generation"].as_u64(),
+            exit["rank"].as_u64()
+        ),
+        (Some("group"), Some(0), Some(0))
     );
     assert_eq!(exit["status"], "exit status: 0");
     // The launcher kept no copy of the socket it handed over, so the port
