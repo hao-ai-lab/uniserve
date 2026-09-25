@@ -558,6 +558,50 @@ fn cache_controls_preserve_isolation_and_prompt_logprob_requirements() {
     }
 }
 
+/// A streamed chat response has no field for prompt logprobs. A streamed
+/// request with `prompt_logprobs: 0`, which the route accepts like vLLM does,
+/// therefore requests no prompt scoring and keeps prefix-cache reads, while
+/// the same buffered request still requests them.
+#[test]
+fn streamed_chat_does_not_request_undeliverable_prompt_logprobs() {
+    for (description, model_type) in [
+        (ModelDescription::Qwen3, "qwen3"),
+        (ModelDescription::SenseNova, "neo_chat"),
+        (ModelDescription::Bagel, "bagel"),
+    ] {
+        let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
+        for stream in [true, false] {
+            let request: uniserve_server::openai::ChatCompletionRequest =
+                serde_json::from_value(serde_json::json!({
+                    "model": processor.served_model_name(),
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "modalities": ["text"],
+                    "stream": stream,
+                    "prompt_logprobs": 0
+                }))
+                .unwrap();
+
+            let (generation, response) = processor
+                .preprocess_chat_request(ServeRequestId::new("stream-prompt-logprobs"), request)
+                .unwrap();
+
+            assert_eq!(
+                response.prompt_logprobs_requested, !stream,
+                "{model_type} stream={stream}"
+            );
+            assert_eq!(
+                generation.sampling.prompt_logprobs_requested(),
+                !stream,
+                "{model_type} stream={stream}"
+            );
+            assert_eq!(
+                generation.cache.read, stream,
+                "{model_type} stream={stream}"
+            );
+        }
+    }
+}
+
 /// Negative seeds are accepted and reinterpreted as their two's-complement
 /// `u64` value, and a logprob count of `-1` requests every candidate
 /// (`u32::MAX`) while values below `-1` are rejected, for every token model.

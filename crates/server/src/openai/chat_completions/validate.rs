@@ -28,7 +28,8 @@ pub fn validate_request_compat(
 
         // Stream chunks (`ChatCompletionStreamResponse`) have no
         // `prompt_logprobs` field, so a streamed response could not deliver
-        // them.
+        // them. A streamed `0` is accepted, as vLLM accepts it, and
+        // `preprocess_chat_request` drops it.
         if request.stream && (prompt_logprobs > 0 || prompt_logprobs == -1) {
             bail_invalid_request!(
                 param = "prompt_logprobs",
