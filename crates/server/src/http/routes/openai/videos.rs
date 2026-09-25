@@ -135,11 +135,12 @@ pub(crate) async fn videos_sync(
 /// Both content types deserialize into the same `VideoGenerationRequest`, whose
 /// `deny_unknown_fields` rejects unknown JSON fields. The multipart path admits
 /// only the text fields `model`, `prompt`, `seconds`, and `seed`, rejects file
-/// parts and repeated fields, and parses `seconds` and `seed` as numbers before
-/// deserializing. Every rejection is `400 Bad Request` except an unsupported
-/// content type, which is `415 Unsupported Media Type`. Semantic checks (served
-/// model, prompt, duration) happen later, in `InputProcessor::video_sampling`
-/// and `InputProcessor::preprocess_video_request`.
+/// parts and repeated fields, and parses `seconds` as a finite number and
+/// `seed` as an unsigned integer before deserializing. Every rejection is
+/// `400 Bad Request` except an unsupported content type, which is
+/// `415 Unsupported Media Type`. Semantic checks (served model, prompt,
+/// duration) happen later, in `InputProcessor::video_sampling` and
+/// `InputProcessor::preprocess_video_request`.
 pub(crate) struct VideoBody(pub VideoGenerationRequest);
 
 impl<S: Send + Sync> axum::extract::FromRequest<S> for VideoBody {
@@ -187,11 +188,21 @@ impl<S: Send + Sync> axum::extract::FromRequest<S> for VideoBody {
                     ApiError::invalid_request(error.to_string(), None).into_response()
                 })?;
                 let value = match name.as_str() {
-                    "seconds" => serde_json::to_value(value.parse::<f64>().map_err(|_| {
-                        ApiError::invalid_request("seconds must be numeric", Some("seconds"))
+                    // `f64` parsing also accepts `inf`, `NaN`, and overflowing
+                    // literals, which a JSON number cannot represent. They are
+                    // refused here, as the JSON body parser refuses them.
+                    "seconds" => value
+                        .parse::<f64>()
+                        .ok()
+                        .and_then(serde_json::Number::from_f64)
+                        .map(serde_json::Value::Number)
+                        .ok_or_else(|| {
+                            ApiError::invalid_request(
+                                "seconds must be a finite number",
+                                Some("seconds"),
+                            )
                             .into_response()
-                    })?)
-                    .unwrap_or_default(),
+                        })?,
                     "seed" => serde_json::Value::from(value.parse::<u64>().map_err(|_| {
                         ApiError::invalid_request("seed must be an unsigned integer", Some("seed"))
                             .into_response()
@@ -537,6 +548,29 @@ mod tests {
         assert_eq!(left, right);
         assert_eq!(left.seconds, Some(5.5));
         assert_eq!(left.seed, 42);
+    }
+
+    /// A duration Rust parses as a float but JSON cannot carry (infinite, NaN,
+    /// or overflowing) is a bad request, as it is for a JSON body, rather than
+    /// a request for the default duration.
+    #[tokio::test]
+    async fn a_non_finite_multipart_duration_is_rejected() {
+        for seconds in ["inf", "-infinity", "NaN", "1e400"] {
+            let multipart = axum::extract::Request::builder()
+                .header(header::CONTENT_TYPE, "multipart/form-data; boundary=clip")
+                .body(Body::from(format!(
+                    "--clip\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nFastH3\r\n\
+                     --clip\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nA river\r\n\
+                     --clip\r\nContent-Disposition: form-data; name=\"seconds\"\r\n\r\n{seconds}\r\n\
+                     --clip--\r\n"
+                )))
+                .unwrap();
+
+            match VideoBody::from_request(multipart, &()).await {
+                Ok(VideoBody(body)) => panic!("seconds={seconds} was accepted as {body:?}"),
+                Err(response) => assert_eq!(response.status(), StatusCode::BAD_REQUEST),
+            }
+        }
     }
 
     #[tokio::test]
