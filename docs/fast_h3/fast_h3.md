@@ -85,7 +85,7 @@ The head logs `awaiting a launcher for each host this instance does not run on a
 uniserve-host --head <address the head logs> --host-identity rank-1
 ```
 
-One launcher serves every worker of the deployment that places a rank on its host, here ranks 4 to 7 of the model worker and ranks 4 to 7 of the host worker. The launcher starts each rank with the Python interpreter and launch descriptor the head resolved, so the other host needs the same Python environment and the checkpoint at the same path.
+One launcher serves every worker of the deployment that places a rank on its host, here ranks 4 to 7 of the model worker and ranks 4 to 7 of the host worker. The launcher starts each rank with the Python interpreter and launch descriptor the head resolved, so the other host needs the same Python environment and the checkpoint at the same path. The launcher and the head speak one launch protocol, so run a `uniserve-host` built from the same source as the head's `uniserve`.
 
 `configs/minimax-h3-eight-devices-single-node.json` places the same components on eight devices of one host, so it needs no launcher and starts exactly like the four-device file: eight-way Ulysses denoising, TP8 text encoding, one video and one audio media unit per rank, and a host worker with eight encoder ranks, one per media unit of a round, and a muxer rank.
 
