@@ -3,8 +3,10 @@
 //! This is the second chat output stage. Visible `Text` deltas pass through
 //! `Qwen3XmlToolParser`; every other event is forwarded unchanged. A parser
 //! error does not fail the request: the stage logs it and forwards all later
-//! text unparsed. After a parse error the parser's unconsumed input is
-//! re-emitted as visible text; after a finalization error it is discarded.
+//! text unparsed. After a parse error, the input the parser has not
+//! represented in its output, such as a whole call whose header failed, is
+//! re-emitted as visible text. Finalization fails only while a published call
+//! is open; that call keeps the arguments already streamed.
 
 use asynk_strim_attr::{TryYielder, try_stream};
 use futures::{StreamExt as _, pin_mut};
@@ -42,8 +44,9 @@ impl ToolState {
     /// fallback.
     ///
     /// On a parser error, the events parsed before the error are still
-    /// emitted, followed by the input the parser had not yet consumed as
-    /// visible text. Markers consumed by earlier events are not re-emitted.
+    /// emitted, followed by `Qwen3XmlToolParser::reset`'s unrepresented input
+    /// as visible text: the whole attempted call when its header failed, or
+    /// the input after the arguments of an already published call.
     fn process_text_delta(
         &mut self,
         kind: AssistantBlockKind,
@@ -140,9 +143,11 @@ impl ToolState {
 
     /// Flushes the parser at end of generation.
     ///
-    /// Buffered plain text is emitted as visible text. The parser fails to
-    /// finalize only while a tool call is still open; that error is logged,
-    /// and the buffered input is discarded without producing events.
+    /// Buffered text, including an unfinished call header with its
+    /// `<tool_call>` line, is emitted as visible text. The parser fails to
+    /// finalize only while a published call is still open; that error is
+    /// logged and produces no events, because the call's arguments have
+    /// already been streamed and only wrapper text remains buffered.
     fn finish(&mut self) -> Result<Vec<AssistantEvent>> {
         if self.parser_failed {
             return Ok(Vec::new());

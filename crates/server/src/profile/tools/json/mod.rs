@@ -7,20 +7,28 @@
 //!   start marker without the rest of the delimiter, such as a `<tool_call>`
 //!   tag mentioned in prose, is plain text.
 //! - `Header` parses `{"<name key>": "<name>", "<arguments key>":` with
-//!   optional JSON whitespace, emits the call's first delta (name, empty
-//!   arguments), and switches to `Arguments`.
+//!   optional JSON whitespace and completes once the arguments value is seen
+//!   to open a JSON object. It then publishes the call by emitting its first
+//!   delta (name, empty arguments) and switches to `Arguments`.
 //! - `Arguments` streams the raw arguments object lexically as argument
 //!   deltas. After the object closes, it expects the wrapper's `}` after
 //!   optional JSON whitespace, then the end delimiter, and returns to `Text`.
 //!
-//! Any other header shape, such as reordered or extra keys, is a parse error.
+//! Any other header shape, such as reordered or extra keys or arguments that
+//! are not an object, is a parse error.
+//!
+//! A header is parsed atomically, so until its call is published the parser
+//! can still return every byte of the attempted call: after a parse error or
+//! at the end of input, `reset` and `finish` yield it as text, start delimiter
+//! included. A published call is never withdrawn; after a later failure only
+//! the input following its streamed arguments is returned.
 
 pub use qwen::Qwen3XmlToolParser;
 
 mod qwen;
 
 use winnow::ascii::multispace0 as ws0;
-use winnow::combinator::{alt, seq};
+use winnow::combinator::{alt, peek, seq};
 use winnow::error::{AddContext, ModalResult, StrContext, StrContextValue};
 use winnow::prelude::*;
 use winnow::stream::{Partial, Stream};
@@ -141,24 +149,25 @@ impl JsonToolCallParser {
         Ok(())
     }
 
-    /// Finalizes buffered input or rejects an incomplete tool call.
+    /// Finalizes buffered input or rejects an incomplete published call.
     ///
-    /// In text mode the buffer, including any held-back partial start
-    /// delimiter, becomes plain text and the parser resets. While a tool call
-    /// is open (from its start delimiter until its end delimiter is parsed)
-    /// this fails and leaves the parser state unchanged.
+    /// Outside a published call, the input `reset` returns becomes plain text
+    /// and the parser resets: in text mode the buffer, including any held-back
+    /// partial start delimiter; in header mode the start delimiter and the
+    /// unfinished header. While a published call is open (from its header
+    /// until its end delimiter is parsed) this fails and leaves the parser
+    /// state unchanged. The call's argument bytes have already been emitted,
+    /// so the buffer then holds at most a prefix of the wrapper's closing text.
     fn finish(&mut self) -> Result<ToolParserOutput> {
-        let mut output = ToolParserOutput::default();
-        match &self.mode {
-            JsonToolCallMode::Text => output.normal_text.push_str(&self.buffer),
-            JsonToolCallMode::Header | JsonToolCallMode::Arguments { .. } => {
-                return Err(parsing_failed!(
-                    "incomplete {} tool call",
-                    self.config.parser_name
-                ));
-            }
+        if matches!(self.mode, JsonToolCallMode::Arguments { .. }) {
+            return Err(parsing_failed!(
+                "incomplete {} tool call",
+                self.config.parser_name
+            ));
         }
-        let _ = self.reset();
+
+        let mut output = ToolParserOutput::default();
+        output.normal_text.push_str(&self.reset());
         Ok(output)
     }
 
@@ -207,14 +216,22 @@ impl JsonToolCallParser {
         Ok(())
     }
 
-    /// Resets the incremental parser state and returns the unconsumed buffer.
+    /// Resets the incremental parser state and returns the input that no
+    /// emitted output represents.
     ///
-    /// Tool indices restart at 0 afterwards.
+    /// That is the unconsumed buffer, preceded in header mode by the start
+    /// delimiter: its event has been applied, but no call has been published
+    /// for it yet. Tool indices restart at 0 afterwards.
     fn reset(&mut self) -> String {
+        let mut unpublished = std::mem::take(&mut self.buffer);
+        if self.mode == JsonToolCallMode::Header {
+            unpublished.insert_str(0, self.config.start_delimiter);
+        }
+
         self.mode = JsonToolCallMode::Text;
         self.active_tool_index = None;
         self.emitted_tool_count = 0;
-        std::mem::take(&mut self.buffer)
+        unpublished
     }
 }
 
@@ -277,6 +294,9 @@ fn tool_call_header_event(
         _: ws0,
         _: literal(":"),
         _: ws0,
+        // The header waits for the arguments value to open an object, so
+        // arguments of any other JSON type fail before the call is published.
+        _: peek(literal("{")),
     )
     .context(StrContext::Label(config.parser_name))
     .parse_next(input)?;
