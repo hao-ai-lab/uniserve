@@ -5,7 +5,12 @@
 //! that do not exist yet. Scheduler gauges and prefix-cache counters are
 //! written by the engine client's scheduler-stats export task
 //! (`EngineClient::from_core` through
-//! `engine_client::metrics::record_scheduler_stats`).
+//! `engine_client::metrics::record_scheduler_stats`). The prompt and
+//! generation token counters are written by the engine client's request
+//! registry when a request completes with its final usage
+//! (`RequestRegistry::complete`), so an interval's throughput counts the
+//! tokens of the requests that completed in it; a request whose stream ended
+//! before its usage report adds none.
 //! `ServingRuntime::new` starts the logger when `Config::log_stats` is set.
 
 use std::fmt::Write;
@@ -13,9 +18,7 @@ use std::time::{Duration, Instant};
 
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, info};
-use uniserve_observability::{
-    EngineLabels, F64Gauge, METRICS, PromptTokenSourceLabels, U64Counter, U64Gauge,
-};
+use uniserve_observability::{EngineLabels, F64Gauge, METRICS, U64Counter, U64Gauge};
 
 /// Period between log lines. Throughput is averaged over the measured time
 /// between samples, which can exceed this period when a tick is delayed.
@@ -26,7 +29,7 @@ const LOG_STATS_INTERVAL: Duration = Duration::from_secs(10);
 /// straight to the atomic with no lock.
 struct EngineMetrics {
     // Counters for throughput deltas.
-    prompt_tokens_computed: U64Counter,
+    prompt_tokens: U64Counter,
     generation_tokens: U64Counter,
     prefix_cache_queries: U64Counter,
     prefix_cache_hits: U64Counter,
@@ -80,15 +83,11 @@ fn resolve_engine_metrics(model_name: &str, engine_count: usize) -> Vec<EngineMe
                 model_name: model_name.to_string(),
                 engine,
             };
-            let pt = PromptTokenSourceLabels {
-                model_name: model_name.to_string(),
-                engine,
-                source: "local_compute",
-            };
             EngineMetrics {
-                // Prompt throughput reads only the `local_compute` source series;
-                // prompt tokens recorded under any other source do not count.
-                prompt_tokens_computed: m.request.prompt_tokens_by_source.get_or_create_owned(&pt),
+                // Prompt throughput counts every prompt token, including
+                // tokens reused from the prefix cache: a request's cache hits
+                // do not reach the request lifecycle that records the counter.
+                prompt_tokens: m.request.prompt_tokens.get_or_create_owned(&el),
                 generation_tokens: m.request.generation_tokens.get_or_create_owned(&el),
                 prefix_cache_queries: m.scheduler.prefix_cache_queries.get_or_create_owned(&el),
                 prefix_cache_hits: m.scheduler.prefix_cache_hits.get_or_create_owned(&el),
@@ -194,7 +193,7 @@ fn read_counters(engines: &[EngineMetrics]) -> CounterSnapshot {
         prefix_cache_hits: 0,
     };
     for e in engines {
-        snap.prompt_tokens += e.prompt_tokens_computed.get();
+        snap.prompt_tokens += e.prompt_tokens.get();
         snap.generation_tokens += e.generation_tokens.get();
         snap.prefix_cache_queries += e.prefix_cache_queries.get();
         snap.prefix_cache_hits += e.prefix_cache_hits.get();

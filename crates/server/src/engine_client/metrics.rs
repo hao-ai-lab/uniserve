@@ -1,16 +1,24 @@
-//! Prometheus publication of engine-reported scheduler statistics.
+//! Prometheus publication of engine-reported scheduler statistics and of
+//! completed request lifecycles.
 //!
 //! `EngineClient` (in `in_process`) runs a once-per-second task that asks the
 //! engine's `SchedulerStatsReporter` for a `SchedulerStats` snapshot and
 //! passes it to [`record_scheduler_stats`] as engine `0`. The reporter already
 //! turns cumulative scheduler counters into per-interval increments; this
 //! module only maps fields onto the `SchedulerMetrics` families.
+//!
+//! When a request the engine accepted completes, the request registry maps
+//! its final statistics onto the `RequestMetrics` families: its outcome
+//! through `record_request_outcome`, and its token usage through
+//! `record_request_usage` when its output reported final usage.
 
 use uniserve_observability::{
     EngineBackendLabels, EngineComponentLabels, EngineDomainKindLabels, EngineDomainLabels,
-    EngineLabels, EngineModeLabels, EnginePathLabels, SchedulerMetrics, WaitingReasonLabels,
+    EngineLabels, EngineModeLabels, EnginePathLabels, FinishedReasonLabels, RequestMetrics,
+    SchedulerMetrics, WaitingReasonLabels,
 };
 
+use crate::serving::{FinishStatus, RequestStatsSnapshot};
 use uniserve_core::codec::stats::SchedulerStats;
 
 const WAITING_REASON_CAPACITY: &str = "capacity";
@@ -327,6 +335,108 @@ pub fn record_scheduler_stats(
         .batch_timing_count
         .get_or_create(&labels)
         .inc_by(stats.batch_count);
+}
+
+/// Returns the `finished_reason` label value of a finish status.
+pub(crate) fn finished_reason_name(status: &FinishStatus) -> &'static str {
+    match status {
+        FinishStatus::Stop { .. } => "stop",
+        FinishStatus::Length => "length",
+        FinishStatus::Abort => "abort",
+        FinishStatus::Error => "error",
+        FinishStatus::Repetition => "repetition",
+    }
+}
+
+/// Records the outcome of one completed request into the request metric
+/// families.
+///
+/// Counts the request under `finished_reason` and observes its end-to-end
+/// latency, measured from the start of its lifecycle, and its queue time when
+/// the engine reported scheduling timestamps.
+pub(crate) fn record_request_outcome(
+    metrics: &RequestMetrics,
+    labels: &EngineLabels,
+    finished_reason: &'static str,
+    stats: &RequestStatsSnapshot,
+) {
+    metrics
+        .request_success
+        .get_or_create(&FinishedReasonLabels {
+            model_name: labels.model_name.clone(),
+            engine: labels.engine,
+            finished_reason,
+        })
+        .inc();
+    metrics
+        .e2e_request_latency_seconds
+        .get_or_create(labels)
+        .observe(seconds(stats.timings.total_us));
+    if let Some(queue_us) = stats.timings.queue_us {
+        metrics
+            .request_queue_time_seconds
+            .get_or_create(labels)
+            .observe(seconds(queue_us));
+    }
+}
+
+/// Records the final usage of one completed request into the request metric
+/// families.
+///
+/// `stats` must carry the totals of the request's `Usage` event. Its prompt
+/// and generated tokens are added to the cumulative token counters and
+/// observed in the per-request token histograms. Time to first token is
+/// measured from the start of the request's lifecycle to its first visible
+/// output, and observed only for a request that generated tokens and produced
+/// visible output.
+pub(crate) fn record_request_usage(
+    metrics: &RequestMetrics,
+    labels: &EngineLabels,
+    stats: &RequestStatsSnapshot,
+) {
+    // Hidden protocol tokens are generated tokens too; together with the
+    // visible ones they make up the engine's completion tokens.
+    let prompt_tokens = u64::from(stats.prompt_tokens);
+    let generation_tokens =
+        u64::from(stats.visible_output_tokens) + u64::from(stats.internal_tokens);
+
+    metrics
+        .prompt_tokens
+        .get_or_create(labels)
+        .inc_by(prompt_tokens);
+    metrics
+        .generation_tokens
+        .get_or_create(labels)
+        .inc_by(generation_tokens);
+
+    metrics
+        .request_prompt_tokens
+        .get_or_create(labels)
+        .observe(prompt_tokens as f64);
+    metrics
+        .request_generation_tokens
+        .get_or_create(labels)
+        .observe(generation_tokens as f64);
+    // A request samples one sequence, so its largest sequence generation is
+    // its own.
+    metrics
+        .request_max_num_generation_tokens
+        .get_or_create(labels)
+        .observe(generation_tokens as f64);
+
+    if generation_tokens > 0
+        && let Some(first_output_us) = stats.timings.first_visible_output_us
+    {
+        metrics
+            .time_to_first_token_seconds
+            .get_or_create(labels)
+            .observe(seconds(first_output_us));
+    }
+}
+
+/// Converts a microsecond duration to the seconds the histograms observe.
+fn seconds(microseconds: u64) -> f64 {
+    microseconds as f64 / 1_000_000.0
 }
 
 #[cfg(test)]

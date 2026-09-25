@@ -20,6 +20,11 @@
 //! and abort commands are recorded by `mark_control`; an abort overrides a
 //! pending cancellation, later lifecycle updates never clear a pending control
 //! state, and `complete` turns it into the matching terminal state.
+//!
+//! `complete` is also where a request's lifecycle reaches the `uniserve:`
+//! request metric families: every request the engine accepted is recorded
+//! there once, from its final statistics, under the engine's model name as
+//! engine 0.
 
 use crate::serving::{
     LifecycleTerminal, ModelEventIdentity, RequestLifecycleState, RequestOutput,
@@ -28,6 +33,7 @@ use crate::serving::{
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use tokio::sync::Notify;
+use uniserve_observability::{EngineLabels, METRICS};
 
 struct RequestRecord {
     // The engine identifier reserved by `register`; `release_engine` clears
@@ -40,6 +46,17 @@ struct RequestRecord {
     // stay here until `complete` moves them to the completed history,
     // independently of the engine receiver's lifetime.
     stats: Option<RequestStatsSnapshot>,
+    // Set by `accept`. Only a request the engine accepted has consumed engine
+    // work, so only such a request is recorded in the request metrics.
+    accepted: bool,
+    // Stable name of the finish status carried by the output's `Finished`
+    // event, recorded by `observe` for the request-success metric.
+    finished_reason: Option<&'static str>,
+    // Set by `observe` on the output's `Usage` event. Until then the token
+    // counts in `stats` are partial (output events need not carry their
+    // token identifiers), so only a request with final usage contributes to
+    // the token metrics.
+    usage_reported: bool,
 }
 
 #[derive(Default)]
@@ -60,21 +77,27 @@ pub(crate) struct RequestRegistry {
     changed: Notify,
     // Maximum number of terminal snapshots kept for `stats` lookups.
     completed_retention: usize,
+    // Labels of the request metric series completed requests are recorded
+    // under; they match the series `StatsLogger` reads.
+    metric_labels: EngineLabels,
 }
 
-impl Default for RequestRegistry {
+impl RequestRegistry {
     /// Creates an empty registry that retains the most recent 1024 terminal
-    /// snapshots.
-    fn default() -> Self {
+    /// snapshots and records completed requests under `model_name`, the
+    /// engine's model name, as engine 0.
+    pub(crate) fn new(model_name: String) -> Self {
         Self {
             state: Mutex::new(RequestRegistryState::default()),
             changed: Notify::new(),
             completed_retention: 1024,
+            metric_labels: EngineLabels {
+                model_name,
+                engine: 0,
+            },
         }
     }
-}
 
-impl RequestRegistry {
     /// Locks the shared state and recovers it after poisoning.
     fn lock(&self) -> std::sync::MutexGuard<'_, RequestRegistryState> {
         self.state
@@ -117,6 +140,9 @@ impl RequestRegistry {
                 engine_request_id: Some(engine_request_id),
                 engine_pending: false,
                 stats,
+                accepted: false,
+                finished_reason: None,
+                usage_reported: false,
             },
         );
         true
@@ -209,11 +235,10 @@ impl RequestRegistry {
     /// control can be recorded between them.
     pub(crate) fn accept(&self, request_id: &str) -> bool {
         let mut registry = self.lock();
-        let Some(stats) = registry
-            .active
-            .get_mut(request_id)
-            .and_then(|record| record.stats.as_mut())
-        else {
+        let Some(record) = registry.active.get_mut(request_id) else {
+            return false;
+        };
+        let Some(stats) = record.stats.as_mut() else {
             return false;
         };
         if matches!(
@@ -223,6 +248,7 @@ impl RequestRegistry {
             return false;
         }
         stats.state = RequestLifecycleState::Accepted;
+        record.accepted = true;
         true
     }
 
@@ -333,7 +359,8 @@ impl RequestRegistry {
         elapsed_us: u64,
     ) -> Option<LifecycleTerminal> {
         let mut state = self.lock();
-        let stats = state.active.get_mut(request_id)?.stats.as_mut()?;
+        let record = state.active.get_mut(request_id)?;
+        let stats = record.stats.as_mut()?;
 
         // External cancellation and abort state dominates every later stream
         // observation and asks the caller to terminate the producer.
@@ -447,10 +474,14 @@ impl RequestRegistry {
                 stats.cache = cache.clone();
                 stats.resources = resources.clone();
                 stats.timings = timings.clone();
+                record.usage_reported = true;
             }
-            // Completion transitions are applied by `complete` after observation.
-            RequestOutput::Finished { .. }
-            | RequestOutput::Rejected { .. }
+            // Completion transitions are applied by `complete` after
+            // observation, which also records the finish status.
+            RequestOutput::Finished { reason, .. } => {
+                record.finished_reason = Some(super::metrics::finished_reason_name(reason));
+            }
+            RequestOutput::Rejected { .. }
             | RequestOutput::Cancelled { .. }
             | RequestOutput::Aborted { .. }
             | RequestOutput::Failed { .. } => {}
@@ -466,6 +497,13 @@ impl RequestRegistry {
     /// `elapsed_us`. Returns `None` without recording anything for an unknown
     /// request or one without statistics, including a second call. The record
     /// stays active while its engine side is claimed.
+    ///
+    /// A request the engine accepted is also recorded in the request metrics:
+    /// its outcome (`metrics::record_request_outcome`) under its finish status
+    /// when it finished, under `abort` when it was cancelled or aborted, and
+    /// under `error` when it failed, and its token usage
+    /// (`metrics::record_request_usage`) when its output reported final
+    /// usage. A rejected request is not recorded.
     pub(crate) fn complete(
         &self,
         request_id: &str,
@@ -475,6 +513,9 @@ impl RequestRegistry {
         let mut state = self.lock();
         let record = state.active.get_mut(request_id)?;
         let mut stats = record.stats.take()?;
+        let accepted = record.accepted;
+        let finished_reason = record.finished_reason;
+        let usage_reported = record.usage_reported;
         if !record.engine_pending {
             state.active.remove(request_id);
         }
@@ -485,6 +526,25 @@ impl RequestRegistry {
         };
         stats.state = actual_terminal;
         stats.timings.total_us = stats.timings.total_us.max(elapsed_us);
+
+        let finished_reason = match actual_terminal {
+            RequestLifecycleState::Finished => finished_reason,
+            RequestLifecycleState::Cancelled | RequestLifecycleState::Aborted => Some("abort"),
+            RequestLifecycleState::Failed => Some("error"),
+            _ => None,
+        };
+        if accepted && let Some(finished_reason) = finished_reason {
+            super::metrics::record_request_outcome(
+                &METRICS.request,
+                &self.metric_labels,
+                finished_reason,
+                &stats,
+            );
+            if usage_reported {
+                super::metrics::record_request_usage(&METRICS.request, &self.metric_labels, &stats);
+            }
+        }
+
         Self::insert_completed(&mut state, stats, self.completed_retention);
         drop(state);
         self.changed.notify_waiters();
