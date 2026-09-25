@@ -41,9 +41,9 @@ use uniserve_core::{
     ImageTrigger, MultimodalInputs, RequestId, SamplingParams,
 };
 use uniserve_engine::{
-    BatchResult, EVENT_BUFFER_CAPACITY, EngineHandle, ExecutionBatch, Executor, ExecutorError,
-    ExecutorInfo, ExecutorSubmitError, Scheduler, SchedulingPolicy, SimEngine, SimExecutor,
-    SpecialTokenIds, WorkerId,
+    BatchEvent, BatchResult, EVENT_BUFFER_CAPACITY, EngineHandle, ExecutionBatch, Executor,
+    ExecutorError, ExecutorInfo, ExecutorSubmitError, Scheduler, SchedulingPolicy, SimEngine,
+    SimExecutor, SpecialTokenIds, WorkerId,
 };
 
 /// Default special tokens, whose first EOS id equals the simulator's synthetic
@@ -1651,6 +1651,56 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
         stats.encoder.cached.load(Ordering::Relaxed) >= 1,
         "input image was not encoded and retained in the encoder cache"
     );
+}
+
+/// A request's worker admission carries the number of input images the
+/// request holds, which worker image preprocessing reads when it divides a
+/// pixel budget among them.
+#[test]
+fn admission_carries_the_request_input_image_count() {
+    let mut sim = SimEngine::new();
+    sim.set_text_len(4);
+    let mut executor = SimExecutor::new(sim);
+    let boundary = executor.observe();
+    let sched = Scheduler::new(Box::new(executor), ctrl(), 32).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let (prompt_token_ids, mut inputs) = image_input(vec![1, 2], vec![3, 4], 0x91, 4, 17);
+    let second = ImageInput {
+        hash: 0x92,
+        ..inputs.images[0].clone()
+    };
+    inputs.images.push(second);
+    let request = generation_request(
+        RequestId(91),
+        (prompt_token_ids, inputs),
+        SamplingParams::default(),
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        4,
+    );
+    let _events = handle.submit(request).expect("submit request");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let admission = loop {
+        let event = boundary
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("the request is admitted");
+        if let BatchEvent::Submitted(batch) = event
+            && let Some(admission) = batch.commands.iter().find_map(|command| match command {
+                uniserve_worker_ipc::BatchCommand::Start { request } => Some(request.clone()),
+                _ => None,
+            })
+        {
+            break admission;
+        }
+    };
+    handle.shutdown();
+    let _ = jh.join();
+
+    assert_eq!(admission.input_images, 2);
 }
 
 /// A Default-constraint request triggered by its second greedy token (1008)

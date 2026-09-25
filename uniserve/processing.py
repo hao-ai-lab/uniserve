@@ -53,6 +53,28 @@ class PatchTransform:
     min_pixels: int
     max_pixels: int
     normalization: Literal["imagenet", "signed_unit"] = "imagenet"
+    # Pixel budget a request's input images share, or None when each input
+    # image is bounded by ``max_pixels`` alone. With ``n`` input images each
+    # one is bounded by ``min(max_pixels, max_total_pixels // n)``; images
+    # that are not request inputs, such as generated images, keep
+    # ``max_pixels``.
+    max_total_pixels: int | None = None
+
+    def pixel_bound(self, input_images: int | None = None) -> int:
+        """Return the upper pixel bound for one image.
+
+        Args:
+            input_images: Number of input images in the image's request, or
+                None for an image that is not a request input.
+
+        Raises:
+            ValueError: If ``input_images`` is not positive.
+        """
+        if input_images is None or self.max_total_pixels is None:
+            return self.max_pixels
+        if input_images < 1:
+            raise ValueError("input image count must be positive")
+        return min(self.max_pixels, self.max_total_pixels // input_images)
 
 
 @dataclass(frozen=True, slots=True)

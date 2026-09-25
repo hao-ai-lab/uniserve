@@ -186,9 +186,28 @@ def prepare_features(
         )
     else:
         prepared = prepare_image(
-            image_processor, mode, source, device=target_device
+            image_processor,
+            mode,
+            source,
+            device=target_device,
+            input_images=_input_images(
+                state.pending_output(call.request_key.request_id)
+            ),
         )
     return prepared
+
+
+def _input_images(request: PendingOutput) -> int:
+    """Return the input image count admitted with a request that has one.
+
+    Raises:
+        WorkerError: ``invalid_descriptor`` when the admission declares no
+            input images.
+    """
+    count = int(request.request.admission.input_images)
+    if count < 1:
+        raise invalid_descriptor("request admission declares no input images")
+    return count
 
 
 def publish_features(
@@ -501,10 +520,8 @@ def vision_state_row(
     states otherwise). A framed layout adds start and end marker tokens;
     ``close_image`` adds the end marker in any layout.
     """
-    cache = calls.cache_coordinates(
-        state.pending_output(call.request_key.request_id),
-        tables=request_tables,
-    )
+    request = state.pending_output(call.request_key.request_id)
+    cache = calls.cache_coordinates(request, tables=request_tables)
     injection = model_runner.image_processor().feature_injection
     if injection is None:
         raise invalid_descriptor(
@@ -540,6 +557,9 @@ def vision_state_row(
     if trailing:
         token_ids[-1] = _feature_token_id(injection, start=False)
 
+    # A row that closes the image carries generated-image feedback; any
+    # other vision row carries one of the request's input images, whose
+    # patch grid follows the pixel budget those images share.
     positions = _vision_positions(
         injection.positions,
         int(embeddings.shape[0]),
@@ -549,6 +569,7 @@ def vision_state_row(
         leading=leading,
         trailing=trailing,
         close_image=close_image,
+        input_images=None if close_image else _input_images(request),
         model_runner=model_runner,
     )
     return TokenRow(
@@ -588,6 +609,7 @@ def _vision_positions(
     leading: bool,
     trailing: bool,
     close_image: bool,
+    input_images: int | None,
     model_runner: ModelExecutor,
 ) -> torch.Tensor:
     """Build position ids for a vision row's marker and feature slots.
@@ -595,7 +617,9 @@ def _vision_positions(
     Returns ``[query]`` positions for ``PositionLayout.TEMPORAL``, all at
     ``conditioning_position``. Otherwise returns ``[3, query]`` rows of
     temporal, height and width coordinates: feature slots take their raster
-    grid coordinates and marker slots zero spatial coordinates.
+    grid coordinates and marker slots zero spatial coordinates. The raster
+    grid is the patch grid of a ``height`` x ``width`` canvas under the
+    pixel bound for ``input_images`` (see ``patch_grid_shape``).
     """
     query = int(leading) + feature_tokens + int(trailing)
     if layout is PositionLayout.TEMPORAL:
@@ -612,7 +636,9 @@ def _vision_positions(
 
     # The encoder may pool patches, so the feature count can be a square
     # downscale of the raw patch grid; recover the per-axis grid factor.
-    raw_height, raw_width = patch_grid_shape(transform, height, width)
+    raw_height, raw_width = patch_grid_shape(
+        transform, height, width, input_images
+    )
     factor_squared, remainder = divmod(raw_height * raw_width, feature_tokens)
     factor = math.isqrt(factor_squared)
     if remainder or factor < 1 or factor * factor != factor_squared:

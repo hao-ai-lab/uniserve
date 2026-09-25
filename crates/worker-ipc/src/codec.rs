@@ -441,6 +441,7 @@ fn admission_from_table(admission: fbs::NewRequest<'_>) -> CodecResult<NewReques
             .prompt_token_ids()
             .map(|ids| ids.iter().collect())
             .unwrap_or_default(),
+        input_images: admission.input_images(),
         ar: admission.ar().map(ar_params_from_table).transpose()?,
         image: admission.image().map(image_from_table).transpose()?,
         diffusion: admission

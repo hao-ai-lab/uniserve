@@ -56,6 +56,12 @@ impl SenseNovaProfile {
     pub const LATENT_DOWNSAMPLE: u32 = 32;
     /// Maximum reusable encoder products tracked by the profile.
     pub const ENCODER_CACHE_ENTRIES: usize = 256;
+    /// Lower pixel bound of an image in the model's patch preprocessing.
+    const MIN_IMAGE_PIXELS: u64 = 512 * 512;
+    /// Upper pixel bound of any single image.
+    const MAX_IMAGE_PIXELS: u64 = 2048 * 2048;
+    /// Pixel budget a request's input images share.
+    const MAX_TOTAL_PIXELS: u64 = 4096 * 4096;
 
     /// Returns bounded runtime capabilities for the selected dtype.
     ///
@@ -221,19 +227,40 @@ impl SenseNovaProfile {
         )
     }
 
+    /// Returns the upper pixel bound of each input image in a request that
+    /// carries `image_count` input images.
+    ///
+    /// The request's input images share a 4096x4096 pixel budget, and no
+    /// image exceeds 2048x2048: `min(2048 * 2048, 4096 * 4096 / n)` with
+    /// floor division, as the reference preprocessing computes it and the
+    /// worker's `PatchTransform.pixel_bound` applies it with the SenseNova
+    /// processor (`uniserve_models/sensenova_u1/processing.py`).
+    pub fn input_image_max_pixels(image_count: usize) -> u64 {
+        let count = u64::try_from(image_count).unwrap_or(u64::MAX).max(1);
+        Self::MAX_IMAGE_PIXELS.min(Self::MAX_TOTAL_PIXELS / count)
+    }
+
     /// Builds the encoder inputs for an input image of the given dimensions.
     ///
-    /// The image is fitted to a 32-aligned grid with an area bounded by
-    /// 512x512 and 2048x2048 pixels and adds no marker tokens. Fails for a
-    /// zero dimension or an aspect ratio above 200. The image count does not
-    /// affect the result.
+    /// The image is fitted to a 32-aligned grid with an area of at least
+    /// 512x512 pixels and at most [`Self::input_image_max_pixels`] for the
+    /// request's `image_count` input images, and adds no marker tokens.
+    /// Fails for a zero dimension or an aspect ratio above 200.
     pub fn image_encoders_for_dimensions(
         &self,
         width: u32,
         height: u32,
-        _image_count: usize,
+        image_count: usize,
     ) -> assets::Result<Vec<ImageEncoderInput>> {
-        let tokens = pixel_bound_tokens(width, height, 32, 262_144, 4_194_304, 32, 0)?;
+        let tokens = pixel_bound_tokens(
+            width,
+            height,
+            32,
+            Self::MIN_IMAGE_PIXELS,
+            Self::input_image_max_pixels(image_count),
+            32,
+            0,
+        )?;
         Ok(vec![ImageEncoderInput {
             encoder: ImageIngestStep::VitEncode,
             num_kv_tokens: Some(tokens),
@@ -243,16 +270,25 @@ impl SenseNovaProfile {
 
     /// Resolves the generated-image feedback KV contribution for the requested canvas.
     ///
-    /// Uses the same grid as an input image plus one marker token. Fails for
-    /// a zero dimension or an aspect ratio above 200, or when the profile's
-    /// feedback configuration has no feedback source or is not a single ViT
-    /// encoder.
+    /// Uses the grid of a single input image plus one marker token: a
+    /// generated image does not share the input images' pixel budget. Fails
+    /// for a zero dimension or an aspect ratio above 200, or when the
+    /// profile's feedback configuration has no feedback source or is not a
+    /// single ViT encoder.
     pub fn image_generation_for_dimensions(
         &self,
         width: u32,
         height: u32,
     ) -> assets::Result<ImageGenerationConfig> {
-        let tokens = pixel_bound_tokens(width, height, 32, 262_144, 4_194_304, 32, 1)?;
+        let tokens = pixel_bound_tokens(
+            width,
+            height,
+            32,
+            Self::MIN_IMAGE_PIXELS,
+            Self::MAX_IMAGE_PIXELS,
+            32,
+            1,
+        )?;
         let mut policy = self.image_generation.clone();
         if policy.feedback_source.is_none()
             || policy.feedback_encoders.len() != 1
