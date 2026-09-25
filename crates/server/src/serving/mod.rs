@@ -1694,6 +1694,104 @@ mod tests {
         ));
     }
 
+    /// SenseNova filtering holds back a trailing fragment that could begin a
+    /// `<think>`, `</think>`, `<answer>` or `</answer>` delimiter. At the end of
+    /// the stream no delimiter can complete, so the held fragment is visible
+    /// text, whether the engine finished the request or a stop string did.
+    #[tokio::test]
+    async fn sensenova_assembler_releases_a_trailing_delimiter_prefix_at_the_end() {
+        let policy = crate::profile::omni::OutputFilterPolicy {
+            reasoning: Some(crate::profile::omni::DelimitedTextPolicy {
+                start: "<think>".to_string(),
+                end: "</think>".to_string(),
+            }),
+            visible_wrappers: vec![crate::profile::omni::DelimitedTextPolicy {
+                start: "<answer>".to_string(),
+                end: "</answer>".to_string(),
+            }],
+        };
+        let text_token = |byte: u8| EngineCoreOutput::TextToken {
+            id: u32::from(byte),
+            logprob: None,
+        };
+        let finished = EngineCoreOutput::Finished {
+            reason: uniserve_core::FinishReason::MaxTokens,
+            stop_reason: None,
+            prompt_tokens: 1,
+            completion_tokens: 3,
+            images: 0,
+        };
+        let cases = [
+            (
+                "engine-finished",
+                vec![
+                    text_token(b'x'),
+                    text_token(b' '),
+                    text_token(b'<'),
+                    finished,
+                ],
+                None,
+                "x <",
+            ),
+            (
+                "stop-string",
+                vec![text_token(b'x'), text_token(b'<'), text_token(b'!')],
+                Some(vec!["!".to_string()]),
+                "x<",
+            ),
+        ];
+
+        for (request_id, events, stop_strings, expected) in cases {
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            tx.try_send(EngineCoreOutput::Scheduled {
+                queued_at: 1.0,
+                scheduled_at: 2.0,
+            })
+            .unwrap();
+            for event in events {
+                tx.try_send(event).unwrap();
+            }
+            drop(tx);
+
+            let outputs = assemble_event_stream(
+                StreamInput {
+                    request_id: request_id.into(),
+                    event_context: event_context(),
+                    prompt_token_ids: vec![b'p' as u32],
+                    tokenizer: crate::serving::test_support::configured_tokenizer(),
+                    prompt_logprobs_requested: false,
+                    generated_logprobs_requested: false,
+                    emit_token_ids: false,
+                    decode_options: TextDecodeOptions {
+                        stop_strings,
+                        ..TextDecodeOptions::default()
+                    },
+                    stream: EventRx::from_receiver(rx),
+                },
+                OutputProcessorPolicy::SenseNova(policy.clone()),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+            assert!(
+                outputs.iter().all(std::result::Result::is_ok),
+                "{request_id}"
+            );
+            let visible: String = outputs
+                .iter()
+                .filter_map(|output| match output {
+                    Ok(RequestOutput::TextDelta { text, .. }) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(visible, expected, "{request_id}");
+            assert!(
+                matches!(outputs.last(), Some(Ok(RequestOutput::Finished { .. }))),
+                "{request_id}"
+            );
+        }
+    }
+
     /// Committed image events are held back and published immediately before the next text
     /// token (or before a terminal event or the end of the engine stream), so they stay
     /// ordered ahead of that token.
