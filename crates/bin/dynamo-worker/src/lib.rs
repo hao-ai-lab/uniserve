@@ -42,17 +42,18 @@ use uniserve_engine::{
 use uniserve_server::{
     AppState, Config, EngineSettings, HttpListenerMode, ModelDescription,
     openai::{VideoGenerationRequest, serve_error_to_api},
-    serving::{FinishStatus, RequestOutput, ServeRequestId, default_video_seconds},
+    serving::{
+        FinishStatus, RequestOutput, ServeRequestId, VIDEO_FPS, default_video_seconds,
+        validate_video_capacity, video_frame_count,
+    },
 };
 
-// The fixed FastH3 request and output contract. The frame rate, size and
-// minimum frame count duplicate the MiniMax H3 values the server reports from
+// The fixed FastH3 request and output contract. The size duplicates the
+// MiniMax H3 values the server reports from
 // `InputProcessor::video_capabilities`; `build_state` checks the step count
 // against the started engine.
-const H3_FPS: u32 = 24;
 const H3_WIDTH: u32 = 1344;
 const H3_HEIGHT: u32 = 768;
-const H3_MIN_FRAMES: u32 = 22;
 const H3_DENOISE_STEPS: i32 = 4;
 const H3_AUDIO_SAMPLE_RATE: i32 = 32_000;
 
@@ -160,11 +161,7 @@ impl DynamoFastH3Engine {
         if args.common.enable_rl {
             return Err(invalid_argument("RL engine routes are not supported"));
         }
-        if !args.max_video_seconds.is_finite() || args.max_video_seconds <= 0.0 {
-            return Err(invalid_argument(
-                "max-video-seconds must be finite and positive",
-            ));
-        }
+        validate_video_capacity(args.max_video_seconds).map_err(invalid_argument)?;
         if args.max_running_requests == 0 {
             return Err(invalid_argument("max-running-requests must be positive"));
         }
@@ -567,24 +564,20 @@ fn prepare_request(
         return Err(invalid_argument("extra video fields are not supported"));
     }
 
-    // `seconds` is an integer in Dynamo's API, so it is always finite here.
+    // `seconds` is an integer in Dynamo's API; the server's duration contract
+    // bounds it and derives the frame count `nvext.num_frames` must match.
     let seconds = request
         .seconds
         .map_or_else(|| default_video_seconds(max_video_seconds), f64::from);
-    if seconds <= 0.0 || seconds > max_video_seconds {
-        return Err(invalid_argument(format!(
-            "seconds must be positive and at most {max_video_seconds}"
-        )));
-    }
-    let frames = aligned_frame_count(seconds)?;
+    let frames = video_frame_count(seconds, max_video_seconds).map_err(invalid_argument)?;
     let nvext = request.nvext.unwrap_or_default();
     reject_present("nvext.annotations", nvext.annotations.as_ref())?;
     reject_present("nvext.negative_prompt", nvext.negative_prompt.as_ref())?;
     reject_present("nvext.guidance_scale", nvext.guidance_scale.as_ref())?;
     reject_present("nvext.boundary_ratio", nvext.boundary_ratio.as_ref())?;
     reject_present("nvext.guidance_scale_2", nvext.guidance_scale_2.as_ref())?;
-    if nvext.fps.is_some_and(|fps| fps != H3_FPS as i32) {
-        return Err(invalid_argument(format!("nvext.fps must be {H3_FPS}")));
+    if nvext.fps.is_some_and(|fps| fps != VIDEO_FPS as i32) {
+        return Err(invalid_argument(format!("nvext.fps must be {VIDEO_FPS}")));
     }
     if nvext.num_frames.is_some_and(|value| value != frames as i32) {
         return Err(invalid_argument(format!(
@@ -614,34 +607,6 @@ fn prepare_request(
         },
         response_format: request.response_format.unwrap_or_default(),
     })
-}
-
-/// Returns the FastH3 frame count for `seconds`: the 24 fps frame count
-/// rounded up to the next value of the form `5 + 17k`.
-///
-/// Refuses a duration whose frame count is not representable or aligns below
-/// `H3_MIN_FRAMES`.
-///
-/// This mirrors the server's `align_num_frames` and the bounds
-/// `InputProcessor::video_sampling` applies around it, so a `num_frames` this
-/// accepts is the count UniServe generates.
-fn aligned_frame_count(seconds: f64) -> Result<u32, DynamoError> {
-    let raw = (seconds * f64::from(H3_FPS)).round();
-    // Alignment adds at most 16 frames, which the upper bound leaves room for.
-    if !raw.is_finite() || raw < 1.0 || raw > f64::from(u32::MAX - 16) {
-        return Err(invalid_argument(
-            "seconds cannot be represented as FastH3 frames",
-        ));
-    }
-    let raw = raw as u32;
-    let frames = raw + (H3_MIN_FRAMES - raw % 17) % 17;
-    // Only raw counts up to 5 align below the minimum, to 5.
-    if frames < H3_MIN_FRAMES {
-        return Err(invalid_argument(
-            "seconds is shorter than supported geometry",
-        ));
-    }
-    Ok(frames)
 }
 
 fn reject_present<T>(field: &str, value: Option<&T>) -> Result<(), DynamoError> {
@@ -682,7 +647,7 @@ fn video_response(
             "output_format": "mp4",
             "url": url,
             "b64_json": b64_json,
-            "fps": H3_FPS,
+            "fps": VIDEO_FPS,
             "audio_sample_rate": H3_AUDIO_SAMPLE_RATE,
         }],
         "inference_time_s": elapsed.as_secs_f64(),
@@ -694,7 +659,7 @@ fn runtime_data(max_video_seconds: f64) -> HashMap<String, Value> {
     BTreeMap::from([
         ("backend".to_string(), json!("uniserve-inprocess")),
         ("task".to_string(), json!("t2va")),
-        ("fps".to_string(), json!(H3_FPS)),
+        ("fps".to_string(), json!(VIDEO_FPS)),
         ("width".to_string(), json!(H3_WIDTH)),
         ("height".to_string(), json!(H3_HEIGHT)),
         ("max_video_seconds".to_string(), json!(max_video_seconds)),
@@ -758,7 +723,7 @@ mod tests {
     /// 5 seconds, or the deployment's maximum when that is shorter.
     #[test]
     fn an_omitted_duration_defaults_as_the_http_route_does() {
-        for (max_video_seconds, expected) in [(15.0, 5.0), (3.0, 3.0)] {
+        for (max_video_seconds, expected) in [(15.0, 5.0), (4.5, 4.5)] {
             let request = json!({"model": "FastH3", "prompt": "A stream in a forest"});
             let prepared = match prepare_request(request, "FastH3", max_video_seconds) {
                 Ok(prepared) => prepared,
@@ -778,6 +743,8 @@ mod tests {
             json!({"model":"FastH3", "prompt":"x", "size":"832x480"}),
             json!({"model":"FastH3", "prompt":"x", "nvext":{"seed":-1}}),
             json!({"model":"FastH3", "prompt":"x", "nvext":{"num_frames":120}}),
+            json!({"model":"FastH3", "prompt":"x", "seconds":3}),
+            json!({"model":"FastH3", "prompt":"x", "seconds":16}),
             json!({"model":"FastH3", "prompt":"x", "extra_args":{"media_passthrough":{"foo":1}}}),
         ] {
             assert!(prepare_request(request, "FastH3", 15.0).is_err());

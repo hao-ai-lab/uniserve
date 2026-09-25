@@ -571,7 +571,8 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         response.raise_for_status()
         job_id = response.json()["id"]
         job = completed(client, job_id)
-        assert job["seconds"] == 5 and job["actual_seconds"] == 124 / 24
+        assert job["seconds"] == 5 and job["num_frames"] == 124
+        assert job["actual_seconds"] == 124 / 24
         assert job["completed_steps"] == job["total_steps"] == 4
         assert job["expires_at"] > job["completed_at"]
         assert job_id in {

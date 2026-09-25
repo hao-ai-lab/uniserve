@@ -69,8 +69,11 @@ def media_builder(model: nn.Module, config: WorkerConfig):
             "media input construction requires its output sampling clock"
         )
 
+    # The server counts a duration's frames rounded half to even at the
+    # output clock, so the capacity provisions exactly the frame count its
+    # longest admitted request resolves to.
     return MediaBuilder(
         denoiser,
-        max_frames=int(config.max_video_seconds * output.frame_rate + 0.5),
+        max_frames=round(config.max_video_seconds * output.frame_rate),
         max_text_tokens=config.max_sequence_tokens,
     )

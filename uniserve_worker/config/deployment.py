@@ -563,17 +563,18 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
     ):
         raise ValueError("--kv-token-capacity must be positive when provided")
 
-    # The frame bounds at 24 frames per second match the validation the
-    # server's configuration applies to the same setting. The upper bound
-    # leaves room in a u32 for the up to 16 frames that the server's frame
-    # alignment (``align_num_frames``) adds.
+    # The capacity resolves to frames at 24 frames per second, rounded half
+    # to even as the server rounds a request's duration. The server admits
+    # capacities within its video API range; the worker only requires one
+    # that covers at least one frame and fits a u32 once the model's native
+    # windows extend it by up to 16 frames.
     max_video_seconds = float(namespace.max_video_seconds)
     if not math.isfinite(max_video_seconds) or max_video_seconds <= 0:
         raise ValueError(
             "--max-video-seconds must resolve to a supported frame count"
         )
-    max_video_frames = math.floor(max_video_seconds * 24.0 + 0.5)
-    if max_video_frames < 6 or max_video_frames > 2**32 - 17:
+    max_video_frames = round(max_video_seconds * 24.0)
+    if max_video_frames < 1 or max_video_frames > 2**32 - 17:
         raise ValueError(
             "--max-video-seconds must resolve to a supported frame count"
         )

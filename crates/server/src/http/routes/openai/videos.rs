@@ -262,7 +262,7 @@ impl<S: Send + Sync> axum::extract::FromRequest<S> for VideoBody {
 /// Creates an asynchronous video job and returns its `queued` record.
 ///
 /// Duration and sampling are resolved before submission and fill the record's
-/// `seconds`, `actual_seconds`, and `total_steps`. A full job store answers
+/// `seconds`, `actual_seconds`, `num_frames`, and `total_steps`. A full job store answers
 /// `429 Too Many Requests`; resolution and submission errors map through
 /// `ApiError`. Once the record is inserted, a detached task consumes
 /// the runtime stream and publishes progress and the final result through
@@ -313,9 +313,8 @@ pub(crate) async fn videos_create(
         completed_at: None,
         expires_at: None,
         seconds: requested_seconds,
-        // 24 fps is the rate `InputProcessor::video_sampling` counts frames at
-        // and `video_capabilities` advertises; the three must agree.
-        actual_seconds: f64::from(sampling.num_frames) / 24.0,
+        actual_seconds: f64::from(sampling.num_frames) / f64::from(crate::serving::VIDEO_FPS),
+        num_frames: sampling.num_frames,
         status: "queued",
         phase: "queued".to_owned(),
         completed_steps: 0,
