@@ -101,6 +101,23 @@ output_throughput = "higher"
         load_config(config)
 
 
+def test_toml_rejects_an_unknown_top_level_key(tmp_path: Path) -> None:
+    config = tmp_path / "profiles.toml"
+    config.write_text(
+        """
+artifct_root = "results"
+
+[servers.local]
+port = 8000
+command = ["server"]
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="artifct_root"):
+        load_config(config)
+
+
 def test_a_profile_resolves_its_paths_against_the_root_it_states(
     tmp_path: Path,
 ) -> None:
