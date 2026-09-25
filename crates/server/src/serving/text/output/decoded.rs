@@ -611,35 +611,81 @@ pub(crate) fn stop_string_holdback_bytes(options: &TextDecodeOptions) -> usize {
         .saturating_sub(1)
 }
 
-/// Returns the first configured stop string that matches newly decoded text.
+/// Returns the configured stop string that completes earliest in newly
+/// decoded text.
 ///
 /// Only matches that include at least one of the last `new_bytes` bytes of
 /// `output` are considered, so earlier text is not rescanned and nothing
-/// matches when `new_bytes` is zero. Stop strings are tried in `stops` order;
-/// the first one that matches wins, at its last occurrence in the searched
-/// range. Returns the stop string's index in `stops` and the byte offset of
-/// the match start in `output`.
+/// matches when `new_bytes` is zero. Each stop string is located at its first
+/// occurrence in that range, and the one whose match ends earliest wins, with
+/// ties going to the earlier entry in `stops`. The result is the one a
+/// decoder that received the new bytes one at a time would report, and
+/// truncating `output` at the match start removes every stop occurrence
+/// (vLLM's `check_stop_strings` selects the same match). Returns the stop
+/// string's index in `stops` and the byte offset of the match start in
+/// `output`.
+///
+/// Matching compares bytes. A match of a complete UTF-8 stop string in UTF-8
+/// text starts and ends on character boundaries, so the offset is a valid
+/// truncation point.
 pub(crate) fn matches_stop_string(
     stops: &[String],
     output: &str,
     new_bytes: usize,
 ) -> Option<(usize, usize)> {
     let output = output.as_bytes();
+    // A match must end at or after this offset to include a new byte.
     let next_offset = (output.len() + 1).saturating_sub(new_bytes);
     stops
         .iter()
-        .map(|stop| {
-            (
-                stop.as_bytes(),
-                stop.len(),
-                next_offset.saturating_sub(stop.len()),
-            )
-        })
         .enumerate()
-        .find_map(|(index, (stop, len, start))| {
-            output[start..]
-                .windows(len)
-                .rposition(|window| window == stop)
-                .map(|position| (index, start + position))
+        .filter_map(|(index, stop)| {
+            let stop = stop.as_bytes();
+            let search_start = next_offset.saturating_sub(stop.len());
+            output[search_start..]
+                .windows(stop.len())
+                .position(|window| window == stop)
+                .map(|position| {
+                    let match_start = search_start + position;
+                    (index, match_start, match_start + stop.len())
+                })
         })
+        // `min_by_key` keeps the first of equal keys, so ties go to list order.
+        .min_by_key(|&(_, _, match_end)| match_end)
+        .map(|(index, match_start, _)| (index, match_start))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matches_stop_string;
+
+    fn stops(values: &[&str]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    /// Truncating at the returned offset must remove every occurrence of the
+    /// stop string, so a new chunk holding it twice (Qwen3 encodes `"\n\n"`
+    /// as one token) matches at its first occurrence.
+    #[test]
+    fn stop_string_matches_its_first_occurrence_in_new_text() {
+        assert_eq!(
+            matches_stop_string(&stops(&["\n"]), "Answer: 42\n\n", 2),
+            Some((0, 10))
+        );
+    }
+
+    /// Among stop strings matching in the same new chunk, the one that
+    /// completes earliest wins, as if tokens arrived one byte at a time;
+    /// list order breaks ties.
+    #[test]
+    fn stop_string_that_completes_earliest_wins() {
+        assert_eq!(
+            matches_stop_string(&stops(&["b", "a"]), "xab", 2),
+            Some((1, 1))
+        );
+        assert_eq!(
+            matches_stop_string(&stops(&["ab", "b"]), "xab", 2),
+            Some((0, 1))
+        );
+    }
 }
