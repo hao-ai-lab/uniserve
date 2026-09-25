@@ -1,16 +1,16 @@
 //! Local and Hugging Face Hub model-file resolution.
 //!
 //! A model id that names an existing directory is read in place. Any other id
-//! is a Hub repository, read from the local Hub cache (under `HF_HOME` when
-//! set) without network access when the cache holds the needed file, and
-//! downloaded otherwise; see [`ResolvedModelFiles::new`] for how a cached
-//! `tokenizer.json` decides this for the whole file set. `ResolvedModelFiles`
-//! requires only `tokenizer.json`; every other file is optional and reported
-//! as `None` when absent.
+//! is a Hub repository: the Hub decides which files it publishes, through its
+//! file listing or a 404 answer for one file, and each published file is read
+//! from the local Hub cache (under `HF_HOME` when set) when cached and
+//! downloaded otherwise. A failed Hub request is reported as an error, never
+//! taken as evidence that a file is absent. `ResolvedModelFiles` requires only
+//! `tokenizer.json`; every other file is optional and reported as `None` when
+//! absent.
 
 use std::path::{Path, PathBuf};
 
-use hf_hub::Cache;
 use hf_hub::api::tokio::{Api, ApiBuilder, ApiError, ApiRepo};
 use thiserror_ext::AsReport as _;
 
@@ -42,16 +42,15 @@ pub struct ResolvedModelFiles {
 impl ResolvedModelFiles {
     /// Resolves configured model files from a local directory, the local Hub cache, or the Hub.
     ///
-    /// A cached `tokenizer.json` selects the cache for the whole set: optional
-    /// files missing from the cache are reported as absent rather than
-    /// downloaded.
+    /// For a Hub repository the file listing decides which optional files
+    /// exist, so the listing is fetched even when every file is cached, and a
+    /// listed file the cache lacks is downloaded.
     ///
     /// # Errors
     ///
     /// Returns [`Error::MissingFile`] when the directory or the repository
-    /// listing has no `tokenizer.json`, [`Error::Remote`] when a Hub request
-    /// fails, and [`Error::Invalid`] when a cached tokenizer path has no
-    /// parent directory.
+    /// listing has no `tokenizer.json`, and [`Error::Remote`] when a Hub
+    /// request, including the listing, fails.
     pub async fn new(model_id: &str) -> Result<Self> {
         ModelSource::from_model_id(model_id)?.model_files().await
     }
@@ -74,10 +73,9 @@ pub(crate) enum ModelSource {
     Local(PathBuf),
     /// A Hub repository reached through `api`.
     Hub {
-        /// Hub client; its cache receives downloaded files.
+        /// Hub client; its cache supplies cached files and receives
+        /// downloads.
         api: Api,
-        /// Local Hub cache consulted before any request.
-        cache: Cache,
         /// Repository identifier.
         repo_id: String,
     },
@@ -96,7 +94,6 @@ impl ModelSource {
         }
         Ok(Self::Hub {
             api: build_api(model_id)?,
-            cache: Cache::from_env(),
             repo_id: model_id.to_owned(),
         })
     }
@@ -110,7 +107,7 @@ impl ModelSource {
                     file: filename.to_owned(),
                 })
             }
-            Self::Hub { api, repo_id, .. } => {
+            Self::Hub { api, repo_id } => {
                 fetch_file(&api.model(repo_id.clone()), repo_id, filename).await
             }
         }
@@ -120,16 +117,7 @@ impl ModelSource {
     pub(crate) async fn model_files(&self) -> Result<ResolvedModelFiles> {
         match self {
             Self::Local(directory) => resolve_local_model_files(directory),
-            Self::Hub {
-                api,
-                cache,
-                repo_id,
-            } => {
-                if let Some(files) = resolve_cached_model_files(cache, repo_id)? {
-                    return Ok(files);
-                }
-                resolve_remote_model_files(api, repo_id).await
-            }
+            Self::Hub { api, repo_id } => resolve_remote_model_files(api, repo_id).await,
         }
     }
 }
@@ -151,7 +139,10 @@ fn resolve_local_model_files(model_dir: &Path) -> Result<ResolvedModelFiles> {
     })
 }
 
-/// Resolves and downloads the required and optional files advertised by a remote model repository.
+/// Resolves the required and optional files a Hub repository's listing advertises.
+///
+/// Each listed file is taken from the cache when cached and downloaded
+/// otherwise, so a cache that holds only some of the files is completed.
 async fn resolve_remote_model_files(api: &Api, model_id: &str) -> Result<ResolvedModelFiles> {
     let repo = api.model(model_id.to_string());
     let info = repo.info().await.map_err(|error| Error::Remote {
@@ -194,34 +185,6 @@ async fn resolve_remote_model_files(api: &Api, model_id: &str) -> Result<Resolve
         chat_template_path,
         config_path,
     })
-}
-
-/// Resolves a model-file set from the local Hub cache when it holds
-/// `tokenizer.json`, returning `None` otherwise.
-fn resolve_cached_model_files(cache: &Cache, model_id: &str) -> Result<Option<ResolvedModelFiles>> {
-    let cache_repo = cache.model(model_id.to_string());
-    let Some(tokenizer_path) = cache_repo.get("tokenizer.json") else {
-        return Ok(None);
-    };
-    let model_dir = tokenizer_path
-        .parent()
-        .ok_or_else(|| {
-            Error::invalid("resolved tokenizer file has no parent directory".to_string())
-        })?
-        .to_path_buf();
-
-    let config_path = match cache_repo.get("config.json") {
-        Some(path) if config_json_is_usable(&path) => Some(path),
-        other => cache_repo.get("llm_config.json").or(other),
-    };
-    Ok(Some(ResolvedModelFiles {
-        tokenizer_path,
-        tokenizer_config_path: cache_repo.get("tokenizer_config.json"),
-        generation_config_path: cache_repo.get("generation_config.json"),
-        preprocessor_config_path: cache_repo.get("preprocessor_config.json"),
-        chat_template_path: discover_chat_template_in_dir(&model_dir),
-        config_path,
-    }))
 }
 
 /// Downloads an optional model file when the repository provides it.
@@ -326,9 +289,8 @@ fn select_chat_template_sibling<'a>(
         .find(|name| name.ends_with(".jinja") && !name.contains('/'))
 }
 
-/// Discovers a standalone chat template in a local or cached checkpoint
-/// directory, with the same named-file precedence as
-/// [`select_chat_template_sibling`].
+/// Discovers a standalone chat template in a local checkpoint directory,
+/// with the same named-file precedence as [`select_chat_template_sibling`].
 fn discover_chat_template_in_dir(dir: &Path) -> Option<PathBuf> {
     for filename in ["chat_template.json", "chat_template.jinja"] {
         let path = dir.join(filename);
@@ -355,9 +317,22 @@ fn discover_chat_template_in_dir(dir: &Path) -> Option<PathBuf> {
 mod tests {
     use std::fs;
 
+    use axum::http::StatusCode;
     use tempfile::tempdir;
 
     use super::{ResolvedModelFiles, select_chat_template_sibling};
+    use crate::profile::assets::Error;
+    use crate::profile::assets::hub_stub::{HubStub, seed_cache};
+
+    const REPO: &str = "org/model";
+
+    /// Files a Hub text-model repository publishes.
+    const PUBLISHED: [(&str, &str); 4] = [
+        ("tokenizer.json", "{}"),
+        ("tokenizer_config.json", r#"{"eos_token":"<|im_end|>"}"#),
+        ("generation_config.json", r#"{"temperature":0.6}"#),
+        ("config.json", r#"{"model_type":"qwen3"}"#),
+    ];
 
     fn siblings(names: &[&'static str]) -> std::collections::BTreeSet<&'static str> {
         names.iter().copied().collect()
@@ -399,5 +374,44 @@ mod tests {
 
         assert_eq!(files.tokenizer_path, dir.path().join("tokenizer.json"));
         assert_eq!(files.config_path, Some(dir.path().join("config.json")));
+    }
+
+    /// A Hub cache that holds `tokenizer.json` but not the other metadata
+    /// files resolves the repository's full file set: the listed files the
+    /// cache lacks are downloaded rather than reported absent.
+    #[tokio::test]
+    async fn a_partial_hub_cache_resolves_every_published_file() {
+        let root = tempdir().unwrap();
+        seed_cache(root.path(), REPO, &PUBLISHED[..1]);
+        let source = HubStub::with_files(&PUBLISHED)
+            .serve(root.path(), REPO)
+            .await;
+
+        let files = source.model_files().await.unwrap();
+
+        let read = |path: Option<std::path::PathBuf>| fs::read_to_string(path.unwrap()).unwrap();
+        assert_eq!(read(files.tokenizer_config_path), PUBLISHED[1].1);
+        assert_eq!(read(files.generation_config_path), PUBLISHED[2].1);
+        assert_eq!(read(files.config_path), PUBLISHED[3].1);
+        assert_eq!(files.preprocessor_config_path, None);
+        assert_eq!(files.chat_template_path, None);
+    }
+
+    /// A repository listing the Hub refuses is reported as a remote failure
+    /// even when the cache holds `tokenizer.json`.
+    #[tokio::test]
+    async fn a_refused_repository_listing_is_a_remote_error() {
+        let root = tempdir().unwrap();
+        seed_cache(root.path(), REPO, &PUBLISHED[..1]);
+        let source = HubStub {
+            listing_status: Some(StatusCode::UNAUTHORIZED),
+            ..HubStub::with_files(&PUBLISHED)
+        }
+        .serve(root.path(), REPO)
+        .await;
+
+        let error = source.model_files().await.unwrap_err();
+
+        assert!(matches!(error, Error::Remote { .. }), "{error:?}");
     }
 }
