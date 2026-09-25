@@ -298,9 +298,10 @@ def _classify_failure(
 
     An error built from any other exception carries the coordinates of every
     call of the batch, plus request and call identity when the batch holds
-    exactly one call. ``classify`` returns an existing ``WorkerError`` itself
-    and fills only its None-valued fields, so its ``calls`` and ``fatal``
-    stay as raised.
+    exactly one call. Its route is the batch's call kind (`BatchState.route`).
+    ``classify`` returns an existing ``WorkerError`` itself and fills only
+    its None-valued fields, so a route the raiser set (a model forward's
+    mode), ``calls`` and ``fatal`` stay as raised.
     """
     scheduled = tuple(
         (
@@ -322,7 +323,7 @@ def _classify_failure(
         req_id=None if sole is None else int(sole.request_key.request_id),
         call_id=None if sole is None else sole.call_id,
         call_kind=None if sole is None else sole.kind.value,
-        route=str(0),
+        route=state.route,
     )
     _log_failure(classified, cause=error)
     return classified
@@ -336,7 +337,8 @@ def _publication_failure(
     """Classify a failure after publication began as a fatal invariant error.
 
     Part of the batch's state may already be visible to successors, so it
-    cannot be discarded and the error is always fatal.
+    cannot be discarded and the error is always fatal. It carries the
+    batch's call kind as its route and every call's coordinates.
     """
     scheduled = tuple(
         (
@@ -352,7 +354,7 @@ def _publication_failure(
         message=(f"batch publication failed after visibility began: {error}"),
         fatal=True,
         phase="batch publication",
-        route=str(0),
+        route=state.route,
         calls=scheduled,
     )
     _log_failure(classified, cause=error)
@@ -375,7 +377,7 @@ def _log_failure(
         "batch failed: %s [code=%s route=%s calls=%s]",
         error.message,
         error.code,
-        0,
+        error.route,
         error.calls,
         exc_info=(type(cause), cause, cause.__traceback__)
         if capture_trace and cause is not None

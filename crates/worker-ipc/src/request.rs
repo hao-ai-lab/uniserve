@@ -149,7 +149,10 @@ pub struct WorkerResponseError {
     pub fatal: bool,
     /// Optional worker phase that failed.
     pub phase: Option<String>,
-    /// Optional execution route that failed.
+    /// Call kind of the failed batch (for example `prefill`), or the forward
+    /// mode of the failed numerical call within it; absent when the failure
+    /// belongs to no batch with calls, such as an undecodable request, a
+    /// submission refused at admission, or a lifecycle-only batch.
     pub route: Option<String>,
     /// Calls affected by the failure.
     pub calls: Vec<ErrorCallIdentity>,

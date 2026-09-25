@@ -1179,7 +1179,8 @@ pub struct WorkerExecError {
     pub message: String,
     /// Execution phase in which the failure occurred, when known.
     pub phase: Option<String>,
-    /// Physical route or worker pool associated with the failure.
+    /// Call kind of the failed batch or numerical call, when the failure
+    /// belongs to a batch with calls (see `WorkerResponseError::route`).
     pub route: Option<String>,
     /// Calls affected by the worker failure.
     pub calls: Vec<uniserve_worker_ipc::ErrorCallIdentity>,

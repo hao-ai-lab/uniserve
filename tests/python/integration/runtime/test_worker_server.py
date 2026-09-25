@@ -13,6 +13,7 @@ import pytest
 from tests.python.fixtures.depth_one import (
     ar_params,
     execution_batch,
+    finalized_report,
     root_parent,
     token_call,
 )
@@ -21,7 +22,7 @@ from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
 from uniserve_worker.errors import WorkerError
 from uniserve_worker.execution.executor import Submission
 from uniserve_worker.protocol.batch import Batch, Finish, NewRequest
-from uniserve_worker.protocol.call import Call, ForwardMode
+from uniserve_worker.protocol.call import Call, CallStatus, ForwardMode
 from uniserve_worker.protocol.identity import CallId, RequestKey
 
 pytestmark = pytest.mark.integration
@@ -199,6 +200,93 @@ def test_execution_failure_is_logged_under_the_submit_request(
     ]
     assert len(failures) == 1
     assert failures[0].startswith("worker request 'submit' failed")
+
+
+def test_execution_failure_reports_the_call_kind_as_its_route(caplog) -> None:
+    """A failure inside a batch's execution names the kind it executed.
+
+    Every call of a batch shares one kind, so the batch failure log and an
+    error raised to a propagating caller both report it as the route.
+    """
+    admissions = (ar_params(93, block_ids=(0,)), ar_params(94, block_ids=(1,)))
+    # A text extension without input tokens is refused while the batch runs.
+    calls = tuple(
+        replace(
+            token_call(
+                admission.request_key,
+                call_id=CallId(index + 1, 0),
+                predecessor=root_parent(admission),
+                mode=ForwardMode.PREFILL,
+                tokens=(3, 4),
+            ),
+            input_token_ids=(),
+        )
+        for index, admission in enumerate(admissions)
+    )
+    with (
+        execution_worker(queue_depth=1) as worker,
+        caplog.at_level(
+            logging.WARNING, logger="uniserve_worker.execution.step"
+        ),
+    ):
+        served = finalized_report(
+            worker,
+            worker.submit(
+                execution_batch(
+                    batch_id=1, admissions=admissions[:1], calls=calls[:1]
+                )
+            ),
+        )
+        with pytest.raises(WorkerError) as raised:
+            worker.submit(
+                execution_batch(
+                    batch_id=2, admissions=admissions[1:], calls=calls[1:]
+                ),
+                propagate_errors=True,
+            )
+
+    assert served.completions[0].status is CallStatus.ERROR
+    assert raised.value.to_mapping()["route"] == "prefill"
+    # One failure log per batch, the served and the propagated one.
+    logged = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("batch failed")
+    ]
+    assert len(logged) == 2
+    assert all("route=prefill " in message for message in logged)
+
+
+def test_refused_call_batch_reports_its_call_kind_route_over_ipc() -> None:
+    """A batch refused before its calls launch still names their kind."""
+    with execution_worker(queue_depth=1) as worker:
+        admission = replace(
+            ar_params(95), request_pool_idx=worker.info.request_slots + 1
+        )
+        call = token_call(
+            admission.request_key,
+            call_id=CallId(1, 0),
+            predecessor=root_parent(admission),
+            mode=ForwardMode.PREFILL,
+            tokens=(3, 4),
+        )
+        endpoint = QueuedWorkerIpc(
+            (
+                _request(
+                    1,
+                    execution_batch(
+                        batch_id=1, admissions=(admission,), calls=(call,)
+                    ),
+                ),
+                {"kind": "close", "message_id": 2},
+            )
+        )
+        worker.bind(endpoint).run()
+
+    response = _by_call(endpoint)[1]
+    assert response["kind"] == "error"
+    assert response["code"] == "InvalidDescriptor"
+    assert response["route"] == "prefill"
 
 
 def test_a_batch_id_that_does_not_advance_is_refused_before_new_admission() -> (
