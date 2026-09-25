@@ -412,7 +412,13 @@ pub(crate) struct WorkerProcessOptions {
     pub quantization_config: serde_json::Value,
     #[arg(long)]
     pub kv_cache_dtype: Option<KvCacheDtype>,
-    #[arg(long = "mem-fraction-static", default_value = "0.70")]
+    /// Each worker rank's share of its device's total storage, in (0, 1].
+    /// A deployment file's `memory_fraction` overrides it for one worker.
+    #[arg(
+        long = "mem-fraction-static",
+        default_value = "0.70",
+        value_parser = parse_storage_fraction
+    )]
     pub kv_storage_fraction: f64,
     /// Parallelism mesh forwarded to the Python worker, e.g.
     /// `tower=text:cuda:0;gen:cuda:1`.
@@ -509,6 +515,16 @@ fn parse_json_object(value: &str) -> Result<Value, String> {
     } else {
         Err("expected a JSON object".to_string())
     }
+}
+
+/// Parses a device storage fraction for clap, refusing a value outside the
+/// range `WorkerConfig::validate_storage_fraction` accepts.
+fn parse_storage_fraction(value: &str) -> Result<f64, String> {
+    let fraction = value
+        .parse::<f64>()
+        .map_err(|error| format!("invalid storage fraction {value:?}: {error}"))?;
+    WorkerConfig::validate_storage_fraction(fraction).map_err(|error| error.to_string())?;
+    Ok(fraction)
 }
 
 /// Returns the secret with surrounding whitespace trimmed, or `None` when it
@@ -664,6 +680,28 @@ mod tests {
                 .tensor_parallel_size,
             2
         );
+    }
+
+    /// `--mem-fraction-static` is each rank's share of its device's total
+    /// storage, so the parser accepts exactly the finite values in (0, 1]
+    /// that the worker accepts, and refuses the rest before any rank starts.
+    #[test]
+    fn serve_accepts_only_a_storage_fraction_in_the_unit_interval() {
+        let serve = |fraction: &str| {
+            <Cli as clap::Parser>::try_parse_from([
+                "uniserve",
+                "serve",
+                "model",
+                "--mem-fraction-static",
+                fraction,
+            ])
+        };
+        for accepted in ["0.05", "1.0"] {
+            assert!(serve(accepted).is_ok(), "{accepted} is a device share");
+        }
+        for refused in ["0", "-0.5", "1.5", "NaN", "inf"] {
+            assert!(serve(refused).is_err(), "{refused} is not a device share");
+        }
     }
 
     /// Writes a deployment configuration and returns the path naming it.

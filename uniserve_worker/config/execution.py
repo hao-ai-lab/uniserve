@@ -431,9 +431,7 @@ def worker_config_from_namespace(
         attention_backend=str(namespace.attention_backend),
         model_dtype=str(namespace.model_dtype),
         kv_cache_dtype=_none_if_empty(namespace.kv_cache_dtype),
-        # The launch value must be strictly below one even though
-        # ``WorkerConfig`` itself accepts a fraction of exactly one.
-        kv_storage_fraction=_bounded_fraction(
+        kv_storage_fraction=_storage_fraction(
             float(namespace.kv_memory_fraction),
             "kv-memory-fraction",
         ),
@@ -503,13 +501,19 @@ def _positive_optional_int(value: object | None) -> int | None:
     return parsed
 
 
-def _bounded_fraction(value: float, name: str) -> float:
-    """Validate a floating-point fraction.
+def _storage_fraction(value: float, name: str) -> float:
+    """Validate a per-process device storage fraction.
 
-    The fraction must lie strictly between zero and one.
+    The fraction is a share of each device's total storage, which
+    ``device_storage_budget`` also bounds by the storage free at startup, so
+    any finite value in (0, 1] is meaningful; one grants the whole device.
+    The engine checks the same range before it launches a rank.
+
+    Raises:
+        ValueError: If the value is not finite or lies outside (0, 1].
     """
-    if value <= 0.0 or value >= 1.0:
-        raise ValueError(f"{name} must be greater than 0 and less than 1")
+    if not math.isfinite(value) or not 0.0 < value <= 1.0:
+        raise ValueError(f"{name} must be finite and in (0, 1]")
     return value
 
 
