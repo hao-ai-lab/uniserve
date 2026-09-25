@@ -29,7 +29,7 @@ from dataclasses import dataclass, replace
 from importlib import import_module
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeVar
 
 import torch
 from torch import nn
@@ -447,11 +447,49 @@ def _source_files(source, root, inventory, io):
     )
 
 
+def _tokenizer_vocabulary(path: Path) -> dict[str, object]:
+    """Map token text to ID from a ``tokenizer.json`` model and added tokens.
+
+    The model vocabulary is an object from token text to ID or, for a
+    Unigram model, a list of ``[text, score]`` rows whose position is the ID;
+    ``added_tokens`` is a list of objects carrying ``content`` and ``id``.
+    Added tokens override the model vocabulary. Any other layout raises
+    ``ValueError``; IDs are returned unchecked for ``_tokens`` to validate.
+    """
+    data = _json(path)
+    model = data.get("model", {})
+    vocabulary = model.get("vocab", {}) if isinstance(model, dict) else None
+    added = data.get("added_tokens", [])
+
+    if isinstance(vocabulary, list) and all(
+        isinstance(row, list) and row and isinstance(row[0], str)
+        for row in vocabulary
+    ):
+        vocabulary = {row[0]: index for index, row in enumerate(vocabulary)}
+    if (
+        not isinstance(vocabulary, dict)
+        or not isinstance(added, list)
+        or any(
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("content"), str)
+            or "id" not in entry
+            for entry in added
+        )
+    ):
+        raise ValueError(f"tokenizer metadata {path} has a malformed layout")
+
+    return {
+        **vocabulary,
+        **{entry["content"]: entry["id"] for entry in added},
+    }
+
+
 def _tokens(processor, root):
     """Fill declared start/end feature-injection token IDs from checkpoint tokenizer files."""  # noqa: E501
     # Only tokens declared by text without an ID are resolved; a processor
     # with nothing to resolve is returned unchanged. A declared token that no
-    # vocabulary source maps to a nonnegative integer raises ``ValueError``.
+    # vocabulary source maps to a nonnegative integer, or a tokenizer file
+    # with a malformed layout, raises ``ValueError``.
     if processor is None or processor.feature_injection is None:
         return processor
     injection = processor.feature_injection
@@ -467,35 +505,27 @@ def _tokens(processor, root):
     # Merge every vocabulary spelling a checkpoint may carry; later files
     # override earlier ones for the same token text.
     vocabulary: dict[str, object] = {}
-    path = root / "tokenizer.json"
-    if path.is_file():
-        data = _json(path)
-        raw_vocab = data.get("model", {}).get("vocab", {})
-        # A dict vocabulary maps token text to ID; a list vocabulary holds one
-        # row per token whose first element is the text and whose position
-        # is the ID.
-        vocabulary.update(
-            raw_vocab
-            if isinstance(raw_vocab, dict)
-            else {row[0]: i for i, row in enumerate(raw_vocab)}
-        )
-        vocabulary.update(
-            {
-                entry["content"]: entry["id"]
-                for entry in data.get("added_tokens", ())
-            }
-        )
+    if (root / "tokenizer.json").is_file():
+        vocabulary.update(_tokenizer_vocabulary(root / "tokenizer.json"))
     for filename in ("vocab.json", "added_tokens.json"):
         if (root / filename).is_file():
             vocabulary.update(_json(root / filename))
-    if (root / "tokenizer_config.json").is_file():
+
+    path = root / "tokenizer_config.json"
+    if path.is_file():
+        # ``added_tokens_decoder`` maps each decimal ID to an object whose
+        # ``content`` is the token text.
+        decoder = _json(path).get("added_tokens_decoder", {})
+        if not isinstance(decoder, dict) or any(
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("content"), str)
+            for entry in decoder.values()
+        ):
+            raise ValueError(
+                f"tokenizer metadata {path} has a malformed layout"
+            )
         vocabulary.update(
-            {
-                entry["content"]: int(index)
-                for index, entry in _json(root / "tokenizer_config.json")
-                .get("added_tokens_decoder", {})
-                .items()
-            }
+            {entry["content"]: int(index) for index, entry in decoder.items()}
         )
 
     updates = {}
@@ -742,11 +772,22 @@ def _architectures(metadata: Mapping) -> tuple[str, ...]:
     """Return the architectures a root metadata file declares.
 
     A pipeline index declares its pipeline class; a model configuration
-    declares its architectures.
+    declares its architectures. A class name that is not a string, or
+    architectures that are not a list of strings, raise ``ValueError``.
     """
-    if "_class_name" in metadata:
-        return (metadata["_class_name"],)
-    return tuple(metadata.get("architectures", ()))
+    declared = (
+        [metadata["_class_name"]]
+        if "_class_name" in metadata
+        else metadata.get("architectures", [])
+    )
+    if not isinstance(declared, list) or any(
+        not isinstance(name, str) for name in declared
+    ):
+        raise ValueError(
+            f"checkpoint must declare architectures as names; "
+            f"found {declared!r}"
+        )
+    return tuple(declared)
 
 
 def read_config(
@@ -776,8 +817,9 @@ def read_config(
             source's files cannot be found.
         ValueError: The checkpoint metadata or selection is invalid or
             unsupported, including an architecture outside the catalog, a
-            selected path that is not a module, and malformed index,
-            tokenizer or quantization metadata.
+            selected path that is not a module, and malformed architecture,
+            model configuration, index, tokenizer or quantization metadata
+            (a required field that is missing or a field of the wrong type).
     """  # noqa: D205
     root, repository, revision = _root(path, io)
     metadata = _root_metadata(root)
@@ -947,11 +989,21 @@ def read_config(
     if quantization is not None:
         method = quantization.get("quant_method", "unquantized")
         if method != "unquantized":
-            if method not in {"fp8", "mxfp8", "nvfp4"}:
+            formats: dict[str, Literal["fp8", "mxfp8", "nvfp4"]] = {
+                "fp8": "fp8",
+                "mxfp8": "mxfp8",
+                "nvfp4": "nvfp4",
+            }
+            quant_format = (
+                formats.get(method) if isinstance(method, str) else None
+            )
+            if quant_format is None:
                 raise ValueError(
                     f"unsupported checkpoint quantization {method!r}"
                 )
-            quantizer = Quantizer(method, axis=0 if method == "fp8" else None)
+            quantizer = Quantizer(
+                quant_format, axis=0 if quant_format == "fp8" else None
+            )
             precision = replace(
                 precision,
                 quantization={"": QuantizationConfig(quantizer, quantizer)},

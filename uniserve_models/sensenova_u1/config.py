@@ -128,7 +128,8 @@ class TransformerConfig:
                 "SenseNova layer_types must describe every decoder layer"
             )
         if any(
-            value not in {"full_attention", "sliding_attention"}
+            not isinstance(value, str)
+            or value not in {"full_attention", "sliding_attention"}
             for value in self.layer_types
         ):
             raise ValueError(
@@ -159,7 +160,7 @@ class TransformerConfig:
             raise ValueError(
                 "SenseNova pad_token_id must be inside the vocabulary"
             )
-        if self.hidden_act not in {
+        if not isinstance(self.hidden_act, str) or self.hidden_act not in {
             "silu",
             "swish",
             "silu_and_mul",
@@ -212,6 +213,13 @@ def _stage_scalar(value: Any, name: str) -> Any:
     return value
 
 
+def _required(config: Mapping[str, Any], name: str, label: str) -> Any:
+    """Return a required field of the ``label`` map for later validation."""
+    if name not in config:
+        raise ValueError(f"SenseNova {label} requires {name!r}")
+    return config[name]
+
+
 def _alias(
     primary: Mapping[str, Any],
     name: str,
@@ -241,11 +249,11 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
     Raises:
         RuntimeError: When the checkpoint requires a newer version of this
             model implementation.
-        KeyError: When a required key is missing, such as ``llm_config``,
-            ``vision_config`` or a text dimension without a default.
-        ValueError: For malformed metadata, including conflicting aliases,
-            an unsupported rotary recipe or sparse MoE text model, and
-            fields that a rotary recipe or config dataclass rejects.
+        ValueError: For malformed metadata, including a missing
+            ``llm_config``, ``vision_config`` or text dimension without a
+            default, conflicting aliases, an unsupported rotary recipe or
+            sparse MoE text model, and fields that a rotary recipe or config
+            dataclass rejects.
     """  # noqa: E501
     from packaging.version import Version
 
@@ -256,7 +264,7 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
             f"checkpoint requires UniServe model code >= {required}"
         )
 
-    text, image = raw["llm_config"], raw["vision_config"]
+    text, image = raw.get("llm_config"), raw.get("vision_config")
     if not isinstance(text, Mapping) or not isinstance(image, Mapping):
         raise ValueError(
             "SenseNova llm_config and vision_config must be objects"
@@ -318,12 +326,22 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
                     option("truncate", True),
                 )
             case "longrope":
+                short = option("short_factor", ())
+                long = option("long_factor", ())
+                if not all(
+                    isinstance(factors, (list, tuple))
+                    for factors in (short, long)
+                ):
+                    raise ValueError(
+                        "SenseNova LongRoPE short and long factors must be "
+                        "lists"
+                    )
                 recipe = LongRoPEScaling(
                     factor,
                     original,
                     option("attention_factor"),
-                    tuple(option("short_factor", ())),
-                    tuple(option("long_factor", ())),
+                    tuple(short),
+                    tuple(long),
                 )
             case "llama3":
                 recipe = LlamaScaling(
@@ -337,10 +355,11 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
                     f"unsupported SenseNova rotary recipe {kind!r}"
                 )
 
-    layers, heads = text["num_hidden_layers"], text["num_attention_heads"]
+    layers = _required(text, "num_hidden_layers", "llm_config")
+    heads = _required(text, "num_attention_heads", "llm_config")
     _positive(layers, "llm_config.num_hidden_layers", integer=True)
     _positive(heads, "llm_config.num_attention_heads", integer=True)
-    hidden = text["hidden_size"]
+    hidden = _required(text, "hidden_size", "llm_config")
     _positive(hidden, "llm_config.hidden_size", integer=True)
     if "head_dim" not in text and hidden % heads:
         raise ValueError(
@@ -391,12 +410,16 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
 
     return Config(
         text=TransformerConfig(
-            vocab_size=text["vocab_size"],
+            vocab_size=_required(text, "vocab_size", "llm_config"),
             hidden_size=hidden,
-            intermediate_size=text["intermediate_size"],
+            intermediate_size=_required(
+                text, "intermediate_size", "llm_config"
+            ),
             num_hidden_layers=layers,
             num_attention_heads=heads,
-            num_key_value_heads=text["num_key_value_heads"],
+            num_key_value_heads=_required(
+                text, "num_key_value_heads", "llm_config"
+            ),
             head_dim=text.get("head_dim", hidden // heads),
             layer_types=tuple(layer_types),
             hidden_act=text.get("hidden_act", "silu"),
@@ -435,9 +458,13 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
         ),
         flow=flow.Config(
             head=flow.HeadConfig(
-                hidden_size=raw["fm_head_dim"] if head_layers > 2 else 4096,
+                hidden_size=_required(raw, "fm_head_dim", "config")
+                if head_layers > 2
+                else 4096,
                 num_layers=head_layers,
-                mlp_ratio=raw["fm_head_mlp_ratio"] if head_layers > 2 else 1.0,
+                mlp_ratio=_required(raw, "fm_head_mlp_ratio", "config")
+                if head_layers > 2
+                else 1.0,
             ),
             use_pixel_head=raw.get("use_pixel_head", False),
             add_noise_scale_embedding=raw.get(
