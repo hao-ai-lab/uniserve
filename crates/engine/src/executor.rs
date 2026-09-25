@@ -638,7 +638,8 @@ impl FromStr for TransferBackend {
 /// product's location decides which carries it: a device product travels on
 /// the edge's device mechanism, a host product on its host mechanism. An edge
 /// may name only one of the two, in which case products of the other
-/// location have no way across it and are refused where they are bound.
+/// location have no way across it: `TransferConfig::bind_inputs` refuses them
+/// where they are bound, and `WorkerExecutor` fails the requests reading them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferEdge {
     /// Pool that produces the transferred product.
@@ -965,61 +966,83 @@ impl TransferConfig {
     ///
     /// # Errors
     ///
-    /// Fails when a tensor is left with no location. Filtering is not rolled
-    /// back: tensors examined up to that one keep their filtered locations.
+    /// Fails with every product that has a tensor left with no location. An
+    /// edge that names only one of the two mechanisms refuses products of the
+    /// other location here, and so does a product published over none of the
+    /// mechanisms its edge carries. Filtering is not rolled back: every
+    /// tensor keeps its filtered locations.
     pub(crate) fn bind_inputs(
         &self,
         products: &mut [uniserve_worker_ipc::TensorPublication],
         kv_inputs: &mut [uniserve_worker_ipc::KvTransfer],
         destination: &uniserve_worker_ipc::WorkerEndpoint,
-    ) -> anyhow::Result<()> {
-        use uniserve_worker_ipc::{TransferHandle, TransferTransport};
-
-        let tensors = products
-            .iter_mut()
-            .map(|payload| &mut payload.value)
-            .flat_map(TransferHandle::tensors_mut)
-            .chain(
-                kv_inputs
-                    .iter_mut()
-                    .flat_map(|publication| &mut publication.tensors),
-            );
-        for tensor in tensors {
-            // A product's location chose the mechanism it was published on,
-            // so a location is kept where the edge carries that mechanism for
-            // either location.
-            tensor.locations.retain(|location| {
-                let published = match &location.transport {
-                    TransferTransport::Local { .. } => TransferBackend::Local,
-                    TransferTransport::PosixShm { .. } => TransferBackend::Shm,
-                    TransferTransport::CudaVmm { .. } => TransferBackend::CudaVmm,
-                    TransferTransport::Channel { .. } => TransferBackend::Channel,
-                };
-                self.edges
-                    .iter()
-                    .find(|edge| {
-                        edge.source_worker.0 == location.source.worker_id
-                            && edge
-                                .source_rank
-                                .is_none_or(|rank| rank == location.source.rank)
-                            && edge.destination_worker.0 == destination.worker_id
-                            && edge
-                                .destination_rank
-                                .is_none_or(|rank| rank == destination.rank)
-                    })
-                    .map_or_else(
-                        || &location.source == destination && published == TransferBackend::Local,
-                        |edge| edge.carries(published),
-                    )
-            });
-            anyhow::ensure!(
-                !tensor.locations.is_empty(),
-                "product has no location on a configured edge to {}:{}",
-                destination.worker_id,
-                destination.rank,
-            );
+    ) -> Result<(), UnroutableInputs> {
+        let mut unroutable = Vec::new();
+        for payload in products.iter_mut() {
+            let buffer = payload.product.buffer_id();
+            let mut bound = true;
+            for tensor in payload.value.tensors_mut() {
+                bound &= self.bind_locations(tensor, destination);
+            }
+            if !bound {
+                unroutable.push(buffer);
+            }
         }
-        Ok(())
+        for publication in kv_inputs.iter_mut() {
+            let mut bound = true;
+            for tensor in &mut publication.tensors {
+                bound &= self.bind_locations(tensor, destination);
+            }
+            if !bound {
+                unroutable.push(publication.source);
+            }
+        }
+        if unroutable.is_empty() {
+            return Ok(());
+        }
+        Err(UnroutableInputs {
+            destination: format!("{}:{}", destination.worker_id, destination.rank),
+            buffers: unroutable,
+        })
+    }
+
+    /// Keeps the locations of one tensor that reach `destination`, as
+    /// `bind_inputs` selects them, and reports whether any remain.
+    fn bind_locations(
+        &self,
+        tensor: &mut uniserve_worker_ipc::TensorTransfer,
+        destination: &uniserve_worker_ipc::WorkerEndpoint,
+    ) -> bool {
+        use uniserve_worker_ipc::TransferTransport;
+
+        // A product's location chose the mechanism it was published on, so a
+        // location is kept where the edge carries that mechanism for either
+        // location.
+        tensor.locations.retain(|location| {
+            let published = match &location.transport {
+                TransferTransport::Local { .. } => TransferBackend::Local,
+                TransferTransport::PosixShm { .. } => TransferBackend::Shm,
+                TransferTransport::CudaVmm { .. } => TransferBackend::CudaVmm,
+                TransferTransport::Channel { .. } => TransferBackend::Channel,
+            };
+            self.edges
+                .iter()
+                .find(|edge| {
+                    edge.source_worker.0 == location.source.worker_id
+                        && edge
+                            .source_rank
+                            .is_none_or(|rank| rank == location.source.rank)
+                        && edge.destination_worker.0 == destination.worker_id
+                        && edge
+                            .destination_rank
+                            .is_none_or(|rank| rank == destination.rank)
+                })
+                .map_or_else(
+                    || &location.source == destination && published == TransferBackend::Local,
+                    |edge| edge.carries(published),
+                )
+        });
+        !tensor.locations.is_empty()
     }
 
     /// Parses `source[:rank]->destination[:rank]=mechanisms` directed bindings.
@@ -1146,6 +1169,21 @@ impl FromStr for TransferConfig {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::parse(value)
     }
+}
+
+/// Transferred inputs that a consuming rank cannot read.
+///
+/// Every published location of these products travels on a mechanism that no
+/// configured edge to the consumer carries, so the requests reading them can
+/// never run there. `WorkerExecutor` fails those requests alone: the refusal
+/// says nothing about the rest of the batch or the health of either instance.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("input products have no location on a configured transfer edge to {destination}")]
+pub(crate) struct UnroutableInputs {
+    /// The consuming rank, as `worker:rank`.
+    pub(crate) destination: String,
+    /// The products left without a location the consumer can read.
+    pub(crate) buffers: Vec<uniserve_worker_ipc::BufferId>,
 }
 
 /// Error returned for an invalid transfer-transport mapping.
@@ -1470,6 +1508,73 @@ mod tests {
         assert!(TransferConfig::parse("a->b=shm+channel").is_err());
         assert!(TransferConfig::parse("a->b=local+shm").is_err());
         assert!(TransferConfig::parse("a->b=cuda_vmm+cuda_vmm").is_err());
+    }
+
+    #[test]
+    fn a_device_only_edge_refuses_a_product_published_as_host_bytes() {
+        use uniserve_worker_ipc::{
+            CallId, DType, DimBound, Locator, RequestKey, ShapeBound, TensorPublication, TensorRef,
+            TensorTransfer, TransferHandle, TransferTransport, WorkerEndpoint as Endpoint,
+        };
+
+        // A device product that did not fit its producer's pool is published
+        // in the producer's own address space and as shared-storage bytes; an
+        // edge that carries only CUDA VMM takes neither to the decoder.
+        let transfer = TransferConfig::parse("denoiser->decoder=cuda_vmm").unwrap();
+        let endpoint = |worker: &str| Endpoint {
+            worker_id: worker.to_owned(),
+            rank: 0,
+            node: "host".to_owned(),
+            address_space: format!("{worker}-process"),
+            incarnation: format!("{worker}-incarnation"),
+        };
+        let producer = endpoint("denoiser");
+        let locator = |transport| Locator {
+            source: producer.clone(),
+            transport,
+            nbytes: 4,
+            dtype: "float32".to_owned(),
+            shape: vec![1],
+            offset: vec![0],
+            device: "cpu".to_owned(),
+        };
+        let product = TensorRef {
+            request_key: RequestKey::new(1, uniserve_core::RequestId(7), 1),
+            producer_call_id: CallId::new(1, 0),
+            output_index: 0,
+            generation: 1,
+            dtype: DType::F32,
+            shape_bound: ShapeBound {
+                dims: vec![DimBound::Static(1)],
+            },
+        };
+        let mut products = vec![TensorPublication {
+            product: product.clone(),
+            value: TransferHandle::DeviceProduct {
+                height: 0,
+                width: 0,
+                value_range: String::new(),
+                tensor: TensorTransfer {
+                    shape: vec![1],
+                    locations: vec![
+                        locator(TransferTransport::Local {
+                            endpoint: producer.incarnation.clone(),
+                            key: 1,
+                        }),
+                        locator(TransferTransport::PosixShm {
+                            endpoint: producer.incarnation.clone(),
+                            name: "segment".to_owned(),
+                        }),
+                    ],
+                },
+            },
+        }];
+
+        let refusal = transfer
+            .bind_inputs(&mut products, &mut [], &endpoint("decoder"))
+            .unwrap_err();
+        assert_eq!(refusal.buffers, vec![product.buffer_id()]);
+        assert_eq!(refusal.destination, "decoder:0");
     }
 
     #[test]

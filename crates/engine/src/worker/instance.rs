@@ -1688,7 +1688,8 @@ impl WorkerGroup {
     /// Returns `WouldBlock` with the batch when the group holds no ranks or
     /// all `depth` slots are held. A closed group, a batch identifier that does
     /// not exceed the previous one, an invalid batch, or a failed projection
-    /// or input binding returns `Failed` with no state change. A rank
+    /// or input binding returns `Failed` with no state change; a failed input
+    /// binding carries the first refusing rank's `UnroutableInputs`. A rank
     /// submission that fails after the batch is recorded replaces the rank
     /// group and returns `Failed` with the recovery's `WorkerFailure`.
     pub fn submit_batch(&mut self, batch: Batch) -> Result<(), BatchSubmitError> {
