@@ -6,6 +6,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.python.fixtures.audio_decoding import CONFIG as AUDIO_CONFIG
+from tests.python.fixtures.audio_decoding import AudioModel
+from tests.python.fixtures.audio_decoding import (
+    entry_points as audio_entry_points,
+)
 from tests.python.fixtures.decoding import Config as DecoderConfig
 from tests.python.fixtures.decoding import DecodedModel
 from tests.python.fixtures.depth_one import finalized_report
@@ -15,6 +20,7 @@ from uniserve.distributed import Communicator, DeviceMesh
 from uniserve_worker.config.deployment import ComponentConfig, ParallelConfig
 from uniserve_worker.config.execution import LaneConfig, WorkerConfig
 from uniserve_worker.errors import InputError
+from uniserve_worker.execution import media
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.protocol.batch import (
@@ -118,6 +124,80 @@ def test_temporal_output_regions_follow_declared_rank_order(rank, units):
             )
     finally:
         runner.close()
+
+
+@pytest.mark.parametrize(
+    ("ranks", "units_per_rank"),
+    [((0,), 2), ((0, 1), 1), ((0, 1), 2), ((1, 0), 2), ((0, 1, 2), 3)],
+)
+def test_audio_decoding_ranks_reconstruct_contiguous_unit_runs(
+    ranks, units_per_rank
+):
+    model = AudioModel()
+    decoder = model.audio_decoder
+    units = len(ranks) * units_per_rank
+    frames = 4 * units
+    # A trimmed final latent frame keeps the last unit's crop in play.
+    num_samples = frames * decoder.latent_rate - 3
+    latent = torch.randn(2 * frames, AUDIO_CONFIG.latent_channels)
+    whole = decoder.decode(
+        (latent,),
+        frames=(slice(0, frames),),
+        num_samples=(num_samples,),
+        workspace={
+            "audio_latents": torch.zeros(
+                2, AUDIO_CONFIG.latent_channels, frames
+            )
+        },
+    )[0]
+    spans = decoder.unit_samples(num_samples, units)
+
+    config = ComponentConfig(
+        ranks, distribution="temporal_units", units_per_rank=units_per_rank
+    )
+    dimensions = ParallelConfig().dimensions
+    decoded = {}
+    for rank in ranks:
+        group = Communicator(tuple(sorted(ranks)), rank)
+        binding = ComponentBinding(
+            "audio_decoder",
+            config,
+            group,
+            DeviceMesh(
+                ranks=(rank,),
+                rank=rank,
+                shape=tuple(size for _, size in dimensions),
+                axes=tuple(axis for axis, _ in dimensions),
+            ),
+            group.device,
+        )
+        runner = ModelExecutor(
+            model,
+            WorkerConfig(rank=rank, world_size=len(ranks)),
+            bindings={"audio_decoder": binding},
+            entry_points=audio_entry_points(AUDIO_CONFIG),
+        )
+        try:
+            decoded[rank] = media.decode_audio(
+                runner,
+                "audio_decoder",
+                latent,
+                num_samples,
+                cursor=0,
+                count=units,
+            ).values[0]
+        finally:
+            runner.close()
+
+        # Each rank reconstructs the contiguous run of ``units_per_rank``
+        # media units its position in ``ranks`` names, which is the sample
+        # region the rank reserves for the track.
+        first = ranks.index(rank) * units_per_rank
+        run = slice(spans[first].start, spans[first + units_per_rank - 1].stop)
+        assert torch.equal(decoded[rank], whole[run])
+
+    # Together the ranks, in their declared order, reproduce the whole track.
+    assert torch.equal(torch.cat([decoded[rank] for rank in ranks]), whole)
 
 
 @pytest.mark.parametrize(

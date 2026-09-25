@@ -109,6 +109,30 @@ class ComponentBinding:
             return self.groups
         return (*self.groups, self.units)
 
+    def media_units(self, cursor: int, count: int) -> range:
+        """Return the media units this rank reconstructs in one round.
+
+        A round covers units ``[cursor, cursor + count)``. With
+        ``temporal_units`` the ranks take contiguous runs of
+        ``units_per_rank`` units in ``config.ranks`` order, the deal the
+        engine routes a round's units by; a rank whose run would start past
+        the round's end holds none, and the last holder's run is cut at the
+        end. Without a distribution the members compute the component
+        together, so each holds the whole round.
+
+        Raises:
+            ValueError: This rank is not a member of a distributed
+                component.
+        """
+        config = self.config
+        if config.distribution is None:
+            return range(cursor, cursor + count)
+
+        per_rank = config.units_per_rank
+        offset = config.ranks.index(self.process_group.global_rank) * per_rank
+        # ``range`` is empty when the run's start lies at or past its stop.
+        return range(cursor + offset, cursor + min(offset + per_rank, count))
+
     @property
     def input_ranks(self) -> tuple[int, ...]:
         """First pipeline-stage input members in configured order."""
