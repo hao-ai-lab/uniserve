@@ -118,6 +118,36 @@ command = ["server"]
         load_config(config)
 
 
+def test_toml_rejects_a_mistyped_load_value_as_a_schema_error(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "profiles.toml"
+    config.write_text(
+        """
+[servers.local]
+port = 8000
+command = ["server"]
+
+[benchmarks.point]
+server = "local"
+task = "text"
+model = "model"
+dataset = "sharegpt"
+tokenizer = "model"
+
+[benchmarks.point.load]
+num_prompts = "5"
+
+[benchmarks.point.metrics]
+output_throughput = "higher"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=r"benchmarks\.point\.load"):
+        load_config(config)
+
+
 def test_a_profile_resolves_its_paths_against_the_root_it_states(
     tmp_path: Path,
 ) -> None:
