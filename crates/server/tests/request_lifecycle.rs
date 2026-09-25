@@ -25,12 +25,19 @@ fn runtime() -> ServingRuntime {
 
 /// Builds a Qwen3 serving runtime whose engine drives `worker` in process
 /// through `SimExecutor`.
-///
-/// The tokenizer maps each code point below 128 to one token whose ID is the
-/// code point; `<|im_end|>` is added as ID 128, which the model config names
-/// as its end-of-sequence token. The chat template renders only the first
-/// message's content.
 fn runtime_with_worker(worker: SimEngine) -> ServingRuntime {
+    runtime_for_engine_model(worker, "sim-model")
+}
+
+/// Builds a Qwen3 serving runtime whose engine, named `engine_model`, drives
+/// `worker` in process through `SimExecutor`.
+///
+/// The engine's model name labels the process-wide request metrics, so a test
+/// that reads them names its own engine. The tokenizer maps each code point
+/// below 128 to one token whose ID is the code point; `<|im_end|>` is added
+/// as ID 128, which the model config names as its end-of-sequence token. The
+/// chat template renders only the first message's content.
+fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> ServingRuntime {
     let vocabulary = (0_u32..128)
         .map(|id| (char::from_u32(id).unwrap().to_string(), id))
         .collect::<Vocab>();
@@ -48,7 +55,7 @@ fn runtime_with_worker(worker: SimEngine) -> ServingRuntime {
 
     let client = Arc::new(
         EngineClient::connect_with_executor(
-            EngineConfig::sim("sim-model"),
+            EngineConfig::sim(engine_model),
             Box::new(SimExecutor::new(worker)),
         )
         .unwrap(),
@@ -307,4 +314,104 @@ fn successful_total_includes_time_waiting_for_preprocessing() {
         assert!(timing.total_us >= timing.compile_us, "{timing:?}");
         runtime.shutdown().await.unwrap();
     });
+}
+
+/// A completed request is recorded once in the request metrics under its
+/// engine's model name: the token counters and token histograms carry the
+/// counts of its usage report, its finish status is counted, and each latency
+/// histogram whose input it carries holds one observation.
+#[tokio::test]
+async fn completed_request_is_recorded_in_request_metrics() {
+    let engine_model = "request-metrics-model";
+    let runtime = runtime_for_engine_model(SimEngine::new(), engine_model);
+    let mut request = TextPromptRequest::new("metrics", "prompt");
+    request.sampling.max_tokens = Some(3);
+    request.sampling.temperature = Some(0.0);
+    request.stop.allowed_token_ids = Some(vec![u32::from(b'a')]);
+
+    let mut stream = runtime.generate_text(request).await.unwrap();
+    let mut usage = None;
+    let mut finish = None;
+    while let Some(event) = stream.next().await {
+        match event.unwrap() {
+            RequestOutput::Usage {
+                prompt_tokens,
+                visible_output_tokens,
+                internal_tokens,
+                ..
+            } => usage = Some((prompt_tokens, visible_output_tokens + internal_tokens)),
+            RequestOutput::Finished { reason, .. } => finish = Some(reason),
+            _ => {}
+        }
+    }
+    assert_eq!(finish, Some(FinishStatus::Length));
+    let (prompt_tokens, generation_tokens) = usage.unwrap();
+    assert_eq!(generation_tokens, 3);
+
+    let rendered = uniserve_observability::METRICS.render().unwrap();
+    let labels = format!("model_name=\"{engine_model}\",engine=\"0\"");
+    for expected in [
+        format!("uniserve:request_success_total{{{labels},finished_reason=\"length\"}} 1"),
+        format!("uniserve:prompt_tokens_total{{{labels}}} {prompt_tokens}"),
+        format!("uniserve:generation_tokens_total{{{labels}}} {generation_tokens}"),
+        format!("uniserve:request_prompt_tokens_count{{{labels}}} 1"),
+        format!("uniserve:request_generation_tokens_count{{{labels}}} 1"),
+        format!("uniserve:request_max_num_generation_tokens_count{{{labels}}} 1"),
+        format!("uniserve:e2e_request_latency_seconds_count{{{labels}}} 1"),
+        format!("uniserve:request_queue_time_seconds_count{{{labels}}} 1"),
+        format!("uniserve:time_to_first_token_seconds_count{{{labels}}} 1"),
+    ] {
+        assert!(
+            rendered.lines().any(|line| line == expected),
+            "missing `{expected}` in:\n{rendered}"
+        );
+    }
+    runtime.shutdown().await.unwrap();
+}
+
+/// A client that disconnects mid-generation is counted as an aborted request
+/// with its latency, while its partial output, which never reached a usage
+/// report, adds nothing to the token metrics.
+#[tokio::test]
+async fn disconnected_request_is_recorded_as_aborted_without_token_usage() {
+    let engine_model = "disconnect-metrics-model";
+    let mut worker = SimEngine::new();
+    worker.set_text_len(1_000_000);
+    let runtime = runtime_for_engine_model(worker, engine_model);
+    let mut request = TextPromptRequest::new("disconnect", "prompt");
+    request.sampling.max_tokens = Some(1_000);
+    request.sampling.temperature = Some(0.0);
+    request.stop.allowed_token_ids = Some(vec![u32::from(b'a')]);
+
+    let mut stream = runtime.generate_text(request).await.unwrap();
+    loop {
+        match stream.next().await.unwrap().unwrap() {
+            RequestOutput::TextDelta { text, .. } if !text.is_empty() => break,
+            _ => {}
+        }
+    }
+    drop(stream);
+
+    let rendered = uniserve_observability::METRICS.render().unwrap();
+    let labels = format!("model_name=\"{engine_model}\",engine=\"0\"");
+    for expected in [
+        format!("uniserve:request_success_total{{{labels},finished_reason=\"abort\"}} 1"),
+        format!("uniserve:e2e_request_latency_seconds_count{{{labels}}} 1"),
+    ] {
+        assert!(
+            rendered.lines().any(|line| line == expected),
+            "missing `{expected}` in:\n{rendered}"
+        );
+    }
+    for family in [
+        "uniserve:generation_tokens_total",
+        "uniserve:request_generation_tokens_count",
+    ] {
+        let series = format!("{family}{{{labels}}}");
+        assert!(
+            !rendered.lines().any(|line| line.starts_with(&series)),
+            "unexpected `{series}` in:\n{rendered}"
+        );
+    }
+    runtime.shutdown().await.unwrap();
 }
