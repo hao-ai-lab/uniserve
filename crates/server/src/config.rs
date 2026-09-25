@@ -143,7 +143,8 @@ pub struct Config {
     /// config snapshots because it is a secret.
     #[serde(skip_serializing)]
     pub api_key: Option<String>,
-    /// Optional per-request wall-clock timeout.
+    /// Optional timeout until a request's response head is returned; streamed
+    /// response bodies (chat SSE and video downloads) are not bounded by it.
     pub request_timeout: Option<Duration>,
     /// Optional front-door HTTP admission limit for in-flight inference
     /// requests.

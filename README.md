@@ -131,7 +131,7 @@ Each image response entry carries `b64_json`, pixel `height` and `width`, and th
 | `--chunked-prefill-size` | `8192` | Per-request prefill bound |
 | `--attention-backend` | `auto` | Worker attention provider selection |
 | `--api-key` | Unset | Bearer token for public routes |
-| `--request-timeout` | Unset | Request wall-clock timeout in seconds |
+| `--request-timeout` | Unset | Seconds until a response head is sent; streamed bodies (chat SSE and video downloads) are not bounded |
 | `--max-concurrent-requests` | Unset | HTTP in-flight admission bound |
 | `--shutdown-timeout` | `30` | Graceful drain bound in seconds |
 
