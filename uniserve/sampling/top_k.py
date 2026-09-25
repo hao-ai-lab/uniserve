@@ -8,6 +8,8 @@ from typing import cast
 
 import torch
 
+from .categorical import sample_categorical
+
 _SamplingKernel = Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     tuple[torch.Tensor, torch.Tensor],
@@ -65,15 +67,13 @@ def _sample_top_k_tensor(
     )
     probabilities = torch.softmax(candidates, dim=-1)
     # Sorting candidates by token ID makes inverse-CDF draws deterministic for
-    # a fixed random value independent of top-k kernel ordering.
+    # a fixed random value independent of top-k kernel ordering, and matches
+    # the general path, which selects in vocabulary order. Candidates dropped
+    # by top-p or min-p carry zero mass, which the shared selector never
+    # picks.
     token_order = torch.argsort(token_indexes, dim=-1)
     ordered_probabilities = probabilities.gather(1, token_order)
-    cumulative = ordered_probabilities.cumsum(dim=-1)
-    sampled_order = (
-        (cumulative < draws.to(dtype=cumulative.dtype).unsqueeze(1))
-        .sum(dim=-1)
-        .clamp_max(top_k - 1)
-    )
+    sampled_order = sample_categorical(ordered_probabilities, draws)
     sampled = token_order.gather(1, sampled_order.unsqueeze(1))[:, 0]
     greedy = (
         torch.where(

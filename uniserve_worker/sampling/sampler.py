@@ -4,13 +4,13 @@
 runs one of three selectors per group: device greedy argmax, the compiled
 fixed-top-k sampler (``uniserve.sampling.sample_top_k``), or the general path
 that shapes logits (``_shape_sampling_logits_batch``), inverts the categorical
-CDF with the call's precomputed semantic RNG draws (argmax at zero
-temperature), and resolves speculative acceptance. Every path then resolves
-predicates, finish, and transition decisions as device tensors and packs the
-completion column that output capture copies to the host. With a
-``selection_broadcast``, the source rank's selection replaces each rank's own
-before those decisions, so tensor-parallel ranks resolve them from one common
-selection.
+CDF (``uniserve.sampling.sample_categorical``) with the call's precomputed
+semantic RNG draws (argmax at zero temperature), and resolves speculative
+acceptance. Every path then resolves predicates, finish, and transition
+decisions as device tensors and packs the completion column that output
+capture copies to the host. With a ``selection_broadcast``, the source rank's
+selection replaces each rank's own before those decisions, so tensor-parallel
+ranks resolve them from one common selection.
 """
 
 from __future__ import annotations
@@ -23,7 +23,11 @@ import torch
 from uniserve_kernels.triton import launchable
 
 from uniserve.distributed.mesh import Communicator
-from uniserve.sampling import SamplingParams, sample_top_k
+from uniserve.sampling import (
+    SamplingParams,
+    sample_categorical,
+    sample_top_k,
+)
 from uniserve.sampling.top_k import top_k_candidates
 from uniserve.tensors import adjacent_view
 from uniserve_worker.errors import (
@@ -433,7 +437,6 @@ def _sample_task_group(
     # Flatten task-local candidate rows into one sampling matrix while retaining
     # offsets needed to restore one selected result per call.
     device = tasks[0].logits.device
-    vocab = int(tasks[0].logits.shape[1])
     offsets: list[int] = []
     offset = 0
     for task in tasks:
@@ -459,15 +462,11 @@ def _sample_task_group(
     )
 
     # Temperature-zero rows use deterministic argmax; remaining rows invert the
-    # categorical CDF with their precomputed RNG draw.
+    # categorical CDF with their precomputed RNG draw. Tokens masked by the
+    # shaping stages carry zero mass, which the shared selector never picks.
     temperatures = parameter_values[:, 0]
     probabilities = torch.softmax(work, dim=-1)
-    cumulative = probabilities.cumsum(dim=-1)
-    sampled_tokens = (
-        (cumulative < draws.to(dtype=cumulative.dtype).unsqueeze(1))
-        .sum(dim=-1)
-        .clamp_max(vocab - 1)
-    )
+    sampled_tokens = sample_categorical(probabilities, draws)
     row_tokens = torch.where(
         temperatures > 0.0,
         sampled_tokens,

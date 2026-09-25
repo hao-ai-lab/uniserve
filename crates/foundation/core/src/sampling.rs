@@ -383,16 +383,31 @@ fn log_softmax(logits: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// Selects the first vocabulary entry whose inclusive cumulative mass reaches `draw`.
+/// Selects the first positive-mass entry whose inclusive cumulative mass
+/// exceeds `draw`.
+///
+/// Each positive-mass entry owns the half-open interval `[cum - p, cum)` of
+/// the canonical draw range `[0, 1)`, so zero-mass (masked) entries are never
+/// selected: a zero draw skips leading masked entries, and when the f32
+/// running total ends at or below the draw, the last positive-mass entry is
+/// selected. This is FlashInfer's sampling-from-probabilities boundary rule.
+/// The worker's `uniserve.sampling.sample_categorical` applies the same rule,
+/// and `tests/python/generated/sampling_rng_parity.json` pins it for both.
+/// A row without positive mass selects index 0; callers reject such rows
+/// before sampling.
 fn sample_categorical(probs: &[f32], draw: f32) -> u32 {
     let mut cum = 0.0f32;
+    let mut last_positive = 0usize;
     for (i, &p) in probs.iter().enumerate() {
-        cum += p;
-        if draw <= cum {
-            return i as u32;
+        if p > 0.0 {
+            cum += p;
+            if cum > draw {
+                return i as u32;
+            }
+            last_positive = i;
         }
     }
-    (probs.len().saturating_sub(1)) as u32
+    last_positive as u32
 }
 
 #[cfg(test)]
@@ -739,15 +754,62 @@ mod tests {
     }
 
     #[test]
-    fn inverse_cdf_selects_the_first_entry_reaching_the_draw() {
-        // Equality remains in the lower bucket of the inclusive cumulative sum.
-        let probs = [0.2f32, 0.3, 0.5];
-        assert_eq!(sample_categorical(&probs, 0.0), 0);
-        assert_eq!(sample_categorical(&probs, 0.2), 0);
-        assert_eq!(sample_categorical(&probs, 0.2001), 1);
-        assert_eq!(sample_categorical(&probs, 0.5), 1);
-        assert_eq!(sample_categorical(&probs, 0.7), 2);
-        // A draw at or past the final cumulative selects the last entry.
-        assert_eq!(sample_categorical(&probs, 1.0), 2);
+    fn inverse_cdf_matches_the_shared_parity_fixture() {
+        // The worker's `uniserve.sampling.sample_categorical` is checked
+        // against the same cases, which pin one boundary rule for both.
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/python/generated/sampling_rng_parity.json"
+        ))
+        .expect("the parity fixture is JSON");
+        let probabilities = |value: &serde_json::Value| -> Vec<f32> {
+            value
+                .as_array()
+                .expect("probabilities are an array")
+                .iter()
+                .map(|entry| entry.as_f64().expect("probability is a number") as f32)
+                .collect()
+        };
+        let draw = |case: &serde_json::Value| {
+            let bits = case["uniform_bits"].as_u64().expect("draw bits");
+            f32::from_bits(u32::try_from(bits).expect("draw bits fit f32"))
+        };
+        let selected = |case: &serde_json::Value| case["selected_token"].as_u64().expect("token");
+
+        // Every RNG coordinate selects from the one shared distribution.
+        let shared = probabilities(&fixture["probs"]);
+        for case in fixture["cases"].as_array().expect("cases") {
+            assert_eq!(
+                u64::from(sample_categorical(&shared, draw(case))),
+                selected(case)
+            );
+        }
+
+        // Boundary cases carry their own distribution and a named edge; every
+        // mismatch is reported together.
+        let boundaries = fixture["boundaries"].as_array().expect("boundaries");
+        assert!(!boundaries.is_empty(), "fixture carries boundary cases");
+        let mismatches: Vec<String> = boundaries
+            .iter()
+            .filter_map(|case| {
+                let token = sample_categorical(&probabilities(&case["probs"]), draw(case));
+                (u64::from(token) != selected(case))
+                    .then(|| format!("{}: selected {token}", case["name"]))
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    #[test]
+    fn stochastic_zero_draw_selects_only_allowed_tokens() {
+        // A zero draw is a canonical uniform value; masked token 0 owns no
+        // part of the draw range, so the only allowed token is selected.
+        let mut logits = vec![1.0, 2.0, 3.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            ..Default::default()
+        };
+        let out = try_apply_sampling_counts(&mut logits, &params, &[], Some(&[2]), None, 0, 0.0)
+            .expect("one allowed token leaves a valid distribution");
+        assert_eq!(out.token, 2);
     }
 }

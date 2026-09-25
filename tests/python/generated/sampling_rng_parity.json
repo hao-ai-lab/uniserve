@@ -2744,5 +2744,74 @@
       "uniform_bits": 1063566524,
       "selected_token": 4
     }
+  ],
+  "boundaries": [
+    {
+      "name": "zero draw skips masked leading entries",
+      "probs": [
+        0.0,
+        0.0,
+        0.5,
+        0.0,
+        0.5,
+        0.0
+      ],
+      "uniform_bits": 0,
+      "selected_token": 2
+    },
+    {
+      "name": "zero draw selects a positive first entry",
+      "probs": [
+        0.125,
+        0.875
+      ],
+      "uniform_bits": 0,
+      "selected_token": 0
+    },
+    {
+      "name": "draw on a cumulative boundary selects the next positive entry",
+      "probs": [
+        0.0,
+        0.0,
+        0.5,
+        0.0,
+        0.5,
+        0.0
+      ],
+      "uniform_bits": 1056964608,
+      "selected_token": 4
+    },
+    {
+      "name": "total below the largest draw selects the last positive entry",
+      "probs": [
+        0.25,
+        0.25,
+        0.25,
+        0.24999988079071045,
+        0.0
+      ],
+      "uniform_bits": 1065353215,
+      "selected_token": 3
+    },
+    {
+      "name": "sequential float32 total below the largest draw selects the last positive entry",
+      "probs": [
+        0.0833333358168602,
+        0.0833333358168602,
+        0.0833333358168602,
+        0.0833333358168602,
+        0.0833333358168602,
+        0.0833333358168602,
+        0.0833333358168602,
+        0.0833333358168602,
+        0.0833333358168602,
+        0.0833333358168602,
+        0.0833333358168602,
+        0.0833333358168602,
+        0.0
+      ],
+      "uniform_bits": 1065353215,
+      "selected_token": 11
+    }
   ]
 }
