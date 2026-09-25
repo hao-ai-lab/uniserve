@@ -112,6 +112,11 @@ async def run_load(
     Raises:
         WarmupFailure: If any warmup output lacks a truthy ``success``; no
             measured request is sent.
+        BaseException: Any exception from a measured submission, or the
+            cancellation of this call, after every outstanding measured
+            submission has been cancelled and awaited. Outputs are not
+            returned; a caller that needs the finished ones collects them
+            in ``submit``.
     """
     if not rows:
         return LoadResult((), (), 0.0)
@@ -146,9 +151,18 @@ async def run_load(
     benchmark_start_time = time.perf_counter()
 
     tasks: list[asyncio.Task[T]] = []
-    async for row in get_request(rows, request_rate):
-        tasks.append(asyncio.create_task(limited(row, time.perf_counter())))
-    outputs = await asyncio.gather(*tasks)
+    try:
+        async for row in get_request(rows, request_rate):
+            tasks.append(asyncio.create_task(limited(row, time.perf_counter())))
+        outputs = await asyncio.gather(*tasks)
+    except BaseException:
+        # ``gather`` leaves sibling tasks running when one raises. They are
+        # cancelled and awaited here, so no submission outlives the failed
+        # window or finishes after the caller has handled the failure.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     benchmark_end_time = time.perf_counter()
 
     # Duration runs from the first arrival until every measured request has

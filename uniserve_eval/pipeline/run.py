@@ -8,7 +8,10 @@ The bundle in the output directory contains:
   `completed` or `failed`; a failure before row selection goes directly from
   `preparing` to `failed`.
 - `warmup_requests.jsonl` and `requests.jsonl`: warmup and measured request
-  records; only measured records feed metrics and validation.
+  records; only measured records feed metrics and validation. When the
+  measured window fails or is interrupted, `requests.jsonl` holds the
+  measured requests that finished before it, in completion order, and
+  `run.json` is `failed`.
 - `gpu_samples.jsonl`: `GpuStorageSampler` telemetry snapshots.
 - `samples/`: decoded image and video outputs referenced by the records.
 - `summary.json` and `summary.md`: the validated summary, written only on the
@@ -70,9 +73,10 @@ async def run_point(
     Raises:
         FileExistsError: If `output_dir` is not empty; nothing is written.
         BaseException: Any error from task lookup, dataset loading, the load
-            run (including `WarmupFailure`), summarizing, or artifact writing
-            is re-raised after the failed `run.json` is written, provided the
-            failure path's own artifact writes succeed.
+            run (including `WarmupFailure` and cancellation), summarizing, or
+            artifact writing is re-raised after the records collected so far
+            and the failed `run.json` are written, provided the failure
+            path's own artifact writes succeed.
     """  # noqa: E501
     output_path = Path(output_dir)
     if output_path.exists() and any(output_path.iterdir()):
@@ -151,7 +155,7 @@ async def run_point(
                     if example.output_len is not None
                     else point.sampling.max_tokens or 0
                 )
-                return await send_request(
+                record = await send_request(
                     client,
                     base_url.rstrip("/"),
                     request,
@@ -161,6 +165,14 @@ async def run_point(
                     output_len_fallback=output_len_fallback,
                     scheduled_time=scheduled,
                 )
+
+                # Measured records are kept as they finish, so a load that
+                # raises or is cancelled still leaves them for the failure
+                # bundle. `run_load` cancels every outstanding submission
+                # before it raises, so none is added afterwards.
+                if scheduled is not None:
+                    records.append(record)
+                return record
 
             # Sampling spans warmup, the settle pause, and the measured
             # window.
@@ -185,7 +197,9 @@ async def run_point(
                 sampler.stop()
 
             # Only measured outputs feed metrics; warmup records remain a
-            # separate diagnostic stream.
+            # separate diagnostic stream. The completed load's outputs, in
+            # submission order, replace the completion-order records that
+            # `submit` collected.
             warmup_records = cast(
                 list[RequestRecord], list(load_result.warmup_outputs)
             )
@@ -233,11 +247,12 @@ async def run_point(
         )
         return RunResult(summary, output_path)
     except BaseException as error:
-        # `run_load` returns no partial results, so the streams hold warmup
-        # records from a `WarmupFailure`, both streams when the failure came
-        # after `run_load` returned, and nothing otherwise. `BaseException`
-        # also covers cancellation and KeyboardInterrupt. `stop` is
-        # idempotent, so a second call after the `finally` above is safe.
+        # The streams hold warmup records from a `WarmupFailure`, the
+        # measured requests that finished before a failure or cancellation
+        # inside the measured window, or both complete streams when the
+        # failure came after `run_load` returned. `BaseException` also
+        # covers cancellation and KeyboardInterrupt. `stop` is idempotent,
+        # so a second call after the `finally` above is safe.
         if sampler is not None:
             sampler.stop()
         _write_records(writer, "warmup_requests.jsonl", warmup_records)

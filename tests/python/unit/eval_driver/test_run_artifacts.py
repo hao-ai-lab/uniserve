@@ -122,3 +122,85 @@ def test_failed_warmup_writes_terminal_diagnostic_artifacts(
     assert warmup[0]["classifier"] == "response_empty_output"
     assert (output / "requests.jsonl").read_text(encoding="utf-8") == ""
     assert not (output / "summary.json").exists()
+
+
+class _CaptionHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler method name.
+        length = int(self.headers.get("content-length", "0"))
+        self.rfile.read(length)
+        payload = json.dumps(
+            {
+                "choices": [
+                    {"finish_reason": "stop", "message": {"content": "beans"}}
+                ],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 1},
+            }
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+def test_interrupted_measurement_persists_the_finished_requests(
+    tmp_path: Path,
+) -> None:
+    # The third row has no input image, so building its request raises
+    # inside the measured window after the first two rows were served.
+    dataset = tmp_path / "rows.jsonl"
+    rows = [
+        {"id": "row-0", "prompt": "describe", "input_image_b64": "aW1hZ2U="},
+        {"id": "row-1", "prompt": "describe", "input_image_b64": "aW1hZ2U="},
+        {"id": "row-2", "prompt": "describe"},
+    ]
+    dataset.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    # One request at a time, so both served rows finish before the third
+    # row's request is built.
+    point = BenchmarkPoint(
+        name="i2t",
+        server="server",
+        task=TaskName.I2T,
+        model="model",
+        dataset="jsonl",
+        dataset_path=str(dataset),
+        metrics=(MetricDefinition(("output_throughput",), "higher"),),
+        load=LoadConfig(num_prompts=3, max_concurrency=1, warmup_requests=0),
+        sampling=SamplingConfig(ignore_eos=False, stream=False, max_tokens=8),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _CaptionHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    output = tmp_path / "result"
+    try:
+        with pytest.raises(ValueError, match="base64"):
+            asyncio.run(
+                run_point(
+                    f"http://127.0.0.1:{server.server_port}",
+                    point,
+                    output,
+                )
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    state = json.loads((output / "run.json").read_text(encoding="utf-8"))
+    assert state["status"] == "failed"
+    assert state["valid"] is False
+    assert state["error"]["type"] == "ValueError"
+    measured = [
+        json.loads(line)
+        for line in (output / "requests.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [record["request_id"] for record in measured] == ["row-0", "row-1"]
+    assert all(record["success"] for record in measured)
+    assert not (output / "summary.json").exists()
