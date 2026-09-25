@@ -594,4 +594,57 @@ mod tests {
             vec![Some(1026)]
         );
     }
+
+    /// Bagel KV-token predictions equal the worker's resize for images whose
+    /// resize scale is not one. The cases are shared with the worker's image
+    /// staging test, so both sides are checked against the same numbers.
+    #[test]
+    fn bagel_image_tokens_follow_the_worker_resize() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            cases: Vec<Case>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            width: u32,
+            height: u32,
+            vae_kv_tokens: u32,
+            vit_kv_tokens: u32,
+        }
+        let fixture: Fixture = serde_json::from_str(include_str!(
+            "../../../../tests/python/fixtures/bagel_image_resize.json"
+        ))
+        .unwrap();
+
+        let (_directory, files) = configured_files("bagel");
+        let tokenizer = HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap();
+        let config = ModelConfig::from_files("bagel", &files, None, &tokenizer).unwrap();
+        let ModelParameters::Bagel(profile) = config.parameters else {
+            unreachable!()
+        };
+        for case in fixture.cases {
+            let size = (case.width, case.height);
+            let ingest = profile
+                .image_encoders_for_dimensions(case.width, case.height, 1)
+                .unwrap();
+            assert_eq!(
+                ingest
+                    .iter()
+                    .map(|input| input.num_kv_tokens)
+                    .collect::<Vec<_>>(),
+                vec![Some(case.vae_kv_tokens), Some(case.vit_kv_tokens)],
+                "input image {size:?}"
+            );
+
+            // Generated-image feedback re-encodes through the same VAE resize.
+            let policy = profile
+                .image_generation_for_dimensions(case.width, case.height)
+                .unwrap();
+            assert_eq!(
+                policy.feedback_encoders[0].num_kv_tokens,
+                Some(case.vae_kv_tokens),
+                "generated image {size:?}"
+            );
+        }
+    }
 }

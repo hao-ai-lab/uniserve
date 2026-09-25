@@ -1,0 +1,14 @@
+{
+  "description": "Bagel input-image resize cases shared by the server's KV-token prediction (crates/server/src/profile/mod.rs) and the worker's image staging (tests/python/unit/execution/test_image_input.py). Each case gives a source size in pixels, the VAE canvas and the ViT tower input the worker resizes it to, and the KV tokens each encoder writes: the grid at the encoder stride (16 for the VAE, 14 for the ViT) plus two framing markers. Expected values follow the worker's single rounding per edge, round(edge * scale / stride) * stride.",
+  "cases": [
+    {"width": 1505, "height": 1000, "vae_width": 1024, "vae_height": 688, "vae_kv_tokens": 2754, "vit_width": 980, "vit_height": 658, "vit_kv_tokens": 3292},
+    {"width": 1000, "height": 1505, "vae_width": 688, "vae_height": 1024, "vae_kv_tokens": 2754, "vit_width": 658, "vit_height": 980, "vit_kv_tokens": 3292},
+    {"width": 305, "height": 596, "vae_width": 512, "vae_height": 1008, "vae_kv_tokens": 2018, "vit_width": 504, "vit_height": 980, "vit_kv_tokens": 2522},
+    {"width": 921, "height": 992, "vae_width": 928, "vae_height": 992, "vae_kv_tokens": 3598, "vit_width": 910, "vit_height": 980, "vit_kv_tokens": 4552},
+    {"width": 200, "height": 772, "vae_width": 272, "vae_height": 1024, "vae_kv_tokens": 1090, "vit_width": 266, "vit_height": 980, "vit_kv_tokens": 1332},
+    {"width": 16, "height": 288, "vae_width": 48, "vae_height": 1024, "vae_kv_tokens": 194, "vit_width": 42, "vit_height": 980, "vit_kv_tokens": 212},
+    {"width": 48, "height": 416, "vae_width": 112, "vae_height": 1024, "vae_kv_tokens": 450, "vit_width": 112, "vit_height": 980, "vit_kv_tokens": 562},
+    {"width": 1024, "height": 512, "vae_width": 1024, "vae_height": 512, "vae_kv_tokens": 2050, "vit_width": 980, "vit_height": 490, "vit_kv_tokens": 2452},
+    {"width": 640, "height": 480, "vae_width": 688, "vae_height": 512, "vae_kv_tokens": 1378, "vit_width": 686, "vit_height": 518, "vit_kv_tokens": 1815}
+  ]
+}
