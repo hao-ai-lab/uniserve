@@ -435,8 +435,11 @@ def test_component_bindings_release_cancelled_requests(
     with server_process(
         command,
         base_url,
+        # Startup prepares and captures every admitted duration at both
+        # text capacities; two-way tensor or pipeline layouts took 9 to 11
+        # minutes to become ready on 4 x GB200.
         tmp_path / "h3-components.log",
-        timeout_s=600,
+        timeout_s=1800,
         env={
             "CUDA_VISIBLE_DEVICES": ",".join(
                 str(index) for index in range(visible_devices)
