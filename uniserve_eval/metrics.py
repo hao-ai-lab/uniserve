@@ -227,13 +227,12 @@ def _peak_per_second(successful: list[RequestRecord]) -> tuple[float, int]:
     """Return peak one-second token completions and overlapping requests.
 
     Time is divided into one-second buckets from the earliest request start.
-    Token arrivals are reconstructed as ``start_time + ttft`` followed by the
-    cumulative recorded ``itl`` gaps, so each streamed text event counts as
-    one token, and only text events whose gap ``RequestRecord.add_text``
-    records as an inter-token latency follow the first. A request counts toward
-    every bucket its start-to-end interval touches, so the request peak can
-    exceed the instantaneous maximum concurrency. The two peaks are
-    maximized independently and may come from different buckets.
+    Token arrivals are the recorded ``text_times`` of each request, so each
+    stamped text event counts as one token at the time it arrived, including
+    an event that follows an image and so has no ``itl`` gap. A request
+    counts toward every bucket its start-to-end interval touches, so the
+    request peak can exceed the instantaneous maximum concurrency. The two
+    peaks are maximized independently and may come from different buckets.
     """
     if not successful:
         return 0.0, 0
@@ -244,10 +243,7 @@ def _peak_per_second(successful: list[RequestRecord]) -> tuple[float, int]:
     requests = np.zeros(buckets)
 
     for record in successful:
-        token_times = [record.start_time + record.ttft]
-        for latency in record.itl:
-            token_times.append(token_times[-1] + latency)
-        for timestamp in token_times:
+        for timestamp in record.text_times:
             index = int(timestamp - start)
             if 0 <= index < buckets:
                 tokens[index] += 1
