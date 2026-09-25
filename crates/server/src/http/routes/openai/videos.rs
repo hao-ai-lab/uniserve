@@ -32,7 +32,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt as _;
-use uniserve_core::{RejectionKind, SharedMedia};
+use uniserve_core::SharedMedia;
 
 use crate::AppState;
 use crate::video_jobs::JobSlot;
@@ -382,14 +382,14 @@ pub(crate) async fn videos_create(
                             message: format!("generation ended: {reason:?}"),
                         });
                     }
-                    // Splits rejections by kind as `ApiError::rejected` does
-                    // for the synchronous route (`400` or `503`).
+                    // A rejection reports the error code the synchronous
+                    // route answers the same rejection with.
                     Some(RequestOutput::Rejected { kind, message, .. }) => {
-                        let code = match kind {
-                            RejectionKind::Invalid => "invalid_request",
-                            RejectionKind::Overloaded => "server_overloaded",
-                        };
-                        return Err(VideoFailure { code, message });
+                        let error = ApiError::rejected(kind, message);
+                        return Err(VideoFailure {
+                            code: error.code(),
+                            message: error.to_error_response().error.message,
+                        });
                     }
                     Some(RequestOutput::Failed { message, .. }) => {
                         return Err(VideoFailure { code: "generation_failed", message });
@@ -609,6 +609,40 @@ mod tests {
             .map(|_| state.videos.reserve())
             .collect::<Vec<_>>();
         assert!(slots.iter().all(Result::is_ok));
+    }
+
+    /// An engine rejection reaches an asynchronous job with the error code the
+    /// synchronous route answers the same rejection with.
+    #[tokio::test]
+    async fn a_rejected_job_reports_the_synchronous_error_code() {
+        let router = crate::http::build_router(Arc::new(video_state()));
+
+        // The simulator has no video media components, so the engine rejects
+        // the request as invalid on both routes.
+        let (sync_status, _, sync_body) =
+            send(&router, post_json("/v1/videos/sync", &video_request())).await;
+        assert_eq!(sync_status, StatusCode::BAD_REQUEST);
+
+        let (status, _, job) = send(&router, post_json("/v1/videos", &video_request())).await;
+        assert_eq!(status, StatusCode::OK);
+        let uri = format!("/v1/videos/{}", job["id"].as_str().unwrap());
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let request = axum::extract::Request::builder()
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .unwrap();
+                let (_, _, job) = send(&router, request).await;
+                if job["status"] == "failed" {
+                    return job;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(failed["error"]["code"], sync_body["error"]["code"]);
     }
 
     #[tokio::test]

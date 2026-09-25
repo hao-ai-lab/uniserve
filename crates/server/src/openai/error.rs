@@ -121,49 +121,45 @@ impl ApiError {
         }
     }
 
+    /// Returns the stable machine-readable `code` of this error category, as
+    /// the error body reports it.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidRequest { .. } => "invalid_request_error",
+            Self::ModelNotFound { .. } => "model_not_found",
+            Self::ServerError { .. } => "server_error",
+            Self::JsonParseError { .. } => "json_parse_error",
+            Self::Conflict { .. } => "runtime_state_conflict",
+            Self::Overloaded { .. } => "server_overloaded",
+        }
+    }
+
     /// Converts this error into the standard OpenAI-compatible JSON error
-    /// payload.
+    /// payload, whose `code` is [`ApiError::code`].
     pub fn to_error_response(&self) -> ErrorResponse {
-        let error = match self {
-            Self::InvalidRequest { message, param } => ErrorDetail {
-                message: message.clone(),
-                error_type: "invalid_request_error".to_string(),
-                param: param.map(|p| p.to_string()),
-                code: Some("invalid_request_error".to_string()),
-            },
-            Self::ModelNotFound { model } => ErrorDetail {
-                message: format!("The model `{model}` does not exist."),
-                error_type: "invalid_request_error".to_string(),
-                param: Some("model".to_string()),
-                code: Some("model_not_found".to_string()),
-            },
-            Self::ServerError { message } => ErrorDetail {
-                message: message.clone(),
-                error_type: "server_error".to_string(),
-                param: None,
-                code: Some("server_error".to_string()),
-            },
-            Self::JsonParseError { message } => ErrorDetail {
-                message: message.clone(),
-                error_type: "invalid_request_error".to_string(),
-                param: None,
-                code: Some("json_parse_error".to_string()),
-            },
-            Self::Conflict { message } => ErrorDetail {
-                message: message.clone(),
-                error_type: "conflict_error".to_string(),
-                param: None,
-                code: Some("runtime_state_conflict".to_string()),
-            },
-            Self::Overloaded { message } => ErrorDetail {
-                message: message.clone(),
-                error_type: "server_error".to_string(),
-                param: None,
-                code: Some("server_overloaded".to_string()),
-            },
+        let (message, error_type, param) = match self {
+            Self::InvalidRequest { message, param } => {
+                (message.clone(), "invalid_request_error", *param)
+            }
+            Self::ModelNotFound { model } => (
+                format!("The model `{model}` does not exist."),
+                "invalid_request_error",
+                Some("model"),
+            ),
+            Self::ServerError { message } => (message.clone(), "server_error", None),
+            Self::JsonParseError { message } => (message.clone(), "invalid_request_error", None),
+            Self::Conflict { message } => (message.clone(), "conflict_error", None),
+            Self::Overloaded { message } => (message.clone(), "server_error", None),
         };
 
-        ErrorResponse { error }
+        ErrorResponse {
+            error: ErrorDetail {
+                message,
+                error_type: error_type.to_string(),
+                param: param.map(str::to_string),
+                code: Some(self.code().to_string()),
+            },
+        }
     }
 }
 
