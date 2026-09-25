@@ -329,6 +329,9 @@ class RequestRecord:
     ``itl`` holds gaps in seconds between consecutive text-bearing stream
     events, not per-token gaps, since one event may carry several tokens.
     The streaming chat transport excludes gaps that span an image event.
+    ``text_times`` holds the absolute arrival time of every stamped
+    text-bearing event, including one that follows an image, so it keeps
+    the timeline that ``itl`` omits across images.
     """
 
     request_id: str
@@ -347,6 +350,7 @@ class RequestRecord:
     latency: float = 0.0
     ttft: float = 0.0
     itl: list[float] = field(default_factory=list)
+    text_times: list[float] = field(default_factory=list)
     token_timing_available: bool = False
     prompt_len: int = 0
     output_len: int = 0
@@ -491,12 +495,13 @@ class RequestRecord:
             count_itl: Whether the gap since ``last_text_time`` is an
                 inter-token interval. The streaming chat transport passes
                 false after an image event so image generation time does not
-                enter ``itl``.
+                enter ``itl``; the event still enters ``text_times``.
         """
         self.token_timing_available = True
         self.generated_text += content
         if timestamp is None:
             return
+        self.text_times.append(timestamp)
         if last_text_time is None:
             self.ttft = timestamp - self.start_time
             self.first_text_time = timestamp
