@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use hf_hub::Cache;
-use hf_hub::api::tokio::{Api, ApiBuilder, ApiRepo};
+use hf_hub::api::tokio::{Api, ApiBuilder, ApiError, ApiRepo};
 use thiserror_ext::AsReport as _;
 
 use crate::profile::assets::error::{Error, Result};
@@ -53,36 +53,85 @@ impl ResolvedModelFiles {
     /// fails, and [`Error::Invalid`] when a cached tokenizer path has no
     /// parent directory.
     pub async fn new(model_id: &str) -> Result<Self> {
-        if Path::new(model_id).is_dir() {
-            return resolve_local_model_files(Path::new(model_id));
-        }
-        if let Some(files) = resolve_cached_model_files(model_id)? {
-            return Ok(files);
-        }
-        resolve_remote_model_files(model_id).await
+        ModelSource::from_model_id(model_id)?.model_files().await
     }
 }
 
 /// Resolves one required file from a local model directory, the local Hub cache, or the Hub.
 ///
-/// `filename` is checkpoint-relative and may name a subfolder. A missing
-/// local file is [`Error::MissingFile`]; a Hub client or download failure,
-/// including a file the repository lacks, is [`Error::Remote`], since this
-/// path downloads without consulting the repository listing.
+/// `filename` is checkpoint-relative and may name a subfolder. A file the
+/// directory or the repository does not have is [`Error::MissingFile`]; for
+/// an uncached Hub file that is the Hub's 404 answer. Every other Hub
+/// failure, such as a refused, rate-limited or unreachable request, is
+/// [`Error::Remote`], so callers never mistake it for an absent file.
 pub async fn resolve_model_file(model_id: &str, filename: &str) -> Result<PathBuf> {
-    let local = Path::new(model_id);
-    if local.is_dir() {
-        return local_file_if_exists(local, filename).ok_or_else(|| Error::MissingFile {
-            model: local.display().to_string(),
-            file: filename.to_owned(),
-        });
+    ModelSource::from_model_id(model_id)?.file(filename).await
+}
+
+/// Where a configured model id's files are read from.
+pub(crate) enum ModelSource {
+    /// An existing local checkpoint directory, read in place.
+    Local(PathBuf),
+    /// A Hub repository reached through `api`.
+    Hub {
+        /// Hub client; its cache receives downloaded files.
+        api: Api,
+        /// Local Hub cache consulted before any request.
+        cache: Cache,
+        /// Repository identifier.
+        repo_id: String,
+    },
+}
+
+impl ModelSource {
+    /// Classifies a configured model id.
+    ///
+    /// An existing directory is local; any other id names a Hub repository,
+    /// reached with a client and cache configured from the environment
+    /// (`HF_HOME`, `HF_ENDPOINT` and `HF_TOKEN`).
+    pub(crate) fn from_model_id(model_id: &str) -> Result<Self> {
+        let local = Path::new(model_id);
+        if local.is_dir() {
+            return Ok(Self::Local(local.to_path_buf()));
+        }
+        Ok(Self::Hub {
+            api: build_api(model_id)?,
+            cache: Cache::from_env(),
+            repo_id: model_id.to_owned(),
+        })
     }
-    let cache_repo = Cache::from_env().model(model_id.to_string());
-    if let Some(path) = cache_repo.get(filename) {
-        return Ok(path);
+
+    /// Resolves one checkpoint-relative file; see [`resolve_model_file`].
+    pub(crate) async fn file(&self, filename: &str) -> Result<PathBuf> {
+        match self {
+            Self::Local(directory) => {
+                local_file_if_exists(directory, filename).ok_or_else(|| Error::MissingFile {
+                    model: directory.display().to_string(),
+                    file: filename.to_owned(),
+                })
+            }
+            Self::Hub { api, repo_id, .. } => {
+                fetch_file(&api.model(repo_id.clone()), repo_id, filename).await
+            }
+        }
     }
-    let api = build_api(model_id)?;
-    download_known_file(&api.model(model_id.to_string()), model_id, filename).await
+
+    /// Resolves the tokenizer and metadata file set; see [`ResolvedModelFiles::new`].
+    pub(crate) async fn model_files(&self) -> Result<ResolvedModelFiles> {
+        match self {
+            Self::Local(directory) => resolve_local_model_files(directory),
+            Self::Hub {
+                api,
+                cache,
+                repo_id,
+            } => {
+                if let Some(files) = resolve_cached_model_files(cache, repo_id)? {
+                    return Ok(files);
+                }
+                resolve_remote_model_files(api, repo_id).await
+            }
+        }
+    }
 }
 
 /// Resolves the model files present in a local checkpoint directory.
@@ -103,8 +152,7 @@ fn resolve_local_model_files(model_dir: &Path) -> Result<ResolvedModelFiles> {
 }
 
 /// Resolves and downloads the required and optional files advertised by a remote model repository.
-async fn resolve_remote_model_files(model_id: &str) -> Result<ResolvedModelFiles> {
-    let api = build_api(model_id)?;
+async fn resolve_remote_model_files(api: &Api, model_id: &str) -> Result<ResolvedModelFiles> {
     let repo = api.model(model_id.to_string());
     let info = repo.info().await.map_err(|error| Error::Remote {
         model: model_id.to_owned(),
@@ -121,7 +169,7 @@ async fn resolve_remote_model_files(model_id: &str) -> Result<ResolvedModelFiles
             file: "tokenizer.json".to_owned(),
         });
     }
-    let tokenizer_path = download_known_file(&repo, model_id, "tokenizer.json").await?;
+    let tokenizer_path = fetch_file(&repo, model_id, "tokenizer.json").await?;
     let tokenizer_config_path =
         download_if_present(&repo, model_id, &siblings, "tokenizer_config.json").await?;
     let generation_config_path =
@@ -129,7 +177,7 @@ async fn resolve_remote_model_files(model_id: &str) -> Result<ResolvedModelFiles
     let preprocessor_config_path =
         download_if_present(&repo, model_id, &siblings, "preprocessor_config.json").await?;
     let chat_template_path = match select_chat_template_sibling(&siblings) {
-        Some(name) => Some(download_known_file(&repo, model_id, name).await?),
+        Some(name) => Some(fetch_file(&repo, model_id, name).await?),
         None => None,
     };
     let config_path = match download_if_present(&repo, model_id, &siblings, "config.json").await? {
@@ -150,8 +198,8 @@ async fn resolve_remote_model_files(model_id: &str) -> Result<ResolvedModelFiles
 
 /// Resolves a model-file set from the local Hub cache when it holds
 /// `tokenizer.json`, returning `None` otherwise.
-fn resolve_cached_model_files(model_id: &str) -> Result<Option<ResolvedModelFiles>> {
-    let cache_repo = Cache::from_env().model(model_id.to_string());
+fn resolve_cached_model_files(cache: &Cache, model_id: &str) -> Result<Option<ResolvedModelFiles>> {
+    let cache_repo = cache.model(model_id.to_string());
     let Some(tokenizer_path) = cache_repo.get("tokenizer.json") else {
         return Ok(None);
     };
@@ -184,18 +232,32 @@ async fn download_if_present(
     filename: &str,
 ) -> Result<Option<PathBuf>> {
     match siblings.contains(filename) {
-        true => download_known_file(repo, model_id, filename)
-            .await
-            .map(Some),
+        true => fetch_file(repo, model_id, filename).await.map(Some),
         false => Ok(None),
     }
 }
 
-/// Downloads a file the caller expects to exist, or returns its cached copy.
-async fn download_known_file(repo: &ApiRepo, model_id: &str, filename: &str) -> Result<PathBuf> {
-    repo.get(filename).await.map_err(|error| Error::Remote {
-        model: model_id.to_owned(),
-        message: format!("failed to download '{filename}': {}", error.as_report()),
+/// Returns a Hub file's cached copy, downloading it when it is not cached.
+///
+/// A 404 answer, the Hub's response for a file the repository does not
+/// publish, is [`Error::MissingFile`]; every other failure is
+/// [`Error::Remote`].
+async fn fetch_file(repo: &ApiRepo, model_id: &str, filename: &str) -> Result<PathBuf> {
+    repo.get(filename).await.map_err(|error| match &error {
+        ApiError::RequestError(request)
+            if request
+                .status()
+                .is_some_and(|status| status.as_u16() == 404) =>
+        {
+            Error::MissingFile {
+                model: model_id.to_owned(),
+                file: filename.to_owned(),
+            }
+        }
+        _ => Error::Remote {
+            model: model_id.to_owned(),
+            message: format!("failed to download '{filename}': {}", error.as_report()),
+        },
     })
 }
 
