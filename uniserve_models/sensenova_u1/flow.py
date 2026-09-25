@@ -44,7 +44,9 @@ class HeadConfig:
                 "flow head width and depth must be positive integers"
             )
         if (
-            not math.isfinite(self.mlp_ratio)
+            isinstance(self.mlp_ratio, bool)
+            or not isinstance(self.mlp_ratio, (int, float))
+            or not math.isfinite(self.mlp_ratio)
             or self.mlp_ratio <= 0
             or int(self.hidden_size * self.mlp_ratio) < 1
         ):

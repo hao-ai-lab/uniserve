@@ -83,9 +83,13 @@ class Config:
                 "VAE base channels must be divisible by 32 GroupNorm groups"
             )
         if (
-            not math.isfinite(self.scale_factor)
+            any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                for value in (self.scale_factor, self.shift_factor)
+            )
             or self.scale_factor <= 0
-            or not math.isfinite(self.shift_factor)
         ):
             raise ValueError(
                 "VAE scale must be finite and positive, "

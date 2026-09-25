@@ -4,14 +4,25 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from uniserve import loading
 from uniserve_models import siglip
 
 from . import vae
 from .weights import checkpoint_sources
+
+
+def _finite(value: object) -> bool:
+    """Return whether ``value`` is a finite real number other than a bool."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
 
 
 @dataclass(frozen=True)
@@ -59,7 +70,7 @@ class TransformerConfig:
         if type(self.qk_norm) is not bool:
             raise ValueError("BAGEL QK normalization must be boolean")
         if any(
-            not math.isfinite(value) or value <= 0
+            not _finite(value) or value <= 0
             for value in (self.rms_norm_eps, self.rope_theta)
         ):
             raise ValueError(
@@ -113,8 +124,21 @@ class Config:
             raise ValueError(
                 "BAGEL latent patches and learned grid size must be positive"
             )
-        if not math.isfinite(self.timestep_shift) or self.timestep_shift <= 0:
+        if not _finite(self.timestep_shift) or self.timestep_shift <= 0:
             raise ValueError("BAGEL timestep shift must be finite and positive")
+        if not isinstance(self.connector_act, str):
+            raise ValueError("BAGEL connector activation must be a name")
+
+
+def _required(text: Mapping[str, Any], name: str) -> Any:
+    """Return a required ``llm_config`` field for its config to validate.
+
+    The value is raw checkpoint JSON; the config dataclass that receives it
+    checks its type.
+    """
+    if name not in text:
+        raise ValueError(f"BAGEL llm_config requires {name!r}")
+    return text[name]
 
 
 def read_config(root: Path, io: loading.Config) -> Config:
@@ -129,30 +153,37 @@ def read_config(root: Path, io: loading.Config) -> Config:
     Raises:
         FileNotFoundError: If ``config.json``, a tower config that is not
             inline, or the primary checkpoint's files are missing.
-        KeyError: If a required text dimension or the
-            ``latent_pos_embed.pos_embed`` tensor is absent.
-        ValueError: If the text head count is not a positive integer or,
-            without an explicit ``head_dim``, does not divide the hidden size;
-            if the latent position table is not a square grid at text width;
-            or if a config's ``__post_init__`` rejects a value. Malformed
-            JSON and checkpoint metadata also raise ``ValueError``.
+        ValueError: If a tower config is not an object; if a required text
+            dimension or the ``latent_pos_embed.pos_embed`` tensor is
+            absent; if the text width or head count is not a positive
+            integer or, without an explicit ``head_dim``, the head count does
+            not divide the width; if the latent position table is not a
+            square grid at text width; or if a config's ``__post_init__``
+            rejects a value. Malformed JSON and checkpoint metadata also
+            raise ``ValueError``.
     """
     raw = json.loads((root / "config.json").read_text())
 
     towers = []
     for name in ("llm", "vit", "vae"):
-        towers.append(
+        tower = (
             raw[f"{name}_config"]
             if f"{name}_config" in raw
             else json.loads((root / f"{name}_config.json").read_text())
         )
+        if not isinstance(tower, Mapping):
+            raise ValueError(f"BAGEL {name}_config must be an object")
+        towers.append(tower)
     text, vision, latent = towers
 
-    heads, hidden = text["num_attention_heads"], text["hidden_size"]
-    # Validate the head count before the default head_dim divides by it.
+    heads = _required(text, "num_attention_heads")
+    hidden = _required(text, "hidden_size")
+    # Validate both before the default head_dim divides one by the other.
     if (
         type(heads) is not int
         or heads < 1
+        or type(hidden) is not int
+        or hidden < 1
         or ("head_dim" not in text and hidden % heads)
     ):
         raise ValueError(
@@ -160,21 +191,38 @@ def read_config(root: Path, io: loading.Config) -> Config:
         )
 
     with checkpoint_sources[0].resolve(root, io=io).open(io=io) as reader:
+        if "latent_pos_embed.pos_embed" not in reader.names():
+            raise ValueError(
+                "BAGEL primary checkpoint lacks latent_pos_embed.pos_embed"
+            )
         shape = reader.get("latent_pos_embed.pos_embed").shape
-    side = math.isqrt(shape[0])
-    if len(shape) != 2 or shape[1] != hidden or side * side != shape[0]:
+    if (
+        len(shape) != 2
+        or shape[1] != hidden
+        or math.isqrt(shape[0]) ** 2 != shape[0]
+    ):
         raise ValueError(
             "BAGEL latent position table must be a square grid at text width"
         )
+    side = math.isqrt(shape[0])
+
+    # BAGEL runs one fewer SigLIP layer than its tower config declares, so
+    # the count must be an integer before the subtraction.
+    vision_layers = vision.get("num_hidden_layers", 27)
+    if type(vision_layers) is not int:
+        raise ValueError("BAGEL vit_config num_hidden_layers must be integer")
+    channel_multipliers = latent.get("ch_mult", (1, 2, 4, 4))
+    if not isinstance(channel_multipliers, (list, tuple)):
+        raise ValueError("BAGEL vae_config ch_mult must be a list")
 
     return Config(
         TransformerConfig(
             hidden,
-            text["intermediate_size"],
-            text["num_hidden_layers"],
+            _required(text, "intermediate_size"),
+            _required(text, "num_hidden_layers"),
             heads,
-            text["num_key_value_heads"],
-            text["vocab_size"],
+            _required(text, "num_key_value_heads"),
+            _required(text, "vocab_size"),
             text.get("rms_norm_eps", 1e-6),
             text.get("rope_theta", 1_000_000.0),
             text.get("head_dim", hidden // heads),
@@ -189,9 +237,7 @@ def read_config(root: Path, io: loading.Config) -> Config:
                 vision.get("hidden_size", 1152),
                 vision.get("num_attention_heads", 16),
                 vision.get("intermediate_size", 4304),
-                # BAGEL runs one fewer SigLIP layer than its tower config
-                # declares.
-                vision.get("num_hidden_layers", 27) - 1,
+                vision_layers - 1,
                 vision.get("layer_norm_eps", 1e-6),
             ),
         ),
@@ -201,7 +247,7 @@ def read_config(root: Path, io: loading.Config) -> Config:
             latent.get("downsample", 8),
             latent.get("ch", 128),
             latent.get("out_ch", 3),
-            tuple(latent.get("ch_mult", (1, 2, 4, 4))),
+            tuple(channel_multipliers),
             latent.get("num_res_blocks", 2),
             latent.get("z_channels", 16),
             latent.get("scale_factor", 0.3611),

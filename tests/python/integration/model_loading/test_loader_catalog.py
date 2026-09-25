@@ -269,6 +269,56 @@ def _tree_file(path, remote):
     )
 
 
+def _malformed_architectures(root: Path) -> None:
+    (root / "config.json").write_text(json.dumps({"architectures": 5}))
+
+
+def _malformed_bagel_shift(root: Path) -> None:
+    _write_bagel_checkpoint(root, {**_bagel_config(), "timestep_shift": "1.0"})
+
+
+def _malformed_bagel_vision_epsilon(root: Path) -> None:
+    metadata = _bagel_config()
+    metadata["vit_config"]["layer_norm_eps"] = "1e-6"
+    _write_bagel_checkpoint(root, metadata)
+
+
+def _bagel_without_vocabulary(root: Path) -> None:
+    metadata = _bagel_config()
+    del metadata["llm_config"]["vocab_size"]
+    _write_bagel_checkpoint(root, metadata)
+
+
+def _sense_without_text_tower(root: Path) -> None:
+    metadata = _sense_config()
+    del metadata["llm_config"]
+    (root / "config.json").write_text(json.dumps(metadata))
+
+
+def _sense_with_malformed_tokenizer(root: Path) -> None:
+    (root / "config.json").write_text(json.dumps(_sense_config()))
+    (root / "tokenizer.json").write_text(json.dumps({"model": 5}))
+
+
+@pytest.mark.parametrize(
+    "write",
+    (
+        _malformed_architectures,
+        _malformed_bagel_shift,
+        _malformed_bagel_vision_epsilon,
+        _bagel_without_vocabulary,
+        _sense_without_text_tower,
+        _sense_with_malformed_tokenizer,
+    ),
+)
+def test_malformed_checkpoint_metadata_is_rejected_as_invalid(tmp_path, write):
+    # Parseable JSON whose fields have the wrong type or are missing is
+    # invalid checkpoint metadata, which read_config reports as ValueError.
+    write(tmp_path)
+    with pytest.raises(ValueError):
+        models.read_config(tmp_path, modules=frozenset())
+
+
 def test_unknown_modular_pipeline_fails_at_discovery(tmp_path):
     (tmp_path / "modular_model_index.json").write_text(
         json.dumps({"_class_name": "UnknownPipeline"})

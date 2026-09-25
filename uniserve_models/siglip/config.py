@@ -38,7 +38,13 @@ class TransformerConfig:
                 "SigLIP widths, layers and heads must be positive "
                 "and compatible"
             )
-        if not math.isfinite(self.layer_norm_eps) or self.layer_norm_eps <= 0:
+        eps = self.layer_norm_eps
+        if (
+            isinstance(eps, bool)
+            or not isinstance(eps, (int, float))
+            or not math.isfinite(eps)
+            or eps <= 0
+        ):
             raise ValueError(
                 "SigLIP layer norm epsilon must be finite and positive"
             )
