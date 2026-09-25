@@ -10,6 +10,7 @@ import pytest
 import torch
 from PIL import Image
 
+from uniserve.diffusion import NoiseScale
 from uniserve.processing import (
     ImageProcessor,
     PatchTransform,
@@ -17,8 +18,11 @@ from uniserve.processing import (
     TowerTransform,
 )
 from uniserve_models import bagel, siglip
+from uniserve_models import sensenova_u1 as u1
 from uniserve_models.bagel import vae
+from uniserve_models.sensenova_u1 import flow, vision
 from uniserve_worker.model_executor.image_inputs import (
+    patch_grid_shape,
     prepare_image,
     prepare_tensor_image,
 )
@@ -26,11 +30,14 @@ from uniserve_worker.protocol.call import MediaCall
 
 pytestmark = pytest.mark.unit
 
-# Resize cases shared with the server's Bagel KV-token prediction test.
+_FIXTURES = Path(__file__).parents[2] / "fixtures"
+
+# Resize cases shared with the server's KV-token prediction tests.
 _BAGEL_RESIZE_CASES = json.loads(
-    (
-        Path(__file__).parents[2] / "fixtures" / "bagel_image_resize.json"
-    ).read_text()
+    (_FIXTURES / "bagel_image_resize.json").read_text()
+)["cases"]
+_SENSENOVA_RESIZE_CASES = json.loads(
+    (_FIXTURES / "sensenova_image_resize.json").read_text()
 )["cases"]
 
 
@@ -66,6 +73,7 @@ def test_encoded_pixels_match_channel_normalization(
         MediaCall.VISION_ENCODING,
         base64.b64encode(encoded.getvalue()).decode(),
         device=torch.device(device),
+        input_images=1,
     )
 
     expected = (
@@ -113,6 +121,7 @@ def test_image_sources_preserve_the_same_model_canvas(kind):
         processor,
         kind,
         base64.b64encode(encoded.getvalue()).decode(),
+        input_images=1,
         **arguments,
     )
     resident = prepare_tensor_image(
@@ -169,7 +178,11 @@ def test_bagel_resize_matches_the_shared_fixture(case):
         (MediaCall.VISION_ENCODING, "vit"),
     ):
         result = prepare_image(
-            processor, kind, payload, device=torch.device("cpu")
+            processor,
+            kind,
+            payload,
+            device=torch.device("cpu"),
+            input_images=1,
         )
         assert (result.height, result.width) == (
             case["vae_height"],
@@ -180,3 +193,72 @@ def test_bagel_resize_matches_the_shared_fixture(case):
             case[f"{tower}_height"],
             case[f"{tower}_width"],
         )
+
+
+def _sensenova_processor() -> ImageProcessor:
+    """Build SenseNova U1's image processor at the published patch size."""
+    config = u1.Config(
+        u1.TransformerConfig(37, 32, 48, 2, 4, 2, 8, ("full_attention",) * 2),
+        vision.Config(16, 32, 0.5, 16, 3, 10000.0),
+        flow.Config(
+            flow.HeadConfig(32, 2, 1.0),
+            False,
+            True,
+            NoiseScale(1.0, "constant", 1, 8),
+        ),
+        64,
+    )
+    return u1.image_processor(config)
+
+
+@pytest.mark.parametrize(
+    "case",
+    _SENSENOVA_RESIZE_CASES,
+    ids=lambda case: (
+        f"{case['width']}x{case['height']}-of-{case['input_images']}"
+    ),
+)
+def test_sensenova_input_images_share_a_pixel_budget(case):
+    encoded = io.BytesIO()
+    Image.new("RGB", (case["width"], case["height"]), (90, 120, 150)).save(
+        encoded, format="PNG"
+    )
+    processor = _sensenova_processor()
+
+    result = prepare_image(
+        processor,
+        MediaCall.VISION_ENCODING,
+        base64.b64encode(encoded.getvalue()).decode(),
+        device=torch.device("cpu"),
+        input_images=case["input_images"],
+    )
+
+    # 16-pixel patches, merged 2x2 into one KV token each by the tower.
+    grid = (case["resized_height"] // 16, case["resized_width"] // 16)
+    assert result.grid_shape == grid
+    assert (
+        patch_grid_shape(
+            processor.vit,
+            case["height"],
+            case["width"],
+            case["input_images"],
+        )
+        == grid
+    )
+    assert grid[0] * grid[1] // 4 == case["kv_tokens"]
+
+
+def test_sensenova_generated_images_keep_the_single_image_bound():
+    # A generated 2048x1152 canvas is not a request input, so it keeps the
+    # 2048x2048 bound however many input images the request carries.
+    generated = torch.zeros(3, 1152, 2048)
+
+    result = prepare_tensor_image(
+        _sensenova_processor(),
+        MediaCall.VISION_ENCODING,
+        generated,
+        device=torch.device("cpu"),
+        signed_unit=False,
+    )
+
+    assert result.grid_shape == (72, 128)

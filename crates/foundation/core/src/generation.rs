@@ -84,7 +84,8 @@ pub struct ImageInput {
     /// [`encoder_cache_key`]. The engine derives encoder-cache keys from this
     /// value and the encoder's index and kind only, so omni preprocessing in
     /// the server folds `CachePolicy::isolation_key` into it to keep isolated
-    /// requests from sharing entries.
+    /// requests from sharing entries, and folds in any request-dependent
+    /// preprocessing parameter that changes the encoder product.
     pub hash: u64,
     /// Base64-encoded input image.
     pub b64: String,

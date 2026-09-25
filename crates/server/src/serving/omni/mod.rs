@@ -99,7 +99,8 @@ mod context_image_defaults {
 /// Input image whose prompt position is resolved but whose encoder inputs are not.
 #[derive(Debug, Clone)]
 struct RenderedImage {
-    /// FNV-1a hash of `b64`; `prepare_generation_resources` later mixes in the
+    /// FNV-1a hash of `b64`. SenseNova preprocessing mixes in the image's
+    /// pixel bound, and `prepare_generation_resources` later mixes in the
     /// request's cache isolation key when it has one.
     hash: u64,
     /// Prompt-token position with the meaning of `ImageInput::position`.
@@ -158,7 +159,7 @@ pub(super) fn preprocess_sensenova(
         negative_text.unwrap_or_default(),
         generation.constraint,
     )?;
-    let multimodal_inputs = prepare_image_inputs(
+    let mut multimodal_inputs = prepare_image_inputs(
         prompt_token_ids.len(),
         images,
         profile.image_num_positions,
@@ -168,6 +169,13 @@ pub(super) fn preprocess_sensenova(
                 .map_err(OmniError::from)
         },
     )?;
+    // An input image's encoder product depends on its pixel bound, which the
+    // request's input image count sets, so the bound joins the image's
+    // encoder-cache identity.
+    let max_pixels = SenseNovaProfile::input_image_max_pixels(multimodal_inputs.images.len());
+    for image in &mut multimodal_inputs.images {
+        image.hash = combine_cache_keys(image.hash, max_pixels);
+    }
     let policy = profile
         .image_generation_for_dimensions(image.width, image.height)
         .map_err(|error| error.to_string())?;
@@ -974,12 +982,16 @@ fn finite(value: f32, name: &str) -> OmniResult<f32> {
 /// unisolated requests share encoder-cache entries for identical image
 /// payloads.
 fn isolated_cache_key(content_key: u64, isolation_key: Option<u64>) -> u64 {
-    let Some(isolation_key) = isolation_key else {
-        return content_key;
-    };
+    isolation_key.map_or(content_key, |isolation_key| {
+        combine_cache_keys(content_key, isolation_key)
+    })
+}
+
+/// Mixes a value that changes an encoder product into its cache key.
+fn combine_cache_keys(key: u64, value: u64) -> u64 {
     let mut bytes = [0_u8; 16];
-    bytes[..8].copy_from_slice(&content_key.to_le_bytes());
-    bytes[8..].copy_from_slice(&isolation_key.to_le_bytes());
+    bytes[..8].copy_from_slice(&key.to_le_bytes());
+    bytes[8..].copy_from_slice(&value.to_le_bytes());
     fnv1a(&bytes)
 }
 

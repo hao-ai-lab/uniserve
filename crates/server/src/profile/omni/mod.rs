@@ -269,8 +269,10 @@ fn scale_to_stride(width: u32, height: u32, scale: f64, stride: u32) -> (u32, u3
 /// Resizes dimensions to factor-aligned values within configured pixel-area bounds.
 ///
 /// Must produce the same shape as the worker's `_bounded_grid_shape`,
-/// including its aspect-ratio limit of 200 and half-to-even rounding. Returns
-/// `(width, height)`.
+/// including its aspect-ratio limit of 200 and half-to-even rounding. The
+/// upper bound wins over the lower one: an image above `max_pixels` shrinks
+/// to it even when `max_pixels` is below `min_pixels`, as happens when many
+/// input images share a pixel budget. Returns `(width, height)`.
 fn pixel_bound_resize(
     width: u32,
     height: u32,
@@ -278,7 +280,7 @@ fn pixel_bound_resize(
     min_pixels: u64,
     max_pixels: u64,
 ) -> assets::Result<(u32, u32)> {
-    if width == 0 || height == 0 || factor == 0 || min_pixels == 0 || max_pixels < min_pixels {
+    if width == 0 || height == 0 || factor == 0 || min_pixels == 0 || max_pixels == 0 {
         return Err(AssetError::invalid(
             "configured pixel-bound geometry is invalid",
         ));

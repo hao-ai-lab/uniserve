@@ -59,16 +59,22 @@ class PreparedImage:
 
 
 def _image_plan(
-    processor: ImageProcessor, kind: MediaCall, height: int, width: int
+    processor: ImageProcessor,
+    kind: MediaCall,
+    height: int,
+    width: int,
+    input_images: int | None,
 ) -> tuple[PatchTransform | TowerTransform, tuple[int, int], tuple[int, int]]:
     """Resolve canvas and tower dimensions independently of pixel storage.
 
     Vision encoding uses the processor's ``vit`` transform and every other
     call kind its ``vae`` transform. A patch tower keeps the source size as
-    its canvas. For a ``TowerTransform``, whether ``vit`` or ``vae``, the
-    canvas is the source resized by the ``vae`` stride policy when the
-    processor declares a ``vae`` transform, and the tower input applies the
-    selected transform's stride policy to that canvas.
+    its canvas, and its pixel bound depends on ``input_images`` (see
+    ``PatchTransform.pixel_bound``). For a ``TowerTransform``, whether
+    ``vit`` or ``vae``, the canvas is the source resized by the ``vae``
+    stride policy when the processor declares a ``vae`` transform, and the
+    tower input applies the selected transform's stride policy to that
+    canvas.
 
     Returns:
         The selected transform, the canvas (height, width) and the tower's
@@ -90,7 +96,7 @@ def _image_plan(
         return (
             transform,
             (height, width),
-            _patch_image_shape(transform, height, width),
+            _patch_image_shape(transform, height, width, input_images),
         )
 
     canvas = (
@@ -127,11 +133,17 @@ def prepare_image(
     encoded: str,
     *,
     device: torch.device,
+    input_images: int,
 ) -> PreparedImage:
-    """Decode RGB bytes and apply the model's canvas and tower transforms."""
+    """Decode a request input image and apply the model's transforms.
+
+    ``input_images`` is the number of input images in the image's request;
+    a patch tower whose images share a pixel budget bounds each by its share
+    (see ``PatchTransform.pixel_bound``).
+    """
     image = _decode_rgb(encoded)
     transform, canvas, tower = _image_plan(
-        processor, kind, image.height, image.width
+        processor, kind, image.height, image.width, input_images
     )
     if not isinstance(transform, PatchTransform):
         image = vision.resize(
@@ -159,7 +171,8 @@ def prepare_tensor_image(
 
     ``image`` is [3, height, width] or [1, 3, height, width] with values in
     [0, 1], or in [-1, 1] when ``signed_unit``; values are clamped to [0, 1]
-    before the transforms.
+    before the transforms. The view is a generated image rather than a
+    request input, so a patch tower bounds it by ``max_pixels`` alone.
     """
     value = image.detach().to(dtype=torch.float32)
     if value.ndim == 4:
@@ -176,7 +189,7 @@ def prepare_tensor_image(
         value = (value + 1.0) * 0.5
     value = value.clamp(0.0, 1.0)
     transform, canvas, tower = _image_plan(
-        processor, kind, int(value.shape[1]), int(value.shape[2])
+        processor, kind, int(value.shape[1]), int(value.shape[2]), None
     )
     if not isinstance(transform, PatchTransform):
         value = _resize_tensor(value, *canvas)
@@ -213,9 +226,16 @@ def patch_grid_shape(
     processor: PatchTransform,
     source_height: int,
     source_width: int,
+    input_images: int | None,
 ) -> tuple[int, int]:
-    """Return the host-known patch grid for the declared image dimensions."""
-    height, width = _patch_image_shape(processor, source_height, source_width)
+    """Return the host-known patch grid for the declared image dimensions.
+
+    ``input_images`` is the number of input images in the request of a
+    request input image, or None for a generated image.
+    """
+    height, width = _patch_image_shape(
+        processor, source_height, source_width, input_images
+    )
     patch = int(processor.patch_size)
     return height // patch, width // patch
 
@@ -224,11 +244,13 @@ def _patch_image_shape(
     processor: PatchTransform,
     source_height: int,
     source_width: int,
+    input_images: int | None,
 ) -> tuple[int, int]:
     """Resolve the resized pixel dimensions for a patch tower.
 
     Both dimensions become multiples of ``patch_size / downsample_ratio``
-    within the processor's pixel-area bounds.
+    within the processor's lower pixel bound and the upper bound
+    ``PatchTransform.pixel_bound`` gives for ``input_images``.
     """
     factor = int(
         round(int(processor.patch_size) / float(processor.downsample_ratio))
@@ -238,7 +260,7 @@ def _patch_image_shape(
         source_width,
         factor=factor,
         minimum=int(processor.min_pixels),
-        maximum=int(processor.max_pixels),
+        maximum=int(processor.pixel_bound(input_images)),
     )
 
 

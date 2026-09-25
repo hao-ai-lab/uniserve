@@ -164,6 +164,7 @@ fn completion_record() -> RequestOutput {
     }
 }
 
+/// An autoregressive admission of a request with three input images.
 fn admission() -> NewRequest {
     NewRequest::new(
         request_key(),
@@ -175,6 +176,7 @@ fn admission() -> NewRequest {
             initial_position: 0,
         }),
         None,
+        3,
     )
     .unwrap()
 }
@@ -1336,10 +1338,11 @@ fn comprehensive_batches() -> Vec<Batch> {
             initial_position: 128,
         }),
         None,
+        0,
     )
     .unwrap();
     let image_params =
-        NewRequest::new(key_for_request(110), 110, None, Some(full_image())).unwrap();
+        NewRequest::new(key_for_request(110), 110, None, Some(full_image()), 2).unwrap();
     let variants = CallKind::ALL;
     let mut batches = Vec::new();
     for (index, kind) in variants.into_iter().enumerate() {

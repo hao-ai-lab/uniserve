@@ -1,0 +1,12 @@
+{
+  "description": "SenseNova input-image resize cases shared by the server's KV-token prediction (crates/server/src/profile/mod.rs) and the worker's image staging (tests/python/unit/execution/test_image_input.py). Each case gives a source size in pixels and the number of input images in its request; the request's input images share a 4096x4096 pixel budget, so each image's pixel bound is min(2048 * 2048, 4096 * 4096 // input_images), as in the reference preprocessing. Expected values follow the reference resize (vllm-omni _smart_resize at a 32-pixel factor with a 512 * 512 lower bound): the resized size in pixels and its KV tokens, one per 32x32 pixel block.",
+  "cases": [
+    {"width": 2048, "height": 2048, "input_images": 1, "resized_width": 2048, "resized_height": 2048, "kv_tokens": 4096},
+    {"width": 2048, "height": 2048, "input_images": 4, "resized_width": 2048, "resized_height": 2048, "kv_tokens": 4096},
+    {"width": 2048, "height": 2048, "input_images": 5, "resized_width": 1824, "resized_height": 1824, "kv_tokens": 3249},
+    {"width": 3000, "height": 2000, "input_images": 6, "resized_width": 2016, "resized_height": 1344, "kv_tokens": 2646},
+    {"width": 1024, "height": 1024, "input_images": 8, "resized_width": 1024, "resized_height": 1024, "kv_tokens": 1024},
+    {"width": 2048, "height": 1152, "input_images": 16, "resized_width": 1344, "resized_height": 768, "kv_tokens": 1008},
+    {"width": 1920, "height": 1080, "input_images": 5, "resized_width": 1920, "resized_height": 1088, "kv_tokens": 2040}
+  ]
+}

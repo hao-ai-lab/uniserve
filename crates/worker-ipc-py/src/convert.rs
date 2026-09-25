@@ -791,6 +791,7 @@ fn admission_to_py<'py>(
         context.request_key(admission.request_key)?,
     )?;
     dict.set_item(intern!(py, "request_pool_idx"), admission.request_pool_idx)?;
+    dict.set_item(intern!(py, "input_images"), admission.input_images)?;
     dict.set_item(
         intern!(py, "generation"),
         admission
@@ -2008,6 +2009,7 @@ mod tests {
                 initial_position: 0,
             }),
             None,
+            2,
         )
         .unwrap();
         let token = TensorRef {
@@ -2363,8 +2365,21 @@ mod tests {
                 let call = native_batch.getattr("calls").unwrap().get_item(0).unwrap();
                 match index {
                     // The token call carries host-staged inputs and the
-                    // sampling state the worker reads per call.
+                    // sampling state the worker reads per call; its
+                    // admission carries the request's input image count.
                     0 => {
+                        assert_eq!(
+                            native_batch
+                                .getattr("admissions")
+                                .unwrap()
+                                .get_item(0)
+                                .unwrap()
+                                .getattr("input_images")
+                                .unwrap()
+                                .extract::<u32>()
+                                .unwrap(),
+                            2
+                        );
                         assert_eq!(
                             call.getattr("input_token_ids")
                                 .unwrap()

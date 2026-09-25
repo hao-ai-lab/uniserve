@@ -572,13 +572,14 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                 MediaCall.VISION_ENCODING,
                 payload,
                 device=torch.device("cuda:0"),
+                input_images=1,
             )
             expected_features = model.vision_encoder.encode(
                 VisionInput(
                     (pixels.pixels,), (pixels.grid,), (pixels.grid_shape,)
                 )
             )[0]
-            admission = ar_params(0)
+            admission = ar_params(0, input_images=1)
             encode = encode_call(
                 admission.request_key,
                 call_id=CallId(1, 0),

@@ -320,19 +320,23 @@ impl Scheduler {
                     let request_key = RequestKey::new(engine_id, id, st.request_epoch);
                     // Admission reserved the request row, and submission
                     // validated the parameters this admission carries.
-                    let admission = st.request_pool_idx().map(|request_pool_idx| {
-                        NewRequest::new(
-                            request_key,
-                            request_pool_idx,
-                            Some(ArRequestParams {
-                                sampling: st.req.sampling.clone(),
-                                negative_token_ids: st.req.negative_prompt_token_ids.clone(),
-                                finish_token_ids,
-                                initial_position: st.num_computed_prompt_tokens,
-                            }),
-                            st.req.generates_images().then(|| st.req.image.clone()),
-                        )
-                    });
+                    let admission = st
+                        .request_pool_idx()
+                        .zip(u32::try_from(st.req.multimodal_inputs.images.len()).ok())
+                        .map(|(request_pool_idx, input_images)| {
+                            NewRequest::new(
+                                request_key,
+                                request_pool_idx,
+                                Some(ArRequestParams {
+                                    sampling: st.req.sampling.clone(),
+                                    negative_token_ids: st.req.negative_prompt_token_ids.clone(),
+                                    finish_token_ids,
+                                    initial_position: st.num_computed_prompt_tokens,
+                                }),
+                                st.req.generates_images().then(|| st.req.image.clone()),
+                                input_images,
+                            )
+                        });
                     let Some(Ok(admission)) = admission else {
                         self.invariant_broken("a running request forms a valid worker admission");
                         return Vec::new();
