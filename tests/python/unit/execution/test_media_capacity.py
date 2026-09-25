@@ -65,7 +65,10 @@ def test_sizes_outside_the_admitted_range_have_no_layout(denoiser):
 
 def test_default_capacities_step_to_the_prompt_capacity(denoiser):
     builder = MediaBuilder(denoiser, max_frames=124, max_text_tokens=5000)
-    assert builder.text_capacities == (2048, 4096, 5056)
+    assert builder.text_capacities == (1024, 2048, 4096, 5056)
+    # A prompt capacity below the first rung is the only capacity.
+    small = MediaBuilder(denoiser, max_frames=124, max_text_tokens=500)
+    assert small.text_capacities == (512,)
     # Without a floor, every native frame count up to the capacity is kept.
     assert builder.frame_counts == (22, 39, 56, 73, 90, 107, 124)
 

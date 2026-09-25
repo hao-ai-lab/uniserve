@@ -27,8 +27,13 @@ REQUEST_PAGES = 8
 #: Element alignment of each modality's samples within a request's pages.
 SAMPLE_ALIGNMENT = 256
 
-#: Spacing, in prompt tokens, of the default text capacities: a request's
-#: layout holds at most this many padding rows beyond its prompt's tiles.
+#: Default text capacities, in prompt tokens: a first rung, then steps of
+#: ``TEXT_CAPACITY_STEP`` up to the prompt capacity. A request's layout holds
+#: at most one step of padding rows beyond its prompt's tiles. Padding rows
+#: cost GEMM work, about 2% of a 4-5 second step per 1024 rows on 4 x GB200
+#: under Ulysses-4, so the first rung spares prompts of up to 1024 tokens
+#: that padding.
+TEXT_CAPACITY_FIRST = 1024
 TEXT_CAPACITY_STEP = 2048
 
 
@@ -93,8 +98,8 @@ class MediaBuilder:
         Admitted frame counts are the legal counts from ``min_frames`` up to
         ``max_frames`` rounded up to complete native windows. Text
         capacities are prompt token counts; the largest must hold
-        ``max_text_tokens``, and without any the capacities step by
-        ``TEXT_CAPACITY_STEP`` up to it.
+        ``max_text_tokens``, and without any they are ``TEXT_CAPACITY_FIRST``
+        and then steps of ``TEXT_CAPACITY_STEP`` up to it.
 
         Raises:
             ValueError: No frame count is admitted, or a text capacity is
@@ -114,9 +119,11 @@ class MediaBuilder:
             raise ValueError("media input admits no frame count")
         self.frame_counts = tuple(counts)
 
-        requested = tuple(int(value) for value in text_capacities) or tuple(
-            range(TEXT_CAPACITY_STEP, max_text_tokens, TEXT_CAPACITY_STEP)
-        ) + (max_text_tokens,)
+        requested = tuple(int(value) for value in text_capacities) or (
+            TEXT_CAPACITY_FIRST,
+            *range(TEXT_CAPACITY_STEP, max_text_tokens, TEXT_CAPACITY_STEP),
+            max_text_tokens,
+        )
         if min(requested) < 1 or max(requested) < max_text_tokens:
             raise ValueError(
                 "text capacities must be positive and hold the prompt capacity"

@@ -145,7 +145,7 @@ Cross-rank products move over the mechanism named for that edge. CUDA VMM reads 
 
 A FastH3 deployment defaults to `--max-video-seconds 15` and `--max-model-len 16384`; set them only to change those limits. `--max-running-requests` caps concurrently resident requests, and the engine clamps that cap to the worker's advertised request-slot capacity; lowering it trades throughput for per-request latency and storage headroom.
 
-Startup prepares the denoiser for every admitted duration: each of the 16 output frame counts up to `--max-video-seconds`, at every text capacity. `--video-text-capacities` lists those capacities in prompt tokens (default: steps of 2048 up to `--max-model-len`), and a request evaluates in the smallest capacity that holds its prompt. With graphs enabled, startup captures all eight denoising steps of every such layout before the server reports ready, and every accepted request replays them: serving never captures a denoising graph and never falls back to eager denoising. The layouts share one workspace and one graph pool, so resident memory follows the largest layout rather than their count, while startup time grows with the count; fewer capacities start faster, and finer ones pad shorter prompts less. A deployment whose layouts do not fit its device fails before it reports ready and names the settings to change. `--graph-policy off` serves the same layouts without graphs.
+Startup prepares every computation an admitted request reaches. The denoiser is prepared for each of the 16 output frame counts up to `--max-video-seconds`, at every text capacity: `--video-text-capacities` lists those capacities in prompt tokens (default: 1024, then steps of 2048 up to `--max-model-len`), and a request evaluates in the smallest capacity that holds its prompt. The text encoder and the text refiner are prepared at every text capacity, and the video and audio decoders at every admitted duration. With graphs enabled (`--graph-policy auto`, the default, or `full`), startup captures all eight denoising steps of every layout and every text-encoding and decoding call before the server reports ready, and accepted requests replay them: serving never captures and never falls back to eager execution. The video post-processor, which converts decoded frames for encoding, runs eagerly by design. The denoiser's layouts share one workspace and one graph pool, so its resident memory follows the largest layout rather than their count, while startup time grows with the count; fewer capacities start faster, and finer ones pad shorter prompts less. Decoder graphs keep one output per duration, so decoder memory grows with `--max-video-seconds`. A deployment whose startup storage does not fit its devices fails before it reports ready; the startup log lists each device's reserved bytes and the graph storage of each component. `--graph-policy off` serves the same layouts without graphs.
 
 Check the live limits and served model name after startup:
 
@@ -177,7 +177,7 @@ docker run --rm \
     --max-running-requests 2
 ```
 
-The first startup compiles the native GPU providers and captures shapes on first use. Those artifacts land in `~/.cache/torch_extensions`; mount that path, or point `TORCH_EXTENSIONS_DIR` at a mounted directory, if container restarts must reuse them.
+The first startup compiles the native GPU providers. Those artifacts land in `~/.cache/torch_extensions`; mount that path, or point `TORCH_EXTENSIONS_DIR` at a mounted directory, if container restarts must reuse them.
 
 ## Generate a video
 
@@ -241,7 +241,7 @@ Omitting `--quantization-config` selects `balanced`.
 --quantization-config '{"mode":"performance","components":{"video_vae":"bf16"}}'
 ```
 
-CUDA graphs are always on. The denoising step and the media-decoding calls are captured on first use and replayed afterwards, so the first request after startup is slower than steady state; a capture failure is raised rather than silently degrading to eager execution. Precision, placement, duration capacity, and prompt capacity are startup settings; restart the server after changing them.
+CUDA graphs are captured during startup, as described above, so requests never capture; a capture failure stops startup rather than silently degrading to eager execution. Precision, placement, duration capacity, and prompt capacity are startup settings; restart the server after changing them.
 
 The four tiers above are runtime dynamic-quantization presets for dense checkpoints. A ModelOpt PTQ checkpoint loads without `--quantization-config`. Each quantized Linear stores its packed NVFP4 values under `.weight`, its K16 block scales in `.weight_scale`, its FP32 weight scale in `.weight_scale_2`, and the static activation scale its calibration cohort recorded in `.input_scale`; the runtime computes only the per-input K16 NVFP4 block encoding against that input scale and does not search a new global scale. Because every row interval uses that same checkpoint-owned scale, singleton DP replicas encode and project bounded 64 MiB intervals instead of materializing a full-token MLP intermediate. Packed checkpoints reject runtime precision presets and component overrides because their weights and scales form one immutable numerical contract.
 

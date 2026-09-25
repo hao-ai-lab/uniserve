@@ -450,7 +450,7 @@ pub(crate) struct WorkerProcessOptions {
     /// admitted duration at every capacity, and a request evaluates in the
     /// smallest capacity that holds its prompt; fewer capacities shorten
     /// startup and lower resident memory, finer ones pad less. Defaults to
-    /// steps of 2048 tokens.
+    /// 1024 tokens, then steps of 2048 tokens.
     #[arg(long)]
     pub video_text_capacities: Option<String>,
     #[arg(long, default_value_t = 512 * 1024 * 1024, hide = true)]
