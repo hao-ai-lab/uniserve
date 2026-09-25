@@ -301,25 +301,43 @@ impl EngineClient {
         Ok(())
     }
 
-    /// Requests graceful shutdown and joins the engine's scheduler thread.
+    /// Requests graceful shutdown and waits until the engine's scheduler
+    /// thread has exited.
     ///
-    /// The join blocks the calling thread until the scheduler has torn down
-    /// its executor. Repeated calls are harmless.
+    /// The scheduler finishes outstanding requests and closes its executor,
+    /// which on a multi-rank deployment waits for every rank to drain and
+    /// exit. The join therefore runs on Tokio's blocking pool, leaving the
+    /// calling runtime thread free for other tasks. Repeated calls are
+    /// harmless.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::ClientClosed` when the blocking shutdown task does not
+    /// complete, which happens only if it panics or its runtime is shutting
+    /// down.
     pub async fn shutdown(&self) -> Result<()> {
-        self.core.shutdown();
-        Ok(())
+        let core = Arc::clone(&self.core);
+        tokio::task::spawn_blocking(move || core.shutdown())
+            .await
+            .map_err(|error| Error::ClientClosed {
+                message: format!("engine shutdown did not complete: {error}"),
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
     use crate::engine_client::EngineClient;
     use uniserve_core::{
         EngineCoreOutput, FeedbackNextToken, FeedbackSource, GenerationConstraint,
         GenerationRequest, ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageParams,
         ImageTrigger, SamplingParams,
     };
-    use uniserve_engine::EngineConfig;
+    use uniserve_engine::{EngineConfig, Executor};
 
     #[tokio::test]
     async fn sim_engine_generates_tokens_through_engine_client() {
@@ -473,5 +491,82 @@ mod tests {
         assert!(finished, "expected a terminal Finished event");
 
         client.shutdown().await.expect("shutdown engine");
+    }
+
+    /// Simulated executor whose teardown lasts until another task releases
+    /// it, as closing worker processes that drain and exit takes time.
+    struct GatedCloseExecutor {
+        inner: uniserve_engine::SimExecutor,
+        release: std::sync::mpsc::Receiver<()>,
+        released: Arc<AtomicBool>,
+    }
+
+    impl Executor for GatedCloseExecutor {
+        fn info(&self) -> &uniserve_engine::ExecutorInfo {
+            self.inner.info()
+        }
+
+        fn is_ready(&self, worker: &uniserve_engine::WorkerId) -> bool {
+            self.inner.is_ready(worker)
+        }
+
+        fn has_capacity(&self, worker: &uniserve_engine::WorkerId) -> bool {
+            self.inner.has_capacity(worker)
+        }
+
+        fn command_has_capacity(&self, command: &uniserve_worker_ipc::BatchCommand) -> bool {
+            self.inner.command_has_capacity(command)
+        }
+
+        fn submit(
+            &mut self,
+            batch: uniserve_engine::ExecutionBatch,
+        ) -> Result<(), uniserve_engine::ExecutorSubmitError> {
+            self.inner.submit(batch)
+        }
+
+        fn poll(
+            &mut self,
+            timeout: Duration,
+        ) -> Result<Option<uniserve_engine::BatchResult>, uniserve_engine::ExecutorError> {
+            self.inner.poll(timeout)
+        }
+
+        fn close(&mut self) -> Result<(), uniserve_engine::ExecutorError> {
+            // The wait is bounded so that a blocked runtime fails the test
+            // instead of hanging it.
+            let released = self.release.recv_timeout(Duration::from_secs(5)).is_ok();
+            self.released.store(released, Ordering::SeqCst);
+            self.inner.close()
+        }
+    }
+
+    /// Shutdown waits for executor teardown without holding the runtime
+    /// thread: on a single-threaded runtime, the task that ends the teardown
+    /// runs while `shutdown` is pending.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_leaves_the_runtime_free_during_executor_teardown() {
+        let (release_tx, release) = std::sync::mpsc::channel();
+        let released = Arc::new(AtomicBool::new(false));
+        let client = EngineClient::connect_with_executor(
+            EngineConfig::sim("sim-model"),
+            Box::new(GatedCloseExecutor {
+                inner: uniserve_engine::SimExecutor::new(uniserve_engine::SimEngine::new()),
+                release,
+                released: Arc::clone(&released),
+            }),
+        )
+        .expect("connect in-process sim engine");
+
+        let releaser = tokio::spawn(async move {
+            let _ = release_tx.send(());
+        });
+        client.shutdown().await.expect("shutdown engine");
+        releaser.await.expect("release task");
+
+        assert!(
+            released.load(Ordering::SeqCst),
+            "executor teardown held the runtime thread"
+        );
     }
 }
