@@ -476,36 +476,30 @@ class TensorStore:
         self._lock = RLock()
 
     def resident_bytes(self, device: torch.device | str) -> int:
-        """Return retained backing bytes on a device.
+        """Return the device bytes of the backing this store allocates.
 
-        Counts each backing storage once: relay arenas and the storage viewed
-        by every resident record. A resident persistent record contributes
-        the whole `BufferPool` arena storage it views, and CUDA arenas from
+        Only request-relay arenas count: they are the storage this store
+        allocates itself, which ``byte_capacity`` bounds and the arena's
+        ``device_product_bytes`` sizes, and callers subtract the result from
+        that bound to find what is still to be allocated. Persistent products
+        and encoder features view `BufferPool` storage, whose whole grant the
+        worker layout counts separately, so they contribute nothing. Relay
+        records view these arenas. CUDA arenas from
         ``uniserve_kernels.peer_storage.empty`` report their page-rounded
         size.
         """
         name = str(torch.device(device))
         with self._lock:
-            tensors = [
-                tensor
+            # Count each physical allocation once, keyed by its storage
+            # pointer.
+            storages = {
+                tensor.untyped_storage().data_ptr(): tensor.untyped_storage()
                 for (
                     owner,
                     _dtype,
-                    _width,
+                    _field,
                 ), tensor in self._relay_arenas.items()
                 if owner == name
-            ]
-            tensors.extend(
-                entry.tensor
-                for entry in self._writes.values()
-                if entry.device_name == name
-            )
-
-            # Arena slices and region views share one backing storage; count
-            # each physical allocation once, keyed by its storage pointer.
-            storages = {
-                tensor.untyped_storage().data_ptr(): tensor.untyped_storage()
-                for tensor in tensors
             }
             return sum(storage.nbytes() for storage in storages.values())
 
