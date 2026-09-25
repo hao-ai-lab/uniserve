@@ -46,7 +46,10 @@ class ImageBuilder:
 
     @property
     def max_tokens(self) -> int:
-        """Longest image sequence the network accepts."""
+        """Longest image sequence the network accepts, in patch rows.
+
+        Framing tokens are not counted; see :attr:`framing`.
+        """
         return self.denoiser.max_sequence_tokens
 
     def sequence_length(self, size: image.Config) -> int:
