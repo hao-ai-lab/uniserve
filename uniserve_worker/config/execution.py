@@ -318,6 +318,13 @@ class WorkerConfig:
     max_batch_tokens: int = 8192
     max_sequence_tokens: int = 16384
     max_video_seconds: float = 15.0
+    # Shortest duration the server admits, which bounds the frame counts the
+    # worker provisions from below; ``None`` provisions every frame count
+    # the model generates up to the capacity.
+    min_video_seconds: float | None = None
+    # Text capacities, in prompt tokens, of the denoiser's layouts; empty
+    # selects ``MediaBuilder``'s default spacing.
+    video_text_capacities: tuple[int, ...] = ()
     max_request_pool_size: int = 128
     encoder_cache_entries: int = 256
     generation_device: str | None = None
@@ -338,10 +345,6 @@ class WorkerConfig:
         (1152, 2048),
         (2048, 1152),
     )
-    # Video request shapes, as (duration in seconds, prompt tokens), whose
-    # denoising ladders warmup captures for their layouts. Requests of any
-    # other layout denoise eagerly; serving never captures.
-    video_graph_shapes: tuple[tuple[float, int], ...] = ()
     flashinfer: FlashInferConfig = FlashInferConfig()
 
     def __post_init__(self) -> None:
@@ -383,6 +386,15 @@ class WorkerConfig:
             raise invalid_descriptor(
                 "video duration capacity must be finite and positive"
             )
+        if self.min_video_seconds is not None and not (
+            math.isfinite(self.min_video_seconds)
+            and 0 < self.min_video_seconds <= self.max_video_seconds
+        ):
+            raise invalid_descriptor(
+                "shortest video duration must lie within the capacity"
+            )
+        if any(value < 1 for value in self.video_text_capacities):
+            raise invalid_descriptor("video text capacities must be positive")
         if not 0 < self.kv_storage_fraction <= 1:
             raise invalid_descriptor(
                 "worker configuration KV storage fraction must be in (0, 1]"
@@ -427,6 +439,12 @@ def worker_config_from_namespace(
         max_batch_tokens=int(namespace.max_batch_tokens),
         max_sequence_tokens=int(namespace.max_model_len),
         max_video_seconds=float(namespace.max_video_seconds),
+        min_video_seconds=_optional_float(
+            getattr(namespace, "min_video_seconds", None)
+        ),
+        video_text_capacities=_parse_positive_int_csv(
+            getattr(namespace, "video_text_capacities", None), default=()
+        ),
         kv_token_capacity=_positive_optional_int(namespace.kv_token_capacity),
         attention_backend=str(namespace.attention_backend),
         model_dtype=str(namespace.model_dtype),
@@ -451,7 +469,6 @@ def worker_config_from_namespace(
             default=(1, 2, 3, 4),
         ),
         flow_graph_shapes=_parse_image_shapes(namespace.flow_graph_shapes),
-        video_graph_shapes=_parse_video_shapes(namespace.video_graph_shapes),
         flashinfer=FlashInferConfig(
             workspace_size=int(namespace.flashinfer_workspace_size),
             use_tensor_core=_parse_optional_bool(
@@ -484,6 +501,11 @@ def _none_if_empty(value: object | None) -> str | None:
             "an explicitly provided string setting must not be empty"
         )
     return text
+
+
+def _optional_float(value: object | None) -> float | None:
+    """Parse an optional floating-point setting, keeping ``None`` as unset."""
+    return None if value is None else float(cast(Any, value))
 
 
 def _positive_optional_int(value: object | None) -> int | None:
@@ -559,36 +581,6 @@ def _parse_image_shapes(raw: object | None) -> tuple[tuple[int, int], ...]:
 
     if not values:
         raise ValueError("flow graph shapes must not be empty")
-    return tuple(values)
-
-
-def _parse_video_shapes(raw: object | None) -> tuple[tuple[float, int], ...]:
-    """Parse the video shapes whose denoising ladders warmup makes resident.
-
-    Each item is ``SECONDSxTOKENS``: the request duration and its prompt length
-    in tokenizer tokens. Both determine the denoiser's numerical size, so a
-    declared shape only serves requests that match it exactly.
-    """
-    if raw is None:
-        return ()
-
-    values: list[tuple[float, int]] = []
-    for item in str(raw).split(","):
-        text = item.strip().lower()
-        if not text:
-            continue
-        seconds_text, separator, tokens_text = text.partition("x")
-        if not separator:
-            raise ValueError("video graph shapes must use SECONDSxTOKENS")
-        shape = float(seconds_text), int(tokens_text)
-        if not math.isfinite(shape[0]) or shape[0] <= 0 or shape[1] < 1:
-            raise ValueError(
-                "video graph shapes must have a positive duration and prompt "
-                "length"
-            )
-        if shape in values:
-            raise ValueError("video graph shapes must be unique")
-        values.append(shape)
     return tuple(values)
 
 

@@ -100,8 +100,7 @@ uniserve serve "$H3_MODEL" \
   --workers configs/minimax-h3-dp8-text-tp8.json \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
-  --max-running-requests 8 \
-  --video-graph-shapes 5x1000
+  --max-running-requests 8
 ```
 
 The two supplied placements isolate the main topology choices:
@@ -146,7 +145,7 @@ Cross-rank products move over the mechanism named for that edge. CUDA VMM reads 
 
 A FastH3 deployment defaults to `--max-video-seconds 15` and `--max-model-len 16384`; set them only to change those limits. `--max-running-requests` caps concurrently resident requests, and the engine clamps that cap to the worker's advertised request-slot capacity; lowering it trades throughput for per-request latency and storage headroom.
 
-`--video-graph-shapes 5x1000,15x10000` declares the duration and prompt length of the requests a deployment serves, and warmup captures the denoising ladder of each declared shape before the server reports ready. A ladder serves every request slot and every prompt length in the same 64-token text tile at the same duration, so `5x1000` covers five-second requests with 961 to 1024 prompt tokens, each with exactly the values an uncaptured evaluation produces. The server never captures a graph while serving: a request that no declared shape covers still serves, but runs its denoising steps without graphs.
+Startup prepares the denoiser for every admitted duration: each of the 16 output frame counts up to `--max-video-seconds`, at every text capacity. `--video-text-capacities` lists those capacities in prompt tokens (default: steps of 2048 up to `--max-model-len`), and a request evaluates in the smallest capacity that holds its prompt. With graphs enabled, startup captures all eight denoising steps of every such layout before the server reports ready, and every accepted request replays them: serving never captures a denoising graph and never falls back to eager denoising. The layouts share one workspace and one graph pool, so resident memory follows the largest layout rather than their count, while startup time grows with the count; fewer capacities start faster, and finer ones pad shorter prompts less. A deployment whose layouts do not fit its device fails before it reports ready and names the settings to change. `--graph-policy off` serves the same layouts without graphs.
 
 Check the live limits and served model name after startup:
 

@@ -167,21 +167,24 @@ class CUDAGraphRunner:
     inputs: Inputs
 
     @classmethod
-    def capture(cls, context, inputs, call, *, pools, restore=None):
+    def capture(cls, context, inputs, call, *, pools, restore=None, warm=True):
         """Warm and capture ``call(inputs)`` on ``context``.
 
-        The eager call first warms the kernel specializations that
-        ``CUDAGraph.capture`` requires. ``restore``, when given, returns
-        mutated state to its pre-call contents after the warm call and again
-        after capture, so preparation leaves live state unchanged. ``inputs``
-        become the graph's fixed input backing, retained by the runner.
+        With ``warm``, an eager call first warms the kernel specializations
+        and prepared resources that ``CUDAGraph.capture`` requires; a caller
+        that has already run the same computation at the same shapes passes
+        ``warm=False``. ``restore``, when given, returns mutated state to its
+        pre-call contents after the warm call and again after capture, so
+        preparation leaves live state unchanged. ``inputs`` become the
+        graph's fixed input backing, retained by the runner.
         """
-        with context.activate():
-            try:
-                call(inputs)
-            finally:
-                if restore is not None:
-                    restore()
+        if warm:
+            with context.activate():
+                try:
+                    call(inputs)
+                finally:
+                    if restore is not None:
+                        restore()
         executable: CUDAGraph[Any] = CUDAGraph(context=context, pools=pools)
         try:
             executable.capture(lambda: call(inputs), restore=restore)

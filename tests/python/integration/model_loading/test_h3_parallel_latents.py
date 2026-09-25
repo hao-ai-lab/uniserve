@@ -223,6 +223,7 @@ def _generate(
                 )
                 denoiser.prepare_state(
                     (size,),
+                    layouts=(layout,),
                     out={
                         name: value
                         for name, value in staged.items()

@@ -137,8 +137,9 @@ pub struct WorkerProcessArgs {
     pub flow_graph_batch_sizes: Option<String>,
     /// Optional diffusion tensor shapes selected for CUDA graph capture.
     pub flow_graph_shapes: Option<String>,
-    /// Optional video request shapes whose denoising ladders warmup captures.
-    pub video_graph_shapes: Option<String>,
+    /// Optional text capacities, in prompt tokens, of a video denoiser's
+    /// layouts, as a comma-separated increasing list.
+    pub video_text_capacities: Option<String>,
     /// FlashInfer workspace capacity in bytes.
     pub flashinfer_workspace_size: u64,
     /// Optional FlashInfer tensor-core selection forwarded to the worker.
@@ -157,6 +158,10 @@ pub struct WorkerProcessArgs {
     pub max_model_len: u32,
     /// Maximum accepted video duration in seconds.
     pub max_video_seconds: f64,
+    /// Shortest video duration in seconds the serving API admits, which
+    /// bounds the frame counts a video worker provisions from below; `None`
+    /// provisions every frame count the model generates.
+    pub min_video_seconds: Option<f64>,
 }
 
 /// Parks until one descriptor becomes readable or `timeout` expires.

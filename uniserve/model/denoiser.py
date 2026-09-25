@@ -90,23 +90,39 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
         raise NotImplementedError
 
     def layout_size(self, size: SizeT) -> SizeT:
-        """Return the size whose numerical layout ``size`` occupies.
+        """Return the smallest layout that holds ``size``.
 
-        Sizes with one layout share constants, workspace and captured graphs,
-        so callers key those by this size; whatever distinguishes the sizes
-        within a layout is request state, which ``prepare_state`` fills. By
-        default every size is its own layout.
+        A layout is the size whose numerical shapes a call evaluates. Every
+        size a layout holds (see ``holds``) shares its constants, workspace
+        and captured graphs, so callers key those by the layout; whatever
+        distinguishes the sizes within a layout is request state, which
+        ``prepare_state`` fills. By default every size is its own layout.
         """
         return size
 
+    def holds(self, layout: SizeT, size: SizeT) -> bool:
+        """Whether a request of ``size`` can be evaluated in ``layout``.
+
+        A caller may evaluate a request in any layout that holds it, such as
+        a capacity many sizes share, rather than in its smallest layout. By
+        default a layout holds only the sizes whose smallest layout it is.
+        """
+        return self.layout_size(size) == layout
+
     def prepare_state(
-        self, sizes: tuple[SizeT, ...], *, out: Mapping[str, torch.Tensor]
+        self,
+        sizes: tuple[SizeT, ...],
+        *,
+        layouts: tuple[SizeT, ...],
+        out: Mapping[str, torch.Tensor],
     ) -> None:
         """Fill the request state that does not derive from a native draw.
 
+        Each size is evaluated in the aligned layout, which must hold it.
         ``out`` holds CPU views of the state fields other than the sample
-        modalities, which the caller stages next to the samples. A network
-        whose state is its samples alone receives no views.
+        modalities, shaped by ``state_buffers`` of the layouts, which the
+        caller stages next to the samples. A network whose state is its
+        samples alone receives no views.
         """
         if out:
             raise NotImplementedError(

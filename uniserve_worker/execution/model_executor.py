@@ -29,13 +29,13 @@ from __future__ import annotations
 import logging
 import time
 from collections import OrderedDict, defaultdict
-from collections.abc import Hashable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from functools import partial
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
@@ -133,6 +133,7 @@ from uniserve_worker.protocol.output import ForwardStats
 from uniserve_worker.sampling.metadata import TokenSelection
 
 if TYPE_CHECKING:
+    from uniserve_worker.model_executor.media_inputs import MediaBuilder
     from uniserve_worker.storage.block_tables import BlockTables
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.kv_cache import KVCacheManager
@@ -280,16 +281,12 @@ class ModelExecutor:
         self.decode_predicates = None
         self.kv_cache = None
         # A standalone denoiser's component, binding and call, the request
-        # bank and latent pool its ladders gather through, and one runner per
-        # prepared layout; declared layouts stay pinned with their captured
-        # ladders.
+        # bank and latent pool its ladders gather through, and the one
+        # runner that serves every layout the media builder admits.
         self._denoiser = None
         self.diffusion_bank: Mapping[str, torch.Tensor] = {}
         self.latent_pool: LatentPool | None = None
-        self._diffusion_runners: OrderedDict[Hashable, DiffusionRunner] = (
-            OrderedDict()
-        )
-        self._pinned_layouts: set[Hashable] = set()
+        self._diffusion: DiffusionRunner | None = None
 
         self.uses_lanes = False
         self._startup_complete = self._closed = False
@@ -443,6 +440,8 @@ class ModelExecutor:
                 entry.close()
                 raise
 
+            # An entry prepared while serving never captures.
+            entry._startup_complete = self._startup_complete
             self._module_entries[key] = entry
 
         self._module_entries.move_to_end(key)
@@ -712,49 +711,38 @@ class ModelExecutor:
         """Borrow the storage the standalone denoiser's ladders gather.
 
         The request bank holds each request's state and the latent pool its
-        samples. Every runner borrows both at preparation, so they are bound
+        samples. The runner borrows both when it is built, so they are bound
         before the first layout is prepared.
         """
-        if self._diffusion_runners:
+        if self._diffusion is not None:
             raise RuntimeError(
                 "bind request storage before preparing diffusion runners"
             )
         self.diffusion_bank = dict(bank)
         self.latent_pool = pool
 
-    def diffusion_runner(self, layout, *, pin: bool = False) -> DiffusionRunner:
-        """Return the standalone denoiser's runner for one layout.
+    @property
+    def diffusion(self) -> DiffusionRunner:
+        """Return the standalone denoiser's runner, built on first use.
 
-        The runner's context is prepared on first use. A pinned layout, one
-        that warmup captures ladders for, stays prepared until the worker
-        closes, and pinning an unpinned layout keeps it. Other layouts serve
-        eager steps: at most one per request slot stays prepared, the least
-        recently used retired first. Every rank of the component prepares,
-        uses and retires layouts in the same order, so each finds the same
-        runners resident without agreeing on it at run time.
+        One runner serves every layout of ``media_builder.layouts``: its
+        context is prepared for the largest, whose storage the others share,
+        and ``prepare_layouts`` prepares them. It captures when the graph
+        policy and the component's stream allow.
         """
         if self._denoiser is None or self.latent_pool is None:
             raise InputError("rank does not own denoising computation")
-        runner = self._diffusion_runners.get(layout)
-        if runner is None:
-            slots = self.worker_config.max_request_pool_size
-            unpinned = [
-                key
-                for key in self._diffusion_runners
-                if key not in self._pinned_layouts
-            ]
-            if not pin and len(unpinned) >= slots:
-                self._retire_diffusion(unpinned[0])
-
+        if self._diffusion is None:
+            builder = cast("MediaBuilder", self.media_builder)
             name, binding, call = self._denoiser
             stream = self.module_stream(name, method=call.entry_point.method)
             captures = (
                 self.worker_config.graph_policy != "off" and stream is not None
             )
-            runner = DiffusionRunner.for_layout(
+            self._diffusion = DiffusionRunner.for_layouts(
                 name,
                 call,
-                layout,
+                builder.layouts()[0],
                 device=binding.device,
                 stream=stream,
                 storage=self.graph_storage,
@@ -765,32 +753,34 @@ class ModelExecutor:
                 if captures
                 else (),
                 bank=self.diffusion_bank if captures else None,
-                slots=slots,
+                slots=self.worker_config.max_request_pool_size,
                 pool=self.latent_pool,
-                pages=self.media_builder.layout_pages(layout),
+                pages=builder.sample_pages.pages,
                 attention=self.attention,
             )
-            self._diffusion_runners[layout] = runner
-        if pin:
-            self._pinned_layouts.add(layout)
-        self._diffusion_runners.move_to_end(layout)
-        return runner
+        return self._diffusion
 
-    def _retire_diffusion(self, layout) -> None:
-        """Drain a layout's runner before releasing its context and graphs."""
-        self._pinned_layouts.discard(layout)
-        runner = self._diffusion_runners.pop(layout)
-        if runner.context.stream is not None:
-            runner.context.stream.synchronize()
-        runner.close()
+    def prepare_layouts(self) -> tuple:
+        """Prepare every layout the media builder admits, largest first.
 
-    def run_denoising(self, layout, ladder, index, bank):
+        Collective across the denoiser's ranks, which prepare the same
+        layouts in the same order. Returns the layouts.
+        """
+        builder = cast("MediaBuilder", self.media_builder)
+        runner = self.diffusion
+        layouts = builder.layouts()
+        for layout in layouts:
+            runner.prepare(layout, pages=builder.layout_pages(layout))
+        self.graph_storage.check()
+        return layouts
+
+    def run_denoising(self, ladder, index, bank):
         """Run one denoising step of a bound ladder and time it.
 
         ``bank`` holds the request's committed samples; see
         ``DiffusionRunner.step``.
         """
-        runner = self.diffusion_runner(layout)
+        runner = self.diffusion
         started = time.perf_counter_ns()
         with profile_range(
             f"uniserve.model.denoise rank={self.worker_config.rank} "
@@ -1191,20 +1181,14 @@ class ModelExecutor:
         """Run media warmup passes, then drain every owned stream."""
         if self.media_builder is not None:
             from uniserve_worker.execution.media import (
-                capture_denoising,
-                warmup_conditioning,
+                prepare_denoising,
                 warmup_decoders,
-                warmup_denoising,
                 warmup_postprocess,
             )
 
-            warmup_denoising(self, storage)
-            warmup_conditioning(self)
+            prepare_denoising(self, storage)
             warmup_decoders(self)
             warmup_postprocess(self, storage)
-            # Capture last so the declared shapes hold the prepared contexts
-            # the captured ladders borrow.
-            capture_denoising(self, storage)
         self.synchronize()
 
     @torch.inference_mode()
@@ -1248,17 +1232,23 @@ class ModelExecutor:
     def complete_startup(self):
         """Seal startup: check captured-graph storage budgets and stream grants.
 
-        Afterwards the staged entries capture no further batch graphs (see
-        ``ModelRunner``). Raises ``CUDAGraphError`` when graph residency
-        exceeds its budget, and ``CUDAError`` when a lane stream has lost its
-        SM partition.
+        Afterwards no runner captures: the staged entries capture no
+        further batch graphs, module entries, including ones prepared later,
+        evaluate signatures without a resident graph eagerly, and the
+        denoiser runner refuses capture (see ``ModelRunner``). Raises
+        ``CUDAGraphError`` when graph residency exceeds its budget, and
+        ``CUDAError`` when a lane stream has lost its SM partition.
         """
         self.graph_storage.check()
 
         for _, stream in self._lane_streams:
             stream.verify()
         self._startup_complete = True
-        for entry in self.entries.values():
+        for entry in (
+            *self.entries.values(),
+            *self._module_entries.values(),
+            *(() if self._diffusion is None else (self._diffusion,)),
+        ):
             entry._startup_complete = True
 
     def synchronize(self):
@@ -1305,7 +1295,7 @@ class ModelExecutor:
             for entry in (
                 *self.entries.values(),
                 *self._module_entries.values(),
-                *self._diffusion_runners.values(),
+                *(() if self._diffusion is None else (self._diffusion,)),
             )
         ]
         close_resources(*actions)
@@ -1349,9 +1339,8 @@ class ModelExecutor:
         actions = [self.synchronize]
         actions.append(self.close_graphs)
         actions.extend(entry.close for entry in self._module_entries.values())
-        actions.extend(
-            runner.close for runner in self._diffusion_runners.values()
-        )
+        if self._diffusion is not None:
+            actions.append(self._diffusion.close)
         for entry in self.entries.values():
             actions.append(entry.close)
 
@@ -1372,8 +1361,7 @@ class ModelExecutor:
         finally:
             self.entries.clear()
             self._module_entries.clear()
-            self._diffusion_runners.clear()
-            self._pinned_layouts.clear()
+            self._diffusion = None
             self.graph_storage.close()
             self._module_streams.clear()
             self._lane_streams.clear()

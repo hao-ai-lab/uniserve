@@ -48,8 +48,10 @@ def media_builder(model: nn.Module, config: WorkerConfig):
     """Instantiate the video input builder within the worker's frame budget.
 
     The frame budget is ``max_video_seconds`` at the post-processor's output
-    frame rate, rounded to the nearest frame; the text budget is
-    ``max_sequence_tokens``.
+    frame rate, rounded half to even to whole frames, and admitted frame
+    counts start at ``min_video_seconds`` converted the same way; the text
+    budget is ``max_sequence_tokens``, divided into
+    ``video_text_capacities``.
 
     Returns:
         The builder, or ``None`` for a model without a ``VideoDenoiser``.
@@ -76,4 +78,8 @@ def media_builder(model: nn.Module, config: WorkerConfig):
         denoiser,
         max_frames=round(config.max_video_seconds * output.frame_rate),
         max_text_tokens=config.max_sequence_tokens,
+        min_frames=1
+        if config.min_video_seconds is None
+        else round(config.min_video_seconds * output.frame_rate),
+        text_capacities=config.video_text_capacities,
     )

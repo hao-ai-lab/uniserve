@@ -158,6 +158,7 @@ def build_packing(
     patch_size: tuple[int, int, int] = (1, 2, 2),
     token_multiple: int = 256,
     audio_frames: int | None = None,
+    text_rows: int | None = None,
 ) -> Packing:
     """Build CPU coordinates for `[text | audio | tiled video | padding]` rows.
 
@@ -165,7 +166,8 @@ def build_packing(
     construction. Execution supplies device views for numerical kernels.
 
     Args:
-        num_text_tokens: Text rows; the text region rounds up to whole tiles.
+        num_text_tokens: Prompt tokens, the valid leading rows of the text
+            region.
         num_frames: Output video frames, of the form ``17 * n + 5``.
         height: Output raster height; only 768 is supported.
         width: Output raster width; only 1344 is supported.
@@ -175,12 +177,19 @@ def build_packing(
             tile when that leaves an odd tile count.
         audio_frames: Audio latent frames per channel; defaults to the
             40 Hz timeline of ``num_frames``.
+        text_rows: Rows of the text region, whole 64-row tiles holding at
+            least the prompt; defaults to the prompt's own tiles. Rows past
+            the prompt are invalid in every tile they occupy, and the media
+            rotary timeline still starts at the prompt's exact length, so a
+            larger region changes the packed shapes but not the positions,
+            tags or validity of any prompt, audio or video token.
 
     Raises:
         ValueError: An unsupported raster, empty text, a frame count H3 does
             not generate, a nonpositive audio length, an alignment that is
-            not a positive multiple of the 64-row tile, or a patch that does
-            not divide the latents.
+            not a positive multiple of the 64-row tile, a text region that is
+            not whole tiles holding the prompt, or a patch that does not
+            divide the latents.
     """
     if num_text_tokens < 1 or height != 768 or width != 1344:
         raise ValueError(
@@ -190,7 +199,12 @@ def build_packing(
         raise ValueError(
             "packing alignment must contain complete 64-token tiles"
         )
-    text_rows = math.ceil(num_text_tokens / 64) * 64
+    if text_rows is None:
+        text_rows = math.ceil(num_text_tokens / 64) * 64
+    elif text_rows % 64 or text_rows < num_text_tokens:
+        raise ValueError(
+            "the H3 text region must be whole 64-row tiles holding the prompt"
+        )
     patch_t, patch_h, patch_w = patch_size
     # Latents are 16x spatially compressed relative to the output raster.
     latent_height, latent_width = height // 16, width // 16
@@ -344,7 +358,9 @@ def build_packing(
         (padded_tokens // 64,), dtype=torch.int32, device="cpu"
     )
     for offset in range(text_rows // 64):
-        tile_valid_sizes[offset] = min(64, num_text_tokens - offset * 64)
+        tile_valid_sizes[offset] = max(
+            0, min(64, num_text_tokens - offset * 64)
+        )
     audio_tile_start = text_rows // 64
     for offset in range(audio_block_rows // 64):
         tile_valid_sizes[audio_tile_start + offset] = max(

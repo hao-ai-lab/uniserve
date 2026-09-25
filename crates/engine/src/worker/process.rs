@@ -227,7 +227,7 @@ impl Default for WorkerProcessArgs {
             prefill_graph_token_sizes: None,
             flow_graph_batch_sizes: None,
             flow_graph_shapes: None,
-            video_graph_shapes: None,
+            video_text_capacities: None,
             flashinfer_workspace_size: 512 * 1024 * 1024,
             flashinfer_use_tensor_core: None,
             flashinfer_decode_backend: FlashInferBackend::Fa2,
@@ -237,6 +237,7 @@ impl Default for WorkerProcessArgs {
             flashinfer_disable_split_kv: false,
             max_model_len: 8192,
             max_video_seconds: 15.0,
+            min_video_seconds: None,
         }
     }
 }
@@ -442,6 +443,7 @@ impl WorkerProcessArgs {
         fields.insert("max_batch_tokens".into(), json!(self.max_batch_tokens));
         fields.insert("max_model_len".into(), json!(self.max_model_len));
         fields.insert("max_video_seconds".into(), json!(self.max_video_seconds));
+        fields.insert("min_video_seconds".into(), json!(self.min_video_seconds));
         fields.insert("graph_policy".into(), json!(self.graph_policy));
         fields.insert(
             "decode_graph_batch_sizes".into(),
@@ -457,7 +459,10 @@ impl WorkerProcessArgs {
             json!(self.flow_graph_batch_sizes),
         );
         fields.insert("flow_graph_shapes".into(), json!(self.flow_graph_shapes));
-        fields.insert("video_graph_shapes".into(), json!(self.video_graph_shapes));
+        fields.insert(
+            "video_text_capacities".into(),
+            json!(self.video_text_capacities),
+        );
         fields.insert(
             "flashinfer_workspace_size".into(),
             json!(self.flashinfer_workspace_size),
