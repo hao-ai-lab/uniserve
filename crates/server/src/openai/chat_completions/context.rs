@@ -22,7 +22,8 @@ pub struct ChatResponseContext {
     pub requested_logprobs: bool,
     /// Whether prompt-token logprobs were requested. Only non-streaming
     /// responses carry them; `validate_request_compat` rejects a streamed
-    /// request that asks for a positive or `-1` count.
+    /// request that asks for a positive or `-1` count, and
+    /// `preprocess_chat_request` drops a streamed `0`.
     pub include_prompt_logprobs: bool,
     /// Whether parsed reasoning is exposed in responses.
     pub include_reasoning: bool,

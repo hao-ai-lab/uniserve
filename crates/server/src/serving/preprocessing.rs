@@ -57,7 +57,11 @@ impl crate::serving::InputProcessor {
         )?;
 
         let requested_logprobs = request.logprobs;
-        let prompt_logprobs = request.prompt_logprobs;
+        // Stream chunks have no `prompt_logprobs` field. Validation accepts a
+        // streamed `prompt_logprobs: 0` for vLLM compatibility, but lowering
+        // it would score every prompt position and disable prefix-cache
+        // reads for output the client never receives, so it is dropped here.
+        let prompt_logprobs = request.prompt_logprobs.filter(|_| !request.stream);
         let include_prompt_logprobs = prompt_logprobs.is_some();
         let return_token_ids = request.return_token_ids.unwrap_or(false);
         // Logprobs imply token IDs, so the richest requested detail wins.
