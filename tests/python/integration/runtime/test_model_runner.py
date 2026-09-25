@@ -1465,7 +1465,7 @@ def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thre
 ) -> None:
     producer = execution_worker(transfer_backends=("shm",))
     consumer = execution_worker(transfer_backends=("shm",))
-    admission = ar_params(73, block_ids=(0,))
+    admission = ar_params(73, block_ids=(0,), input_images=1)
     image = io.BytesIO()
     Image.new("RGB", (16, 16), (64, 96, 128)).save(image, format="PNG")
     encoded = base64.b64encode(image.getvalue()).decode("ascii")
@@ -1529,7 +1529,10 @@ def test_free_preserves_another_requests_feature_with_the_same_generation() -> (
     None
 ):
     worker = execution_worker(transfer_backends=("shm",))
-    admissions = (ar_params(93, block_ids=(0,)), ar_params(94, block_ids=(1,)))
+    admissions = (
+        ar_params(93, block_ids=(0,), input_images=1),
+        ar_params(94, block_ids=(1,), input_images=1),
+    )
     image = io.BytesIO()
     Image.new("RGB", (16, 16), (64, 96, 128)).save(image, format="PNG")
     encoded = base64.b64encode(image.getvalue()).decode("ascii")
@@ -1672,7 +1675,7 @@ def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
     output_dtype: DType,
 ) -> None:
     worker = execution_worker()
-    admission = ar_params(95, block_ids=(0,))
+    admission = ar_params(95, block_ids=(0,), input_images=1)
 
     def encoded_call(call_id: CallId, color: tuple[int, int, int]):
         image = io.BytesIO()
@@ -2137,7 +2140,7 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
 
 def test_encode_publishes_an_immutable_feature_without_advancing_state():
     worker = execution_worker()
-    admission = ar_params(3, block_ids=(0,))
+    admission = ar_params(3, block_ids=(0,), input_images=1)
     extend = token_call(
         admission.request_key,
         call_id=CallId(1, 0),

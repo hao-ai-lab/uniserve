@@ -651,6 +651,7 @@ def ar_params(
     prefix_len: int = 0,
     request_epoch: int = 1,
     sampling: SamplingParams | None = None,
+    input_images: int = 0,
 ) -> NewRequest:
     rk = request_key(request_id, request_epoch)
     _reset_request(rk)
@@ -669,6 +670,7 @@ def ar_params(
             ),
             initial_position=int(prefix_len),
         ),
+        input_images=input_images,
     )
 
 

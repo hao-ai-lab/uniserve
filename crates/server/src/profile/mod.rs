@@ -649,6 +649,49 @@ mod tests {
         );
     }
 
+    /// SenseNova input images share one pixel budget per request, so an
+    /// image's KV tokens depend on how many input images the request
+    /// carries. The cases are shared with the worker's image staging test.
+    #[tokio::test]
+    async fn sensenova_image_tokens_share_the_request_pixel_budget() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            cases: Vec<Case>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            width: u32,
+            height: u32,
+            input_images: usize,
+            kv_tokens: u32,
+        }
+        let fixture: Fixture = serde_json::from_str(include_str!(
+            "../../../../tests/python/fixtures/sensenova_image_resize.json"
+        ))
+        .unwrap();
+
+        let (_directory, _tokenizer, config) = resolved_config("sensenova", "neo_chat").await;
+        let ModelParameters::SenseNova(profile) = config.unwrap().parameters else {
+            unreachable!()
+        };
+        for case in fixture.cases {
+            let ingest = profile
+                .image_encoders_for_dimensions(case.width, case.height, case.input_images)
+                .unwrap();
+            assert_eq!(
+                ingest
+                    .iter()
+                    .map(|input| input.num_kv_tokens)
+                    .collect::<Vec<_>>(),
+                vec![Some(case.kv_tokens)],
+                "{}x{} among {} input images",
+                case.width,
+                case.height,
+                case.input_images
+            );
+        }
+    }
+
     /// Bagel KV-token predictions equal the worker's resize for images whose
     /// resize scale is not one. The cases are shared with the worker's image
     /// staging test, so both sides are checked against the same numbers.

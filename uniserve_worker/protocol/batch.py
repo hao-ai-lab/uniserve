@@ -324,6 +324,10 @@ class NewRequest:
     diffusion: DiffusionParams | None = None
     # Prompt tokens; required (non-empty) for diffusion requests.
     prompt_token_ids: tuple[int, ...] = ()
+    # Number of input images the request carries. Model preprocessing may
+    # bound each input image by its share of a pixel budget the images
+    # share (``PatchTransform.pixel_bound``).
+    input_images: int = 0
 
     def __post_init__(self) -> None:
         """Require a positive slot and at least one family parameter set.
@@ -366,6 +370,9 @@ class NewRequest:
             prompt_token_ids=_uints(
                 data.get("prompt_token_ids", ()), f"{where}.prompt_token_ids"
             ),
+            input_images=_uint(
+                data.get("input_images", 0), f"{where}.input_images"
+            ),
             generation=(
                 None
                 if data.get("ar") is None
@@ -395,6 +402,7 @@ class NewRequest:
             "request_key": self.request_key.to_mapping(),
             "request_pool_idx": self.request_pool_idx,
             "prompt_token_ids": list(self.prompt_token_ids),
+            "input_images": self.input_images,
             "ar": None
             if self.generation is None
             else self.generation.to_mapping(),

@@ -139,7 +139,7 @@ def test_retained_encoder_product_outlives_its_producer_request(
         if backends == ("local",)
         else execution_worker(transfer_backends=backends, device=device)
     )
-    admission = ar_params(91, block_ids=(0,))
+    admission = ar_params(91, block_ids=(0,), input_images=1)
     image = io.BytesIO()
     Image.new("RGB", (16, 16), (64, 96, 128)).save(image, format="PNG")
     encode = encode_call(

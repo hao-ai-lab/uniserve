@@ -1238,6 +1238,7 @@ mod tests {
                 initial_position: 0,
             }),
             None,
+            0,
         )
         .expect("admission")
     }

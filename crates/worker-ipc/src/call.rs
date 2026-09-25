@@ -1063,6 +1063,10 @@ pub struct NewRequest {
     pub diffusion: Option<DiffusionSamplingParams>,
     /// Tokenized conditioning supplied at diffusion admission.
     pub prompt_token_ids: Vec<u32>,
+    /// Number of input images the request carries. Model image preprocessing
+    /// that divides a pixel budget among a request's input images reads it
+    /// when it encodes one of them.
+    pub input_images: u32,
 }
 
 impl NewRequest {
@@ -1075,6 +1079,7 @@ impl NewRequest {
         request_pool_idx: u32,
         ar: Option<ArRequestParams>,
         image: Option<ImageParams>,
+        input_images: u32,
     ) -> ValidationResult<Self> {
         ensure_valid!(request_pool_idx > 0, "request-pool index must be positive");
         ensure_valid!(
@@ -1088,6 +1093,7 @@ impl NewRequest {
             image,
             diffusion: None,
             prompt_token_ids: Vec::new(),
+            input_images,
         };
         Ok(admission)
     }
@@ -1107,6 +1113,7 @@ impl NewRequest {
             image: None,
             diffusion: Some(diffusion),
             prompt_token_ids,
+            input_images: 0,
         };
         admission.validate()?;
         Ok(admission)

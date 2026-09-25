@@ -77,7 +77,7 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
     );
 
     let first = text_admission(51, 1, 1)?;
-    let second = text_admission(52, 1, 2)?;
+    let second = image_admission(52, 1, 2)?;
     let first_key = first.request_key;
     let second_key = second.request_key;
     let mut extend = token_batch(
@@ -2160,9 +2160,8 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
             batch.input_products,
         )
     };
-    let make_batch = |batch_id, request_index, request_id, page| -> anyhow::Result<Batch> {
-        let admission = text_admission(request_id, 1, page)?;
-        Ok(token_batch(
+    let admitted_batch = |admission: NewRequest, batch_id, request_index, page| -> Batch {
+        token_batch(
             batch_id,
             batch_id,
             admission.request_key,
@@ -2172,6 +2171,14 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
             &[7],
             BlockId(page),
             0,
+        )
+    };
+    let make_batch = |batch_id, request_index, request_id, page| -> anyhow::Result<Batch> {
+        Ok(admitted_batch(
+            text_admission(request_id, 1, page)?,
+            batch_id,
+            request_index,
+            page,
         ))
     };
 
@@ -2220,7 +2227,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     // to 8 prefill on encoder-0, publish the token there, copy it to
     // encoder-1, and encode an image on encoder-1, whose feature the Finish
     // retains.
-    let shared = make_batch(5, 0, 54, 3)?;
+    let shared = admitted_batch(image_admission(54, 1, 3)?, 5, 0, 3);
     let admission = shared.admissions().next().unwrap().clone();
     let source = shared.calls[0].token_output.clone().unwrap();
     executor.submit(bind(shared, "encoder-0"))?;
@@ -2885,6 +2892,18 @@ fn execute(
         .ok_or_else(|| anyhow::anyhow!("submission did not complete"))
 }
 
+/// A text admission that also declares one input image, as the engine does
+/// for a request whose vision encoding call encodes an image it carries.
+fn image_admission(
+    request_id: u64,
+    request_epoch: u64,
+    request_pool_idx: u32,
+) -> anyhow::Result<NewRequest> {
+    let mut admission = text_admission(request_id, request_epoch, request_pool_idx)?;
+    admission.input_images = 1;
+    Ok(admission)
+}
+
 /// A greedy text admission for engine 1 that ignores EOS, starting at
 /// position zero in request pool slot `request_pool_idx`.
 fn text_admission(
@@ -2906,6 +2925,7 @@ fn text_admission(
             initial_position: 0,
         }),
         None,
+        0,
     )?)
 }
 

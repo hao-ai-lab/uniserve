@@ -22,15 +22,17 @@ def image_processor(config: Config) -> ImageProcessor:
     These transforms prepare input images for ``Model.vision_encoder``; the
     denoiser's generated images do not pass through them.
     """
-    # The pixel bounds equal the reference preprocessing's per-image bounds
-    # for up to four input images; the reference lowers the upper bound for
-    # more.
+    # The reference preprocessing bounds each of a request's n input images
+    # by min(2048 * 2048, 4096 * 4096 // n) pixels, so five or more input
+    # images share a 4096 * 4096 budget. The server's SenseNova profile
+    # predicts KV tokens with the same bounds.
     return ImageProcessor(
         vit=PatchTransform(
             patch_size=int(config.vision.patch_size),
             downsample_ratio=float(config.vision.downsample_ratio),
             min_pixels=512 * 512,
             max_pixels=2048 * 2048,
+            max_total_pixels=4096 * 4096,
         ),
         staging_dtype=torch.bfloat16,
         feature_injection=FeatureInjection(

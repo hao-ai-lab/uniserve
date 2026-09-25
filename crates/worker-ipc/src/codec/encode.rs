@@ -275,6 +275,7 @@ fn admission<'a>(b: &mut FlatBufferBuilder<'a>, v: &NewRequest) -> WIPOffset<fbs
             image,
             diffusion,
             prompt_token_ids,
+            input_images: v.input_images,
         },
     )
 }
