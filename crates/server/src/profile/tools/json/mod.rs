@@ -2,16 +2,16 @@
 //!
 //! The parser is a three-mode state machine over a buffered stream:
 //!
-//! - `Text` emits plain text up to the start marker and holds back a trailing
-//!   partial marker. The start marker followed by the configured marker
-//!   whitespace switches to `Header`.
+//! - `Text` emits plain text up to the start delimiter and holds back a
+//!   trailing partial delimiter. The start delimiter switches to `Header`. A
+//!   start marker without the rest of the delimiter, such as a `<tool_call>`
+//!   tag mentioned in prose, is plain text.
 //! - `Header` parses `{"<name key>": "<name>", "<arguments key>":` with
 //!   optional JSON whitespace, emits the call's first delta (name, empty
 //!   arguments), and switches to `Arguments`.
 //! - `Arguments` streams the raw arguments object lexically as argument
 //!   deltas. After the object closes, it expects the wrapper's `}` after
-//!   optional JSON whitespace, then the marker whitespace and end marker, and
-//!   returns to `Text`.
+//!   optional JSON whitespace, then the end delimiter, and returns to `Text`.
 //!
 //! Any other header shape, such as reordered or extra keys, is a parse error.
 
@@ -47,11 +47,13 @@ const MAX_BUFFER_BYTES: usize = 1 << 20;
 struct JsonToolCallConfig {
     /// Name used in parse error messages.
     parser_name: &'static str,
-    start_marker: &'static str,
-    end_marker: &'static str,
-    /// Exact text required after `start_marker` and before `end_marker`. It is
-    /// matched literally, not as optional whitespace.
-    marker_whitespace: &'static str,
+    /// Exact text that opens a tool call: the start marker together with the
+    /// whitespace the format requires after it. Text mode scans for the whole
+    /// delimiter, so the marker alone never starts a tool call.
+    start_delimiter: &'static str,
+    /// Exact text that closes a tool call after the wrapper object: the
+    /// whitespace the format requires before the end marker, then the marker.
+    end_delimiter: &'static str,
     /// JSON key of the function name, which must be the header's first key.
     name_key: &'static str,
     /// Candidate JSON keys naming the arguments payload, which must follow the
@@ -89,7 +91,7 @@ struct JsonToolCallParser {
     buffer: String,
     mode: JsonToolCallMode,
     /// Tool index that argument deltas extend; set by a header, cleared by the
-    /// end marker.
+    /// end delimiter.
     active_tool_index: Option<usize>,
     /// Number of tool calls started since the last reset; also the next
     /// call's `tool_index`.
@@ -141,10 +143,10 @@ impl JsonToolCallParser {
 
     /// Finalizes buffered input or rejects an incomplete tool call.
     ///
-    /// In text mode the buffer, including any held-back partial marker, becomes
-    /// plain text and the parser resets. While a tool call is open (from its
-    /// start marker until its end marker is parsed) this fails and leaves the
-    /// parser state unchanged.
+    /// In text mode the buffer, including any held-back partial start
+    /// delimiter, becomes plain text and the parser resets. While a tool call
+    /// is open (from its start delimiter until its end delimiter is parsed)
+    /// this fails and leaves the parser state unchanged.
     fn finish(&mut self) -> Result<ToolParserOutput> {
         let mut output = ToolParserOutput::default();
         match &self.mode {
@@ -243,17 +245,14 @@ fn parse_text_event(
     .parse_next(input)
 }
 
-/// Parses a marker-wrapped JSON tool-call start marker.
+/// Parses a marker-wrapped JSON tool-call start delimiter.
 fn tool_call_start_event(
     input: &mut JsonToolInput<'_>,
     config: JsonToolCallConfig,
 ) -> ModalResult<JsonToolCallEvent> {
-    seq!(
-        _: literal(config.start_marker),
-        _: |input: &mut JsonToolInput<'_>| marker_whitespace(input, config),
-    )
-    .value(JsonToolCallEvent::ToolCallStart)
-    .parse_next(input)
+    literal(config.start_delimiter)
+        .value(JsonToolCallEvent::ToolCallStart)
+        .parse_next(input)
 }
 
 /// Parses a marker-wrapped JSON tool-call header before the raw arguments
@@ -351,7 +350,7 @@ fn argument_delta_event(
     take_json_object(input, json_scan).map(|len| JsonToolCallEvent::Arguments { len })
 }
 
-/// Parses the wrapper object's `}` and the end marker after the arguments.
+/// Parses the wrapper object's `}` and the end delimiter after the arguments.
 ///
 /// JSON whitespace may separate the arguments object from this `}`, as it may
 /// separate every other token of the wrapper object.
@@ -364,28 +363,24 @@ fn tool_call_close_event(
     tool_call_end_event(input, config)
 }
 
-/// Parses a marker-wrapped JSON tool-call end marker.
+/// Parses a marker-wrapped JSON tool-call end delimiter.
 fn tool_call_end_event(
     input: &mut JsonToolInput<'_>,
     config: JsonToolCallConfig,
 ) -> ModalResult<JsonToolCallEvent> {
-    seq!(
-        _: |input: &mut JsonToolInput<'_>| marker_whitespace(input, config),
-        _: literal(config.end_marker),
-    )
-    .value(JsonToolCallEvent::ToolCallEnd)
-    .parse_next(input)
-}
-
-/// Parses configured whitespace around a marker-wrapped JSON tool call.
-fn marker_whitespace(input: &mut JsonToolInput<'_>, config: JsonToolCallConfig) -> ModalResult<()> {
-    literal(config.marker_whitespace).void().parse_next(input)
+    literal(config.end_delimiter)
+        .value(JsonToolCallEvent::ToolCallEnd)
+        .parse_next(input)
 }
 
 /// Parses a safe text run before the next marker-wrapped JSON tool call.
+///
+/// Scanning for the whole start delimiter keeps a start marker that the
+/// delimiter's whitespace does not follow inside the text run, so it neither
+/// starts a call nor stops text emission.
 fn safe_text_event(
     input: &mut JsonToolInput<'_>,
     config: JsonToolCallConfig,
 ) -> ModalResult<JsonToolCallEvent> {
-    safe_text_len(input, config.start_marker).map(|len| JsonToolCallEvent::Text { len })
+    safe_text_len(input, config.start_delimiter).map(|len| JsonToolCallEvent::Text { len })
 }
