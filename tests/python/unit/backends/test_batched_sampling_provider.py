@@ -101,3 +101,49 @@ def test_top_k_provider_accepts_every_serving_wave_row_count() -> None:
 
         assert bool(valid.all())
         assert torch.equal(tokens, torch.argmax(logits, dim=-1))
+
+
+@pytest.mark.parametrize(
+    "device",
+    (
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=(
+                pytest.mark.gpu,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="CUDA is required"
+                ),
+            ),
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    "parameters",
+    (
+        pytest.param([1.0, 0.9, 0.0], id="top-p"),
+        pytest.param([1.0, 1.0, 0.5], id="min-p"),
+    ),
+)
+def test_top_k_zero_draw_skips_candidates_removed_by_filters(
+    device, parameters
+) -> None:
+    # The top-3 candidates are IDs 1, 2, and 0 with probabilities about .517,
+    # .468, and .016. Top-p .9 and min-p .5 each drop ID 0, the lowest-ID
+    # candidate, so a draw of exactly 0.0 must select ID 1.
+    logits = torch.tensor(
+        [[0.5, 4.0, 3.9, 0.0, -1.0, -2.0]],
+        dtype=torch.float32,
+        device=device,
+    )
+    draws = torch.zeros((1,), dtype=torch.float32, device=device)
+
+    tokens, valid = sample_top_k(
+        logits,
+        draws,
+        torch.tensor([parameters], dtype=torch.float32, device=device),
+        3,
+    )
+
+    assert valid.tolist() == [True]
+    assert tokens.tolist() == [1]
