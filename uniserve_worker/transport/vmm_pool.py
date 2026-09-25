@@ -241,6 +241,12 @@ class VmmPool:
         otherwise the lowest free gap that fits, before, between or after the
         live chunks, is returned. The caller holds the lock and records the span
         as live.
+
+        Every live chunk ends at or below the watermark, which is what lets
+        the watermark path hand out the space above it without consulting the
+        live chunks. A gap before or between live chunks ends at a live
+        chunk's start, so it keeps that invariant; a span after the last live
+        chunk can reach past the watermark, which then rises to its end.
         """
         if self._watermark + span <= self._capacity:
             offset = self._watermark
@@ -253,5 +259,6 @@ class VmmPool:
                 return cursor
             cursor = max(cursor, offset + self._live[offset])
         if self._capacity - cursor >= span:
+            self._watermark = max(self._watermark, cursor + span)
             return cursor
         return None
