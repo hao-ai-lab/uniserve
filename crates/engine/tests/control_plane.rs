@@ -27,9 +27,11 @@
 //!   the event stream. The `prefix` counters are recorded at admission.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::error::TryRecvError;
 use uniserve_worker_ipc::{ForwardMode, MediaCall};
 
 use uniserve_core::{EngineCoreOutput, FinishReason};
@@ -39,7 +41,9 @@ use uniserve_core::{
     ImageTrigger, MultimodalInputs, RequestId, SamplingParams,
 };
 use uniserve_engine::{
-    EngineHandle, Scheduler, SchedulingPolicy, SimEngine, SimExecutor, SpecialTokenIds,
+    BatchResult, EVENT_BUFFER_CAPACITY, EngineHandle, ExecutionBatch, Executor, ExecutorError,
+    ExecutorInfo, ExecutorSubmitError, Scheduler, SchedulingPolicy, SimEngine, SimExecutor,
+    SpecialTokenIds, WorkerId,
 };
 
 /// Default special tokens, whose first EOS id equals the simulator's synthetic
@@ -2730,4 +2734,114 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     }
     assert_eq!(scheduler.stats.general.running.load(Ordering::Relaxed), 0);
     assert_eq!(scheduler.stats.general.in_flight.load(Ordering::Relaxed), 0);
+}
+
+/// Executor whose worker process can be lost: once `lost` is set, every poll
+/// reports an executor failure, as a worker exit does, and the scheduler
+/// latches engine-fatal. Everything else is the simulator.
+struct LosableExecutor {
+    inner: SimExecutor,
+    lost: Arc<AtomicBool>,
+}
+
+impl Executor for LosableExecutor {
+    fn info(&self) -> &ExecutorInfo {
+        self.inner.info()
+    }
+
+    fn is_ready(&self, worker: &WorkerId) -> bool {
+        self.inner.is_ready(worker)
+    }
+
+    fn has_capacity(&self, worker: &WorkerId) -> bool {
+        self.inner.has_capacity(worker)
+    }
+
+    fn command_has_capacity(&self, command: &uniserve_worker_ipc::BatchCommand) -> bool {
+        self.inner.command_has_capacity(command)
+    }
+
+    fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
+        self.inner.submit(batch)
+    }
+
+    fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, ExecutorError> {
+        if self.lost.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("worker process exited"));
+        }
+        self.inner.poll(timeout)
+    }
+
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        self.inner.close()
+    }
+}
+
+/// A worker failure that stops the engine still delivers `Finished { Aborted }`
+/// to a running request whose event channel is full, after every event it
+/// published before the failure.
+#[test]
+fn engine_death_delivers_the_terminal_behind_a_full_event_channel() {
+    let (command_tx, commands) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(command_tx);
+
+    let mut sim = SimEngine::new();
+    sim.set_text_len(1_000_000);
+    let lost = Arc::new(AtomicBool::new(false));
+    let executor = Box::new(LosableExecutor {
+        inner: SimExecutor::new(sim),
+        lost: Arc::clone(&lost),
+    });
+    let mut scheduler =
+        Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs).unwrap();
+    let mut events = handle
+        .submit(generation_request(
+            RequestId(1),
+            text_input(vec![1, 2, 3]),
+            SamplingParams::default(),
+            ImageParams::default(),
+            GenerationConstraint::UndOnly,
+            256,
+        ))
+        .unwrap();
+
+    // The client reads nothing, so the request fills its event channel and
+    // parks on output capacity with nothing in flight.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && scheduler.step(&commands) {}
+    assert_eq!(scheduler.stats.general.in_flight.load(Ordering::Relaxed), 0);
+    assert_eq!(scheduler.stats.general.running.load(Ordering::Relaxed), 1);
+
+    lost.store(true, Ordering::SeqCst);
+    assert!(scheduler.run(commands), "a lost worker stops the engine");
+
+    let mut received = Vec::new();
+    loop {
+        match events.try_recv() {
+            Ok(event) => received.push(event),
+            Err(TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => panic!("the stopped engine left the event stream open"),
+        }
+    }
+    assert!(
+        received.len() > EVENT_BUFFER_CAPACITY,
+        "received {} events, ending with {:?}; the request published more than its channel holds",
+        received.len(),
+        received.last(),
+    );
+    let text_tokens = received
+        .iter()
+        .filter(|event| matches!(event, EngineCoreOutput::TextToken { .. }))
+        .count();
+    match received.last() {
+        Some(EngineCoreOutput::Finished {
+            reason,
+            completion_tokens,
+            ..
+        }) => {
+            assert_eq!(*reason, FinishReason::Aborted);
+            assert_eq!(*completion_tokens, text_tokens);
+        }
+        other => panic!("the stream did not end with its terminal event: {other:?}"),
+    }
 }

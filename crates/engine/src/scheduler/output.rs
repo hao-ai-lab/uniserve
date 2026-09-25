@@ -195,6 +195,18 @@ impl OutputSender {
         });
         progressed
     }
+
+    /// Hands every retained journal to its receiver as the control loop stops.
+    ///
+    /// A stopped scheduler can no longer flush journals into their full
+    /// channels, so each journal's pending events, including the terminal
+    /// event, move to the receiver, which yields them after the channel's
+    /// buffered events (`EventTx::close_with`).
+    pub(super) fn hand_off_retired(&mut self) {
+        for (_, output) in self.retired.drain() {
+            output.event_tx.close_with(output.journal);
+        }
+    }
 }
 
 impl Scheduler {
@@ -1314,8 +1326,9 @@ impl Scheduler {
             );
 
             // A full event channel transfers ownership to the retired-output
-            // queue, which drains the terminal event under normal backpressure.
-            // A closed receiver drops the terminal event with the journal.
+            // queue, which drains the terminal event under normal backpressure
+            // or hands it to the receiver when the control loop stops. A
+            // closed receiver drops the terminal event with the journal.
             let terminal = EngineCoreOutput::Finished {
                 reason,
                 stop_reason,

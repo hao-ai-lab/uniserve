@@ -37,7 +37,9 @@ impl Scheduler {
     /// Shutdown covers both a `Shutdown` command and a disconnected command
     /// channel. Running requests finish immediately rather than waiting for
     /// their in-flight calls, and batches assembled but not yet submitted are
-    /// dropped.
+    /// dropped. Events still journaled behind a full channel, including these
+    /// terminal events, are handed to their receivers, since no later flush
+    /// will deliver them.
     pub(super) fn abort_all_requests(&mut self) {
         self.inflight.pending_submissions.clear();
 
@@ -74,6 +76,10 @@ impl Scheduler {
         for id in running {
             self.finish(id, FinishReason::Aborted);
         }
+
+        // Every running request has now retired its journal, so the retained
+        // journals hold all output the control loop can no longer deliver.
+        self.output.hand_off_retired();
     }
 
     /// Applies one command; returns true on shutdown.
