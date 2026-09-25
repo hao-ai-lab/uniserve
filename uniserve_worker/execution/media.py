@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from uniserve.runtime.tensor_buffers import TensorBuffers
     from uniserve_worker.execution.model_executor import ModelExecutor
     from uniserve_worker.execution.request import RequestPool, RequestState
+    from uniserve_worker.model_executor.output import ExecutionOutput
     from uniserve_worker.storage.tensor_store import TensorStore
     from uniserve_worker.transport.interface import Transport
 
@@ -124,6 +125,81 @@ def audio_unit_windows(
             "request has latent frames"
         )
     return decoder.unit_frames(num_samples, units)
+
+
+def assigned_units(
+    runner: ModelExecutor, entry: str, cursor: int, count: int, total: int
+) -> range:
+    """Return this rank's media units of one decode round.
+
+    The round covers units ``[cursor, cursor + count)`` of a request's
+    ``total``; ``ComponentBinding.media_units`` deals them to the component's
+    ranks. Raises ``invalid_descriptor`` when the round lies outside the
+    request's units or assigns this rank none.
+    """
+    if cursor < 0 or count < 1 or cursor + count > total:
+        raise invalid_descriptor(
+            "media decoder assignment exceeds its media unit range"
+        )
+    units = runner.bindings[entry].media_units(cursor, count)
+    if not units:
+        raise invalid_descriptor(
+            "media decoder assignment exceeds its media unit range"
+        )
+    return units
+
+
+def decode_audio(
+    runner: ModelExecutor,
+    entry: str,
+    latent: torch.Tensor,
+    num_samples: int,
+    *,
+    cursor: int,
+    count: int,
+) -> ExecutionOutput:
+    """Reconstruct this rank's audio media units of one decode round.
+
+    ``latent`` is the request's complete audio latent timeline and
+    ``num_samples`` its exact duration. The rank's units form a contiguous
+    run (see ``assigned_units``), and the decoder reconstructs each unit
+    within its own halo in one call, so a round warmed at startup and served
+    later share one input signature.
+
+    Returns:
+        The rank's samples as one tensor, the concatenation of its units in
+        order, which is the sample-major region
+        ``ModelExecutor.output_layout`` reserves for the rank, together with
+        the call's execution statistics.
+
+    Raises:
+        WorkerError: ``invalid_descriptor`` when the round assigns this rank
+            no unit or lies outside the request's units, or the decoder does
+            not return one tensor per unit; ``unsupported_setup`` from
+            ``audio_unit_windows``.
+    """
+    windows = audio_unit_windows(runner, entry, num_samples)
+    units = assigned_units(runner, entry, cursor, count, len(windows))
+    result = runner.run_module(
+        entry,
+        (latent,) * len(units),
+        method="decode",
+        size=runner.audio_decoder.latent_frames(num_samples),
+        frames=tuple(windows[unit] for unit in units),
+        num_samples=(num_samples,) * len(units),
+    )
+    if len(result.values) != len(units):
+        raise invalid_descriptor(
+            "audio decoder must return one tensor per media unit"
+        )
+    if len(units) == 1:
+        return result
+
+    # Consecutive units' samples abut, so their concatenation is the rank's
+    # contiguous span of the track.
+    return replace(
+        result, values=(torch.cat(result.values),), vocabularies=(), layouts=()
+    )
 
 
 def slot_ladder(trajectory: DiffusionState) -> SlotLadder:
@@ -302,19 +378,20 @@ def declared_sizes(runner: ModelExecutor) -> tuple:
 def decoded_units(runner: ModelExecutor, name: str, count: int) -> tuple:
     """List the media unit indices this rank decodes for one unit count.
 
-    The engine hands each decode round as many units as the component has
-    ranks, in rank order, so a rank's share follows from its position.
+    The engine covers a request's ``count`` units in rounds as wide as the
+    units the component's ranks reconstruct together, each rank
+    ``units_per_rank`` of them when the component is distributed, and deals
+    each round's units by ``ComponentBinding.media_units``.
     """
     binding = runner.bindings[name]
-    ranks = binding.config.ranks
-    position = ranks.index(binding.process_group.global_rank)
-    units, cursor = [], 0
-    while cursor < count:
-        width = min(len(ranks), count - cursor)
-        if position < width:
-            units.append(cursor + position)
-        cursor += width
-    return tuple(units)
+    config = binding.config
+    per_rank = config.units_per_rank if config.distribution is not None else 1
+    width = len(config.ranks) * per_rank
+    return tuple(
+        unit
+        for cursor in range(0, count, width)
+        for unit in binding.media_units(cursor, min(width, count - cursor))
+    )
 
 
 @torch.inference_mode()
@@ -421,17 +498,16 @@ def warmup_decoders(runner: ModelExecutor) -> None:
                 latent = torch.zeros(
                     shape, dtype=torch.float32, device=binding.device
                 )
-                samples = audio_samples(runner, num_frames)
-                windows = audio_unit_windows(runner, name, samples)
-                for unit in decoded_units(runner, name, len(windows)):
-                    runner.run_module(
-                        name,
-                        (latent,),
-                        method="decode",
-                        size=module.latent_frames(samples),
-                        frames=(windows[unit],),
-                        num_samples=(samples,),
-                    )
+                # The engine hands a request's audio units to the decoder in
+                # one round, which serving decodes through the same call.
+                decode_audio(
+                    runner,
+                    name,
+                    latent,
+                    audio_samples(runner, num_frames),
+                    cursor=0,
+                    count=audio_unit_count(runner, name),
+                )
 
 
 @torch.inference_mode()
@@ -916,28 +992,17 @@ def execute(
             if call.kind is MediaCall.AUDIO_DECODING
             else MediaTrack.VIDEO
         )
-        # Each rank of a distributed decoder binding owns one media unit of
-        # the declared range, on either track.
-        samples = (
-            None
-            if track is MediaTrack.VIDEO
-            else audio_samples(model_runner, media.num_frames)
-        )
-        windows = (
-            model_runner.video_decoder.frame_slices(media.num_frames)
-            if samples is None
-            else audio_unit_windows(model_runner, call.component, samples)
-        )
-        binding = model_runner.bindings[call.component]
-        position = binding.config.ranks.index(binding.process_group.global_rank)
-        if position >= count or cursor < 0 or cursor + count > len(windows):
-            raise invalid_descriptor(
-                "media decoder assignment exceeds its media unit range"
-            )
-        unit = cursor + position
-        window = windows[unit]
-
+        # Each rank of a distributed decoder binding reconstructs its
+        # contiguous run of the declared range's media units, on either
+        # track (``ComponentBinding.media_units``).
         if track is MediaTrack.VIDEO:
+            windows = model_runner.video_decoder.frame_slices(media.num_frames)
+            # A video decoder places one native unit per rank
+            # (``validate_components``), so its run is a single unit.
+            unit = assigned_units(
+                model_runner, call.component, cursor, count, len(windows)
+            ).start
+            window = windows[unit]
             decoded = model_runner.run_module(
                 call.component,
                 (read.tensor,),
@@ -1001,24 +1066,19 @@ def execute(
                 row = value.new_zeros((1, longest, *value.shape[2:]))
                 row[:, :frames].copy_(value)
                 value = row
-            values = (value,)
+            values: tuple[torch.Tensor, ...] = (value,)
         else:
-            audio_decoder = model_runner.component(call.kind)
-            result = model_runner.run_module(
+            result = decode_audio(
+                model_runner,
                 call.component,
-                (read.tensor,),
-                method="decode",
-                size=audio_decoder.latent_frames(samples),
-                frames=(window,),
-                num_samples=(samples,),
+                read.tensor,
+                audio_samples(model_runner, media.num_frames),
+                cursor=cursor,
+                count=count,
             )
             if result.stats is None:
                 raise RuntimeError("module output has no execution statistics")
             state.forward_stats.append(result.stats)
-            if len(result.values) != 1:
-                raise invalid_descriptor(
-                    "media decoder must return one numerical tensor"
-                )
             values = result.values
         # Decoded media units are host products: a host rank's encoder reads
         # them in place from the segment this rank publishes, over the host

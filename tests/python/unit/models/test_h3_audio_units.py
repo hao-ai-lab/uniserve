@@ -11,36 +11,11 @@ context that actually covers the receptive field.
 import pytest
 import torch
 
-from uniserve_models.minimax_h3 import audio_vae
+from tests.python.fixtures.audio_decoding import CONFIG
+from tests.python.fixtures.audio_decoding import decoder as _decoder
 from uniserve_models.minimax_h3.decoding import AudioDecoder
 
 pytestmark = pytest.mark.unit
-
-# A decoder small enough to run on CPU whose halo is a few latent frames, so a
-# short track still exercises a partial context window rather than the whole
-# timeline.
-CONFIG = audio_vae.Config(
-    encoder_dim=4,
-    encoder_rates=(2, 2),
-    latent_dim=8,
-    latent_channels=2,
-    decoder_dim=8,
-    decoder_rates=(2, 2),
-    decoder_kernel_sizes=(4, 4),
-    num_attention_heads=1,
-    resblock_kernel_sizes=(3,),
-    resblock_dilation_sizes=((1,),),
-    latents_mean=(0.0, 0.0),
-    latents_std=(1.0, 1.0),
-)
-
-
-def _decoder() -> AudioDecoder:
-    torch.manual_seed(20260917)
-    decoder = AudioDecoder(CONFIG, sample_rate=32000).eval()
-    for parameter in decoder.parameters():
-        parameter.data = torch.randn_like(parameter) * 0.05
-    return decoder
 
 
 def _track(decoder: AudioDecoder, frames: int, trim: int):

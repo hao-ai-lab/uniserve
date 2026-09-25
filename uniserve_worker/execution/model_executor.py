@@ -876,10 +876,10 @@ class ModelExecutor:
             else layout.shape[0]
         )
         units = total if decode is None else decode.max_units
-        position = binding.config.ranks.index(binding.process_group.global_rank)
-        start = position * binding.config.units_per_rank
-        count = min(binding.config.units_per_rank, units - start)
-        if count < 1:
+        # The product holds only the round's units, so the rank's run is
+        # counted from the round's first unit.
+        run = binding.media_units(0, units)
+        if not run:
             return None
 
         if audio:
@@ -889,7 +889,7 @@ class ModelExecutor:
             return replace(
                 layout,
                 local_slice=(
-                    slice(spans[start].start, spans[start + count - 1].stop),
+                    slice(spans[run.start].start, spans[run.stop - 1].stop),
                     *layout.local_slice[1:],
                 ),
             )
@@ -897,7 +897,7 @@ class ModelExecutor:
         return replace(
             layout,
             shape=(units, *layout.shape[1:]),
-            local_slice=(slice(start, start + count), *layout.local_slice[1:]),
+            local_slice=(slice(run.start, run.stop), *layout.local_slice[1:]),
         )
 
     def configure_inputs(
