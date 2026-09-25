@@ -27,7 +27,7 @@ def _sensenova_denoiser(tmp_path):
     from uniserve_models.sensenova_u1.transformer import Transformer
 
     (tmp_path / "config.json").write_text(json.dumps(neo_metadata()))
-    config = read_config(tmp_path, IOConfig())
+    config = read_config(tmp_path, IOConfig(), sources={})
     with torch.device("meta"):
         return Denoiser(config, Transformer(config.text))
 

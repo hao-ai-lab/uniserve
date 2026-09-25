@@ -135,3 +135,23 @@ def test_index_and_checksum_enforce_declared_file_set(tmp_path):
     )
     with pytest.raises(FileNotFoundError, match="missing"):
         checkpoint.Config().resolve(tmp_path, io=Config())
+
+
+def test_header_only_source_serves_metadata_to_dummy_reads(tmp_path):
+    # Header entries describe tensors whose values are not present, so only
+    # dummy reads, which synthesize values from metadata, accept them.
+    source = checkpoint.Source(
+        "primary",
+        tmp_path,
+        (),
+        "network.",
+        headers=(("weight", (4, 6), "BF16"),),
+    )
+    with source.open(io=Config(mode="dummy")) as reader:
+        assert reader.names() == ("network.weight",)
+        weight = reader.get("network.weight")
+        assert (weight.shape, weight.dtype) == ((4, 6), torch.bfloat16)
+        assert weight.read().shape == (4, 6)
+    for mode in ("eager", "layered"):
+        with pytest.raises(ValueError, match="only dummy reads"):
+            source.open(io=Config(mode=mode))

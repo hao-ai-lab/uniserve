@@ -42,7 +42,7 @@ def test_loading_normalizes_immutable_architecture_fields(tmp_path):
     metadata = asdict(_config())
     path = tmp_path / "config.json"
     path.write_text(json.dumps(metadata))
-    config = qwen3.read_config(tmp_path, loading.Config())
+    config = qwen3.read_config(tmp_path, loading.Config(), sources={})
     metadata["num_hidden_layers"] = 7
     metadata["max_position_embeddings"] = 4096
     path.write_text(json.dumps(metadata))
@@ -55,7 +55,7 @@ def test_loading_normalizes_immutable_architecture_fields(tmp_path):
 def test_checkpoint_configuration_requires_numerical_dimensions(tmp_path):
     (tmp_path / "config.json").write_text("{}")
     with pytest.raises(ValueError, match="requires integer field"):
-        qwen3.read_config(tmp_path, loading.Config())
+        qwen3.read_config(tmp_path, loading.Config(), sources={})
 
 
 @pytest.mark.parametrize(

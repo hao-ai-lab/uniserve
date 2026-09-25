@@ -443,11 +443,13 @@ def _normalize(metadata: Mapping[str, Mapping[str, Any]]) -> Config:
     )
 
 
-def read_config(root: Path, io) -> Config:
+def read_config(root: Path, io, *, sources) -> Config:
     """Read all architecture sidecars before any numerical module construction.
 
     ``root`` is the checkpoint directory, whose sidecars the loader has
-    already fetched; ``io`` is part of the package interface and unused here.
+    already fetched; ``io`` and ``sources`` (the resolved ``config_sources``,
+    of which H3 declares none) are part of the package interface and unused
+    here.
     An unreadable sidecar raises ``OSError``; invalid JSON or an unsupported
     export raises ``ValueError``.
     """  # noqa: E501

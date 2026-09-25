@@ -2,9 +2,9 @@
 
 ``read_config`` resolves a local checkpoint directory or a Hub repository to
 the model package named in ``_catalog``, reads the package's typed
-configuration, fetches the payload files the selected modules need (plus any
-the package reads to build its configuration), and returns an immutable
-``Config``. ``load_model`` then materializes the model
+configuration, fetches the payload files the selected modules need (plus the
+tensor headers the package reads to build its configuration), and returns an
+immutable ``Config``. ``load_model`` then materializes the model
 through ``uniserve.loading.load_model``. The worker bootstrap
 (``uniserve_worker.bootstrap.model_loader``) and direct Python callers use the
 same two calls.
@@ -447,6 +447,86 @@ def _source_files(source, root, inventory, io):
     )
 
 
+def _safetensors_headers(repository, revision, names, io):
+    """Read the tensor entries of Hub safetensors files from their headers.
+
+    Each file costs HTTP range requests over its length-prefixed JSON header,
+    never its tensor payload, with the saved Hub token as for every other Hub
+    request here; files are read on ``io.num_threads`` threads (8 when
+    unset). Returns the ``(name, shape, dtype)`` entries of all files, which
+    ``checkpoint.Source`` accepts as ``headers``. A header that does not
+    parse raises ``ValueError``; a request failure propagates.
+    """
+    if not names:
+        return ()
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    from huggingface_hub import HfApi
+    from huggingface_hub.errors import SafetensorsParsingError
+
+    api = HfApi()
+
+    def read(name):
+        return api.parse_safetensors_file_metadata(
+            repo_id=repository, filename=name, revision=revision
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=io.num_threads or 8) as executor:
+            files = tuple(executor.map(read, sorted(names)))
+    except SafetensorsParsingError as error:
+        raise ValueError(f"malformed safetensors header: {error}") from error
+
+    return tuple(
+        (name, tuple(tensor.shape), tensor.dtype)
+        for file in files
+        for name, tensor in sorted(file.tensors.items())
+    )
+
+
+def _config_sources(package, root, inventory, repository, revision, io):
+    """Resolve the sources ``package.read_config`` reads tensor headers from.
+
+    Returns ``package.config_sources`` resolved by name. A local checkpoint
+    resolves in place. A Hub checkpoint downloads the files of each source,
+    except under dummy loading, which synthesizes weight values and needs
+    only the headers: a file the Hub cache already holds is read locally, a
+    safetensors file contributes only its header (``_safetensors_headers``),
+    and a PyTorch container, whose tensor metadata is not separable from its
+    payload, is downloaded.
+    """
+    sources = {}
+    for declaration in package.config_sources:
+        if repository is None:
+            sources[declaration.name] = declaration.resolve(root, io=io)
+            continue
+
+        names = _source_files(declaration, root, inventory, io)
+        if io.mode != "dummy":
+            _fetch(root, names, repository, revision, io)
+            sources[declaration.name] = declaration.resolve(root, io=io)
+            continue
+
+        # ``root`` is the pinned snapshot directory of the Hub cache, so a
+        # present file is the cached copy of this revision's file.
+        missing = {name for name in names if not (root / name).is_file()}
+        remote = {
+            name
+            for name in missing
+            if PurePosixPath(name).suffix == ".safetensors"
+        }
+        _fetch(root, missing - remote, repository, revision, io)
+        sources[declaration.name] = checkpoint.Source(
+            declaration.name,
+            root,
+            tuple(sorted(root / name for name in set(names) - remote)),
+            declaration.prefix,
+            headers=_safetensors_headers(repository, revision, remote, io),
+        )
+    return sources
+
+
 def _tokenizer_vocabulary(path: Path) -> dict[str, object]:
     """Map token text to ID from a ``tokenizer.json`` model and added tokens.
 
@@ -806,9 +886,10 @@ def read_config(
     Args:
         path: A local checkpoint directory, a file inside one, or a Hub
             repository id, pinned to ``io.revision`` when it is set.
-        io: Checkpoint IO policy. With ``mode="dummy"`` the only Hub
-            payloads downloaded are the sources the package's
-            ``config_sources`` names.
+        io: Checkpoint IO policy. With ``mode="dummy"`` no payload of the
+            selected modules is downloaded from the Hub, and the sources the
+            package's ``config_sources`` names contribute only their
+            safetensors headers (see ``_config_sources``).
         modules: Module paths to resolve sources for; ``None`` selects the
             whole model, and an empty set resolves no payload source.
 
@@ -847,26 +928,18 @@ def read_config(
         if repository is None
         else _hub_checkpoint_identity(repository, revision, io)
     )
-    if repository is not None:
-        # Some architectures derive dimensions from checkpoint tensor headers.
-        # The package declares those sources before module selection is known.
-        # Dummy loading fetches them too: it synthesizes tensor values, not the
-        # headers that define the architecture.
-        for declaration in package.config_sources:
-            _fetch(
-                root,
-                _source_files(declaration, root, inventory, io),
-                repository,
-                revision,
-                io,
-            )
+    # Some architectures derive dimensions from checkpoint tensor headers.
+    # The package declares those sources before module selection is known.
+    config_sources = _config_sources(
+        package, root, inventory, repository, revision, io
+    )
 
     # A meta-device skeleton resolves module selection and the mappings
     # without allocating weights. A source is needed when its mapping's
     # module is selected or when the mapping names any selected parameter as
     # required or optional, which covers parameters shared into an unselected
     # mapping's module.
-    model_config = package.read_config(root, io)
+    model_config = package.read_config(root, io, sources=config_sources)
     with torch.device("meta"):
         model = package.Model(model_config)
     selected = _selection(model, modules)

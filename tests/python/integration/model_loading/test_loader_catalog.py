@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from huggingface_hub.utils import SafetensorsFileMetadata, TensorInfo
 from safetensors.torch import load_file, save_file
 
 from tests.python.fixtures.checkpoints import qwen_checkpoint
@@ -219,9 +220,11 @@ def test_image_processing_metadata_has_resolved_token_identities(
     assert load_tokenizer(config.tokenizer).convert_tokens_to_ids("<img>") == 1
 
 
-@pytest.mark.parametrize("mode", ("eager", "dummy"))
+@pytest.mark.parametrize(
+    ("mode", "cached"), (("eager", False), ("dummy", False), ("dummy", True))
+)
 def test_remote_image_architecture_resolves_checkpoint_dimensions_and_transforms(  # noqa: E501
-    tmp_path, monkeypatch, mode
+    tmp_path, monkeypatch, mode, cached
 ):
     remote = tmp_path / "remote"
     snapshot = tmp_path / "snapshots" / ("b" * 40)
@@ -229,7 +232,12 @@ def test_remote_image_architecture_resolves_checkpoint_dimensions_and_transforms
     _write_bagel_checkpoint(remote, _bagel_config())
     # An unselected payload source stays on the Hub in every mode.
     save_file({"weight": torch.zeros(1)}, remote / "ae.safetensors")
-    downloaded = set()
+    if cached:
+        snapshot.mkdir(parents=True)
+        shutil.copyfile(
+            remote / "ema.safetensors", snapshot / "ema.safetensors"
+        )
+    downloaded, headers = set(), set()
 
     def download(*, repo_id, filename, revision, cache_dir):
         downloaded.add(filename)
@@ -244,16 +252,45 @@ def test_remote_image_architecture_resolves_checkpoint_dimensions_and_transforms
     def tree(self, *, repo_id, revision, recursive):
         return [_tree_file(path, remote) for path in remote.iterdir()]
 
+    def header(self, *, repo_id, filename, revision, **options):
+        # The Hub serves the leading length-prefixed JSON header of a
+        # safetensors file through HTTP range requests.
+        assert revision == snapshot.name
+        headers.add(filename)
+        data = (remote / filename).read_bytes()
+        entries = json.loads(data[8 : 8 + int.from_bytes(data[:8], "little")])
+        metadata = entries.pop("__metadata__", {})
+        return SafetensorsFileMetadata(
+            metadata=metadata,
+            tensors={
+                name: TensorInfo(
+                    entry["dtype"], entry["shape"], tuple(entry["data_offsets"])
+                )
+                for name, entry in entries.items()
+            },
+        )
+
     monkeypatch.setattr("huggingface_hub.hf_hub_download", download)
     monkeypatch.setattr("huggingface_hub.HfApi.list_repo_files", files)
     monkeypatch.setattr("huggingface_hub.HfApi.list_repo_tree", tree)
+    monkeypatch.setattr(
+        "huggingface_hub.HfApi.parse_safetensors_file_metadata", header
+    )
     # Architecture inspection still needs the learned position-table extent,
-    # even when no numerical module is selected for loading, and dummy
-    # loading cannot synthesize the header that extent comes from.
+    # even when no numerical module is selected for loading. Dummy loading
+    # reads that extent from the primary shard's header, locally when the
+    # cache holds the shard, and downloads no weight payload.
     config = models.read_config(
         "owner/bagel", io=loading.Config(mode=mode), modules=frozenset()
     )
-    assert downloaded == {"config.json", "ema.safetensors"}
+    if mode == "eager":
+        assert (downloaded, headers) == (
+            {"config.json", "ema.safetensors"},
+            set(),
+        )
+    else:
+        assert downloaded == {"config.json"}
+        assert headers == (set() if cached else {"ema.safetensors"})
     assert config.model.max_latent_size == 3
     assert config.image_processor.vit.resize.stride == 2
     assert config.image_processor.vit.resize.max_size == 8

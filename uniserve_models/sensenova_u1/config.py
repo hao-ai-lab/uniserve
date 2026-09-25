@@ -18,6 +18,7 @@ from typing import Any
 
 from uniserve import loading
 from uniserve.diffusion import NoiseScale
+from uniserve.loading import checkpoint
 from uniserve.nn.rope import (
     DynamicScaling,
     LinearScaling,
@@ -485,11 +486,17 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
     )
 
 
-def read_config(root: Path, io: loading.Config) -> Config:
+def read_config(
+    root: Path,
+    io: loading.Config,
+    *,
+    sources: Mapping[str, checkpoint.Source],
+) -> Config:
     """Normalize checkpoint aliases and typed rotary recipes before construction.
 
-    ``io`` belongs to the package ``read_config`` contract; SenseNova reads
-    only the local ``config.json``. Metadata errors are those of ``_normalize``.
+    ``io`` and ``sources`` belong to the package ``read_config`` contract;
+    SenseNova reads only the local ``config.json`` and declares no
+    ``config_sources``. Metadata errors are those of ``_normalize``.
     """  # noqa: E501
     return _normalize(json.loads((root / "config.json").read_text()))
 
