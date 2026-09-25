@@ -26,7 +26,12 @@ from uniserve.nn import (
     RMSNorm,
     RowParallelLinear,
 )
-from uniserve.nn.attention import Attention, DenseInput
+from uniserve.nn.attention import (
+    Attention,
+    DenseInput,
+    SequenceLengths,
+    VisibleInput,
+)
 
 from .config import TransformerConfig
 
@@ -67,11 +72,11 @@ class RefinerBlock(nn.Module):
         self.mlp = GatedMLP(config.hidden_size, config.intermediate_size)
 
     def forward(
-        self, hidden: torch.Tensor, mask: torch.Tensor | None = None
+        self, hidden: torch.Tensor, visible: VisibleInput | None = None
     ) -> torch.Tensor:
         # hidden is [batch, tokens, hidden_size]; one document per batch row.
-        # ``mask`` is a [batch, 1, 1, tokens] boolean of the keys each
-        # document's queries attend to, or None when every row is text.
+        # ``visible`` bounds the keys of padded documents, packed one after
+        # another; without it every row of a document is text.
         batch, tokens, _ = hidden.shape
         projections = self.qkv(self.norms[0](hidden))
         q, k, v = (
@@ -80,15 +85,20 @@ class RefinerBlock(nn.Module):
         )
         q, k = self.norms[2](q), self.norms[3](k)
 
-        attended = self.attention(
-            q.transpose(1, 2),  # [batch, heads, tokens, head_dim]
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            DenseInput(causal=False, mask=mask),
-        )
-        hidden = hidden + self.output(
-            attended.transpose(1, 2).reshape(batch, tokens, -1)
-        )
+        if visible is None:
+            attended = self.attention(
+                q.transpose(1, 2),  # [batch, heads, tokens, head_dim]
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                DenseInput(causal=False, mask=None),
+            ).transpose(1, 2)
+        else:
+            # Packed [batch * tokens, heads, head_dim] rows, each document's
+            # queries seeing only its text keys.
+            attended = self.attention(
+                q.flatten(0, 1), k.flatten(0, 1), v.flatten(0, 1), visible
+            )
+        hidden = hidden + self.output(attended.reshape(batch, tokens, -1))
         return hidden + self.mlp(self.norms[1](hidden))
 
 
@@ -108,16 +118,40 @@ class TokenRefiner(nn.Module):
     ) -> torch.Tensor:
         """Refine ``[documents, rows, text_dim]`` features.
 
-        ``lengths`` holds each document's text rows as int32; the rows past
-        it are masked out as keys, so every text row's output ignores them.
+        ``lengths`` holds each document's text rows as int32. Every query of
+        a document then sees only the keys before its length, so every text
+        row's output ignores the padding rows. The endpoints are device data
+        and the packed row counts are the fixed capacity, so one captured
+        call serves every length.
         """
-        mask = None
+        visible = None
         if lengths is not None:
-            rows = torch.arange(hidden.shape[1], device=hidden.device)
-            mask = (rows < lengths.unsqueeze(1)).view(hidden.shape[0], 1, 1, -1)
+            documents, rows = hidden.shape[:2]
+            device = hidden.device
+            counts = SequenceLengths(
+                torch.full(
+                    (documents,), rows, dtype=torch.int32, device=device
+                ),
+                torch.arange(
+                    0,
+                    (documents + 1) * rows,
+                    rows,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                (rows,) * documents,
+            )
+            visible = VisibleInput(
+                counts,
+                counts,
+                lengths.unsqueeze(1).expand(documents, rows).contiguous(),
+                None,
+                prefix_bounds=True,
+                fully_visible=False,
+            )
         hidden = self.input(hidden.to(self.input.weight.dtype))
         for block in self.blocks:
-            hidden = block(hidden, mask)
+            hidden = block(hidden, visible)
         return self.norm(hidden)
 
 
