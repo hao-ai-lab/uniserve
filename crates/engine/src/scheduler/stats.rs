@@ -205,9 +205,9 @@ pub struct WorkerStats {
     pub cuda_graph_misses: AtomicU64,
     /// Cumulative graph dispatches that fell back to eager execution.
     pub cuda_graph_fallbacks: AtomicU64,
-    /// Cumulative logical tokens submitted to CUDA graphs.
+    /// Cumulative real query tokens submitted to CUDA graphs.
     pub cuda_graph_unpadded_tokens: AtomicU64,
-    /// Cumulative padded tokens executed by CUDA graphs.
+    /// Cumulative padding token slots CUDA graph buckets added.
     pub cuda_graph_padded_tokens: AtomicU64,
     /// CUDA graph dispatch counts keyed by worker runtime mode.
     pub cuda_graph_runtime_mode_counts: Mutex<BTreeMap<String, u64>>,

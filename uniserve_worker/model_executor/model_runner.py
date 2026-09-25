@@ -302,7 +302,8 @@ class ModelRunner(Execution, ABC):
         With ``borrow_output``, a replayed result views the graph's output
         storage without a clone; the caller must finish reading it before
         the bucket replays again. The result carries graph-dispatch
-        statistics only.
+        statistics only; a graph execution counts the batch's query tokens
+        and the padding token slots its bucket adds.
 
         Raises:
             CUDAGraphError: After startup, a configured text bucket that
@@ -362,6 +363,14 @@ class ModelRunner(Execution, ABC):
             self.capture_batch(batch, forward)
             captured = True
 
+        # Padding is reported in query tokens: the live batch's, and the token
+        # slots its bucket adds (a text bucket's padding sequences, none for
+        # an exact signature). Graph-eligible token and denoising batches
+        # always stage attention with host query lengths.
+        live_tokens = batch.query_tokens
+        bucket_tokens = execution.query_tokens
+        assert live_tokens is not None and bucket_tokens is not None
+
         result = replay_batch(
             self.buckets[key].graphs[None],
             execution,
@@ -383,8 +392,8 @@ class ModelRunner(Execution, ABC):
                 },
                 cuda_graph_captures=int(captured),
                 cuda_graph_replays=int(not captured),
-                cuda_graph_unpadded_tokens=batch.row_count,
-                cuda_graph_padded_tokens=execution.row_count - batch.row_count,
+                cuda_graph_unpadded_tokens=live_tokens,
+                cuda_graph_padded_tokens=bucket_tokens - live_tokens,
             ),
         )
 

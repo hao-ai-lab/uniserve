@@ -112,10 +112,10 @@ pub struct ForwardStats {
     /// Executions that fell back from graph replay.
     #[serde(default)]
     pub cuda_graph_fallbacks: u64,
-    /// Real tokens represented by CUDA graph executions.
+    /// Real query tokens of the batches CUDA graph executions computed.
     #[serde(default)]
     pub cuda_graph_unpadded_tokens: u64,
-    /// Padded token slots represented by CUDA graph executions.
+    /// Padding token slots CUDA graph buckets added beyond the real tokens.
     #[serde(default)]
     pub cuda_graph_padded_tokens: u64,
     /// CUDA graph dispatches grouped by runtime mode.
