@@ -2,9 +2,9 @@
 //!
 //! The in-flight count lives in `AppState` (`server_load`). Only the generation
 //! routes in `TRACKED_HANDLERS` are counted and subject to the optional
-//! `max_concurrent_requests` limit. The video routes are not: asynchronous
-//! video jobs are bounded by the job slots in `crate::video_jobs::VideoJobs`
-//! instead, and `/v1/videos/sync` has no frontend concurrency bound.
+//! `max_concurrent_requests` limit. The video routes are not: both video
+//! submission routes are bounded by the job slots in
+//! `crate::video_jobs::VideoJobs` instead.
 
 use std::sync::{Arc, Weak};
 

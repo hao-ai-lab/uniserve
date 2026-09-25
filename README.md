@@ -132,7 +132,7 @@ Each image response entry carries `b64_json`, pixel `height` and `width`, and th
 | `--attention-backend` | `auto` | Worker attention provider selection |
 | `--api-key` | Unset | Bearer token for public routes |
 | `--request-timeout` | Unset | Seconds until a response head is sent; streamed bodies (chat SSE and video downloads) are not bounded |
-| `--max-concurrent-requests` | Unset | HTTP in-flight admission bound |
+| `--max-concurrent-requests` | Unset | In-flight bound for chat completion and image generation requests (503 above it); video requests share the video job slots instead |
 | `--shutdown-timeout` | `30` | Graceful drain bound in seconds |
 
 For tensor-parallel execution, select one rank per participating GPU:

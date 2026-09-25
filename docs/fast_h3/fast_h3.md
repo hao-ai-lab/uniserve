@@ -215,9 +215,9 @@ curl --fail-with-body http://127.0.0.1:8000/v1/videos
 curl --fail-with-body -X DELETE "http://127.0.0.1:8000/v1/videos/$VIDEO_ID"
 ```
 
-Job states are `queued`, `in_progress`, `completed`, and `failed`. A running job also reports `phase` (`encoding`, `preparing`, `denoising`, `decoding`, then `finalizing`), `completed_steps` against `total_steps`, and `actual_seconds` for the aligned frame count. Jobs and retained MP4s live in the server process, expire after one hour, and disappear on restart. The server retains at most 128 jobs and 1 GiB of artifacts. Deleting a queued or running job cancels it.
+Job states are `queued`, `in_progress`, `completed`, and `failed`. A running job also reports `phase` (`encoding`, `preparing`, `denoising`, `decoding`, then `finalizing`), `completed_steps` against `total_steps`, and `actual_seconds` for the aligned frame count. Jobs and retained MP4s live in the server process, expire after one hour, and disappear on restart. The server retains at most 1 GiB of artifacts, and retained jobs and in-flight synchronous requests share 128 job slots. Deleting a queued or running job cancels it.
 
-Creating a job while 128 are retained returns HTTP 429 with code `video_job_capacity_exceeded`. A failed job reports `error.code`: `invalid_request` when the deployment cannot serve the request as specified, `server_overloaded` when the engine's waiting queue was full and the same request may be resubmitted, and `generation_failed` when execution failed. The synchronous endpoint returns the same conditions as HTTP 400, 503, and 500.
+A request to either endpoint while all 128 job slots are taken returns HTTP 429 with code `video_job_capacity_exceeded`. A failed job reports `error.code`: `invalid_request` when the deployment cannot serve the request as specified, `server_overloaded` when the engine's waiting queue was full and the same request may be resubmitted, and `generation_failed` when execution failed. The synchronous endpoint returns the same conditions as HTTP 400, 503, and 500.
 
 ## Precision and graphs
 

@@ -241,7 +241,9 @@ pub(crate) struct SharedRuntimeArgs {
     /// SSE streams and video downloads) are not bounded by it.
     #[arg(long = "request-timeout", value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
     pub request_timeout: Option<u64>,
-    /// Front-door HTTP admission limit for in-flight inference requests.
+    /// HTTP admission limit for in-flight chat completion and image generation
+    /// requests, which are shed with 503 above it. Video requests are bounded
+    /// by the video job slots instead.
     #[arg(long = "max-concurrent-requests", value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
     pub max_concurrent_requests: Option<u64>,
     /// Enable or disable periodic logging of engine statistics.

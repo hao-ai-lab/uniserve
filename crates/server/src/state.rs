@@ -74,7 +74,8 @@ impl AppState {
         self
     }
 
-    /// Configures the maximum number of concurrent HTTP requests.
+    /// Configures the maximum number of concurrent chat completion and image
+    /// generation requests.
     pub fn with_max_concurrent_requests(mut self, limit: Option<u64>) -> Self {
         self.max_concurrent_requests = limit;
         self

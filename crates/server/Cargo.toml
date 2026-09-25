@@ -48,6 +48,7 @@ criterion.workspace = true
 expect-test.workspace = true
 tempfile.workspace = true
 tokenizers.workspace = true
+tower.workspace = true
 uniserve-engine = { workspace = true, features = ["testing"] }
 
 [[bench]]
