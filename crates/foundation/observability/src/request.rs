@@ -110,8 +110,17 @@ pub(crate) type PromptTokenSourceCounterFamily = Family<PromptTokenSourceLabels,
 
 /// Request-lifecycle Prometheus families.
 ///
-/// The server's `StatsLogger` reads `prompt_tokens_by_source` (the
-/// `local_compute` series) and `generation_tokens` to log throughput.
+/// The server records each request the engine accepted when it completes:
+/// `request_success`, `e2e_request_latency_seconds`, and
+/// `request_queue_time_seconds` for every such request, and `prompt_tokens`,
+/// `generation_tokens`, `request_prompt_tokens`, `request_generation_tokens`,
+/// `request_max_num_generation_tokens`, and `time_to_first_token_seconds` for
+/// one whose output reported its final usage. The remaining families need
+/// inputs the request lifecycle does not carry (per-token timestamps,
+/// per-request prefix-cache hits, preemptions, and request sampling
+/// parameters) and are registered without samples. The server's
+/// `StatsLogger` reads `prompt_tokens` and `generation_tokens` to log
+/// throughput.
 #[derive(MetricFamily)]
 pub struct RequestMetrics {
     // Request-derived counters.

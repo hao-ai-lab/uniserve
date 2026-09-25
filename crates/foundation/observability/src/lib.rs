@@ -10,8 +10,10 @@
 //!   (`record_scheduler_stats`), from periodic `SchedulerStats` snapshots.
 //! - `serving`: the `/metrics` scrape handler, which calls
 //!   `ServingMetrics::set_request_states` just before rendering.
-//! - `request`: registered and exported; the server's `StatsLogger` reads its
-//!   prompt and generation token counters.
+//! - `request`: the engine client's request registry
+//!   (`RequestRegistry::complete`), once for each request the engine accepted,
+//!   when the request completes; the server's `StatsLogger` reads its prompt
+//!   and generation token counters.
 //!
 //! Every metric field is a `prometheus-client` handle whose clones share their
 //! underlying state, so updates through a field reach the clone held by the

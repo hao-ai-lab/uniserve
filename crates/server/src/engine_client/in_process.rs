@@ -69,11 +69,14 @@ impl EngineClient {
     /// The export task publishes one scheduler-stats snapshot per second as
     /// engine `0`, matching `engine_count`. It holds only a weak reference to
     /// the core, so it does not keep the engine alive and exits on the first
-    /// tick after the client is dropped.
+    /// tick after the client is dropped. The request registry records
+    /// completed requests under the same model name and engine.
     fn from_core(core: EngineCore) -> Result<Self> {
         let core = Arc::new(core);
 
-        let requests = Arc::new(super::requests::RequestRegistry::default());
+        let requests = Arc::new(super::requests::RequestRegistry::new(
+            core.model_name().to_string(),
+        ));
         {
             let stats = Arc::clone(core.stats());
             let block_size = core.info().kv_block_size();
