@@ -129,6 +129,24 @@ def test_execution_lanes_are_typed_and_domain_disjoint(tmp_path) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "capacity", ['"kv_capacity_tokens":4096', '"latent_capacity_units":8']
+)
+def test_execution_lanes_reject_a_pool_capacity(capacity, tmp_path) -> None:
+    # A lane partitions compute only; its calls share the worker-wide KV and
+    # latent pools, so a lane-local capacity is not a lane field.
+    with pytest.raises(SystemExit):
+        worker_args(
+            tmp_path,
+            max_batch_tokens=8192,
+            lane=[
+                '{"lane_id":"decode","sm_budget":64,"domains":["decode"],'
+                + capacity
+                + "}"
+            ],
+        )
+
+
 def test_execution_lanes_reject_duplicate_domain_bindings(tmp_path) -> None:
     with pytest.raises(SystemExit):
         worker_args(
