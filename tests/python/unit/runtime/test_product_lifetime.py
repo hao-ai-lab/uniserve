@@ -518,6 +518,60 @@ def test_a_deferred_write_commits_when_its_host_work_publishes_it() -> None:
         buffers.close()
 
 
+def test_resident_bytes_cover_only_storage_the_store_allocates() -> None:
+    """Resident bytes count the store's relay arenas, not borrowed storage.
+
+    They are compared with the store's own device-product byte bound, so a
+    persistent product, whose storage the `BufferPool` owns and the worker
+    layout counts, adds nothing, while the first relay binding adds its
+    whole arena.
+    """
+    buffers = BufferPool(byte_capacity=64, devices=("cpu",))
+    request_slots, relay_depth = 1, 2
+    store = TensorStore(
+        capacity=1,
+        byte_capacity=32,
+        request_capacity=request_slots,
+        relay_depth=relay_depth,
+        buffer_pool=buffers,
+    )
+    persistent = TensorRef(
+        request_key=RequestKey(1, 1, 1),
+        producer_call_id=CallId(1, 0),
+        output_index=0,
+        generation=1,
+        dtype=DType.F32,
+        shape_bound=ShapeBound((StaticDim(4),)),
+    )
+    relay = replace(
+        persistent,
+        producer_call_id=CallId(2, 0),
+        shape_bound=ShapeBound((StaticDim(1),)),
+    )
+    try:
+        store.bind_outputs(
+            ((persistent, "cpu"),),
+            buffer_allocations={
+                persistent.buffer_id: BufferAllocation(
+                    persistent.buffer_id, 0, 16
+                )
+            },
+        )
+        assert store.resident_bytes("cpu") == 0
+
+        store.bind_outputs(
+            ((relay, "cpu"),), request_slots={relay.request_key: 1}
+        )
+        # One F32 element per (request slot, lane), with row zero unused.
+        assert store.resident_bytes("cpu") == (request_slots + 1) * (
+            relay_depth * 4
+        )
+    finally:
+        store.close()
+        buffers.close()
+        store.event_pool.close()
+
+
 @pytest.mark.parametrize("relay", (False, True))
 def test_tensor_publication_is_atomic_and_preserves_generation_ownership(
     relay: bool,
