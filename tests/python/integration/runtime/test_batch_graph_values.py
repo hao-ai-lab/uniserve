@@ -244,6 +244,35 @@ def test_text_graph_replay_uses_live_lengths_tokens_and_cache_blocks(
 
 
 @torch.inference_mode()
+def test_graph_statistics_count_live_and_padding_tokens(tmp_path):
+    """Graph padding counters count tokens, not rows.
+
+    A replay reports the live query tokens and the token slots its bucket
+    adds beyond them.
+    """
+    _save_checkpoint(tmp_path)
+    model = models.load_model(
+        models.read_config(tmp_path, io=loading.Config()),
+        device="cuda:0",
+        weights=weights.Config(dtype=torch.bfloat16),
+    ).model
+    pages = ((0, 1), (2, 3))
+    with _text_runner(model, "flashinfer", decode_capacity=4) as execute:
+        # Two prompts of 2 and 5 tokens pad to the only prefill bucket, 8
+        # rows of 16 tokens.
+        prefill = execute(((1, 2), (3, 4, 5, 6, 7)), pages)
+        # Two single-token rows pad to the 4-row decode bucket.
+        decode = execute(((8,), (9,)), pages, prefixes=(2, 5), decode=True)
+
+    assert prefill.stats.cuda_graph_replays == 1
+    assert prefill.stats.cuda_graph_unpadded_tokens == 7
+    assert prefill.stats.cuda_graph_padded_tokens == 16 - 7
+    assert decode.stats.cuda_graph_replays == 1
+    assert decode.stats.cuda_graph_unpadded_tokens == 2
+    assert decode.stats.cuda_graph_padded_tokens == 4 - 2
+
+
+@torch.inference_mode()
 @pytest.mark.parametrize("provider", ["trtllm", "flash_attn_4", "flashinfer"])
 @pytest.mark.parametrize(
     "selection", [TokenSelection.HIDDEN, TokenSelection.LAST_LOGITS]
