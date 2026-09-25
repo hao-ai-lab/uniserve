@@ -49,8 +49,9 @@ pub const SOCKET_CHANNEL: &str = "tcp";
 /// [`RankServer::completion_wake`]. Neither travels between processes. A
 /// shared-storage channel fires one of its own iceoryx2 notifiers; a socket
 /// channel writes to a local descriptor its owner polls beside the socket.
-/// On both, every wake taken from one channel shares one pending bit, so
-/// wakes fired before the owner drains them coalesce into one notification.
+/// On both, wakes fired before the owner drains them coalesce into one
+/// notification: a shared-storage channel's senders share one pending bit,
+/// and a socket channel's drain reads every byte its senders wrote.
 #[derive(Clone)]
 pub enum Wake {
     /// Fires the shared-storage channel's notifier.
