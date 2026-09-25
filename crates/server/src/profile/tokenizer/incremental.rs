@@ -43,7 +43,9 @@ pub struct IncrementalDecoder<'a> {
     /// empty, for example when the seeded tokens are all skipped special
     /// tokens or the prompt decodes only to incomplete UTF-8 bytes; seeding
     /// again on a later push would treat generated tokens already in the
-    /// window as prompt.
+    /// window as prompt. Seeding runs on the first push, so this is also
+    /// whether any generated token has entered the window, which `flush`
+    /// needs to avoid emitting the unseeded prompt as output.
     prompt_seeded: bool,
     /// Consecutive `push_token` calls that held back their decode (no longer
     /// than `prefix`, or ending in U+FFFD). Bounds the buffered window: see
@@ -208,16 +210,21 @@ impl IncrementalDecoder<'_> {
 
     /// Flushes buffered tokens and optionally truncates final output bytes.
     ///
-    /// Decodes whatever the window still holds (including a trailing U+FFFD)
-    /// into the output, then truncates the output to `truncate_output_to`
-    /// bytes when given. The offset must lie on a character boundary, as a
-    /// stop-string match offset does, or `String::truncate` panics.
+    /// Decodes the generated tokens the window still holds (including a
+    /// trailing U+FFFD) into the output, then truncates the output to
+    /// `truncate_output_to` bytes when given. The offset must lie on a
+    /// character boundary, as a stop-string match offset does, or
+    /// `String::truncate` panics. Before the first `push_token` the window
+    /// holds only the unseeded prompt, which is decode context rather than
+    /// output, so a stream that generated no token flushes no text.
     ///
     /// Returns the text not yet returned by `next_chunk` (`None` if there is
     /// none) and the complete output. The window and output are emptied, so
     /// callers flush once per stream.
     pub fn flush(&mut self, truncate_output_to: Option<usize>) -> Result<(Option<String>, String)> {
-        if !self.ids.is_empty() {
+        if !self.prompt_seeded {
+            self.ids.clear();
+        } else if !self.ids.is_empty() {
             let string = self.tokenizer.decode(&self.ids, self.skip_special_tokens)?;
             let prefix_len = self.prefix.len();
             self.ids.clear();
@@ -242,5 +249,27 @@ impl IncrementalDecoder<'_> {
     /// that `next_chunk` still withholds.
     pub fn output(&self) -> &str {
         &self.cumulative_output
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A stream that ends before its first generated token, such as an
+    /// image-only generation or a request whose first sampled token is EOS,
+    /// produced no text: the prompt is decode context, never output. Prompts
+    /// shorter and longer than the seed's trailing-suffix window are both
+    /// covered because prompt seeding treats them differently.
+    #[test]
+    fn flush_without_generated_tokens_emits_nothing() {
+        let tokenizer = crate::serving::test_support::configured_tokenizer();
+        for prompt in ["p", "a longer prompt"] {
+            let prompt_token_ids: Vec<u32> = prompt.bytes().map(u32::from).collect();
+            let mut decoder = tokenizer.create_decode_stream(&prompt_token_ids, true, 0);
+
+            let (last_chunk, output) = decoder.flush(None).unwrap();
+
+            assert_eq!(last_chunk, None, "prompt {prompt:?}");
+            assert_eq!(output, "", "prompt {prompt:?}");
+        }
     }
 }
