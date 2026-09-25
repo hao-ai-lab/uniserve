@@ -17,7 +17,8 @@ use hf_hub::api::tokio::ApiBuilder;
 
 use crate::profile::assets::model_files::ModelSource;
 
-/// Commit the stub reports for every file.
+/// Commit the stub reports for every file, and the snapshot [`seed_cache`]
+/// writes, so downloads land beside seeded files.
 const COMMIT: &str = "5f3b0c1e";
 
 /// Repository contents and failure modes served by the stub.
@@ -47,7 +48,8 @@ impl HubStub {
     /// Serves the stub on a loopback port for the rest of the test.
     ///
     /// Returns a Hub source for `repo_id` whose client talks to the stub and
-    /// whose cache lives under `cache_root`.
+    /// whose cache lives under `cache_root`, the directory [`seed_cache`]
+    /// writes.
     pub(super) async fn serve(self, cache_root: &Path, repo_id: &str) -> ModelSource {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -59,15 +61,13 @@ impl HubStub {
 
         // A cache under the test directory also keeps the client from reading
         // a token file outside it.
-        let cache = Cache::new(cache_root.join("hub"));
-        let api = ApiBuilder::from_cache(cache.clone())
+        let api = ApiBuilder::from_cache(Cache::new(cache_root.join("hub")))
             .with_endpoint(endpoint)
             .with_progress(false)
             .build()
             .unwrap();
         ModelSource::Hub {
             api,
-            cache,
             repo_id: repo_id.to_owned(),
         }
     }
@@ -112,5 +112,22 @@ impl HubStub {
             content.clone(),
         )
             .into_response()
+    }
+}
+
+/// Writes `files` into the Hub cache under `cache_root` as the snapshot of
+/// `repo_id` that `refs/main` names, the layout an earlier download leaves.
+pub(super) fn seed_cache(cache_root: &Path, repo_id: &str, files: &[(&str, &str)]) {
+    let repository = cache_root
+        .join("hub")
+        .join(format!("models--{}", repo_id.replace('/', "--")));
+    std::fs::create_dir_all(repository.join("refs")).unwrap();
+    std::fs::write(repository.join("refs").join("main"), COMMIT).unwrap();
+
+    let snapshot = repository.join("snapshots").join(COMMIT);
+    for (name, content) in files {
+        let path = snapshot.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
     }
 }
