@@ -150,12 +150,21 @@ class Config:
 
 @dataclass(frozen=True, slots=True)
 class Source:
-    """A closed set of resolved files and their logical name prefix."""
+    """A closed set of resolved files and their logical name prefix.
+
+    ``headers`` lists the tensors of safetensors files that are not present
+    locally, as ``(name, shape, dtype)`` entries copied from those files'
+    headers, with safetensors dtype names such as ``"BF16"``. Such entries
+    carry metadata but no values, so only dummy reads, which generate values
+    from metadata alone, accept a source with headers, and a checksum
+    manifest verifies the local files only.
+    """
 
     name: str
     root: Path
     files: tuple[Path, ...]
     prefix: str = ""
+    headers: tuple[tuple[str, tuple[int, ...], str], ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self, "root", Path(self.root))
@@ -170,8 +179,30 @@ class Source:
             if not path.is_file():
                 raise FileNotFoundError(path)
 
+        object.__setattr__(
+            self,
+            "headers",
+            tuple(
+                (name, tuple(shape), dtype)
+                for name, shape, dtype in self.headers
+            ),
+        )
+        for name, shape, dtype in self.headers:
+            if not isinstance(name, str) or any(
+                type(size) is not int or size < 0 for size in shape
+            ):
+                raise ValueError(
+                    "checkpoint headers require tensor names and shapes"
+                )
+            _dtype(dtype)
+
     def open(self, *, io: IOConfig) -> Reader:
         """Verify integrity and encoding, then open a reader for the IO mode."""
+        if self.headers and io.mode != "dummy":
+            raise ValueError(
+                "checkpoint headers describe tensors without local values; "
+                "only dummy reads accept them"
+            )
         _checksums(self, io.checksum_manifest)
         suffixes = {path.suffix for path in self.files}
         supported = (
@@ -479,15 +510,13 @@ class Reader:
                 if state is not None and not isinstance(self, _LayeredReader):
                     self._states[path] = state
                 for name, shape, dtype in metadata:
-                    logical = self.source.prefix + name
-                    if logical in self._weights:
-                        raise ValueError(
-                            f"duplicate checkpoint tensor {logical!r}"
-                        )
-                    self._weights[logical] = _FileWeight(
-                        logical, shape, dtype, self, logical
-                    )
+                    logical = self._declare(name, shape, dtype)
                     self._locations[logical] = (path, name)
+
+        # Header entries have no local file to locate; ``Source.open`` admits
+        # them only for the dummy reader, whose reads need metadata alone.
+        for name, shape, dtype in self.source.headers:
+            self._declare(name, shape, _dtype(dtype))
         self._weights = dict(sorted(self._weights.items()))
 
         # ModelOpt's unified export keeps an NVFP4 weight under its ordinary
@@ -550,6 +579,16 @@ class Reader:
             self._weights[name] = FP8Weight(
                 value, _ScaleWeight(scale, shape), axis
             )
+
+    def _declare(self, name, shape, dtype) -> str:
+        """Register one stored tensor and return its prefixed logical name."""
+        logical = self.source.prefix + name
+        if logical in self._weights:
+            raise ValueError(f"duplicate checkpoint tensor {logical!r}")
+        self._weights[logical] = _FileWeight(
+            logical, shape, dtype, self, logical
+        )
+        return logical
 
     def _index(self, path):
         raise NotImplementedError
@@ -655,12 +694,13 @@ class _DummyReader(Reader):
     """Generate deterministic source values from checkpoint metadata alone.
 
     Derived constants can depend on tensors that are not model Parameters.
-    Their shapes come from file headers; ordinary parameter-only dummy loading
-    never opens this reader and does not require checkpoint files.
+    Their shapes come from the headers of local files or from the source's
+    ``headers``; ordinary parameter-only dummy loading never opens this
+    reader and does not require checkpoint files.
     """
 
     def _open(self):
-        if not self.source.files:
+        if not self.source.files and not self.source.headers:
             raise ValueError(
                 "dummy source reads require checkpoint tensor metadata"
             )

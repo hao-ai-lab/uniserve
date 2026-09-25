@@ -25,7 +25,7 @@ def checkpoint(tmp_path):
 
 
 def test_full_vsa_checkpoint_resolves_its_trained_rungs(checkpoint):
-    config = read_config(checkpoint, IOConfig())
+    config = read_config(checkpoint, IOConfig(), sources={})
     assert config.diffusion.ladder == (999, 749, 500, 250)
     assert config.diffusion.time_scale == 1000
     assert config.diffusion.video_shift == 12
@@ -52,7 +52,7 @@ def test_eight_step_checkpoint_owns_its_ladder_and_shifts(checkpoint):
     scheduler["shift"] = 10.0
     scheduler_path.write_text(json.dumps(scheduler))
 
-    config = read_config(checkpoint, IOConfig())
+    config = read_config(checkpoint, IOConfig(), sources={})
 
     assert config.diffusion.ladder == (999, 874, 749, 624, 500, 375, 250, 125)
     assert config.diffusion.video_shift == 10
@@ -100,12 +100,12 @@ def test_incompatible_checkpoint_is_rejected(checkpoint, field, value):
     manifest[field] = value
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match=field):
-        read_config(checkpoint, IOConfig())
+        read_config(checkpoint, IOConfig(), sources={})
 
 
 def test_architecture_without_variant_metadata_is_rejected(tmp_path):
     with pytest.raises(FileNotFoundError, match="fastvideo_inference.json"):
-        read_config(tmp_path, IOConfig())
+        read_config(tmp_path, IOConfig(), sources={})
 
 
 @pytest.mark.parametrize(
@@ -139,7 +139,7 @@ def test_h3_reader_rejects_unsupported_decoder_math(
     values[field] = value
     path.write_text(json.dumps(values))
     with pytest.raises(ValueError, match=error):
-        read_config(checkpoint, IOConfig())
+        read_config(checkpoint, IOConfig(), sources={})
 
 
 def test_h3_reader_reports_missing_decoder_field(checkpoint):
@@ -150,7 +150,7 @@ def test_h3_reader_reports_missing_decoder_field(checkpoint):
     with pytest.raises(
         ValueError, match="video_vae is missing field latent_channels"
     ):
-        read_config(checkpoint, IOConfig())
+        read_config(checkpoint, IOConfig(), sources={})
 
 
 def test_h3_direct_configuration_preserves_cross_component_dimensions():

@@ -71,7 +71,7 @@ def test_embedding_replacement_matches_numerical_embedding_input(tmp_path):
     io = loading.Config()
     model = loading.load_model(
         qwen3.Model,
-        qwen3.read_config(tmp_path, io),
+        qwen3.read_config(tmp_path, io, sources={}),
         checkpoint=tuple(
             source.resolve(tmp_path, io=io)
             for source in qwen3.checkpoint_sources
@@ -142,7 +142,7 @@ def _partitioned(rank, rendezvous, root, shape, axes):
         )
         model = loading.load_model(
             qwen3.Model,
-            qwen3.read_config(root, io),
+            qwen3.read_config(root, io, sources={}),
             checkpoint=tuple(
                 source.resolve(root, io=io)
                 for source in qwen3.checkpoint_sources
@@ -280,7 +280,7 @@ def test_decoder_without_prefix_storage(tmp_path):
     io = loading.Config()
     model = loading.load_model(
         qwen3.Model,
-        qwen3.read_config(tmp_path, io),
+        qwen3.read_config(tmp_path, io, sources={}),
         checkpoint=tuple(
             source.resolve(tmp_path, io=io)
             for source in qwen3.checkpoint_sources
@@ -317,7 +317,7 @@ def test_text_encoder_retains_checkpoint_layers_and_sequence_boundaries(
     io = loading.Config()
     model = loading.load_model(
         qwen3.Model,
-        qwen3.read_config(tmp_path, io),
+        qwen3.read_config(tmp_path, io, sources={}),
         checkpoint=tuple(
             source.resolve(tmp_path, io=io)
             for source in qwen3.checkpoint_sources

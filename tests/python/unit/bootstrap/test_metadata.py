@@ -11,9 +11,16 @@ from safetensors.torch import save_file
 
 from tests.python.fixtures.model_metadata import neo_metadata
 from uniserve.loading import Config as IOConfig
-from uniserve_models.bagel import read_config as bagel_config
+from uniserve_models import bagel
 
 pytestmark = pytest.mark.unit
+
+
+def _bagel_config(root):
+    """Read BAGEL metadata with its primary source resolved in place."""
+    io = IOConfig()
+    primary = bagel.checkpoint_sources[0].resolve(root, io=io)
+    return bagel.read_config(root, io, sources={primary.name: primary})
 
 
 @pytest.mark.parametrize("inline", [False, True])
@@ -55,7 +62,7 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(
         "end_of_image_id": 63,
     }
     (tmp_path / "config.json").write_text(json.dumps(raw))
-    config = bagel_config(tmp_path, IOConfig())
+    config = _bagel_config(tmp_path)
 
     assert config.text.hidden_size == 16
     assert config.text.num_attention_heads == 4
@@ -71,18 +78,18 @@ def test_bagel_metadata_resolves_towers_and_checkpoint_position_extent(
     (tmp_path / "config.json").write_text(
         json.dumps({**raw, "max_latent_size": 4})
     )
-    normalized = bagel_config(tmp_path, IOConfig())
+    normalized = _bagel_config(tmp_path)
     assert normalized.max_latent_size == 3
 
     save_file({"latent_pos_embed.pos_embed": torch.zeros(9, 12)}, path)
     with pytest.raises(ValueError, match="square grid at text width"):
-        bagel_config(tmp_path, IOConfig())
+        _bagel_config(tmp_path)
 
     # Positional vectors must form the square grid used by latent patch
     # indexing.
     save_file({"latent_pos_embed.pos_embed": torch.zeros(10, 16)}, path)
     with pytest.raises(ValueError, match="square grid at text width"):
-        bagel_config(tmp_path, IOConfig())
+        _bagel_config(tmp_path)
 
 
 def test_h3_worker_advertises_bounded_media_products():
@@ -162,7 +169,7 @@ def test_sensenova_reader_resolves_aliases_and_numerical_layer_modes(tmp_path):
         use_sliding_window=False, sliding_window=64, max_window_layers=1
     )
     (tmp_path / "config.json").write_text(json.dumps(raw))
-    config = read_config(tmp_path, IOConfig())
+    config = read_config(tmp_path, IOConfig(), sources={})
     assert config.text.layer_types == ("full_attention",) * 3
     assert config.text.sliding_window == 64
     assert config.text.pad_token_id == 3
@@ -195,7 +202,7 @@ def test_sensenova_reader_rejects_inconsistent_checkpoint_math(
     raw["llm_config"][field] = value
     (tmp_path / "config.json").write_text(json.dumps(raw))
     with pytest.raises(ValueError, match=error):
-        read_config(tmp_path, IOConfig())
+        read_config(tmp_path, IOConfig(), sources={})
 
 
 def test_sensenova_direct_config_rejects_mismatched_vision_features(tmp_path):
@@ -204,7 +211,7 @@ def test_sensenova_direct_config_rejects_mismatched_vision_features(tmp_path):
     from uniserve_models.sensenova_u1 import read_config
 
     (tmp_path / "config.json").write_text(json.dumps(neo_metadata()))
-    config = read_config(tmp_path, IOConfig())
+    config = read_config(tmp_path, IOConfig(), sources={})
     with pytest.raises(ValueError, match="vision output must match"):
         replace(config, vision=replace(config.vision, output_size=32))
 
@@ -218,7 +225,7 @@ def test_sensenova_reader_rejects_unimplemented_sliding_attention(tmp_path):
     )
     (tmp_path / "config.json").write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="sliding_attention is not supported"):
-        read_config(tmp_path, IOConfig())
+        read_config(tmp_path, IOConfig(), sources={})
 
 
 @pytest.mark.parametrize("storage", ("bfloat16", "float8_e4m3fn"))
