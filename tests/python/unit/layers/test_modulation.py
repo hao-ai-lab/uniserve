@@ -261,6 +261,54 @@ def test_text_fp8_swiglu_matches_unfused_boundary() -> None:
     )
 
 
+_FP8_SWIGLU_WIDTH = 512
+
+
+@pytest.mark.parametrize(
+    "rows",
+    (
+        8,
+        # Eight rows past 2**31 packed input elements: the last rows start
+        # beyond the signed 32-bit offset range.
+        pytest.param(
+            2**31 // (2 * _FP8_SWIGLU_WIDTH) + 8, marks=pytest.mark.slow
+        ),
+    ),
+)
+@torch.inference_mode()
+def test_text_fp8_swiglu_kernel_matches_reference(rows) -> None:
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("FP8 execution requires compute capability 9 or newer")
+    torch.manual_seed(53)
+    width = _FP8_SWIGLU_WIDTH
+    gate_up = torch.empty(
+        rows, 2 * width, device="cuda", dtype=torch.bfloat16
+    ).normal_()
+    quantizer = Quantizer("fp8", axis=0)
+    encoded = quantizer.from_tensors(
+        {
+            "values": torch.empty(
+                rows, width, device="cuda", dtype=torch.float8_e4m3fn
+            ),
+            "scale": torch.empty(rows, 1, device="cuda", dtype=torch.float32),
+        },
+        shape=(rows, width),
+        dtype=torch.bfloat16,
+    )
+
+    # Inference mode admits the fused kernel; the first and last rows bound
+    # every row offset the launch computes.
+    silu_and_mul(gate_up, out=encoded)
+    buffers = encoded.buffers()
+    for checked in (slice(0, 8), slice(rows - 8, rows)):
+        gate, value = gate_up[checked].double().chunk(2, dim=-1)
+        _assert_e4m3_error(
+            buffers["values"][checked],
+            buffers["scale"][checked],
+            F.silu(gate) * value,
+        )
+
+
 @pytest.mark.gpu
 def test_modulated_rms_norm_retains_its_source_rows():
     """The retained rows are the normalized rows' source, byte for byte."""
