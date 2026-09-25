@@ -98,8 +98,13 @@ mod tests {
     use thiserror_ext::AsReport;
 
     use super::Qwen3XmlToolParser;
-    use crate::profile::tools::ToolParserOutput;
     use crate::profile::tools::test_utils::{collect_stream, split_by_chars, test_tools};
+    use crate::profile::tools::{ToolCallDelta, ToolParserItem, ToolParserOutput};
+
+    /// Collects the tool-call updates of `output` in order.
+    fn calls(output: &ToolParserOutput) -> Vec<&ToolCallDelta> {
+        output.calls().collect()
+    }
 
     fn build_tool_call(function_name: &str, arguments: &str) -> String {
         format!(
@@ -112,8 +117,8 @@ mod tests {
         let mut parser = Qwen3XmlToolParser::new(&test_tools());
         let output = parser.parse_complete("Hello, world!").unwrap();
 
-        assert_eq!(output.normal_text, "Hello, world!");
-        assert!(output.calls.is_empty());
+        assert_eq!(output.normal_text(), "Hello, world!");
+        assert!(calls(&output).is_empty());
     }
 
     #[test]
@@ -127,11 +132,11 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(output.normal_text, "Let me check.\n");
-        assert_eq!(output.calls.len(), 1);
-        assert_eq!(output.calls[0].tool_index, 0);
-        assert_eq!(output.calls[0].name.as_deref(), Some("get_weather"));
-        assert_eq!(output.calls[0].arguments, arguments);
+        assert_eq!(output.normal_text(), "Let me check.\n");
+        assert_eq!(calls(&output).len(), 1);
+        assert_eq!(calls(&output)[0].tool_index, 0);
+        assert_eq!(calls(&output)[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(calls(&output)[0].arguments, arguments);
     }
 
     #[test]
@@ -142,7 +147,7 @@ mod tests {
             .parse_complete(&build_tool_call("get_weather", arguments))
             .unwrap();
 
-        assert_eq!(output.calls[0].arguments, arguments);
+        assert_eq!(calls(&output)[0].arguments, arguments);
     }
 
     /// Argument bytes stream out chunk by chunk: the fifth chunk closes the
@@ -165,8 +170,7 @@ mod tests {
         for chunk in chunks {
             let next = parser.parse_chunk(chunk).unwrap();
             observed_arguments.extend(
-                next.calls
-                    .iter()
+                next.calls()
                     .filter(|call| call.name.is_none())
                     .map(|call| call.arguments.clone()),
             );
@@ -176,7 +180,7 @@ mod tests {
 
         assert_eq!(observed_arguments, ["{\"location\":", "\"Beijing\"", "}"]);
         assert_eq!(
-            output.coalesce_calls().calls[0].arguments,
+            calls(&output.coalesce_calls())[0].arguments,
             r#"{"location":"Beijing"}"#
         );
     }
@@ -192,9 +196,9 @@ mod tests {
 
         let output = collect_stream(&mut parser, &chunks);
 
-        assert_eq!(output.normal_text, "hello ");
-        assert_eq!(output.calls.len(), 1);
-        assert_eq!(output.calls[0].arguments, r#"{"location":"Tokyo"}"#);
+        assert_eq!(output.normal_text(), "hello ");
+        assert_eq!(calls(&output).len(), 1);
+        assert_eq!(calls(&output)[0].arguments, r#"{"location":"Tokyo"}"#);
     }
 
     #[test]
@@ -205,8 +209,8 @@ mod tests {
             .parse_complete(&build_tool_call("echo", arguments))
             .unwrap();
 
-        assert_eq!(output.calls.len(), 1);
-        assert_eq!(output.calls[0].arguments, arguments);
+        assert_eq!(calls(&output).len(), 1);
+        assert_eq!(calls(&output)[0].arguments, arguments);
     }
 
     #[test]
@@ -220,7 +224,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(output.calls[0].name.as_deref(), Some("say_\"hi"));
+        assert_eq!(calls(&output)[0].name.as_deref(), Some("say_\"hi"));
     }
 
     /// Without the newline after `<tool_call>` the block is not a tool call,
@@ -233,8 +237,8 @@ mod tests {
 
         let output = parser.parse_complete(input).unwrap();
 
-        assert_eq!(output.normal_text, input);
-        assert!(output.calls.is_empty());
+        assert_eq!(output.normal_text(), input);
+        assert!(calls(&output).is_empty());
     }
 
     /// A `<tool_call>` tag that does not start a tool call streams out as
@@ -246,8 +250,8 @@ mod tests {
         let first = parser.parse_chunk("Use the <tool_call> tag.").unwrap();
         let second = parser.parse_chunk(" More.").unwrap();
 
-        assert_eq!(first.normal_text, "Use the <tool_call> tag.");
-        assert_eq!(second.normal_text, " More.");
+        assert_eq!(first.normal_text(), "Use the <tool_call> tag.");
+        assert_eq!(second.normal_text(), " More.");
     }
 
     /// A tag that does not start a tool call leaves later well-formed calls
@@ -262,10 +266,10 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(output.normal_text, "<tool_call> x\n");
-        assert_eq!(output.calls.len(), 1);
-        assert_eq!(output.calls[0].name.as_deref(), Some("add"));
-        assert_eq!(output.calls[0].arguments, r#"{"x":1}"#);
+        assert_eq!(output.normal_text(), "<tool_call> x\n");
+        assert_eq!(calls(&output).len(), 1);
+        assert_eq!(calls(&output)[0].name.as_deref(), Some("add"));
+        assert_eq!(calls(&output)[0].arguments, r#"{"x":1}"#);
     }
 
     /// JSON whitespace between the arguments object and the wrapper's closing
@@ -279,10 +283,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(output.normal_text, "");
-        assert_eq!(output.calls.len(), 1);
-        assert_eq!(output.calls[0].name.as_deref(), Some("add"));
-        assert_eq!(output.calls[0].arguments, r#"{"x": 1}"#);
+        assert_eq!(output.normal_text(), "");
+        assert_eq!(calls(&output).len(), 1);
+        assert_eq!(calls(&output)[0].name.as_deref(), Some("add"));
+        assert_eq!(calls(&output)[0].arguments, r#"{"x": 1}"#);
     }
 
     #[test]
@@ -314,28 +318,21 @@ mod tests {
 
         let output = collect_stream(&mut parser, &chunks);
 
-        expect![[r#"
-            ToolParserOutput {
-                normal_text: "",
-                calls: [
-                    ToolCallDelta {
-                        tool_index: 0,
-                        name: Some(
-                            "get_weather",
-                        ),
-                        arguments: "{\"location\":\"Shanghai\"}",
-                    },
-                    ToolCallDelta {
-                        tool_index: 1,
-                        name: Some(
-                            "add",
-                        ),
-                        arguments: "{\"x\":1,\"y\":2}",
-                    },
-                ],
-            }
-        "#]]
-        .assert_debug_eq(&output);
+        assert_eq!(
+            output.items,
+            [
+                ToolParserItem::Call(ToolCallDelta {
+                    tool_index: 0,
+                    name: Some("get_weather".to_string()),
+                    arguments: r#"{"location":"Shanghai"}"#.to_string(),
+                }),
+                ToolParserItem::Call(ToolCallDelta {
+                    tool_index: 1,
+                    name: Some("add".to_string()),
+                    arguments: r#"{"x":1,"y":2}"#.to_string(),
+                }),
+            ]
+        );
     }
 
     #[test]
@@ -364,9 +361,12 @@ mod tests {
         let streamed = parser.parse_chunk(input).unwrap();
         let finished = parser.finish().unwrap();
 
-        assert_eq!(streamed.normal_text + finished.normal_text.as_str(), input);
-        assert!(streamed.calls.is_empty());
-        assert!(finished.calls.is_empty());
+        assert_eq!(
+            streamed.normal_text() + finished.normal_text().as_str(),
+            input
+        );
+        assert!(calls(&streamed).is_empty());
+        assert!(calls(&finished).is_empty());
     }
 
     /// A header that fails to parse publishes no call, and `reset` returns
@@ -383,8 +383,8 @@ mod tests {
         let result = parser.parse_into("me\": \"add\", \"args\": {}}\n</tool_call>", &mut output);
 
         assert!(result.is_err());
-        assert_eq!(output.normal_text, "Hi ");
-        assert!(output.calls.is_empty());
+        assert_eq!(output.normal_text(), "Hi ");
+        assert!(calls(&output).is_empty());
         assert_eq!(
             parser.reset(),
             "<tool_call>\n{\"name\": \"add\", \"args\": {}}\n</tool_call>"
@@ -402,7 +402,7 @@ mod tests {
         let result = parser.parse_into(input, &mut output);
 
         assert!(result.is_err());
-        assert!(output.calls.is_empty());
+        assert!(calls(&output).is_empty());
         assert_eq!(parser.reset(), input);
     }
 

@@ -167,7 +167,7 @@ impl JsonToolCallParser {
         }
 
         let mut output = ToolParserOutput::default();
-        output.normal_text.push_str(&self.reset());
+        output.push_text(&self.reset());
         Ok(output)
     }
 
@@ -179,7 +179,7 @@ impl JsonToolCallParser {
     ) -> Result<()> {
         match event {
             JsonToolCallEvent::Text { len: consumed_len } => {
-                output.normal_text.push_str(&self.buffer[..consumed_len]);
+                output.push_text(&self.buffer[..consumed_len]);
             }
             JsonToolCallEvent::ToolCallStart => self.mode = JsonToolCallMode::Header,
             JsonToolCallEvent::ToolCallHeader { function_name } => {
@@ -189,7 +189,7 @@ impl JsonToolCallParser {
                 self.mode = JsonToolCallMode::Arguments {
                     json_scan: JsonObjectScanState::default(),
                 };
-                output.calls.push(ToolCallDelta {
+                output.push_call(ToolCallDelta {
                     tool_index,
                     name: Some(function_name),
                     arguments: String::new(),
@@ -202,7 +202,7 @@ impl JsonToolCallParser {
                         self.config.parser_name
                     ));
                 };
-                output.calls.push(ToolCallDelta {
+                output.push_call(ToolCallDelta {
                     tool_index,
                     name: None,
                     arguments: self.buffer[..consumed_len].to_string(),
