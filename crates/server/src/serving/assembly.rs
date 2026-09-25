@@ -218,11 +218,11 @@ async fn emit_terminal(
 /// (the decoder publishes its start only after the engine's `Scheduled`
 /// event), then content-block, tool-call, and sample events, then `Usage` and
 /// one terminal event. An engine rejection surfaced by the decoder becomes a
-/// `Rejected` terminal event. Any other decoder or processor failure
-/// (including an engine error or unavailable-artifact event, which the
-/// decoder reports as malformed output), a duplicate or missing start, or a
-/// stream that closes before `Done` ends the stream with
-/// `ServeError::OutputProcessing`.
+/// `Rejected` terminal event, and an engine error or unavailable-artifact
+/// event a `Failed` terminal event, as in [`assemble_event_stream`]; neither
+/// is preceded by `Usage`. Any other decoder or processor failure, a
+/// duplicate or missing start, or a stream that closes before `Done` ends the
+/// stream with `ServeError::OutputProcessing`.
 pub(super) async fn assemble_chat_event_stream(
     assembly: StreamInput,
     processor: Qwen3ChatOutputProcessor,
@@ -271,8 +271,9 @@ pub(super) async fn assemble_chat_event_stream(
     let mut queue_us = None;
     let mut first_visible_output_us = None;
     while let Some(next) = output.next().await {
-        // Engine rejection travels through the decoder as an error; it is a
-        // terminal outcome rather than an output-processing failure.
+        // Engine rejection and engine failure travel through the decoder as
+        // errors; they are terminal outcomes rather than output-processing
+        // failures.
         let next = match next {
             Err(crate::serving::chat::Error::Text(crate::serving::text::Error::Rejected {
                 kind,
@@ -282,6 +283,17 @@ pub(super) async fn assemble_chat_event_stream(
                 y.yield_ok(RequestOutput::Rejected {
                     request_id,
                     kind,
+                    message,
+                })
+                .await;
+                return Ok(());
+            }
+            Err(crate::serving::chat::Error::Text(crate::serving::text::Error::EngineFailed {
+                message,
+                ..
+            })) => {
+                y.yield_ok(RequestOutput::Failed {
+                    request_id,
                     message,
                 })
                 .await;

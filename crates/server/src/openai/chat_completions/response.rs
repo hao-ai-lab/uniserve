@@ -686,7 +686,13 @@ pub async fn chat_completion_chunk_stream(
             Ok(RequestOutput::Rejected { kind, message, .. }) => {
                 return Err(ApiError::rejected(kind, message));
             }
-            Ok(RequestOutput::Failed { .. }) => {
+            Ok(RequestOutput::Failed {
+                request_id,
+                message,
+            }) => {
+                // As in `collect_chat_completion`, the failure detail is
+                // logged but not returned to the client.
+                error!(%request_id, %message, "chat completion failed");
                 bail_server_error!("Internal server error");
             }
             Ok(_) => {}

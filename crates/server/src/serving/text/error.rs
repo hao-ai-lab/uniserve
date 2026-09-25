@@ -1,9 +1,11 @@
 //! Text tokenization, decoding, and stream errors.
 //!
 //! `decoded_text_event_stream` reports engine-protocol violations as
-//! [`Error::MalformedOutput`] and an engine admission rejection as
-//! [`Error::Rejected`]; `serving::assembly` turns the latter into a terminal
-//! rejection rather than an output-processing failure.
+//! [`Error::MalformedOutput`], an engine admission rejection as
+//! [`Error::Rejected`], and an engine failure of the running request as
+//! [`Error::EngineFailed`]; `serving::assembly` turns the latter two into
+//! `Rejected` and `Failed` terminal events rather than output-processing
+//! failures.
 
 use crate::engine_client::Error as GatewayError;
 use thiserror::Error;
@@ -19,6 +21,15 @@ pub enum Error {
         /// Engine classification of the rejection.
         kind: uniserve_core::RejectionKind,
         /// Engine-supplied rejection detail.
+        message: String,
+    },
+    /// The engine failed the running request or could not deliver its
+    /// output (`EngineCoreOutput::Error` or `ArtifactUnavailable`).
+    #[error("text request `{request_id}` failed in the engine: {message}")]
+    EngineFailed {
+        /// Identifier of the failed request.
+        request_id: String,
+        /// Engine-supplied failure detail.
         message: String,
     },
     /// The tokenizer cannot encode or decode model text.

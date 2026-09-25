@@ -1792,6 +1792,84 @@ mod tests {
         }
     }
 
+    /// An engine failure of a running request (`Error`, or `ArtifactUnavailable`
+    /// when its output cannot be delivered) is a `Failed` terminal carrying the
+    /// engine message on every generation assembler, including the Qwen3 chat
+    /// assembler, rather than an output-processing error.
+    #[tokio::test]
+    async fn assemblers_report_an_engine_failure_as_a_failed_terminal() {
+        let failures = [
+            EngineCoreOutput::Error {
+                message: "worker call failed".to_string(),
+            },
+            EngineCoreOutput::ArtifactUnavailable {
+                message: "worker call failed".to_string(),
+            },
+        ];
+        for chat in [false, true] {
+            for failure in failures.clone() {
+                let tokenizer = crate::serving::test_support::configured_tokenizer();
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                tx.try_send(EngineCoreOutput::Scheduled {
+                    queued_at: 1.0,
+                    scheduled_at: 2.0,
+                })
+                .unwrap();
+                tx.try_send(EngineCoreOutput::TextToken {
+                    id: b'a' as u32,
+                    logprob: None,
+                })
+                .unwrap();
+                tx.try_send(failure).unwrap();
+                drop(tx);
+
+                let input = StreamInput {
+                    request_id: "engine-failure".into(),
+                    event_context: event_context(),
+                    prompt_token_ids: vec![b'p' as u32],
+                    tokenizer: Arc::clone(&tokenizer),
+                    prompt_logprobs_requested: false,
+                    generated_logprobs_requested: false,
+                    emit_token_ids: false,
+                    decode_options: TextDecodeOptions::default(),
+                    stream: EventRx::from_receiver(rx),
+                };
+                let events = if chat {
+                    let processor = crate::serving::chat::Qwen3ChatOutputProcessor::new(
+                        &mut crate::serving::chat::ChatRequest::for_test(),
+                        tokenizer,
+                        true,
+                    )
+                    .unwrap();
+                    // Boxed like the runtime boxes it, since the chat pipeline
+                    // is a large future.
+                    Box::pin(assemble_chat_event_stream(input, processor))
+                        .collect::<Vec<_>>()
+                        .await
+                } else {
+                    assemble_event_stream(input, OutputProcessorPolicy::None)
+                        .collect::<Vec<_>>()
+                        .await
+                };
+
+                assert!(
+                    events.iter().all(std::result::Result::is_ok),
+                    "chat={chat}: {:?}",
+                    events.last()
+                );
+                assert!(
+                    matches!(
+                        events.last(),
+                        Some(Ok(RequestOutput::Failed { message, .. }))
+                            if message == "worker call failed"
+                    ),
+                    "chat={chat}: {:?}",
+                    events.last()
+                );
+            }
+        }
+    }
+
     /// Committed image events are held back and published immediately before the next text
     /// token (or before a terminal event or the end of the engine stream), so they stay
     /// ordered ahead of that token.
