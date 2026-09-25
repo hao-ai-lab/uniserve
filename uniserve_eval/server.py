@@ -56,17 +56,19 @@ class ManagedServer:
         # signals as a whole.
         environment = dict(os.environ)
         environment.update(self.launch.environment)
-        self.process = subprocess.Popen(
-            self.launch.command,
-            cwd=self.launch.working_directory,
-            env=environment,
-            stdout=self.log,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
 
+        # `__exit__` does not run when `__enter__` raises, so a failed launch
+        # or readiness wait releases the log and any started process here.
         try:
+            self.process = subprocess.Popen(
+                self.launch.command,
+                cwd=self.launch.working_directory,
+                env=environment,
+                stdout=self.log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
             self._wait_until_ready()
         except BaseException:
             self.stop()
