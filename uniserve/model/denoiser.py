@@ -206,7 +206,11 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
 
     @property
     def max_sequence_tokens(self) -> int:
-        """Longest image sequence this network accepts, framing included."""
+        """Longest image sequence this network accepts, in latent patch rows.
+
+        ``framing_tokens`` are not counted; the framed sequence holds up to
+        ``max_sequence_tokens + framing_tokens`` tokens.
+        """
         raise NotImplementedError
 
     def bind_inputs(
