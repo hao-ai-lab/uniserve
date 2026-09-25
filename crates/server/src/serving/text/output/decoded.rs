@@ -326,10 +326,11 @@ fn decode_one_token(
 ///
 /// Fails with [`Error::EmptyPromptTokenIds`] for an empty prompt,
 /// [`Error::Rejected`] when the engine rejects the request,
-/// [`Error::MalformedOutput`] when engine events violate the protocol or the
-/// engine reports an error or an unavailable artifact,
-/// [`Error::StreamClosedBeforeTerminalOutput`] when the channel closes without
-/// a terminal event, and a tokenizer error when decoding fails.
+/// [`Error::EngineFailed`] when the engine reports an error or an unavailable
+/// artifact, [`Error::MalformedOutput`] when engine events violate the
+/// protocol, [`Error::StreamClosedBeforeTerminalOutput`] when the channel
+/// closes without a terminal event, and a tokenizer error when decoding
+/// fails.
 #[allow(clippy::too_many_arguments)]
 #[try_stream]
 pub async fn decoded_text_event_stream(
@@ -568,9 +569,11 @@ pub async fn decoded_text_event_stream(
                     message,
                 });
             }
+            // An engine failure is a terminal outcome, not malformed output;
+            // the chat assembler turns it into a `Failed` event.
             EngineCoreOutput::Error { message }
             | EngineCoreOutput::ArtifactUnavailable { message } => {
-                return Err(Error::MalformedOutput {
+                return Err(Error::EngineFailed {
                     request_id: request_id.clone(),
                     message,
                 });
