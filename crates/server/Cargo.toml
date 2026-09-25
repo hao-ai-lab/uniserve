@@ -50,6 +50,7 @@ tempfile.workspace = true
 tokenizers.workspace = true
 tower.workspace = true
 uniserve-engine = { workspace = true, features = ["testing"] }
+uniserve-worker-ipc.workspace = true
 
 [[bench]]
 name = "tokenizer_hf"
