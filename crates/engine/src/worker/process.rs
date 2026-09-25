@@ -68,8 +68,12 @@ const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 /// One configured model-execution lane passed in [`WorkerProcessArgs`].
 ///
 /// The engine only parses and forwards lanes; the worker's `LaneConfig` in
-/// `uniserve_worker.config.execution` resolves and applies them.
+/// `uniserve_worker.config.execution` resolves and applies them. Unknown
+/// fields are refused here, as the worker refuses them, because the launch
+/// descriptor re-serializes only the fields below and a misspelled limit
+/// would otherwise vanish without an error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LaneConfig {
     /// Stable lane identity within the worker process.
     pub lane_id: String,
@@ -96,10 +100,11 @@ impl std::str::FromStr for LaneConfig {
 
     /// Parses one JSON lane descriptor, as the `--lane` option passes it.
     ///
-    /// Refuses invalid JSON, an empty `lane_id`, a zero `sm_budget`, and an
-    /// empty domain list or one with an unknown or repeated selector. The
-    /// worker validates the remaining constraints, such as positive capacity
-    /// overrides, when it reads the lane.
+    /// Refuses invalid JSON, a field outside the lane schema, an empty
+    /// `lane_id`, a zero `sm_budget`, and an empty domain list or one with an
+    /// unknown or repeated selector. The worker validates the remaining
+    /// constraints, such as positive capacity overrides, when it reads the
+    /// lane.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let lane: Self = serde_json::from_str(value)
             .map_err(|error| format!("invalid execution lane JSON: {error}"))?;
@@ -1312,5 +1317,24 @@ impl Drop for RankProcess {
     /// Closes the rank as `close` does, ignoring its result.
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LaneConfig;
+
+    /// `--lane` accepts only the fields the worker applies, so a misspelled
+    /// optional limit fails at argument parsing instead of leaving the lane
+    /// without that limit.
+    #[test]
+    fn a_lane_naming_an_unknown_field_is_refused() {
+        let lane = r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]"#;
+        assert!(format!("{lane}}}").parse::<LaneConfig>().is_ok());
+
+        for misspelled in [r#""max_batch_token":4096"#, r#""max_inflght":2"#] {
+            let parsed = format!("{lane},{misspelled}}}").parse::<LaneConfig>();
+            assert!(parsed.is_err(), "{misspelled} must be refused");
+        }
     }
 }
