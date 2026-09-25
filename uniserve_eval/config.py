@@ -21,7 +21,7 @@ import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from .datasets import get_dataset
 from .tasks import get_task
@@ -70,6 +70,11 @@ _LOAD_FIELDS = set(LoadConfig.__dataclass_fields__)
 _SAMPLING_FIELDS = set(SamplingConfig.__dataclass_fields__)
 _IMAGE_FIELDS = set(ImageConfig.__dataclass_fields__)
 _VIDEO_FIELDS = set(VideoConfig.__dataclass_fields__)
+
+# The settings dataclasses a benchmark table's nested tables construct.
+_Settings = TypeVar(
+    "_Settings", LoadConfig, SamplingConfig, ImageConfig, VideoConfig
+)
 
 
 @dataclass(frozen=True)
@@ -155,9 +160,9 @@ def load_config(path: Path = DEFAULT_CONFIG) -> EvaluationConfig:
     checked.
 
     Validation stops at the first violation. Schema violations raise
-    `ValueError`, an unregistered task or dataset name raises `KeyError`, and
-    a mistyped value that reaches a dataclass constructor can raise other
-    exceptions such as `TypeError`.
+    `ValueError` naming the offending table, including a load, sampling,
+    image, or video value whose type or range its settings dataclass
+    rejects; an unregistered task or dataset name raises `KeyError`.
     """
     config_path = Path(path).resolve()
     with config_path.open("rb") as handle:
@@ -448,7 +453,7 @@ def _load_config(raw: Any, context: str) -> LoadConfig:
     # accepted as the same unbounded arrival rate.
     if "request_rate" in value and value["request_rate"] == "inf":
         value["request_rate"] = float("inf")
-    return LoadConfig(**value)
+    return _build_settings(LoadConfig, value, context)
 
 
 def _sampling_config(
@@ -462,7 +467,7 @@ def _sampling_config(
     extra = value.get("extra_body", {})
     if extra and not isinstance(extra, dict):
         raise ValueError(f"{context}.extra_body must be a table")
-    return SamplingConfig(**value)
+    return _build_settings(SamplingConfig, value, context)
 
 
 def _image_config(
@@ -480,8 +485,13 @@ def _image_config(
         if not isinstance(interval, list) or len(interval) != 2:
             raise ValueError(f"{context}.cfg_interval must have two values")
         # TOML arrays arrive as lists; the dataclass field is a float pair.
-        value["cfg_interval"] = (float(interval[0]), float(interval[1]))
-    return ImageConfig(**value)
+        try:
+            value["cfg_interval"] = (float(interval[0]), float(interval[1]))
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"{context}.cfg_interval must have two numeric values"
+            ) from error
+    return _build_settings(ImageConfig, value, context)
 
 
 def _video_config(raw: Any, context: str) -> VideoConfig:
@@ -490,7 +500,25 @@ def _video_config(raw: Any, context: str) -> VideoConfig:
         return VideoConfig()
     value = _mapping(raw, context)
     _reject_unknown(value, _VIDEO_FIELDS, context)
-    return VideoConfig(**value)
+    return _build_settings(VideoConfig, value, context)
+
+
+def _build_settings(
+    cls: type[_Settings], value: dict[str, Any], context: str
+) -> _Settings:
+    """Construct a settings dataclass and report a rejected value as schema.
+
+    The dataclasses check their values in `__post_init__`: a value of the
+    wrong type fails there with `TypeError`, for example when a string is
+    compared with a number, and a violated constraint with `ValueError`.
+    Neither names the profile table, so both are raised as `ValueError`
+    prefixed with `context`. A mistyped value that no check touches is
+    accepted as given.
+    """
+    try:
+        return cls(**value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{context}: {error}") from error
 
 
 def _suite_profile(
