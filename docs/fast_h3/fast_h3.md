@@ -182,7 +182,7 @@ The first startup compiles the native GPU providers and captures shapes on first
 
 ## Generate a video
 
-Only `model`, `prompt`, `seconds`, and `seed` are accepted, as JSON or as `multipart/form-data`. `seconds` defaults to 5 and `seed` defaults to 0.
+Only `model`, `prompt`, `seconds`, and `seed` are accepted, as JSON or as `multipart/form-data`. `seconds` defaults to 5, or to `--max-video-seconds` when that is shorter, and `seed` defaults to 0.
 
 ```bash
 curl --fail-with-body --max-time 600 \

@@ -42,7 +42,7 @@ use uniserve_engine::{
 use uniserve_server::{
     AppState, Config, EngineSettings, HttpListenerMode, ModelDescription,
     openai::{VideoGenerationRequest, serve_error_to_api},
-    serving::{FinishStatus, RequestOutput, ServeRequestId},
+    serving::{FinishStatus, RequestOutput, ServeRequestId, default_video_seconds},
 };
 
 // The fixed FastH3 request and output contract. The frame rate, size and
@@ -516,7 +516,9 @@ struct PreparedRequest {
 
 /// Maps a Dynamo video request onto UniServe's `VideoGenerationRequest`.
 ///
-/// Omitted fields default to 5 seconds, seed 0 and a `url` response.
+/// Omitted fields default to seed 0, a `url` response, and the duration
+/// UniServe's HTTP video route resolves (`default_video_seconds`: 5 seconds,
+/// capped at `max_video_seconds`).
 /// `nvext.num_frames` is only checked against the aligned frame count of
 /// `seconds`; UniServe derives the frame count from `seconds` again in
 /// `InputProcessor::video_sampling`. Every refusal is an invalid-argument
@@ -566,7 +568,9 @@ fn prepare_request(
     }
 
     // `seconds` is an integer in Dynamo's API, so it is always finite here.
-    let seconds = request.seconds.map(f64::from).unwrap_or(5.0);
+    let seconds = request
+        .seconds
+        .map_or_else(|| default_video_seconds(max_video_seconds), f64::from);
     if seconds <= 0.0 || seconds > max_video_seconds {
         return Err(invalid_argument(format!(
             "seconds must be positive and at most {max_video_seconds}"
@@ -748,6 +752,20 @@ mod tests {
         assert_eq!(prepared.request.seconds, Some(5.0));
         assert_eq!(prepared.request.seed, 1000);
         assert!(matches!(prepared.response_format, ResponseFormat::B64Json));
+    }
+
+    /// An omitted duration resolves as it does on UniServe's HTTP video route:
+    /// 5 seconds, or the deployment's maximum when that is shorter.
+    #[test]
+    fn an_omitted_duration_defaults_as_the_http_route_does() {
+        for (max_video_seconds, expected) in [(15.0, 5.0), (3.0, 3.0)] {
+            let request = json!({"model": "FastH3", "prompt": "A stream in a forest"});
+            let prepared = match prepare_request(request, "FastH3", max_video_seconds) {
+                Ok(prepared) => prepared,
+                Err(error) => panic!("max {max_video_seconds}s refused the default: {error}"),
+            };
+            assert_eq!(prepared.request.seconds, Some(expected));
+        }
     }
 
     // Each request carries one field or value FastH3 does not support. With

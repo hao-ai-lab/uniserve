@@ -474,7 +474,7 @@ impl InputProcessor {
             ModelParameters::MiniMaxH3 {
                 max_video_seconds, ..
             } => {
-                let default_seconds = max_video_seconds.min(5.0);
+                let default_seconds = default_video_seconds(*max_video_seconds);
                 let mut suggested_seconds = vec![default_seconds];
                 if *max_video_seconds > default_seconds {
                     suggested_seconds.push(*max_video_seconds);
@@ -580,7 +580,7 @@ impl InputProcessor {
                 },
             ));
         };
-        let seconds = seconds.unwrap_or(max_video_seconds.min(5.0));
+        let seconds = seconds.unwrap_or_else(|| default_video_seconds(*max_video_seconds));
         // Duration is a public floating-point input and must be finite before
         // conversion to the fixed-width frame protocol.
         if !seconds.is_finite() || seconds <= 0.0 || seconds > *max_video_seconds {
@@ -963,6 +963,16 @@ impl InputProcessor {
         };
         Ok((generation, response))
     }
+}
+
+/// Returns the duration, in seconds, of a video request that omits `seconds`.
+///
+/// The default is 5 seconds, capped at the deployment's `max_video_seconds` so an omitted
+/// duration is always within bounds. `InputProcessor::video_sampling` resolves omitted
+/// durations with it and `InputProcessor::video_capabilities` advertises it; any other video
+/// entry point into the same engine must resolve omitted durations with it too.
+pub fn default_video_seconds(max_video_seconds: f64) -> f64 {
+    max_video_seconds.min(5.0)
 }
 
 /// Rounds a frame count up to the next value of the form `5 + 17k`.
