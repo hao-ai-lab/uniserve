@@ -18,6 +18,13 @@
 //! and a `{worker_id, port}` reply to each `Reserve`. The head sends
 //! `Instruction`s. The launcher side is the `uniserve-host` binary, whose
 //! instruction and report types must stay field-compatible with these.
+//!
+//! Each worker group's launches carry a generation, which every `Spawn` names
+//! and the launcher echoes in that rank's `RankExit`. A `Stop` ends the
+//! group's generation before the group is relaunched under the next one. A
+//! launcher may report an exit of a stopped rank before it reads the `Stop`,
+//! and the head may read that report only after the relaunch, so an exit is
+//! attributed to a group only when it names the group's current generation.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -40,6 +47,8 @@ struct Presentation {
 pub(crate) struct RankExit {
     /// Worker group of the process that exited.
     pub worker_id: String,
+    /// The group generation the rank's `Spawn` carried.
+    pub generation: u64,
     /// Rank of the process that exited within its group.
     pub rank: u32,
     /// Exit status text the launcher read.
@@ -50,13 +59,18 @@ pub(crate) struct RankExit {
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Instruction<'a> {
-    /// Start one rank from the descriptor the head derived for it.
-    Spawn(RemoteLaunch<'a>),
+    /// Start one rank from the descriptor the head derived for it, as a
+    /// member of its group's current generation.
+    Spawn {
+        generation: u64,
+        #[serde(flatten)]
+        launch: RemoteLaunch<'a>,
+    },
     /// Bind and hold a collective store socket for one worker group, which
     /// the launcher hands to that group's first rank when it spawns it.
     Reserve { worker_id: &'a str },
     /// Stop every rank of one worker group the launcher owns, before the
-    /// group is relaunched.
+    /// group is relaunched under its next generation.
     Stop { worker_id: &'a str },
     /// Stop every rank the launcher owns.
     Terminate,
@@ -77,8 +91,8 @@ pub(crate) fn lock(
 
 /// Everything a launcher needs to start one rank.
 ///
-/// Serialized as the body of a `spawn` instruction, so the field names are
-/// the wire contract with the launcher.
+/// Serialized as the body of a `spawn` instruction, beside the generation the
+/// registry adds, so the field names are the wire contract with the launcher.
 #[derive(Serialize)]
 pub(crate) struct RemoteLaunch<'a> {
     pub rank: u32,
@@ -108,16 +122,68 @@ struct Launcher {
     pending: Vec<u8>,
 }
 
+/// Rank exits read from the launchers and not yet taken, and the generation
+/// each worker group is launched under.
+///
+/// A launcher reports every group's ranks on one connection, and each group
+/// takes its own. Only exits of a group's current generation are kept, so a
+/// report of a rank a stop ended is never attributed to its relaunch.
+#[derive(Default)]
+struct ExitReports {
+    /// Each group's current generation; a group absent here has never been
+    /// stopped and is in generation zero.
+    generations: HashMap<String, u64>,
+    /// Exits of each group's current generation, with the host that
+    /// reported each, by worker group.
+    reported: HashMap<String, Vec<(String, RankExit)>>,
+}
+
+impl ExitReports {
+    /// Returns the generation `worker_id`'s launches currently carry.
+    fn generation(&self, worker_id: &str) -> u64 {
+        self.generations.get(worker_id).copied().unwrap_or(0)
+    }
+
+    /// Keeps one exit a launcher on `host` reported for its group, or
+    /// discards it when it names a generation a stop has ended.
+    fn file(&mut self, host: &str, exit: RankExit) {
+        if exit.generation != self.generation(&exit.worker_id) {
+            tracing::debug!(
+                host,
+                worker = %exit.worker_id,
+                rank = exit.rank,
+                generation = exit.generation,
+                "discarding the exit of a stopped rank"
+            );
+            return;
+        }
+        self.reported
+            .entry(exit.worker_id.clone())
+            .or_default()
+            .push((host.to_owned(), exit));
+    }
+
+    /// Takes every kept exit of `worker_id`.
+    fn take(&mut self, worker_id: &str) -> Vec<(String, RankExit)> {
+        self.reported.remove(worker_id).unwrap_or_default()
+    }
+
+    /// Ends `worker_id`'s current generation: its kept exits are discarded,
+    /// as is every exit of that generation read later.
+    fn end_generation(&mut self, worker_id: &str) {
+        *self.generations.entry(worker_id.to_owned()).or_default() += 1;
+        self.reported.remove(worker_id);
+    }
+}
+
 /// The head's launcher registration address and the launchers that presented.
 pub(crate) struct LauncherRegistry {
     listener: TcpListener,
     address: String,
     /// Connected launchers by the host identity each presented.
     hosts: HashMap<String, Launcher>,
-    /// Exits read from the launchers and not yet taken, by worker group: a
-    /// launcher reports every group's ranks on one connection, and each
-    /// group takes its own.
-    exits: HashMap<String, Vec<(String, RankExit)>>,
+    /// Exits read from the launchers, kept for the group each belongs to.
+    exits: ExitReports,
 }
 
 impl LauncherRegistry {
@@ -136,7 +202,7 @@ impl LauncherRegistry {
             listener,
             address,
             hosts: HashMap::new(),
-            exits: HashMap::new(),
+            exits: ExitReports::default(),
         })
     }
 
@@ -324,27 +390,26 @@ impl LauncherRegistry {
                     });
                 }
                 let exit: RankExit = serde_json::from_value(report)?;
-                self.exits
-                    .entry(exit.worker_id.clone())
-                    .or_default()
-                    .push((host.to_owned(), exit));
+                self.exits.file(host, exit);
             }
         })();
         launcher.stream.set_read_timeout(None)?;
         reservation
     }
 
-    /// Sends one rank's launch to the launcher that owns its host.
+    /// Sends one rank's launch to the launcher that owns its host, under its
+    /// group's current generation.
     pub(crate) fn spawn_remote(
         &mut self,
         host: &str,
         launch: RemoteLaunch<'_>,
     ) -> anyhow::Result<()> {
+        let generation = self.exits.generation(launch.worker_id);
         let launcher = self
             .hosts
             .get_mut(host)
             .with_context(|| format!("no launcher presented host {host}"))?;
-        let line = serde_json::to_string(&Instruction::Spawn(launch))
+        let line = serde_json::to_string(&Instruction::Spawn { generation, launch })
             .context("encoding a remote launch")?;
         launcher
             .stream
@@ -356,15 +421,17 @@ impl LauncherRegistry {
             .with_context(|| format!("flushing a launch to host {host}"))
     }
 
-    /// Takes every exit of one worker group's ranks its launchers have
-    /// reported, keeping the other groups' exits for their own owners.
+    /// Takes every exit of one worker group's current generation its
+    /// launchers have reported, keeping the other groups' exits for their own
+    /// owners.
     ///
     /// The drain is best effort and never blocks: it reads whatever each
     /// connection holds, keeps a partial line in `pending` for the next call,
-    /// discards lines that do not decode as a `RankExit`, and moves on from a
-    /// launcher whose socket cannot be switched to nonblocking mode or at its
-    /// first read error or end of stream. A closed launcher connection is
-    /// therefore not reported here.
+    /// discards lines that do not decode as a `RankExit` and exits of a
+    /// generation a stop has ended, and moves on from a launcher whose socket
+    /// cannot be switched to nonblocking mode or at its first read error or
+    /// end of stream. A closed launcher connection is therefore not reported
+    /// here.
     pub(crate) fn drain_exits(&mut self, worker_id: &str) -> Vec<(String, RankExit)> {
         for (host, launcher) in self.hosts.iter_mut() {
             if launcher.stream.set_nonblocking(true).is_err() {
@@ -376,25 +443,26 @@ impl LauncherRegistry {
                 .is_ok_and(|read| read > 0)
             {
                 if let Ok(exit) = serde_json::from_slice::<RankExit>(&launcher.pending) {
-                    self.exits
-                        .entry(exit.worker_id.clone())
-                        .or_default()
-                        .push((host.clone(), exit));
+                    self.exits.file(host, exit);
                 }
                 launcher.pending.clear();
             }
             let _ = launcher.stream.set_nonblocking(false);
         }
-        self.exits.remove(worker_id).unwrap_or_default()
+        self.exits.take(worker_id)
     }
 
     /// Stops one worker group's ranks on every launcher, ahead of relaunching
     /// the group; the launchers stay connected for the other groups.
     ///
-    /// The group's exits already collected are discarded. The launcher drops
-    /// the stopped ranks from its supervision before terminating them, so a
-    /// rank still running at the stop is not reported as an exit.
+    /// The group's generation ends first, even if a stop cannot be sent: its
+    /// exits already collected are discarded, and so is any exit of the
+    /// stopped ranks read later, including one a launcher wrote before it
+    /// read the stop. The launcher drops the stopped ranks from its
+    /// supervision before terminating them, so a rank still running at the
+    /// stop is not reported at all.
     pub(crate) fn stop_worker(&mut self, worker_id: &str) -> anyhow::Result<()> {
+        self.exits.end_generation(worker_id);
         let line = serde_json::to_string(&Instruction::Stop { worker_id })
             .context("encoding a worker stop")?;
         for (host, launcher) in self.hosts.iter_mut() {
@@ -407,7 +475,6 @@ impl LauncherRegistry {
                 .flush()
                 .with_context(|| format!("flushing a worker stop to host {host}"))?;
         }
-        self.exits.remove(worker_id);
         Ok(())
     }
 }
@@ -491,10 +558,31 @@ impl RemoteHost<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::LauncherRegistry;
+    use super::{LauncherRegistry, RemoteLaunch};
+    use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    /// Reads one newline-delimited JSON message from the other end.
+    fn receive(reader: &mut BufReader<TcpStream>) -> serde_json::Value {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("a message arrives");
+        serde_json::from_str(&line).expect("the message is JSON")
+    }
+
+    /// Returns the statuses of the first nonempty drain of `worker_id`'s
+    /// exits within five seconds, or none.
+    fn await_exits(registry: &mut LauncherRegistry, worker_id: &str) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let exits = registry.drain_exits(worker_id);
+            if !exits.is_empty() || Instant::now() >= deadline {
+                return exits.into_iter().map(|(_, exit)| exit.status).collect();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     /// One launcher serves every worker group placed on its host: the exits
     /// it reports are routed to the group they belong to, and a stop names
@@ -510,8 +598,10 @@ mod tests {
                 .expect("the launcher presents");
             stream
                 .write_all(
-                    b"{\"worker_id\":\"model\",\"rank\":5,\"status\":\"exit status: 1\"}\n\
-                      {\"worker_id\":\"host\",\"rank\":1,\"status\":\"exit status: 2\"}\n",
+                    b"{\"worker_id\":\"model\",\"generation\":0,\"rank\":5,\
+                      \"status\":\"exit status: 1\"}\n\
+                      {\"worker_id\":\"host\",\"generation\":0,\"rank\":1,\
+                      \"status\":\"exit status: 2\"}\n",
                 )
                 .expect("the launcher reports two exits");
             let mut line = String::new();
@@ -545,5 +635,71 @@ mod tests {
         registry.stop_worker("host").expect("the stop is sent");
         let stop = launcher.join().expect("the launcher thread ends");
         assert_eq!(stop.trim(), "{\"stop\":{\"worker_id\":\"host\"}}");
+    }
+
+    /// A stop ends a group's generation: an exit its launcher reported for
+    /// a stopped rank before reading the stop, and which the head has not
+    /// read when it relaunches the group, is not attributed to the relaunch,
+    /// while an exit of a relaunched rank is.
+    #[test]
+    fn an_exit_reported_before_a_stop_is_not_attributed_to_the_relaunch() {
+        let mut registry = LauncherRegistry::bind().expect("a registry binds");
+        let address = registry.address().to_owned();
+        let (reported, stale_exit_written) = std::sync::mpsc::channel();
+        let launcher = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("the launcher connects");
+            stream
+                .write_all(b"{\"host\":\"b\"}\n")
+                .expect("the launcher presents");
+            let mut reader = BufReader::new(stream.try_clone().expect("the connection splits"));
+
+            // A launcher reports an exit under the generation its rank's
+            // spawn carried.
+            let mut report = |spawn: &serde_json::Value, status: &str| {
+                let exit = serde_json::json!({
+                    "worker_id": spawn["spawn"]["worker_id"],
+                    "generation": spawn["spawn"]["generation"],
+                    "rank": spawn["spawn"]["rank"],
+                    "status": status,
+                });
+                writeln!(stream, "{exit}").expect("the launcher reports an exit");
+            };
+
+            // The failed rank's exit is written before the stop is read.
+            let failed = receive(&mut reader);
+            report(&failed, "signal: 9 (SIGKILL)");
+            reported.send(()).expect("the head awaits the report");
+            let stop = receive(&mut reader);
+            let relaunched = receive(&mut reader);
+            report(&relaunched, "exit status: 1");
+            stop
+        });
+        registry
+            .await_hosts(&["b".to_owned()], Duration::from_secs(5))
+            .expect("host b presents");
+
+        let descriptor = serde_json::json!({});
+        let launch = || RemoteLaunch {
+            rank: 5,
+            worker_id: "model",
+            world_size: 8,
+            python: "python3",
+            descriptor: &descriptor,
+            environment: HashMap::new(),
+        };
+        registry
+            .spawn_remote("b", launch())
+            .expect("the rank is launched");
+        stale_exit_written
+            .recv()
+            .expect("the launcher reports the failed rank");
+        registry.stop_worker("model").expect("the stop is sent");
+        registry
+            .spawn_remote("b", launch())
+            .expect("the rank is relaunched");
+
+        assert_eq!(await_exits(&mut registry, "model"), ["exit status: 1"]);
+        let stop = launcher.join().expect("the launcher thread ends");
+        assert_eq!(stop, serde_json::json!({"stop": {"worker_id": "model"}}));
     }
 }
