@@ -17,7 +17,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::profile::assets::error::{Error, Result};
-use crate::profile::assets::model_files::resolve_model_file;
+use crate::profile::assets::model_files::ModelSource;
 
 /// Index files consulted in order: the classic pipeline index, then the modular one.
 ///
@@ -95,15 +95,22 @@ impl PipelineIndex {
 
 /// Resolves the root index of a diffusers pipeline checkpoint.
 ///
-/// A repository that publishes neither index file is not a pipeline
-/// checkpoint, so a resolution failure yields `None` rather than an error.
-/// Any `resolve_model_file` failure counts as absence, including a network or
-/// authentication error for a Hub repository. An index that resolves but
-/// cannot be read or parsed is an error.
+/// A checkpoint that publishes neither index file is not a pipeline
+/// checkpoint: [`Error::MissingFile`] for both files yields `None`. Any other
+/// resolution failure, such as a refused, rate-limited or unreachable Hub
+/// request, is returned, since it says nothing about whether the index
+/// exists. An index that resolves but cannot be read or parsed is an error.
 pub async fn resolve_pipeline_index(model_id: &str) -> Result<Option<PipelineIndex>> {
+    pipeline_index(&ModelSource::from_model_id(model_id)?).await
+}
+
+/// Resolves the root index from an already classified model source.
+async fn pipeline_index(source: &ModelSource) -> Result<Option<PipelineIndex>> {
     for filename in PIPELINE_INDEX_FILES {
-        if let Ok(path) = resolve_model_file(model_id, filename).await {
-            return read_pipeline_index(&path).map(Some);
+        match source.file(filename).await {
+            Ok(path) => return read_pipeline_index(&path).map(Some),
+            Err(Error::MissingFile { .. }) => continue,
+            Err(error) => return Err(error),
         }
     }
     Ok(None)
@@ -120,7 +127,10 @@ fn read_pipeline_index(path: &Path) -> Result<PipelineIndex> {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
+
     use super::*;
+    use crate::profile::assets::hub_stub::HubStub;
 
     #[test]
     fn a_modular_component_resolves_to_its_declared_subfolder() {
@@ -165,5 +175,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(resolved, None);
+    }
+
+    const REPO: &str = "org/pipeline";
+    const MODULAR_INDEX: &str = r#"{"_class_name": "MiniMaxH3ModularPipeline"}"#;
+
+    /// A Hub repository that publishes an index is a pipeline, and one that
+    /// publishes neither index file is not.
+    #[tokio::test]
+    async fn a_hub_repository_is_a_pipeline_when_it_publishes_an_index() {
+        let root = tempfile::tempdir().unwrap();
+        let pipeline = HubStub::with_files(&[("modular_model_index.json", MODULAR_INDEX)])
+            .serve(root.path(), REPO)
+            .await;
+        let plain = HubStub::with_files(&[("config.json", r#"{"model_type":"qwen3"}"#)])
+            .serve(root.path(), "org/plain")
+            .await;
+
+        let index = pipeline_index(&pipeline).await.unwrap().unwrap();
+
+        assert_eq!(index.class_name, "MiniMaxH3ModularPipeline");
+        assert_eq!(pipeline_index(&plain).await.unwrap(), None);
+    }
+
+    /// A download the Hub refuses is reported as a remote failure rather than
+    /// taken as a checkpoint without an index.
+    #[tokio::test]
+    async fn a_refused_index_download_is_a_remote_error() {
+        let root = tempfile::tempdir().unwrap();
+        let source = HubStub {
+            download_status: Some(StatusCode::UNAUTHORIZED),
+            ..HubStub::with_files(&[("modular_model_index.json", MODULAR_INDEX)])
+        }
+        .serve(root.path(), REPO)
+        .await;
+
+        let error = pipeline_index(&source).await.unwrap_err();
+
+        assert!(matches!(error, Error::Remote { .. }), "{error:?}");
     }
 }
