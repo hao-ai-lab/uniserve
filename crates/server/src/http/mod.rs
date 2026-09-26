@@ -12,7 +12,7 @@ mod listener;
 mod middleware;
 mod routes;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 mod utils;
 
 use std::sync::{Arc, OnceLock};

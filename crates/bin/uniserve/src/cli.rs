@@ -22,6 +22,7 @@ use uniserve_engine::{
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
     FlashInferBackend, LaneConfig, TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
+use uniserve_server::serving::systemone::{CanvasMode, ReadoutLayout, ReadoutOptions};
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineSettings, HttpListenerMode, ImageFetchPolicy,
     SchedulingPolicy,
@@ -283,6 +284,18 @@ pub(crate) struct SharedRuntimeArgs {
     /// The single model name used in the API. Defaults to the resolved model ID.
     #[arg(long)]
     pub served_model_name: Option<String>,
+
+    /// How a DiffusionGemma server divides System One questions among
+    /// readout prompts and canvases: `joint` packs questions in request order
+    /// into shared canvases up to the canvas length; `independent` gives every
+    /// question its own prompt and canvas.
+    #[arg(long = "readout-layout", default_value = "joint")]
+    pub readout_layout: ReadoutLayout,
+    /// Length of every System One readout canvas on a DiffusionGemma server:
+    /// `full` is the checkpoint's canvas length; `compact` the smallest
+    /// multiple of 16 tokens that holds the answer scaffold.
+    #[arg(long = "readout-canvas", default_value = "full")]
+    pub readout_canvas: CanvasMode,
 }
 
 impl SharedRuntimeArgs {
@@ -410,6 +423,10 @@ impl SharedRuntimeArgs {
                 timeout: Duration::from_secs(self.image_fetch_timeout),
                 max_bytes: self.image_fetch_max_bytes,
                 allow_private: self.allow_private_image_urls,
+            },
+            readout: ReadoutOptions {
+                layout: self.readout_layout,
+                canvas: self.readout_canvas,
             },
         }
     }

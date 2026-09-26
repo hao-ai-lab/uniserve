@@ -20,6 +20,11 @@ use super::{
     CanvasMode, ImageSize, ReadoutEncoder, ReadoutLayout, ReadoutOptions, ReadoutPlan,
     StartupError, SystemOneError, SystemOneRequest,
 };
+use axum::http::StatusCode;
+use base64::Engine as _;
+
+use crate::http::test_support::{SERVED_MODEL, post_json, send, sim_state};
+use crate::profile::ModelParameters;
 use crate::profile::assets::ResolvedModelFiles;
 use crate::profile::diffusion_gemma::{
     ControlTokens, DenoisingDefaults, DiffusionGemmaProfile, PatchBudget,
@@ -738,4 +743,150 @@ fn a_tokenizer_that_merges_two_letter_labels_is_refused_at_startup() {
         matches!(&error, StartupError::Contract(message) if message.contains("\" C D\"")),
         "{error}"
     );
+}
+
+/// Application state serving `checkpoint`'s readout over the engine
+/// simulator, which answers every candidate with a fixed log-probability.
+fn readout_router(checkpoint: &Checkpoint, options: ReadoutOptions) -> axum::Router {
+    let runtime = crate::http::test_support::sim_runtime(ModelParameters::DiffusionGemma(
+        checkpoint.profile.clone(),
+    ))
+    .with_readout(checkpoint.encoder(options, 4096));
+    crate::http::build_router(Arc::new(crate::AppState::new(runtime)))
+}
+
+fn readout_body(questions: Value) -> Value {
+    json!({
+        "model": SERVED_MODEL,
+        "state": "A support ticket.",
+        "questions": questions,
+    })
+}
+
+/// A readout request travels through the route, the engine's prefill and
+/// canvas passes, and answer assembly: every question is answered in request
+/// order with a distribution over its keys, and usage counts the prompt
+/// tokens the plan encodes. With the independent layout the second prompt
+/// runs after the first has cached their shared prefix.
+#[tokio::test]
+async fn the_route_answers_every_question_from_the_engine_readout() {
+    let checkpoint = Checkpoint::new(&[]);
+    let options = ReadoutOptions {
+        layout: ReadoutLayout::Independent,
+        canvas: CanvasMode::Full,
+    };
+    let router = readout_router(&checkpoint, options);
+    let questions = json!({"urgent": noul("Is it urgent?"), "team": choice(3)});
+    let expected = checkpoint
+        .encoder(options, 4096)
+        .plan(&request(questions.clone()), &[])
+        .unwrap();
+
+    let (status, _, body) = send(
+        &router,
+        post_json("/v1/systemone", &readout_body(questions)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], SERVED_MODEL);
+    assert_eq!(body["usage"]["input_tokens"], expected.input_tokens);
+    assert_eq!(body["usage"]["output_tokens"], 0);
+    let answers = body["answers"].as_object().unwrap();
+    assert_eq!(answers.keys().collect::<Vec<_>>(), ["urgent", "team"]);
+    let noul = &answers["urgent"];
+    assert_eq!(noul["type"], "noul");
+    assert!((0.0..=1.0).contains(&noul["noul"].as_f64().unwrap()));
+    let team = &answers["team"];
+    assert_eq!(team["type"], "choice");
+    let total: f64 = team["probabilities"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|value| value.as_f64().unwrap())
+        .sum();
+    assert!((total - 1.0).abs() < 1e-9, "{team}");
+    assert!(team["x_candidate_mass"].as_f64().unwrap() > 0.0);
+}
+
+/// An attached image travels to the engine as an encoded image whose soft
+/// tokens the usage counts.
+#[tokio::test]
+async fn the_route_reads_out_over_an_attached_image() {
+    let checkpoint = Checkpoint::new(&[]);
+    let router = readout_router(&checkpoint, ReadoutOptions::default());
+    let mut png = Vec::new();
+    image::RgbImage::new(96, 48)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let source = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&png)
+    );
+    let mut body = readout_body(json!({"urgent": noul("Is it urgent?")}));
+    body["x_images"] = json!([source]);
+    let expected = checkpoint
+        .encoder(ReadoutOptions::default(), 4096)
+        .plan(
+            &request_with(body.clone()),
+            &[ImageSize {
+                width: 96,
+                height: 48,
+            }],
+        )
+        .unwrap();
+
+    let (status, _, answer) = send(&router, post_json("/v1/systemone", &body)).await;
+
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(expected.prompts[0].images[0].soft_tokens > 0);
+    assert_eq!(answer["usage"]["input_tokens"], expected.input_tokens);
+    assert_eq!(answer["answers"]["urgent"]["type"], "noul");
+}
+
+/// Refusals keep the official FastAPI shapes: another model is `404` with a
+/// message, and an invalid or malformed body is `422` with its issues.
+#[tokio::test]
+async fn the_route_refuses_another_model_and_invalid_bodies() {
+    let checkpoint = Checkpoint::new(&[]);
+    let router = readout_router(&checkpoint, ReadoutOptions::default());
+
+    let mut other = readout_body(json!({"urgent": noul("Is it urgent?")}));
+    other["model"] = json!("another-model");
+    let (status, _, body) = send(&router, post_json("/v1/systemone", &other)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["detail"].as_str().unwrap().contains("another-model"));
+
+    let (status, _, body) = send(
+        &router,
+        post_json("/v1/systemone", &readout_body(json!({}))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["detail"][0]["loc"], json!(["body", "questions"]));
+
+    let malformed = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/systemone")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from("{"))
+        .unwrap();
+    let (status, _, body) = send(&router, malformed).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["detail"][0]["type"], "json_invalid");
+}
+
+/// A model without the readout does not serve the route.
+#[tokio::test]
+async fn a_model_without_the_readout_does_not_serve_the_route() {
+    let router = crate::http::build_router(Arc::new(sim_state(ModelParameters::Qwen3)));
+
+    let (status, _, body) = send(
+        &router,
+        post_json("/v1/systemone", &readout_body(json!({"a": noul("A?")}))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, json!({"detail": "Not Found"}));
 }

@@ -2,7 +2,7 @@
 
 UniServe provides a Python computation library and an OpenAI-compatible inference server for text and omni models. `uniserve` supplies numerical layers, loading and resource binding; `uniserve_models` composes the concrete models; `uniserve_worker` executes serving requests with those same numerical implementations. Rust owns HTTP admission, tokenization, scheduling, generation state, cache accounting and response assembly.
 
-The configured model descriptions are `qwen3`, `sensenova`, `bagel`, and `minimax-h3`. A server process loads exactly one description and exposes one served-model identity.
+The configured model descriptions are `qwen3`, `sensenova`, `bagel`, `minimax-h3`, and `diffusion-gemma`. A server process loads exactly one description and exposes one served-model identity.
 
 ## Requirements
 
@@ -59,6 +59,7 @@ Run `uniserve serve --help` for the complete option set.
 | `GET /v1/models` | Configured served model |
 | `POST /v1/chat/completions` | Streaming and non-streaming text, image-input, image-output, and interleaved generation |
 | `POST /v1/images/generations` | Single-image generation adapter for configured omni descriptions |
+| `POST /v1/systemone` | TypeSafe System One decision readout (DiffusionGemma) |
 
 List the configured model:
 
@@ -114,6 +115,30 @@ curl -s http://127.0.0.1:8000/v1/images/generations \
 
 Each image response entry carries `b64_json`, pixel `height` and `width`, and the encoded PNG byte count `bytes`; `revised_prompt` is included when available. Request timing starts before preprocessing and includes queueing and generation.
 
+Serve a DiffusionGemma checkpoint with `--page-size 32`: its sliding-window layers have the widest KV rows, so their 32-token pages give the full-attention layers the 64-token pages their native kernels read.
+
+```bash
+uniserve serve /models/diffusiongemma-26B-A4B-it \
+  --served-model-name diffusion-gemma \
+  --page-size 32
+```
+
+A DiffusionGemma server answers System One 0.2.0 requests: a `state` and named `noul`, `choice`, or `score` questions. It renders the questions into readout prompts, denoises each answer canvas once over its prompt, and reads every answer from the full-vocabulary probabilities of its answer tokens; nothing is generated, so `usage.output_tokens` is 0. Every answer also carries `x_candidate_mass`, the unnormalized probability of all its answer tokens; a value near 0 means the model did not answer within them. The optional `x_images` field attaches 1 to 8 images, as `data:image/...;base64` or `http(s)` URLs fetched under the same rules as chat images, which the prompt names Image 1 to Image n. Validation failures are 422 with FastAPI's `{"detail": [...]}` body, another model name is 404, and inference failures are 500 with `{"detail": ...}`.
+
+```bash
+curl -s http://127.0.0.1:8000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "diffusion-gemma",
+    "state": "Help! My payouts have been failing for 3 days.",
+    "questions": {
+      "spam": {"type": "noul", "instructions": "Is this message spam?"},
+      "team": {"type": "choice", "instructions": "Which team should handle this?",
+               "criteria": {"billing": "Payments and refunds", "technical": "Bugs and outages"}}
+    }
+  }'
+```
+
 
 ## Serving configuration
 
@@ -134,11 +159,13 @@ Each image response entry carries `b64_json`, pixel `height` and `width`, and th
 | `--attention-backend` | `auto` | Worker attention provider selection |
 | `--api-key` | Unset | Bearer token for public routes |
 | `--request-timeout` | Unset | Seconds until a response head is sent; streamed bodies (chat SSE and video downloads) are not bounded |
-| `--max-concurrent-requests` | Unset | In-flight bound for chat completion and image generation requests (503 above it); video requests share the video job slots instead |
+| `--max-concurrent-requests` | Unset | In-flight bound for chat completion, image generation, and System One requests (503 above it); video requests share the video job slots instead |
 | `--shutdown-timeout` | `30` | Graceful drain bound in seconds |
 | `--image-fetch-timeout` | `20` | Seconds allowed to fetch one `http(s)` image URL, including redirects and the complete body |
 | `--image-fetch-max-bytes` | `20000000` | Largest accepted input image in bytes, for fetched URLs and `data:` URLs alike |
 | `--allow-private-image-urls` | Off | Allow image URLs that resolve to loopback, private, link-local, unique-local, or cloud metadata addresses |
+| `--readout-layout` | `joint` | System One question grouping: `joint` packs questions in request order into shared canvases; `independent` gives each question its own prompt and canvas |
+| `--readout-canvas` | `full` | System One canvas length: `full` is the checkpoint's canvas length; `compact` the smallest multiple of 16 tokens holding the answer scaffold |
 
 For tensor-parallel execution, select one rank per participating GPU:
 

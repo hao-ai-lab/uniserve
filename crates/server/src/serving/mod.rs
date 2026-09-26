@@ -361,6 +361,8 @@ pub struct ServingRuntime {
     model: Arc<InputProcessor>,
     engine: Arc<EngineClient>,
     images: media::ImageFetcher,
+    // The System One readout encoder of a model that serves the endpoint.
+    readout: Option<Arc<systemone::ReadoutEncoder>>,
     // Held only to keep the periodic logging task alive; dropping the logger aborts the task.
     _stats_logger: Option<Arc<crate::engine_client::generation::log_stats::StatsLogger>>,
     // Cumulative lifecycle counters shared with every request's lifecycle guard and assembler.
@@ -389,9 +391,17 @@ impl ServingRuntime {
             model: Arc::new(model),
             engine,
             images,
+            readout: None,
             _stats_logger: stats_logger,
             metrics: Arc::new(RuntimeLifecycleMetrics::default()),
         }
+    }
+
+    /// Serves `POST /v1/systemone` with `encoder`, prepared for this model.
+    #[must_use]
+    pub fn with_readout(mut self, encoder: systemone::ReadoutEncoder) -> Self {
+        self.readout = Some(Arc::new(encoder));
+        self
     }
 
     /// Returns the resolved model owned by this runtime.

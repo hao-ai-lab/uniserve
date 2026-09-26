@@ -19,6 +19,9 @@
 //!    [`ReadoutPlan::assemble`] turns into the official response, with the
 //!    `x_candidate_mass` extension on every answer.
 //!
+//! [`ServingRuntime::systemone`](crate::serving::ServingRuntime::systemone)
+//! runs these steps for one request body.
+//!
 //! The readout matches the reference DJev encoder token for token for every
 //! request it accepts; `prompt` documents the text rules for the official
 //! inputs it does not.
@@ -31,6 +34,7 @@ mod plan;
 mod prompt;
 mod python;
 mod request;
+mod serve;
 #[cfg(test)]
 mod tests;
 mod vocabulary;
