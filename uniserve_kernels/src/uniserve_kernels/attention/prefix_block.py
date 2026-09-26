@@ -33,11 +33,12 @@ otherwise, matching the ``base2`` flag of
 :func:`uniserve_kernels.attention.merge.merge_attention_states`.
 
 Supported configuration: CUDA compute capability 10.x, BF16 Q/K/V, caches
-and output, head dimension 256, query heads a multiple of KV heads with at
-most 128 query heads per KV head dividing 128, and 16, 32 or 64 tokens per
-page. :func:`can_run` checks a call without launching it.
+and output, head dimension 256 or 512, query heads a multiple of KV heads
+with the query heads per KV head dividing 128 (head dimension 256) or 64
+(head dimension 512), and 16, 32 or 64 tokens per page. :func:`can_run`
+checks a call without launching it.
 
-Each distinct specialization (see ``_compile_key``) compiles once per
+Each distinct specialization (the executor cache key) compiles once per
 process on first use; :func:`prefix_block_attention` refuses to compile
 during CUDA graph capture, so every specialization must run once before
 capture.
@@ -76,10 +77,11 @@ else:  # pragma: no cover
 _EXECUTORS: dict[tuple[object, ...], Callable[..., None]] = {}
 _SM_COUNTS: dict[int, int] = {}
 
-HEAD_DIMS = (256,)
+HEAD_DIMS = (256, 512)
 PAGE_TOKENS = (16, 32, 64)
-# Packed rows of one work tile, computed by a two-CTA cluster.
-_TILE_ROWS = 256
+# Packed rows of one work tile, computed by a two-CTA cluster, by head
+# dimension: a 512-wide accumulator allows 64 rows per CTA.
+_TILE_ROWS = {256: 256, 512: 128}
 
 
 def available(device: torch.device | None = None) -> bool:
@@ -132,8 +134,11 @@ def _check(
     if kv_heads < 1 or query_heads % kv_heads:
         return "query heads must be a multiple of KV heads"
     group = query_heads // kv_heads
-    if 128 % group:
-        return "query heads per KV head must divide 128"
+    if (_TILE_ROWS[head_dim] // 2) % group:
+        return (
+            "query heads per KV head must divide "
+            f"{_TILE_ROWS[head_dim] // 2} at head_dim {head_dim}"
+        )
     pages, page_tokens, cache_heads, cache_dim = key_cache.shape
     if page_tokens not in PAGE_TOKENS:
         return f"page_tokens {page_tokens} is not one of {PAGE_TOKENS}"
@@ -377,7 +382,8 @@ def prefix_block_attention(
     batch = prefix_lengths.shape[0]
     kv_heads = key.shape[1]
     group = query.shape[1] // kv_heads
-    num_m_blocks = max(1, -(-max_query_len * group // _TILE_ROWS))
+    tile_rows = _TILE_ROWS[query.shape[2]]
+    num_m_blocks = max(1, -(-max_query_len * group // tile_rows))
     total_tiles = batch * kv_heads * num_m_blocks
     if batch == 0 or max_query_len == 0:
         return out
