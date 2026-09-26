@@ -15,7 +15,7 @@ from torch import nn
 from uniserve.model import TransformerDecoder
 from uniserve.nn.attention import Attention as ScaledAttention
 from uniserve.nn.attention import AttentionBatch
-from uniserve.nn.functional import qk_norm_rope
+from uniserve.nn.functional import qk_norm_rope, sandwich_rms_norm
 from uniserve.nn.linear import (
     Linear,
     MergedColumnParallelLinear,
@@ -124,16 +124,16 @@ class Attention(nn.Module):
 class Router(nn.Module):
     """Select experts from the unweighted-normalized, rescaled layer stream.
 
-    Scores are ``projection(rms(x) * scale * hidden^-1/2)``. The top-k of
-    their full softmax renormalize to one and then multiply by each
-    selected expert's ``per_expert_scale``. Returns int32 expert ids and FP32
-    weights, both ``[tokens, top_k]``.
+    Scores are ``projection(rms(x) * scale * hidden^-1/2)``; the layer
+    computes that input with its sandwich normalization (see
+    :meth:`input_factors`). The top-k of their full softmax renormalize to
+    one and then multiply by each selected expert's ``per_expert_scale``.
+    Returns int32 expert ids and FP32 weights, both ``[tokens, top_k]``.
     """
 
     def __init__(self, config: TextConfig):
         super().__init__()
         size = config.hidden_size
-        self.norm = RMSNorm(size, config.rms_norm_eps, elementwise_affine=False)
         self.scale = nn.Parameter(torch.ones(size), requires_grad=False)
         self.projection = Linear(size, config.num_experts, bias=False)
         self.topk = TopK(config.top_k_experts, renormalize=True)
@@ -142,18 +142,25 @@ class Router(nn.Module):
         )
         self.root_size = size**-0.5
 
+    def input_factors(self) -> tuple:
+        """The router input as a sandwich normalization entry: the stream
+        normalized without weight, times ``scale``, times ``hidden^-1/2``.
+        """  # noqa: D205
+        return (None, self.scale, self.root_size)
+
     def forward(
-        self, hidden: torch.Tensor
+        self, scaled: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        scaled = self.norm(hidden) * self.scale * self.root_size
         return self.topk(self.projection(scaled), scale=self.per_expert_scale)
 
 
 class MoE(nn.Module):
     """Routed expert branch of a layer, with its own input and output norms.
 
-    The router reads the layer's stream as it is; the experts read its
-    normalization. Every expert is a tanh-GELU gated MLP.
+    The router and the experts read two normalizations of the layer's
+    stream, and the output norm scales the experts' sum; the layer applies
+    all three in its sandwich normalizations. Every expert is a tanh-GELU
+    gated MLP.
     """
 
     def __init__(self, config: TextConfig):
@@ -170,11 +177,14 @@ class MoE(nn.Module):
         )
         self.output_norm = RMSNorm(size, eps)
 
-    def forward(self, stream: torch.Tensor) -> torch.Tensor:
-        ids, weights = self.router(stream)
-        return self.output_norm(
-            self.experts(self.input_norm(stream), ids, weights)
-        )
+    def forward(
+        self, routed: torch.Tensor, hidden: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the experts' unnormalized sum for the router input
+        ``routed`` and the expert input ``hidden``.
+        """  # noqa: D205
+        ids, weights = self.router(routed)
+        return self.experts(hidden, ids, weights)
 
 
 class Layer(nn.Module):
@@ -182,7 +192,10 @@ class Layer(nn.Module):
 
     With ``h = x + post_attention_norm(attention(input_norm(x)))`` the layer
     returns ``(h + post_feedforward_norm(dense(h) + moe(h))) * layer_scalar``,
-    where ``dense(h) = post_mlp_norm(mlp(pre_feedforward_norm(h)))``. The
+    where ``dense(h) = post_mlp_norm(mlp(pre_feedforward_norm(h)))`` and
+    ``moe(h)`` is the MoE output norm of its experts, which read the MoE
+    input norm and the router input of ``h``. Two sandwich normalizations
+    evaluate everything between the attention, MLP and expert calls. The
     scalar rescales the whole stream, so the layer cannot defer its residual
     addition: it receives and returns ``residual=None`` and ``hidden`` is
     the complete stream, rounded where the reference rounds it.
@@ -191,6 +204,7 @@ class Layer(nn.Module):
     def __init__(self, config: TextConfig, index: int):
         super().__init__()
         size, eps = config.hidden_size, config.rms_norm_eps
+        self.eps = eps
         self.input_norm = RMSNorm(size, eps)
         self.attention = Attention(config, config.layers[index], index)
         self.post_attention_norm = RMSNorm(size, eps)
@@ -215,11 +229,31 @@ class Layer(nn.Module):
             raise ValueError("DiffusionGemma layers carry the complete stream")
 
         attended = self.attention(self.input_norm(hidden), positions, attention)
-        stream = hidden + self.post_attention_norm(attended)
+        stream, (dense_input, expert_input, routed) = sandwich_rms_norm(
+            hidden,
+            ((attended, None),),
+            self.post_attention_norm.weight,
+            eps=self.eps,
+            norms=(
+                (self.pre_feedforward_norm.weight,),
+                (self.moe.input_norm.weight,),
+                self.moe.router.input_factors(),
+            ),
+        )
 
-        dense = self.post_mlp_norm(self.mlp(self.pre_feedforward_norm(stream)))
-        stream = stream + self.post_feedforward_norm(dense + self.moe(stream))
-        return stream * self.layer_scalar, None
+        dense = self.mlp(dense_input)
+        experts = self.moe(routed, expert_input)
+        stream, _ = sandwich_rms_norm(
+            stream,
+            (
+                (dense, self.post_mlp_norm.weight),
+                (experts, self.moe.output_norm.weight),
+            ),
+            self.post_feedforward_norm.weight,
+            eps=self.eps,
+            scale=self.layer_scalar,
+        )
+        return stream, None
 
 
 class Backbone(TransformerDecoder):
