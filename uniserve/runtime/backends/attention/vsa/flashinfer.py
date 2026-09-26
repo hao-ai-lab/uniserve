@@ -111,6 +111,7 @@ class _Operator(BaseOperator):
 
 
 class Backend(BaseBackend):
+    name = "flashinfer"
     operator_class = _Operator
 
     def workspace_buffers(self, pattern, *, num_heads, head_dim, dtype):

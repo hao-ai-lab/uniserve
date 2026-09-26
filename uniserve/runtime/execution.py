@@ -689,6 +689,41 @@ class ExecutionContext(Generic[SizeT]):
             for binding in readers:
                 binding.bind(mirrored, source=batch)
 
+    def kernels(self) -> list[dict[str, object]]:
+        """Describe the kernel prepared at every call site of this context.
+
+        Returns one record per call site and prepared representation, in
+        module order. Each record holds ``path``, the call site's module path
+        within the prepared module, and ``op``: ``attention``, ``vsa``,
+        ``moe`` or ``matmul``. The rest describes the call site's
+        representation and the ``provider`` its binding resolved; automatic
+        attention selection also reports, under ``inputs``, the provider
+        that served each input class the call site met. Call sites prepare
+        and select lazily, so read this after the calls to report have run,
+        for example after warmup and graph capture. A closed context reports
+        nothing.
+        """
+        module = self.module
+        if module is None:
+            return []
+
+        records: list[dict[str, object]] = []
+        for path, child in module.named_modules():
+            bindings = (
+                self._merged.get(id(child))
+                if isinstance(child, MergedColumnParallelLinear)
+                else self._operators.get(id(child)),
+                self._moe.get(id(child)),
+                self._vsa.get(id(child)),
+                self._attention.get(id(child)),
+            )
+            for binding in bindings:
+                if binding is not None:
+                    records.extend(
+                        {"path": path, **record} for record in binding.kernels()
+                    )
+        return records
+
     @contextmanager
     def activate(self):
         """Enter this context's execution scopes.

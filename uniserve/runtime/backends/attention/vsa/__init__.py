@@ -177,6 +177,7 @@ class Operator:
 class Backend:
     """Construct operators and their workspace for one concrete VSA provider."""
 
+    name: str
     operator_class: type[Operator]
 
     def workspace_buffers(

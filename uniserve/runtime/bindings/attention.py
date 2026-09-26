@@ -11,6 +11,7 @@ import torch
 from uniserve.model.inputs import TextSize
 from uniserve.nn import _binding
 from uniserve.nn.attention.inputs import DenseInput
+from uniserve.quantization import QuantizedTensor
 
 from ..backends import attention as attention_backend
 from . import capturing
@@ -68,6 +69,8 @@ class AttentionBinding:
         self.table = table
         self.device, self.dtype, self.allocate = device, dtype, allocate
         self.operators = {}
+        # Name of the provider each prepared dtype's operator belongs to.
+        self.providers = {}
         self._bound = set()
         self._bound_batches = {}
         self.batch = None
@@ -145,8 +148,41 @@ class AttentionBinding:
             **options, workspace=self.allocate(requirements, self.device)
         )
         self.operators[dtype] = operator
+        self.providers[dtype] = provider.name
         self._bound.discard(dtype)
         return operator
+
+    def kernels(self):
+        """Describe the kernels serving this call site, one per dtype.
+
+        Each record carries the layer's local head counts, head dimension,
+        history window and cache storage, the prepared ``provider`` and the
+        provider serving each input class the call site has met
+        (``inputs``; see ``Operator.selections``). A provider other than
+        automatic selection serves every input itself.
+        """
+        cache = None
+        if self.cache is not None:
+            storage = (
+                "per-block FP8"
+                if isinstance(self.cache.key, QuantizedTensor)
+                else str(self.cache.key.dtype).removeprefix("torch.")
+            )
+            cache = f"{storage} pages of {self.cache.block_size} tokens"
+        return [
+            {
+                "op": "attention",
+                "heads": self.module.local_heads,
+                "kv_heads": self.module.local_kv_heads,
+                "head_dim": self.module.head_dim,
+                "window": self.module.window,
+                "dtype": str(dtype).removeprefix("torch."),
+                "cache": cache,
+                "provider": self.providers[dtype],
+                "inputs": dict(operator.selections()),
+            }
+            for dtype, operator in self.operators.items()
+        ]
 
     def partitions_tokens(self):
         """Report whether token partitions read exact host lengths."""
@@ -307,6 +343,7 @@ class AttentionBinding:
         for operator in self.operators.values():
             operator.close()
         self.operators.clear()
+        self.providers.clear()
         self._bound_batches.clear()
         self.context_plans.clear()
         self.cache_batches.clear()

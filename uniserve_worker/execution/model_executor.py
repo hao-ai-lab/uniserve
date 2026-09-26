@@ -92,6 +92,10 @@ from uniserve_worker.errors import (
     classify,
     invalid_descriptor,
 )
+from uniserve_worker.execution.kernel_table import (
+    format_kernel_table,
+    kernel_table,
+)
 from uniserve_worker.model_executor.component_binding import (
     ComponentBinding,
 )
@@ -1437,12 +1441,27 @@ class ModelExecutor:
 
         for _, stream in self._lane_streams:
             stream.verify()
-        self._startup_complete = True
-        for entry in (
+
+        runners = (
             *self.entries.values(),
             *self._module_entries.values(),
             *(() if self._diffusion is None else (self._diffusion,)),
-        ):
+        )
+        # Warmup and capture have now prepared every call site and resolved
+        # every selection the served call kinds make.
+        logger.info(
+            "%s",
+            format_kernel_table(
+                kernel_table(
+                    runners,
+                    rank=self.worker_config.rank,
+                    device=str(self.worker_config.device),
+                )
+            ),
+        )
+
+        self._startup_complete = True
+        for entry in runners:
             entry._startup_complete = True
 
     def synchronize(self):

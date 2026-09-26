@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from uniserve.model.inputs import TextSize
+from uniserve.quantization import QuantizedTensor, RowOrder
 
 from ..backends import moe as moe_backend
 from . import capturing
@@ -20,6 +21,7 @@ class MoEBinding:
         self.allocate = allocate
         self.size = size
         self.operator = None
+        self.provider = None
 
     def prepare(self, size: TextSize):
         previous = self.operator
@@ -46,7 +48,40 @@ class MoEBinding:
         if previous is not None:
             previous.close()
         self.operator = operator
+        self.provider = provider.name
         return operator
+
+    def kernels(self):
+        """Describe the grouped-expert kernel serving this call site.
+
+        The record names the prepared provider, the expert count, and each
+        projection's weight representation and resident row order (the
+        physical order the provider placed; ``linear`` is logical order).
+        Empty until the call site is prepared.
+        """
+        if self.operator is None:
+            return []
+        projections = {}
+        for name in ("up_gate", "down"):
+            weight = getattr(self.module, name).weight
+            quantized = isinstance(weight, QuantizedTensor)
+            projections[name] = {
+                "weight": weight.quantizer.format
+                if quantized
+                else str(weight.dtype).removeprefix("torch."),
+                "row_order": weight.row_order.value
+                if quantized
+                else RowOrder.LINEAR.value,
+            }
+        return [
+            {
+                "op": "moe",
+                "provider": self.provider,
+                "experts": self.module.num_experts,
+                "activation": self.module.activation,
+                **projections,
+            }
+        ]
 
     def __call__(self, hidden, topk_ids, topk_weights):
         operator = self.prepare(TextSize(hidden.shape[0], 1))
@@ -55,4 +90,4 @@ class MoEBinding:
     def close(self):
         if self.operator is not None:
             self.operator.close()
-        self.operator = None
+        self.operator = self.provider = None
