@@ -1129,11 +1129,12 @@ class ModelExecutor:
         config = self.worker_config
         self._initialize_streams(event_slots=max_inflight + 1)
 
-        # A decode or prefill row holds at least one page of every cache
-        # group, so the pool's allocatable units bound the rows of either
-        # call. A prefill call holds at most the text tokens its staging
-        # accepts, the batch token budget plus one image's feature span, and
-        # at most the tokens the pool's units cover.
+        # A decode or prefill row, and the request of every canvas a call
+        # reads, holds at least one page of every cache group, so the pool's
+        # allocatable units bound the rows of each call. A prefill call holds
+        # at most the text tokens its staging accepts, the batch token budget
+        # plus one image's feature span, and at most the tokens the pool's
+        # units cover.
         max_rows = min(max_calls, request_slots)
         pool_rows = (kv_cache.info.num_units - 1) // kv_cache.row_units
         decode_sizes = decode_captures(
@@ -1385,6 +1386,8 @@ class ModelExecutor:
 
                 entry.decode_shapes, entry.prefill_shapes = decode, prefill
                 entry.table_widths = self.table_widths
+                if isinstance(entry, CanvasRunner):
+                    entry.pool_rows = pool_rows
 
                 for kind in kinds:
                     key = (name, kind)

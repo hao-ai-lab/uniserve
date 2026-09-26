@@ -70,6 +70,9 @@ class CanvasRunner(ModelRunner):
         mesh = self.model.backbone.mesh
         self.pipeline = mesh.get_group("pp" if "pp" in mesh.axes else ())
         self.canvas_slots = None
+        # Rows of one page of every cache group the KV unit pool holds, set
+        # by ``ModelExecutor.bind``; None leaves canvases unbounded by it.
+        self.pool_rows: int | None = None
 
     @property
     def canvas_length(self) -> int:
@@ -82,10 +85,15 @@ class CanvasRunner(ModelRunner):
 
         With graph pools a readout bucket stages up to twice its canvases
         as sequences, so staging holds twice the canvases (see
-        ``canvas_staging_rows``).
+        ``canvas_staging_rows``). The scheduler reuses cached prompt pages
+        only up to a whole page before a prompt's last token, which the
+        request computes into a page of every cache group of its own, so no
+        call reads more canvases than the KV unit pool has ``pool_rows``.
         """
         buffers = self.input_buffers
         rows = buffers.max_rows // 2 if self.pools else buffers.max_rows
+        if self.pool_rows is not None:
+            rows = min(rows, self.pool_rows)
         return min(rows, buffers.max_tokens // self.canvas_length)
 
     @property
