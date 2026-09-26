@@ -35,8 +35,9 @@ otherwise, matching the ``base2`` flag of
 Supported configuration: CUDA compute capability 10.x, BF16 Q/K/V, caches
 and output, head dimension 256 or 512, query heads a multiple of KV heads
 with the query heads per KV head dividing 128 (head dimension 256) or 64
-(head dimension 512), and 16, 32 or 64 tokens per page. :func:`can_run`
-checks a call without launching it.
+(head dimension 512), and 16, 32 or 64 tokens per page.
+:func:`unsupported_configuration` checks these dimensions before any tensor
+exists; :func:`can_run` checks a call without launching it.
 
 Each distinct specialization (the executor cache key) compiles once per
 process on first use; :func:`prefix_block_attention` refuses to compile
@@ -103,6 +104,38 @@ def import_error() -> BaseException | None:
     return _IMPORT_ERROR
 
 
+def unsupported_configuration(
+    *,
+    query_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    page_tokens: int,
+    dtype: torch.dtype,
+) -> str | None:
+    """Return why the kernel cannot serve these dimensions, or None.
+
+    ``dtype`` is the element type of Q/K/V, the caches and the output. The
+    check needs no tensor or device, so a caller can decide which kernel
+    serves a layer before its inputs exist; :func:`can_run` additionally
+    checks a concrete call's layouts and device.
+    """
+    if dtype != torch.bfloat16:
+        return "query, key, value and caches must be BF16"
+    if head_dim not in HEAD_DIMS:
+        return f"head_dim {head_dim} is not one of {HEAD_DIMS}"
+    if kv_heads < 1 or query_heads % kv_heads:
+        return "query heads must be a multiple of KV heads"
+    group = query_heads // kv_heads
+    if (_TILE_ROWS[head_dim][0] // 2) % group:
+        return (
+            "query heads per KV head must divide "
+            f"{_TILE_ROWS[head_dim][0] // 2} at head_dim {head_dim}"
+        )
+    if page_tokens not in PAGE_TOKENS:
+        return f"page_tokens {page_tokens} is not one of {PAGE_TOKENS}"
+    return None
+
+
 def _check(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -129,21 +162,18 @@ def _check(
 
     tokens, query_heads, head_dim = query.shape
     kv_heads = key.shape[1]
-    if head_dim not in HEAD_DIMS:
-        return f"head_dim {head_dim} is not one of {HEAD_DIMS}"
+    pages, page_tokens, cache_heads, cache_dim = key_cache.shape
+    problem = unsupported_configuration(
+        query_heads=query_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_tokens=page_tokens,
+        dtype=query.dtype,
+    )
+    if problem is not None:
+        return problem
     if key.shape != (tokens, kv_heads, head_dim) or value.shape != key.shape:
         return "key and value must be [tokens, kv_heads, head_dim]"
-    if kv_heads < 1 or query_heads % kv_heads:
-        return "query heads must be a multiple of KV heads"
-    group = query_heads // kv_heads
-    if (_TILE_ROWS[head_dim][0] // 2) % group:
-        return (
-            "query heads per KV head must divide "
-            f"{_TILE_ROWS[head_dim][0] // 2} at head_dim {head_dim}"
-        )
-    pages, page_tokens, cache_heads, cache_dim = key_cache.shape
-    if page_tokens not in PAGE_TOKENS:
-        return f"page_tokens {page_tokens} is not one of {PAGE_TOKENS}"
     if cache_heads != kv_heads or cache_dim != head_dim or pages < 1:
         return "caches must match the KV heads and head dimension"
 
@@ -532,4 +562,5 @@ __all__ = [
     "can_run",
     "import_error",
     "prefix_block_attention",
+    "unsupported_configuration",
 ]

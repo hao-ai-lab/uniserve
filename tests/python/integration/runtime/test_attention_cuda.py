@@ -723,16 +723,8 @@ def _window_batch(representation, *, block_size, device):
 @pytest.mark.parametrize(
     ("provider", "representation", "heads", "block_size", "window", "graphs"),
     [
-        ("flashinfer", "causal", (16, 8, 256), 32, 7, False),
-        ("flashinfer", "image", (16, 8, 256), 32, 7, False),
-        ("flashinfer", "segmented", (16, 8, 256), 32, 7, True),
-        ("flashinfer", "segmented", (16, 2, 512), 64, None, False),
         ("trtllm", "causal", (16, 8, 256), 32, 7, True),
         ("trtllm", "causal", (16, 2, 512), 64, None, True),
-        ("auto", "causal", (16, 2, 512), 64, 7, False),
-        ("auto", "causal", (16, 8, 256), 32, 7, False),
-        ("auto", "image", (16, 8, 256), 32, 7, False),
-        ("auto", "segmented", (16, 8, 256), 32, 7, False),
         ("torch", "segmented", (16, 8, 256), 32, 7, True),
         ("torch", "image", (16, 8, 256), 32, 7, True),
     ],

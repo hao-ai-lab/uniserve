@@ -4,7 +4,9 @@ A prompt pass through ``Model.text`` writes the K/V cache and yields causal
 logits; a canvas pass through ``Model.denoiser`` reads that cache without
 writing it and yields soft-capped canvas logits. Both run on the CPU through
 the torch attention backend and compare against the Transformers encoder,
-its cache and its decoder in FP32.
+its cache and its decoder in FP32. On an SM100 GPU, a model with the
+attention shapes of the released checkpoints runs every call through the
+automatic native attention providers and reproduces that CPU path.
 """
 
 import json
@@ -57,7 +59,7 @@ LAYERS = (
 )
 
 
-def _checkpoint(root):
+def _checkpoint(root, *, text=None, vision=None, unit_scores=False):
     """Save a two-layer DiffusionGemma checkpoint; return its reference.
 
     Layer 0 attends through a sliding window and layer 1 fully, with no
@@ -66,7 +68,11 @@ def _checkpoint(root):
     standardization are randomized so each factor is observable, and the
     head's logits are large enough for the small softcap to bend them. The
     tokenizer files declare the canvas's special tokens: pad 0, mask 4 and
-    end of turn 6.
+    end of turn 6. ``text`` and ``vision`` override entries of the text and
+    vision configurations. ``unit_scores`` scales every query norm by the
+    inverse square root of its head width, so the unscaled attention scores
+    of normalized queries and keys have unit variance, as trained query
+    norms keep them, instead of growing with the head width.
     """
     config = DiffusionGemmaConfig(
         text_config={
@@ -87,6 +93,7 @@ def _checkpoint(root):
             "use_bidirectional_attention": "vision",
             "max_position_embeddings": 256,
             "rms_norm_eps": 1e-6,
+            **(text or {}),
         },
         vision_config={
             "model_type": "gemma4_vision",
@@ -102,6 +109,7 @@ def _checkpoint(root):
             "rope_parameters": {"rope_theta": 100.0, "rope_type": "default"},
             "standardize": True,
             "use_clipped_linears": False,
+            **(vision or {}),
         },
         canvas_length=16,
         image_token_id=IMAGE,
@@ -120,6 +128,8 @@ def _checkpoint(root):
         for name, value in model.named_parameters():
             if name.endswith(".weight") and "norm" in name.split(".")[-2]:
                 uniform(value, 0.8, 1.2)
+            if unit_scores and name.endswith("q_norm.weight"):
+                value.mul_(value.numel() ** -0.5)
         encoder = model.model.encoder
         for index, layer in enumerate(model.model.decoder.layers):
             uniform(layer.router.scale, 0.5, 1.5)
@@ -649,3 +659,223 @@ def test_pipeline_stages_exchange_the_complete_stream(tmp_path):
         nprocs=2,
         join=True,
     )
+
+
+# Attention shapes of the released checkpoints, which the SM100 kernels
+# serve: sliding layers of 16 query and 8 KV heads of width 256, full layers
+# of 16 query and 2 KV heads of width 512, and vision heads of width 72. The
+# 40-token history window is shorter than the prompt, so sliding tables
+# start after retired pages; sliding pages hold 16 tokens and full pages 32.
+# Every token weights all experts, so no rounding difference can switch a
+# token's expert selection; with unit-variance attention scores (see
+# _checkpoint) the logits are then continuous at BF16 resolution.
+NATIVE_TEXT = {
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "head_dim": 256,
+    "global_head_dim": 512,
+    "num_global_key_value_heads": 2,
+    "sliding_window": 41,
+    "top_k_experts": 6,
+}
+NATIVE_VISION = {"hidden_size": 144, "head_dim": 72}
+NATIVE_BLOCK_SIZE, NATIVE_PAGES = 16, 32
+
+
+def _sequence_batch(cache, rows, *, device, canvas=0):
+    """Build one call over consecutive chunks of one sequence.
+
+    ``rows`` are ``(start, stop, causal)`` token intervals, one call row
+    each; a canvas call instead holds one ``canvas``-token row reading the
+    prefix ``[0, start)`` of its only interval. The sequence owns logical
+    pages ``0..NATIVE_PAGES`` of every table on its own units. A windowed
+    table lists each row's pages from the first one its window reads, so
+    earlier pages are retired.
+    """
+    entries = {}
+    for number, table in enumerate(cache.tables):
+        group = cache.groups[table.group]
+        page = group.page_tokens
+        units = tuple(
+            range(1 + number * NATIVE_PAGES, 1 + (number + 1) * NATIVE_PAGES)
+        )
+        windowed = group.window is not None
+        blocks, starts = [], []
+        for start, stop, _ in rows:
+            first = max(start - group.window, 0) // page if windowed else 0
+            end = start if canvas else stop
+            blocks.append(units[first : max(-(-end // page), first + 1)])
+            starts.append(first)
+
+        if canvas:
+            ((prefix, _, _),) = rows
+            entry = SegmentedInput(
+                SequenceLengths.from_lengths((canvas,), device=device),
+                SequenceLengths.from_lengths((prefix,), device=device),
+                BlockTable(
+                    torch.tensor(blocks, dtype=torch.int32, device=device),
+                    page,
+                    torch.tensor(starts, dtype=torch.int32, device=device)
+                    if windowed
+                    else None,
+                    tuple(starts) if windowed else None,
+                ),
+                None,
+                torch.full((1, canvas), canvas, dtype=torch.int32).to(device),
+                True,
+            )
+        else:
+            entry = PagedInput.from_blocks(
+                blocks=tuple(blocks),
+                query_lengths=tuple(stop - start for start, stop, _ in rows),
+                prefix_lengths=tuple(start for start, _, _ in rows),
+                block_size=page,
+                causal=tuple(causal for _, _, causal in rows),
+                device=device,
+                start_pages=tuple(starts) if windowed else None,
+            )
+        if entries:
+            # Every table shares the first table's query domain.
+            entry = replace(
+                entry, queries=entries[0].queries, prefixes=entries[0].prefixes
+            )
+        entries[number] = entry
+    return AttentionBatch(entries, entries[0].queries)
+
+
+def _native_pass(root, device, attention, tokens, calls, images, canvases):
+    """Run every prompt call and canvas read in BF16; return their logits.
+
+    ``calls`` are tuples of ``(start, stop, causal)`` rows of one sequence;
+    image token rows take the images' pooled features, which the model's own
+    vision encoder computes first. Logits return as FP32 CPU tensors.
+    """
+    model = models.load_model(
+        models.read_config(root),
+        device=device,
+        weights=weights.Config(dtype=torch.bfloat16),
+    ).model
+    config = model.text.cache_config
+    tables = len(plan_units(config, block_size=NATIVE_BLOCK_SIZE).tables)
+    cache = PrefixCache(
+        config,
+        num_units=1 + tables * NATIVE_PAGES,
+        block_size=NATIVE_BLOCK_SIZE,
+        device=device,
+    )
+    context = ExecutionContext(model, cache=cache, attention=attention)
+    with cache, context, torch.inference_mode():
+        context.prepare(TextSize(128, 4))
+        rows, grids = images
+        features = torch.cat(
+            model.vision_encoder.encode(
+                VisionInput(
+                    tuple(row.to(device) for row in rows),
+                    tuple(
+                        torch.tensor([grid], device=device) for grid in grids
+                    ),
+                    grids,
+                )
+            )
+        )
+        tokens = tokens.to(device)
+        replaced = tokens == IMAGE
+        values = torch.zeros(
+            (tokens.numel(), HIDDEN), dtype=features.dtype, device=device
+        )
+        values[replaced] = features
+
+        logits = []
+        for call in calls:
+            batch = _sequence_batch(cache, call, device=device)
+            context.bind_attention(batch)
+            select = torch.cat(
+                [torch.arange(start, stop) for start, stop, _ in call]
+            ).to(device)
+            hidden = model.text(
+                TextInput(
+                    tokens[select],
+                    select,
+                    batch,
+                    EmbeddingReplacement(values[select], replaced[select]),
+                )
+            )
+            indices = torch.arange(select.numel(), device=device)
+            logits.append(
+                model.text.compute_logits(
+                    hidden, token_indices=indices
+                ).gather()
+            )
+        for prefix, canvas in canvases:
+            count = canvas.numel()
+            batch = _sequence_batch(
+                cache, ((prefix, prefix, False),), device=device, canvas=count
+            )
+            context.bind_attention(batch)
+            hidden = model.denoiser(
+                CanvasInput(
+                    canvas.to(device),
+                    torch.arange(prefix, prefix + count, device=device),
+                    batch,
+                )
+            )
+            indices = torch.arange(count, device=device)
+            logits.append(
+                model.denoiser.compute_logits(
+                    hidden, token_indices=indices
+                ).gather()
+            )
+    return [value.float().cpu() for value in logits]
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] != 10,
+    reason="native DiffusionGemma attention requires an SM100 GPU",
+)
+def test_native_cuda_attention_reproduces_the_cpu_torch_path(tmp_path):
+    """Every call on CUDA through automatic attention matches the CPU path.
+
+    A 166-token prompt holds two images. One call writes its leading text;
+    one call holds the first image block, text, the second image block and
+    more text as consecutive rows of the sequence; a third call writes the
+    remaining text and a fourth commits a 16-token block. A canvas is read
+    after the prompt and after the commit. Both paths run the BF16 model,
+    on CUDA through automatic attention and on the CPU through the portable
+    torch provider, over the same unit-pool tables whose sliding rows start
+    after retired pages. Prompt and canvas logits agree within the BF16
+    attention tolerance.
+    """
+    _checkpoint(
+        tmp_path, text=NATIVE_TEXT, vision=NATIVE_VISION, unit_scores=True
+    )
+    generator = torch.Generator().manual_seed(23)
+    images = (
+        torch.rand(3, 24, 24, generator=generator),
+        torch.rand(3, 12, 24, generator=generator),
+    )
+    grids = ((6, 6), (3, 6))
+    rows = tuple(patchify(image, patch_size=4) for image in images)
+    text = torch.randint(7, 58, (156,), generator=generator).tolist()
+    tokens = torch.tensor(
+        [*text[:50], BEGIN_IMAGE, *[IMAGE] * 4, END_IMAGE, *text[50:110]]
+        + [BEGIN_IMAGE, *[IMAGE] * 2, END_IMAGE, *text[110:]]
+    )
+    calls = (
+        ((0, 51, True),),
+        ((51, 55, False), (55, 117, True), (117, 119, False), (119, 130, True)),
+        ((130, 150, True),),
+        ((150, 166, True),),
+    )
+    canvases = []
+    for prefix in (150, 166):
+        canvas = torch.randint(0, 58, (16,), generator=generator)
+        canvas[::3] = 4
+        canvases.append((prefix, canvas))
+
+    arguments = (tokens, calls, (rows, grids), canvases)
+    expected = _native_pass(tmp_path, "cpu", "torch", *arguments)
+    actual = _native_pass(tmp_path, "cuda:0", "auto", *arguments)
+    for value, wanted in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, wanted, rtol=2e-2, atol=2e-2)

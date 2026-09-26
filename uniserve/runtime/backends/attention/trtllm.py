@@ -38,6 +38,13 @@ def _require_windowed_causal(window, batch):
 
 
 class _TRTLLM(_Operator):
+    # A table with start pages is read from its first column: the prepared
+    # key lengths count each row's keys from its table origin, and the
+    # kernels align queries to the end of their keys, so causal positions
+    # and the history window keep their relative meaning while retired
+    # pages, which no query of the row may read, are never addressed.
+    reads_retired_tables = True
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache
