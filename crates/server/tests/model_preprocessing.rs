@@ -3,17 +3,24 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read as _, Write as _};
+use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use base64::Engine as _;
 use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-use uniserve_core::{GenerationLimits, ImageIngestStep};
+use uniserve_core::{GenerationLimits, GenerationRequest, ImageIngestStep};
 use uniserve_server::profile::assets::ResolvedModelFiles;
 use uniserve_server::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use uniserve_server::profile::{ModelConfig, ModelDescription};
 use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
-use uniserve_server::serving::{InputProcessor, ServeRequestId};
+use uniserve_server::serving::media::{
+    ImageFetchError, ImageFetchPolicy, ImageFetcher, ImageInput, ImageListError,
+};
+use uniserve_server::serving::{InputProcessor, ResponseOptions, ServeRequestId, chat_image_urls};
 
 /// Base64 payload of a 1x1 PNG image.
 const PNG_1X1: &str =
@@ -191,23 +198,171 @@ fn runtime_limits() -> GenerationLimits {
     }
 }
 
-/// Chat request with one input image between two text parts.
+/// Data URL of the `PNG_1X1` image.
+fn png_data_url() -> String {
+    format!("data:image/png;base64,{PNG_1X1}")
+}
+
+/// Chat request with one input image, referenced by `image_url`, between two
+/// text parts.
 ///
 /// The leading text contains a literal `</img>`, which the synthetic tokenizer
 /// encodes as the SenseNova end-of-image token. The top-level `seed` (9) and
 /// the `image_config` seed (17) differ so tests can tell which one wins.
-fn image_chat_request(model: &str) -> uniserve_server::openai::ChatCompletionRequest {
+fn image_chat_request(
+    model: &str,
+    image_url: &str,
+) -> uniserve_server::openai::ChatCompletionRequest {
     serde_json::from_value(serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": "literal </img> before "},
-            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{PNG_1X1}")}},
+            {"type": "image_url", "image_url": {"url": image_url}},
             {"type": "text", "text": " after"}
         ]}],
         "seed": 9,
         "image_config": {"seed": 17}
     }))
     .unwrap()
+}
+
+/// Runs `ImageFetcher::fetch_all` to completion on a current-thread runtime.
+fn resolve_images(
+    fetcher: &ImageFetcher,
+    urls: Vec<String>,
+) -> Result<Vec<ImageInput>, ImageListError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(fetcher.fetch_all(urls))
+}
+
+/// Resolves a chat request's input images under the default image policy
+/// and preprocesses the request with them, as `ServingRuntime::generate_chat`
+/// does.
+fn preprocess_image_chat(
+    processor: &InputProcessor,
+    request_id: &str,
+    request: uniserve_server::openai::ChatCompletionRequest,
+) -> (GenerationRequest, ResponseOptions) {
+    let fetcher = ImageFetcher::new(ImageFetchPolicy::default()).unwrap();
+    let images = resolve_images(&fetcher, chat_image_urls(&request)).unwrap();
+    processor
+        .preprocess_chat_request(ServeRequestId::new(request_id), request, images)
+        .unwrap()
+}
+
+/// HTTP server on an ephemeral 127.0.0.1 port that answers every request
+/// with one `image/png` body from a background thread.
+struct ImageServer {
+    address: SocketAddr,
+    connections: Arc<AtomicUsize>,
+}
+
+impl ImageServer {
+    /// Starts serving `body`.
+    fn start(body: Vec<u8>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::clone(&connections);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                accepted.fetch_add(1, Ordering::SeqCst);
+
+                // Consume the request head, then answer and close.
+                let mut head = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && matches!(stream.read(&mut byte), Ok(1)) {
+                    head.push(byte[0]);
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(&body);
+            }
+        });
+        Self {
+            address,
+            connections,
+        }
+    }
+
+    /// Number of connections accepted so far.
+    fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+}
+
+/// An http image URL prepares exactly the image input its equivalent data URL
+/// does, for both omni profiles: the same prompt tokens, encoder-cache
+/// identity, worker payload, position, and encoders.
+#[test]
+fn image_urls_prepare_the_same_image_input_as_data_urls() {
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(PNG_1X1)
+        .unwrap();
+    let server = ImageServer::start(png);
+    // The server is on loopback, which only the private-destination policy reaches.
+    let fetcher = ImageFetcher::new(ImageFetchPolicy {
+        allow_private: true,
+        ..ImageFetchPolicy::default()
+    })
+    .unwrap();
+
+    for (description, model_type) in [
+        (ModelDescription::SenseNova, "neo_chat"),
+        (ModelDescription::Bagel, "bagel"),
+    ] {
+        let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
+        let prepare = |image_url: &str| {
+            let request = image_chat_request(processor.served_model_name(), image_url);
+            let images = resolve_images(&fetcher, chat_image_urls(&request)).unwrap();
+            processor
+                .preprocess_chat_request(ServeRequestId::new("image-source"), request, images)
+                .unwrap()
+        };
+
+        let (from_url, url_response) = prepare(&format!("http://{}/image.png", server.address));
+        let (from_data, data_response) = prepare(&png_data_url());
+
+        assert_eq!(
+            url_response.prompt_token_ids,
+            data_response.prompt_token_ids
+        );
+        assert_eq!(from_url.multimodal_inputs.images.len(), 1, "{model_type}");
+        assert_eq!(from_url.multimodal_inputs, from_data.multimodal_inputs);
+    }
+}
+
+/// Under the default image policy, a chat image URL on a loopback host is
+/// refused before any connection is made, however the host is written.
+#[test]
+fn loopback_image_urls_are_refused_by_default() {
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(PNG_1X1)
+        .unwrap();
+    let server = ImageServer::start(png);
+    let fetcher = ImageFetcher::new(ImageFetchPolicy::default()).unwrap();
+    let port = server.address.port();
+
+    for host in ["127.0.0.1", "localhost", "[::1]"] {
+        let request = image_chat_request("sensenova", &format!("http://{host}:{port}/image.png"));
+        let error = resolve_images(&fetcher, chat_image_urls(&request)).unwrap_err();
+
+        assert_eq!(error.index, 0);
+        assert!(
+            matches!(error.source, ImageFetchError::NonPublicAddress),
+            "{host}: {error}"
+        );
+    }
+    assert_eq!(server.connections(), 0);
 }
 
 /// `InputProcessor::new` refuses to bind a profile whose worker limits lack a
@@ -278,10 +433,8 @@ fn model_resolution_requires_every_configured_runtime_branch() {
 #[test]
 fn sensenova_places_the_input_image_at_its_rendered_slot() {
     let (_directory, tokenizer, model) = resolved_model(ModelDescription::SenseNova, "neo_chat");
-    let request = image_chat_request(model.served_model_name());
-    let (generation, response) = model
-        .preprocess_chat_request(ServeRequestId::new("image-params"), request)
-        .unwrap();
+    let request = image_chat_request(model.served_model_name(), &png_data_url());
+    let (generation, response) = preprocess_image_chat(&model, "image-params", request);
 
     // The `image_config` seed takes precedence over the text sampling seed.
     assert_eq!(generation.sampling.seed, Some(17));
@@ -323,10 +476,8 @@ fn sensenova_places_the_input_image_at_its_rendered_slot() {
 #[test]
 fn bagel_places_the_input_image_between_surrounding_chat_text() {
     let (_directory, _tokenizer, model) = resolved_model(ModelDescription::Bagel, "bagel");
-    let request = image_chat_request(model.served_model_name());
-    let (generation, response) = model
-        .preprocess_chat_request(ServeRequestId::new("image-params"), request)
-        .unwrap();
+    let request = image_chat_request(model.served_model_name(), &png_data_url());
+    let (generation, response) = preprocess_image_chat(&model, "image-params", request);
     assert_eq!(generation.sampling.seed, Some(17));
     assert_eq!(generation.image.seed, Some(17));
     let image = &generation.multimodal_inputs.images[0];
@@ -532,21 +683,33 @@ fn sampling_defaults_preserve_explicit_zero_controls() {
         }))
         .unwrap();
     let (default, _) = model
-        .preprocess_chat_request(ServeRequestId::new("sampling-defaults"), request.clone())
+        .preprocess_chat_request(
+            ServeRequestId::new("sampling-defaults"),
+            request.clone(),
+            Vec::new(),
+        )
         .unwrap();
     assert_eq!(default.max_und_tokens, 128);
     assert_eq!(default.sampling.temperature, 1.0);
 
     request.temperature = Some(0.0);
     let (greedy, _) = model
-        .preprocess_chat_request(ServeRequestId::new("sampling-defaults"), request.clone())
+        .preprocess_chat_request(
+            ServeRequestId::new("sampling-defaults"),
+            request.clone(),
+            Vec::new(),
+        )
         .unwrap();
     assert_eq!(greedy.sampling.temperature, 0.0);
     assert_eq!(greedy.max_und_tokens, 128);
 
     request.max_completion_tokens = Some(0);
     assert!(matches!(
-        model.preprocess_chat_request(ServeRequestId::new("sampling-defaults"), request),
+        model.preprocess_chat_request(
+            ServeRequestId::new("sampling-defaults"),
+            request,
+            Vec::new()
+        ),
         Err(uniserve_server::openai::ApiError::InvalidRequest { .. })
     ));
 }
@@ -607,7 +770,7 @@ fn sensenova_image_cache_identity_follows_its_pixel_bound() {
             .map(|_| {
                 serde_json::json!({
                     "type": "image_url",
-                    "image_url": {"url": format!("data:image/png;base64,{PNG_1X1}")}
+                    "image_url": {"url": png_data_url()}
                 })
             })
             .chain([serde_json::json!({"type": "text", "text": "compare"})])
@@ -618,9 +781,7 @@ fn sensenova_image_cache_identity_follows_its_pixel_bound() {
                 "messages": [{"role": "user", "content": content}]
             }))
             .unwrap();
-        let (generation, _) = processor
-            .preprocess_chat_request(ServeRequestId::new("image-bound"), request)
-            .unwrap();
+        let (generation, _) = preprocess_image_chat(&processor, "image-bound", request);
         generation.multimodal_inputs.images[0].hash
     };
 
@@ -747,7 +908,11 @@ fn streamed_chat_does_not_request_undeliverable_prompt_logprobs() {
                 .unwrap();
 
             let (generation, response) = processor
-                .preprocess_chat_request(ServeRequestId::new("stream-prompt-logprobs"), request)
+                .preprocess_chat_request(
+                    ServeRequestId::new("stream-prompt-logprobs"),
+                    request,
+                    Vec::new(),
+                )
                 .unwrap();
 
             assert_eq!(

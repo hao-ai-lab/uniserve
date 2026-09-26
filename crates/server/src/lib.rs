@@ -31,6 +31,8 @@ use crate::engine_client::EngineClient;
 use crate::profile::ModelConfig;
 pub use crate::profile::ModelDescription;
 pub use crate::serving::chat::ChatTemplateContentFormatOption;
+pub use crate::serving::media::ImageFetchPolicy;
+use crate::serving::media::ImageFetcher;
 use crate::serving::{InputProcessor, ServingRuntime};
 use anyhow::{Context as _, Result};
 pub use config::{Config, EngineSettings, HttpListenerMode};
@@ -170,7 +172,9 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         config.reasoning_parsing,
     )
     .context("failed to bind the configured model description")?;
-    let runtime = ServingRuntime::new(model, Arc::clone(&engine), config.log_stats);
+    let images = ImageFetcher::new(config.image_fetch)
+        .context("failed to initialize the image URL fetcher")?;
+    let runtime = ServingRuntime::new(model, Arc::clone(&engine), images, config.log_stats);
 
     Ok(Arc::new(
         AppState::new(runtime)

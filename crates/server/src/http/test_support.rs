@@ -21,6 +21,7 @@ use crate::AppState;
 use crate::engine_client::EngineClient;
 use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
+use crate::serving::media::{ImageFetchPolicy, ImageFetcher};
 use crate::serving::test_support::configured_tokenizer;
 use crate::serving::{InputProcessor, ServedSamplingControl, ServingRuntime, WorkerCapabilities};
 
@@ -70,7 +71,8 @@ pub(crate) fn sim_state(parameters: ModelParameters) -> AppState {
     )
     .unwrap();
 
-    AppState::new(ServingRuntime::new(processor, client, false))
+    let images = ImageFetcher::new(ImageFetchPolicy::default()).unwrap();
+    AppState::new(ServingRuntime::new(processor, client, images, false))
 }
 
 /// Sends `request` through `router` and returns the status, the headers, and

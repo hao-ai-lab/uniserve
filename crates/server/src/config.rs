@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::serving::chat::ChatTemplateContentFormatOption;
+use crate::serving::media::ImageFetchPolicy;
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
@@ -158,6 +159,9 @@ pub struct Config {
     /// `reasoning_content` from `content`. When `false`, reasoning delimiter
     /// tokens stream verbatim as content text.
     pub reasoning_parsing: bool,
+    /// Time, size, and destination limits for request image references
+    /// (`image_url` data and http(s) URLs).
+    pub image_fetch: ImageFetchPolicy,
 }
 
 impl Default for Config {
@@ -183,6 +187,7 @@ impl Default for Config {
             max_concurrent_requests: None,
             shutdown_timeout: Duration::from_secs(0),
             reasoning_parsing: true,
+            image_fetch: ImageFetchPolicy::default(),
         }
     }
 }
