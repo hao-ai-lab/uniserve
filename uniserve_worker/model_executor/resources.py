@@ -211,8 +211,9 @@ def output_layouts(
             raise ValueError("a media timeline's denoiser is a video denoiser")
         return component.output_layout(builder.layout(size))
 
-    # Audio length follows from the video frame count at the declared rates.
+    # The product holds the whole decoded track, which the decoder defines
+    # from the latent timeline generated with the video's frames.
     if clock is None:
         raise ValueError("audio output layout requires its media clock")
-    samples = round(size.num_frames * component.sample_rate / clock.frame_rate)
+    samples = component.track_samples(size.num_frames, clock.frame_rate)
     return component.output_layout(samples)
