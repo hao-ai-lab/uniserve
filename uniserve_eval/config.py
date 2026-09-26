@@ -333,8 +333,8 @@ def _server_profile(name: str, raw: Any) -> ServerProfile:
     """Validate and construct one server profile table.
 
     A table with `replicas` declares an array of single-process tables. Each
-    replica inherits the table's `host` and merges the table's `environment`
-    under its own, and must not repeat a port.
+    replica inherits the table's `host` unless it names its own, merges the
+    table's `environment` under its own, and must not repeat a host and port.
     """
     value = expand_environment(_mapping(raw, f"servers.{name}"))
     _reject_unknown(
@@ -359,16 +359,19 @@ def _server_profile(name: str, raw: Any) -> ServerProfile:
     for index, item in enumerate(replicas_value):
         context = f"servers.{name}.replicas[{index}]"
         item = _mapping(item, context)
-        _reject_unknown(item, {"command", "port", "environment"}, context)
+        _reject_unknown(
+            item, {"command", "host", "port", "environment"}, context
+        )
         environment = {**shared, **_server_environment(item, context)}
         replicas.append(
             _server_process(
                 f"{name}.replica-{index}",
-                {**item, "host": host, "environment": environment},
+                {"host": host, **item, "environment": environment},
                 context,
             )
         )
-    if len({replica.port for replica in replicas}) != len(replicas):
+    listeners = {(replica.host, replica.port) for replica in replicas}
+    if len(listeners) != len(replicas):
         raise ValueError(f"servers.{name}.replicas must use distinct ports")
     first = replicas[0]
     return ServerProfile(

@@ -64,6 +64,29 @@ environment = { DEVICES = "2,3" }
     ]
 
 
+def test_a_replica_may_listen_on_another_host(tmp_path):
+    config = _profile(
+        tmp_path,
+        """
+[servers.engine]
+
+[[servers.engine.replicas]]
+command = ["serve"]
+port = 9001
+
+[[servers.engine.replicas]]
+command = ["ssh", "peer", "serve"]
+host = "peer"
+port = 9001
+""",
+    )
+
+    assert config.servers["engine"].base_urls == (
+        "http://127.0.0.1:9001",
+        "http://peer:9001",
+    )
+
+
 @pytest.mark.parametrize(
     "ports, message",
     [((9001, 9001), "distinct ports"), ((9001,), "two or more")],
