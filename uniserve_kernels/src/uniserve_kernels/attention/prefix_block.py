@@ -80,8 +80,10 @@ _SM_COUNTS: dict[int, int] = {}
 HEAD_DIMS = (256, 512)
 PAGE_TOKENS = (16, 32, 64)
 # Packed rows of one work tile, computed by a two-CTA cluster, by head
-# dimension: a 512-wide accumulator allows 64 rows per CTA.
-_TILE_ROWS = {256: 256, 512: 128}
+# dimension, widest first: a 512-wide accumulator allows 64 rows per CTA;
+# at head dim 256 the 128-row tile serves batches too small to occupy the
+# GPU with 256-row tiles.
+_TILE_ROWS = {256: (256, 128), 512: (128,)}
 
 
 def available(device: torch.device | None = None) -> bool:
@@ -134,10 +136,10 @@ def _check(
     if kv_heads < 1 or query_heads % kv_heads:
         return "query heads must be a multiple of KV heads"
     group = query_heads // kv_heads
-    if (_TILE_ROWS[head_dim] // 2) % group:
+    if (_TILE_ROWS[head_dim][0] // 2) % group:
         return (
             "query heads per KV head must divide "
-            f"{_TILE_ROWS[head_dim] // 2} at head_dim {head_dim}"
+            f"{_TILE_ROWS[head_dim][0] // 2} at head_dim {head_dim}"
         )
     pages, page_tokens, cache_heads, cache_dim = key_cache.shape
     if page_tokens not in PAGE_TOKENS:
@@ -285,6 +287,25 @@ def _abi(tensor: torch.Tensor | None) -> tuple[object, ...] | None:
     return (tensor.dtype, tensor.ndim, int(tensor.stride(-1)))
 
 
+def _tile_rows(
+    head_dim: int, group: int, blocks: int, block_rows: int, clusters: int
+) -> int:
+    """Rows per work tile for ``blocks`` (sequence, KV head) row blocks.
+
+    Each block holds up to ``block_rows`` packed rows. A narrower tile,
+    whose CTA rows ``group`` divides, is used when its tiles still run in
+    one wave of the ``clusters`` two-CTA clusters: the work then spreads over
+    more clusters and each runs a shorter tile. Otherwise the widest tile,
+    which uses the tensor cores and memory best, is used.
+    """
+    rows = _TILE_ROWS[head_dim]
+    for narrow in rows[1:]:
+        tiles = blocks * -(-block_rows // narrow)
+        if (narrow // 2) % group == 0 and tiles <= clusters:
+            return narrow
+    return rows[0]
+
+
 def _sm_count(device: torch.device) -> int:
     index = device.index
     if index is None:
@@ -382,15 +403,19 @@ def prefix_block_attention(
     batch = prefix_lengths.shape[0]
     kv_heads = key.shape[1]
     group = query.shape[1] // kv_heads
-    tile_rows = _TILE_ROWS[query.shape[2]]
-    num_m_blocks = max(1, -(-max_query_len * group // tile_rows))
-    total_tiles = batch * kv_heads * num_m_blocks
     if batch == 0 or max_query_len == 0:
         return out
-    num_clusters = max(1, min(total_tiles, _sm_count(query.device) // 2))
+    clusters = _sm_count(query.device) // 2
+    tile_rows = _tile_rows(
+        query.shape[2], group, batch * kv_heads, max_query_len * group, clusters
+    )
+    num_m_blocks = max(1, -(-max_query_len * group // tile_rows))
+    total_tiles = batch * kv_heads * num_m_blocks
+    num_clusters = max(1, min(total_tiles, clusters))
 
     specialization = {
         "head_dim": query.shape[2],
+        "tile_rows": tile_rows,
         "group_size": group,
         "page_tokens": key_cache.shape[1],
         "query_window": bool(query_window) and window is not None,
