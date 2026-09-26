@@ -27,33 +27,34 @@ from __future__ import annotations
 import torch
 
 from uniserve.nn.attention.inputs import PagedInput, SegmentedInput
-from uniserve.quantization import QuantizedTensor
 
 from . import Backend as _Backend
+from . import CachePages
 from . import Operator as _Operator
 
 
 def unsupported(
-    *, num_heads, num_kv_heads, head_dim, dtype, cache
+    *, num_heads, num_kv_heads, head_dim, dtype, pages: CachePages | None
 ) -> str | None:
     """Return why the kernel cannot serve a layer, or None.
 
-    ``cache`` is the layer's bound prefix state: the kernel reads prefixes
-    only from paged BF16 caches with 16-, 32- or 64-token pages.
+    ``pages`` describes the layer's bound prefix cache: the kernel reads
+    prefixes only from paged caches storing the query dtype in 16-, 32- or
+    64-token pages.
     """
     from uniserve_kernels.attention import prefix_block
 
-    if cache is None:
+    if pages is None:
         return "requires a bound paged prefix cache"
-    if isinstance(cache.key, QuantizedTensor):
+    if pages.quantized:
         return "does not read per-block FP8 prefix caches"
-    if cache.key.dtype != dtype:
+    if pages.dtype != dtype:
         return "requires the cache to store the query dtype"
     return prefix_block.unsupported_configuration(
         query_heads=num_heads,
         kv_heads=num_kv_heads,
         head_dim=head_dim,
-        page_tokens=cache.block_size,
+        page_tokens=pages.page_tokens,
         dtype=dtype,
     )
 
@@ -73,7 +74,7 @@ class _PrefixBlock(_Operator):
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
             dtype=self.dtype,
-            cache=self.cache,
+            pages=None if self.cache is None else CachePages.of(self.cache),
         )
         if problem is not None:
             raise ValueError(f"prefix-block attention {problem}")

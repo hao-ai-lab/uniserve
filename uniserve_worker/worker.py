@@ -47,6 +47,7 @@ from uniserve_worker.bootstrap.cache import (
     group_layers,
     plan_cache,
     resident_width,
+    resolve_page_size,
     storage,
 )
 from uniserve_worker.bootstrap.capacity import (
@@ -378,6 +379,19 @@ class Worker:
             startup.callback(runner.close)
 
             self.attention = runner.attention
+
+            # The KV page size follows from the cache layers and the
+            # attention kernels that read them when the operator set none;
+            # everything planned from here on uses the resolved size.
+            worker_config = resolve_page_size(
+                model,
+                worker_config,
+                runner.attention,
+                group=None
+                if process_groups is None
+                else process_groups.process_group,
+            )
+            runner.worker_config = worker_config
 
             endpoint = WorkerEndpoint.local(worker_id, int(worker_config.rank))
 

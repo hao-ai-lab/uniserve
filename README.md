@@ -115,14 +115,6 @@ curl -s http://127.0.0.1:8000/v1/images/generations \
 
 Each image response entry carries `b64_json`, pixel `height` and `width`, and the encoded PNG byte count `bytes`; `revised_prompt` is included when available. Request timing starts before preprocessing and includes queueing and generation.
 
-Serve a DiffusionGemma checkpoint with `--page-size 32`: its sliding-window layers have the widest KV rows, so their 32-token pages give the full-attention layers the 64-token pages their native kernels read.
-
-```bash
-uniserve serve /models/diffusiongemma-26B-A4B-it \
-  --served-model-name diffusion-gemma \
-  --page-size 32
-```
-
 A DiffusionGemma server answers System One 0.2.0 requests: a `state` and named `noul`, `choice`, or `score` questions. It renders the questions into readout prompts, denoises each answer canvas once over its prompt, and reads every answer from the full-vocabulary probabilities of its answer tokens; nothing is generated, so `usage.output_tokens` is 0. Every answer also carries `x_candidate_mass`, the unnormalized probability of all its answer tokens; a value near 0 means the model did not answer within them. The optional `x_images` field attaches 1 to 8 images, as `data:image/...;base64` or `http(s)` URLs fetched under the same rules as chat images, which the prompt names Image 1 to Image n. Validation failures are 422 with FastAPI's `{"detail": [...]}` body, another model name is 404, and inference failures are 500 with `{"detail": ...}`.
 
 ```bash
@@ -153,6 +145,7 @@ curl -s http://127.0.0.1:8000/v1/systemone \
 | `--workers` | One `model` entry over every rank | Path to a JSON deployment configuration: Worker instances, node/device ranks, and the components placed on them |
 | `--max-model-len` | Model configuration | Context-length ceiling |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |
+| `--page-size` | Chosen by the worker | Tokens per KV page of the cache group with the widest rows; unset, the worker takes the largest power of two up to 64 whose pages its attention kernels read in every cache group (32 for DiffusionGemma, whose full-attention pages then hold 64 tokens) |
 | `--max-running-requests` | `128` | Scheduler active-request bound |
 | `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget |
 | `--chunked-prefill-size` | `8192` | Per-request prefill bound |

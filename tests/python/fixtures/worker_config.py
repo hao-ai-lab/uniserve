@@ -1,7 +1,7 @@
 """Resolved worker resources for deterministic model fixtures."""
 
+from uniserve_worker.bootstrap.cache import DEFAULT_BLOCK_SIZE
 from uniserve_worker.bootstrap.capacity import (
-    DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
     DEFAULT_MAX_REQUEST_POOL_SIZE,
     DEFAULT_NUM_UNITS_FALLBACK,

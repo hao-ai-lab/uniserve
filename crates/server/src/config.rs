@@ -246,7 +246,7 @@ impl EngineSettings {
     /// worker placement `WorkerConfig::validate_all` refuses.
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
-            self.worker_process.block_size > 0,
+            self.worker_process.block_size.is_none_or(|size| size > 0),
             "block_size must be greater than 0"
         );
         anyhow::ensure!(
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn zero_block_size_is_rejected() {
         let mut config = Config::default();
-        config.engine.worker_process.block_size = 0;
+        config.engine.worker_process.block_size = Some(0);
         assert!(config.validate().is_err());
     }
 

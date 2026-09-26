@@ -100,12 +100,6 @@ def served(request, tmp_path_factory) -> Iterator[tuple[str, Path]]:
         python,
         "--max-model-len",
         "8192",
-        # The native kernels of the head-dimension-512 full-attention layers
-        # read 16- to 64-token pages. The sliding-window group has the widest
-        # token rows, so its 32-token pages give the full-attention group
-        # 64-token pages.
-        "--page-size",
-        "32",
     ]
     log = tmp_path_factory.mktemp(request.param) / "server.log"
     with server_process(args, base_url, log, timeout_s=1800.0):
