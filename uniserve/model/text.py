@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from .inputs import TextInput
-from .logits import Logits, VocabShard
+from .logits import Logits, project_logits
 from .transformer import TransformerDecoder
 
 
@@ -55,20 +55,8 @@ class CausalLM(nn.Module):
         pipeline = self.backbone._pipeline
         if pipeline.rank != pipeline.size - 1:
             return None
-        if hidden.ndim != 2 or token_indices.ndim != 1:
-            raise ValueError(
-                "logits require packed hidden rows and one-dimensional token "
-                "indices"
-            )
-        if token_indices.dtype not in {torch.int32, torch.int64}:
-            raise ValueError("token indices must be integers")
 
         # The last stage retains the head, which exposes its vocabulary shard.
         head = self.lm_head
         assert head is not None
-        vocab = head.vocab
-        if not isinstance(vocab, VocabShard):
-            raise TypeError("the vocabulary head must expose a VocabShard")
-
-        selected = hidden.index_select(0, token_indices)
-        return Logits(head(selected), vocab)
+        return project_logits(head, hidden, token_indices)
