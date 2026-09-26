@@ -391,3 +391,13 @@ def test_cuda_residual_norms_of_strided_rows_raise():
         scaled_residual_rms_norm_absmax_(
             rows, torch.zeros_like(rows), weight, weight, eps=1e-6
         )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_video_unpacking_of_strided_tokens_raises():
+    tokens = torch.randn((1, 3, 2 * 48), device="cuda")[..., :48]
+    with pytest.raises(ValueError, match="unpatchify_video_tokens.*contiguous"):
+        unpatchify_video_tokens(
+            tokens, None, grid_shape=(1, 1, 3), patch_shape=(1, 4, 4)
+        )
