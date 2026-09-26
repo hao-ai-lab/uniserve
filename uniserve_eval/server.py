@@ -1,8 +1,8 @@
-"""Owns a benchmark server process from launch through termination.
+"""Owns benchmark server processes from launch through termination.
 
-`cli.run` wraps each benchmark point in one `ManagedServer`, so every point
-measures a freshly launched server whose combined stdout and stderr go to a
-per-point log file.
+`cli.run` wraps each deployment in one `ManagedDeployment`: a single
+`ManagedServer`, or one per replica. Each process's combined stdout and
+stderr go to its own log file.
 """
 
 from __future__ import annotations
@@ -52,6 +52,22 @@ class ManagedServer:
 
     def __enter__(self) -> Self:
         """Start the server and return after its listener accepts connections."""  # noqa: E501
+        # `__exit__` does not run when `__enter__` raises, so a failed launch
+        # or readiness wait releases the log and any started process here.
+        try:
+            self.start()
+            self.wait_until_ready()
+        except BaseException:
+            self.stop()
+            raise
+        return self
+
+    def start(self) -> None:
+        """Launch the server process without waiting for its listener.
+
+        The caller owns `stop` from this point, including when the launch
+        itself raises after opening the log.
+        """
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log = self.log_path.open("w", encoding="utf-8")
 
@@ -60,24 +76,15 @@ class ManagedServer:
         # signals as a whole.
         environment = dict(os.environ)
         environment.update(self.launch.environment)
-
-        # `__exit__` does not run when `__enter__` raises, so a failed launch
-        # or readiness wait releases the log and any started process here.
-        try:
-            self.process = subprocess.Popen(
-                self.launch.command,
-                cwd=self.launch.working_directory,
-                env=environment,
-                stdout=self.log,
-                stderr=subprocess.STDOUT,
-                text=True,
-                start_new_session=True,
-            )
-            self._wait_until_ready()
-        except BaseException:
-            self.stop()
-            raise
-        return self
+        self.process = subprocess.Popen(
+            self.launch.command,
+            cwd=self.launch.working_directory,
+            env=environment,
+            stdout=self.log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
 
     def __exit__(
         self,
@@ -123,7 +130,7 @@ class ManagedServer:
             self.log.close()
             self.log = None
 
-    def _wait_until_ready(self) -> None:
+    def wait_until_ready(self) -> None:
         """Wait for the configured TCP listener or report early process exit.
 
         Raises:
@@ -150,6 +157,61 @@ class ManagedServer:
             f"{self.profile.host}:{self.profile.port} "
             f"within {self.timeout_s}s"
         )
+
+
+class ManagedDeployment:
+    """Runs every process of one deployment and waits until all listen.
+
+    Replicas launch together so their model loading overlaps, and readiness
+    requires every listener. Any launch or readiness failure stops all of
+    them, as does leaving the context.
+    """
+
+    def __init__(
+        self,
+        processes: list[tuple[ServerProfile, ServerLaunch, Path]],
+        *,
+        timeout_s: float,
+    ) -> None:
+        """Configure each process's profile, launch, and log path."""
+        self.servers = [
+            ManagedServer(profile, launch, log_path, timeout_s=timeout_s)
+            for profile, launch, log_path in processes
+        ]
+
+    def __enter__(self) -> Self:
+        """Start every process and return once all listeners accept."""
+        try:
+            for server in self.servers:
+                server.start()
+            for server in self.servers:
+                server.wait_until_ready()
+        except BaseException:
+            self.stop()
+            raise
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        """Terminate every process group and close the logs."""
+        self.stop()
+
+    def stop(self) -> None:
+        """Stop every process; each stop is a no-op once completed."""
+        for server in self.servers:
+            server.stop()
+
+    def exited(self) -> list[Path]:
+        """Return the logs of processes that are no longer running."""
+        return [
+            server.log_path
+            for server in self.servers
+            if server.process is None or server.process.poll() is not None
+        ]
 
 
 def _signal_group(group: int, signum: int) -> None:

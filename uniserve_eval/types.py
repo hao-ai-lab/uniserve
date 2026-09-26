@@ -364,6 +364,8 @@ class RequestRecord:
     error: str | None = None
     warnings: list[str] = field(default_factory=list)
     endpoint: str = ""
+    # Origin the request was routed to; replicas make this per request.
+    base_url: str = ""
     scheduled_time: float | None = None
     start_time: float = 0.0
     http_response_time: float | None = None
@@ -587,6 +589,7 @@ class RequestRecord:
             "error": self.error,
             "warnings": list(self.warnings),
             "endpoint": self.endpoint,
+            "base_url": self.base_url,
             # Absolute event timestamps are raw `time.perf_counter()` seconds.
             "scheduled_time": self.scheduled_time,
             "client_send_time": self.start_time,

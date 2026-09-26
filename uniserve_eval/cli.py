@@ -11,11 +11,12 @@ from .config import DEFAULT_CONFIG, load_config, server_launch
 from .pipeline.run import run_point
 from .pipeline.setup import (
     applied_environment,
-    describe_launch,
+    describe_deployment,
     host_lock,
-    prepare_launch,
+    prepare_deployment,
 )
-from .server import ManagedServer
+from .server import ManagedDeployment
+from .types import BenchmarkPoint
 
 
 def list_items(args: argparse.Namespace) -> None:
@@ -24,7 +25,7 @@ def list_items(args: argparse.Namespace) -> None:
     if args.section in {"all", "servers"}:
         print("[servers]")
         for name, server in config.servers.items():
-            print(f"{name}\t{server.base_url}")
+            print(f"{name}\t{','.join(server.base_urls)}")
     if args.section in {"all", "benchmarks"}:
         print("[benchmarks]")
         for name, point in config.benchmarks.items():
@@ -40,21 +41,26 @@ def plan(args: argparse.Namespace) -> None:
 
     Unlike `run`, planning neither takes the host lock nor rejects
     unresolved environment references, so an unset `${NAME}` appears
-    verbatim in the printed command.
+    verbatim in the printed command. A replicated deployment lists one
+    command and origin per replica.
     """
     config = load_config(args.config)
     points = config.selected_points(args.selection)
     rendered = []
     for point in points:
         server = config.servers[point.server]
-        launch = server_launch(server, args.executable, config.root)
+        launches = [
+            server_launch(instance, args.executable, config.root)
+            for instance in server.instances
+        ]
         rendered.append(
             {
                 "benchmark": point.name,
                 "task": point.task.value,
-                "server_command": list(launch.command),
-                "server_working_directory": str(launch.working_directory),
-                "base_url": server.base_url,
+                "server": server.name,
+                "server_commands": [list(item.command) for item in launches],
+                "server_working_directory": str(launches[0].working_directory),
+                "base_urls": list(server.base_urls),
                 "dataset": point.dataset,
                 "num_prompts": point.load.num_prompts,
                 # `json.dumps` would render infinity as the non-standard
@@ -75,61 +81,101 @@ def plan(args: argparse.Namespace) -> None:
 def run(args: argparse.Namespace) -> None:
     """Run selected points serially and stop after the first invalid result.
 
-    Each point launches its own server, measures against it, and stops it
-    before the next point starts, even when consecutive points name the same
-    server. Results go to `<output root>/<point name>`, which `run_point`
-    requires to be absent or empty, and server output goes to
-    `<output root>/server-logs/<point name>.log`.
+    By default each point launches its own deployment, measures against it,
+    and stops it before the next point starts. With `--reuse-deployment`,
+    consecutive points that name the same server share one deployment, which
+    stays up until the next point names a different server; each point
+    still performs its own declared warmup and priming. Results go to
+    `<output root>/<point name>`, which `run_point` requires to be absent or
+    empty, and server output goes to `<output root>/server-logs/<first point
+    of the deployment>.log`, with a `.replica-<i>` infix per replica.
 
     Exits with status 2 when a point completes with a failed validation. An
     exception while preparing, launching, or measuring a point propagates and
-    ends the run; `ManagedServer` stops a server that was already started.
+    ends the run; `ManagedDeployment` stops processes already started.
     """
     config = load_config(args.config)
     output_root = args.output_root or config.artifact_root
     points = config.selected_points(args.selection)
-    failures = 0
+
+    # Consecutive points form one deployment group only when reuse is
+    # requested and they name the same server.
+    groups: list[list[BenchmarkPoint]] = []
+    for point in points:
+        if (
+            args.reuse_deployment
+            and groups
+            and groups[-1][0].server == point.server
+        ):
+            groups[-1].append(point)
+        else:
+            groups.append([point])
 
     # The lock is held for the whole selection, so another uniserve-eval
     # process fails to acquire it instead of starting a server between points.
     with host_lock():
-        for point in points:
-            server = config.servers[point.server]
-            launch = prepare_launch(config, point, args.executable)
-            point_dir = output_root / point.name
-            log_path = output_root / "server-logs" / f"{point.name}.log"
-            launch_record = describe_launch(launch)
-
-            # The launch environment also applies to this process for the
-            # duration of the point and is restored afterwards; the server
-            # receives it through `ManagedServer`.
-            with applied_environment(launch.environment):
-                with ManagedServer(
-                    server,
+        for group in groups:
+            first = group[0]
+            server = config.servers[first.server]
+            launches = prepare_deployment(config, first, args.executable)
+            for point in group[1:]:
+                prepare_deployment(config, point, args.executable)
+            replicated = len(launches) > 1
+            processes = [
+                (
+                    instance,
                     launch,
-                    log_path,
-                    timeout_s=args.launch_timeout_s,
-                ):
-                    result = asyncio.run(
-                        run_point(
-                            server.base_url,
-                            point,
-                            point_dir,
-                            launch=launch_record,
-                            timeout_s=args.request_timeout_s,
-                        )
-                    )
-
-            status = "pass" if result.summary["validation"]["valid"] else "fail"
-            print(
-                f"{point.name}: {status} ({result.summary['ok_count']}"
-                f"/{result.summary['request_count']} requests)"
+                    _log_path(output_root, first, index, replicated),
+                )
+                for index, (instance, launch) in enumerate(launches)
+            ]
+            launch_record = describe_deployment(
+                [launch for _, launch in launches]
             )
-            if result.summary["validation"]["valid"] is not True:
-                failures += 1
-                break
-    if failures:
-        raise SystemExit(2)
+            launch_record["deployment"] = {
+                "started_for": first.name,
+                "logs": [str(path) for _, _, path in processes],
+            }
+
+            # The shared deployment environment also applies to this process
+            # while the group runs and is restored afterwards; each server
+            # process receives its own launch environment.
+            with applied_environment(dict(server.environment)):
+                with ManagedDeployment(
+                    processes, timeout_s=args.launch_timeout_s
+                ) as deployment:
+                    for point in group:
+                        exited = deployment.exited()
+                        if exited:
+                            raise RuntimeError(
+                                "a deployment process exited before "
+                                f"{point.name}; see {exited[0]}"
+                            )
+                        result = asyncio.run(
+                            run_point(
+                                server.base_urls,
+                                point,
+                                output_root / point.name,
+                                launch=launch_record,
+                                timeout_s=args.request_timeout_s,
+                            )
+                        )
+                        valid = result.summary["validation"]["valid"]
+                        print(
+                            f"{point.name}: {'pass' if valid else 'fail'} "
+                            f"({result.summary['ok_count']}"
+                            f"/{result.summary['request_count']} requests)"
+                        )
+                        if valid is not True:
+                            raise SystemExit(2)
+
+
+def _log_path(
+    output_root: Path, point: BenchmarkPoint, index: int, replicated: bool
+) -> Path:
+    """Return a process log path named after the deployment's first point."""
+    suffix = f".replica-{index}" if replicated else ""
+    return output_root / "server-logs" / f"{point.name}{suffix}.log"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -163,6 +209,7 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--output-root", type=Path)
     command.add_argument("--launch-timeout-s", type=float, default=1800)
     command.add_argument("--request-timeout-s", type=float)
+    command.add_argument("--reuse-deployment", action="store_true")
     command.set_defaults(function=run)
     return parser
 

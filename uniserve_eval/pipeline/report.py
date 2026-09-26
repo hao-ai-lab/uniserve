@@ -25,7 +25,7 @@ from ..types import (
 
 def build_summary(
     point: BenchmarkPoint,
-    base_url: str,
+    base_urls: Sequence[str],
     records: list[RequestRecord],
     dur_s: float,
     *,
@@ -39,7 +39,7 @@ def build_summary(
 
     Args:
         point: The resolved benchmark point that produced `records`.
-        base_url: The server origin the requests were sent to.
+        base_urls: The server origins the requests were routed to.
         records: Measured request records; callers pass no warmup records.
         dur_s: Measured-window duration in seconds, the throughput
             denominator.
@@ -49,7 +49,7 @@ def build_summary(
         tokenizer: Optional tokenizer forwarded to `summarize`.
         server_version: The server's `/version` payload, or None when it
             could not be fetched.
-        launch: The `describe_launch` provenance record, if any.
+        launch: The `describe_deployment` provenance record, if any.
 
     Returns:
         A JSON-compatible summary mapping.
@@ -78,7 +78,7 @@ def build_summary(
         "model": point.model,
         "dataset": point.dataset,
         "endpoint": point.endpoint,
-        "base_url": base_url,
+        "base_urls": list(base_urls),
         "workload": point.workload_dict(),
         "selected_rows": selected_rows,
         "elapsed_s": dur_s,

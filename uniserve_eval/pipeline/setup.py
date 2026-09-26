@@ -1,8 +1,9 @@
-"""Prepares an exclusive, resolved server launch for measurement.
+"""Prepares an exclusive, resolved server deployment for measurement.
 
-`cli.run` takes `host_lock` for the whole selection, then for each point
-resolves the launch with `prepare_launch`, records its provenance with
-`describe_launch`, and starts the server inside `applied_environment`.
+`cli.run` takes `host_lock` for the whole selection, then for each
+deployment resolves every process launch with `prepare_deployment`, records
+its provenance with `describe_deployment`, and starts the processes inside
+`applied_environment`.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from typing import Any
 from ..config import (
     EvaluationConfig,
     ServerLaunch,
+    ServerProfile,
     require_resolved,
     server_launch,
 )
@@ -69,27 +71,45 @@ def applied_environment(values: dict[str, str]) -> Iterator[None]:
                 os.environ[name] = value
 
 
-def prepare_launch(
+def prepare_deployment(
     config: EvaluationConfig,
     point: BenchmarkPoint,
     executable: Path | None,
-) -> ServerLaunch:
-    """Resolve a point's server launch and require all environment references.
+) -> list[tuple[ServerProfile, ServerLaunch]]:
+    """Resolve every process launch of a point's deployment.
 
     Configuration loading leaves `${NAME}` references to unset variables in
-    place, and `cli.plan` renders them as written; a run rejects those in the
-    launch command and the point's workload here, before any server starts.
+    place, and `cli.plan` renders them as written; a run rejects those in
+    each launch command and the point's workload here, before any server
+    starts. A replicated deployment yields one launch per replica, in the
+    profile's order.
 
     Raises:
-        ValueError: If the launch command or the point's workload still holds
+        ValueError: If a launch command or the point's workload still holds
             an unresolved environment reference, or `server_launch` finds
             `--worker-python` without a path.
     """  # noqa: E501
     server = config.servers[point.server]
-    launch = server_launch(server, executable, config.root)
-    require_resolved(launch.command, context=f"server {server.name}")
+    launches = []
+    for instance in server.instances:
+        launch = server_launch(instance, executable, config.root)
+        require_resolved(launch.command, context=f"server {instance.name}")
+        launches.append((instance, launch))
     require_resolved(point.workload_dict(), context=f"benchmark {point.name}")
-    return launch
+    return launches
+
+
+def describe_deployment(launches: list[ServerLaunch]) -> dict[str, Any]:
+    """Capture provenance for a deployment's processes.
+
+    The first process's `describe_launch` record carries the shared source
+    revision and worktree state. A replicated deployment adds `replicas`,
+    one complete launch record per process.
+    """
+    record = describe_launch(launches[0])
+    if len(launches) > 1:
+        record["replicas"] = [describe_launch(launch) for launch in launches]
+    return record
 
 
 def describe_launch(launch: ServerLaunch) -> dict[str, Any]:
