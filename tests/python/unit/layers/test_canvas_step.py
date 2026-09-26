@@ -222,3 +222,13 @@ def test_zero_confidence_runs_every_step_of_a_block():
         scores, state, sampling, decision=decision, vocab_size=VOCAB
     )
     assert decision.finished[:, 0].tolist() == [False, False, True]
+
+
+def test_workspace_size_matches_its_allocation():
+    workspace = canvas.CanvasWorkspace.empty(ROWS, LENGTH, VOCAB, HIDDEN)
+    allocated = sum(
+        getattr(workspace, name).nbytes for name in workspace.__slots__
+    )
+    assert allocated == canvas.CanvasWorkspace.nbytes(
+        ROWS, LENGTH, VOCAB, HIDDEN, device_type="cpu"
+    )

@@ -273,6 +273,13 @@ _SCRATCH_PARTIALS = 8
 _SCRATCH_BYTES = (32 << 20, 256 << 20)
 
 
+def _scratch_bytes(positions: int, hidden_size: int, device_type: str) -> int:
+    if device_type != "cuda":
+        return 0
+    partials = _SCRATCH_PARTIALS * positions * hidden_size * 4
+    return min(max(partials, _SCRATCH_BYTES[0]), _SCRATCH_BYTES[1])
+
+
 @dataclass(frozen=True, slots=True)
 class CanvasWorkspace:
     """Scratch of one step: the self-conditioning distribution in transit.
@@ -303,10 +310,8 @@ class CanvasWorkspace:
         device: torch.device | str | None = None,
     ) -> CanvasWorkspace:
         positions = rows * canvas_length
-        scratch = 0
-        if torch.empty(0, device=device).is_cuda:
-            partials = _SCRATCH_PARTIALS * positions * hidden_size * 4
-            scratch = min(max(partials, _SCRATCH_BYTES[0]), _SCRATCH_BYTES[1])
+        device_type = torch.empty(0, device=device).device.type
+        scratch = _scratch_bytes(positions, hidden_size, device_type)
         return cls(
             weights=torch.empty(
                 positions, vocab_size, dtype=dtype, device=device
@@ -318,6 +323,31 @@ class CanvasWorkspace:
                 positions, hidden_size, dtype=torch.float32, device=device
             ),
             scratch=torch.empty(scratch, dtype=torch.uint8, device=device),
+        )
+
+    @staticmethod
+    def nbytes(
+        rows: int,
+        canvas_length: int,
+        vocab_size: int,
+        hidden_size: int,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        device_type: str = "cuda",
+    ) -> int:
+        """Bytes of the tensors ``empty`` allocates for these arguments.
+
+        Sums ``weights``, ``normalizer``, ``product`` and ``scratch`` of a
+        workspace on a device of type ``device_type`` (``"cuda"`` or
+        ``"cpu"``) without allocating; a caching allocator may round each
+        tensor's allocation up.
+        """
+        positions = rows * canvas_length
+        return (
+            positions * vocab_size * dtype.itemsize
+            + positions * 4
+            + positions * hidden_size * 4
+            + _scratch_bytes(positions, hidden_size, device_type)
         )
 
 
