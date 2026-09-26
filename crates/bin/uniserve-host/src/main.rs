@@ -11,6 +11,12 @@
 //! bound socket that rank serves the group's collective store on, from the
 //! head's reservation until the rank inherits it at spawn.
 //!
+//! Its ranks never outlive it. An orderly end of supervision terminates them,
+//! and on Linux the kernel kills each rank when the launcher dies by any other
+//! means. Its log output is diagnostics only: a launcher is often started over
+//! an SSH session whose pipe closes before the deployment stops, and a failed
+//! log write must not end supervision.
+//!
 //! It does nothing else. The head derives every launch value once, so a
 //! launcher's command line is the head's address and its own host identity.
 //!
@@ -123,6 +129,10 @@ fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        // tracing-subscriber reports a failed write with `eprintln!`, which
+        // panics, and so aborts this process, when stderr is the same closed
+        // pipe; dropping the event keeps supervision independent of it.
+        .log_internal_errors(false)
         .init();
     let args = Args::parse();
 
@@ -290,6 +300,7 @@ fn start_rank(
     for (name, value) in &spawn.environment {
         command.env(name, value);
     }
+    die_with_launcher(&mut command);
     if let Some(listener) = store_listener {
         let fd = uniserve_core::launch::inherit_listener(&mut command, listener);
         spawn
@@ -314,6 +325,38 @@ fn start_rank(
         _descriptor: directory,
     })
 }
+
+/// Makes the rank `command` starts die with this launcher.
+///
+/// The kernel sends the rank SIGKILL when the thread that spawned it exits,
+/// which covers a launcher killed by a signal or aborted before `terminate`
+/// runs. Every rank is spawned from the main thread, whose exit is the
+/// process's. A rank whose launcher exited between fork and the request is
+/// already orphaned, so it fails to start instead.
+#[cfg(target_os = "linux")]
+fn die_with_launcher(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    let launcher = std::process::id() as libc::pid_t;
+    // SAFETY: the closure runs in the forked child between fork and exec and
+    // calls only `prctl` and `getppid`, which are async-signal-safe, and
+    // builds its errors without allocating.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != launcher {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Elsewhere only an orderly end of supervision terminates the ranks.
+#[cfg(not(target_os = "linux"))]
+fn die_with_launcher(_command: &mut Command) {}
 
 /// Reports every rank that has exited since the last report and stops
 /// supervising it. A rank whose exit status cannot be read is reported as
