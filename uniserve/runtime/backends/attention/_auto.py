@@ -1,8 +1,17 @@
 """Select native attention by representation and input.
 
 Select native attention from the actual representation and numerical input.
+
+History-windowed attention and head dimension 512 have complete native
+coverage on SM100: TensorRT-LLM context kernels evaluate causal paged rows,
+and the prefix-block kernel evaluates non-causal paged blocks and segmented
+prefix reads. On CUDA, FlashInfer, the FlashAttention-2 library and the
+portable torch provider therefore never stand in for these calls: a call no
+native kernel serves raises when its layer is prepared or bound, naming the
+call's path, shape, dtype and mask semantics.
 """
 
+from dataclasses import replace
 from importlib import import_module
 
 import torch
@@ -19,6 +28,11 @@ from uniserve.tensors import BufferConfig
 
 from . import Backend as _Backend
 from . import Operator as _Operator
+from ._sequences import causal_runs
+
+# Providers that substitute for missing native coverage. They serve only
+# calls outside the natively covered classes (see ``_native_only``).
+_FALLBACKS = frozenset({"flash_attn", "flashinfer", "torch"})
 
 
 def _available(module, names):
@@ -29,12 +43,58 @@ def _available(module, names):
     return all(callable(getattr(library, name, None)) for name in names)
 
 
+def _native_only(device, head_dim, window):
+    """Whether only native kernels may serve a layer's calls on ``device``.
+
+    Windowed history and head dimension 512 are the call classes whose
+    native coverage is complete; the fallbacks remain candidates for the
+    others.
+    """
+    return device.type == "cuda" and (window is not None or head_dim == 512)
+
+
+def _layer(*, num_heads, num_kv_heads, head_dim, dtype, cache, window):
+    """Describe a layer's attention shape, dtypes and history bound."""
+    if cache is None:
+        storage = "without a prefix cache"
+    elif isinstance(cache.key, QuantizedTensor):
+        storage = (
+            f"over a per-block FP8 cache of {cache.block_size}-token pages"
+        )
+    else:
+        storage = (
+            f"over a {cache.key.dtype} cache of {cache.block_size}-token pages"
+        )
+    history = (
+        "the whole history"
+        if window is None
+        else f"a {window}-token history window"
+    )
+    return (
+        f"{num_heads} query and {num_kv_heads} KV heads of dimension "
+        f"{head_dim}, {dtype} queries {storage}, reading {history}"
+    )
+
+
+def _causality(flags):
+    if all(flags):
+        return "causal rows"
+    if not any(flags):
+        return "non-causal rows"
+    return "mixed causal and non-causal rows"
+
+
 class _Automatic(_Operator):
     """Dispatching operator selecting native providers.
 
     Dispatching operator selecting a native provider for each numerical
-    input.
+    input. A paged batch whose causal and non-causal rows prefer different
+    providers is evaluated as its contiguous runs of equal causality, each
+    by its own provider, after the batch's cache write commits once.
     """
+
+    # Retired-page tables reach only providers that read them.
+    reads_retired_tables = True
 
     def __init__(self, providers, requirements, architecture, **kwargs):
         super().__init__(**kwargs)
@@ -72,6 +132,14 @@ class _Automatic(_Operator):
         # inputs require.
         fa4_indexed = self.head_dim != 256
         if isinstance(batch, (VisibleInput, SegmentedInput)):
+            # The prefix-block kernel reads a segmented prefix when every
+            # query sees all of its current keys.
+            block = (
+                ("prefix_block",)
+                if isinstance(batch, SegmentedInput)
+                and batch.fully_visible_current
+                else ()
+            )
             # Device-visible endpoints are captured directly by FA4. This
             # retains the packed-attention preference for native mask kernels.
             fa4 = (
@@ -79,7 +147,7 @@ class _Automatic(_Operator):
                 if self._architecture in (9, 10, 11) and fa4_indexed
                 else ()
             )
-            return (*fa4, "flashinfer", "torch")
+            return (*block, *fa4, "flashinfer", "torch")
         if isinstance(batch, PagedInput):
             block_size = batch.block_table.block_size
             ordinary = (
@@ -90,12 +158,15 @@ class _Automatic(_Operator):
                 if self._architecture not in (8, 12) and fa4_indexed
                 else ()
             )
-            # TensorRT-LLM context kernels bound a history window only along
-            # the causal diagonal.
+            # Non-causal blocks read their own keys and a prefix window with
+            # the prefix-block kernel. TensorRT-LLM context kernels bound a
+            # history window only along the causal diagonal.
+            block = ("prefix_block",) if not any(batch.causal) else ()
             trtllm = (
                 ("trtllm",) if self.window is None or all(batch.causal) else ()
             )
             return (
+                *block,
                 *trtllm,
                 *ordinary[:1],
                 "flashinfer",
@@ -111,12 +182,13 @@ class _Automatic(_Operator):
             "torch",
         )
 
-    def _operator(self, batch, *, ndim=None):
+    def _name(self, batch, *, ndim=None):
+        """Return the first available provider reading ``batch``, or None."""
         # A table with retired window pages is read only by providers that
         # consume its start pages; no other provider may substitute for one.
         table = getattr(batch, "block_table", None)
         retired = table is not None and table.start_page is not None
-        name = next(
+        return next(
             (
                 name
                 for name in self._names(batch, ndim=ndim)
@@ -128,10 +200,77 @@ class _Automatic(_Operator):
             ),
             None,
         )
+
+    def _runs(self, batch):
+        """Whether a mixed-causality paged batch splits into causal runs.
+
+        The providers of a mixed batch's causal and non-causal rows depend
+        only on causality, not on lengths, so the decision needs no host
+        values. A batch whose rows all prefer one provider stays whole.
+        """
+        if not isinstance(batch, PagedInput) or len(set(batch.causal)) < 2:
+            return False
+        rows = batch.queries.batch_size
+        causal, blocks = (
+            self._name(replace(batch, causal=(flag,) * rows))
+            for flag in (True, False)
+        )
+        return causal != blocks
+
+    def _describe(self, batch):
+        """Name a call's path, shape, dtype and mask semantics."""
+        if isinstance(batch, DenseInput):
+            path = "dense attention"
+            mask = "causal" if batch.causal else "non-causal"
+            if batch.mask is not None:
+                mask += " with an explicit mask"
+        else:
+            if isinstance(batch, PagedInput):
+                path, mask = "paged attention", _causality(batch.causal)
+            elif isinstance(batch, VarlenInput):
+                path, mask = (
+                    "variable-length attention",
+                    _causality(batch.causal),
+                )
+            elif isinstance(batch, SegmentedInput):
+                path = "segmented prefix read"
+                mask = (
+                    "every current key visible"
+                    if batch.fully_visible_current
+                    else "per-query current key endpoints"
+                )
+            else:
+                path = "visible-endpoint attention"
+                mask = (
+                    "every key visible"
+                    if batch.fully_visible
+                    else "per-query key endpoints"
+                )
+            tokens = batch.queries.num_tokens
+            path += f" of {batch.queries.batch_size} rows" + (
+                "" if tokens is None else f" and {tokens} query tokens"
+            )
+        table = getattr(batch, "block_table", None)
+        if table is not None and table.start_page is not None:
+            mask += " over block tables starting after retired pages"
+        layer = _layer(
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            dtype=self.dtype,
+            cache=self.cache,
+            window=self.window,
+        )
+        return (
+            f"{path} on sm{self._architecture} with {mask}: {layer}; "
+            f"available providers: {', '.join(sorted(self._providers))}"
+        )
+
+    def _operator(self, batch, *, ndim=None):
+        name = self._name(batch, ndim=ndim)
         if name is None:
             raise ValueError(
-                "no available attention provider reads this input"
-                + (" over retired window pages" if retired else "")
+                f"no available attention kernel serves {self._describe(batch)}"
             )
 
         if name not in self._operators:
@@ -151,17 +290,51 @@ class _Automatic(_Operator):
     def bind(self, batch):
         if self._closed:
             raise RuntimeError("attention operator is closed")
-        # The selected operator owns the same dimensions and capacity and
-        # validates them once together with its native preparation requirements.
-        self._operator(batch).bind(batch)
+        if not self._runs(batch):
+            # The selected operator owns the same dimensions and capacity and
+            # validates them once together with its native preparation
+            # requirements.
+            self._operator(batch).bind(batch)
+            return
+
+        # Runs are sliced by exact host lengths, which the base binding
+        # requires here. Rows split only between TensorRT-LLM (causal runs)
+        # and the prefix-block kernel (non-causal runs); neither keeps a
+        # per-batch plan, so one provider may bind several runs of a batch.
+        super().bind(batch)
+        for _, _, run in causal_runs(batch):
+            self._operator(run).bind(run)
 
     def requires_host_lengths(self, batch):
+        if self._runs(batch):
+            return True
         return self._operator(batch).requires_host_lengths(batch)
 
     def __call__(self, q, k, v, batch, *, scale, out):
-        return self._operator(batch, ndim=q.ndim)(
-            q, k, v, batch, scale=scale, out=out
-        )
+        if not self._runs(batch):
+            return self._operator(batch, ndim=q.ndim)(
+                q, k, v, batch, scale=scale, out=out
+            )
+
+        self._validate(q, k, v, batch, out)
+        if q.ndim != 3 or k.ndim != 3:
+            raise ValueError(
+                "mixed-causality attention requires packed query and current "
+                "K/V rows"
+            )
+        # A later run may read rows an earlier run of the same sequence
+        # writes, so the batch's complete write commits before any run; the
+        # runs carry no write addresses.
+        if batch.write_indices is not None:
+            self.update_cache(k, v, indices=batch.write_indices)
+        for rows, _, run in causal_runs(batch):
+            if rows.start == rows.stop:
+                continue
+            # Current K/V share the query rows of their run.
+            self._operator(run)(
+                q[rows], k[rows], v[rows], run, scale=scale, out=out[rows]
+            )
+        return out
 
     def close(self):
         for operator in self._operators.values():
@@ -231,6 +404,12 @@ class Backend(_Backend):
                     "flashinfer"
                 ].config.workspace_size
             )
+        from uniserve_kernels.attention import prefix_block
+
+        if prefix_block.available(device):
+            self._factories["prefix_block"] = import_module(
+                f"{__package__}.prefix_block"
+            ).Backend()
         from .flash_attn_4 import available
 
         if available():
@@ -243,12 +422,18 @@ class Backend(_Backend):
             sorted(self._factories)
         )
 
-    def _providers(self, dtype, head_dim, cache, window):
+    def _providers(
+        self, dtype, head_dim, cache, window, num_heads, num_kv_heads
+    ):
+        from .prefix_block import unsupported
+
+        native_only = _native_only(self.device, head_dim, window)
+
         # Native kernels require half precision and unquantized cache state.
         if dtype not in {torch.float16, torch.bfloat16} or (
             cache is not None and isinstance(cache.key, QuantizedTensor)
         ):
-            return {"torch": self._factories["torch"]}
+            return {} if native_only else {"torch": self._factories["torch"]}
 
         # Restrict candidates to each kernel's head-dimension, cache-block and
         # history-window constraints. The pinned SM100 TensorRT-LLM cubins
@@ -258,7 +443,8 @@ class Backend(_Backend):
         return {
             name: backend
             for name, backend in self._factories.items()
-            if (name != "flashinfer" or head_dim in {64, 128, 256, 512})
+            if not (native_only and name in _FALLBACKS)
+            and (name != "flashinfer" or head_dim in {64, 128, 256, 512})
             and (
                 name != "trtllm"
                 or head_dim in {64, 128, 256}
@@ -268,6 +454,17 @@ class Backend(_Backend):
                     and cache is not None
                     and cache.block_size in {16, 32, 64}
                 )
+            )
+            and (
+                name != "prefix_block"
+                or unsupported(
+                    num_heads=num_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    dtype=dtype,
+                    cache=cache,
+                )
+                is None
             )
             and (
                 window is None
@@ -301,6 +498,8 @@ class Backend(_Backend):
             arguments["head_dim"],
             arguments["cache"],
             arguments.get("window"),
+            arguments["num_heads"],
+            arguments["num_kv_heads"],
         )
         requirements = {
             name: backend.workspace_buffers(**arguments)
@@ -329,4 +528,17 @@ class Backend(_Backend):
             key: value for key, value in kwargs.items() if key != "workspace"
         }
         providers, requirements = self._requirements(arguments)
+        if not providers:
+            layer = _layer(
+                num_heads=arguments["num_heads"],
+                num_kv_heads=arguments["num_kv_heads"],
+                head_dim=arguments["head_dim"],
+                dtype=arguments["dtype"],
+                cache=arguments["cache"],
+                window=arguments.get("window"),
+            )
+            raise ValueError(
+                f"no native attention kernel on sm{self._architecture} "
+                f"serves {layer}"
+            )
         return _Automatic(providers, requirements, self._architecture, **kwargs)

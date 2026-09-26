@@ -322,6 +322,7 @@ def resolve(
         "flashinfer",
         "trtllm",
         "sgl_kernel",
+        "prefix_block",
     }:
         raise ValueError(f"unknown attention backend {backend!r}")
 
