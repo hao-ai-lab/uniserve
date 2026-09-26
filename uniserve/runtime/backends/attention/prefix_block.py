@@ -112,10 +112,18 @@ class _PrefixBlock(_Operator):
             indices = indices.new_zeros((indices.shape[0], 1))
 
         # The launch grid is sized by a host bound on every block length. A
-        # captured launch replays with changed lengths, which only the packed
-        # query capacity bounds; an eager call uses its exact longest block.
+        # captured launch replays with changed lengths: a segmented read's
+        # visibility extent bounds every block it replays with, since its
+        # rows must stay within it, and the packed query capacity bounds a
+        # paged block's. An eager call uses its exact longest block.
         longest = batch.queries.maximum
-        if longest is None or torch.cuda.is_current_stream_capturing():
+        if torch.cuda.is_current_stream_capturing():
+            longest = (
+                batch.visible_current_end.shape[1]
+                if isinstance(batch, SegmentedInput)
+                else q.shape[0]
+            )
+        elif longest is None:
             longest = q.shape[0]
 
         start_page = table.start_page
