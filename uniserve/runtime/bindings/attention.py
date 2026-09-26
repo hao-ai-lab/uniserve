@@ -42,7 +42,9 @@ class AttentionBinding:
     """Specialize one attention call site.
 
     Specialize one attention call site's operators, plans, and bound
-    metadata.
+    metadata. ``table`` is the prefix-cache table holding this layer's
+    state, whose entry of each ``AttentionBatch`` the layer reads; ``None``
+    means the layer has no cache table and reads a single-entry batch.
     """
 
     def __init__(
@@ -55,6 +57,7 @@ class AttentionBinding:
         dtype,
         allocate,
         context_transport,
+        table=None,
     ):
         self.module, self.backend, self.cache, self.size = (
             module,
@@ -62,6 +65,7 @@ class AttentionBinding:
             cache,
             size,
         )
+        self.table = table
         self.device, self.dtype, self.allocate = device, dtype, allocate
         self.operators = {}
         self._bound = set()
@@ -168,16 +172,20 @@ class AttentionBinding:
             batch, prepared=self.batch if capturing(self.device) else None
         )
 
-    def bind(self, batch, *, source=None):
-        """Plan numerical metadata for every prepared dtype.
+    def bind(self, attention, *, source=None):
+        """Plan this layer's table entry for every prepared dtype.
 
-        Graph capture uses these plans. The next eager call that receives
-        ``source`` (the caller's batch, defaulting to ``batch``) also uses
-        them; later calls plan again, since device columns can change.
+        ``attention`` is an ``AttentionBatch``. Graph capture uses these
+        plans. The next eager call that receives ``source``'s entry (the
+        caller's batch, defaulting to ``attention``) also uses them; later
+        calls plan again, since device columns can change.
         """
         from ..backends.attention._sequences import host_lengths
 
-        self._fresh = batch if source is None else source
+        batch = attention.entry(self.table)
+        self._fresh = (attention if source is None else source).entry(
+            self.table
+        )
         batch = self.sequence_inputs(batch)
         self.batch = batch
 

@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from uniserve.nn.attention import Attention, DenseInput
+from uniserve.nn.attention import Attention, AttentionBatch, DenseInput
 from uniserve.runtime import CUDAGraph, CUDAStream, ExecutionContext
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
@@ -75,7 +75,7 @@ def test_dense_attention_preserves_heads_masks_and_graph_inputs(
         else None
     )
     attention = Attention(query_heads, kv_heads, width)
-    inputs = DenseInput(causal=not masked, mask=mask)
+    inputs = AttentionBatch.single(DenseInput(causal=not masked, mask=mask))
 
     def execute():
         def layout(value):

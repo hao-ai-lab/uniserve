@@ -24,6 +24,7 @@ import torch
 from uniserve.media import image
 from uniserve.model import EmbeddingReplacement, TextInput, VisionInput
 from uniserve.nn.attention import (
+    AttentionBatch,
     BlockTable,
     PagedInput,
     SegmentedInput,
@@ -486,7 +487,10 @@ class TokenBuffers(AttentionBuffers):
             if attention is None
             else attention
         )
-        inputs = self._text(rows, self.stage_attention(attention))
+        # Every cache layer of a worker's prefix cache reads table 0.
+        inputs = self._text(
+            rows, AttentionBatch.single(self.stage_attention(attention))
+        )
         return inputs, tuple(row.selection for row in rows), finish
 
     def _text(self, rows, attention):
@@ -646,14 +650,16 @@ class TokenBuffers(AttentionBuffers):
             offsets=self.cumulative_prefix_lengths[: count + 1],
         )
 
-        attention = PagedInput(
-            queries,
-            prefixes,
-            BlockTable(
-                self.block_tables[:count, :width], cache.info.block_size
-            ),
-            writes,
-            tuple(row.causal for row in rows),
+        attention = AttentionBatch.single(
+            PagedInput(
+                queries,
+                prefixes,
+                BlockTable(
+                    self.block_tables[:count, :width], cache.info.block_size
+                ),
+                writes,
+                tuple(row.causal for row in rows),
+            )
         )
 
         if self.image_builder is not None:
@@ -683,7 +689,13 @@ class DiffusionBuffers(AttentionBuffers):
             if attention is None
             else attention
         )
-        return self._images(rows, self.stage_attention(attention)), (), None
+        return (
+            self._images(
+                rows, AttentionBatch.single(self.stage_attention(attention))
+            ),
+            (),
+            None,
+        )
 
     def _images(self, rows, attention):
         """Stage denoising positions and timesteps, then bind image inputs.

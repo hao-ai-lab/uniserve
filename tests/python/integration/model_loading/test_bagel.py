@@ -7,7 +7,12 @@ from torch.nn import functional as F
 from tests.python.fixtures.checkpoints import bagel_checkpoint, load_bagel
 from uniserve.media import image
 from uniserve.model import TextInput, TextSize
-from uniserve.nn.attention import PagedInput, SequenceLengths, VarlenInput
+from uniserve.nn.attention import (
+    AttentionBatch,
+    PagedInput,
+    SequenceLengths,
+    VarlenInput,
+)
 from uniserve.runtime import ExecutionContext, PrefixCache
 
 pytestmark = pytest.mark.integration
@@ -28,13 +33,15 @@ def test_text_prefill_decode_and_zero_query_match_qwen_equations(tmp_path):
         ) as context:
             context.prepare(TextSize(4, 1))
             for start, stop in ((0, 3), (3, 4), (4, 4)):
-                batch = PagedInput.from_blocks(
-                    blocks=((0,),),
-                    query_lengths=(stop - start,),
-                    prefix_lengths=(start,),
-                    block_size=4,
-                    causal=True,
-                    device="cpu",
+                batch = AttentionBatch.single(
+                    PagedInput.from_blocks(
+                        blocks=((0,),),
+                        query_lengths=(stop - start,),
+                        prefix_lengths=(start,),
+                        block_size=4,
+                        causal=True,
+                        device="cpu",
+                    )
                 )
                 context.bind_attention(batch)
                 hidden = model.text(
@@ -72,7 +79,9 @@ def test_image_markers_use_text_expert_and_flow_preserves_residual(tmp_path):
         sizes=(size,),
         timesteps=(timestep,),
         positions=(factory.positions(size, 9, device="cpu"),),
-        attention=VarlenInput(lengths, lengths, (False,)),
+        attention=AttentionBatch.single(
+            VarlenInput(lengths, lengths, (False,))
+        ),
         step_index=0,
     )
     before = sample.clone()

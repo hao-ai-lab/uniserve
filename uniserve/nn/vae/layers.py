@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from uniserve.nn.attention import Attention, DenseInput
+from uniserve.nn.attention import Attention, AttentionBatch, DenseInput
 
 
 class ResidualBlock(nn.Module):
@@ -69,7 +69,12 @@ class AttentionBlock(nn.Module):
         # portable score workspace without changing the attention equation.
         result = torch.cat(
             tuple(
-                self.attention(chunk, key, value, DenseInput(False, None))
+                self.attention(
+                    chunk,
+                    key,
+                    value,
+                    AttentionBatch.single(DenseInput(False, None)),
+                )
                 for chunk in query.split(4096, dim=2)
             ),
             dim=2,

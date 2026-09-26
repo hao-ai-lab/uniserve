@@ -27,7 +27,7 @@ from typing import cast
 
 import torch
 
-from uniserve.nn.attention import PagedInput, SegmentedInput
+from uniserve.nn.attention import AttentionBatch, PagedInput, SegmentedInput
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.runtime.resources import close_resources
 from uniserve.tensors import OutputLayout, TensorOutput
@@ -133,19 +133,28 @@ class ModelRunner(Execution, ABC):
         # prefix lengths lets calls that differ only in cached prefix length
         # share one graph; ``replay_batch`` rebinds the live host lengths.
         keyed = execution
-        if isinstance(attention, (PagedInput, SegmentedInput)):
+        if attention is not None and all(
+            isinstance(entry, (PagedInput, SegmentedInput))
+            for entry in attention.entries.values()
+        ):
             keyed = replace(
                 execution,
                 inputs=replace(
                     execution.inputs,
-                    attention=replace(
-                        attention,
-                        prefixes=replace(
-                            attention.prefixes,
-                            host=None
-                            if attention.prefixes.host is None
-                            else (0,) * len(attention.prefixes.host),
-                        ),
+                    attention=AttentionBatch(
+                        {
+                            table: replace(
+                                entry,
+                                prefixes=replace(
+                                    entry.prefixes,
+                                    host=None
+                                    if entry.prefixes.host is None
+                                    else (0,) * len(entry.prefixes.host),
+                                ),
+                            )
+                            for table, entry in attention.entries.items()
+                        },
+                        attention.queries,
                     ),
                 ),
             )
@@ -351,7 +360,10 @@ class ModelRunner(Execution, ABC):
                 # error. Only prefill variants matching no configured shape
                 # run eagerly.
                 configured = key[1][-1] or any(
-                    shape.causal == execution.inputs.attention.causal[0]
+                    shape.causal
+                    == next(
+                        iter(execution.inputs.attention.entries.values())
+                    ).causal[0]
                     and shape.selection is execution.token_selections[0]
                     for shape in self.prefill_shapes
                 )

@@ -18,7 +18,7 @@ from tests.python.fixtures.checkpoints import qwen_checkpoint
 from uniserve import loading
 from uniserve.loading import weights
 from uniserve.model import TextInput, TextSize
-from uniserve.nn.attention import SequenceLengths, VarlenInput
+from uniserve.nn.attention import AttentionBatch, SequenceLengths, VarlenInput
 from uniserve.processing import load_tokenizer
 from uniserve.quantization import QuantizationConfig, QuantizedTensor, Quantizer
 from uniserve.runtime import ExecutionContext
@@ -130,7 +130,7 @@ def _load(root, io=loading.Config(), precision=None):
 def _logits(model):
     tokens = torch.tensor([1, 3, 9])
     lengths = SequenceLengths.from_lengths((3,), device="cpu")
-    attention = VarlenInput(lengths, lengths, (True,))
+    attention = AttentionBatch.single(VarlenInput(lengths, lengths, (True,)))
     with ExecutionContext(model, attention="torch") as context:
         context.prepare(TextSize(3, 1))
         hidden = model(TextInput(tokens, torch.arange(3), attention))

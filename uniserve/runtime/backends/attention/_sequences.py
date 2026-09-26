@@ -1,6 +1,6 @@
 """Numerical sequence slicing for kernels with one causality flag per launch."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from itertools import groupby
 
 import torch
@@ -43,6 +43,36 @@ def host_lengths(batch, *, prepared=None):
             host = tuple(lengths.values.cpu().tolist())
         changes[name] = replace(lengths, host=host)
     return replace(batch, **changes) if changes else batch
+
+
+def batch_host_lengths(batch):
+    """Mirror every entry of an ``AttentionBatch`` with one read per column.
+
+    Entries share their query lengths, so the shared domain is read once and
+    each entry keeps borrowing the same device columns. Reading device values
+    during CUDA capture is forbidden, as for ``host_lengths``.
+    """
+    from uniserve.nn.attention.inputs import AttentionBatch
+
+    if batch.queries is None:
+        return batch
+    queries = (
+        batch.queries
+        if batch.queries.host is not None
+        else host_lengths(_Queries(batch.queries)).queries
+    )
+    entries = {
+        table: host_lengths(replace(entry, queries=queries))
+        for table, entry in batch.entries.items()
+    }
+    return AttentionBatch(entries, queries)
+
+
+@dataclass(frozen=True, slots=True)
+class _Queries:
+    """A query-only view letting ``host_lengths`` mirror a shared domain."""
+
+    queries: SequenceLengths
 
 
 def _lengths(lengths, start, stop):

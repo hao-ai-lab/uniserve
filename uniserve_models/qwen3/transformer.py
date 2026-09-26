@@ -14,7 +14,7 @@ from torch import nn
 from uniserve.model import TransformerDecoder
 from uniserve.nn.attention import Attention as ScaledAttention
 from uniserve.nn.attention import (
-    AttentionInput,
+    AttentionBatch,
     RotaryQKVProjection,
 )
 from uniserve.nn.functional import add_rms_norm
@@ -75,7 +75,7 @@ class Attention(nn.Module):
         self,
         hidden: torch.Tensor,
         positions: torch.Tensor,
-        attention: AttentionInput,
+        attention: AttentionBatch,
     ):
         # This unscaled recipe depends only on positions, so computing factors
         # does not require a host mirror of the attention lengths.

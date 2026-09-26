@@ -10,7 +10,7 @@ from tests.python.fixtures.checkpoints import qwen_checkpoint
 from uniserve import loading
 from uniserve.loading import weights
 from uniserve.model import EmbeddingReplacement, TextInput, TextSize
-from uniserve.nn.attention import PagedInput
+from uniserve.nn.attention import AttentionBatch, PagedInput
 from uniserve.runtime import ExecutionContext, PrefixCache
 from uniserve_models import loading as models
 from uniserve_models import qwen3
@@ -38,13 +38,15 @@ def test_checkpoint_prefill_decode_and_selected_logits(tmp_path, tied, theta):
         with ExecutionContext(model, cache=cache, attention="torch") as context:
             context.prepare(TextSize(4, 1))
             for start, stop in ((0, 3), (3, 4)):
-                batch = PagedInput.from_blocks(
-                    query_lengths=(stop - start,),
-                    prefix_lengths=(start,),
-                    blocks=((0,),),
-                    block_size=4,
-                    causal=True,
-                    device="cpu",
+                batch = AttentionBatch.single(
+                    PagedInput.from_blocks(
+                        query_lengths=(stop - start,),
+                        prefix_lengths=(start,),
+                        blocks=((0,),),
+                        block_size=4,
+                        causal=True,
+                        device="cpu",
+                    )
                 )
                 context.bind_attention(batch)
                 hidden = model(
@@ -85,13 +87,15 @@ def test_embedding_replacement_matches_numerical_embedding_input(tmp_path):
     embeddings[1].fill_(0.25)
     with torch.no_grad():
         expected = reference(inputs_embeds=embeddings[None]).logits[0]
-    batch = PagedInput.from_blocks(
-        query_lengths=(3,),
-        prefix_lengths=(0,),
-        blocks=((0,),),
-        block_size=4,
-        causal=True,
-        device="cpu",
+    batch = AttentionBatch.single(
+        PagedInput.from_blocks(
+            query_lengths=(3,),
+            prefix_lengths=(0,),
+            blocks=((0,),),
+            block_size=4,
+            causal=True,
+            device="cpu",
+        )
     )
     with PrefixCache(
         model.cache_config, num_blocks=1, block_size=4, device="cpu"
@@ -179,13 +183,15 @@ def _partitioned(rank, rendezvous, root, shape, axes):
                     devices=(),
                 )
                 for start, stop in ((0, 3), (3, 4)):
-                    batch = PagedInput.from_blocks(
-                        blocks=((0,),),
-                        query_lengths=(stop - start,),
-                        prefix_lengths=(start,),
-                        block_size=4,
-                        causal=True,
-                        device="cpu",
+                    batch = AttentionBatch.single(
+                        PagedInput.from_blocks(
+                            blocks=((0,),),
+                            query_lengths=(stop - start,),
+                            prefix_lengths=(start,),
+                            block_size=4,
+                            causal=True,
+                            device="cpu",
+                        )
                     )
                     context.bind_attention(batch)
                     hidden = model(
@@ -215,7 +221,9 @@ def _partitioned(rank, rendezvous, root, shape, axes):
                 lengths = SequenceLengths.from_lengths(
                     (2, 0, 1, 1), device="cpu"
                 )
-                attention = VarlenInput(lengths, lengths, (True,) * 4)
+                attention = AttentionBatch.single(
+                    VarlenInput(lengths, lengths, (True,) * 4)
+                )
                 context.bind_attention(attention)
                 selected = (
                     call(
@@ -291,7 +299,7 @@ def test_decoder_without_prefix_storage(tmp_path):
     ).model
     tokens = torch.tensor([1, 3, 9])
     lengths = SequenceLengths.from_lengths((3,), device="cpu")
-    batch = VarlenInput(lengths, lengths, (True,))
+    batch = AttentionBatch.single(VarlenInput(lengths, lengths, (True,)))
     inputs = TextInput(tokens, torch.arange(3), batch)
     with torch.no_grad():
         expected = reference(tokens[None]).logits[0]
@@ -452,7 +460,7 @@ def test_public_partial_loading_exposes_selected_decoder_values(tmp_path):
         actual = backbone(
             backbone.embed_input_ids(tokens),
             torch.arange(3),
-            VarlenInput(lengths, lengths, (True,)),
+            AttentionBatch.single(VarlenInput(lengths, lengths, (True,))),
         )
         expected = reference.model(tokens[None]).last_hidden_state[0]
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
