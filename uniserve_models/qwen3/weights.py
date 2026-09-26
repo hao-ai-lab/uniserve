@@ -79,26 +79,34 @@ def parameter_sources(config: Config) -> Mapping[str, str]:
             )
 
         if config.num_experts:
+            # Stacked expert parameters receive every expert's projections
+            # through ``expert_sources``.
             names[f"{target}.mlp.router.weight"] = f"{source}.mlp.gate.weight"
-            mlps = tuple(
-                (
-                    f"{target}.mlp.experts.experts.{expert}",
-                    f"{source}.mlp.experts.{expert}",
-                )
-                for expert in range(config.num_experts)
+            continue
+        for branch in ("gate", "up"):
+            names[f"{target}.mlp.gate_up.projections.{branch}.weight"] = (
+                f"{source}.mlp.{branch}_proj.weight"
             )
-        else:
-            mlps = ((f"{target}.mlp", f"{source}.mlp"),)
-        for target_mlp, source_mlp in mlps:
-            for branch in ("gate", "up"):
-                names[f"{target_mlp}.gate_up.projections.{branch}.weight"] = (
-                    f"{source_mlp}.{branch}_proj.weight"
-                )
-            names[f"{target_mlp}.down.weight"] = (
-                f"{source_mlp}.down_proj.weight"
-            )
+        names[f"{target}.mlp.down.weight"] = f"{source}.mlp.down_proj.weight"
 
     return names
+
+
+def expert_sources(config: Config) -> Mapping[str, str]:
+    """Map each MoE layer's stacked expert module to its checkpoint prefix.
+
+    Keys are ``FusedMoE`` module paths of a complete ``Model``; values are
+    the Transformers prefix whose ``{expert}.{gate,up,down}_proj.weight``
+    tensors hold each expert's matrices.
+    """
+    if not config.num_experts:
+        return {}
+    return {
+        f"backbone.layers.{index}.mlp.experts": (
+            f"model.layers.{index}.mlp.experts"
+        )
+        for index in range(config.num_hidden_layers)
+    }
 
 
 def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
@@ -113,9 +121,17 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
     loading, the load fails reporting it missing when it is selected.
     """
     names = parameter_sources(model.config)
+    experts = expert_sources(model.config)
+    modules = dict(model.named_modules(remove_duplicate=False))
     parameters = dict(model.named_parameters(remove_duplicate=False))
     off_stage = frozenset(
         source for target, source in names.items() if target not in parameters
+    ) | frozenset(
+        f"{prefix}.{expert}.{projection}_proj.weight"
+        for path, prefix in experts.items()
+        if path not in modules
+        for expert in range(model.config.num_experts)
+        for projection in ("gate", "up", "down")
     )
     # Tied heads can have a redundant checkpoint copy; the embedding is the
     # unique source for their shared Parameter on either pipeline endpoint.
@@ -123,7 +139,7 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
         off_stage |= {"lm_head.weight"}
     # A tensor still read by a resident parameter is never nonresident; with
     # tied embeddings the last stage's head reads the embedding tensor.
-    used_sources = {names[target] for target in parameters}
+    used_sources = {names[target] for target in parameters if target in names}
     off_stage -= used_sources
 
     # ``parameters`` lists a tied Parameter under both of its paths, as the
@@ -131,15 +147,41 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
     # same tensor, and the loader skips the identical repeat.
     def assign(reader):
         available = frozenset(reader.names())
-        result = []
-        for target, parameter in parameters.items():
-            source = names[target]
+
+        def resolve(source):
             # Some checkpoints serialize the same tensors without the
             # "model." prefix used by the canonical naming.
             if source not in available and source.startswith("model.layers."):
                 source = source.removeprefix("model.")
-            if source in available:
-                result.append(weights.Assignment(parameter, reader.get(source)))
+            return reader.get(source) if source in available else None
+
+        result = []
+        for path, prefix in experts.items():
+            module = modules.get(path)
+            if module is None:
+                continue
+            for expert in range(model.config.num_experts):
+                sources = {
+                    projection: resolve(
+                        f"{prefix}.{expert}.{projection}_proj.weight"
+                    )
+                    for projection in ("gate", "up", "down")
+                }
+                if any(value is None for value in sources.values()):
+                    continue
+                result.extend(
+                    weights.expert_assignments(
+                        module,
+                        up=(sources["up"], 0),
+                        gate=(sources["gate"], 0),
+                        down=sources["down"],
+                        expert=expert,
+                    )
+                )
+        for target, parameter in parameters.items():
+            weight = resolve(names[target]) if target in names else None
+            if weight is not None:
+                result.append(weights.Assignment(parameter, weight))
         return tuple(result)
 
     return (

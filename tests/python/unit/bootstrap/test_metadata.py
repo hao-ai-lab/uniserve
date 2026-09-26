@@ -253,6 +253,7 @@ def test_text_worker_reports_exact_cache_capacity(storage):
                 num_experts=0,
                 num_experts_per_tok=1,
                 moe_intermediate_size=48,
+                norm_topk_prob=False,
             )
         ).to(dtype=torch.bfloat16)
     config = WorkerConfig(

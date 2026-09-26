@@ -1,0 +1,252 @@
+"""Native grouped-expert kernels evaluate the routed expert equation.
+
+Every value is positive, so each rounding step bounds the relative error of
+every output independently of cancellation.
+"""
+
+import pytest
+import torch
+from torch.nn import functional as F
+
+from uniserve.model import TextSize
+from uniserve.nn.moe import FusedMoE
+from uniserve.quantization import Quantizer, ScaleLayout
+from uniserve.runtime import CUDAStream, ExecutionContext
+from uniserve.runtime.cuda_graph import CUDAGraph
+
+pytestmark = [pytest.mark.integration, pytest.mark.gpu]
+
+EXPERTS, HIDDEN, INTERMEDIATE, TOP_K, TOKENS = 8, 256, 128, 2, 40
+DEVICE = torch.device("cuda:0")
+E4M3_ONE = 0x38  # the E4M3 byte encoding 1.0
+
+
+def _gamma(roundings):
+    """Relative bound of ``roundings`` BF16 unit roundoffs (Higham gamma)."""
+    unit = 2**-8
+    return roundings * unit / (1 - roundings * unit)
+
+
+def _routes(generator, tokens=TOKENS):
+    """Distinct experts per token and positive FP32 route weights."""
+    ids = torch.stack(
+        [
+            torch.randperm(EXPERTS, generator=generator)[:TOP_K]
+            for _ in range(tokens)
+        ]
+    ).to(torch.int32)
+    weights = torch.rand(tokens, TOP_K, generator=generator) + 0.25
+    return ids.to(DEVICE), weights.to(DEVICE)
+
+
+def _reference(hidden, up_gate, down, ids, weights, activation):
+    """The routed equation in FP64 over already-decoded operands."""
+    hidden, up_gate, down = hidden.double(), up_gate.double(), down.double()
+    result = torch.zeros_like(hidden)
+    for slot in range(TOP_K):
+        expert = ids[:, slot].long()
+        projected = torch.einsum("th,toh->to", hidden, up_gate[expert])
+        up, gate = projected.split(INTERMEDIATE, dim=-1)
+        activated = (
+            F.silu(gate)
+            if activation == "silu"
+            else F.gelu(gate, approximate="tanh")
+        ) * up
+        result += weights[:, slot, None].double() * torch.einsum(
+            "ti,thi->th", activated, down[expert]
+        )
+    return result
+
+
+def _replay_matches(module, hidden, ids, weights, expected, *, rtol):
+    """Evaluate eagerly, then replay a capture over rewritten routing."""
+    stream = CUDAStream.external(torch.cuda.Stream(device=DEVICE))
+    stream.wait(torch.cuda.current_stream(DEVICE))
+    generator = torch.Generator().manual_seed(47)
+    with stream, ExecutionContext(module, stream=stream) as context:
+        context.prepare(TextSize(TOKENS, 1))
+        with context.activate():
+            actual = module(hidden, ids, weights)
+        torch.testing.assert_close(
+            actual.double(), expected(hidden, ids, weights), rtol=rtol, atol=0
+        )
+
+        with CUDAGraph(context=context) as graph:
+            graph.capture(lambda: module(hidden, ids, weights))
+            replacement_ids, replacement_weights = _routes(generator)
+            ids.copy_(replacement_ids)
+            weights.copy_(replacement_weights)
+            hidden.copy_(hidden.flip(0))
+            actual = graph.replay()
+            torch.testing.assert_close(
+                actual.double(),
+                expected(hidden, ids, weights),
+                rtol=rtol,
+                atol=0,
+            )
+    torch.cuda.synchronize(DEVICE)
+
+
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+@torch.inference_mode()
+def test_bf16_experts_match_the_routed_equation(activation):
+    generator = torch.Generator().manual_seed(41)
+    module = FusedMoE(
+        EXPERTS,
+        HIDDEN,
+        INTERMEDIATE,
+        top_k=TOP_K,
+        activation=activation,
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+    # Positive operands scaled so each projection stays near unit size.
+    for parameter, fan_in in (
+        (module.up_gate.weight, HIDDEN),
+        (module.down.weight, INTERMEDIATE),
+    ):
+        parameter.copy_(
+            (torch.rand(parameter.shape, generator=generator) + 0.125) / fan_in
+        )
+    hidden = (torch.rand(TOKENS, HIDDEN, generator=generator) + 0.125).to(
+        DEVICE, torch.bfloat16
+    )
+    ids, weights = _routes(generator)
+
+    def expected(hidden, ids, weights):
+        return _reference(
+            hidden,
+            module.up_gate.weight,
+            module.down.weight,
+            ids,
+            weights,
+            activation,
+        )
+
+    # BF16 roundings of the activated intermediate, each expert's projection
+    # and the combined output, plus the kernel's approximate activation,
+    # whose relative error is below one BF16 unit on positive inputs.
+    _replay_matches(module, hidden, ids, weights, expected, rtol=_gamma(4))
+
+
+def _nvfp4(codes, block_scale, tensor_scale):
+    """Encode positive E2M1 ``codes [E, rows, K]`` with per-expert scales.
+
+    ``block_scale`` holds one E4M3 byte per expert for all its blocks.
+    """
+    experts, rows, width = codes.shape
+    codes, block_scale = codes.to(DEVICE), block_scale.to(DEVICE)
+    values = (codes[..., 0::2] | (codes[..., 1::2] << 4)).to(torch.uint8)
+    scales = block_scale.to(torch.uint8)[:, None, None].expand(
+        experts, rows, width // 16
+    )
+    return (
+        Quantizer("nvfp4")
+        .from_tensors(
+            {
+                "values": values.contiguous(),
+                "block_scale": scales.reshape(
+                    experts * rows, width // 16
+                ).contiguous(),
+                "tensor_scale": tensor_scale.float().to(DEVICE),
+            },
+            shape=(experts, rows, width),
+            dtype=torch.bfloat16,
+        )
+        .repack(scale_layout=ScaleLayout.SWIZZLED_128X4)
+    )
+
+
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+@torch.inference_mode()
+def test_nvfp4_experts_apply_per_expert_scales_and_static_activations(
+    activation,
+):
+    """Operands are exact in every encoding the kernel applies.
+
+    Hidden blocks contain E2M1 magnitudes with a maximum of six, so the unit
+    activation scale encodes them exactly. Each up row selects one hidden
+    column; each gate row reads columns holding 6 and 2 with weight 4, so
+    every gate is 32, where SiLU and tanh-GELU equal the identity in FP32.
+    The intermediate ``32 * x`` then encodes exactly at block scale 32.
+    Per-expert power-of-two tensor scales are compensated by block scales,
+    so a kernel reading another expert's scale changes the result.
+    """
+    generator = torch.Generator().manual_seed(43)
+    module = FusedMoE(
+        EXPERTS,
+        HIDDEN,
+        INTERMEDIATE,
+        top_k=TOP_K,
+        activation=activation,
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+
+    # Positive E2M1 codes 1..7 encode 0.5, 1, 1.5, 2, 3, 4 and 6.
+    hidden_codes = torch.randint(1, 8, (TOKENS, HIDDEN), generator=generator)
+    hidden_codes[:, ::16] = 7
+    hidden_codes[:, 1] = 4
+    magnitudes = torch.tensor((0, 0.5, 1, 1.5, 2, 3, 4, 6))
+    hidden = magnitudes[hidden_codes].to(DEVICE, torch.bfloat16)
+
+    up_gate_codes = torch.zeros(
+        EXPERTS, 2 * INTERMEDIATE, HIDDEN, dtype=torch.long
+    )
+    rows = torch.arange(INTERMEDIATE)
+    for expert in range(EXPERTS):
+        # The first channel of every intermediate block reads a six.
+        columns = torch.randint(0, HIDDEN, (INTERMEDIATE,), generator=generator)
+        columns[::16] = 0
+        up_gate_codes[expert, rows, columns] = 2
+    up_gate_codes[:, INTERMEDIATE:, :2] = 6
+    shifts = torch.arange(EXPERTS) % 3
+    module.up_gate.weight = torch.nn.Parameter(
+        _nvfp4(
+            up_gate_codes,
+            E4M3_ONE + 8 * shifts,
+            torch.exp2(-shifts.float()),
+        ),
+        requires_grad=False,
+    )
+    down_codes = torch.randint(
+        0, 8, (EXPERTS, HIDDEN, INTERMEDIATE), generator=generator
+    )
+    module.down.weight = torch.nn.Parameter(
+        _nvfp4(
+            down_codes,
+            torch.full((EXPERTS,), E4M3_ONE - 8 * 3),
+            torch.exp2(-(torch.arange(EXPERTS) % 2).float()),
+        ),
+        requires_grad=False,
+    )
+    module.up_gate.input_quantizer = Quantizer("nvfp4", calibrated_scale=1.0)
+    module.down.input_quantizer = Quantizer("nvfp4", calibrated_scale=1.0)
+    ids, weights = _routes(generator)
+
+    up_gate = module.up_gate.weight.dequantize(dtype=torch.float32)
+    down = module.down.weight.dequantize(dtype=torch.float32)
+
+    def expected(hidden, ids, weights):
+        return _reference(hidden, up_gate, down, ids, weights, activation)
+
+    # Every expert projection is exact in FP32. BF16 roundings of each
+    # expert's projection and of the combined output, and the FP32 route
+    # products and sums, remain.
+    _replay_matches(module, hidden, ids, weights, expected, rtol=_gamma(3))
+
+
+@torch.inference_mode()
+def test_representations_without_a_native_kernel_fail_at_preparation():
+    module = FusedMoE(
+        EXPERTS,
+        HIDDEN,
+        INTERMEDIATE,
+        top_k=TOP_K,
+        activation="silu",
+        device=DEVICE,
+        dtype=torch.float32,
+    )
+    with pytest.raises(ValueError, match="no native expert kernel covers"):
+        with ExecutionContext(module) as context:
+            context.prepare(TextSize(TOKENS, 1))

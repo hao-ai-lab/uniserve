@@ -30,6 +30,7 @@ def _decoder(*, normalize_output: bool) -> Transformer:
         num_experts=0,
         num_experts_per_tok=1,
         moe_intermediate_size=32,
+        norm_topk_prob=False,
     )
     model = Transformer(config)
     if not normalize_output:

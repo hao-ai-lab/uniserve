@@ -41,6 +41,7 @@ from uniserve.loading import weights as weight_options
 from uniserve.model import ComponentEntry
 from uniserve.nn.attention import AttentionParallelConfig
 from uniserve.nn.linear import Linear
+from uniserve.nn.moe import ExpertLinear
 from uniserve.processing import FlowPrompt, ImageProcessor
 from uniserve.quantization import QuantizationConfig, Quantizer
 
@@ -814,6 +815,12 @@ def _calibrated_quantization(model, declarations, sources, declared, io):
                             "positive static input_scale"
                         )
                     for path in owners[id(assignment.target)]:
+                        if isinstance(paths[path], ExpertLinear):
+                            # Stacked experts share one activation encoding;
+                            # its static scale is the largest calibrated
+                            # expert scale, so no expert's input saturates.
+                            scales[path] = max(scales.get(path, 0.0), value)
+                            continue
                         if not isinstance(paths[path], Linear):
                             raise ValueError(
                                 f"ModelOpt weight {weight.name!r} maps onto "

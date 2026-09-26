@@ -94,6 +94,7 @@ class TextEncoder(BaseTextEncoder):
                 num_experts=0,
                 num_experts_per_tok=1,
                 moe_intermediate_size=config.intermediate_size,
+                norm_topk_prob=False,
             )
         )
         # H3 conditions on the retained layer's raw hidden state; the Qwen

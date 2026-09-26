@@ -23,6 +23,7 @@ from uniserve.nn.linear import (
     _padded_vocabulary,
     _vocabulary,
 )
+from uniserve.nn.moe import FusedMoE
 from uniserve.quantization import QuantizedTensor
 
 from .distribution import Distribution
@@ -79,6 +80,9 @@ def _communication_axes(module, mesh, attention):
         if isinstance(child, (Attention, VsaAttention)):
             add(head)
             add(context)
+        if isinstance(child, FusedMoE):
+            # Tensor-parallel shards of I sum once after combining experts.
+            add("tp")
         if isinstance(child, (Linear, VocabParallelEmbedding)):
             # Quantization reduces statistics across each sharded dimension.
             for axis in tokens:
@@ -120,6 +124,55 @@ def communicators(module: nn.Module) -> tuple:
             if group.size > 1:
                 groups[group._require()] = group
     return tuple(groups.values())
+
+
+def _partition_experts(module, mesh, group, attention) -> None:
+    """Keep this rank's interval of every expert's intermediate channels.
+
+    Each rank holds the same experts with ``I / tp`` of their up, gate and
+    down channels; ``up_gate`` keeps the local up rows followed by the local
+    gate rows, preserving the resident order.
+    """
+    bound = getattr(module, "_parallel_mesh", None)
+    if bound is not None:
+        if bound != mesh or module._attention_parallel != attention:
+            raise ValueError(
+                "a resident layer cannot change its mathematical partition"
+            )
+        return
+    intermediate = module.intermediate_size
+    if intermediate % group.size:
+        raise ValueError(
+            "expert intermediate channels must divide the tensor-parallel group"
+        )
+    if isinstance(module.up_gate.weight, QuantizedTensor):
+        raise ValueError("parallel binding must precede weight quantization")
+    width = intermediate // group.size
+    local = slice(group.rank * width, (group.rank + 1) * width)
+    if width != intermediate:
+        up_gate, down = module.up_gate.weight, module.down.weight
+        module.up_gate.weight = nn.Parameter(
+            torch.cat(
+                (
+                    up_gate[:, local],
+                    up_gate[
+                        :,
+                        intermediate + local.start : intermediate + local.stop,
+                    ],
+                ),
+                dim=1,
+            ),
+            requires_grad=False,
+        )
+        module.down.weight = nn.Parameter(
+            down[:, :, local].contiguous(), requires_grad=False
+        )
+        module.up_gate.out_features = 2 * width
+        module.down.in_features = width
+    module.intermediate_slice = local
+    module.group = group
+    module._parallel_mesh = mesh
+    module._attention_parallel = attention
 
 
 def _replicated_heads(mesh: DeviceMesh, heads: int) -> Distribution:
@@ -405,6 +458,9 @@ def parallelize_(
                 )
             child._parallel_mesh = mesh
             child._attention_parallel = attention
+            continue
+        if isinstance(child, FusedMoE):
+            _partition_experts(child, mesh, group, attention)
             continue
         if not isinstance(child, (Linear, VocabParallelEmbedding)):
             continue
