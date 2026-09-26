@@ -223,17 +223,23 @@ class Backend:
 def resolve(backend, *, device):
     """Return the Backend for a name or instance.
 
-    Return the Backend for a name, an existing instance, or 'auto' device
-    probing.
+    ``"auto"`` selects the native SM100 kernels (``sm100``) and raises on any
+    other device, including a CUDA device without them: FlashInfer's
+    block-sparse wrapper runs its FlashAttention-2 templates and the Triton
+    kernel is a portable reference, so neither stands in for native
+    coverage. Both remain selectable by name.
     """
     if isinstance(backend, Backend):
         return backend
     if backend == "auto":
-        for name in ("sm100", "flashinfer", "triton"):
-            candidate = import_module(f"{__name__}.{name}")
-            if candidate.available(device):
-                return candidate.Backend()
-        raise RuntimeError(f"no installed VSA backend supports {device}")
+        native = import_module(f"{__name__}.sm100")
+        if native.available(device):
+            return native.Backend()
+        raise RuntimeError(
+            f"no native VSA kernel supports {device}: the SM100 block-sparse "
+            "kernels require a compute capability 10.x CUDA device with the "
+            "CUTLASS DSL, cuDNN frontend and CUDA driver bindings"
+        )
 
     if backend not in {"sm100", "cute", "flashinfer", "triton"}:
         raise ValueError(f"unknown VSA backend {backend!r}")
