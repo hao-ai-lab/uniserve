@@ -145,6 +145,13 @@ class ExecutionContext(Generic[SizeT]):
     ``scratch``, when given, is a borrowed :class:`Scratch` whose other
     borrowers run on the same stream; the caller closes it after every
     borrower retires. Without it the context owns a private one.
+
+    ``derive_host_lengths`` lets attention planning read host sequence
+    lengths and table start pages a batch lacks from its device columns, a
+    synchronizing device-to-host copy for direct library callers. A caller
+    whose inputs always carry those host mirrors, such as the serving
+    worker, passes False, and a call missing one then raises instead of
+    copying. Planning never reads device values during graph capture.
     """
 
     def __init__(
@@ -159,6 +166,7 @@ class ExecutionContext(Generic[SizeT]):
         moe="auto",
         groups=None,
         scratch: Scratch | None = None,
+        derive_host_lengths: bool = True,
     ):
         # Close releases the module; a closed context never executes again.
         self.module: nn.Module | None = module
@@ -172,6 +180,7 @@ class ExecutionContext(Generic[SizeT]):
             matmul,
         )
         self._moe_backend = moe
+        self._derive_host_lengths = derive_host_lengths
 
         reference: torch.Tensor | None = next(
             (value for value in module.parameters() if not value.is_meta), None
@@ -572,6 +581,7 @@ class ExecutionContext(Generic[SizeT]):
                         self._attention_workspace,
                         self._context_transport,
                         table,
+                        derive_host_lengths=self._derive_host_lengths,
                     )
                     self._attention[id(child)] = attention_binding
 
@@ -665,7 +675,9 @@ class ExecutionContext(Generic[SizeT]):
         eager execution the next call of each planned layer on ``batch`` uses
         these plans instead of planning again; bind again after changing
         lengths in place. Exact host lengths are read at most once for all
-        layers and tables.
+        layers and tables, and only when the batch lacks them and the context
+        derives host lengths; otherwise a plan that needs a missing mirror
+        raises ``ValueError``.
         """
         from .backends.attention._sequences import batch_host_lengths
 
@@ -685,7 +697,9 @@ class ExecutionContext(Generic[SizeT]):
                 binding.reads_host_lengths(batch.entry(binding.table))
                 for binding in readers
             ):
-                mirrored = batch_host_lengths(batch)
+                mirrored = batch_host_lengths(
+                    batch, derive=self._derive_host_lengths
+                )
             for binding in readers:
                 binding.bind(mirrored, source=batch)
 

@@ -8,13 +8,20 @@ import torch
 from uniserve.nn.attention.inputs import BlockTable, PagedInput, SequenceLengths
 
 
-def host_lengths(batch, *, prepared=None):
+def host_lengths(batch, *, prepared=None, derive=True):
     """Supply exact mirrors at preparation, retaining borrowed device columns.
 
     Sequence lengths and a block table's start pages are mirrored. During
     capture, prepared mirrors must describe these same fixed addresses.
     Reading device values is forbidden there; replay metadata is prepared by
     the caller before each invocation that requires host-driven planning.
+
+    Without ``prepared``, a missing mirror is read from its column. A CUDA
+    column is read only with ``derive``, a synchronizing device-to-host copy
+    that direct library callers may rely on; serving contexts pass False,
+    because their input staging supplies every mirror, and a missing CUDA
+    mirror then raises ``ValueError`` instead of copying. Columns on the CPU
+    are mirrored either way, since reading them transfers nothing.
     """
     changes = {}
     table = getattr(batch, "block_table", None)
@@ -36,16 +43,13 @@ def host_lengths(batch, *, prepared=None):
                 )
             host = previous.start_page_host
         else:
-            if (
-                table.start_page.is_cuda
-                and torch.cuda.is_current_stream_capturing()
-            ):
-                raise RuntimeError(
-                    "prepare host table start pages before CUDA capture"
-                )
-            host = tuple(table.start_page.cpu().tolist())
+            host = _read(table.start_page, "table start pages", derive)
         changes["block_table"] = replace(table, start_page_host=host)
-    for name in ("queries", "keys", "prefixes"):
+    for name, what in (
+        ("queries", "query lengths"),
+        ("keys", "key lengths"),
+        ("prefixes", "prefix lengths"),
+    ):
         lengths = getattr(batch, name, None)
         if lengths is None or lengths.host is not None:
             continue
@@ -62,24 +66,32 @@ def host_lengths(batch, *, prepared=None):
                 )
             host = previous.host
         else:
-            if (
-                lengths.values.is_cuda
-                and torch.cuda.is_current_stream_capturing()
-            ):
-                raise RuntimeError(
-                    "prepare host sequence lengths before CUDA capture"
-                )
-            host = tuple(lengths.values.cpu().tolist())
+            host = _read(lengths.values, what, derive)
         changes[name] = replace(lengths, host=host)
     return replace(batch, **changes) if changes else batch
 
 
-def batch_host_lengths(batch):
+def _read(values, what, derive):
+    """Mirror one metadata column on the host, as ``host_lengths`` permits."""
+    if values.is_cuda:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(f"prepare host {what} before CUDA capture")
+        if not derive:
+            raise ValueError(
+                f"attention planning requires host {what}, which this "
+                "context never reads from the device; stage them with the "
+                "call's attention input"
+            )
+    return tuple(values.cpu().tolist())
+
+
+def batch_host_lengths(batch, *, derive=True):
     """Mirror every entry of an ``AttentionBatch`` with one read per column.
 
     Entries share their query lengths, so the shared domain is read once and
     each entry keeps borrowing the same device columns. Reading device values
-    during CUDA capture is forbidden, as for ``host_lengths``.
+    during CUDA capture is forbidden, and without ``derive`` a missing CUDA
+    mirror raises, as for ``host_lengths``.
     """
     from uniserve.nn.attention.inputs import AttentionBatch
 
@@ -88,10 +100,10 @@ def batch_host_lengths(batch):
     queries = (
         batch.queries
         if batch.queries.host is not None
-        else host_lengths(_Queries(batch.queries)).queries
+        else host_lengths(_Queries(batch.queries), derive=derive).queries
     )
     entries = {
-        table: host_lengths(replace(entry, queries=queries))
+        table: host_lengths(replace(entry, queries=queries), derive=derive)
         for table, entry in batch.entries.items()
     }
     return AttentionBatch(entries, queries)

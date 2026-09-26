@@ -47,6 +47,10 @@ class AttentionBinding:
     metadata. ``table`` is the prefix-cache table holding this layer's
     state, whose entry of each ``AttentionBatch`` the layer reads; ``None``
     means the layer has no cache table and reads a single-entry batch.
+    ``derive_host_lengths`` states whether a plan that needs host sequence
+    lengths or table start pages the batch lacks may read them from the
+    device (see ``_sequences.host_lengths``); without it the batch must
+    carry them.
     """
 
     def __init__(
@@ -60,6 +64,8 @@ class AttentionBinding:
         allocate,
         context_transport,
         table=None,
+        *,
+        derive_host_lengths=True,
     ):
         self.module, self.backend, self.cache, self.size = (
             module,
@@ -68,6 +74,7 @@ class AttentionBinding:
             size,
         )
         self.table = table
+        self.derive_host_lengths = derive_host_lengths
         self.device, self.dtype, self.allocate = device, dtype, allocate
         self.operators = {}
         # Name of the provider each prepared dtype's operator belongs to.
@@ -222,7 +229,9 @@ class AttentionBinding:
         from ..backends.attention._sequences import host_lengths
 
         return host_lengths(
-            batch, prepared=self.batch if capturing(self.device) else None
+            batch,
+            prepared=self.batch if capturing(self.device) else None,
+            derive=self.derive_host_lengths,
         )
 
     def bind(self, attention, *, source=None):
@@ -260,7 +269,9 @@ class AttentionBinding:
                 else self._context_plan(batch, dtype).refresh(batch)
             )
             if operator.requires_host_lengths(numerical):
-                numerical = host_lengths(numerical)
+                numerical = host_lengths(
+                    numerical, derive=self.derive_host_lengths
+                )
             operator.bind(numerical)
             self._bound_batches[dtype] = numerical
 
@@ -310,7 +321,7 @@ class AttentionBinding:
             # without an explicit bind call. A previous plan for this dtype
             # does not describe the current batch.
             if operator.requires_host_lengths(batch):
-                batch = host_lengths(batch)
+                batch = host_lengths(batch, derive=self.derive_host_lengths)
             operator.bind(batch)
             self._bound.add(q.dtype)
             self._bound_batches[q.dtype] = batch
