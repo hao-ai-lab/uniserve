@@ -89,8 +89,10 @@ pub struct WorkerProcessArgs {
     /// Optional KV cache capacity expressed in tokens.
     pub kv_token_capacity: Option<u64>,
     /// Tokens per KV page of the cache group with the widest token rows;
-    /// the worker derives every other group's page size from it.
-    pub block_size: u32,
+    /// the worker derives every other group's page size from it. `None`
+    /// lets the worker choose it from its cache layers and attention
+    /// kernels.
+    pub block_size: Option<u32>,
     /// Maximum calls accepted in one worker run.
     pub max_batch_calls: u32,
     /// Maximum tokens accepted in one worker run.

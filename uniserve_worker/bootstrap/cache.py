@@ -14,17 +14,28 @@ group and its K/V heads to be covered without a gap.
 from dataclasses import replace
 
 import torch
+from torch import nn
 
+from uniserve.distributed.mesh import Communicator
 from uniserve.math import ceil_div
 from uniserve.model import CausalLM
+from uniserve.nn.attention import Attention
 from uniserve.quantization import Quantizer
+from uniserve.runtime.backends.attention import Backend, CachePages
 from uniserve.runtime.prefix_cache import Planes, plan_units
+from uniserve_worker.bootstrap.inputs import capability
 from uniserve_worker.config.execution import WorkerConfig
+from uniserve_worker.errors import unsupported_setup
 from uniserve_worker.protocol.worker_info import (
     KVCacheInfo,
     KvGroup,
     KvGroupKind,
 )
+
+# The largest base page size, in tokens, a worker chooses when the operator
+# sets none. A smaller one is chosen only when an attention kernel cannot
+# read the pages the larger one gives some cache group.
+DEFAULT_BLOCK_SIZE = 64
 
 
 def storage(config: WorkerConfig) -> tuple[torch.dtype | None, bool]:
@@ -46,13 +57,21 @@ def plan_cache(model: CausalLM, config: WorkerConfig) -> Planes:
     """Plan the rank's unit pool from its resident cache layers.
 
     The page size of the group with the widest token rows is the configured
-    ``block_size``; every other group's page holds as many tokens as fit
-    the same plane.
+    ``block_size``, which ``resolve_page_size`` sets when the operator left
+    it unset; every other group's page holds as many tokens as fit the same
+    plane.
 
     Raises:
-        ValueError: As ``plan_units``, or when the model has no resident
-            cache layer.
+        ValueError: As ``plan_units``, when the model has no resident cache
+            layer, or when the page size is unresolved.
     """
+    if config.block_size is None:
+        raise ValueError("the worker's KV page size is unresolved")
+    return _plan(model, config, config.block_size)
+
+
+def _plan(model: CausalLM, config: WorkerConfig, block_size: int) -> Planes:
+    """Plan the unit pool with ``block_size``-token pages of the widest rows."""
     layers = model.cache_config.layers
     if not layers:
         raise ValueError(
@@ -61,11 +80,97 @@ def plan_cache(model: CausalLM, config: WorkerConfig) -> Planes:
     dtype, fp8 = storage(config)
     return plan_units(
         model.cache_config,
-        block_size=config.block_size,
+        block_size=block_size,
         dtype=dtype,
         quantization={name: Quantizer("fp8", axis=0) for name in layers}
         if fp8
         else None,
+    )
+
+
+def resolve_page_size(
+    model: nn.Module,
+    config: WorkerConfig,
+    attention: Backend,
+    *,
+    group: Communicator | None = None,
+) -> WorkerConfig:
+    """Resolve the KV page size of a worker whose operator set none.
+
+    An explicit ``block_size`` is kept: a cache group whose pages its
+    attention cannot read then fails when the layer is prepared, naming the
+    layer and its pages. Unset, the base page size is the largest power of
+    two up to ``DEFAULT_BLOCK_SIZE`` at which ``attention`` serves every
+    resident cache layer on the pages its group then holds; a model without
+    a paged cache takes ``DEFAULT_BLOCK_SIZE``. The ranks of ``group`` take
+    the smallest of their sizes, so the ranks of one worker share one page
+    shape.
+
+    Returns:
+        ``config`` with ``block_size`` set.
+
+    Raises:
+        WorkerError: ``unsupported_setup`` when no page size up to
+            ``DEFAULT_BLOCK_SIZE`` serves every resident cache layer.
+    """
+    if config.block_size is not None:
+        return config
+
+    text = capability(model, CausalLM)
+    size = (
+        DEFAULT_BLOCK_SIZE
+        if text is None
+        else _largest_page_size(text, config, attention)
+    )
+    if group is not None and group.size > 1:
+        agreed = torch.tensor(size, dtype=torch.int64, device=group.device)
+        group.all_reduce(agreed, op="min")
+        size = int(agreed.item())
+    return replace(config, block_size=size)
+
+
+def _largest_page_size(
+    model: CausalLM, config: WorkerConfig, attention: Backend
+) -> int:
+    """Return the largest base page size ``attention`` reads for every layer.
+
+    Candidates halve from ``DEFAULT_BLOCK_SIZE``; each plans the unit pool
+    and asks the backend whether it serves every resident cache layer, with
+    that layer's attention shape, on its group's pages.
+    """
+    readers = {
+        module.cache_name: module
+        for module in model.modules()
+        if isinstance(module, Attention) and module.cache_name is not None
+    }
+    layouts = model.cache_config.layers
+    if not set(layouts) <= set(readers):
+        raise unsupported_setup(
+            "every resident cache layer requires an attention layer reading it"
+        )
+
+    size = DEFAULT_BLOCK_SIZE
+    while size >= 1:
+        planes = _plan(model, config, size)
+        if all(
+            attention.reads_pages(
+                num_heads=readers[name].local_heads,
+                num_kv_heads=readers[name].local_kv_heads,
+                head_dim=readers[name].head_dim,
+                dtype=layouts[name].compute_dtype,
+                window=readers[name].window,
+                pages=CachePages(
+                    group.page_tokens, group.dtype, planes.quantized
+                ),
+            )
+            for group in planes.groups
+            for name in group.layers
+        ):
+            return size
+        size //= 2
+    raise unsupported_setup(
+        f"no KV page size of at most {DEFAULT_BLOCK_SIZE} tokens is read by "
+        "the attention of every resident cache layer"
     )
 
 

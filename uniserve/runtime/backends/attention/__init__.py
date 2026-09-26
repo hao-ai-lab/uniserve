@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from importlib import import_module
 
 import torch as torch_lib
@@ -16,7 +17,30 @@ from uniserve.nn.attention.inputs import (
     SegmentedInput,
     VisibleInput,
 )
+from uniserve.quantization import QuantizedTensor
 from uniserve.tensors import BufferConfig
+
+
+@dataclass(frozen=True, slots=True)
+class CachePages:
+    """How a layer's paged prefix cache stores its pages.
+
+    ``page_tokens`` is the tokens of one page, ``dtype`` the element type
+    the pages store and ``quantized`` whether they hold per-block FP8
+    values with scales.
+    """
+
+    page_tokens: int
+    dtype: torch_lib.dtype
+    quantized: bool = False
+
+    @classmethod
+    def of(cls, state: mha.State) -> CachePages:
+        """Describe the pages of a bound cache state."""
+        key = state.key
+        return cls(
+            state.block_size, key.dtype, isinstance(key, QuantizedTensor)
+        )
 
 
 class Operator:
@@ -261,6 +285,25 @@ class Backend:
     name: str
 
     operator_class: type[Operator]
+
+    def reads_pages(
+        self,
+        *,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch_lib.dtype,
+        window: int | None,
+        pages: CachePages,
+    ) -> bool:
+        """Report whether the backend serves a cache layer on ``pages``.
+
+        A layer with a paged prefix cache receives causal and non-causal
+        paged calls and segmented reads of its prefix. A backend serving
+        one provider reports True and validates its own page constraints
+        when a layer is prepared.
+        """
+        return True
 
     def workspace_buffers(
         self,

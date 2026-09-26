@@ -17,9 +17,11 @@ from importlib import import_module
 import torch
 
 from uniserve.nn.attention.inputs import (
+    BlockTable,
     DenseInput,
     PagedInput,
     SegmentedInput,
+    SequenceLengths,
     VarlenInput,
     VisibleInput,
 )
@@ -27,6 +29,7 @@ from uniserve.quantization import QuantizedTensor
 from uniserve.tensors import BufferConfig
 
 from . import Backend as _Backend
+from . import CachePages
 from . import Operator as _Operator
 from ._sequences import causal_runs
 
@@ -76,12 +79,115 @@ def _layer(*, num_heads, num_kv_heads, head_dim, dtype, cache, window):
     )
 
 
+def _paged_calls(page_tokens):
+    """Return one-row samples of every paged call a cache layer receives.
+
+    They are a causal and a non-causal paged row and a segmented prefix read
+    whose queries see every current key, over ``page_tokens``-token pages.
+    Routing depends only on their kind, causality and page size.
+    """
+    lengths = SequenceLengths.from_lengths((1,), device="cpu")
+    table = BlockTable(torch.ones((1, 1), dtype=torch.int32), page_tokens)
+    return (
+        PagedInput(lengths, lengths, table, None, (True,)),
+        PagedInput(lengths, lengths, table, None, (False,)),
+        SegmentedInput(
+            lengths,
+            lengths,
+            table,
+            None,
+            torch.ones((1, 1), dtype=torch.int32),
+            True,
+        ),
+    )
+
+
 def _causality(flags):
     if all(flags):
         return "causal rows"
     if not any(flags):
         return "non-causal rows"
     return "mixed causal and non-causal rows"
+
+
+def _names(batch, *, head_dim, window, architecture, ndim=None):
+    """Name the providers that may read ``batch``, most preferred first.
+
+    ``head_dim``, ``window`` and ``architecture`` describe the layer and
+    the device; a provider must also be available for the layer to serve
+    the call.
+    """
+    if isinstance(batch, DenseInput) and batch.mask is not None:
+        return ("torch",)
+    if isinstance(batch, DenseInput) and ndim == 4:
+        # Keep the explicit batch in one native invocation. FlashInfer's
+        # single-prefill path otherwise serializes its individual samples.
+        return (
+            "sgl_kernel",
+            "flash_attn",
+            "flash_attn_4",
+            "flashinfer",
+            "torch",
+        )
+    if isinstance(batch, VarlenInput):
+        # Packed Q/K/V need no cache plan. Native varlen kernels consume
+        # offsets directly without reserving paged split-KV intermediates.
+        return (
+            "sgl_kernel",
+            "flash_attn",
+            "flash_attn_4",
+            "flashinfer",
+            "torch",
+        )
+    # The SM100 head-dimension-256 FA4 kernel accepts neither per-sequence
+    # key lengths nor mask functions, which paged, visible and segmented
+    # inputs require.
+    fa4_indexed = head_dim != 256
+    if isinstance(batch, (VisibleInput, SegmentedInput)):
+        # The prefix-block kernel reads a segmented prefix when every
+        # query sees all of its current keys.
+        block = (
+            ("prefix_block",)
+            if isinstance(batch, SegmentedInput) and batch.fully_visible_current
+            else ()
+        )
+        # Device-visible endpoints are captured directly by FA4. This
+        # retains the packed-attention preference for native mask kernels.
+        fa4 = (
+            ("flash_attn_4",)
+            if architecture in (9, 10, 11) and fa4_indexed
+            else ()
+        )
+        return (*block, *fa4, "flashinfer", "torch")
+    if isinstance(batch, PagedInput):
+        block_size = batch.block_table.block_size
+        ordinary = ("sgl_kernel", "flash_attn") if block_size % 256 == 0 else ()
+        fa4 = (
+            ("flash_attn_4",)
+            if architecture not in (8, 12) and fa4_indexed
+            else ()
+        )
+        # Non-causal blocks read their own keys and a prefix window with
+        # the prefix-block kernel. TensorRT-LLM context kernels bound a
+        # history window only along the causal diagonal.
+        block = ("prefix_block",) if not any(batch.causal) else ()
+        trtllm = ("trtllm",) if window is None or all(batch.causal) else ()
+        return (
+            *block,
+            *trtllm,
+            *ordinary[:1],
+            "flashinfer",
+            *ordinary[1:],
+            *fa4,
+            "torch",
+        )
+    return (
+        "sgl_kernel",
+        "flashinfer",
+        "flash_attn",
+        "flash_attn_4",
+        "torch",
+    )
 
 
 class _Automatic(_Operator):
@@ -104,84 +210,6 @@ class _Automatic(_Operator):
         self._operators = {}
         self._arguments = kwargs
 
-    def _names(self, batch, *, ndim=None):
-        if isinstance(batch, DenseInput) and batch.mask is not None:
-            return ("torch",)
-        if isinstance(batch, DenseInput) and ndim == 4:
-            # Keep the explicit batch in one native invocation. FlashInfer's
-            # single-prefill path otherwise serializes its individual samples.
-            return (
-                "sgl_kernel",
-                "flash_attn",
-                "flash_attn_4",
-                "flashinfer",
-                "torch",
-            )
-        if isinstance(batch, VarlenInput):
-            # Packed Q/K/V need no cache plan. Native varlen kernels consume
-            # offsets directly without reserving paged split-KV intermediates.
-            return (
-                "sgl_kernel",
-                "flash_attn",
-                "flash_attn_4",
-                "flashinfer",
-                "torch",
-            )
-        # The SM100 head-dimension-256 FA4 kernel accepts neither per-sequence
-        # key lengths nor mask functions, which paged, visible and segmented
-        # inputs require.
-        fa4_indexed = self.head_dim != 256
-        if isinstance(batch, (VisibleInput, SegmentedInput)):
-            # The prefix-block kernel reads a segmented prefix when every
-            # query sees all of its current keys.
-            block = (
-                ("prefix_block",)
-                if isinstance(batch, SegmentedInput)
-                and batch.fully_visible_current
-                else ()
-            )
-            # Device-visible endpoints are captured directly by FA4. This
-            # retains the packed-attention preference for native mask kernels.
-            fa4 = (
-                ("flash_attn_4",)
-                if self._architecture in (9, 10, 11) and fa4_indexed
-                else ()
-            )
-            return (*block, *fa4, "flashinfer", "torch")
-        if isinstance(batch, PagedInput):
-            block_size = batch.block_table.block_size
-            ordinary = (
-                ("sgl_kernel", "flash_attn") if block_size % 256 == 0 else ()
-            )
-            fa4 = (
-                ("flash_attn_4",)
-                if self._architecture not in (8, 12) and fa4_indexed
-                else ()
-            )
-            # Non-causal blocks read their own keys and a prefix window with
-            # the prefix-block kernel. TensorRT-LLM context kernels bound a
-            # history window only along the causal diagonal.
-            block = ("prefix_block",) if not any(batch.causal) else ()
-            trtllm = (
-                ("trtllm",) if self.window is None or all(batch.causal) else ()
-            )
-            return (
-                *block,
-                *trtllm,
-                *ordinary[:1],
-                "flashinfer",
-                *ordinary[1:],
-                *fa4,
-                "torch",
-            )
-        return (
-            "sgl_kernel",
-            "flashinfer",
-            "flash_attn",
-            "flash_attn_4",
-            "torch",
-        )
-
     def _name(self, batch, *, ndim=None):
         """Return the first available provider reading ``batch``, or None."""
         # A table with retired window pages is read only by providers that
@@ -191,7 +219,13 @@ class _Automatic(_Operator):
         return next(
             (
                 name
-                for name in self._names(batch, ndim=ndim)
+                for name in _names(
+                    batch,
+                    head_dim=self.head_dim,
+                    window=self.window,
+                    architecture=self._architecture,
+                    ndim=ndim,
+                )
                 if name in self._providers
                 and (
                     not retired
@@ -423,15 +457,20 @@ class Backend(_Backend):
         )
 
     def _providers(
-        self, dtype, head_dim, cache, window, num_heads, num_kv_heads
+        self, dtype, head_dim, pages, window, num_heads, num_kv_heads
     ):
+        """Return the available providers that serve a layer's shape.
+
+        ``pages`` describes the layer's paged prefix cache, or is None for
+        a layer without one.
+        """
         from .prefix_block import unsupported
 
         native_only = _native_only(self.device, head_dim, window)
 
         # Native kernels require half precision and unquantized cache state.
         if dtype not in {torch.float16, torch.bfloat16} or (
-            cache is not None and isinstance(cache.key, QuantizedTensor)
+            pages is not None and pages.quantized
         ):
             return {} if native_only else {"torch": self._factories["torch"]}
 
@@ -451,8 +490,8 @@ class Backend(_Backend):
                 or (
                     head_dim == 512
                     and window is None
-                    and cache is not None
-                    and cache.block_size in {16, 32, 64}
+                    and pages is not None
+                    and pages.page_tokens in {16, 32, 64}
                 )
             )
             and (
@@ -462,7 +501,7 @@ class Backend(_Backend):
                     num_kv_heads=num_kv_heads,
                     head_dim=head_dim,
                     dtype=dtype,
-                    cache=cache,
+                    pages=pages,
                 )
                 is None
             )
@@ -487,16 +526,43 @@ class Backend(_Backend):
             )
             and (
                 name not in {"sgl_kernel", "flash_attn"}
-                or cache is None
-                or cache.block_size % 256 == 0
+                or pages is None
+                or pages.page_tokens % 256 == 0
             )
         }
 
+    def reads_pages(
+        self, *, num_heads, num_kv_heads, head_dim, dtype, window, pages
+    ):
+        """Report whether a provider serves each paged call of a layer.
+
+        A layer on ``pages`` receives causal and non-causal paged calls and
+        segmented reads of its prefix whose queries see every current key;
+        each must reach an available provider that serves the layer's shape,
+        as the prepared operator selects one per call.
+        """
+        providers = self._providers(
+            dtype, head_dim, pages, window, num_heads, num_kv_heads
+        )
+        return all(
+            any(
+                name in providers
+                for name in _names(
+                    call,
+                    head_dim=head_dim,
+                    window=window,
+                    architecture=self._architecture,
+                )
+            )
+            for call in _paged_calls(pages.page_tokens)
+        )
+
     def _requirements(self, arguments):
+        cache = arguments["cache"]
         providers = self._providers(
             arguments["dtype"],
             arguments["head_dim"],
-            arguments["cache"],
+            None if cache is None else CachePages.of(cache),
             arguments.get("window"),
             arguments["num_heads"],
             arguments["num_kv_heads"],
