@@ -6,7 +6,8 @@ are supported, with SwiGLU or tanh-GELU gating. Routing weights multiply
 after the down projection, and the per-token combination happens inside the
 kernel. Encoded experts are not served here: the CUTLASS NVFP4 path stores
 its FC1 output and gated product in BF16 before encoding the FC2 input,
-which the NVFP4 reference keeps in FP32; ``trtllm`` serves NVFP4 experts.
+which the NVFP4 reference keeps in FP32; ``cutedsl`` and ``trtllm`` serve
+NVFP4 experts.
 """
 
 from __future__ import annotations
@@ -69,7 +70,7 @@ class Backend(_Backend):
         if isinstance(weight, QuantizedTensor) or isinstance(
             module.down.weight, QuantizedTensor
         ):
-            return "encoded experts are served by trtllm-gen"
+            return "encoded experts are served by the NVFP4 expert providers"
         if weight.dtype not in {torch.bfloat16, torch.float16}:
             return f"expert weight dtype {weight.dtype} is not BF16 or FP16"
         return None

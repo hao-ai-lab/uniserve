@@ -2,7 +2,7 @@
 
 Every value is positive where a test bounds relative error, so each rounding
 step bounds the relative error of every output independently of
-cancellation.
+cancellation. NVFP4 cases run on every native NVFP4 provider.
 """
 
 import pytest
@@ -21,6 +21,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 EXPERTS, HIDDEN, INTERMEDIATE, TOP_K, TOKENS = 8, 256, 128, 2, 40
 DEVICE = torch.device("cuda:0")
 E4M3_ONE = 0x38  # the E4M3 byte encoding 1.0
+NVFP4_PROVIDERS = ("cutedsl", "trtllm")
 
 
 def _gamma(roundings):
@@ -29,15 +30,15 @@ def _gamma(roundings):
     return roundings * unit / (1 - roundings * unit)
 
 
-def _routes(generator, tokens=TOKENS):
+def _routes(generator, tokens=TOKENS, top_k=TOP_K):
     """Distinct experts per token and positive FP32 route weights."""
     ids = torch.stack(
         [
-            torch.randperm(EXPERTS, generator=generator)[:TOP_K]
+            torch.randperm(EXPERTS, generator=generator)[:top_k]
             for _ in range(tokens)
         ]
     ).to(torch.int32)
-    weights = torch.rand(tokens, TOP_K, generator=generator) + 0.25
+    weights = torch.rand(tokens, top_k, generator=generator) + 0.25
     return ids.to(DEVICE), weights.to(DEVICE)
 
 
@@ -45,7 +46,7 @@ def _reference(hidden, up_gate, down, ids, weights, activation):
     """The routed equation in FP64 over already-decoded operands."""
     hidden, up_gate, down = hidden.double(), up_gate.double(), down.double()
     result = torch.zeros_like(hidden)
-    for slot in range(TOP_K):
+    for slot in range(ids.shape[1]):
         expert = ids[:, slot].long()
         projected = torch.einsum("th,toh->to", hidden, up_gate[expert])
         up, gate = projected.split(INTERMEDIATE, dim=-1)
@@ -60,12 +61,17 @@ def _reference(hidden, up_gate, down, ids, weights, activation):
     return result
 
 
-def _replay_matches(module, hidden, ids, weights, expected, *, rtol):
+def _replay_matches(
+    module, hidden, ids, weights, expected, *, rtol, provider="auto"
+):
     """Evaluate eagerly, then replay a capture over rewritten routing."""
     stream = CUDAStream.external(torch.cuda.Stream(device=DEVICE))
     stream.wait(torch.cuda.current_stream(DEVICE))
     generator = torch.Generator().manual_seed(47)
-    with stream, ExecutionContext(module, stream=stream) as context:
+    with (
+        stream,
+        ExecutionContext(module, stream=stream, moe=provider) as context,
+    ):
         context.prepare(TextSize(TOKENS, 1))
         with context.activate():
             actual = module(hidden, ids, weights)
@@ -75,7 +81,9 @@ def _replay_matches(module, hidden, ids, weights, expected, *, rtol):
 
         with CUDAGraph(context=context) as graph:
             graph.capture(lambda: module(hidden, ids, weights))
-            replacement_ids, replacement_weights = _routes(generator)
+            replacement_ids, replacement_weights = _routes(
+                generator, top_k=ids.shape[1]
+            )
             ids.copy_(replacement_ids)
             weights.copy_(replacement_weights)
             hidden.copy_(hidden.flip(0))
@@ -160,7 +168,7 @@ def _nvfp4(codes, block_scale, tensor_scale):
     )
 
 
-def _exact_nvfp4(activation, generator):
+def _exact_nvfp4(activation, generator, top_k=TOP_K):
     """Return NVFP4 experts and hidden states every encoding keeps exact.
 
     Hidden blocks contain E2M1 magnitudes with a maximum of six, so the unit
@@ -175,7 +183,7 @@ def _exact_nvfp4(activation, generator):
         EXPERTS,
         HIDDEN,
         INTERMEDIATE,
-        top_k=TOP_K,
+        top_k=top_k,
         activation=activation,
         device=DEVICE,
         dtype=torch.bfloat16,
@@ -223,10 +231,11 @@ def _exact_nvfp4(activation, generator):
     return module, hidden
 
 
+@pytest.mark.parametrize("provider", NVFP4_PROVIDERS)
 @pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
 @torch.inference_mode()
 def test_nvfp4_experts_apply_per_expert_scales_and_static_activations(
-    activation,
+    activation, provider
 ):
     """Operands are exact in every encoding the kernel applies."""
     generator = torch.Generator().manual_seed(43)
@@ -239,14 +248,26 @@ def test_nvfp4_experts_apply_per_expert_scales_and_static_activations(
     def expected(hidden, ids, weights):
         return _reference(hidden, up_gate, down, ids, weights, activation)
 
-    # Every expert projection is exact in FP32. BF16 roundings of each
-    # expert's projection and of the combined output, and the FP32 route
-    # products and sums, remain.
-    _replay_matches(module, hidden, ids, weights, expected, rtol=_gamma(3))
+    # Every expert projection is exact in FP32. Two BF16 roundings remain,
+    # of each expert's projection and of the combined output (or of each
+    # weighted route and of their BF16 sum), plus the FP32 route products
+    # and sums.
+    _replay_matches(
+        module,
+        hidden,
+        ids,
+        weights,
+        expected,
+        rtol=_gamma(3),
+        provider=provider,
+    )
 
 
+@pytest.mark.parametrize("provider", NVFP4_PROVIDERS)
 @torch.inference_mode()
-def test_preparing_nvfp4_experts_keeps_one_copy_of_the_logical_weights():
+def test_preparing_nvfp4_experts_keeps_one_copy_of_the_logical_weights(
+    provider,
+):
     """A kernel's physical placement changes neither values nor footprint."""
     module, _ = _exact_nvfp4("gelu_tanh", torch.Generator().manual_seed(53))
     logical = {
@@ -265,7 +286,7 @@ def test_preparing_nvfp4_experts_keeps_one_copy_of_the_logical_weights():
     torch.cuda.synchronize(DEVICE)
     resident = torch.cuda.memory_allocated(DEVICE)
 
-    with ExecutionContext(module) as context:
+    with ExecutionContext(module, moe=provider) as context:
         context.prepare(TextSize(TOKENS, 1))
         torch.cuda.synchronize(DEVICE)
         assert torch.cuda.memory_allocated(DEVICE) - resident < smallest
@@ -278,9 +299,10 @@ def test_preparing_nvfp4_experts_keeps_one_copy_of_the_logical_weights():
         assert module.up_gate.weight is placed
 
 
+@pytest.mark.parametrize("provider", NVFP4_PROVIDERS)
 @pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
 @torch.inference_mode()
-def test_nvfp4_gating_applies_the_declared_nonlinearity(activation):
+def test_nvfp4_gating_applies_the_declared_nonlinearity(activation, provider):
     """Each probe channel is the only nonzero input of its FC2 block.
 
     Token t routes only to expert t, whose channel 16m has up value 6 and
@@ -348,7 +370,7 @@ def test_nvfp4_gating_applies_the_declared_nonlinearity(activation):
         ),
     )
 
-    with ExecutionContext(module) as context:
+    with ExecutionContext(module, moe=provider) as context:
         context.prepare(TextSize(tokens, 1))
         with context.activate():
             actual = module(hidden, ids, weights)
@@ -358,6 +380,89 @@ def test_nvfp4_gating_applies_the_declared_nonlinearity(activation):
     torch.testing.assert_close(
         actual.float(), expected, rtol=2**-3 + _gamma(1), atol=0
     )
+
+
+@pytest.mark.parametrize("provider", NVFP4_PROVIDERS)
+@torch.inference_mode()
+def test_nvfp4_calls_combining_many_routes_stay_within_the_rounding_bound(
+    provider,
+):
+    """Every call over eight routes per token is correctly combined.
+
+    A provider may combine a token's routes in a different order on each
+    call, so its output need not repeat bit for bit; each call must still
+    combine every route once. Every expert projection is exact in FP32.
+    Each route's contribution passes at most eight BF16 roundings (its own
+    and seven additions) in any summation order, plus the FP32 route
+    products.
+    """
+    top_k = EXPERTS
+    generator = torch.Generator().manual_seed(61)
+    module, hidden = _exact_nvfp4("gelu_tanh", generator, top_k=top_k)
+    ids, weights = _routes(generator, top_k=top_k)
+    expected = _reference(
+        hidden,
+        module.up_gate.weight.dequantize(dtype=torch.float32),
+        module.down.weight.dequantize(dtype=torch.float32),
+        ids,
+        weights,
+        "gelu_tanh",
+    ).float()
+
+    stream = CUDAStream.external(torch.cuda.Stream(device=DEVICE))
+    stream.wait(torch.cuda.current_stream(DEVICE))
+    with (
+        stream,
+        ExecutionContext(module, stream=stream, moe=provider) as context,
+    ):
+        context.prepare(TextSize(TOKENS, 1))
+        with context.activate():
+            for _ in range(16):
+                torch.testing.assert_close(
+                    module(hidden, ids, weights).float(),
+                    expected,
+                    rtol=_gamma(top_k + 1),
+                    atol=0,
+                )
+        with CUDAGraph(context=context) as graph:
+            graph.capture(lambda: module(hidden, ids, weights))
+            for _ in range(16):
+                torch.testing.assert_close(
+                    graph.replay().float(),
+                    expected,
+                    rtol=_gamma(top_k + 1),
+                    atol=0,
+                )
+    torch.cuda.synchronize(DEVICE)
+
+
+@pytest.mark.parametrize(
+    ("placed", "selected"), [("trtllm", "cutedsl"), ("cutedsl", "trtllm")]
+)
+@torch.inference_mode()
+def test_nvfp4_providers_reject_weights_placed_for_another_kernel(
+    placed, selected
+):
+    """A provider never rearranges weights another provider has placed."""
+    module, hidden = _exact_nvfp4("silu", torch.Generator().manual_seed(67))
+    ids, weights = _routes(torch.Generator().manual_seed(71))
+    with ExecutionContext(module, moe=placed) as context:
+        context.prepare(TextSize(TOKENS, 1))
+        with context.activate():
+            before = module(hidden, ids, weights)
+        resident = {
+            name: getattr(module, name).weight for name in ("up_gate", "down")
+        }
+
+        with pytest.raises(ValueError, match="row order another expert"):
+            with ExecutionContext(module, moe=selected) as other:
+                other.prepare(TextSize(TOKENS, 1))
+
+        # The placed weights and the prepared operator are untouched.
+        for name, weight in resident.items():
+            assert getattr(module, name).weight is weight
+        with context.activate():
+            assert torch.equal(module(hidden, ids, weights), before)
 
 
 def _uncalibrated_nvfp4():

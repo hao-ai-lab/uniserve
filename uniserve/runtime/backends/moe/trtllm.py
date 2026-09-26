@@ -37,39 +37,11 @@ captured token count, as for every prepared operator.
 from __future__ import annotations
 
 import torch
-from torch import nn
 
-from uniserve.quantization import QuantizedTensor, RowOrder, ScaleLayout
+from uniserve.quantization import RowOrder
 
-from . import Backend as _Backend
+from . import NVFP4Backend
 from . import Operator as _Operator
-
-# The physical row order each projection's kernel reads.
-_UP_GATE_ORDER = RowOrder.INTERLEAVED_SHUFFLED_128
-_DOWN_ORDER = RowOrder.SHUFFLED_128
-
-
-def _place(linear, order: RowOrder) -> None:
-    """Store an ``ExpertLinear``'s stacked NVFP4 weight in ``order``.
-
-    The rearranged encoding replaces the parameter, so one copy stays
-    resident; the transient copy is one projection of one layer. The work
-    completes before returning: later calls may run on another stream, and
-    the released encoding must have no pending reads.
-    """
-    weight = linear.weight
-    if (
-        weight.row_order is order
-        and weight.scale_layout is ScaleLayout.SWIZZLED_128X4
-    ):
-        return
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("expert weights must be placed before capture")
-    placed = weight.repack(
-        scale_layout=ScaleLayout.SWIZZLED_128X4, row_order=order
-    )
-    torch.cuda.current_stream(weight.device).synchronize()
-    linear.weight = nn.Parameter(placed, requires_grad=False)
 
 
 class _TrtllmGen(_Operator):
@@ -203,53 +175,13 @@ class _TrtllmGen(_Operator):
         self._linear_scale = self._down_scale = None
 
 
-class Backend(_Backend):
+class Backend(NVFP4Backend):
     name = "trtllm"
     operator_class = _TrtllmGen
+    up_gate_order = RowOrder.INTERLEAVED_SHUFFLED_128
+    down_order = RowOrder.SHUFFLED_128
 
-    def unsupported(self, module) -> str | None:
-        up_gate, down = module.up_gate.weight, module.down.weight
-        if up_gate.device.type != "cuda":
-            return "the kernels run on CUDA devices"
-        if torch.cuda.get_device_capability(up_gate.device)[0] != 10:
+    def kernels_unsupported(self, device) -> str | None:
+        if torch.cuda.get_device_capability(device)[0] != 10:
             return "the kernels are built for SM100-class devices"
-        if not all(
-            isinstance(weight, QuantizedTensor)
-            and weight.quantizer.format == "nvfp4"
-            for weight in (up_gate, down)
-        ):
-            return "only NVFP4 expert weights are served"
-        if up_gate.dtype != torch.bfloat16:
-            return "NVFP4 experts compute in BF16"
-        if any(
-            quantizer is None
-            or quantizer.format != "nvfp4"
-            or quantizer.calibrated_scale is None
-            for quantizer in (
-                module.up_gate.input_quantizer,
-                module.down.input_quantizer,
-            )
-        ):
-            return "W4A4 activations require static calibrated NVFP4 scales"
-        if any(
-            weight.buffers()["tensor_scale"].shape != (module.num_experts,)
-            for weight in (up_gate, down)
-        ):
-            return "each expert requires its own tensor scale"
-        # Every expert's scales must fill whole 128x4 swizzle tiles, so the
-        # stacked swizzle equals the per-expert swizzle the kernels index:
-        # rows (H and 2I) multiples of 128, and K / 16 (for K = H and I)
-        # multiples of four.
-        hidden, intermediate = module.hidden_size, down.shape[2]
-        if hidden % 128:
-            return f"hidden width {hidden} must be a multiple of 128"
-        if intermediate % 64:
-            return f"intermediate width {intermediate} must be a multiple of 64"
-        if module.group.size > 1:
-            return "tensor-parallel expert shards are not validated"
         return None
-
-    def prepare(self, *, module, size, workspace):
-        _place(module.up_gate, _UP_GATE_ORDER)
-        _place(module.down, _DOWN_ORDER)
-        return super().prepare(module=module, size=size, workspace=workspace)

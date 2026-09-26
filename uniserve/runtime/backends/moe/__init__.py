@@ -6,7 +6,8 @@ weights. Operators borrow the module's parameters and context-owned
 workspace; host planning happens only in ``prepare`` so calls can be
 captured in CUDA graphs. A provider whose kernel reads expert weights in
 another physical row order places them in that order when it is prepared;
-the logical weights stay unchanged and only one copy stays resident.
+the logical weights stay unchanged and only one copy stays resident
+(``NVFP4Backend``).
 """
 
 from __future__ import annotations
@@ -15,14 +16,18 @@ from collections.abc import Mapping
 from importlib import import_module
 
 import torch
+from torch import nn
 
 from uniserve.model.inputs import TextSize
+from uniserve.quantization import QuantizedTensor, RowOrder, ScaleLayout
 from uniserve.tensors import BufferConfig
 
 # Native providers in automatic selection order. Their representations are
 # disjoint: trtllm-gen serves NVFP4 experts, CUTLASS BF16 and FP16 experts.
+# CuTeDSL also serves NVFP4 experts, by explicit selection only: its atomic
+# combine does not repeat bit for bit between calls.
 _NATIVE = ("trtllm", "cutlass")
-_PROVIDERS = frozenset((*_NATIVE, "torch"))
+_PROVIDERS = frozenset((*_NATIVE, "cutedsl", "torch"))
 
 
 class Operator:
@@ -73,6 +78,116 @@ class Backend:
         return self.operator_class(
             module=module, size=size, workspace=workspace
         )
+
+
+def _place(linear, order: RowOrder) -> None:
+    """Store an ``ExpertLinear``'s stacked NVFP4 weight in ``order``.
+
+    Block scales take the 128x4 swizzled layout the grouped kernels read.
+    The rearranged encoding replaces the parameter, so one copy stays
+    resident; the transient copy is one projection of one layer. The work
+    completes before returning: later calls may run on another stream, and
+    the released encoding must have no pending reads.
+    """
+    weight = linear.weight
+    if (
+        weight.row_order is order
+        and weight.scale_layout is ScaleLayout.SWIZZLED_128X4
+    ):
+        return
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("expert weights must be placed before capture")
+    placed = weight.repack(
+        scale_layout=ScaleLayout.SWIZZLED_128X4, row_order=order
+    )
+    torch.cuda.current_stream(weight.device).synchronize()
+    linear.weight = nn.Parameter(placed, requires_grad=False)
+
+
+class NVFP4Backend(Backend):
+    """Grouped W4A4 NVFP4 kernels over expert weights in a physical order.
+
+    The kernels read ``[E, rows, K]`` NVFP4 weights with one FP32 tensor
+    scale per expert and 128x4-swizzled E4M3 block scales, and encode their
+    activations with the static calibrated scales of ``up_gate`` and
+    ``down``'s input quantizers. A subclass names the physical row orders
+    its kernels read (``up_gate_order``, ``down_order``) and the devices
+    they run on (``kernels_unsupported``). Preparation places loaded
+    linear-order weights in those orders once; weights another provider
+    placed in a different order are rejected, because a prepared operator
+    of that provider may still borrow them.
+    """
+
+    up_gate_order: RowOrder
+    down_order: RowOrder
+
+    def kernels_unsupported(self, device: torch.device) -> str | None:
+        """Return why the kernels cannot run on CUDA ``device``, or ``None``.
+
+        Covers the device architecture and the installed kernel library.
+        """
+        return None
+
+    def unsupported(self, module) -> str | None:
+        up_gate, down = module.up_gate.weight, module.down.weight
+        if up_gate.device.type != "cuda":
+            return "the kernels run on CUDA devices"
+        reason = self.kernels_unsupported(up_gate.device)
+        if reason is not None:
+            return reason
+        if not all(
+            isinstance(weight, QuantizedTensor)
+            and weight.quantizer.format == "nvfp4"
+            for weight in (up_gate, down)
+        ):
+            return "only NVFP4 expert weights are served"
+        if up_gate.dtype != torch.bfloat16:
+            return "NVFP4 experts compute in BF16"
+        if any(
+            quantizer is None
+            or quantizer.format != "nvfp4"
+            or quantizer.calibrated_scale is None
+            for quantizer in (
+                module.up_gate.input_quantizer,
+                module.down.input_quantizer,
+            )
+        ):
+            return "W4A4 activations require static calibrated NVFP4 scales"
+        if any(
+            weight.buffers()["tensor_scale"].shape != (module.num_experts,)
+            for weight in (up_gate, down)
+        ):
+            return "each expert requires its own tensor scale"
+
+        # Every expert's scales must fill whole 128x4 swizzle tiles, so the
+        # stacked swizzle equals the per-expert swizzle the kernels index:
+        # rows (H and 2I) multiples of 128, and K / 16 (for K = H and I)
+        # multiples of four.
+        hidden, intermediate = module.hidden_size, down.shape[2]
+        if hidden % 128:
+            return f"hidden width {hidden} must be a multiple of 128"
+        if intermediate % 64:
+            return f"intermediate width {intermediate} must be a multiple of 64"
+        if module.group.size > 1:
+            return "tensor-parallel expert shards are not validated"
+
+        for name, order in (
+            ("up_gate", self.up_gate_order),
+            ("down", self.down_order),
+        ):
+            stored = getattr(module, name).weight.row_order
+            if stored is not RowOrder.LINEAR and stored is not order:
+                return (
+                    f"{name} weights are stored in the {stored.value} row "
+                    f"order another expert provider placed; these kernels "
+                    f"read {order.value}"
+                )
+        return None
+
+    def prepare(self, *, module, size: TextSize, workspace) -> Operator:
+        _place(module.up_gate, self.up_gate_order)
+        _place(module.down, self.down_order)
+        return super().prepare(module=module, size=size, workspace=workspace)
 
 
 def resolve(backend: str | Backend, *, module, device: torch.device) -> Backend:
