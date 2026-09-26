@@ -175,13 +175,10 @@ Plan measure(const Shape& shape, const torch::Tensor& weights, const torch::Tens
   return plan;
 }
 
-}  // namespace
 
-// output [positions, hidden] (FP32) = weights [positions, vocab] (BF16) x
-// table [vocab, hidden] (BF16), every dot product accumulated in FP32, with
-// the contiguous uint8 `scratch` as cuBLASLt workspace.
-void product(torch::Tensor weights, torch::Tensor table, torch::Tensor output,
-             torch::Tensor scratch) {
+// Checks the operands of a product and returns its plan key.
+Shape shape_of(const torch::Tensor& weights, const torch::Tensor& table,
+               const torch::Tensor& output, const torch::Tensor& scratch) {
   TORCH_CHECK(weights.is_cuda() && table.is_cuda() && output.is_cuda(),
               "the self-conditioning product needs CUDA operands");
   TORCH_CHECK(weights.device() == table.device() && weights.device() == output.device(),
@@ -198,6 +195,26 @@ void product(torch::Tensor weights, torch::Tensor table, torch::Tensor output,
   TORCH_CHECK(scratch.device() == weights.device() && scratch.scalar_type() == at::kByte &&
                   scratch.is_contiguous(),
               "the self-conditioning scratch must be contiguous uint8 on the operands' device");
+  return Shape{weights.get_device(),
+               weights.size(0),
+               output.size(1),
+               weights.size(1),
+               weights.stride(0),
+               table.stride(0),
+               output.stride(0),
+               std::min({alignment(weights.data_ptr()), alignment(table.data_ptr()),
+                         alignment(output.data_ptr())}),
+               static_cast<size_t>(scratch.numel())};
+}
+
+}  // namespace
+
+// output [positions, hidden] (FP32) = weights [positions, vocab] (BF16) x
+// table [vocab, hidden] (BF16), every dot product accumulated in FP32, with
+// the contiguous uint8 `scratch` as cuBLASLt workspace.
+void product(torch::Tensor weights, torch::Tensor table, torch::Tensor output,
+             torch::Tensor scratch) {
+  const Shape shape = shape_of(weights, table, output, scratch);
   if (weights.numel() == 0 || output.numel() == 0) {
     return;
   }
@@ -206,16 +223,6 @@ void product(torch::Tensor weights, torch::Tensor table, torch::Tensor output,
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   void* workspace = scratch.data_ptr();
   const size_t workspace_bytes = static_cast<size_t>(scratch.numel());
-  const Shape shape{weights.get_device(),
-                    weights.size(0),
-                    output.size(1),
-                    weights.size(1),
-                    weights.stride(0),
-                    table.stride(0),
-                    output.stride(0),
-                    std::min({alignment(weights.data_ptr()), alignment(table.data_ptr()),
-                              alignment(output.data_ptr())}),
-                    workspace_bytes};
 
   std::unique_lock<std::mutex> lock(plans_mutex);
   auto found = plans.find(shape);
@@ -234,4 +241,38 @@ void product(torch::Tensor weights, torch::Tensor table, torch::Tensor output,
   lock.unlock();
   CHECK_CUBLASLT(
       launch(plan, plan.algorithm, weights, table, output, workspace, workspace_bytes, stream));
+}
+
+// The configuration of the algorithm chosen for these operands' shape, or an
+// empty list before their first product: cuBLASLt version, algorithm id,
+// tile, stages, split-K count, reduction scheme, CTA swizzling, custom
+// option, inner shape and cluster shape.
+std::vector<int64_t> product_algorithm(torch::Tensor weights, torch::Tensor table,
+                                       torch::Tensor output, torch::Tensor scratch) {
+  const Shape shape = shape_of(weights, table, output, scratch);
+  cublasLtMatmulAlgo_t algorithm;
+  {
+    const std::lock_guard<std::mutex> lock(plans_mutex);
+    const auto found = plans.find(shape);
+    if (found == plans.end()) {
+      return {};
+    }
+    algorithm = found->second.algorithm;
+  }
+  const auto read = [&](cublasLtMatmulAlgoConfigAttributes_t attribute, auto value) {
+    size_t written = 0;
+    CHECK_CUBLASLT(cublasLtMatmulAlgoConfigGetAttribute(&algorithm, attribute, &value,
+                                                        sizeof(value), &written));
+    return static_cast<int64_t>(value);
+  };
+  return {static_cast<int64_t>(cublasLtGetVersion()),
+          read(CUBLASLT_ALGO_CONFIG_ID, int32_t{}),
+          read(CUBLASLT_ALGO_CONFIG_TILE_ID, uint32_t{}),
+          read(CUBLASLT_ALGO_CONFIG_STAGES_ID, uint32_t{}),
+          read(CUBLASLT_ALGO_CONFIG_SPLITK_NUM, int32_t{}),
+          read(CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, uint32_t{}),
+          read(CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, uint32_t{}),
+          read(CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, uint32_t{}),
+          read(CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, uint16_t{}),
+          read(CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, uint16_t{})};
 }
