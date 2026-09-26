@@ -32,6 +32,8 @@ mod model;
 mod omni;
 mod preprocessing;
 mod sampling;
+/// TypeSafe System One decision readout for DiffusionGemma.
+pub mod systemone;
 #[cfg(test)]
 pub(crate) mod test_support;
 /// Text tokenization, decoding, and sampling utilities.
