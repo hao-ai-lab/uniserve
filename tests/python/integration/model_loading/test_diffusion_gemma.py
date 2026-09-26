@@ -9,6 +9,7 @@ its cache and its decoder in FP32.
 
 import json
 import math
+from dataclasses import replace
 
 import pytest
 import torch
@@ -37,6 +38,7 @@ from uniserve.nn.attention import (
 )
 from uniserve.nn.functional import patchify
 from uniserve.runtime import ExecutionContext, PrefixCache
+from uniserve.runtime.prefix_cache import plan_units
 from uniserve_models import loading as models
 
 pytestmark = pytest.mark.integration
@@ -46,7 +48,9 @@ WINDOW = 8
 SOFTCAP = 0.5
 HIDDEN, VOCAB = 32, 64
 IMAGE, BEGIN_IMAGE, END_IMAGE = 60, 58, 59
-BLOCK_SIZE, BLOCKS = 4, tuple(range(8))
+# Every cache group's table holds eight pages of the unit pool; the groups'
+# tables name disjoint units.
+BLOCK_SIZE, PAGES = 4, 8
 LAYERS = (
     "text.backbone.layers.0.attention.attention",
     "text.backbone.layers.1.attention.attention",
@@ -171,6 +175,61 @@ def _capped(logits):
     return torch.tanh(logits.float() / SOFTCAP) * SOFTCAP
 
 
+def _units(cache, table):
+    """Return the units of one numerical table: its own run of the pool."""
+    return tuple(range(table * PAGES, (table + 1) * PAGES))
+
+
+def _layer_units(cache, name):
+    return _units(cache, cache.table(name))
+
+
+def _page_tokens(cache, table):
+    return cache.groups[cache.tables[table].group].page_tokens
+
+
+def _batch(cache, build):
+    """Build one entry per table; entries share the first one's lengths."""
+    entries = {}
+    for table in range(len(cache.tables)):
+        entry = build(_units(cache, table), _page_tokens(cache, table))
+        if entries:
+            first = entries[0]
+            entry = replace(
+                entry, queries=first.queries, prefixes=first.prefixes
+            )
+        entries[table] = entry
+    return AttentionBatch(entries, entries[0].queries)
+
+
+def _paged(cache, *, queries, prefix, causal):
+    return _batch(
+        cache,
+        lambda units, page_tokens: PagedInput.from_blocks(
+            query_lengths=(queries,),
+            prefix_lengths=(prefix,),
+            blocks=(units,),
+            block_size=page_tokens,
+            causal=causal,
+            device="cpu",
+        ),
+    )
+
+
+def _segmented(cache, *, count, prefix):
+    return _batch(
+        cache,
+        lambda units, page_tokens: SegmentedInput(
+            SequenceLengths.from_lengths((count,), device="cpu"),
+            SequenceLengths.from_lengths((prefix,), device="cpu"),
+            BlockTable(torch.tensor([units], dtype=torch.int32), page_tokens),
+            None,
+            torch.full((1, count), count, dtype=torch.int32),
+            True,
+        ),
+    )
+
+
 def _prompt(model, context, tokens, segments, features=None):
     """Write the prompt's K/V segment by segment; return every token's logits.
 
@@ -179,15 +238,11 @@ def _prompt(model, context, tokens, segments, features=None):
     """
     logits = []
     for start, stop, causal in segments:
-        batch = AttentionBatch.single(
-            PagedInput.from_blocks(
-                query_lengths=(stop - start,),
-                prefix_lengths=(start,),
-                blocks=(BLOCKS,),
-                block_size=BLOCK_SIZE,
-                causal=causal,
-                device="cpu",
-            )
+        batch = _paged(
+            context.cache,
+            queries=stop - start,
+            prefix=start,
+            causal=causal,
         )
         context.bind_attention(batch)
         replacement = None
@@ -215,16 +270,7 @@ def _prompt(model, context, tokens, segments, features=None):
 def _canvas(model, context, canvas, prefix, soft=None):
     """Denoise one canvas row over a cached prefix; return its logits."""
     count = canvas.numel()
-    batch = AttentionBatch.single(
-        SegmentedInput(
-            SequenceLengths.from_lengths((count,), device="cpu"),
-            SequenceLengths.from_lengths((prefix,), device="cpu"),
-            BlockTable(torch.tensor([BLOCKS], dtype=torch.int32), BLOCK_SIZE),
-            None,
-            torch.full((1, count), count, dtype=torch.int32),
-            True,
-        )
-    )
+    batch = _segmented(context.cache, count=count, prefix=prefix)
     context.bind_attention(batch)
     hidden = model.denoiser(
         CanvasInput(canvas, torch.arange(prefix, prefix + count), batch, soft)
@@ -235,9 +281,11 @@ def _canvas(model, context, canvas, prefix, soft=None):
 
 
 def _session(model):
+    config = model.text.cache_config
+    tables = len(plan_units(config, block_size=BLOCK_SIZE).tables)
     cache = PrefixCache(
-        model.text.cache_config,
-        num_blocks=len(BLOCKS),
+        config,
+        num_units=tables * PAGES,
         block_size=BLOCK_SIZE,
         device="cpu",
     )
@@ -289,7 +337,9 @@ def test_prompt_cache_and_canvas_match_transformers(tmp_path, prompt_length):
         ):
             stored = layer.keys.shape[-2]
             key, value = cache.state(name).read(
-                BLOCKS, start=prompt_length - stored, length=stored
+                _layer_units(cache, name),
+                start=prompt_length - stored,
+                length=stored,
             )
             for actual, wanted in ((key, layer.keys), (value, layer.values)):
                 torch.testing.assert_close(
@@ -536,16 +586,7 @@ def _pipeline_stage(rank, rendezvous, root):
         cache, context = _session(model)
         with cache, context:
             context.prepare(TextSize(32, 1))
-            batch = AttentionBatch.single(
-                PagedInput.from_blocks(
-                    query_lengths=(count,),
-                    prefix_lengths=(0,),
-                    blocks=(BLOCKS,),
-                    block_size=BLOCK_SIZE,
-                    causal=True,
-                    device="cpu",
-                )
-            )
+            batch = _paged(cache, queries=count, prefix=0, causal=True)
             context.bind_attention(batch)
             hidden = model.text(TextInput(prompt, torch.arange(count), batch))
             prompt_logits = model.text.compute_logits(
@@ -573,16 +614,7 @@ def _pipeline_stage(rank, rendezvous, root):
 def _canvas_stage(model, context, canvas, prefix):
     """Run one canvas pass on this pipeline stage; return its logits."""
     count = canvas.numel()
-    batch = AttentionBatch.single(
-        SegmentedInput(
-            SequenceLengths.from_lengths((count,), device="cpu"),
-            SequenceLengths.from_lengths((prefix,), device="cpu"),
-            BlockTable(torch.tensor([BLOCKS], dtype=torch.int32), BLOCK_SIZE),
-            None,
-            torch.full((1, count), count, dtype=torch.int32),
-            True,
-        )
-    )
+    batch = _segmented(context.cache, count=count, prefix=prefix)
     context.bind_attention(batch)
     hidden = model.denoiser(
         CanvasInput(canvas, torch.arange(prefix, prefix + count), batch)
