@@ -73,7 +73,7 @@ def _extension():
     return jit.load(
         "uniserve_topk_softmax",
         [Path(__file__).parent / "csrc" / "topk_softmax.cu"],
-        cuda_flags=("-O3", "-std=c++20"),
+        cuda_flags=("-O3", "-std=c++20", jit.device_architecture()),
     )
 
 

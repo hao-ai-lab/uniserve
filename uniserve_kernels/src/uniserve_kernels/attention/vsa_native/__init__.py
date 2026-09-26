@@ -31,18 +31,24 @@ def load() -> None:
 
 @lru_cache(maxsize=1)
 def _extension():
-    # One build or cache lookup per process. The explicit -gencode flag pins
-    # the sm_100a target; torch adds no TORCH_CUDA_ARCH_LIST targets when the
-    # CUDA flags already name an architecture. -lcuda links the driver API
-    # that the launcher uses to encode TMA tensor maps.
-    from torch.utils.cpp_extension import load as load_extension
+    # One build or cache lookup per process, content-addressed by
+    # uniserve_kernels.jit.load. The explicit -gencode flag pins the sm_100a
+    # target; torch adds no TORCH_CUDA_ARCH_LIST targets when the CUDA flags
+    # already name an architecture. -lcuda links the driver API that the
+    # launcher uses to encode TMA tensor maps.
+    from uniserve_kernels import jit
 
-    source = Path(__file__).parent / "csrc" / "attention.cu"
-    return load_extension(
+    directory = Path(__file__).parent / "csrc"
+    return jit.load(
         "uniserve_sparse_attention_sm100",
-        sources=[str(source)],
-        extra_cflags=["-O3", "-std=c++20"],
-        extra_cuda_cflags=[
+        [directory / "attention.cu"],
+        headers=[
+            directory / "block_sparse_launch_sm100a.cuh",
+            directory / "block_sparse_kernel_sm100a.cuh",
+            directory / "primitives.cuh",
+        ],
+        cxx_flags=["-O3", "-std=c++20"],
+        cuda_flags=[
             "-O3",
             "-std=c++20",
             "--use_fast_math",
@@ -51,7 +57,7 @@ def _extension():
             "-Xcompiler=-fno-strict-aliasing",
             "-gencode=arch=compute_100a,code=sm_100a",
         ],
-        extra_ldflags=["-lcuda"],
+        ldflags=["-lcuda"],
     )
 
 
