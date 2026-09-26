@@ -98,19 +98,22 @@ impl HfSpecialTokens {
     }
 }
 
-/// Model metadata used to bind Qwen3, SenseNova, or Bagel to its description.
+/// Model metadata used to bind a root-configured checkpoint to its description.
 ///
 /// This is the raw view of the file `ResolvedModelFiles::config_path` selects,
 /// distinct from the resolved `crate::profile::ModelConfig`. Composite
-/// checkpoints (the SenseNova and Bagel layouts) nest their language model
-/// under `llm_config`; the root `model_type` still identifies the family.
+/// checkpoints nest their language model under `llm_config` (the SenseNova
+/// and Bagel layouts) or `text_config` (DiffusionGemma); the root
+/// `model_type` still identifies the family.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct ModelConfig {
     model_type: Option<String>,
     max_position_embeddings: Option<u32>,
-    /// Nested language-model section of a composite checkpoint.
+    /// Nested language-model section of a SenseNova or Bagel checkpoint.
     llm_config: Option<Box<ModelConfig>>,
+    /// Nested language-model section of a DiffusionGemma checkpoint.
+    text_config: Option<Box<ModelConfig>>,
 }
 
 /// Generation defaults consumed by configured request lowering.
@@ -131,6 +134,26 @@ pub struct GenerationConfig {
     pub repetition_penalty: Option<f32>,
     /// Default maximum number of generated tokens.
     pub max_new_tokens: Option<u32>,
+    /// Block-diffusion denoising steps per canvas.
+    pub max_denoising_steps: Option<u32>,
+    /// Block-diffusion sampler settings.
+    pub sampler_config: Option<DiffusionSamplerConfig>,
+    /// Block-diffusion sampling temperature at the first step.
+    pub t_min: Option<f32>,
+    /// Block-diffusion sampling temperature at the last step.
+    pub t_max: Option<f32>,
+    /// Block-diffusion stopping threshold on residual canvas uncertainty.
+    pub confidence_threshold: Option<f32>,
+    /// Consecutive unchanged block-diffusion steps that end denoising early.
+    pub stability_threshold: Option<u32>,
+}
+
+/// The `sampler_config` section of a block-diffusion `generation_config.json`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DiffusionSamplerConfig {
+    /// Entropy budget, in nats, of the tokens one denoising step accepts.
+    pub entropy_bound: Option<f32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -155,10 +178,13 @@ impl OneOrManyTokenIds {
 }
 
 impl ModelConfig {
-    /// Returns the nested `llm_config` section when present, otherwise the
-    /// root configuration.
+    /// Returns the nested `llm_config` or `text_config` section when present,
+    /// otherwise the root configuration.
     fn language_model(&self) -> &Self {
-        self.llm_config.as_deref().unwrap_or(self)
+        self.llm_config
+            .as_deref()
+            .or(self.text_config.as_deref())
+            .unwrap_or(self)
     }
 
     /// Returns the configured model-type discriminator.
@@ -168,8 +194,8 @@ impl ModelConfig {
 
     /// Returns the language model's declared maximum position count.
     ///
-    /// Reads only the nested `llm_config` when it exists, without falling back
-    /// to a root-level value.
+    /// Reads only the nested language-model section when it exists, without
+    /// falling back to a root-level value.
     pub fn max_position_embeddings(&self) -> Option<u32> {
         self.language_model().max_position_embeddings
     }
@@ -200,6 +226,20 @@ where
     let Some(path) = path else {
         return Ok(T::default());
     };
+    read_json(path)
+}
+
+/// Deserializes the JSON file at `path`.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] for an unreadable file and [`Error::Json`] for
+/// content that does not deserialize into `T`, including a missing required
+/// field.
+pub fn read_json<T>(path: &Path) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
     let content = std::fs::read_to_string(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
@@ -214,9 +254,9 @@ where
 mod tests {
     use super::ModelConfig;
 
-    /// A flat Qwen3 layout and the nested SenseNova and Bagel layouts: the
-    /// family comes from the root `model_type` and the context limit from the
-    /// language-model section.
+    /// A flat Qwen3 layout and the nested SenseNova, Bagel, and DiffusionGemma
+    /// layouts: the family comes from the root `model_type` and the context
+    /// limit from the language-model section.
     #[test]
     fn configured_model_layouts_expose_context_limits() {
         for (source, model_type, max_tokens) in [
@@ -234,6 +274,11 @@ mod tests {
                 r#"{"model_type":"bagel","llm_config":{"model_type":"qwen2","num_attention_heads":28,"max_position_embeddings":32768}}"#,
                 "bagel",
                 32768,
+            ),
+            (
+                r#"{"model_type":"diffusion_gemma","canvas_length":256,"text_config":{"model_type":"diffusion_gemma_text","max_position_embeddings":262144}}"#,
+                "diffusion_gemma",
+                262144,
             ),
         ] {
             let config: ModelConfig = serde_json::from_str(source).unwrap();

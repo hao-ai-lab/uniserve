@@ -89,6 +89,9 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let (model_config, tokenizer, renderer) = ModelConfig::load(config)
         .await
         .with_context(|| format!("failed to resolve model assets for `{}`", config.model))?;
+    let runtime_family = model_config
+        .runtime_family()
+        .context("the configured model cannot be served by the engine")?;
     let effective_max_model_len = model_config.max_model_tokens();
     let channel_payload_capacity = model_config.channel_payload_capacity();
     let control_tokens = special_token_ids(&model_config);
@@ -136,7 +139,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         ..config.engine.worker_process.clone()
     };
     let engine_config = EngineConfig {
-        runtime_family: model_config.runtime_family(),
+        runtime_family,
         generation_limits,
         max_batch: config.engine.max_batch,
         max_num_batched_tokens: config.engine.max_num_batched_tokens,

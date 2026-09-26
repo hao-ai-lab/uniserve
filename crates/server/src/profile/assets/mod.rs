@@ -20,8 +20,9 @@ pub mod pipeline_index;
 
 pub use checkpoint::resolve_tensor_shape;
 pub use config::{
-    GenerationConfig, HfSpecialTokens, HfTokenizerConfig, ModelConfig, NamedSpecialToken,
-    OneOrManyTokenIds, load_generation_config, load_model_config, load_tokenizer_config,
+    DiffusionSamplerConfig, GenerationConfig, HfSpecialTokens, HfTokenizerConfig, ModelConfig,
+    NamedSpecialToken, OneOrManyTokenIds, load_generation_config, load_model_config,
+    load_tokenizer_config, read_json,
 };
 pub use error::{Error, Result};
 pub use model_files::{ResolvedModelFiles, resolve_model_file};
