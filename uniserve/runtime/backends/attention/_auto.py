@@ -43,6 +43,7 @@ from uniserve.nn.attention.inputs import (
 from uniserve.quantization import QuantizedTensor
 from uniserve.tensors import BufferConfig
 
+from .. import record_kernel_choice
 from . import Backend as _Backend
 from . import CachePages
 from . import Operator as _Operator
@@ -320,7 +321,10 @@ class _Automatic(_Operator):
             raise ValueError(
                 f"no native attention kernel serves {self._describe(batch)}"
             )
-        self._selections.setdefault(": ".join(_input_class(batch)), name)
+        selection = ": ".join(_input_class(batch))
+        if selection not in self._selections:
+            self._selections[selection] = name
+            record_kernel_choice()
 
         if name not in self._operators:
             # Workspace buffers are namespaced per provider; the shared

@@ -37,9 +37,9 @@ def _tables(caplog) -> list[dict]:
 def test_worker_startup_logs_one_table_of_every_call_site(device, caplog):
     """Warmup ends with one tagged JSON table of the selected kernels.
 
-    The stub model's single cache-writing attention layer is served by the
-    portable provider by name; on CUDA the table also lists it among the
-    portable call sites so that no such call site is silent.
+    The stub model's cache-writing attention layers are served by the
+    portable provider by name; on CUDA the table also lists every prepared
+    one among the portable call sites so that no such call site is silent.
     """
     policy = WorkerConfig(
         graph_policy="off",
@@ -54,12 +54,17 @@ def test_worker_startup_logs_one_table_of_every_call_site(device, caplog):
         worker.warmup()
 
     (table,) = _tables(caplog)
-    assert (table["rank"], table["device"]) == (0, device)
+    assert (table["stage"], table["rank"], table["device"]) == (
+        "startup",
+        0,
+        device,
+    )
+    # Call sites that prepare at their first call report no provider yet.
     attention = [
         (runner["runner"], site)
         for runner in table["runners"]
         for site in runner["call_sites"]
-        if site["op"] == "attention"
+        if site["op"] == "attention" and site["provider"] is not None
     ]
     assert attention
     assert all(
@@ -108,10 +113,16 @@ def test_attention_records_name_the_provider_of_each_input_class():
         ExecutionContext(layers, attention="auto", stream=stream) as context,
     ):
         context.prepare(None)
+        # Without a declared size, call sites prepare at their first call.
+        unprepared = {record["path"]: record for record in context.kernels()}
         layers.spatial(*spatial, AttentionBatch.single(DenseInput(False, None)))
         layers.text(*text, AttentionBatch.single(DenseInput(True, None)))
         records = {record["path"]: record for record in context.kernels()}
 
+    assert {
+        path: (record["dtype"], record["provider"])
+        for path, record in unprepared.items()
+    } == {"spatial": (None, None), "text": (None, None)}
     assert records["spatial"]["op"] == "attention"
     assert records["spatial"]["dtype"] == "float32"
     assert records["spatial"]["inputs"] == {

@@ -6,6 +6,7 @@ from uniserve.model.inputs import TextSize
 from uniserve.quantization import QuantizedTensor, RowOrder
 
 from ..backends import moe as moe_backend
+from ..backends import record_kernel_choice
 from . import capturing
 
 
@@ -49,6 +50,7 @@ class MoEBinding:
             previous.close()
         self.operator = operator
         self.provider = provider.name
+        record_kernel_choice()
         return operator
 
     def kernels(self):

@@ -8,6 +8,7 @@ from uniserve.nn.linear import MergedColumnParallelLinear
 from uniserve.quantization import QuantizedTensor
 
 from ..backends import matmul as matmul_backend
+from ..backends import record_kernel_choice
 from . import capturing
 
 
@@ -66,6 +67,7 @@ class MatmulBinding:
 
         self.operators[key] = (rows, operator)
         self.providers[key] = provider.name
+        record_kernel_choice()
         return operator
 
     def kernels(self):

@@ -63,6 +63,7 @@ from uniserve.runtime import (
     Scratch,
     partition_streams,
 )
+from uniserve.runtime.backends import kernel_choices
 from uniserve.runtime.backends.attention import resolve as attention_backend
 from uniserve.runtime.backends.attention.flashinfer import Backend as FlashInfer
 from uniserve.runtime.cuda_graph import CUDAGraphError
@@ -93,8 +94,8 @@ from uniserve_worker.errors import (
     invalid_descriptor,
 )
 from uniserve_worker.execution.kernel_table import (
+    KernelRecords,
     format_kernel_table,
-    kernel_table,
 )
 from uniserve_worker.model_executor.component_binding import (
     ComponentBinding,
@@ -303,6 +304,10 @@ class ModelExecutor:
 
         self.uses_lanes = False
         self._startup_complete = self._closed = False
+        # Kernel records of every runner, and the process's kernel choice
+        # count when they were last gathered (see ``_report_new_kernels``).
+        self._kernels = KernelRecords()
+        self._kernel_choices = 0
 
         try:
             for name, binding in self.bindings.items():
@@ -849,7 +854,7 @@ class ModelExecutor:
             f"uniserve.model.module rank={self.worker_config.rank} work={name}"
         ):
             try:
-                return runner.execute_model(*args, **kwargs)
+                result = runner.execute_model(*args, **kwargs)
             except CUDAGraphError:
                 # Retire the failed context and its graphs; the next call at
                 # this size prepares a fresh one.
@@ -862,6 +867,8 @@ class ModelExecutor:
                     )
                 )
                 raise
+        self._report_new_kernels()
+        return result
 
     @property
     def denoises(self) -> bool:
@@ -1442,27 +1449,53 @@ class ModelExecutor:
         for _, stream in self._lane_streams:
             stream.verify()
 
-        runners = (
+        # Warmup and capture have now prepared the call sites and resolved
+        # the selections they exercise.
+        self._kernel_choices = kernel_choices()
+        self._kernels.add(self._runners())
+        self._log_kernels("startup")
+
+        self._startup_complete = True
+        for entry in self._runners():
+            entry._startup_complete = True
+
+    def _runners(self) -> tuple[ModelRunner, ...]:
+        """Return every runner this executor currently holds."""
+        return (
             *self.entries.values(),
             *self._module_entries.values(),
             *(() if self._diffusion is None else (self._diffusion,)),
         )
-        # Warmup and capture have now prepared every call site and resolved
-        # every selection the served call kinds make.
+
+    def _log_kernels(self, stage: str) -> None:
+        """Log the table of every kernel record (see ``kernel_table``)."""
         logger.info(
             "%s",
             format_kernel_table(
-                kernel_table(
-                    runners,
+                self._kernels.table(
+                    stage=stage,
                     rank=self.worker_config.rank,
                     device=str(self.worker_config.device),
                 )
             ),
         )
 
-        self._startup_complete = True
-        for entry in runners:
-            entry._startup_complete = True
+    def _report_new_kernels(self) -> None:
+        """Log the table again after a serving call chose a new kernel.
+
+        Call sites prepared at their first call and input classes startup
+        did not exercise choose their kernels while serving. The process's
+        choice count keeps the check per call to one integer comparison;
+        records are gathered only after it changes, and the table is logged
+        only when they include a new call site or kernel (a computation
+        prepared again at another size repeats known records).
+        """
+        choices = kernel_choices()
+        if not self._startup_complete or choices == self._kernel_choices:
+            return
+        self._kernel_choices = choices
+        if self._kernels.add(self._runners()):
+            self._log_kernels("serving")
 
     def synchronize(self):
         """Host-synchronize every owned stream and each device's current stream.
@@ -1892,6 +1925,7 @@ class ModelExecutor:
                     mode_us={forward_mode.value: duration_us},
                     component_us={"forward": duration_us},
                 )
+                self._report_new_kernels()
                 return replace(
                     output,
                     request_pool_indices=request_pool_indices,
