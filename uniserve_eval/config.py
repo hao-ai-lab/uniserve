@@ -65,6 +65,7 @@ _ROOT_FIELDS = {
     "image",
     "video",
     "metrics",
+    "provenance",
 }
 _LOAD_FIELDS = set(LoadConfig.__dataclass_fields__)
 _SAMPLING_FIELDS = set(SamplingConfig.__dataclass_fields__)
@@ -414,6 +415,9 @@ def _benchmark_point(
         tokenizer=tokenizer,
         endpoint=endpoint,
         question=question,
+        provenance=_mapping(
+            value.get("provenance", {}), f"benchmarks.{name}.provenance"
+        ),
     )
 
 

@@ -65,6 +65,7 @@ def plan(args: argparse.Namespace) -> None:
                     else point.load.request_rate
                 ),
                 "max_concurrency": point.load.max_concurrency,
+                "workload": point.workload_dict(),
                 "metrics": [metric.as_dict() for metric in point.metrics],
             }
         )
@@ -161,7 +162,7 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--executable", type=Path)
     command.add_argument("--output-root", type=Path)
     command.add_argument("--launch-timeout-s", type=float, default=1800)
-    command.add_argument("--request-timeout-s", type=float, default=6 * 60 * 60)
+    command.add_argument("--request-timeout-s", type=float)
     command.set_defaults(function=run)
     return parser
 

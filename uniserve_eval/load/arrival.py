@@ -4,9 +4,7 @@
 ``submit`` coroutine that builds and sends one request. This module owns only
 arrival timing, the client-side concurrency limit, and the measured window;
 request construction, transport, and metrics live elsewhere. Submission
-outputs are opaque here except for warmup, which reads their ``success``
-attribute and, for the failure message, ``classifier``, ``status_code``, and
-``error``.
+records supply monotonic start and terminal timestamps for the load window.
 """
 
 from __future__ import annotations
@@ -19,9 +17,9 @@ from typing import Any, TypeVar
 
 import numpy as np
 
-from ..types import Example
+from ..types import Example, RequestRecord
 
-T = TypeVar("T")
+T = TypeVar("T", bound=RequestRecord)
 # ``submit(example, scheduled)`` sends one request. ``scheduled`` is the
 # ``time.perf_counter()`` arrival time for measured requests and ``None`` for
 # warmup requests.
@@ -88,8 +86,10 @@ async def run_load(
     max_concurrency: int | None,
     submit: Submit[T],
     warmup_requests: int = 1,
+    warmup_rows: list[Example] | None = None,
+    inspect_warmup: Callable[[list[T]], None] | None = None,
 ) -> LoadResult:
-    """Run warmup, settle, and measured requests under a concurrency limit.
+    """Run excluded warmup and measured requests under a concurrency limit.
 
     Warmup sends ``rows[0]`` ``warmup_requests`` times concurrently, within
     the concurrency limit. The measured phase then submits every row once at
@@ -103,6 +103,9 @@ async def run_load(
             ``0``) for no limit.
         submit: Coroutine that sends one example; see ``Submit``.
         warmup_requests: Number of warmup submissions; ``0`` skips warmup.
+        warmup_rows: Explicit excluded corpus, replacing first-row repetition.
+        inspect_warmup: Inspect excluded outputs after their slots are released
+            and before checking warmup success.
 
     Returns:
         Warmup and measured outputs in submission order, and the measured
@@ -135,20 +138,19 @@ async def run_load(
 
     # Warmup exercises the same request path outside the reported duration.
     warmup_outputs: list[T] = []
-    if warmup_requests > 0:
+    excluded = (
+        warmup_rows if warmup_rows is not None else [rows[0]] * warmup_requests
+    )
+    if excluded:
         warmup_outputs = await asyncio.gather(
-            *[limited(rows[0], None) for _ in range(warmup_requests)]
+            *[limited(row, None) for row in excluded]
         )
+        if inspect_warmup is not None:
+            inspect_warmup(warmup_outputs)
         if not all(
             getattr(output, "success", False) for output in warmup_outputs
         ):
             raise WarmupFailure(list(warmup_outputs))
-
-    # A fixed pause precedes the measured window, with or without warmup,
-    # and lies outside the reported duration.
-    await asyncio.sleep(1.0)
-
-    benchmark_start_time = time.perf_counter()
 
     tasks: list[asyncio.Task[T]] = []
     try:
@@ -163,15 +165,13 @@ async def run_load(
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
-    benchmark_end_time = time.perf_counter()
-
-    # Duration runs from the first arrival until every measured request has
-    # finished. The arrival loop ends at the final arrival (see
-    # ``get_request``), so the window closes at the last completion and
-    # holds no inter-arrival delay beyond it. ``metrics.summarize`` divides
-    # its throughputs by this duration.
+    # Every attempted request, including errors and deadlines, contributes to
+    # the window. Coroutine cleanup and subsequent inspection do not.
+    duration = max(output.final_event_time for output in outputs) - min(
+        output.start_time for output in outputs
+    )
     return LoadResult(
         tuple(warmup_outputs),
         tuple(outputs),
-        benchmark_end_time - benchmark_start_time,
+        duration,
     )

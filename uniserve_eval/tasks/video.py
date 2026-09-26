@@ -1,11 +1,7 @@
-"""Defines synchronous text-to-video-with-audio benchmark behavior.
+"""Build native video requests and inspect complete MP4s after measurement.
 
-Requests go to ``/v1/videos/sync``, whose response body is the encoded MP4
-itself; ``uniserve_eval.transport.video`` decodes it into the ``DecodedVideo``
-metadata that ``VideoTask.validate_output`` checks. The expected raster, frame
-rate, codecs, and audio clock are the fixed output contract of the MiniMax H3
-profile (``uniserve_models.minimax_h3`` and the worker's MP4 muxer in
-``uniserve_worker.media.container``).
+Synchronous and asynchronous adapters share the MiniMax H3 media contract.
+Inspection uses each request's duration and never runs inside a load slot.
 """
 
 from __future__ import annotations
@@ -14,6 +10,7 @@ import math
 from collections.abc import Sequence
 from typing import ClassVar
 
+from ..transport.video import VideoOutputError, inspect_video_bytes
 from ..types import (
     VIDEOS_SYNC,
     Example,
@@ -26,15 +23,22 @@ from .base import BenchmarkTask
 
 
 class VideoTask(BenchmarkTask):
-    """Builds synchronous video requests and validates the media contract."""
+    """Builds native video requests and validates the media contract."""
 
     name: ClassVar[TaskName] = TaskName.VIDEO
-    allowed_endpoints: ClassVar[tuple[str, ...]] = (VIDEOS_SYNC,)
+    allowed_endpoints: ClassVar[tuple[str, ...]] = (VIDEOS_SYNC, "/v1/videos")
     default_endpoint: ClassVar[str] = VIDEOS_SYNC
     default_stream: ClassVar[bool] = False
 
     def build_request(self, example: Example) -> TaskRequest:
         """Build a deterministic duration- and seed-qualified video request."""
+        seconds = float(
+            example.seconds
+            if example.seconds is not None
+            else self.point.video.seconds
+        )
+        if not math.isfinite(seconds) or not 4 <= seconds <= 15:
+            raise ValueError("H3 seconds must be finite and in [4, 15]")
         return TaskRequest(
             self.point.endpoint,
             {
@@ -45,27 +49,44 @@ class VideoTask(BenchmarkTask):
                     if example.seed is not None
                     else self.point.load.seed
                 ),
-                "seconds": float(
-                    example.seconds
-                    if example.seconds is not None
-                    else self.point.video.seconds
-                ),
+                "seconds": seconds,
             },
             stream=False,
+            video_backend=self.point.video.backend,
+            poll_interval_s=self.point.video.poll_interval_s,
         )
+
+    def inspect_output(self, record: RequestRecord) -> None:
+        """Decode and classify a response outside the load window."""
+        if not record.success:
+            return
+        try:
+            record.decoded_video = inspect_video_bytes(
+                record.video_body or b"", declared_mime=record.video_mime
+            )
+        except VideoOutputError as error:
+            record.mark_failure(error.classifier, str(error))
+        record.media_checks = self.validate_output([record]).checks
+        if not all(record.media_checks.values()):
+            failed = [
+                key for key, passed in record.media_checks.items() if not passed
+            ]
+            if record.success:
+                record.mark_failure("invalid_video_output", ", ".join(failed))
 
     def validate_output(
         self, records: Sequence[RequestRecord]
     ) -> ValidationResult:
         """Validate fixed video geometry, codecs, audio, and duration alignment."""  # noqa: E501
-        # The expected frame count reproduces the server's duration resolution
-        # in `InputProcessor::video_sampling`: round seconds to the nearest
-        # frame at 24 fps, then round up to the form 17k + 5 (k media units of
-        # 17 frames plus a final 5-frame tail), as `align_num_frames` does.
-        # Rows that override `seconds` are still checked against the point's
-        # duration.
-        raw_frames = math.floor(float(self.point.video.seconds) * 24.0 + 0.5)
-        expected_frames = int(raw_frames + (5 - raw_frames) % 17)
+        # Python round uses the API's ties-to-even rule before upward alignment.
+        expected_frames = []
+        for record in records:
+            seconds = record.requested_seconds
+            raw_frames = round(
+                (seconds if seconds is not None else self.point.video.seconds)
+                * 24
+            )
+            expected_frames.append(raw_frames + (5 - raw_frames) % 17)
         outputs = [record.decoded_video for record in records]
         present = bool(outputs) and all(
             output is not None for output in outputs
@@ -84,11 +105,13 @@ class VideoTask(BenchmarkTask):
                 and all(
                     video.width == 1344
                     and video.height == 768
-                    and video.frame_count == expected_frames
+                    and video.frame_count == frames
                     # The container frame rate is a rational; require exactly
                     # 24 fps.
                     and video.fps_numerator == 24 * video.fps_denominator
-                    for video in videos
+                    for video, frames in zip(
+                        videos, expected_frames, strict=True
+                    )
                 ),
                 "aac_stereo_32khz_audio": present
                 and all(
@@ -101,6 +124,17 @@ class VideoTask(BenchmarkTask):
                 and all(
                     abs(video.audio_duration_s - video.video_duration_s)
                     <= duration_tolerance_s
+                    for video in videos
+                ),
+                "nonzero_video_variance": present
+                and all(
+                    math.isfinite(video.video_variance)
+                    and video.video_variance > 0
+                    for video in videos
+                ),
+                "nonzero_audio_rms": present
+                and all(
+                    math.isfinite(video.audio_rms) and video.audio_rms > 0
                     for video in videos
                 ),
             },
