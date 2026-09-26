@@ -8,7 +8,9 @@ and the prefix-block kernel evaluates non-causal paged blocks and segmented
 prefix reads. On CUDA, FlashInfer, the FlashAttention-2 library and the
 portable torch provider therefore never stand in for these calls: a call no
 native kernel serves raises when its layer is prepared or bound, naming the
-call's path, shape, dtype and mask semantics.
+call's path, shape, dtype and mask semantics. The one exception is FP32
+single-head dense attention of head dimension 512, which no native kernel
+computes and the portable provider evaluates (``_portable``).
 """
 
 from dataclasses import replace
@@ -54,6 +56,25 @@ def _native_only(device, head_dim, window):
     others.
     """
     return device.type == "cuda" and (window is not None or head_dim == 512)
+
+
+def _portable(*, num_heads, num_kv_heads, head_dim, dtype, pages, window):
+    """Whether the portable provider serves a CUDA layer's dense calls.
+
+    No native CUDA kernel computes FP32 single-head dense attention of head
+    dimension 512 without a prefix cache (``pages`` is None) or history
+    window, the spatial self-attention of FP32 image autoencoders: the
+    TensorRT-LLM and FlashAttention-4 kernels compute in half precision, and
+    neither serves head dimension 512 on dense inputs. The portable torch
+    provider evaluates these calls.
+    """
+    return (
+        dtype == torch.float32
+        and head_dim == 512
+        and num_heads == num_kv_heads == 1
+        and pages is None
+        and window is None
+    )
 
 
 def _layer(*, num_heads, num_kv_heads, head_dim, dtype, cache, window):
@@ -466,7 +487,16 @@ class Backend(_Backend):
         """
         from .prefix_block import unsupported
 
-        native_only = _native_only(self.device, head_dim, window)
+        native_only = _native_only(
+            self.device, head_dim, window
+        ) and not _portable(
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            pages=pages,
+            window=window,
+        )
 
         # Native kernels require half precision and unquantized cache state.
         if dtype not in {torch.float16, torch.bfloat16} or (
