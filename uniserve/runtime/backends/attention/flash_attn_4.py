@@ -119,6 +119,10 @@ class _FlashAttentionOperator(_Operator):
             raise ValueError(
                 "FlashAttention-4 requires FP16 or BF16 computation"
             )
+        if self.window is not None:
+            raise ValueError(
+                "FlashAttention-4 attention does not take history windows"
+            )
         if self.cache is not None and isinstance(
             self.cache.key, QuantizedTensor
         ):
@@ -146,6 +150,15 @@ class _FlashAttentionOperator(_Operator):
         if isinstance(batch, DenseInput) and batch.mask is not None:
             raise ValueError(
                 "FlashAttention-4 does not consume arbitrary dense masks"
+            )
+        if self.head_dim == 256 and isinstance(
+            batch, (PagedInput, VisibleInput, SegmentedInput)
+        ):
+            # The dedicated head-dimension-256 kernel rejects per-sequence
+            # key lengths and mask functions, which these inputs require.
+            raise ValueError(
+                "FlashAttention-4 head dimension 256 supports only dense and "
+                "variable-length inputs"
             )
         self._validate(q, k, v, batch, out)
 
@@ -336,6 +349,14 @@ class Backend(_Backend):
     operator_class = _FlashAttentionOperator
 
     def workspace_buffers(
-        self, *, num_heads, num_kv_heads, head_dim, dtype, size, cache
+        self,
+        *,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        dtype,
+        size,
+        cache,
+        window=None,
     ):
         return {"lengths": BufferConfig((size.batch_size,), torch.int32)}

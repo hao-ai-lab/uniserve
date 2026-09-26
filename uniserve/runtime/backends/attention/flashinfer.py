@@ -83,6 +83,18 @@ def _tensor_cores(config, num_heads, num_kv_heads):
     return num_heads // num_kv_heads >= 4
 
 
+def _split_disabled(owner, *, causal):
+    """Decide whether a native plan must keep each query's keys unsplit.
+
+    FlashInfer 0.6.18 bounds split-KV work by the causal key range plus the
+    window, so a non-causal windowed plan would drop keys to the right of the
+    query diagonal. Such plans run unsplit; others follow the configuration.
+    """
+    return owner.config.disable_split_kv or (
+        owner.window is not None and not causal
+    )
+
+
 @triton.jit
 def _page_indices(
     table,
@@ -125,10 +137,13 @@ class _PagePlan:
     never depends on Python object identity or requires a device-to-host copy.
     """
 
-    def __init__(self, owner, *, queries, table, decode, custom):
+    def __init__(self, owner, *, queries, table, decode, custom, fixed=False):
         import flashinfer
 
         self.decode = decode
+        # A segmented prefix reads one interval [P - window, P) for all its
+        # queries instead of a window that follows each query position.
+        self.fixed = fixed
         self.device = owner.workspace["scratch"].device
         count = len(queries)
         self.capacity = table.indices.numel()
@@ -202,7 +217,8 @@ class _PagePlan:
 
     def bind(self, owner, queries, keys, table, *, causal):
         # Host page counts and last-page lengths come from declared lengths;
-        # physical page IDs are refreshed on device by fill().
+        # physical page IDs are refreshed on device by fill(). A custom mask
+        # already folds the history window into its bits (see run()).
         counts = tuple(
             (length + table.block_size - 1) // table.block_size
             for length in keys
@@ -229,7 +245,14 @@ class _PagePlan:
                 if self.decode
                 else owner.config.prefill_split_tile_size
             ),
-            "disable_split_kv": owner.config.disable_split_kv,
+            "disable_split_kv": _split_disabled(
+                owner, causal=all(causal) or self.mask is not None
+            ),
+            "window_left": (
+                -1
+                if owner.window is None or self.mask is not None
+                else owner.window
+            ),
         }
         with _plan_workspace(self.wrapper):
             if self.decode:
@@ -303,6 +326,7 @@ class _PagePlan:
         out=None,
         lse=False,
         visible=None,
+        window=None,
     ):
         self.fill(table)
 
@@ -318,6 +342,9 @@ class _PagePlan:
                 0 if visible is None else visible.stride(0),
                 0 if visible is None else visible.stride(1),
                 visible is not None,
+                -1 if window is None else window,
+                window is not None,
+                self.fixed,
             )
         # The native run consumes this scalar; all shape-dependent planning is
         # performed by bind, outside capture. The caller owns its score scale.
@@ -339,9 +366,15 @@ def _ragged_mask(
     visible_rows: tl.constexpr,
     visible_columns: tl.constexpr,
     use_visible: tl.constexpr,
+    window,
+    use_window: tl.constexpr,
+    fixed_window: tl.constexpr,
 ):
     # Each sequence owns a byte-aligned little-endian mask. Sequence lengths
     # and visibility are loaded at replay, including a changed row partition.
+    # A history window keeps keys from query position - window on, where
+    # queries align to the end of their keys; a fixed window instead keeps
+    # the final `window` keys for every query of the sequence.
     byte = tl.program_id(0) * 128 + tl.arange(0, 128)
     total = tl.load(mask_offsets + count)
     if tl.program_id(0) * 128 < total:
@@ -387,6 +420,12 @@ def _ragged_mask(
                 (is_causal[:, None] == 0)
                 | (key <= query + klen[:, None] - qlen[:, None])
             )
+
+        if use_window:
+            if fixed_window:
+                allowed &= key >= klen[:, None] - window
+            else:
+                allowed &= key >= query + klen[:, None] - qlen[:, None] - window
 
         value = tl.sum(allowed.to(tl.int32) << tl.arange(0, 8)[None, :], axis=1)
         tl.store(packed + byte, value.to(tl.uint8), byte < total)
@@ -439,6 +478,9 @@ class _RaggedPlan:
             if isinstance(batch, VarlenInput)
             else (False,) * self.count
         )
+        # Only variable-length keys are history. A visible input here is a
+        # segmented call's current keys, which the window does not bound.
+        window = owner.window if isinstance(batch, VarlenInput) else None
         with _plan_workspace(self.wrapper):
             self.wrapper.plan(
                 _host(tuple(accumulate(queries, initial=0))),
@@ -452,7 +494,15 @@ class _RaggedPlan:
                 kv_data_type=owner.dtype,
                 non_blocking=True,
                 fixed_split_size=owner.config.prefill_split_tile_size,
-                disable_split_kv=owner.config.disable_split_kv,
+                disable_split_kv=_split_disabled(
+                    owner,
+                    causal=all(causal)
+                    or self.mask is not None
+                    or window is None,
+                ),
+                window_left=(
+                    -1 if window is None or self.mask is not None else window
+                ),
             )
         if self.mask is not None:
             # The native packed-mask plan derives bit offsets from Q/K indptr.
@@ -471,7 +521,7 @@ class _RaggedPlan:
             self.mask_offsets.copy_(_host(offsets), non_blocking=True)
             self.causal.copy_(_host(causal), non_blocking=True)
 
-    def run(self, q, k, v, batch, *, scale, out=None, lse=False):
+    def run(self, q, k, v, batch, *, scale, out=None, lse=False, window=None):
         if self.mask is not None:
             visible = (
                 batch.visible_end if isinstance(batch, VisibleInput) else None
@@ -487,6 +537,9 @@ class _RaggedPlan:
                 0 if visible is None else visible.stride(0),
                 0 if visible is None else visible.stride(1),
                 visible is not None,
+                -1 if window is None else window,
+                window is not None,
+                False,
             )
         self.wrapper._sm_scale = scale
         return self.wrapper.run(
@@ -528,7 +581,9 @@ class _FlashInfer(_Operator):
         self._plans = {}
         self._paged = self._ragged = self._current = None
 
-    def _page_plan(self, queries, keys, table, *, causal, custom=False):
+    def _page_plan(
+        self, queries, keys, table, *, causal, custom=False, fixed=False
+    ):
         # Single-token queries without a custom mask take the decode wrapper.
         decode = all(count == 1 for count in queries) and not custom
 
@@ -543,12 +598,18 @@ class _FlashInfer(_Operator):
             table.block_size,
             decode,
             custom,
+            fixed,
             False if custom else all(causal),
         )
         plan = self._plans.get(signature)
         if plan is None:
             plan = _PagePlan(
-                self, queries=queries, table=table, decode=decode, custom=custom
+                self,
+                queries=queries,
+                table=table,
+                decode=decode,
+                custom=custom,
+                fixed=fixed,
             )
             self._plans[signature] = plan
         plan.bind(self, queries, keys, table, causal=causal)
@@ -615,11 +676,15 @@ class _FlashInfer(_Operator):
                 raise RuntimeError(
                     "segmented attention requires bound prefix state"
                 )
+            # A windowed prefix reads [P - window, P) for all queries, which
+            # the native window (relative to each query) cannot express.
             self._paged = self._page_plan(
                 batch.queries.host,
                 batch.prefixes.host,
                 batch.block_table,
                 causal=(False,) * batch.queries.batch_size,
+                custom=self.window is not None,
+                fixed=self.window is not None,
             )
             self._current = VisibleInput(
                 batch.queries,
@@ -632,17 +697,26 @@ class _FlashInfer(_Operator):
             self._ragged = self._ragged_plan(self._current)
 
     def _dense(self, q, k, v, *, scale, causal=False, mask=None, lse=False):
-        if causal and mask is not None:
-            # Fold causality into the custom mask; single_prefill accepts only
-            # one of the two.
+        window = self.window
+        if mask is not None or (window is not None and not causal):
+            # Fold causality and the history window into one custom mask:
+            # single_prefill accepts a mask or causality, and its native
+            # window is only used together with the causal diagonal below.
             rows = (
                 torch.arange(q.shape[0], device=q.device)
                 + k.shape[0]
                 - q.shape[0]
             )
             columns = torch.arange(k.shape[0], device=q.device)
-            mask = mask & (columns[None] <= rows[:, None])
-            causal = False
+            visible = torch.ones(
+                (q.shape[0], k.shape[0]), dtype=torch.bool, device=q.device
+            )
+            if causal:
+                visible &= columns[None] <= rows[:, None]
+            if window is not None:
+                visible &= columns[None] >= rows[:, None] - window
+            mask = visible if mask is None else mask & visible
+            causal, window = False, None
 
         if not k.shape[0]:
             result = torch.zeros_like(q)
@@ -659,6 +733,7 @@ class _FlashInfer(_Operator):
             causal=causal,
             custom_mask=mask,
             sm_scale=scale,
+            window_left=-1 if window is None else window,
             return_lse=lse,
             backend=self.config.prefill_backend,
         )
@@ -722,13 +797,18 @@ class _FlashInfer(_Operator):
                 batch.block_table,
                 scale=scale,
                 lse=True,
+                window=self.window,
             )
             result, _ = self._merge(*current, *prefix)
             out.copy_(result)
             return out
 
         if self._ragged is not None:
-            return self._ragged.run(q, k, v, batch, scale=scale, out=out)
+            # Visible inputs reject windows at bind; the window here always
+            # applies to variable-length keys.
+            return self._ragged.run(
+                q, k, v, batch, scale=scale, out=out, window=self.window
+            )
 
         key, value = (
             (k, v) if self.cache is None else (self.cache.key, self.cache.value)
@@ -748,6 +828,7 @@ class _FlashInfer(_Operator):
             scale=scale,
             out=out,
             visible=visible,
+            window=self.window,
         )
 
     def close(self):

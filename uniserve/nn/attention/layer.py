@@ -25,6 +25,14 @@ class Attention(nn.Module):
     Head counts describe the full architecture. Mathematical parallel binding
     assigns local query/KV heads, token ownership and the global cache-head IDs.
     Cache state and mutable kernel resources are borrowed from the active call.
+
+    ``window`` bounds the visible history in tokens; ``None`` reads the whole
+    history. A query at absolute position ``q`` reads history keys from
+    ``max(q - window, 0)`` on, and a causal query still reads itself. Queries
+    align to the end of their key sequence, so a paged query token ``i`` sits
+    at ``prefix + i``. A segmented input's queries read the fixed prefix
+    interval ``[max(P - window, 0), P)`` of their prefix length ``P`` together
+    with their declared current keys, which the window does not bound.
     """
 
     # Recorded by parallelize_ once the layer is bound to its partition.
@@ -39,6 +47,7 @@ class Attention(nn.Module):
         *,
         scale: float | None = None,
         cache_name: str | None = None,
+        window: int | None = None,
     ):
         super().__init__()
         if (
@@ -48,6 +57,11 @@ class Attention(nn.Module):
             raise ValueError(
                 "attention requires positive compatible query and KV heads"
             )
+        if window is not None and (type(window) is not int or window < 0):
+            raise ValueError(
+                "attention windows must be nonnegative token counts"
+            )
+        self.window = window
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -161,7 +175,7 @@ class Attention(nn.Module):
                     "cached attention requires an active ExecutionContext"
                 )
             return functional.attention(
-                q, k, v, batch, scale=self.scale, out=out
+                q, k, v, batch, scale=self.scale, window=self.window, out=out
             )
         destination = torch.empty_like(q) if out is None else out
         return operator(q, k, v, batch, scale=self.scale, out=destination)

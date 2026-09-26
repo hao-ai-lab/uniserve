@@ -1,10 +1,12 @@
 """Native attention preserves numerical masks, cache writes and graph inputs."""
 
-from contextlib import contextmanager
+import math
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 
 import pytest
 import torch
+from uniserve_kernels.attention.merge import merge_attention_states
 
 from uniserve.cache import Config, mha
 from uniserve.model import TextSize
@@ -678,3 +680,207 @@ def test_automatic_vision_attention_preserves_non_power_of_two_heads_on_replay()
             graph.reset()
             native.close()
             reference.close()
+
+
+def _window_batch(representation, *, block_size, device):
+    """Two sequences whose prefixes extend past the tested history windows."""
+    prefixes, queries = (40, 13), (9, 5)
+    pages = tuple(
+        -(-(prefix + query) // block_size)
+        for prefix, query in zip(prefixes, queries, strict=True)
+    )
+    blocks = (
+        tuple(range(1, 1 + pages[0])),
+        tuple(range(1 + pages[0], 1 + pages[0] + pages[1])),
+    )
+    paged = PagedInput.from_blocks(
+        blocks=blocks,
+        query_lengths=queries,
+        prefix_lengths=prefixes,
+        block_size=block_size,
+        causal=representation != "image",
+        device=device,
+    )
+    if representation in {"causal", "image"}:
+        return paged, blocks, prefixes
+    ends = torch.full((2, 9), 0, dtype=torch.int32, device=device)
+    ends[0, :9], ends[1, :5] = 9, 5
+    return (
+        SegmentedInput(
+            paged.queries,
+            paged.prefixes,
+            paged.block_table,
+            None,
+            ends,
+            True,
+        ),
+        blocks,
+        prefixes,
+    )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize(
+    ("provider", "representation", "heads", "block_size", "window", "graphs"),
+    [
+        ("flashinfer", "causal", (16, 8, 256), 32, 7, False),
+        ("flashinfer", "image", (16, 8, 256), 32, 7, False),
+        ("flashinfer", "segmented", (16, 8, 256), 32, 7, True),
+        ("flashinfer", "segmented", (16, 2, 512), 64, None, False),
+        ("trtllm", "causal", (16, 8, 256), 32, 7, True),
+        ("trtllm", "causal", (16, 2, 512), 64, None, True),
+        ("auto", "causal", (16, 2, 512), 64, 7, False),
+        ("auto", "causal", (16, 8, 256), 32, 7, False),
+        ("auto", "image", (16, 8, 256), 32, 7, False),
+        ("auto", "segmented", (16, 8, 256), 32, 7, False),
+        ("torch", "segmented", (16, 8, 256), 32, 7, True),
+        ("torch", "image", (16, 8, 256), 32, 7, True),
+    ],
+)
+def test_native_history_window_matches_portable_reference(
+    provider, representation, heads, block_size, window, graphs
+):
+    device = torch.device("cuda", 0)
+    num_heads, num_kv_heads, head_dim = heads
+    generator = torch.Generator(device=device).manual_seed(41)
+    batch, blocks, prefixes = _window_batch(
+        representation, block_size=block_size, device=device
+    )
+    tokens = batch.queries.num_tokens
+    q = torch.randn(
+        tokens,
+        num_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    k, v = (
+        torch.randn(
+            tokens,
+            num_kv_heads,
+            head_dim,
+            dtype=q.dtype,
+            device=device,
+            generator=generator,
+        )
+        for _ in range(2)
+    )
+    layout = Config(
+        {
+            "attention": mha.Config(
+                num_kv_heads, head_dim, tuple(range(num_kv_heads)), q.dtype
+            )
+        }
+    )
+    arguments = {
+        "num_heads": num_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "dtype": q.dtype,
+        "size": TextSize(tokens, 2),
+        "window": window,
+    }
+    with PrefixCache(
+        layout, num_blocks=16, block_size=block_size, device=device
+    ) as cache:
+        state = cache.state("attention")
+        for row, prefix in zip(blocks, prefixes, strict=True):
+            history = torch.randn(
+                prefix,
+                num_kv_heads,
+                head_dim,
+                dtype=q.dtype,
+                device=device,
+                generator=generator,
+            )
+            state.write(row, start=0, key=history, value=history.flip(0))
+
+        backends = (resolve(provider, device=device), TorchBackend())
+        with ExitStack() as scope:
+            native, reference = (
+                scope.enter_context(
+                    _prepare_with(backend, state, arguments, device)
+                )
+                for backend in backends
+            )
+            actual, expected = torch.empty_like(q), torch.empty_like(q)
+            native.bind(batch)
+            native(q, k, v, batch, scale=head_dim**-0.5, out=actual)
+            if graphs:
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    native(q, k, v, batch, scale=head_dim**-0.5, out=actual)
+                actual.zero_()
+                graph.replay()
+            reference_batch = (
+                replace(batch, write_indices=None)
+                if isinstance(batch, PagedInput)
+                else batch
+            )
+            reference(
+                q, k, v, reference_batch, scale=head_dim**-0.5, out=expected
+            )
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@contextmanager
+def _prepare_with(backend, state, arguments, device):
+    arguments = {**arguments, "cache": state}
+    requirements = backend.workspace_buffers(**arguments)
+    with TensorBuffers.allocate(requirements, device=device) as buffers:
+        operator = backend.prepare(
+            **arguments, workspace=buffers.view(requirements)
+        )
+        try:
+            yield operator
+        finally:
+            operator.close()
+
+
+@pytest.mark.parametrize("base2", [False, True])
+def test_merged_attention_states_equal_attention_over_the_union(base2):
+    device = torch.device("cuda", 0)
+    generator = torch.Generator(device=device).manual_seed(43)
+    q, k, v = (
+        torch.randn(
+            rows, 4, 64, dtype=torch.float64, device=device, generator=generator
+        )
+        for rows in (6, 10, 10)
+    )
+
+    def state(keys, values):
+        # Float64 states rounded once to FP32 isolate the merge from the
+        # rounding of the matrix products that produced them.
+        scores = torch.einsum("qhd,khd->qhk", q, keys) * 0.125
+        lse = torch.logsumexp(scores, dim=-1)
+        output = torch.einsum("qhk,khd->qhd", scores.softmax(-1), values)
+        lse = lse / math.log(2) if base2 else lse
+        return output.float(), lse.float()
+
+    first, second = state(k[:4], v[:4]), state(k[4:], v[4:])
+    merged, lse = merge_attention_states(*first, *second, base2=base2)
+    expected, expected_lse = state(k, v)
+    torch.testing.assert_close(merged, expected, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(lse, expected_lse, rtol=1e-5, atol=1e-5)
+
+
+def test_windowed_head_dimension_512_is_rejected_by_tensorrt_llm():
+    device = torch.device("cuda", 0)
+    arguments = {
+        "num_heads": 16,
+        "num_kv_heads": 2,
+        "head_dim": 512,
+        "dtype": torch.bfloat16,
+        "size": TextSize(8, 1),
+        "cache": None,
+        "window": 7,
+    }
+    backend = resolve("trtllm", device=device)
+    requirements = backend.workspace_buffers(**arguments)
+    with (
+        TensorBuffers.allocate(requirements, device=device) as buffers,
+        pytest.raises(ValueError, match="windowed head dimension 512"),
+    ):
+        backend.prepare(**arguments, workspace=buffers.view(requirements))

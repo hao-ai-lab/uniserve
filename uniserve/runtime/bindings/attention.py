@@ -76,6 +76,13 @@ class AttentionBinding:
     def _context_plan(self, batch, dtype):
         from ._context import _ContextPlan
 
+        if self.module.window is not None:
+            # Context partitions localize keys before visibility is applied;
+            # a history bound would need global query positions they drop.
+            raise ValueError(
+                "windowed attention does not support context-parallel keys"
+            )
+
         key = dtype, _ContextPlan.signature(batch)
         if key not in self.context_plans:
             if capturing(self.device):
@@ -126,6 +133,7 @@ class AttentionBinding:
             "dtype": dtype,
             "size": size,
             "cache": self.cache,
+            "window": self.module.window,
         }
         provider = attention_backend.resolve(self.backend, device=self.device)
         requirements = provider.workspace_buffers(**options)

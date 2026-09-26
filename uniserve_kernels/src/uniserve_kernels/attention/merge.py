@@ -1,10 +1,13 @@
 """Stable online-softmax combination of independently computed KV segments.
 
 An attention state is a normalized output together with its log-sum-exp
-(LSE, natural log) over one KV segment. Merging two states over disjoint
-segments reproduces attention over their union. The FlashAttention-4 provider
-in ``uniserve.runtime.backends.attention.flash_attn_4`` merges its current
-window with its paged prefix this way.
+(LSE) over one KV segment. Merging two states over disjoint segments
+reproduces attention over their union. Providers report the LSE in different
+bases: FlashAttention-4 and the portable SDPA path use the natural logarithm,
+while TensorRT-LLM and FlashInfer kernels report base-2 values. Callers state
+the base of the states they pass; both states share it. The FlashAttention-4
+provider in ``uniserve.runtime.backends.attention.flash_attn_4`` merges its
+current window with its paged prefix this way.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ if triton is not None:
         head_dim: tl.constexpr,
         block_rows: tl.constexpr,
         block_dim: tl.constexpr,
+        base2: tl.constexpr,
     ):
         """Merge two independently normalized attention states.
 
@@ -60,14 +64,22 @@ if triton is not None:
         both_empty = (first_lse == -float("inf")) & (
             second_lse == -float("inf")
         )
-        first_scale = tl.exp(first_lse - maximum)
-        second_scale = tl.exp(second_lse - maximum)
+        # Base-2 states weight each side by 2^(lse - max) and add log2 of the
+        # denominator; natural-log states use e and ln identically.
+        if base2:
+            first_scale = tl.exp2(first_lse - maximum)
+            second_scale = tl.exp2(second_lse - maximum)
+        else:
+            first_scale = tl.exp(first_lse - maximum)
+            second_scale = tl.exp(second_lse - maximum)
         denominator = first_scale + second_scale
         first_weight = tl.where(both_empty, 0.0, first_scale / denominator)
         second_weight = tl.where(both_empty, 0.0, second_scale / denominator)
-        merged_lse = tl.where(
-            both_empty, -float("inf"), maximum + tl.log(denominator)
-        )
+        if base2:
+            total = tl.log2(denominator)
+        else:
+            total = tl.log(denominator)
+        merged_lse = tl.where(both_empty, -float("inf"), maximum + total)
 
         offsets = rows[:, None] * head_dim + columns[None, :]
         mask = row_mask[:, None] & (columns[None, :] < head_dim)
@@ -88,15 +100,19 @@ def merge_attention_states(
     first_lse: torch.Tensor,
     second_output: torch.Tensor,
     second_lse: torch.Tensor,
+    *,
+    base2: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge independently evaluated KV segments with stable online softmax.
 
     Each state is an (output [..., head_dim], lse [...]) pair; returns the
     merged pair in the same layouts, with the output in ``first_output``'s
-    dtype. Empty segments carry an LSE of -inf; when both segments are empty
-    the merged output is zero and the merged LSE is -inf. Contiguous CUDA
-    states that fit the fused kernel run it; other inputs evaluate the same
-    formula with tensor operations. Both paths allocate new result tensors.
+    dtype. ``base2`` states that both LSEs, and the merged result, are base-2
+    logarithms; otherwise they are natural logarithms. Empty segments carry
+    an LSE of -inf; when both segments are empty the merged output is zero
+    and the merged LSE is -inf. Contiguous CUDA states that fit the fused
+    kernel run it; other inputs evaluate the same formula with tensor
+    operations. Both paths allocate new result tensors.
 
     Raises:
         ValueError: If the two outputs or the two LSE tensors differ in shape.
@@ -128,15 +144,21 @@ def merge_attention_states(
             head_dim,
             block_rows,
             block_dim,
+            base2,
             num_warps=8,
         )
         return output, merged_lse
 
     # nan_to_num zeroes the NaN weights that both-empty rows produce, matching
     # the fused kernel.
-    merged_lse = torch.logaddexp(first_lse, second_lse)
-    first_weight = torch.exp(first_lse - merged_lse).nan_to_num(0.0)
-    second_weight = torch.exp(second_lse - merged_lse).nan_to_num(0.0)
+    if base2:
+        merged_lse = torch.logaddexp2(first_lse, second_lse)
+        first_weight = torch.exp2(first_lse - merged_lse).nan_to_num(0.0)
+        second_weight = torch.exp2(second_lse - merged_lse).nan_to_num(0.0)
+    else:
+        merged_lse = torch.logaddexp(first_lse, second_lse)
+        first_weight = torch.exp(first_lse - merged_lse).nan_to_num(0.0)
+        second_weight = torch.exp(second_lse - merged_lse).nan_to_num(0.0)
 
     output = (
         first_output.float() * first_weight.unsqueeze(-1)
