@@ -46,6 +46,28 @@ def test_rejects_untrained_schedule(steps, shift):
         model.make_schedules(steps, shift=shift, device="cpu")
 
 
-@pytest.mark.parametrize("video_frames,expected", [(124, 207), (362, 604)])
+# Nearest-integer audio latents per aligned frame count: 107 frames last
+# 4.458 s, or 178.3 latents at 40 Hz; 362 frames last 15.083 s, or 603.3.
+@pytest.mark.parametrize(
+    "video_frames,expected", [(107, 178), (124, 207), (243, 405), (362, 603)]
+)
 def test_audio_duration(video_frames, expected):
     assert audio_latent_frames(video_frames) == expected
+
+
+def test_audio_track_decodes_exactly_the_generated_latent_timeline():
+    """The decoded track and the denoiser's audio rows describe one timeline.
+
+    Every aligned frame count's track spans whole latent frames, the same
+    count the denoiser generates, so the decoder never reads past the
+    generated latents or leaves requested samples uncovered.
+    """
+    from uniserve_models.minimax_h3 import audio_vae
+    from uniserve_models.minimax_h3.decoding import AudioDecoder
+
+    with torch.device("meta"):
+        decoder = AudioDecoder(audio_vae.Config(), sample_rate=32000)
+    for frames in range(107, 363, 17):
+        samples = decoder.track_samples(frames, 24)
+        assert samples == audio_latent_frames(frames) * decoder.latent_rate
+        assert decoder.latent_frames(samples) == audio_latent_frames(frames)

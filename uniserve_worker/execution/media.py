@@ -99,10 +99,14 @@ def video_shape(runner: ModelExecutor, media: DiffusionParams, tokens: int):
 
 
 def audio_samples(runner: ModelExecutor, num_frames: int) -> int:
-    """Return the audio sample count spanning the given video frame count."""
-    decoder = runner.audio_decoder
-    output = runner.video_postprocessor
-    return round(num_frames * decoder.sample_rate / output.frame_rate)
+    """Return the sample count of the audio track generated with the video.
+
+    The model's decoder defines the track from its latent timeline; the
+    muxer aligns it to the video duration.
+    """
+    return runner.audio_decoder.track_samples(
+        num_frames, runner.video_postprocessor.frame_rate
+    )
 
 
 def audio_unit_count(runner: ModelExecutor, entry: str) -> int:

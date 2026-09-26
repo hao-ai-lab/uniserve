@@ -85,7 +85,8 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
         try:
             # Returning to a previously used duration exercises resource reuse
             # after another request has consumed the same reconstruction owner.
-            for frames in (39, 22, 39):
+            # 107 frames is a count whose audio timeline rounds down.
+            for frames in (39, 22, 39, 107):
                 count = video_latent_frames(frames)
                 native = (
                     torch.randn(
@@ -148,7 +149,9 @@ def test_window_decoding_matches_native_reconstruction_and_exact_audio_duration(
                     )
                     * 0.05
                 )
-                samples = round(frames * 32000 / 24)
+                # The track is the decode of the generated latent timeline.
+                samples = model.audio_decoder.track_samples(frames, 24)
+                assert samples == count * 800
                 with ExecutionContext(model.audio_decoder.decoder) as context:
                     context.prepare(None)
                     with context.activate():
