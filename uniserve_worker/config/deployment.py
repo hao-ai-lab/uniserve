@@ -494,6 +494,11 @@ class WorkerProcessArgs:
             raise ValueError("publication backends must be bound transports")
         if "cuda_vmm" in backends and not device.startswith("cuda:"):
             raise ValueError("CUDA VMM requires a CUDA worker device")
+        if device.startswith("cuda") or (
+            generation_device is not None
+            and generation_device.startswith("cuda")
+        ):
+            _require_native_cuda_representation(namespace)
 
         return cls(
             worker_id=str(namespace.worker_id),
@@ -583,6 +588,46 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
         namespace.world_size
     ):
         raise ValueError("--rank must satisfy 0 <= rank < world-size")
+
+
+def _require_native_cuda_representation(namespace: argparse.Namespace) -> None:
+    """Reject CUDA launches whose representation no native kernel computes.
+
+    CUDA attention runs only native kernels, which compute in BF16 or FP16
+    over BF16 or FP16 caches:
+
+    - an FP32 model (``--dtype float32``) has no native attention kernel;
+    - an FP8 KV cache (``--kv-cache-dtype float8_e4m3fn``, or the
+      ``kv_cache_dtype`` key of ``--quantization-config``, which overrides
+      it) stores one FP8 scale per cache block. The FP8-KV TensorRT-LLM
+      kernels read FP8 queries with per-tensor BMM1/BMM2 scales and no
+      native kernel reads per-block scales.
+
+    Failing here, before the model loads, names the option instead of the
+    first attention layer that cannot be prepared.
+
+    Raises:
+        ValueError: The launch selects one of these representations.
+    """
+    if str(namespace.model_dtype) == "float32":
+        raise ValueError(
+            "--dtype float32 has no native CUDA attention kernel: CUDA "
+            "attention computes in bfloat16 or float16"
+        )
+    override = dict(namespace.quantization_config).get("kv_cache_dtype")
+    storage = override if override is not None else namespace.kv_cache_dtype
+    if storage == "float8_e4m3fn":
+        option = (
+            "--kv-cache-dtype"
+            if override is None
+            else "--quantization-config kv_cache_dtype"
+        )
+        raise ValueError(
+            f"{option} float8_e4m3fn has no native CUDA attention kernel: "
+            "the cache keeps one FP8 scale per block, which no native kernel "
+            "reads (the FP8-KV TensorRT-LLM kernels take FP8 queries with "
+            "per-tensor BMM1/BMM2 scales); use a bfloat16 or float16 KV cache"
+        )
 
 
 def _load_config(namespace: argparse.Namespace) -> IOConfig:
