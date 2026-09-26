@@ -95,6 +95,8 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
+Models with image input (SenseNova and Bagel) accept `image_url` content parts whose URL is either a `data:image/<subtype>;base64,...` URL or an `http(s)` URL. The server fetches `http(s)` URLs itself before tokenization: it follows at most three redirects, requires an `image/*` `Content-Type` or a recognizable PNG, JPEG, GIF, WebP, or BMP file, and enforces `--image-fetch-timeout` and `--image-fetch-max-bytes`. Every hop must resolve to a public address unless `--allow-private-image-urls` is set, and environment proxy settings are not used for these fetches. An image that cannot be fetched or decoded fails the request with 400.
+
 Generate one image from a SenseNova server:
 
 ```bash
@@ -134,6 +136,9 @@ Each image response entry carries `b64_json`, pixel `height` and `width`, and th
 | `--request-timeout` | Unset | Seconds until a response head is sent; streamed bodies (chat SSE and video downloads) are not bounded |
 | `--max-concurrent-requests` | Unset | In-flight bound for chat completion and image generation requests (503 above it); video requests share the video job slots instead |
 | `--shutdown-timeout` | `30` | Graceful drain bound in seconds |
+| `--image-fetch-timeout` | `20` | Seconds allowed to fetch one `http(s)` image URL, including redirects and the complete body |
+| `--image-fetch-max-bytes` | `20000000` | Largest accepted input image in bytes, for fetched URLs and `data:` URLs alike |
+| `--allow-private-image-urls` | Off | Allow image URLs that resolve to loopback, private, link-local, unique-local, or cloud metadata addresses |
 
 For tensor-parallel execution, select one rank per participating GPU:
 

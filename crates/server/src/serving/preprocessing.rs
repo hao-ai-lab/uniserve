@@ -6,7 +6,8 @@
 //! and resolves the final `GenerationRequest`. Wire-level checks that need the
 //! served configuration run here; model-specific validation happens during
 //! preprocessing. Serving errors are mapped back to `ApiError` with
-//! `serve_error_to_api`.
+//! `serve_error_to_api`. [`chat_image_urls`] lists a chat request's image
+//! references so the serving runtime can resolve them before preprocessing.
 
 use crate::profile::tools;
 use crate::serving::chat::{
@@ -27,8 +28,45 @@ use crate::openai::{
     ReasoningEffort, Tool, ToolCall, ToolChoice, ToolChoiceValue,
 };
 
+/// Returns the URL of every input image in a chat request, in prompt order.
+///
+/// Images are the `image_url` parts of system, user, developer, and tool
+/// messages, in message order and then part order; assistant content carries
+/// no input images (message conversion rejects image parts there). This is
+/// the order in which [`InputProcessor::preprocess_chat_request`] pairs the
+/// resolved images with their parts.
+///
+/// [`InputProcessor::preprocess_chat_request`]: crate::serving::InputProcessor::preprocess_chat_request
+pub fn chat_image_urls(request: &ChatCompletionRequest) -> Vec<String> {
+    request
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            ChatMessage::System { content, .. }
+            | ChatMessage::User { content, .. }
+            | ChatMessage::Tool { content, .. }
+            | ChatMessage::Developer { content, .. } => Some(content),
+            ChatMessage::Assistant { .. } => None,
+        })
+        .filter_map(|content| match content {
+            MessageContent::Parts(parts) => Some(parts),
+            MessageContent::Text(_) => None,
+        })
+        .flatten()
+        .filter_map(|part| match part {
+            ContentPart::ImageUrl { image_url, .. } => Some(image_url.url.clone()),
+            ContentPart::Text { .. } => None,
+        })
+        .collect()
+}
+
 impl crate::serving::InputProcessor {
     /// Validates and tokenizes a chat API request into its final engine input.
+    ///
+    /// `images` are the request's input images resolved from
+    /// [`chat_image_urls`], in that order; each takes the place of its
+    /// `image_url` part, whose URL is not read again. Pass no images for a
+    /// model without image input, which rejects image parts.
     ///
     /// The returned request carries a placeholder engine identifier that the
     /// caller must replace before submission (see
@@ -39,11 +77,13 @@ impl crate::serving::InputProcessor {
     /// Returns an `ApiError` when route validation (served model name,
     /// `prompt_logprobs` bounds and streaming compatibility) or message and
     /// control conversion fails, and the mapped serving error when
-    /// preprocessing fails.
+    /// preprocessing fails, including when `images` does not hold exactly one
+    /// image per `image_url` part.
     pub fn preprocess_chat_request(
         &self,
         request_id: ServeRequestId,
         request: ChatCompletionRequest,
+        images: Vec<crate::serving::ImageInput>,
     ) -> Result<
         (
             uniserve_core::GenerationRequest,
@@ -96,7 +136,7 @@ impl crate::serving::InputProcessor {
         self.preprocess_generation(
             request_id,
             prompt,
-            Vec::new(),
+            images,
             modalities,
             SamplingConfig {
                 temperature: request.temperature,

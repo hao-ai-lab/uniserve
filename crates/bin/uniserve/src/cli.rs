@@ -23,7 +23,8 @@ use uniserve_engine::{
     FlashInferBackend, LaneConfig, TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
 use uniserve_server::{
-    ChatTemplateContentFormatOption, Config, EngineSettings, HttpListenerMode, SchedulingPolicy,
+    ChatTemplateContentFormatOption, Config, EngineSettings, HttpListenerMode, ImageFetchPolicy,
+    SchedulingPolicy,
 };
 
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
@@ -255,6 +256,28 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long = "log-stats", action = ArgAction::Set, default_value_t = true)]
     pub log_stats: bool,
 
+    /// Time limit, in seconds, for fetching one http(s) image URL, covering
+    /// the connection, every redirect, and the complete response body.
+    #[arg(
+        long = "image-fetch-timeout",
+        default_value_t = ImageFetchPolicy::DEFAULT_TIMEOUT.as_secs(),
+        value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
+    )]
+    pub image_fetch_timeout: u64,
+    /// Largest accepted input image in bytes, for fetched image URLs and
+    /// decoded data URLs alike.
+    #[arg(
+        long = "image-fetch-max-bytes",
+        default_value_t = ImageFetchPolicy::DEFAULT_MAX_BYTES,
+        value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
+    )]
+    pub image_fetch_max_bytes: u64,
+    /// Allow image URLs whose host is or resolves to a loopback, private,
+    /// link-local, unique-local, or cloud metadata address. Scheme, redirect,
+    /// time, size, and content-type limits still apply.
+    #[arg(long = "allow-private-image-urls")]
+    pub allow_private_image_urls: bool,
+
     /// The single model name used in the API. Defaults to the resolved model ID.
     #[arg(long)]
     pub served_model_name: Option<String>,
@@ -381,6 +404,11 @@ impl SharedRuntimeArgs {
             max_concurrent_requests: self.max_concurrent_requests,
             shutdown_timeout: Duration::from_secs(self.shutdown_timeout),
             reasoning_parsing: self.reasoning_parser != "none",
+            image_fetch: ImageFetchPolicy {
+                timeout: Duration::from_secs(self.image_fetch_timeout),
+                max_bytes: self.image_fetch_max_bytes,
+                allow_private: self.allow_private_image_urls,
+            },
         }
     }
 }
@@ -767,6 +795,49 @@ mod tests {
         let Command::Serve(args) = parsed.command;
         let worker = args.runtime.worker_process.to_args();
         assert_eq!(worker.quantization_config, serde_json::json!({}));
+    }
+
+    /// The image fetch flags lower into the server's image fetch policy, which
+    /// defaults to a 20-second fetch, a 20 MB image, and public destinations
+    /// only; a zero time or size limit is refused.
+    #[test]
+    fn serve_lowers_image_fetch_limits() {
+        let serve = |flags: &[&str]| {
+            <Cli as clap::Parser>::try_parse_from(
+                ["uniserve", "serve", "model"]
+                    .into_iter()
+                    .chain(flags.iter().copied()),
+            )
+        };
+        let policy = |flags: &[&str]| {
+            let Command::Serve(args) = serve(flags).expect("serve invocation").command;
+            args.to_uniserve_config().image_fetch
+        };
+
+        assert_eq!(
+            policy(&[]),
+            ImageFetchPolicy {
+                timeout: Duration::from_secs(20),
+                max_bytes: 20_000_000,
+                allow_private: false,
+            }
+        );
+        assert_eq!(
+            policy(&[
+                "--image-fetch-timeout",
+                "5",
+                "--image-fetch-max-bytes",
+                "1024",
+                "--allow-private-image-urls",
+            ]),
+            ImageFetchPolicy {
+                timeout: Duration::from_secs(5),
+                max_bytes: 1024,
+                allow_private: true,
+            }
+        );
+        assert!(serve(&["--image-fetch-timeout", "0"]).is_err());
+        assert!(serve(&["--image-fetch-max-bytes", "0"]).is_err());
     }
 
     #[test]

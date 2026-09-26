@@ -803,6 +803,9 @@ impl InputProcessor {
 
     /// Tokenizes model input and resolves its final engine and output requirements.
     ///
+    /// `images` are the prompt's input images: the top-level images of a text prompt, or the
+    /// resolved `image_url` parts of a chat prompt in `chat_image_urls` order.
+    ///
     /// The returned `GenerationRequest::request_id` is a placeholder derived from the external
     /// identifier. `EngineClient::submit_generation` accepts only the identifier reserved by
     /// `EngineClient::register_request`, so the caller must replace it before submission.

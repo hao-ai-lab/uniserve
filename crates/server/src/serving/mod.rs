@@ -8,7 +8,8 @@
 //!
 //! [`ServingRuntime`] owns each request from identity reservation to its terminal event. It
 //! reserves the external identifier and an engine `RequestId` in the engine client's
-//! `RequestRegistry` before preprocessing, runs model preprocessing on the blocking pool,
+//! `RequestRegistry` before preprocessing, resolves the request's image references on the
+//! async runtime ([`media::ImageFetcher`]), runs model preprocessing on the blocking pool,
 //! submits the prepared request, and wraps the engine receiver in the assembler and in
 //! lifecycle tracking (`LifecycleGuard`, `LifecycleTrackedStream`).
 //!
@@ -25,6 +26,8 @@ mod assembly;
 /// Chat request rendering and structured output processing.
 pub mod chat;
 mod input;
+/// Image reference resolution shared by every request path that accepts images.
+pub mod media;
 mod model;
 mod omni;
 mod preprocessing;
@@ -52,15 +55,17 @@ use thiserror::Error;
 use uniserve_core::EngineCoreOutput;
 
 pub use input::{
-    DecodeControls, ImageGenControls, ImageInput, ModalitySelection, ModelEventIdentity,
-    OutputDetail, OutputProcessorPolicy, PromptInput, ResponseOptions, SamplingConfig, StopConfig,
+    DecodeControls, ImageGenControls, ModalitySelection, ModelEventIdentity, OutputDetail,
+    OutputProcessorPolicy, PromptInput, ResponseOptions, SamplingConfig, StopConfig,
     TextPromptRequest,
 };
+pub use media::ImageInput;
 pub use model::{
     InputProcessor, MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, ModelSupport, ServedEndpoint,
     ServedFeature, ServedModality, ServedSamplingControl, VIDEO_FPS, WorkerCapabilities,
     default_video_seconds, validate_video_capacity, video_frame_count,
 };
+pub use preprocessing::chat_image_urls;
 
 use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, Qwen3ChatOutputProcessor};
 use crate::serving::omni::{SenseNovaOutputProcessor, SenseNovaTextDelta};
@@ -274,6 +279,15 @@ pub enum ServeError {
     /// Engine submission or streaming fails.
     #[error(transparent)]
     Engine(#[from] crate::engine_client::Error),
+    /// An input image reference cannot be fetched or decoded.
+    #[error("request `{request_id}` has an invalid input image")]
+    ImageInput {
+        /// Identifier of the rejected request.
+        request_id: ServeRequestId,
+        /// The failing reference and its cause.
+        #[source]
+        source: media::ImageListError,
+    },
     /// Request tokenization fails before engine submission.
     #[error("request `{request_id}` cannot be tokenized")]
     Tokenize {
@@ -344,6 +358,7 @@ impl From<(uniserve_core::GenerationRequest, ResponseOptions)> for Prepared {
 pub struct ServingRuntime {
     model: Arc<InputProcessor>,
     engine: Arc<EngineClient>,
+    images: media::ImageFetcher,
     // Held only to keep the periodic logging task alive; dropping the logger aborts the task.
     _stats_logger: Option<Arc<crate::engine_client::generation::log_stats::StatsLogger>>,
     // Cumulative lifecycle counters shared with every request's lifecycle guard and assembler.
@@ -352,7 +367,14 @@ pub struct ServingRuntime {
 
 impl ServingRuntime {
     /// Creates a serving runtime for one resolved model and engine client.
-    pub fn new(model: InputProcessor, engine: Arc<EngineClient>, log_stats: bool) -> Self {
+    ///
+    /// `images` resolves the image references of every request this runtime serves.
+    pub fn new(
+        model: InputProcessor,
+        engine: Arc<EngineClient>,
+        images: media::ImageFetcher,
+        log_stats: bool,
+    ) -> Self {
         let stats_logger = log_stats.then(|| {
             Arc::new(
                 crate::engine_client::generation::log_stats::StatsLogger::start(
@@ -364,6 +386,7 @@ impl ServingRuntime {
         Self {
             model: Arc::new(model),
             engine,
+            images,
             _stats_logger: stats_logger,
             metrics: Arc::new(RuntimeLifecycleMetrics::default()),
         }
@@ -382,6 +405,11 @@ impl ServingRuntime {
     /// Returns the engine client backing this runtime.
     pub fn engine(&self) -> &EngineClient {
         &self.engine
+    }
+
+    /// Returns the fetcher that resolves request image references.
+    pub fn image_fetcher(&self) -> &media::ImageFetcher {
+        &self.images
     }
 
     /// Returns an aggregate point-in-time metrics snapshot.
@@ -410,6 +438,9 @@ impl ServingRuntime {
     }
 
     /// Preprocesses a chat request while retaining cancellation and identity ownership.
+    ///
+    /// The `image_url` parts are fetched only for a model that accepts image input; for any
+    /// other model, preprocessing rejects them without network access.
     pub async fn generate_chat(
         &self,
         request_id: ServeRequestId,
@@ -419,10 +450,15 @@ impl ServingRuntime {
             &request,
             self.served_model_name(),
         )?;
+        let image_urls = if self.model.supports_image_input() {
+            chat_image_urls(&request)
+        } else {
+            Vec::new()
+        };
         let input_id = request_id.clone();
-        self.generate_with(request_id, move |model| {
+        self.generate_with(request_id, image_urls, move |model, images| {
             model
-                .preprocess_chat_request(input_id, request)
+                .preprocess_chat_request(input_id, request, images)
                 .map(Prepared::from)
         })
         .await
@@ -435,7 +471,7 @@ impl ServingRuntime {
         request: crate::openai::ImageGenerationRequest,
     ) -> crate::openai::Result<RequestOutputStream> {
         let input_id = request_id.clone();
-        self.generate_with(request_id, move |model| {
+        self.generate_with(request_id, Vec::new(), move |model, _| {
             model
                 .preprocess_image_request(input_id, request)
                 .map(Prepared::from)
@@ -448,7 +484,7 @@ impl ServingRuntime {
         &self,
         request: TextPromptRequest,
     ) -> crate::openai::Result<RequestOutputStream> {
-        self.generate_with(request.request_id.clone(), move |model| {
+        self.generate_with(request.request_id.clone(), Vec::new(), move |model, _| {
             model
                 .preprocess_text_request(request)
                 .map(Prepared::from)
@@ -464,7 +500,7 @@ impl ServingRuntime {
         request: crate::openai::VideoGenerationRequest,
     ) -> crate::openai::Result<RequestOutputStream> {
         let input_id = request_id.clone();
-        self.generate_with(request_id, move |model| {
+        self.generate_with(request_id, Vec::new(), move |model, _| {
             model
                 .preprocess_video_request(&input_id, request)
                 .map(Prepared::Diffusion)
@@ -472,19 +508,28 @@ impl ServingRuntime {
         .await
     }
 
-    /// Owns the request across blocking preprocessing, submission, and public output.
+    /// Owns the request across image resolution, blocking preprocessing, submission, and
+    /// public output.
+    ///
+    /// `image_urls` are the request's image references in the order `preprocess` expects
+    /// their [`ImageInput`] values. They are resolved on the async runtime before
+    /// preprocessing starts, so no network I/O occupies the blocking pool.
     ///
     /// Registration precedes preprocessing, so a duplicate identifier is refused before any
-    /// tokenization work and a cancel or abort can target a request that is still compiling.
-    /// Every path after registration either returns a stream that carries the lifecycle guard
-    /// or records a terminal outcome through it.
+    /// image or tokenization work and a cancel or abort can target a request that is still
+    /// compiling. Every path after registration either returns a stream that carries the
+    /// lifecycle guard or records a terminal outcome through it.
     async fn generate_with(
         &self,
         request_id: ServeRequestId,
-        preprocess: impl FnOnce(&InputProcessor) -> crate::openai::Result<Prepared> + Send + 'static,
+        image_urls: Vec<String>,
+        preprocess: impl FnOnce(&InputProcessor, Vec<ImageInput>) -> crate::openai::Result<Prepared>
+        + Send
+        + 'static,
     ) -> crate::openai::Result<RequestOutputStream> {
         // `compile_us` and the lifecycle's elapsed times are measured from this instant, so
-        // time spent queued for the blocking pool counts toward compilation.
+        // image fetching and time spent queued for the blocking pool count toward
+        // compilation.
         let compile_started = Instant::now();
         let identity = self.model.event_identity();
 
@@ -513,20 +558,32 @@ impl ServingRuntime {
         );
 
         // A control command that arrives during preprocessing ends the request immediately.
+        // Dropping the preprocessing future cancels any image download still in progress.
         // Dropping the `spawn_blocking` handle detaches the task rather than cancelling it, so
-        // the preprocessing still runs to completion and its result is discarded.
+        // tokenization that has started still runs to completion and its result is discarded.
         let model = Arc::clone(&self.model);
-        let tokenize_request_id = request_id.clone();
+        let preprocess_request_id = request_id.clone();
+        let preprocessing = async move {
+            let images = self.images.fetch_all(image_urls).await.map_err(|source| {
+                crate::openai::serve_error_to_api(ServeError::ImageInput {
+                    request_id: preprocess_request_id.clone(),
+                    source,
+                })
+            })?;
+            tokio::task::spawn_blocking(move || preprocess(&model, images))
+                .await
+                .unwrap_or_else(|error| {
+                    Err(crate::openai::serve_error_to_api(ServeError::Tokenize {
+                        request_id: preprocess_request_id,
+                        source: TokenizeError::Task(error),
+                    }))
+                })
+        };
         let tokenize_result = tokio::select! {
             terminal = self.engine.requests.wait_for_control(&request_id) => {
                 return Ok(self.control_event_stream(request_id, terminal, lifecycle));
             }
-            tokenized = tokio::task::spawn_blocking(move || preprocess(&model)) => {
-                tokenized.unwrap_or_else(|error| Err(crate::openai::serve_error_to_api(ServeError::Tokenize {
-                    request_id: tokenize_request_id,
-                    source: TokenizeError::Task(error),
-                })))
-            }
+            tokenized = preprocessing => tokenized,
         };
         let mut tokenized = match tokenize_result {
             Ok(tokenized) => tokenized,
