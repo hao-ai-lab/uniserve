@@ -278,6 +278,41 @@ def test_text_worker_reports_exact_cache_capacity(storage):
     )
 
 
+@pytest.mark.parametrize(
+    "seconds,frames", [(5.0, 124), (10.0, 243), (15.0, 362)]
+)
+def test_h3_audio_product_holds_the_decoded_track(seconds, frames):
+    """The advertised audio product is the whole track the decoder returns.
+
+    The decoded track spans the whole latent frames generated with the video,
+    so its length differs from the video duration in samples wherever that
+    duration is a fractional number of latent frames: longer at 124 frames,
+    equal at 243 and shorter at 362.
+    """
+    from uniserve_models.minimax_h3 import Config, Model
+    from uniserve_models.minimax_h3.packing import audio_latent_frames
+    from uniserve_worker.bootstrap.outputs import resolve_outputs
+    from uniserve_worker.config.execution import WorkerConfig
+
+    with torch.device("meta"):
+        model = Model(Config())
+    config = WorkerConfig(
+        device="cpu",
+        max_sequence_tokens=65,
+        max_video_seconds=seconds,
+        max_request_pool_size=2,
+        min_request_pool_size=2,
+    )
+    products = {
+        value.name: value
+        for values in resolve_outputs(model, config).values()
+        for value in values
+    }
+    track = audio_latent_frames(frames) * model.audio_decoder.latent_rate
+    assert track == model.audio_decoder.track_samples(frames, 24)
+    assert products["audio_samples"].shape_bound.max_elements == track * 2
+
+
 def test_h3_video_capacity_rounds_half_frames_to_even():
     """A capacity sizes the frames its longest admitted request resolves to.
 
