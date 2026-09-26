@@ -180,18 +180,17 @@ def sandwich_rms_norm(
         return stream, outputs
 
     # The composition that defines the kernel's rounding points.
-    summed = None
-    for update, branch_weight in updates:
-        term = (
-            update
-            if branch_weight is None
-            else rms_norm(update, branch_weight, eps)
-        )
-        summed = term if summed is None else summed + term
+    terms = [
+        update if branch is None else rms_norm(update, branch, eps)
+        for update, branch in updates
+    ]
+    summed = terms[0]
+    for term in terms[1:]:
+        summed = summed + term
     stream = residual + rms_norm(summed, weight, eps)
     if scale is not None:
         stream = stream * scale
-    outputs = []
+    normalized: list[torch.Tensor] = []
     for norm_weight, *factors in norms:
         value = (
             _rms(stream, eps).to(stream.dtype)
@@ -200,8 +199,8 @@ def sandwich_rms_norm(
         )
         for factor in factors:
             value = value * factor
-        outputs.append(value)
-    return stream, tuple(outputs)
+        normalized.append(value)
+    return stream, tuple(normalized)
 
 
 def _autocast_dtype(value: torch.Tensor) -> torch.dtype:
