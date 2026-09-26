@@ -199,6 +199,7 @@ impl EngineClient {
         let request = match self.core.runtime_family() {
             RuntimeFamily::Ar => Request::Ar(request),
             RuntimeFamily::Umm => Request::Umm(request),
+            RuntimeFamily::BlockDiffusion => Request::BlockDiffusion(request),
             RuntimeFamily::Diffusion => {
                 self.requests.release_engine(&external_request_id, rid);
                 return Err(Error::ClientClosed {
@@ -370,6 +371,7 @@ mod tests {
             priority: 0,
             cache: Default::default(),
             image_generation: policy,
+            readout: Vec::new(),
         };
         let mut stream = client
             .submit_generation("req-text".to_string(), generation)
@@ -451,6 +453,7 @@ mod tests {
             priority: 0,
             cache: Default::default(),
             image_generation: policy,
+            readout: Vec::new(),
         };
         request
             .validate_resources(&client.generation_limits())

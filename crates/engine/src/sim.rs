@@ -679,6 +679,7 @@ impl SimEngine {
             kv_computed_len: 0,
             num_completed_steps: 0,
             committed_tokens: Vec::new(),
+            candidate_logprobs: Vec::new(),
             finish_flags: FinishFlags::default(),
             media_output: None,
             kv_output: None,
@@ -706,9 +707,17 @@ impl SimEngine {
                     }
                 }
                 if !visual_state && !samples_token {
+                    // A readout's prompt chunk samples nothing and advances
+                    // positions with its tokens; the `CloseKv` write, which
+                    // declares a completion, only extends KV.
                     request.kv_visible_len = request
                         .kv_visible_len
                         .saturating_add(call.bounds.max_tokens);
+                    if call.completion_output.is_none() {
+                        request.logical_position = request
+                            .logical_position
+                            .saturating_add(call.bounds.max_tokens);
+                    }
                     record.position = request.logical_position;
                     set_kv_lengths(&mut record, request.kv_visible_len);
                 } else if samples_token {
@@ -813,6 +822,17 @@ impl SimEngine {
                         .collect();
                 }
             }
+            CallKind::Forward(ForwardMode::TokenDenoising) => {
+                // A canvas pass reads KV without writing it and reports one
+                // deterministic log-probability per readout candidate.
+                if let Some(readout) = &call.readout {
+                    record.candidate_logprobs = readout
+                        .candidate_ids
+                        .iter()
+                        .map(|&token| sim_candidate_logprob(call.request_key.request_id, token))
+                        .collect();
+                }
+            }
             CallKind::Media(MediaCall::TextEncoding)
             | CallKind::Media(MediaCall::VisionEncoding)
             | CallKind::Media(MediaCall::LatentEncoding) => {}
@@ -910,6 +930,7 @@ impl SimEngine {
             kv_computed_len: request.kv_visible_len,
             num_completed_steps: u32::from(request.flow_step),
             committed_tokens: Vec::new(),
+            candidate_logprobs: Vec::new(),
             finish_flags: FinishFlags::default(),
             media_output: None,
             kv_output: None,
@@ -1003,6 +1024,12 @@ impl SimEngine {
 }
 
 /// Sets every logical KV frontier to the visible token position.
+/// Deterministic natural-log probability the simulator reports for readout
+/// candidate `token` of request `request_id`: a value in `[-7, -1]`.
+pub fn sim_candidate_logprob(request_id: RequestId, token: u32) -> f32 {
+    -1.0 - ((request_id.0.wrapping_add(u64::from(token))) % 7) as f32
+}
+
 fn set_kv_lengths(lengths: &mut RequestOutput, visible: u32) {
     lengths.kv_visible_len = visible;
     lengths.kv_computed_len = visible;
@@ -1279,6 +1306,7 @@ mod tests {
             kv_input: None,
             kv_output: None,
             input_token_ids: Vec::new(),
+            readout: None,
             sampling_state: None,
             request_key,
             call_id: CallId::new(batch_id, request_index),

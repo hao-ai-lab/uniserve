@@ -1,9 +1,9 @@
 //! Generation lifecycle state and worker-call planning.
 //!
-//! A request advances through context ingestion, understanding decode, image
-//! generation, optional feedback, and terminal publication
-//! ([`GenerationPhase`]). [`RequestState`] holds the accepted progress of one
-//! admitted token request.
+//! A request advances through context ingestion, then either understanding
+//! decode, image generation and optional feedback, or, for a readout, canvas
+//! denoising, and finally terminal publication ([`GenerationPhase`]).
+//! [`RequestState`] holds the accepted progress of one admitted token request.
 //!
 //! Each `plan_*` builder returns one call whose identities are placeholders
 //! and whose `Bounds` come from `finish_plan`; `register_call` then stamps the
@@ -27,8 +27,8 @@ use uniserve_worker_ipc::{
 
 use uniserve_core::{GenerationRequest, ImageIngestStep, RequestId, SamplingParams};
 use uniserve_worker_ipc::{
-    Bounds, BufferId, Call, CallId, CallKind, CallStatus, DType, DimBound, DrawLayout, RequestKey,
-    RequestOutput, Rng, SamplingState, ShapeBound, TensorRef,
+    Bounds, BufferId, Call, CallId, CallKind, CallStatus, DType, DimBound, DrawLayout, Readout,
+    RequestKey, RequestOutput, Rng, SamplingState, ShapeBound, TensorRef,
 };
 
 use crate::scheduler::image_artifact::png_artifact_dims_b64;
@@ -188,6 +188,9 @@ pub(crate) enum GenerationPhase {
     FeedbackEncode,
     /// Write the feedback encoder's feature into KV.
     FeedbackState,
+    /// Denoise a readout request's canvas rows over its prompt, a bounded
+    /// group of rows per call, until every row has reported its slots.
+    Readout,
 }
 
 /// Image extension consumes an encoder feature rather than token inputs.
@@ -209,11 +212,14 @@ pub(super) fn is_feedback_computation(call: &Call) -> bool {
         && call.completion_output.is_some()
 }
 
-/// Prompt extension samples a token and has no image-feature input.
+/// Prompt extension writes prompt tokens into KV: a prefill with no
+/// image-feature input and no completion predicate. It samples the next token
+/// unless its request is a readout, whose prompt only conditions its canvases;
+/// the `CloseKv` write is the prefill that declares a completion instead.
 pub(super) fn is_prompt_extend(call: &Call) -> bool {
     call.code == CallKind::Forward(ForwardMode::Prefill)
         && !consumes_image_features(call)
-        && call.token_output.is_some()
+        && call.completion_output.is_none()
 }
 
 impl RequestState {
@@ -310,6 +316,19 @@ impl RequestState {
                 let count = record.committed_tokens.len().max(1).min(u32::MAX as usize) as u32;
                 self.logical_position = self.logical_position.saturating_add(count);
                 self.kv_visible_len = self.kv_visible_len.saturating_add(count);
+            }
+            CallKind::Forward(ForwardMode::TokenDenoising) => {
+                // The call covers the rows after the accepted ones whose
+                // canvases it carries; their log-probabilities follow the
+                // accepted ones in report order.
+                let rows = self
+                    .readout_rows_covering(self.readout_rows, call.input_token_ids.len())
+                    .ok_or(GenerationResultError::Progress {
+                        detail: "readout_rows_mismatch",
+                    })?;
+                self.readout_rows += rows;
+                self.readout_logprobs
+                    .extend_from_slice(&record.candidate_logprobs);
             }
             CallKind::Transfer(TransferMode::KvPublish) => {
                 self.image_conditioning = call.kv_output;
@@ -427,14 +446,18 @@ fn computation(request: &GenerationRequest, code: CallKind) -> Call {
         kv_input: None,
         kv_output: None,
         input_token_ids: Vec::new(),
+        readout: None,
         sampling_state: None,
     }
 }
 
-/// Plans a prefill of prompt tokens `start..end` with a sampled-token output.
+/// Plans a prefill of prompt tokens `start..end`, with a sampled-token output
+/// unless the request is a readout.
 ///
-/// The RNG coordinate is `end`, the exclusive prompt end. Fails with
-/// `InvalidPromptRange` for an empty range or one past the prompt.
+/// The RNG coordinate is `end`, the exclusive prompt end. A readout's prompt
+/// only conditions its canvases, so its prefill samples nothing and declares
+/// no RNG coordinate. Fails with `InvalidPromptRange` for an empty range or
+/// one past the prompt.
 pub(super) fn plan_prompt(
     request: &GenerationRequest,
     start: u32,
@@ -451,6 +474,9 @@ pub(super) fn plan_prompt(
     let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = end.saturating_sub(start);
     call.input_token_ids = request.prompt_token_ids[start as usize..end as usize].to_vec();
+    if request.is_readout() {
+        return finish_plan(request, call, 0);
+    }
     call.token_output = Some(output_tensor(0, DType::I64));
     call.transition_output = sampling_state
         .as_ref()
@@ -472,6 +498,55 @@ pub(super) fn plan_prompt(
         0
     };
     finish_plan(request, call, prompt_positions)
+}
+
+/// Plans one token-denoising pass over the readout rows `rows` of `request`.
+///
+/// The call carries the rows' canvases back to back as its input tokens and
+/// their slots as a `Readout` whose slot tokens index that concatenation;
+/// candidates keep the request's report order, and each returns one FP32
+/// log-probability. Fails with `InvalidReadoutRows` for an empty range or
+/// one past the request's rows.
+pub(super) fn plan_readout(
+    request: &GenerationRequest,
+    rows: std::ops::Range<usize>,
+) -> Result<Call, PlanningError> {
+    let selected = request
+        .readout
+        .get(rows.clone())
+        .filter(|selected| !selected.is_empty())
+        .ok_or(PlanningError::InvalidReadoutRows {
+            start: rows.start,
+            end: rows.end,
+            rows: request.readout.len(),
+        })?;
+
+    let mut call = computation(request, CallKind::Forward(ForwardMode::TokenDenoising));
+    let mut readout = Readout {
+        slot_tokens: Vec::new(),
+        candidate_offsets: vec![0],
+        candidate_ids: Vec::new(),
+    };
+    for row in selected {
+        // Slot positions are row-relative; the call addresses them in its
+        // concatenated canvas tokens.
+        let offset = call.input_token_ids.len() as u32;
+        for slot in &row.slots {
+            readout.slot_tokens.push(offset + slot.position);
+            readout.candidate_ids.extend_from_slice(&slot.candidates);
+            readout
+                .candidate_offsets
+                .push(readout.candidate_ids.len() as u32);
+        }
+        call.input_token_ids.extend_from_slice(&row.token_ids);
+    }
+    call.bounds.max_tokens = u32::try_from(call.input_token_ids.len())
+        .map_err(|_| PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
+    let completion_bytes = (readout.candidate_ids.len() as u64).saturating_mul(4);
+    call.readout = Some(readout);
+    let mut call = finish_plan(request, call, 0)?;
+    call.bounds.max_completion_bytes = completion_bytes;
+    Ok(call)
 }
 
 /// Plans a sampled continuation; relay inputs leave host token values empty.
@@ -776,6 +851,12 @@ pub(crate) enum PlanningError {
         end: u32,
         prompt_tokens: usize,
     },
+    #[error("invalid readout rows {start}..{end} of {rows} rows")]
+    InvalidReadoutRows {
+        start: usize,
+        end: usize,
+        rows: usize,
+    },
     #[error("image generation branch is disabled")]
     GenerationBranchDisabled,
     #[error("generated-image feedback is disabled")]
@@ -938,6 +1019,29 @@ pub(crate) fn validate_generation_result(
                 detail: "image_dimensions_mismatch",
             });
         }
+    }
+
+    // A readout reports one finite log-probability per declared candidate,
+    // and no other call reports any.
+    if let Some(readout) = &call.readout {
+        if record.candidate_logprobs.len() != readout.candidate_count() {
+            return Err(GenerationResultError::Product {
+                detail: "readout_candidate_count_mismatch",
+            });
+        }
+        if record
+            .candidate_logprobs
+            .iter()
+            .any(|logprob| !logprob.is_finite())
+        {
+            return Err(GenerationResultError::Product {
+                detail: "readout_logprob_not_finite",
+            });
+        }
+    } else if !record.candidate_logprobs.is_empty() {
+        return Err(GenerationResultError::Product {
+            detail: "unexpected_candidate_logprobs",
+        });
     }
 
     // A feature write must reach exactly `start + tokens` when the encoder
@@ -1252,6 +1356,11 @@ pub(crate) struct RequestState {
     /// cache, freed by `Scheduler::free_transient_products` or when the
     /// request finishes.
     pub(super) transient_encoder_products: Vec<TensorRef>,
+    /// Leading readout rows whose candidate log-probabilities have been
+    /// accepted.
+    pub(super) readout_rows: usize,
+    /// Accepted candidate log-probabilities of those rows, in report order.
+    pub(super) readout_logprobs: Vec<f32>,
     /// Unix time, in seconds, at which the request state was created.
     pub queued_at: f64,
     pub(crate) terminal_intent: TerminalIntent,
@@ -1308,6 +1417,26 @@ impl RequestState {
     /// Returns whether the text request can be replayed.
     pub(crate) fn is_replayable_text(&self) -> bool {
         self.replayable
+    }
+
+    /// Returns how many readout rows from row `start` a token-denoising call
+    /// of `canvas_tokens` canvas tokens covers, or `None` when no whole
+    /// number of rows there has exactly that many tokens.
+    pub(super) fn readout_rows_covering(
+        &self,
+        start: usize,
+        canvas_tokens: usize,
+    ) -> Option<usize> {
+        let mut remaining = canvas_tokens;
+        let mut rows = 0;
+        for row in self.req.readout.get(start..)? {
+            if remaining == 0 {
+                break;
+            }
+            remaining = remaining.checked_sub(row.token_ids.len())?;
+            rows += 1;
+        }
+        (remaining == 0 && rows > 0).then_some(rows)
     }
 
     /// Returns the pending image step, if one exists.

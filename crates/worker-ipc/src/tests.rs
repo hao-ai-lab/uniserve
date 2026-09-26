@@ -54,6 +54,7 @@ fn ar_decode_call() -> Call {
         kv_input: None,
         kv_output: None,
         input_token_ids: Vec::new(),
+        readout: None,
         sampling_state: None,
         request_key: request_key(),
         call_id: CallId::new(11, 0),
@@ -75,7 +76,18 @@ fn ar_decode_call() -> Call {
     }
 }
 
+/// Two readout slots over a four-token canvas: slot 0 reads two candidates at
+/// canvas token 0, slot 1 one candidate at canvas token 2.
+fn readout() -> Readout {
+    Readout {
+        slot_tokens: vec![0, 2],
+        candidate_offsets: vec![0, 2, 3],
+        candidate_ids: vec![31, 32, 33],
+    }
+}
+
 fn call_for(kind: CallKind, call_id: CallId) -> Call {
+    let denoises = kind == CallKind::Forward(ForwardMode::TokenDenoising);
     Call {
         consumer_slots: Vec::new(),
         coordinates: CallCoordinates::default(),
@@ -109,13 +121,22 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
             output_index: 0,
             generation: 2,
         }),
-        input_token_ids: Vec::new(),
+        // A token-denoising call carries its canvas and the slots it reads.
+        input_token_ids: if denoises {
+            vec![4, 9, 4, 1]
+        } else {
+            Vec::new()
+        },
+        readout: denoises.then(readout),
         sampling_state: None,
         request_key: request_key(),
         call_id,
         component: "model".into(),
         code: kind,
-        bounds: Bounds::default(),
+        bounds: Bounds {
+            max_tokens: if denoises { 4 } else { 0 },
+            ..Bounds::default()
+        },
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
@@ -158,6 +179,7 @@ fn completion_record() -> RequestOutput {
         num_completed_steps: 0,
 
         committed_tokens: vec![271],
+        candidate_logprobs: Vec::new(),
         finish_flags: FinishFlags::default(),
         media_output: None,
         kv_output: None,
@@ -376,6 +398,81 @@ fn every_call_kind_round_trips_through_ipc() {
     }
 }
 
+/// A token-denoising readout reaches the rank with its canvas and slots, and
+/// its completion returns the candidates' log-probabilities in candidate
+/// order.
+#[test]
+fn a_readout_and_its_candidate_logprobs_round_trip() {
+    let call_id = CallId::new(5, 0);
+    let call = call_for(CallKind::Forward(ForwardMode::TokenDenoising), call_id);
+    let batch = execute_round_trip(batch_with_calls(5, Vec::new(), vec![call.clone()]));
+    assert_eq!(batch.calls().next().unwrap(), &call);
+
+    let mut record = completion_record();
+    record.call_id = call_id;
+    record.code = CallKind::Forward(ForwardMode::TokenDenoising);
+    record.sampled_logprob = None;
+    record.top_logprobs.clear();
+    record.prompt_logprobs.clear();
+    record.committed_tokens.clear();
+    record.product_generations.clear();
+    record.candidate_logprobs = vec![-0.25, -3.5, -17.75];
+    let report = lane_report(5, vec![record], Vec::new(), None, None);
+    let decoded =
+        decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
+            .unwrap();
+    assert_eq!(decoded.report().unwrap(), &report);
+}
+
+/// A readout belongs to a token-denoising call and must address the canvas
+/// that call carries, with every slot reading at least one candidate.
+#[test]
+fn a_readout_must_address_the_canvas_of_a_token_denoising_call() {
+    let call_id = CallId::new(5, 0);
+    let valid = call_for(CallKind::Forward(ForwardMode::TokenDenoising), call_id);
+    assert!(valid.validate().is_ok());
+
+    let mut unread = valid.clone();
+    unread.readout = None;
+    let mut misplaced = call_for(CallKind::Forward(ForwardMode::Prefill), call_id);
+    misplaced.readout = Some(readout());
+    misplaced.input_token_ids = vec![1, 2, 3, 4];
+    misplaced.bounds.max_tokens = 4;
+    let mut outside = valid.clone();
+    outside.readout.as_mut().unwrap().slot_tokens[1] = 4;
+    let mut empty_slot = valid.clone();
+    empty_slot.readout.as_mut().unwrap().candidate_offsets = vec![0, 3, 3];
+    let mut short_offsets = valid.clone();
+    short_offsets.readout.as_mut().unwrap().candidate_offsets = vec![0, 2];
+    let mut sampling = valid.clone();
+    sampling.token_output = Some(output_product(call_id));
+    for call in [
+        unread,
+        misplaced,
+        outside,
+        empty_slot,
+        short_offsets,
+        sampling,
+    ] {
+        assert!(call.validate().is_err(), "{:?}", call.readout);
+    }
+}
+
+/// Only a successful token-denoising completion reports candidate
+/// log-probabilities.
+#[test]
+fn candidate_logprobs_belong_to_a_successful_token_denoising_completion() {
+    let mut record = completion_record();
+    record.candidate_logprobs = vec![-1.0];
+    assert!(record.validate().is_err());
+
+    record.code = CallKind::Forward(ForwardMode::TokenDenoising);
+    assert!(record.validate().is_ok());
+    record.status = CallStatus::Error;
+    record.error_code = Some(ErrorCode::ComputeError);
+    assert!(record.validate().is_err());
+}
+
 /// Constructs malformed wire input independently of the validated encoder.
 ///
 /// The frame holds one call with the given forward and media codes and no
@@ -542,6 +639,7 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             kv_input: None,
             kv_output: None,
             input_token_ids: Vec::new(),
+            readout: None,
             sampling_state: None,
             request_key: request_key(),
             call_id: CallId::new(56 + index as u64, 0),
@@ -1473,7 +1571,12 @@ fn comprehensive_batches() -> Vec<Batch> {
                 output_index: 1,
                 generation: 2,
             }),
-            input_token_ids: Vec::new(),
+            input_token_ids: if kind == CallKind::Forward(ForwardMode::TokenDenoising) {
+                vec![4, 9, 4, 1]
+            } else {
+                Vec::new()
+            },
+            readout: (kind == CallKind::Forward(ForwardMode::TokenDenoising)).then(readout),
             sampling_state: None,
             request_key: key,
             call_id,
@@ -1672,6 +1775,7 @@ fn full_run_result() -> BatchOutput {
         kv_computed_len: 8,
 
         committed_tokens: vec![271, 272],
+        candidate_logprobs: Vec::new(),
         finish_flags: FinishFlags {
             eos: true,
             length: false,

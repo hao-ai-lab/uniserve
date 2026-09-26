@@ -233,7 +233,11 @@ LANE_COMPUTATION_GROUPS: dict[str, tuple[CallKind, ...]] = {
         MediaCall.TEXT_ENCODING,
         *TransferMode,
     ),
-    "decode": (ForwardMode.DECODE, ForwardMode.VERIFY),
+    "decode": (
+        ForwardMode.DECODE,
+        ForwardMode.VERIFY,
+        ForwardMode.TOKEN_DENOISING,
+    ),
     "flow": (
         MediaCall.LATENT_PREPARATION,
         MediaCall.DENOISING,

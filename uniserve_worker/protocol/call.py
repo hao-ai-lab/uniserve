@@ -45,11 +45,17 @@ from uniserve_worker.protocol.validation import (
 
 
 class ForwardMode(StrEnum):
-    """The numerical mode of one homogeneous autoregressive call."""
+    """The numerical mode of one homogeneous token-model call.
+
+    Prefill, decode and verify extend a request's KV cache causally; token
+    denoising runs one pass over canvas rows that read the request's cached
+    prefix without writing it.
+    """
 
     PREFILL = "prefill"
     DECODE = "decode"
     VERIFY = "verify"
+    TOKEN_DENOISING = "token_denoising"
 
 
 class MediaCall(StrEnum):
@@ -94,9 +100,7 @@ VIDEO_CALLS = (
 # Every call kind a worker may execute, in the order of the Rust
 # `CallKind::ALL`. Worker reports list supported calls in this order.
 CALL_KINDS: tuple[CallKind, ...] = (
-    ForwardMode.PREFILL,
-    ForwardMode.DECODE,
-    ForwardMode.VERIFY,
+    *ForwardMode,
     *MediaCall,
     *TransferMode,
 )
@@ -175,9 +179,7 @@ class DrawLayout(StrEnum):
 # the request's `state_call_id` only on an OK result of one of these.
 _STATE_ADVANCING_WORK = frozenset(
     {
-        ForwardMode.PREFILL,
-        ForwardMode.DECODE,
-        ForwardMode.VERIFY,
+        *ForwardMode,
         MediaCall.LATENT_PREPARATION,
         MediaCall.DENOISING,
     }
@@ -582,6 +584,79 @@ class CallCoordinates:
 
 
 @dataclass(frozen=True, slots=True)
+class Readout:
+    """Candidate log-probabilities a token-denoising call reads at slots.
+
+    The call's ``input_token_ids`` hold its canvas rows back to back. Slot
+    ``i`` is canvas token ``slot_tokens[i]`` of that sequence and reads the
+    candidate ids ``candidate_ids[candidate_offsets[i]:candidate_offsets[i +
+    1]]``. The call reports each candidate's natural-log probability under
+    the log-softmax over the full vocabulary of the logits at its slot, in
+    ``candidate_ids`` order (``RequestOutput.candidate_logprobs``).
+    """
+
+    slot_tokens: tuple[int, ...]
+    candidate_offsets: tuple[int, ...]
+    candidate_ids: tuple[int, ...]
+
+    def validate(self, canvas_tokens: int) -> None:
+        """Require slots inside the canvas that partition the candidates.
+
+        Raises:
+            WorkerError: A slot lies outside the call's ``canvas_tokens``
+                canvas tokens, reads no candidate, or the offsets do not
+                partition ``candidate_ids`` in slot order.
+        """
+        offsets = self.candidate_offsets
+        if not self.slot_tokens or len(offsets) != len(self.slot_tokens) + 1:
+            raise invalid_descriptor(
+                "readout candidate offsets do not bound every slot"
+            )
+        if (
+            offsets[0] != 0
+            or offsets[-1] != len(self.candidate_ids)
+            or any(
+                left >= right
+                for left, right in zip(offsets, offsets[1:], strict=False)
+            )
+        ):
+            raise invalid_descriptor(
+                "readout candidate offsets do not partition the candidates"
+            )
+        if any(not 0 <= token < canvas_tokens for token in self.slot_tokens):
+            raise invalid_descriptor(
+                "readout slot lies outside the call's canvas rows"
+            )
+
+    @classmethod
+    def from_mapping(cls, value: object, where: str = "readout") -> Readout:
+        """Parse a readout's slot and candidate columns."""
+        data = _map(value, where)
+        return cls(
+            slot_tokens=tuple(
+                _ints(data.get("slot_tokens"), f"{where}.slot_tokens")
+            ),
+            candidate_offsets=tuple(
+                _ints(
+                    data.get("candidate_offsets"),
+                    f"{where}.candidate_offsets",
+                )
+            ),
+            candidate_ids=tuple(
+                _ints(data.get("candidate_ids"), f"{where}.candidate_ids")
+            ),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        """Serialize the readout's slot and candidate columns."""
+        return {
+            "slot_tokens": list(self.slot_tokens),
+            "candidate_offsets": list(self.candidate_offsets),
+            "candidate_ids": list(self.candidate_ids),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class Call:
     """One immutable computation with its identity, dataflow, and limits."""
 
@@ -622,8 +697,9 @@ class Call:
     # Per-call sampler constraints. The token executor treats None as an empty
     # `SamplingState` and merges these finish ids with the admission's.
     sampling_state: SamplingState | None = None
-    # Host-known prompt, draft, or decode input tokens in model input order;
-    # empty when a continuation reads its predecessor's device token.
+    # Host-known prompt, draft, or decode input tokens in model input order,
+    # or a token-denoising call's canvas rows back to back; empty when a
+    # continuation reads its predecessor's device token.
     input_token_ids: tuple[int, ...] = ()
     # Encoded source image payload for a vision or latent encoding call.
     input_image: str | None = None
@@ -635,6 +711,8 @@ class Call:
     # by the engine; a published product retires once each has acknowledged
     # it. This rank's own slot is never listed.
     consumer_slots: tuple[int, ...] = ()
+    # Candidate slots of a token-denoising call; None for every other call.
+    readout: Readout | None = None
 
     def tensor_inputs(self) -> tuple[tensor.TensorRef, ...]:
         """Return the tensor inputs of the computation, excluding its predicate.
@@ -760,6 +838,26 @@ class Call:
                 "encoded image requires an image encoder without another "
                 "image source"
             )
+
+        # A token-denoising call reads candidates at slots of the canvas rows
+        # it carries and samples no token.
+        if (self.readout is not None) != (
+            self.kind is ForwardMode.TOKEN_DENOISING
+        ):
+            raise invalid_descriptor(
+                "a candidate readout belongs exactly to a token-denoising call"
+            )
+        if self.readout is not None:
+            if (
+                not self.input_token_ids
+                or self.token_output is not None
+                or self.transition_output is not None
+            ):
+                raise invalid_descriptor(
+                    "token denoising requires canvas tokens and samples no "
+                    "token"
+                )
+            self.readout.validate(len(self.input_token_ids))
 
         # KV cache transfer endpoints. A KV output's index shares the output
         # index space with the tensor outputs checked below.
@@ -1030,6 +1128,11 @@ class Call:
                 if get("sampling_state") is None
                 else SamplingState.from_mapping(get("sampling_state"))
             ),
+            readout=(
+                None
+                if get("readout") is None
+                else Readout.from_mapping(get("readout"), f"{where}.readout")
+            ),
         )
         call.validate()
         return call
@@ -1096,6 +1199,9 @@ class Call:
                 if self.sampling_state is None
                 else self.sampling_state.to_mapping()
             ),
+            "readout": None
+            if self.readout is None
+            else self.readout.to_mapping(),
         }
 
 

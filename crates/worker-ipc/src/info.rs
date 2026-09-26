@@ -463,18 +463,15 @@ impl WorkerInfo {
         );
         ensure_valid!(self.queue_depth > 0, "worker queue depth must be positive");
 
-        // Advertised call families require their corresponding pools.
-        let requires_kv = self.supported_calls.iter().any(|variant| {
-            matches!(
-                variant,
-                CallKind::Forward(ForwardMode::Prefill)
-                    | CallKind::Forward(ForwardMode::Decode)
-                    | CallKind::Forward(ForwardMode::Verify)
-            )
-        });
+        // Advertised call families require their corresponding pools; every
+        // token-model forward reads or extends a request's KV cache.
+        let requires_kv = self
+            .supported_calls
+            .iter()
+            .any(|variant| matches!(variant, CallKind::Forward(_)));
         ensure_valid!(
             !requires_kv || self.kv_cache.is_some(),
-            "worker advertises AR work without a KV cache"
+            "worker advertises token work without a KV cache"
         );
         if let Some(kv_cache) = &self.kv_cache {
             kv_cache.validate()?;

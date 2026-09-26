@@ -1050,11 +1050,18 @@ pub(super) async fn assemble_event_stream(
                 return Ok(());
             }
             // Artifacts and media progress belong to diffusion media requests,
-            // which `assemble_media_event_stream` serves.
+            // which `assemble_media_event_stream` serves, and readout answers
+            // to readout requests, which the System One route collects.
             EngineCoreOutput::Artifact(_) | EngineCoreOutput::MediaProgress { .. } => {
                 return Err(malformed_output(
                     request_id,
                     "generation request received a media lifecycle event",
+                ));
+            }
+            EngineCoreOutput::Readout { .. } => {
+                return Err(malformed_output(
+                    request_id,
+                    "generation request received a readout answer",
                 ));
             }
         }

@@ -1012,6 +1012,7 @@ impl Scheduler {
             kv_input: None,
             kv_output: None,
             input_token_ids: Vec::new(),
+            readout: None,
             sampling_state: None,
             request_key,
             call_id,
@@ -1487,6 +1488,27 @@ impl Scheduler {
         })
     }
 
+    /// Readout rows accepted or covered by submitted canvas passes.
+    ///
+    /// Canvas passes cover consecutive rows from the accepted cursor in
+    /// submission order, so each in-flight pass continues where the previous
+    /// one ends. Returns `None` for a request that is not running or whose
+    /// in-flight passes do not cover whole rows.
+    pub(super) fn scheduled_readout_rows(&self, id: RequestId) -> Option<usize> {
+        let state = self.running.get(&id)?;
+        self.inflight
+            .pending_calls
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .filter(|pending| pending.call.readout.is_some())
+            .try_fold(state.readout_rows, |rows, pending| {
+                let covered =
+                    state.readout_rows_covering(rows, pending.call.input_token_ids.len())?;
+                Some(rows + covered)
+            })
+    }
+
     /// Last denoising step covered by submitted intervals, without accepting them.
     pub(super) fn num_scheduled_denoise_steps(&self, id: RequestId) -> Option<u32> {
         let state = self.running.get(&id)?;
@@ -1562,6 +1584,7 @@ impl Scheduler {
                 CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
                     Phase::Prefill
                 }
+                CallKind::Forward(ForwardMode::TokenDenoising) => Phase::Readout,
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
                     if is_feedback_computation(call) {
                         if self.scheduled_feedback(id)?.0 == 0 {
@@ -1598,12 +1621,18 @@ impl Scheduler {
             None => state.phase,
         };
         Some(match phase {
+            // A readout's complete prompt conditions its canvases; any other
+            // request decodes from it.
             Phase::Prefill
                 if self.num_scheduled_prompt_tokens(id)?
                     >= state.req.prompt_token_ids.len() as u32
                     && state.num_ingested_images >= state.req.multimodal_inputs.images.len() =>
             {
-                Phase::DecodeUnd
+                if state.req.is_readout() {
+                    Phase::Readout
+                } else {
+                    Phase::DecodeUnd
+                }
             }
             Phase::DenoiseGen
                 if self.num_scheduled_denoise_steps(id)? >= state.denoising.steps() =>
@@ -1844,6 +1873,7 @@ impl Scheduler {
             Phase::PrepareGen => CallKind::Media(MediaCall::LatentPreparation),
             Phase::DenoiseGen => CallKind::Media(MediaCall::Denoising),
             Phase::CommitGen => CallKind::Media(MediaCall::ImageDecoding),
+            Phase::Readout => CallKind::Forward(ForwardMode::TokenDenoising),
             Phase::FeedbackEncode => {
                 let feedback = &state.req.image_generation;
                 feedback.feedback_source.as_ref()?;
@@ -2457,7 +2487,9 @@ impl Scheduler {
         // Aggregate timings by the stable public metric groups, one slot per
         // `ExecutionDomainStats::groups` entry. Multiple concrete calls in one
         // group count as one returned batch, as do multiple requests.
-        let mut returned_groups: [Option<TimingCounters>; 3] = [None; 3];
+        let mut returned_groups: [Option<TimingCounters>;
+            super::stats::ExecutionDomainStats::COUNT] =
+            [None; super::stats::ExecutionDomainStats::COUNT];
         let mut invalid_result = false;
 
         // A completion can mutate state only while its logical batch remains owned
