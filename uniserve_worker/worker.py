@@ -667,7 +667,9 @@ class Worker:
                 # Each live request tensor reserves one credit per
                 # publication representation and one read credit on every
                 # possible remote rank. These credits bound ownership
-                # lifetimes; they allocate no storage.
+                # lifetimes. The CUDA VMM transport also sizes its device
+                # pool (``VmmPool``) from them, reserved on a device's first
+                # publication of storage that cannot be exported in place.
                 transfer_byte_capacity *= len(publication_backends) + max(
                     0, int(worker_config.world_size) - 1
                 )
@@ -801,10 +803,14 @@ class Worker:
             # fails when graph residency exceeds it. The budget is the graph
             # pools' current residency plus this process's remaining grant on
             # the device, less the device's share of products not yet
-            # resident. A token worker's remaining grant includes the graph
-            # allowance that KV sizing held back; a media worker's graph
-            # share is what its fixed request banks and lazy products leave,
-            # not a fraction of total device memory.
+            # resident. The remaining grant is charged with everything the
+            # process holds on the device, and until startup is sealed the
+            # storage charges all of the footprint's growth, so what warmup
+            # and capture leave outside the pools stays within the grant too.
+            # A token worker's remaining grant includes the graph allowance
+            # that KV sizing held back; a media worker's graph share is what
+            # its fixed request banks and lazy products leave, not a fraction
+            # of total device memory.
             devices = tuple(
                 dict.fromkeys(
                     (
