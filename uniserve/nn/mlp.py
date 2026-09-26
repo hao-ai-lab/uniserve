@@ -56,8 +56,7 @@ class GatedMLP(nn.Module):
         packed = _join_channels((branches["gate"], branches["up"]))
 
         if (
-            isinstance(self.activation, SiLUAndMul)
-            and self.down.input_quantizer == Quantizer("fp8", axis=0)
+            self.down.input_quantizer == Quantizer("fp8", axis=0)
             and self.down.group.size == 1
         ):
             # The fused producer computes FP32 gating and encodes once before
