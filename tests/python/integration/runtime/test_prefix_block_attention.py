@@ -1,0 +1,481 @@
+"""SM100 prefix-block attention reads exactly each row's visible keys.
+
+Every query row of a block attends to its whole block and to a window of
+the sequence's paged prefix. Expected values come from an FP32 softmax over
+keys gathered explicitly through the block table. Cache contents that no
+row may see, the sentinel page, and packed rows after the last sequence
+hold NaN, so any read of them reaches the output.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, replace
+from itertools import accumulate
+
+import pytest
+import torch
+from uniserve_kernels.attention import prefix_block
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.gpu,
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or not prefix_block.available(),
+        reason="requires the CUTLASS DSL and a compute capability 10.x GPU",
+    ),
+]
+
+_HEAD_DIM = 256
+_QUERY_HEADS = 16
+_KV_HEADS = 8
+# Packed rows after the last sequence, as in a graph-captured buffer.
+_PADDING_ROWS = 9
+_UNWRITTEN = 7.0
+_TOLERANCE = {"rtol": 2e-2, "atol": 2e-2}
+
+
+@dataclass(frozen=True)
+class Batch:
+    query: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    key_cache: torch.Tensor
+    value_cache: torch.Tensor
+    block_table: torch.Tensor
+    query_offsets: torch.Tensor
+    prefix_lengths: torch.Tensor
+    start_page: torch.Tensor | None = None
+    prefix_start: torch.Tensor | None = None
+
+
+def _normalized(shape, generator):
+    # Per-head RMS-normalized projections, as the model's Q/K norms produce.
+    values = torch.randn(shape, generator=generator, device="cuda")
+    scale = torch.rsqrt(values.pow(2).mean(-1, keepdim=True) + 1e-6)
+    return (values * scale).to(torch.bfloat16)
+
+
+def _int32(values):
+    return torch.tensor(values, dtype=torch.int32, device="cuda")
+
+
+def _batch(
+    lengths,
+    prefixes,
+    *,
+    page_tokens,
+    start_pages=None,
+    prefix_starts=None,
+    seed=0,
+    pages=None,
+    table_width=None,
+):
+    """Build packed blocks and a NaN-filled paged cache.
+
+    Physical page 0 is a NaN sentinel that fills unused block table
+    entries. Sequence ``b`` owns logical pages ``[start_pages[b],
+    ceil(P_b / page_tokens))`` on distinct random physical pages; only its
+    prefix tokens are written, so unwritten page tails and unowned pages
+    stay NaN.
+    """
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    starts = start_pages or (0,) * len(lengths)
+    tokens = sum(lengths)
+
+    query = _normalized(
+        (tokens + _PADDING_ROWS, _QUERY_HEADS, _HEAD_DIM), generator
+    )
+    key = _normalized((tokens + _PADDING_ROWS, _KV_HEADS, _HEAD_DIM), generator)
+    value = torch.randn(key.shape, generator=generator, device="cuda")
+    value = value.to(torch.bfloat16)
+    for tensor in (query, key, value):
+        tensor[tokens:] = float("nan")
+
+    owned = [
+        max(0, math.ceil(prefix / page_tokens) - start)
+        for prefix, start in zip(prefixes, starts, strict=True)
+    ]
+    pages = pages or 1 + sum(owned) + 3
+    shape = (pages, page_tokens, _KV_HEADS, _HEAD_DIM)
+    key_cache = torch.full(shape, float("nan"), device="cuda")
+    value_cache = torch.full(shape, float("nan"), device="cuda")
+    key_cache = key_cache.to(torch.bfloat16)
+    value_cache = value_cache.to(torch.bfloat16)
+
+    physical = 1 + torch.randperm(
+        pages - 1, generator=torch.Generator().manual_seed(seed)
+    )
+    table = torch.zeros(
+        (len(lengths), table_width or max(owned + [1]) + 2),
+        dtype=torch.int32,
+    )
+    used = 0
+    for row, (prefix, start, count) in enumerate(
+        zip(prefixes, starts, owned, strict=True)
+    ):
+        for column in range(count):
+            page = int(physical[used])
+            used += 1
+            table[row, column] = page
+            written = min(page_tokens, prefix - (start + column) * page_tokens)
+            rows = (written, _KV_HEADS, _HEAD_DIM)
+            key_cache[page, :written] = _normalized(rows, generator)
+            value_cache[page, :written] = torch.randn(
+                rows, generator=generator, device="cuda"
+            ).to(torch.bfloat16)
+
+    return Batch(
+        query=query,
+        key=key,
+        value=value,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=table.cuda(),
+        query_offsets=_int32(tuple(accumulate(lengths, initial=0))),
+        prefix_lengths=_int32(prefixes),
+        start_page=None if start_pages is None else _int32(start_pages),
+        prefix_start=None if prefix_starts is None else _int32(prefix_starts),
+    )
+
+
+def _reference(batch, *, window, query_window, scale):
+    """FP32 attention over explicitly gathered visible keys.
+
+    Returns the output ``[tokens, Hq, D]`` and the natural-log LSE
+    ``[tokens, Hq]`` of every packed row inside a block.
+    """
+    offsets = batch.query_offsets.tolist()
+    page_tokens = batch.key_cache.shape[1]
+    group = _QUERY_HEADS // _KV_HEADS
+    kv_of_head = torch.arange(_QUERY_HEADS, device="cuda") // group
+    output = torch.empty((offsets[-1], _QUERY_HEADS, _HEAD_DIM), device="cuda")
+    lse = torch.empty((offsets[-1], _QUERY_HEADS), device="cuda")
+
+    for row, prefix in enumerate(batch.prefix_lengths.tolist()):
+        begin, end = offsets[row], offsets[row + 1]
+        positions = torch.arange(end - begin, device="cuda")
+        lower = torch.zeros_like(positions)
+        if batch.prefix_start is not None:
+            lower += int(batch.prefix_start[row])
+        if window is not None:
+            history = prefix - window + (positions if query_window else 0)
+            lower = torch.maximum(lower, torch.as_tensor(history).cuda())
+        first = int(lower.clamp(0, prefix).min())
+        # Gather the prefix tokens any row can see through the table.
+        tokens = torch.arange(first, prefix, device="cuda")
+        start = 0 if batch.start_page is None else int(batch.start_page[row])
+        pages = batch.block_table[row, tokens // page_tokens - start].long()
+        slots = tokens % page_tokens
+        keys = torch.cat(
+            (batch.key_cache[pages, slots], batch.key[begin:end])
+        ).float()
+        values = torch.cat(
+            (batch.value_cache[pages, slots], batch.value[begin:end])
+        ).float()
+        visible = torch.cat(
+            (
+                tokens[None, :] >= lower[:, None],
+                torch.ones(
+                    (end - begin, end - begin), dtype=torch.bool, device="cuda"
+                ),
+            ),
+            dim=1,
+        )
+        # Invisible gathered keys may be NaN-free here, but zero them anyway
+        # so that masked entries cannot leak NaN into the reference.
+        scores = torch.einsum(
+            "qhd,khd->hqk",
+            batch.query[begin:end].float(),
+            keys[:, kv_of_head],
+        )
+        scores = (scores * scale).masked_fill(~visible, float("-inf"))
+        weights = torch.softmax(scores, dim=-1)
+        output[begin:end] = torch.einsum(
+            "hqk,khd->qhd", weights, values[:, kv_of_head]
+        )
+        lse[begin:end] = torch.logsumexp(scores, dim=-1).T
+    return output, lse
+
+
+def _launch(batch, *, window, query_window, scale, out, lse, lse_base2=False):
+    prefix_block.prefix_block_attention(
+        batch.query,
+        batch.key,
+        batch.value,
+        batch.key_cache,
+        batch.value_cache,
+        batch.block_table,
+        batch.query_offsets,
+        batch.prefix_lengths,
+        max_query_len=280,
+        window=window,
+        query_window=query_window,
+        start_page=batch.start_page,
+        prefix_start=batch.prefix_start,
+        scale=scale,
+        out=out,
+        lse=lse,
+        lse_base2=lse_base2,
+    )
+
+
+def _outputs(batch):
+    out = torch.full_like(batch.query, _UNWRITTEN)
+    lse = torch.full(batch.query.shape[:2], _UNWRITTEN, device="cuda")
+    return out, lse
+
+
+def _assert_matches(batch, out, lse, *, window, query_window, scale, base2):
+    expected, expected_lse = _reference(
+        batch, window=window, query_window=query_window, scale=scale
+    )
+    tokens = expected.shape[0]
+    if base2:
+        expected_lse = expected_lse / math.log(2.0)
+    torch.testing.assert_close(out[:tokens].float(), expected, **_TOLERANCE)
+    torch.testing.assert_close(lse[:tokens], expected_lse, **_TOLERANCE)
+    # Rows after the packed sequences are not written.
+    assert bool((out[tokens:] == _UNWRITTEN).all())
+    assert bool((lse[tokens:] == _UNWRITTEN).all())
+
+
+def _history_start_pages(prefixes, page_tokens):
+    # Pages entirely before the 1023-token window are retired, so the
+    # table's first column is a later logical page.
+    return tuple(max(0, prefix - 1023) // page_tokens for prefix in prefixes)
+
+
+@pytest.mark.parametrize("page_tokens", [16, 32])
+@torch.inference_mode()
+def test_canvas_reads_fixed_history_window(page_tokens):
+    # Empty prefix, prefixes shorter than, at and around the window, one
+    # that is not a page multiple, and a block shorter than a key tile.
+    lengths = (256, 256, 256, 256, 256, 256, 17)
+    prefixes = (0, 5, 1022, 1023, 1024, 1025, 3001)
+    batch = _batch(
+        lengths,
+        prefixes,
+        page_tokens=page_tokens,
+        start_pages=_history_start_pages(prefixes, page_tokens),
+        seed=page_tokens,
+    )
+    out, lse = _outputs(batch)
+
+    _launch(
+        batch, window=1023, query_window=False, scale=1 / 16, out=out, lse=lse
+    )
+
+    _assert_matches(
+        batch,
+        out,
+        lse,
+        window=1023,
+        query_window=False,
+        scale=1 / 16,
+        base2=False,
+    )
+
+
+@pytest.mark.parametrize("page_tokens", [16, 32])
+@torch.inference_mode()
+def test_image_block_window_follows_each_query(page_tokens):
+    lengths = (280, 280, 280, 280, 3)
+    prefixes = (0, 300, 1023, 1500, 2000)
+    batch = _batch(
+        lengths,
+        prefixes,
+        page_tokens=page_tokens,
+        start_pages=_history_start_pages(prefixes, page_tokens),
+        seed=7 + page_tokens,
+    )
+    out, lse = _outputs(batch)
+
+    _launch(
+        batch, window=1023, query_window=True, scale=1 / 16, out=out, lse=lse
+    )
+
+    _assert_matches(
+        batch,
+        out,
+        lse,
+        window=1023,
+        query_window=True,
+        scale=1 / 16,
+        base2=False,
+    )
+
+
+@pytest.mark.parametrize("query_window", [False, True])
+@torch.inference_mode()
+def test_short_window_bounds_are_exact(query_window):
+    # With a few visible keys per row every key carries a large share of
+    # the softmax, so a key admitted or dropped at either window edge moves
+    # the output well past the tolerance. Windows cut pages mid-way.
+    lengths = (5, 3, 9)
+    prefixes = (20, 37, 3)
+    batch = _batch(lengths, prefixes, page_tokens=16, seed=23)
+    out, lse = _outputs(batch)
+
+    _launch(
+        batch,
+        window=3,
+        query_window=query_window,
+        scale=1.0,
+        out=out,
+        lse=lse,
+    )
+
+    _assert_matches(
+        batch,
+        out,
+        lse,
+        window=3,
+        query_window=query_window,
+        scale=1.0,
+        base2=False,
+    )
+
+
+@pytest.mark.parametrize("lse_base2", [False, True])
+@torch.inference_mode()
+def test_whole_prefix_from_explicit_start(lse_base2):
+    # Without a window every row reads the prefix from its start column; the
+    # model's unit softmax scale.
+    lengths = (256, 280, 64)
+    prefixes = (300, 1000, 64)
+    batch = _batch(
+        lengths, prefixes, page_tokens=16, prefix_starts=(100, 0, 63), seed=11
+    )
+    out, lse = _outputs(batch)
+
+    _launch(
+        batch,
+        window=None,
+        query_window=False,
+        scale=1.0,
+        out=out,
+        lse=lse,
+        lse_base2=lse_base2,
+    )
+
+    _assert_matches(
+        batch,
+        out,
+        lse,
+        window=None,
+        query_window=False,
+        scale=1.0,
+        base2=lse_base2,
+    )
+
+
+@torch.inference_mode()
+def test_graph_replay_reads_updated_lengths_and_tables():
+    # Two batches of different lengths, prefixes, start pages and tables
+    # replayed through one capture sized for both.
+    pages, width = 400, 80
+    batches = [
+        _batch(
+            (280, 256),
+            (1500, 700),
+            page_tokens=16,
+            start_pages=(29, 0),
+            seed=3,
+            pages=pages,
+            table_width=width,
+        ),
+        _batch(
+            (17, 280),
+            (2000, 0),
+            page_tokens=16,
+            start_pages=(61, 0),
+            seed=4,
+            pages=pages,
+            table_width=width,
+        ),
+    ]
+    rows = max(batch.query.shape[0] for batch in batches)
+
+    def resized(tensor):
+        grown = torch.full(
+            (rows, *tensor.shape[1:]),
+            float("nan"),
+            dtype=tensor.dtype,
+            device="cuda",
+        )
+        grown[: tensor.shape[0]] = tensor
+        return grown
+
+    live = replace(
+        batches[0],
+        query=resized(batches[0].query),
+        key=resized(batches[0].key),
+        value=resized(batches[0].value),
+    )
+    out, lse = _outputs(live)
+
+    def launch():
+        _launch(
+            live,
+            window=1023,
+            query_window=True,
+            scale=1 / 16,
+            out=out,
+            lse=lse,
+        )
+
+    # Compile outside the capture, then record the launch.
+    launch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+
+    for batch in batches:
+        for name in ("query", "key", "value"):
+            getattr(live, name).copy_(resized(getattr(batch, name)))
+        for name in (
+            "key_cache",
+            "value_cache",
+            "block_table",
+            "query_offsets",
+            "prefix_lengths",
+            "start_page",
+        ):
+            getattr(live, name).copy_(getattr(batch, name))
+        out.fill_(_UNWRITTEN)
+        lse.fill_(_UNWRITTEN)
+
+        graph.replay()
+
+        _assert_matches(
+            live,
+            out,
+            lse,
+            window=1023,
+            query_window=True,
+            scale=1 / 16,
+            base2=False,
+        )
+
+
+def test_eligibility_reports_unsupported_page_size():
+    batch = _batch((256,), (100,), page_tokens=16)
+    arguments = [
+        batch.query,
+        batch.key,
+        batch.value,
+        batch.key_cache,
+        batch.value_cache,
+        batch.block_table,
+        batch.query_offsets,
+        batch.prefix_lengths,
+    ]
+    assert prefix_block.can_run(*arguments, window=1023)
+
+    wide = batch.key_cache.new_zeros((4, 128, _KV_HEADS, _HEAD_DIM))
+    arguments[3:5] = [wide, wide]
+    assert not prefix_block.can_run(*arguments, window=1023)
+    with pytest.raises(ValueError, match="page_tokens"):
+        prefix_block.prefix_block_attention(*arguments, max_query_len=256)
