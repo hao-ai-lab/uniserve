@@ -100,7 +100,7 @@ def test_paged_attention_observes_updates_and_mutated_block_tables(quantized):
     config = mha.Config(1, 4, (0,), torch.float32)
     with PrefixCache(
         Config({"attention": config}),
-        num_blocks=3,
+        num_units=3,
         block_size=2,
         device="cpu",
         quantization={"attention": Quantizer("fp8", axis=0)}
@@ -140,7 +140,7 @@ def test_segmented_attention_merges_visible_current_tokens_with_prefix(
 ):
     with PrefixCache(
         Config({"attention": mha.Config(1, 4, (0,), torch.float32)}),
-        num_blocks=2,
+        num_units=2,
         block_size=2,
         device="cpu",
     ) as cache:
@@ -209,7 +209,7 @@ def test_paged_window_follows_each_query_position(window, causal):
     query = torch.randn(3, 2, 4, generator=generator)
     with PrefixCache(
         Config({"attention": mha.Config(1, 4, (0,), torch.float32)}),
-        num_blocks=5,
+        num_units=5,
         block_size=2,
         device="cpu",
     ) as cache:
@@ -274,7 +274,7 @@ def test_segmented_window_reads_one_prefix_interval(prefix_length, window):
     query = torch.randn(3, 2, 4, generator=generator)
     with PrefixCache(
         Config({"attention": mha.Config(1, 4, (0,), torch.float32)}),
-        num_blocks=3,
+        num_units=3,
         block_size=2,
         device="cpu",
     ) as cache:
@@ -330,7 +330,7 @@ def test_paged_window_reads_each_row_from_its_start_page(causal):
     query = torch.randn(5, 2, 4, generator=generator)
     layout = mha.Config(1, 4, (0,), torch.float32)
     with PrefixCache(
-        Config({"attention": layout}), num_blocks=10, block_size=2, device="cpu"
+        Config({"attention": layout}), num_units=10, block_size=2, device="cpu"
     ) as cache:
         state = cache.state("attention")
         # Row 0: an eight-token prefix in pages 0..3 appends three tokens;
@@ -385,7 +385,7 @@ def test_segmented_window_reads_its_prefix_from_the_start_page():
     query = torch.randn(3, 2, 4, generator=generator)
     layout = mha.Config(1, 4, (0,), torch.float32)
     with PrefixCache(
-        Config({"attention": layout}), num_blocks=5, block_size=2, device="cpu"
+        Config({"attention": layout}), num_units=5, block_size=2, device="cpu"
     ) as cache:
         state = cache.state("attention")
         # A seven-token prefix whose window [4, 7) starts on page 2, after

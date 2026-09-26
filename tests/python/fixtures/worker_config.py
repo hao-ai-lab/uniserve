@@ -4,7 +4,7 @@ from uniserve_worker.bootstrap.capacity import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
     DEFAULT_MAX_REQUEST_POOL_SIZE,
-    DEFAULT_NUM_BLOCKS_FALLBACK,
+    DEFAULT_NUM_UNITS_FALLBACK,
 )
 from uniserve_worker.config.execution import WorkerConfig
 
@@ -21,7 +21,7 @@ def stub_worker_config(
         rank=0,
         world_size=1,
         block_size=int(block_size),
-        kv_token_capacity=int(block_size) * DEFAULT_NUM_BLOCKS_FALLBACK,
+        kv_token_capacity=int(block_size) * DEFAULT_NUM_UNITS_FALLBACK,
         attention_backend="torch",
         model_dtype="bfloat16",
         kv_cache_dtype=None,

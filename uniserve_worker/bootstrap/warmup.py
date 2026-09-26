@@ -12,7 +12,8 @@ batches take, on CUDA devices only:
 
 No engine scheduler is present at startup, so this module takes over the
 engine storage pools' role: the scenarios choose request slots,
-`_build_warmup_batch` and `_warmup_flow_tables` lease KV and latent pages,
+`_build_warmup_batch` and `_warmup_flow_tables` lease KV units and latent
+pages,
 and `_WarmupRequests` tracks those leases and allocates persistent buffer
 spans. Each ``Batch`` carries the resulting assignments. Batch ids and
 collective sequences are private to this sequence; ``Worker.warmup`` resets
@@ -26,6 +27,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from itertools import islice
 from typing import TYPE_CHECKING
 
 import torch
@@ -42,7 +44,7 @@ from uniserve_worker.protocol.batch import (
     BatchCommand,
     BlockTable,
     BufferAllocation,
-    CachePageAllocation,
+    CacheUnitAllocation,
     Finish,
     Free,
     LatentParams,
@@ -71,21 +73,22 @@ class _WarmupRequests:
     """Track synthetic request allocations.
 
     Holds the leases that stand in for the engine's storage pools while no
-    scheduler is attached. KV pages and latent pages have no free list:
-    occupancy is recomputed from the lease maps whenever pages are leased,
-    so popping a lease (`drop_request`) returns its pages. Persistent buffer
-    spans use a first-fit extent list. Request slot zero, KV page zero, and
+    scheduler is attached. KV units and latent pages have no free list:
+    occupancy is recomputed from the lease maps whenever units are leased,
+    so popping a lease (`drop_request`) returns its units. Persistent buffer
+    spans use a first-fit extent list. Request slot zero, KV unit zero, and
     latent page zero are sentinels and are never assigned.
     """
 
     def __init__(self, worker: Worker) -> None:
         """Borrow the worker whose storage the synthetic requests occupy."""
         self.worker = worker
-        # Main KV block table of each (request, KV group), in logical order.
-        self._kv_pages: dict[tuple[RequestKey, int], list[int]] = {}
-        # KV group 0 pages and request slot of each request's alternative
-        # guidance prefix (see `_warmup_flow_tables`).
-        self._prefix_pages: dict[RequestKey, list[int]] = {}
+        # Main KV units of each (request, KV group), page-major in logical
+        # order.
+        self._kv_units: dict[tuple[RequestKey, int], list[int]] = {}
+        # KV units of every group and the request slot of each request's
+        # alternative guidance prefix (see `_warmup_flow_tables`).
+        self._prefix_units: dict[tuple[RequestKey, int], list[int]] = {}
         self._prefix_slots: dict[RequestKey, int] = {}
         # Latent page table of each image request, in logical order.
         self._latent_pages: dict[RequestKey, list[int]] = {}
@@ -99,6 +102,84 @@ class _WarmupRequests:
         # increasing ids, so control batches and call batches share this one
         # counter.
         self._batch_id = 0
+
+    def occupied_units(self) -> set[int]:
+        """Return every KV unit a main or prefix lease holds."""
+        return {
+            unit
+            for leases in (self._kv_units, self._prefix_units)
+            for units in leases.values()
+            for unit in units
+        }
+
+    def grow_tables(
+        self,
+        leases: dict[tuple[RequestKey, int], list[int]],
+        request_key: RequestKey,
+        slot: int,
+        tokens: int,
+    ) -> tuple[tuple[BlockTable, ...], tuple[CacheUnitAllocation, ...]]:
+        """Grow a request's leased tables of every cache group to ``tokens``.
+
+        Each group's lease keeps its units until `drop_request` and gains
+        the units of the whole pages ``tokens`` newly needs, taken from the
+        lowest units no lease holds. Returns every group's resulting table
+        and the units newly allocated to each.
+
+        Raises:
+            WorkerError: From `invalid_descriptor` when the worker has no KV
+                cache, a lease would shrink, or the pool has too few free
+                units.
+        """
+        cache = self.worker.kv_cache
+        if cache is None:
+            raise invalid_descriptor("warmup KV call requires cache storage")
+        occupied = self.occupied_units()
+        free = (
+            unit
+            for unit in range(1, int(cache.info.num_units))
+            if unit not in occupied
+        )
+
+        tables: list[BlockTable] = []
+        allocations: list[CacheUnitAllocation] = []
+        for group, shape in enumerate(cache.shapes):
+            lease = leases.setdefault((request_key, group), [])
+            pages = ceil_div(tokens, shape.page_tokens)
+            missing = pages * shape.units_per_page - len(lease)
+            if missing < 0:
+                raise invalid_descriptor(
+                    "warmup call regresses its KV capacity"
+                )
+            allocated = tuple(islice(free, missing))
+            if len(allocated) != missing:
+                raise invalid_descriptor(
+                    "warmup KV allocation exceeds resident capacity: "
+                    f"request={request_key.request_id}, group={group}, "
+                    f"required_units={missing}, "
+                    f"available_units={len(allocated)}, "
+                    f"leased_units={len(occupied)}"
+                )
+            lease.extend(allocated)
+            occupied.update(allocated)
+            tables.append(
+                BlockTable(
+                    request_pool_idx=slot,
+                    group_id=group,
+                    start_page=0,
+                    unit_ids=tuple(lease),
+                    allocated_tokens=pages * shape.page_tokens,
+                )
+            )
+            if allocated:
+                allocations.append(
+                    CacheUnitAllocation(
+                        request_pool_idx=slot,
+                        group_id=group,
+                        unit_ids=allocated,
+                    )
+                )
+        return tuple(tables), tuple(allocations)
 
     def drop_request(self, request_id: int) -> None:
         """Retire one synthetic request and release everything it holds.
@@ -117,13 +198,10 @@ class _WarmupRequests:
         # requests have no further scheduler messages and can leave the table.
         self.worker.requests.drop(request_id)
 
-        for group_id in range(
-            0
-            if self.worker.kv_cache is None
-            else self.worker.kv_cache.group_count
-        ):
-            self._kv_pages.pop((request.request_key, group_id), None)
-        self._prefix_pages.pop(request.request_key, None)
+        for leases in (self._kv_units, self._prefix_units):
+            for key in tuple(leases):
+                if key[0] == request.request_key:
+                    del leases[key]
         self._prefix_slots.pop(request.request_key, None)
         self._latent_pages.pop(request.request_key, None)
 
@@ -230,8 +308,8 @@ def _warmup_batch(
     admissions: tuple[NewRequest, ...],
     calls: tuple[Call, ...],
     block_tables: dict[tuple[RequestKey, CallId], tuple[BlockTable, ...]],
-    new_cache_pages: dict[
-        tuple[RequestKey, CallId], tuple[CachePageAllocation, ...]
+    new_cache_units: dict[
+        tuple[RequestKey, CallId], tuple[CacheUnitAllocation, ...]
     ],
     forward_inputs: dict[
         tuple[RequestKey, CallId],
@@ -266,10 +344,10 @@ def _warmup_batch(
                 (),
             )
         ),
-        new_cache_pages=tuple(
+        new_cache_units=tuple(
             allocation
             for call in calls
-            for allocation in new_cache_pages.get(
+            for allocation in new_cache_units.get(
                 (call.request_key, call.call_id),
                 (),
             )
@@ -468,13 +546,10 @@ def _build_warmup_batch(
     admissions_by_key = {
         admission.request_key: admission for admission in admissions
     }
-    occupied_blocks = {
-        page for pages in requests._kv_pages.values() for page in pages
-    }
     request_pool_indices: dict[RequestKey, int] = {}
     block_tables: dict[tuple[RequestKey, CallId], tuple[BlockTable, ...]] = {}
-    new_cache_pages: dict[
-        tuple[RequestKey, CallId], tuple[CachePageAllocation, ...]
+    new_cache_units: dict[
+        tuple[RequestKey, CallId], tuple[CacheUnitAllocation, ...]
     ] = {}
     forward_inputs: dict[
         tuple[RequestKey, CallId],
@@ -546,67 +621,19 @@ def _build_warmup_batch(
             else 0
         )
 
-        tables: list[BlockTable] = []
-        allocations: list[CachePageAllocation] = []
-        if requests.worker.kv_cache is None:
-            raise invalid_descriptor("warmup KV call requires cache storage")
-
-        for group_id in range(requests.worker.kv_cache.group_count):
-            lease_key = (call.request_key, group_id)
-            block_table = requests._kv_pages.setdefault(lease_key, [])
-            target_pages = ceil_div(
-                visible + input_length,
-                int(requests.worker.kv_cache.info.block_size),
-            )
-
-            # A lease keeps every page granted to the request's earlier calls
-            # until `drop_request`; a call whose extent needs fewer pages than
-            # the lease already holds is rejected.
-            missing = target_pages - len(block_table)
-            if missing < 0:
-                raise invalid_descriptor(
-                    "warmup call regresses its KV capacity"
-                )
-
-            allocated = tuple(
-                candidate
-                for candidate in requests.worker.kv_cache.page_ids(group_id)
-                if candidate not in occupied_blocks
-            )[:missing]
-            if len(allocated) != missing:
-                raise invalid_descriptor(
-                    "warmup KV allocation exceeds resident capacity: "
-                    f"request={call.request_key.request_id}, "
-                    f"group={group_id}, "
-                    f"required_pages={missing}, "
-                    f"available_pages={len(allocated)}, "
-                    "resident_pages="
-                    f"{len(requests.worker.kv_cache.page_ids(group_id))}, "
-                    f"leased_pages={len(occupied_blocks)}"
-                )
-
-            block_table.extend(allocated)
-            occupied_blocks.update(allocated)
-            tables.append(
-                BlockTable(
-                    request_pool_idx=request_pool_indices[call.request_key],
-                    group_id=group_id,
-                    page_ids=tuple(block_table),
-                    allocated_tokens=len(block_table)
-                    * requests.worker.kv_cache.info.block_size,
-                )
-            )
-            if allocated:
-                allocations.append(
-                    CachePageAllocation(
-                        request_pool_idx=request_pool_indices[call.request_key],
-                        group_id=group_id,
-                        page_ids=allocated,
-                    )
-                )
+        # A lease keeps every unit granted to the request's earlier calls
+        # until `drop_request`; a call whose extent needs fewer pages than
+        # the lease already holds is rejected. Warmup retires no window page,
+        # so every group's table covers the whole extent.
+        tables, allocations = requests.grow_tables(
+            requests._kv_units,
+            call.request_key,
+            request_pool_indices[call.request_key],
+            visible + input_length,
+        )
         identity = (call.request_key, call.call_id)
-        block_tables[identity] = tuple(tables)
-        new_cache_pages[identity] = tuple(allocations)
+        block_tables[identity] = tables
+        new_cache_units[identity] = allocations
         if input_length > 0:
             forward_inputs[identity] = (
                 (request_pool_indices[call.request_key],),
@@ -703,8 +730,8 @@ def _build_warmup_batch(
                 *block_tables.get(identity, ()),
                 *extra_tables,
             )
-            new_cache_pages[identity] = (
-                *new_cache_pages.get(identity, ()),
+            new_cache_units[identity] = (
+                *new_cache_units.get(identity, ()),
                 *extra_allocations,
             )
             forward_inputs[identity] = flow_rows
@@ -714,7 +741,7 @@ def _build_warmup_batch(
         admissions=admissions,
         calls=calls,
         block_tables=block_tables,
-        new_cache_pages=new_cache_pages,
+        new_cache_units=new_cache_units,
         forward_inputs=forward_inputs,
         latent_params=latent_params,
         buffer_allocations=tuple(buffer_allocations.values()),
@@ -730,7 +757,7 @@ def _warmup_flow_tables(
     width: int,
 ) -> tuple[
     tuple[BlockTable, ...],
-    tuple[CachePageAllocation, ...],
+    tuple[CacheUnitAllocation, ...],
     tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[bool, ...]],
 ]:
     """Build KV tables and forward rows for a DENOISING call's CFG branches.
@@ -739,13 +766,14 @@ def _warmup_flow_tables(
     flow step, with prefixes from `resolve_prefix`. A branch that reuses the
     request's conditioning reads the main slot; all other branches must
     share one alternative prefix. A nonempty alternative prefix is leased KV
-    group 0 pages and a request slot of its own, and the rows start with one
+    units in every group and a request slot of its own, and the rows start
+    with one
     row that writes it into KV. Then follows one read-only row per branch
     whose query is the image sequence (patches plus framing tokens). The
     request must already be admitted.
 
     Returns:
-        The alternative prefix's block tables, its newly allocated pages,
+        The alternative prefix's block tables, its newly allocated units,
         and the forward-row columns (request_pool_indices, seq_lens,
         query_lens, write_kv).
 
@@ -753,7 +781,7 @@ def _warmup_flow_tables(
         WorkerError: From `invalid_descriptor` when the request is unknown
             or has no image parameters, the worker has no image builder or
             KV cache, the image has no guidance, `resolve_prefix` rejects a
-            branch, branches need distinct alternative prefixes, or KV pages
+            branch, branches need distinct alternative prefixes, or KV units
             or a request slot for the prefix are unavailable.
     """
     request = requests.worker.requests.get(call.request_key.request_id)
@@ -800,40 +828,8 @@ def _warmup_flow_tables(
         )
     alternative = next(iter(alternatives), ())
 
-    # Grow the prefix lease in KV group 0, avoiding pages leased to other
-    # requests' prefixes and to every main KV lease.
-    if requests.worker.kv_cache is None:
-        raise invalid_descriptor("warmup flow requires KV cache storage")
-
-    required = ceil_div(
-        len(alternative), requests.worker.kv_cache.info.block_size
-    )
-    lease = requests._prefix_pages.setdefault(call.request_key, [])
-    missing = required - len(lease)
-    occupied = {
-        page
-        for request_key, pages in requests._prefix_pages.items()
-        if request_key != call.request_key
-        for page in pages
-    }
-    occupied.update(
-        page for pages in requests._kv_pages.values() for page in pages
-    )
-    # The lease persists until `drop_request`, so every DENOISING call of
-    # the request sees the same prefix table and allocates only new pages.
-    allocated = tuple(
-        page
-        for page in requests.worker.kv_cache.page_ids(0)
-        if page not in occupied
-    )[:missing]
-    if len(allocated) != missing:
-        raise invalid_descriptor(
-            "warmup alternative prefix exceeds KV capacity"
-        )
-    lease.extend(allocated)
-
     tables: tuple[BlockTable, ...] = ()
-    allocations: tuple[CachePageAllocation, ...] = ()
+    allocations: tuple[CacheUnitAllocation, ...] = ()
     alternative_slot = main_slot
     request_pool_indices: list[int] = []
     seq_lens: list[int] = []
@@ -857,23 +853,15 @@ def _warmup_flow_tables(
             raise invalid_descriptor(
                 "warmup has no request slot for an alternative prefix"
             )
-        tables = (
-            BlockTable(
-                request_pool_idx=alternative_slot,
-                group_id=0,
-                page_ids=tuple(lease),
-                allocated_tokens=len(lease)
-                * requests.worker.kv_cache.info.block_size,
-            ),
+        # The prefix lease persists until `drop_request`, so every DENOISING
+        # call of the request sees the same prefix tables and allocates only
+        # new units, apart from the units of other requests' leases.
+        tables, allocations = requests.grow_tables(
+            requests._prefix_units,
+            call.request_key,
+            alternative_slot,
+            len(alternative),
         )
-        if allocated:
-            allocations = (
-                CachePageAllocation(
-                    request_pool_idx=alternative_slot,
-                    group_id=0,
-                    page_ids=allocated,
-                ),
-            )
         request_pool_indices.append(alternative_slot)
         seq_lens.append(len(alternative))
         query_lens.append(len(alternative))

@@ -85,7 +85,7 @@ def _run(rank, rendezvous, root, architecture, config, shape, axes):
                 scope.enter_context(
                     PrefixCache(
                         item.text.cache_config,
-                        num_blocks=2,
+                        num_units=2,
                         block_size=4,
                         device="cpu",
                     )

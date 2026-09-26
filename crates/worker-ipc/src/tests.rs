@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use uniserve_core::{BlockId, CfgRenorm, KvGroupKind, RequestId};
+use uniserve_core::{CfgRenorm, KvGroupKind, RequestId, UnitId};
 
 use super::*;
 use crate::codec::{decode_request, decode_response, encode_request, encode_response};
@@ -61,7 +61,7 @@ fn ar_decode_call() -> Call {
         code: kind,
         bounds: Bounds {
             max_tokens: 1,
-            max_kv_pages: 1,
+            max_kv_units: 1,
             ..Bounds::default()
         },
         inputs: Vec::new(),
@@ -283,22 +283,23 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
             });
             next_buffer_offset += bytes;
         }
-        let capacity_pages = call.bounds.max_kv_pages;
-        if capacity_pages > 0 {
+        let capacity_units = call.bounds.max_kv_units;
+        if capacity_units > 0 {
             // The request id doubles as the request pool slot, which forward
-            // rows, block tables, and page allocations require to be positive.
+            // rows, block tables, and unit allocations require to be positive.
             let request_pool_idx = u32::try_from(call.request_key.request_id.0).unwrap();
-            let page_ids = (1..=capacity_pages).map(BlockId).collect::<Vec<_>>();
+            let unit_ids = (1..=capacity_units).map(UnitId).collect::<Vec<_>>();
             run.block_tables.push(BlockTable {
                 request_pool_idx,
                 group_id: 0,
-                page_ids: page_ids.clone(),
+                start_page: 0,
+                unit_ids: unit_ids.clone(),
                 allocated_tokens: call.bounds.max_tokens.max(1),
             });
-            run.new_cache_pages.push(CachePageAllocation {
+            run.new_cache_units.push(CacheUnitAllocation {
                 request_pool_idx,
                 group_id: 0,
-                page_ids,
+                unit_ids,
             });
             run.forward.push(
                 call_index as u32,
@@ -574,7 +575,36 @@ fn block_table_allocation_round_trips_with_the_call() {
     let base = ar_decode_call();
     let batch = execute_round_trip(batch_with_calls(9, Vec::new(), vec![base.clone()]));
     assert_eq!(batch.calls().next().unwrap(), &base);
-    assert_eq!(batch.block_tables[0].page_ids, vec![BlockId(1)]);
+    assert_eq!(batch.block_tables[0].unit_ids, vec![UnitId(1)]);
+}
+
+/// A sliding-window group's table carries only its in-window pages: its
+/// start page and page-major units survive the round trip, and its fresh
+/// units must lie inside the table and never name the unit-zero sentinel.
+#[test]
+fn windowed_block_table_round_trips_its_start_page_and_units() {
+    let mut run = batch_with_calls(9, Vec::new(), vec![ar_decode_call()]);
+    let slot = run.block_tables[0].request_pool_idx;
+    run.block_tables.push(BlockTable {
+        request_pool_idx: slot,
+        group_id: 1,
+        start_page: 3,
+        unit_ids: vec![UnitId(7), UnitId(8), UnitId(9), UnitId(10)],
+        allocated_tokens: 5 * 16,
+    });
+    run.new_cache_units.push(CacheUnitAllocation {
+        request_pool_idx: slot,
+        group_id: 1,
+        unit_ids: vec![UnitId(9), UnitId(10)],
+    });
+    assert_eq!(execute_round_trip(run.clone()), run);
+
+    let mut outside = run.clone();
+    outside.new_cache_units[1].unit_ids = vec![UnitId(11)];
+    assert!(outside.validate().is_err());
+    let mut sentinel = run;
+    sentinel.block_tables[1].unit_ids[0] = UnitId(0);
+    assert!(sentinel.validate().is_err());
 }
 
 #[test]
@@ -732,15 +762,13 @@ fn unchanged_kv_publication_round_trips_without_physical_tensors() {
         vec![RequestOutput {
             code: CallKind::Transfer(TransferMode::KvPublish),
             kv_output: Some(KvTransfer {
-                tensors: Vec::new(),
+                groups: Vec::new(),
                 source,
                 destination: "decoder".into(),
                 base: Some(source),
                 base_extent: 16,
                 published_extent: 16,
-                group_id: 0,
                 compute_dtype: "bfloat16".into(),
-                page_size: 16,
             }),
             ..completion_record()
         }],
@@ -817,8 +845,10 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
         }],
     };
     // Five tokens past a base of three, with four-token pages, touch two
-    // source pages. Each tensor is one rank's shard: three of six kv heads
-    // starting at head three, and for FP8 one of two scale head groups.
+    // source pages of the full-attention group. Each tensor is one rank's
+    // shard: three of six kv heads starting at head three, and for FP8 one of
+    // two scale head groups. A sliding-window group with a two-token history
+    // carries only tokens [6, 8) of its own layers.
     for (dtype, itemsize) in [("bfloat16", 2), ("float8_e4m3fn", 1)] {
         let mut tensors = vec![
             tensor("keys", dtype, vec![5, 2, 3, 4], itemsize),
@@ -828,26 +858,41 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
             field.shape[2] = 6;
             field.locations[0].offset[2] = 3;
         }
+        let mut window = vec![
+            tensor("window-keys", dtype, vec![2, 1, 2, 8], itemsize),
+            tensor("window-values", dtype, vec![2, 1, 2, 8], itemsize),
+        ];
         if dtype == "float8_e4m3fn" {
             let mut scales = tensor("scales", "float32", vec![2, 2, 2, 1], 4);
             scales.shape[3] = 2;
             scales.locations[0].offset[3] = 1;
             tensors.push(scales);
+            // Tokens [6, 8) lie in one eight-token source page.
+            window.push(tensor("window-scales", "float32", vec![1, 2, 1, 1], 4));
         }
         let report = lane_report(
             5,
             vec![RequestOutput {
                 code: CallKind::Transfer(TransferMode::KvPublish),
                 kv_output: Some(KvTransfer {
-                    tensors,
+                    groups: vec![
+                        KvGroupTransfer {
+                            start: 3,
+                            page_tokens: 4,
+                            tensors,
+                        },
+                        KvGroupTransfer {
+                            start: 6,
+                            page_tokens: 8,
+                            tensors: window,
+                        },
+                    ],
                     source,
                     destination: "decoder".into(),
                     base: Some(source),
                     base_extent: 3,
                     published_extent: 8,
-                    group_id: 0,
                     compute_dtype: "bfloat16".into(),
-                    page_size: 4,
                 }),
                 ..completion_record()
             }],
@@ -860,25 +905,31 @@ fn raw_kv_publication_round_trips_page_representation_and_exact_request() {
                 .unwrap();
         assert_eq!(decoded.report().unwrap(), &report);
 
-        // Zero generations, a zero page size, and malformed or unexpected
+        // Zero generations, a zero page size, a group starting before the
+        // base, an unchanged extent with groups, and malformed or unexpected
         // scales are each rejected on encode.
-        for invalid_field in ["source", "base", "page_size", "scales"] {
+        for invalid_field in ["source", "base", "page_tokens", "start", "extent", "scales"] {
             let mut invalid = report.clone();
             let KvTransfer {
                 source,
                 base,
-                page_size,
-                tensors,
+                base_extent,
+                published_extent,
+                groups,
                 ..
             } = invalid.completions[0].kv_output.as_mut().unwrap();
             match invalid_field {
                 "source" => source.generation = 0,
                 "base" => base.as_mut().unwrap().generation = 0,
-                "page_size" => *page_size = 0,
+                "page_tokens" => groups[0].page_tokens = 0,
+                "start" => groups[1].start = 2,
+                "extent" => *base_extent = *published_extent,
                 "scales" if dtype == "float8_e4m3fn" => {
-                    tensors[2] = tensor("scales", "float32", vec![1, 2, 2], 4);
+                    groups[0].tensors[2] = tensor("scales", "float32", vec![1, 2, 2], 4);
                 }
-                "scales" => tensors.push(tensor("scales", "float32", vec![2, 2, 2], 4)),
+                "scales" => groups[0]
+                    .tensors
+                    .push(tensor("scales", "float32", vec![2, 2, 2], 4)),
                 _ => unreachable!(),
             }
             assert!(encode_response(&WorkerResponse::result(invalid)).is_err());
@@ -1048,7 +1099,7 @@ fn batch_rejects_two_calls_for_one_request() {
         collective_seq: 1,
         calls: vec![ar_decode_call(), ar_decode_call()],
         block_tables: Vec::new(),
-        new_cache_pages: Vec::new(),
+        new_cache_units: Vec::new(),
         forward: ForwardBatch::default(),
         latent_params: Vec::new(),
         decode_ranges: Vec::new(),
@@ -1183,9 +1234,10 @@ fn worker_info_round_trips() {
             attention_backend: "torch".into(),
             weight_formats: vec!["dense".into()],
             kv_cache: Some(KvCacheInfo {
-                num_layers: 9,
-                total_layers: 28,
-                layer_offset: 11,
+                groups: vec![KvCacheGroup {
+                    layer_ids: (11..20).collect(),
+                    ..WorkerInfo::default().kv_cache.unwrap().groups[0].clone()
+                }],
                 ..WorkerInfo::default().kv_cache.unwrap()
             }),
             components: vec![ComponentInfo {
@@ -1251,11 +1303,50 @@ fn worker_info_rejects_duplicate_set_members() {
     assert!(encode_response(&WorkerResponse::info(info)).is_err());
 }
 
+/// A KV pool needs an allocatable unit; every page size must be a power of
+/// two dividing the largest one; a layer belongs to one group; heads stay
+/// within their logical bounds; and a sliding window retains no sink.
 #[test]
-fn worker_info_requires_group_totals_to_match_the_cache() {
-    let mut info = full_caps();
-    info.kv_cache.as_mut().unwrap().groups[1].num_blocks = 2047;
-    assert!(encode_response(&WorkerResponse::info(info)).is_err());
+fn worker_info_rejects_inconsistent_kv_groups() {
+    let valid = full_caps();
+    assert!(encode_response(&WorkerResponse::info(valid.clone())).is_ok());
+    let cases: [fn(&mut KvCacheInfo); 6] = [
+        |cache| cache.num_units = 1,
+        |cache| cache.groups[1].page_tokens = 48,
+        |cache| cache.groups[1].layer_ids.push(0),
+        |cache| cache.groups[0].layer_ids.clear(),
+        |cache| cache.groups[0].kv_head_offset = 1,
+        |cache| {
+            cache.groups[1].kind = KvGroupKind::SlidingWindow {
+                window: 4096,
+                sink: 64,
+            }
+        },
+    ];
+    for invalidate in cases {
+        let mut info = valid.clone();
+        invalidate(info.kv_cache.as_mut().unwrap());
+        assert!(encode_response(&WorkerResponse::info(info)).is_err());
+    }
+}
+
+/// Stages combine into the narrowest pool with the largest unit and the
+/// union of their layers, and must agree on every group's page shape.
+#[test]
+fn kv_stages_merge_into_the_narrowest_pool() {
+    let first = full_caps().kv_cache.unwrap();
+    let mut second = first.clone();
+    second.num_units = 1024;
+    second.unit_bytes = first.unit_bytes * 2;
+    second.groups[0].layer_ids = vec![28, 29];
+    let merged = first.merge(&second).unwrap();
+    assert_eq!(merged.num_units, 1024);
+    assert_eq!(merged.unit_bytes, first.unit_bytes * 2);
+    assert_eq!(merged.groups[0].layer_ids.len(), 16);
+    assert_eq!(merged.groups[1].layer_ids, first.groups[1].layer_ids);
+
+    second.groups[1].units_per_page = 3;
+    assert!(first.merge(&second).is_err());
 }
 
 fn key_for_request(request: u64) -> RequestKey {
@@ -1390,7 +1481,7 @@ fn comprehensive_batches() -> Vec<Batch> {
             code: kind,
             bounds: Bounds {
                 max_tokens: 7 + index as u32,
-                max_kv_pages: 3,
+                max_kv_units: 3,
                 max_latent_bytes: 1 << 20,
                 max_completion_bytes: 4096,
                 max_transfer_bytes: 1 << 16,
@@ -1460,18 +1551,24 @@ fn full_caps() -> WorkerInfo {
         media_components: video_components(),
         num_inference_steps: 4,
         supported_calls: CallKind::ALL.to_vec(),
+        // A full-attention group with 64-token pages of one unit and a
+        // sliding-window group with 32-token pages of two units share one
+        // pool.
         kv_cache: Some(KvCacheInfo {
             groups: vec![
                 KvCacheGroup {
-                    num_blocks: 2048,
-                    kind: KvGroupKind::Full,
+                    layer_ids: (0..14).collect(),
+                    ..WorkerInfo::default().kv_cache.unwrap().groups[0].clone()
                 },
                 KvCacheGroup {
-                    num_blocks: 2048,
                     kind: KvGroupKind::SlidingWindow {
                         window: 4096,
-                        sink: 64,
+                        sink: 0,
                     },
+                    page_tokens: 32,
+                    units_per_page: 2,
+                    layer_ids: (14..28).collect(),
+                    ..WorkerInfo::default().kv_cache.unwrap().groups[0].clone()
                 },
             ],
             ..WorkerInfo::default().kv_cache.unwrap()

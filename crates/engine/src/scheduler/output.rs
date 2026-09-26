@@ -531,36 +531,6 @@ impl Scheduler {
                     return self.finish(id, FinishReason::Error);
                 }
 
-                // Only a complete prompt publishes reusable KV blocks, keyed by
-                // the loaded worker that holds them.
-                let Some(state) = self.running.get(&id) else {
-                    return;
-                };
-                let key = RequestKey::new(self.engine_id, id, state.request_epoch);
-                let source = self
-                    .placement
-                    .affinity
-                    .get(&(key, DEFAULT_COMPONENT.to_owned()))
-                    .and_then(|worker| {
-                        self.executor
-                            .info()
-                            .workers
-                            .iter()
-                            .find(|(id, _)| id == worker)
-                    })
-                    .map(|(_, worker)| Arc::new(worker.endpoint.clone()));
-                let (Some(source), Some(st), Some(kv)) = (
-                    source,
-                    self.running.get_mut(&id),
-                    self.storage.cache.as_ref(),
-                ) else {
-                    self.invariant_broken(
-                        "a prefilled request keeps its loaded prefill worker and KV cache",
-                    );
-                    return;
-                };
-                cache_prompt_blocks(&kv.coordinator, st, &kv.block_pool, &source);
-
                 // A description-lowered prefix may already end at a branch trigger.
                 if self.prefilled_gen_trigger(id) {
                     self.begin_image(id);
@@ -950,24 +920,28 @@ impl Scheduler {
     /// Converts a worst-case KV reservation into concrete generation-branch capacity.
     ///
     /// Succeeds, clearing `image_reservation_pending`, when the request reserves
-    /// its worst-case envelope and the first block table already holds at least
-    /// `max_reserved_kv_blocks` blocks. Otherwise finishes the request with
+    /// its worst-case envelope and every block table already covers
+    /// `max_reserved_kv_tokens` tokens. Otherwise finishes the request with
     /// `FinishReason::Error` and returns `false`; a request that is not running
     /// also returns `false`.
     pub(super) fn promote_gen_branch_reservation(&mut self, id: RequestId) -> bool {
-        let Some((required_blocks, reserves_envelope)) = self
+        let Some((required_tokens, reserves_envelope)) = self
             .running
             .get(&id)
-            .map(|st| (st.max_reserved_kv_blocks, st.reserve_worstcase))
+            .map(|st| (st.max_reserved_kv_tokens, st.reserve_worstcase))
         else {
             return false;
         };
-        let allocated_blocks = self
+        let covered = self
             .running
             .get(&id)
-            .and_then(|state| state.block_tables()?.first())
-            .map_or(0, BlockTable::len);
-        if !reserves_envelope || allocated_blocks < required_blocks {
+            .and_then(RequestState::block_tables)
+            .is_some_and(|tables| {
+                tables
+                    .iter()
+                    .all(|table| table.capacity_tokens() >= required_tokens)
+            });
+        if !reserves_envelope || !covered {
             self.finish(id, FinishReason::Error);
             return false;
         }
@@ -1305,10 +1279,12 @@ impl Scheduler {
                 .reserved_encoder_entries
                 .saturating_sub(st.req.num_encoder_cache_entries());
             if st.reserve_worstcase {
-                self.storage.reserved_blocks = self
-                    .storage
-                    .reserved_blocks
-                    .saturating_sub(st.max_reserved_kv_blocks);
+                let reserved = self.storage.cache().map_or(0, |cache| {
+                    cache
+                        .coordinator
+                        .units_for_tokens(st.max_reserved_kv_tokens)
+                });
+                self.storage.reserved_units = self.storage.reserved_units.saturating_sub(reserved);
             }
 
             // Releasing the request's encoder pins may make cache products
@@ -1355,35 +1331,71 @@ impl Scheduler {
     }
 }
 
-/// Publishes the request's full prompt blocks to the prefix cache, attributed
-/// to the worker endpoint `source` that holds their KV.
-///
-/// `prefix_cached` records a successful publish, including the no-op when
-/// prefix caching is disabled or the request does not write the cache, and
-/// later calls return early; a failed publish leaves it unset.
-fn cache_prompt_blocks(
-    coordinator: &KvCacheCoordinator,
-    state: &mut RequestState,
-    pool: &BlockPool,
-    source: &Arc<uniserve_worker_ipc::WorkerEndpoint>,
-) {
-    if state.prefix_cached {
-        return;
-    }
-    // A request holds block tables only once admitted; before that it has no
-    // prompt blocks to cache.
-    let Some(tables) = state.block_tables() else {
-        return;
-    };
-    let prompt = state.req.prompt_token_ids.clone();
-    if coordinator.cache_prefix(
-        pool,
-        tables,
-        &prompt,
-        &state.prefix_block_hashes,
-        state.req.cache.write,
-        source,
-    ) {
-        state.prefix_cached = true;
+impl Scheduler {
+    /// Applies a completed forward's accepted KV extent to the request's
+    /// cache tables.
+    ///
+    /// First publishes the prompt pages the request has now computed, keyed
+    /// by the loaded prefill worker that holds them, so every page of a
+    /// sliding-window group enters the prefix cache while its table still
+    /// holds it. Then retires the sliding-window pages no later reader needs:
+    /// calls apply in submission order, so every earlier reader has
+    /// completed, and later calls read no history before the accepted extent
+    /// minus the window. A request without its prefill worker or KV cache
+    /// breaks a scheduler invariant.
+    pub(super) fn advance_request_kv(&mut self, id: RequestId) {
+        let Some(state) = self.running.get(&id) else {
+            return;
+        };
+        let key = RequestKey::new(self.engine_id, id, state.request_epoch);
+        let source = self
+            .placement
+            .affinity
+            .get(&(key, DEFAULT_COMPONENT.to_owned()))
+            .and_then(|worker| {
+                self.executor
+                    .info()
+                    .workers
+                    .iter()
+                    .find(|(id, _)| id == worker)
+            })
+            .map(|(_, worker)| Arc::new(worker.endpoint.clone()));
+        let (Some(source), Some(state), Some(kv)) = (
+            source,
+            self.running.get_mut(&id),
+            self.storage.cache.as_ref(),
+        ) else {
+            self.invariant_broken(
+                "a prefilled request keeps its loaded prefill worker and KV cache",
+            );
+            return;
+        };
+
+        // The request's prompt, hashes and publication progress are borrowed
+        // beside its tables for the duration of the update.
+        let prompt = std::mem::take(&mut state.req.prompt_token_ids);
+        let hashes = std::mem::take(&mut state.prefix_page_hashes);
+        let mut published = std::mem::take(&mut state.prefix_published);
+        let computed = state.num_computed_prompt_tokens as usize;
+        let visible = state.kv_visible_len as usize;
+        let cache_write = state.req.cache.write;
+        let advanced = state.kv_mut().is_some_and(|allocation| {
+            kv.coordinator.publish_prompt(
+                &kv.block_pool,
+                allocation,
+                &prompt,
+                &hashes,
+                computed,
+                &mut published,
+                cache_write,
+                &source,
+            ) && kv.coordinator.release_window(allocation, visible)
+        });
+        state.req.prompt_token_ids = prompt;
+        state.prefix_page_hashes = hashes;
+        state.prefix_published = published;
+        if !advanced {
+            self.invariant_broken("an admitted request's KV tables match the cache groups");
+        }
     }
 }

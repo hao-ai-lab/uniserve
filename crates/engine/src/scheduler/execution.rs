@@ -1149,7 +1149,7 @@ impl Scheduler {
             worker,
             request_pool_idx: Some(request_pool_idx),
             block_tables: Vec::new(),
-            new_cache_pages: Vec::new(),
+            new_cache_units: Vec::new(),
             forward: uniserve_worker_ipc::ForwardBatch::default(),
             latent,
             decode,
@@ -1306,8 +1306,7 @@ impl Scheduler {
     }
 
     /// Publishes request, in-flight batch, KV-cache and encoder-cache gauges
-    /// to scheduler counters, and discards the block pool's queued cache
-    /// events.
+    /// to scheduler counters.
     pub(super) fn publish_cache_stats(&mut self) {
         self.stats
             .general
@@ -1319,29 +1318,26 @@ impl Scheduler {
             .store(self.pending_request_count(), Ordering::Relaxed);
         self.stats
             .kv_cache
-            .free_blocks
-            .store(self.storage.free_blocks(), Ordering::Relaxed);
+            .free_units
+            .store(self.storage.free_units(), Ordering::Relaxed);
         self.stats
             .general
             .in_flight
             .store(self.inflight.pending_batches.len(), Ordering::Relaxed);
-        // Nothing else reads the block pool's bounded event ring, so it is
-        // drained and discarded here. The counters below come from the pool's
-        // own statistics, not from the events.
         if let Some(kv) = self.storage.cache.as_ref() {
-            let _ = kv.block_pool.drain_events();
+            let pool = kv.block_pool.stats();
             self.stats
                 .kv_cache
-                .blocks_evicted
-                .store(kv.block_pool.stats().evictions, Ordering::Relaxed);
+                .pages_evicted
+                .store(pool.evictions, Ordering::Relaxed);
             self.stats
                 .kv_cache
-                .blocks_stored
-                .store(kv.block_pool.stats().blocks_stored, Ordering::Relaxed);
+                .pages_stored
+                .store(pool.pages_stored, Ordering::Relaxed);
             self.stats
                 .kv_cache
-                .cached_blocks
-                .store(kv.block_pool.cached_blocks(), Ordering::Relaxed);
+                .cached_pages
+                .store(kv.block_pool.cached_pages(), Ordering::Relaxed);
         }
         self.stats
             .encoder
@@ -2687,9 +2683,10 @@ impl Scheduler {
                 }
 
                 // A descendant submitted before its chain was invalidated is
-                // discarded: `num_kv_blocks_sent` drops by its `max_kv_pages`
-                // bound, its products are freed, and the chain stays marked
-                // while later descendants remain in flight.
+                // discarded: `num_kv_units_sent` drops by its `max_kv_units`
+                // bound, so the next dispatch declares those units again, its
+                // products are freed, and the chain stays marked while later
+                // descendants remain in flight.
                 let discard_invalidated_descendant = self
                     .running
                     .get(&id)
@@ -2697,9 +2694,9 @@ impl Scheduler {
                 if discard_invalidated_descendant {
                     let has_unresolved_descendants = self.inflight.has_pending_calls(id);
                     if let Some(state) = self.running.get_mut(&id) {
-                        state.num_kv_blocks_sent = state
-                            .num_kv_blocks_sent
-                            .saturating_sub(call.bounds.max_kv_pages as usize);
+                        state.num_kv_units_sent = state
+                            .num_kv_units_sent
+                            .saturating_sub(u64::from(call.bounds.max_kv_units));
                         state.speculative_chain_invalidated = has_unresolved_descendants;
                     }
                     self.free_buffers(call.output_buffers());
@@ -2792,6 +2789,12 @@ impl Scheduler {
                     }
                     continue;
                 }
+                // An accepted forward extends the request's KV: publish the
+                // prompt pages it completed, then retire sliding-window pages
+                // no later reader needs.
+                if progress_result.is_some() && matches!(call.code, CallKind::Forward(_)) {
+                    self.advance_request_kv(id);
+                }
 
                 // Apply accepted progress directly; the output decoder separately
                 // decides the user-visible prefix and stop-string boundary.
@@ -2865,9 +2868,9 @@ impl Scheduler {
                 if record.status == CallStatus::Predicated {
                     let has_unresolved_descendants = self.inflight.has_pending_calls(id);
                     if let Some(state) = self.running.get_mut(&id) {
-                        state.num_kv_blocks_sent = state
-                            .num_kv_blocks_sent
-                            .saturating_sub(call.bounds.max_kv_pages as usize);
+                        state.num_kv_units_sent = state
+                            .num_kv_units_sent
+                            .saturating_sub(u64::from(call.bounds.max_kv_units));
                         state.speculative_chain_invalidated = has_unresolved_descendants;
                     }
                     self.free_buffers(call.output_buffers());

@@ -8,57 +8,60 @@
 
 use super::*;
 
-/// Fixed physical KV-cache geometry exposed by a worker that executes AR work.
+/// Physical KV unit pool exposed by a worker that executes AR work.
 ///
-/// `num_layers` and `num_kv_heads` describe this rank's share of the model's
-/// logical cache; `total_layers`, `total_kv_heads` and the two offsets place
-/// that share within it.
+/// The pool is `num_units` allocation units, unit zero being the padding
+/// sentinel. Each group's logical pages draw `units_per_page` units from the
+/// one pool, so the scheduler accounts every group's demand in units. Each
+/// group also places this rank's share of the model's logical cache: its
+/// layers by global id and its KV heads by offset.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvCacheInfo {
-    /// Tokens stored in each physical KV page.
-    pub block_size: u32,
-    /// Total physical pages in the request KV pool.
-    pub num_blocks: u32,
-    /// Transformer layers stored by this rank.
-    pub num_layers: u32,
-    /// Transformer layers in the complete logical cache.
-    pub total_layers: u32,
-    /// First logical layer stored by this rank.
-    pub layer_offset: u32,
-    /// KV heads this rank stores per layer.
-    pub num_kv_heads: u32,
-    /// Logical model KV heads across all tensor-parallel members.
-    pub total_kv_heads: u32,
-    /// First logical KV head stored by this rank.
-    pub kv_head_offset: u32,
-    /// Elements stored per KV head.
-    pub head_dim: u32,
-    /// Physical bytes one token occupies on this rank across its stored layers
-    /// and heads, including per-page metadata (initialization flags and, with
-    /// FP8, scales) amortized over the page and rounded up.
-    pub bytes_per_token: u64,
-    /// Positional attention groups partitioning the physical pages.
-    pub groups: Vec<KvCacheGroup>,
+    /// Allocation units in the pool, including the unit-zero sentinel.
+    pub num_units: u32,
+    /// Physical bytes one unit occupies on this rank: every column plane of
+    /// the unit plus its per-unit metadata (initialization flags and, with
+    /// FP8, scales).
+    pub unit_bytes: u64,
     /// Element data type of KV tensors.
     pub dtype: KvCacheDtype,
+    /// Cache groups in table order.
+    pub groups: Vec<KvCacheGroup>,
 }
 
 impl KvCacheInfo {
-    /// Bound one token's logical publication independently of the producing TP size.
-    /// A partial-page suffix may carry a complete scale for every head group.
+    /// Returns the units the scheduler may allocate: all but the sentinel.
+    pub fn usable_units(&self) -> u32 {
+        self.num_units.saturating_sub(1)
+    }
+
+    /// Returns the largest page size of any group, in tokens.
     ///
-    /// Unlike `bytes_per_token`, which covers this rank's share, this covers
-    /// the published key and value tensors over `total_layers` and
-    /// `total_kv_heads`. With FP8 it also reserves one FP32 scale for each key
-    /// and value head, layer and token. The scheduler multiplies it by the
-    /// published length to bound a KV-publish transfer.
-    pub fn publication_bytes_per_token(&self) -> u64 {
+    /// Every page size divides it (`validate`), so a length aligned to it is
+    /// a whole number of pages in every group.
+    pub fn max_page_tokens(&self) -> u32 {
+        self.groups
+            .iter()
+            .map(|group| group.page_tokens)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Bounds the logical publication of a `tokens`-long visible KV extent,
+    /// independently of the producing TP size.
+    ///
+    /// A publication carries each group's keys and values over the group's
+    /// layers (`layer_ids`) and `total_kv_heads`; a sliding-window group
+    /// carries at most `window` tokens, the history its readers need. With
+    /// FP8 the bound also reserves one FP32 scale for each key and value
+    /// head, layer and token, because a partial-page suffix may carry a
+    /// complete scale for every head group.
+    pub fn publication_bytes(&self, tokens: u32) -> u64 {
         let width = match self.dtype {
             KvCacheDtype::Float16 | KvCacheDtype::BFloat16 => 2,
             KvCacheDtype::Float32 => 4,
             KvCacheDtype::Float8E4m3Fn => 1,
         };
-        let head_bytes = u64::from(self.head_dim) * width;
 
         // FP8 scales are FP32.
         let scale_bytes = if self.dtype == KvCacheDtype::Float8E4m3Fn {
@@ -67,50 +70,113 @@ impl KvCacheInfo {
             0
         };
 
-        // Key and value tensors.
-        (2 * u64::from(self.total_layers))
-            .saturating_mul(u64::from(self.total_kv_heads))
-            .saturating_mul(head_bytes + scale_bytes)
+        self.groups
+            .iter()
+            .map(|group| {
+                let published = group
+                    .kind
+                    .window()
+                    .map_or(tokens, |window| tokens.min(window));
+                let head_bytes = u64::from(group.head_dim) * width + scale_bytes;
+
+                // Key and value tensors over every layer and head of the group.
+                (2 * group.layer_ids.len() as u64)
+                    .saturating_mul(u64::from(group.total_kv_heads))
+                    .saturating_mul(head_bytes)
+                    .saturating_mul(u64::from(published))
+            })
+            .fold(0u64, u64::saturating_add)
     }
 
-    /// Validates positive geometry and a complete non-overlapping group partition.
+    /// Validates the pool size, page shapes and each group's layer and head
+    /// placement.
     ///
-    /// Groups carry page counts rather than page ranges, so the partition check
-    /// requires each count to be positive and the counts to sum to
-    /// `num_blocks`.
-    /// `bytes_per_token` is required to be positive but is not recomputed
-    /// from the other fields.
+    /// Every page size must be a power of two that divides the largest one,
+    /// so page-aligned prefix lengths agree across groups. A layer belongs to
+    /// at most one group. A sliding-window group may not retain sink tokens:
+    /// a table keeps one contiguous run of pages.
     pub fn validate(&self) -> ValidationResult<()> {
-        // Establish the physical dimensions before summing the group partition.
         ensure_valid!(
-            self.block_size > 0
-                && self.num_blocks > 0
-                && self.num_layers > 0
-                && u64::from(self.layer_offset) + u64::from(self.num_layers)
-                    <= u64::from(self.total_layers)
-                && self.num_kv_heads > 0
-                && u64::from(self.kv_head_offset) + u64::from(self.num_kv_heads)
-                    <= u64::from(self.total_kv_heads)
-                && self.head_dim > 0
-                && self.bytes_per_token > 0
-                && !self.groups.is_empty(),
-            "worker info declare incomplete KV geometry"
+            self.num_units > 1 && self.unit_bytes > 0 && !self.groups.is_empty(),
+            "worker info declare an incomplete KV unit pool"
         );
-        let mut total_blocks = 0u64;
+
+        let largest = self.max_page_tokens();
+        let mut layers = HashSet::new();
         for group in &self.groups {
             ensure_valid!(
-                group.num_blocks > 0,
-                "worker KV groups are not a canonical physical page partition"
+                group.page_tokens.is_power_of_two()
+                    && largest.is_multiple_of(group.page_tokens)
+                    && group.units_per_page > 0
+                    && group.units_per_page < self.num_units,
+                "worker KV group page shape is invalid"
             );
-            total_blocks = total_blocks
-                .checked_add(u64::from(group.num_blocks))
-                .ok_or_else(|| invalid_message!("worker KV group page range overflows"))?;
+            ensure_valid!(
+                !group.layer_ids.is_empty()
+                    && group.layer_ids.iter().all(|layer| layers.insert(*layer)),
+                "worker KV groups omit or repeat a layer"
+            );
+            ensure_valid!(
+                group.num_kv_heads > 0
+                    && u64::from(group.kv_head_offset) + u64::from(group.num_kv_heads)
+                        <= u64::from(group.total_kv_heads)
+                    && group.head_dim > 0,
+                "worker KV group head interval exceeds its logical bounds"
+            );
+            ensure_valid!(
+                !matches!(group.kind, KvGroupKind::SlidingWindow { sink, .. } if sink > 0),
+                "worker KV group retains sliding-window sink tokens"
+            );
         }
-        ensure_valid!(
-            total_blocks == u64::from(self.num_blocks),
-            "worker KV groups do not cover the physical request page pool"
-        );
         Ok(())
+    }
+
+    /// Combines the pools of two KV stages that one request may traverse.
+    ///
+    /// Stages must agree on dtype and on every group's retention policy and
+    /// page shape; their rank-local layer ids and head placement may differ.
+    /// The combined pool has the smaller unit count, because the scheduler
+    /// assigns one set of unit ids valid in both, the larger unit size, and
+    /// per group the union of both stages' layers, which bounds publications.
+    pub fn merge(&self, other: &Self) -> ValidationResult<Self> {
+        ensure_valid!(
+            self.dtype == other.dtype
+                && self.groups.len() == other.groups.len()
+                && self
+                    .groups
+                    .iter()
+                    .zip(&other.groups)
+                    .all(|(left, right)| left.same_page_shape(right)),
+            "KV stages expose incompatible cache layouts"
+        );
+
+        let groups = self
+            .groups
+            .iter()
+            .zip(&other.groups)
+            .map(|(left, right)| {
+                let mut layer_ids = left.layer_ids.clone();
+                layer_ids.extend(
+                    right
+                        .layer_ids
+                        .iter()
+                        .filter(|layer| !left.layer_ids.contains(layer)),
+                );
+                layer_ids.sort_unstable();
+                KvCacheGroup {
+                    layer_ids,
+                    ..left.clone()
+                }
+            })
+            .collect();
+        let merged = Self {
+            num_units: self.num_units.min(other.num_units),
+            unit_bytes: self.unit_bytes.max(other.unit_bytes),
+            dtype: self.dtype,
+            groups,
+        };
+        merged.validate()?;
+        Ok(merged)
     }
 }
 
@@ -271,14 +337,10 @@ impl WorkerInfo {
         self.num_inference_steps
     }
 
-    /// Returns the advertised KV page size, or zero when KV is unsupported.
-    pub fn kv_block_size(&self) -> u32 {
-        self.kv_cache.as_ref().map_or(0, |config| config.block_size)
-    }
-
-    /// Returns the advertised KV page count, or zero when KV is unsupported.
-    pub fn kv_num_blocks(&self) -> u32 {
-        self.kv_cache.as_ref().map_or(0, |config| config.num_blocks)
+    /// Returns the advertised allocatable KV units, or zero when KV is
+    /// unsupported.
+    pub fn kv_usable_units(&self) -> u32 {
+        self.kv_cache.as_ref().map_or(0, KvCacheInfo::usable_units)
     }
 
     /// Returns total latent capacity in model-defined units.
@@ -479,22 +541,23 @@ impl Default for WorkerInfo {
             max_batch_calls: 1,
             max_batch_tokens: 8192,
             request_slots: 128,
+            // One full-attention group of 28 layers with 8 BF16 heads of 128:
+            // each 64-token page is one unit of 28 columns of 128 KiB K and V
+            // planes plus one initialization flag per plane.
             kv_cache: Some(KvCacheInfo {
-                block_size: 64,
-                num_blocks: 4096,
-                num_layers: 28,
-                total_layers: 28,
-                layer_offset: 0,
-                num_kv_heads: 8,
-                total_kv_heads: 8,
-                kv_head_offset: 0,
-                head_dim: 128,
-                bytes_per_token: 57_344,
-                groups: vec![KvCacheGroup {
-                    num_blocks: 4096,
-                    kind: Default::default(),
-                }],
+                num_units: 4096,
+                unit_bytes: 28 * 2 * (64 * 8 * 128 * 2 + 1),
                 dtype: KvCacheDtype::BFloat16,
+                groups: vec![KvCacheGroup {
+                    kind: Default::default(),
+                    page_tokens: 64,
+                    units_per_page: 1,
+                    layer_ids: (0..28).collect(),
+                    num_kv_heads: 8,
+                    total_kv_heads: 8,
+                    kv_head_offset: 0,
+                    head_dim: 128,
+                }],
             }),
             latent_page_units: 0,
             latent_pages: 0,

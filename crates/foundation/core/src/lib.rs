@@ -149,14 +149,14 @@ pub fn now_monotonic_us() -> u64 {
 /// Process-wide origin shared by the monotonic clocks, set on first use.
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
-/// Index of a physical page in the paged KV cache.
+/// Index of a physical allocation unit in the paged KV pool.
 ///
-/// The engine's KV block pool allocates these, and block tables map a
-/// sequence's logical blocks onto them; worker calls name them as page ids.
-/// The worker treats page zero as its padding sentinel, so the pool never
-/// allocates it.
+/// The engine's block pool allocates units, and a block table maps each
+/// logical page of a cache group onto that group's number of units; worker
+/// calls name them as unit ids. The worker treats unit zero as its padding
+/// sentinel, valid memory in every plane, so the pool never allocates it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-pub struct BlockId(pub u32);
+pub struct UnitId(pub u32);
 
 /// Request identity within one engine.
 #[derive(
@@ -898,70 +898,79 @@ pub struct CfgParams {
     pub interval: (f32, f32),
 }
 
-/// Dimensions of a paged key/value cache and the byte sizes they imply.
+/// History retention policy of a KV-cache group.
 ///
-/// The descriptor holds counts only and owns no backing buffer.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct KvLayout {
-    /// Number of physical KV pages.
-    pub num_blocks: u32,
-    /// Tokens stored in each physical page.
-    pub block_size: u32,
-    /// Transformer layers represented in the cache.
-    pub num_layers: u32,
-    /// KV heads stored per layer.
-    pub num_kv_heads: u32,
-    /// Elements stored per head.
-    pub head_dim: u32,
-    /// Storage bytes for each KV element.
-    pub dtype_bytes: u32,
-}
-
-impl KvLayout {
-    /// Returns storage consumed by one token across all layers and heads.
-    pub fn bytes_per_token(&self) -> u64 {
-        // Account for both key and value tensors at every layer.
-        2 * self.num_kv_heads as u64
-            * self.head_dim as u64
-            * self.num_layers as u64
-            * self.dtype_bytes as u64
-    }
-
-    /// Returns storage consumed by the complete KV layout.
-    pub fn total_bytes(&self) -> u64 {
-        self.num_blocks as u64 * self.block_size as u64 * self.bytes_per_token()
-    }
-}
-
-/// Attention kind for a KV-cache group.
-///
-/// A model with mixed attention (e.g. full + sliding-window) maps to multiple
-/// groups, each with its own physical page subspace.
+/// A model whose layers read different histories (for example full and
+/// sliding-window attention) reports one group per policy and page shape.
+/// Every group draws its pages from the same unit pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum KvGroupKind {
-    /// Full attention: every block is retained for the request's lifetime.
+    /// Full attention: every page is retained for the request's lifetime.
     #[default]
     Full,
-    /// Sliding-window attention over the most recent `window` tokens plus
-    /// `sink` always-kept prefix tokens. The engine's page allocation treats
-    /// this group like a full-attention group.
+    /// Sliding-window attention. A reader starting at absolute position `q`
+    /// needs the history `[q - window, q)`, so pages that lie entirely before
+    /// the oldest position any remaining reader needs are released while the
+    /// request continues. `window` is the longest history any reader of the
+    /// group needs, not the checkpoint's nominal window.
     SlidingWindow {
-        /// Number of recent tokens retained for attention.
+        /// History tokens any reader of the group needs.
         window: u32,
-        /// Number of prefix tokens retained outside the window.
+        /// Prefix tokens retained outside the window. The unit pool keeps one
+        /// contiguous run of pages per table, so validation rejects a
+        /// nonzero sink.
         sink: u32,
     },
 }
 
-/// One positional KV-cache group reported by the worker at handshake.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+impl KvGroupKind {
+    /// Returns the history bound in tokens, or `None` for full attention.
+    pub const fn window(self) -> Option<u32> {
+        match self {
+            Self::Full => None,
+            Self::SlidingWindow { window, .. } => Some(window),
+        }
+    }
+}
+
+/// One KV-cache group of a worker's unit pool, reported at handshake.
+///
+/// A logical page of the group holds `page_tokens` tokens of every layer in
+/// the group and occupies `units_per_page` physical units. Unit and column
+/// geometry belong to the worker; the scheduler only needs the page shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvCacheGroup {
-    /// Number of physical pages in this group's subspace.
-    pub num_blocks: u32,
-    /// Attention retention policy for the group.
+    /// History retention policy of the group.
     #[serde(default)]
     pub kind: KvGroupKind,
+    /// Tokens stored per logical page; a power of two.
+    pub page_tokens: u32,
+    /// Physical units one logical page occupies.
+    pub units_per_page: u32,
+    /// Global cache-layer ids of this rank's layers in the group, in the
+    /// column order the worker stores them.
+    pub layer_ids: Vec<u32>,
+    /// KV heads this rank stores per layer.
+    pub num_kv_heads: u32,
+    /// Logical KV heads of each layer across all tensor-parallel members.
+    pub total_kv_heads: u32,
+    /// First logical KV head stored by this rank.
+    pub kv_head_offset: u32,
+    /// Elements stored per KV head.
+    pub head_dim: u32,
+}
+
+impl KvCacheGroup {
+    /// Whether two groups share retention policy, page shape and logical head
+    /// geometry, whatever layers and heads each rank stores.
+    pub fn same_page_shape(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.page_tokens == other.page_tokens
+            && self.units_per_page == other.units_per_page
+            && self.total_kv_heads == other.total_kv_heads
+            && self.head_dim == other.head_dim
+    }
 }
 
 /// Algorithm used to derive prefix-cache block keys.

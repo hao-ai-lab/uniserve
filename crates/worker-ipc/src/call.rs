@@ -342,13 +342,14 @@ impl CallKind {
 /// [`Call::validate`] checks `max_tokens` against `input_token_ids` and
 /// `max_latent_bytes` against encoder, latent, and image outputs;
 /// [`Batch::validate`] checks `max_transfer_bytes` against installed KV
-/// inputs. Neither checks `max_kv_pages` or `max_completion_bytes`.
+/// inputs. Neither checks `max_kv_units` or `max_completion_bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Bounds {
     /// Maximum tokens the call may process or produce.
     pub max_tokens: u32,
-    /// Maximum paged-KV pages the call may consume.
-    pub max_kv_pages: u32,
+    /// Paged-KV units newly allocated to the request's tables and first
+    /// declared to workers by this call.
+    pub max_kv_units: u32,
     /// Maximum latent storage in bytes.
     pub max_latent_bytes: u64,
     /// Maximum host-visible completion data in bytes.
@@ -1156,62 +1157,71 @@ impl NewRequest {
     }
 }
 
-/// One scheduler-owned request-slot block table.
+/// One request slot's complete unit table in one KV cache group.
+///
+/// `unit_ids` lists the units of logical pages `start_page..`, page-major:
+/// the group's `units_per_page` units of page `start_page` come first. Pages
+/// before `start_page` have been released by a sliding-window group, and a
+/// worker reads none of them. `allocated_tokens` is the absolute token extent
+/// the table covers, up to the end of its last page; the worker checks it
+/// against the group's page shape, which this record does not carry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockTable {
     /// Scheduler-assigned request-state row that owns the table.
     pub request_pool_idx: u32,
     /// KV cache group addressed by the table.
     pub group_id: u32,
-    /// Physical KV page identifiers in logical order.
-    pub page_ids: Vec<BlockId>,
-    /// Token capacity covered by the installed pages.
+    /// First logical page the units cover; earlier pages are retired.
+    pub start_page: u32,
+    /// Physical unit identifiers of pages `start_page..`, page-major.
+    pub unit_ids: Vec<UnitId>,
+    /// Absolute token extent the table covers.
     pub allocated_tokens: u32,
 }
 
-/// Physical pages newly acquired for one installed block table.
+/// Physical units newly acquired for one installed block table.
+///
+/// The worker resets every listed unit before a call reads or writes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CachePageAllocation {
-    /// Scheduler-assigned request-state row receiving the pages.
+pub struct CacheUnitAllocation {
+    /// Scheduler-assigned request-state row receiving the units.
     pub request_pool_idx: u32,
-    /// KV cache group receiving the pages.
+    /// KV cache group receiving the units.
     pub group_id: u32,
-    /// Newly allocated physical page identifiers.
-    pub page_ids: Vec<BlockId>,
+    /// Newly allocated physical unit identifiers.
+    pub unit_ids: Vec<UnitId>,
+}
+
+/// Whether `units` are real units (never the zero sentinel) without repeats.
+fn distinct_units(units: &[UnitId]) -> bool {
+    units.iter().all(|unit| unit.0 > 0) && units.iter().collect::<HashSet<_>>().len() == units.len()
 }
 
 impl BlockTable {
-    /// Validates table identity, page uniqueness, and allocated length.
+    /// Validates table identity and unit uniqueness.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             self.request_pool_idx > 0,
             "block table request slot must be positive"
         );
         ensure_valid!(
-            self.page_ids.iter().all(|page| page.0 > 0)
-                && self.page_ids.iter().collect::<HashSet<_>>().len() == self.page_ids.len(),
-            "block table repeats a page or carries page zero"
-        );
-        ensure_valid!(
-            !self.page_ids.is_empty() || self.allocated_tokens == 0,
-            "empty block table carries allocated tokens"
+            distinct_units(&self.unit_ids),
+            "block table repeats a unit or carries unit zero"
         );
         Ok(())
     }
 }
 
-impl CachePageAllocation {
-    /// Validates newly allocated page identities and ownership.
+impl CacheUnitAllocation {
+    /// Validates newly allocated unit identities and ownership.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             self.request_pool_idx > 0,
-            "cache-page allocation request slot must be positive"
+            "cache-unit allocation request slot must be positive"
         );
         ensure_valid!(
-            !self.page_ids.is_empty()
-                && self.page_ids.iter().all(|page| page.0 > 0)
-                && self.page_ids.iter().collect::<HashSet<_>>().len() == self.page_ids.len(),
-            "cache-page allocation is empty, repeats a page, or carries page zero"
+            !self.unit_ids.is_empty() && distinct_units(&self.unit_ids),
+            "cache-unit allocation is empty, repeats a unit, or carries unit zero"
         );
         Ok(())
     }
@@ -1445,8 +1455,8 @@ pub struct Batch {
     pub calls: Vec<Call>,
     /// Complete scheduler-owned KV page tables required by the calls.
     pub block_tables: Vec<BlockTable>,
-    /// Physical KV pages newly allocated for this invocation.
-    pub new_cache_pages: Vec<CachePageAllocation>,
+    /// Physical KV units newly allocated for this invocation.
+    pub new_cache_units: Vec<CacheUnitAllocation>,
     /// Columnar model inputs carried directly by the worker message.
     #[serde(flatten)]
     pub forward: ForwardBatch,
@@ -1475,7 +1485,7 @@ impl Batch {
             collective_seq: batch_id.max(1),
             calls,
             block_tables: Vec::new(),
-            new_cache_pages: Vec::new(),
+            new_cache_units: Vec::new(),
             forward: ForwardBatch::default(),
             latent_params: Vec::new(),
             decode_ranges: Vec::new(),
@@ -1583,24 +1593,24 @@ impl Batch {
             .map(|table| ((table.request_pool_idx, table.group_id), table))
             .collect::<HashMap<_, _>>();
 
-        let mut allocation_ids = HashSet::with_capacity(self.new_cache_pages.len());
-        for allocation in &self.new_cache_pages {
+        let mut allocation_ids = HashSet::with_capacity(self.new_cache_units.len());
+        for allocation in &self.new_cache_units {
             allocation.validate()?;
             let identity = (allocation.request_pool_idx, allocation.group_id);
             ensure_valid!(
                 allocation_ids.insert(identity),
-                "run repeats a cache-page allocation"
+                "run repeats a cache-unit allocation"
             );
             let table = tables.get(&identity).ok_or_else(|| {
-                invalid_message!("cache-page allocation has no matching block table")
+                invalid_message!("cache-unit allocation has no matching block table")
             })?;
-            let table_pages = table.page_ids.iter().collect::<HashSet<_>>();
+            let table_units = table.unit_ids.iter().collect::<HashSet<_>>();
             ensure_valid!(
                 allocation
-                    .page_ids
+                    .unit_ids
                     .iter()
-                    .all(|page| table_pages.contains(page)),
-                "cache-page allocation is outside its block table"
+                    .all(|unit| table_units.contains(unit)),
+                "cache-unit allocation is outside its block table"
             );
         }
 
@@ -1831,7 +1841,7 @@ impl Batch {
                     && consumers[0].code == CallKind::Transfer(TransferMode::KvInstall),
                 "KV transfer requires one installation consumer"
             );
-            let bytes = publication.tensors.iter().try_fold(0_u64, |sum, tensor| {
+            let bytes = publication.tensors().try_fold(0_u64, |sum, tensor| {
                 Ok::<_, ValidationError>(sum.saturating_add(tensor.validate()?))
             })?;
             ensure_valid!(

@@ -37,12 +37,20 @@ def test_decode_publication_and_staging_follow_live_request_coordinates(
     expected_positions = [0] + [1] * capacity
     expected_sampling = [0] + [16] * capacity
     expected_predicates = [False] * (capacity + 1)
-    pages = torch.arange(
+    # Table 0 belongs to a full-attention group and table 1 to a windowed
+    # group whose readers need two history tokens; both use two-token pages.
+    # Unit ``(table, slot, column)`` is numbered in row-major order.
+    units = torch.arange(
         2 * (capacity + 1) * 5, dtype=torch.int32, device=device
     ).reshape(2, capacity + 1, 5)
+    starts = torch.zeros((2, capacity + 1), dtype=torch.int32, device=device)
+    shapes = torch.tensor(
+        [[0, 2, -1], [1, 2, 2]], dtype=torch.int32, device=device
+    )
     staging_slots = torch.zeros(capacity, dtype=torch.int64, device=device)
-    table_storage = torch.full(
-        (capacity, 5), -1, dtype=torch.int32, device=device
+    tables = torch.full((2, capacity, 5), -1, dtype=torch.int32, device=device)
+    start_pages = torch.full(
+        (2, capacity), -1, dtype=torch.int32, device=device
     )
     outputs = {
         name: torch.empty(capacity, dtype=dtype, device=device)
@@ -50,9 +58,11 @@ def test_decode_publication_and_staging_follow_live_request_coordinates(
             ("input_ids", torch.int64),
             ("cache_lengths", torch.int32),
             ("query_lengths", torch.int32),
-            ("write_indices", torch.int64),
         )
     }
+    outputs["write_indices"] = torch.empty(
+        (2, capacity), dtype=torch.int64, device=device
+    )
     outputs["positions"] = torch.full(
         (axes, capacity), -9, dtype=torch.int64, device=device
     )
@@ -62,13 +72,8 @@ def test_decode_publication_and_staging_follow_live_request_coordinates(
         )
 
     # Exercise a singleton, a partial batch and the non-power-of-two capacity,
-    # then shrink again while changing the page horizon and selected KV group.
-    for count, width, group in (
-        (1, 1, 0),
-        (3, 3, 1),
-        (capacity, 5, 0),
-        (1, 3, 1),
-    ):
+    # then shrink again while changing the staged width.
+    for count, width in ((1, 1), (3, 3), (capacity, 5), (1, 3)):
         live = slots[::-1][:count]
         indices = torch.tensor(live, dtype=torch.int64, device=device)
         tokens = torch.tensor(
@@ -98,18 +103,25 @@ def test_decode_publication_and_staging_follow_live_request_coordinates(
         assert state.sampling_positions.tolist() == expected_sampling
         assert state.predicates.tolist() == expected_predicates
 
+        # The windowed group has retired every page before the one its
+        # readers' windows reach, so its first staged page is its first
+        # installed page.
+        first = [max(length - 2, 0) // 2 for length in expected_lengths]
+        starts[1].copy_(torch.tensor(first, dtype=torch.int32))
+
         staging_slots[:count].copy_(indices)
-        tables = table_storage[:, :width]
         gather_request_decode_inputs(
             request_pool_indices=staging_slots,
-            request_page_tables=pages,
+            request_unit_tables=units,
+            request_start_pages=starts,
+            table_shapes=shapes,
             request_cache_lengths=state.valid_cache_lengths,
             request_tokens=state.future_input_tokens[:, 0],
             request_positions=state.logical_lengths,
             block_tables=tables,
+            start_pages=start_pages,
             rows=count,
-            group_id=group,
-            page_size=2,
+            columns=width,
             **outputs,
         )
         padding = capacity - count
@@ -123,21 +135,32 @@ def test_decode_publication_and_staging_follow_live_request_coordinates(
             == [expected_lengths[s] for s in live] + [0] * padding
         )
         assert outputs["query_lengths"].tolist() == [1] * capacity
-        assert (
-            tables.tolist()
-            == pages[group, live, :width].tolist() + [[0] * width] * padding
-        )
+        for table in range(2):
+            assert (
+                tables[table, :, :width].tolist()
+                == units[table, live, :width].tolist() + [[0] * width] * padding
+            )
+        assert start_pages.tolist() == [
+            [0] * capacity,
+            [first[s] for s in live] + [0] * padding,
+        ]
         assert outputs["query_offsets"].tolist() == list(range(capacity + 1))
         assert outputs["prefix_offsets"].tolist() == list(
             accumulate(
                 [expected_lengths[s] for s in live] + [0] * padding, initial=0
             )
         )
-        assert (
-            outputs["write_indices"].tolist()
-            == [
-                (group * (capacity + 1) + s) * 10 + expected_lengths[s]
+        # Each token writes the unit of its page, counted from the table's
+        # first installed page, at its offset in the page.
+        writes = [
+            [
+                int(units[table, s, length // 2 - start]) * 2 + length % 2
                 for s in live
+                for length, start in (
+                    (expected_lengths[s], first[s] if table else 0),
+                )
             ]
             + [-1] * padding
-        )
+            for table in range(2)
+        ]
+        assert outputs["write_indices"].tolist() == writes

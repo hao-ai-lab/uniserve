@@ -285,7 +285,7 @@ class ModelExecutor:
         self.prefill_row_sizes: tuple[int, ...] = ()
         self.flow_captures: tuple[DiffusionShape, ...] = ()
         self.flow_cfg_branches: tuple[int, ...] = ()
-        self.decode_context_blocks = 0
+        self.table_widths: tuple[int, ...] = ()
         self.decode_predicates = None
         self.kv_cache = None
         # A standalone denoiser's component, binding and call, the request
@@ -1059,7 +1059,7 @@ class ModelExecutor:
         request_slots,
         max_tokens,
         latent_capacity_units,
-        decode_context_blocks,
+        table_widths,
         max_inflight,
     ):
         """Bind staged input resources and graph budgets for every capability.
@@ -1079,21 +1079,25 @@ class ModelExecutor:
             raise RuntimeError("input execution resources are already bound")
 
         self.kv_cache, self.decode_predicates = kv_cache, decode_predicates
-        self.decode_context_blocks = decode_context_blocks
+        self.table_widths = tuple(table_widths)
         self.prefill_row_sizes = DEFAULT_PREFILL_GRAPH_ROW_BUCKETS
         config = self.worker_config
         self._initialize_streams(event_slots=max_inflight + 1)
 
+        # A decode row holds at least one page of every cache group, and one
+        # prefill row at most the tokens the pool's units cover in every
+        # group.
         max_rows = min(max_calls, request_slots)
         decode_sizes = tuple(
             value
             for value in config.decode_graph_batch_sizes
-            if 0 < value <= max_rows and value < kv_cache.info.num_blocks
+            if 0 < value <= max_rows
+            and value * kv_cache.row_units < kv_cache.info.num_units
         )
         prefill_capacity = min(
             max_tokens,
             config.max_sequence_tokens,
-            (kv_cache.info.num_blocks - 1) * config.block_size,
+            kv_cache.token_capacity,
         )
         prefill_sizes = tuple(
             value
@@ -1296,7 +1300,7 @@ class ModelExecutor:
                 )
 
                 entry.decode_shapes, entry.prefill_shapes = decode, prefill
-                entry.decode_context_blocks = decode_context_blocks
+                entry.table_widths = self.table_widths
 
                 for kind in kinds:
                     key = (name, kind)

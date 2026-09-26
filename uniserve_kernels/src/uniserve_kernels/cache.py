@@ -1,24 +1,21 @@
-"""Paged K/V scatter, FP8 block rescaling and block initialization.
+"""Paged K/V scatter and FP8 block rescaling.
 
 Caches store ``[blocks, tokens, heads, dim]`` rows. Writes address physical
 token slots ``block * block_size + token``; ``-1`` skips a token.
 
-These kernels back ``uniserve.cache.paged.paged_kv_write``,
-``uniserve.cache._fp8.rescale_`` and ``uniserve.runtime._block_fill.BlockFill``;
-``uniserve_kernels.attention.paged`` also calls the scatter body from its own
-kernel. The scatter and the fill have eligibility checks
-(``unsupported_paged_kv_write``, ``can_fill_blocks``). ``paged_kv_write``
-raises on CUDA when the scatter check reports a reason; ``BlockFill`` issues
-one ``fill_`` per field when the fused fill does not apply. Every launch
-selects the device of its tensors, independently of the calling thread's
-current CUDA device.
+These kernels back ``uniserve.cache.paged.paged_kv_write`` and
+``uniserve.cache._fp8.rescale_``; ``uniserve_kernels.attention.paged`` also
+calls the scatter body from its own kernel. The scatter has an eligibility
+check (``unsupported_paged_kv_write``); ``paged_kv_write`` raises on CUDA
+when it reports a reason. Every launch selects the device of its tensors,
+independently of the calling thread's current CUDA device.
 """
 
 from __future__ import annotations
 
 import torch
 
-from uniserve_kernels.triton import launchable, tl, triton, unsupported_operands
+from uniserve_kernels.triton import tl, triton, unsupported_operands
 
 # Elements of one flattened ``heads * dim`` cache row per scatter program.
 # ``uniserve_kernels.attention.paged`` passes the same width as a literal.
@@ -143,43 +140,6 @@ if triton is not None:
                 tl.store(
                     values + block * width + indices, encoded, indices < width
                 )
-
-
-if triton is not None:
-
-    @triton.jit
-    def _fill_kernel(
-        tensors,
-        widths: tl.constexpr,
-        values: tl.constexpr,
-        tiles: tl.constexpr,
-        start,
-        block: tl.constexpr,
-    ):
-        # Grid axis 0 walks the per-field ``block``-element tiles of one cache
-        # block, concatenated across fields; axis 1 indexes cache blocks along
-        # the leading axis, offset by ``start``. Field ``i`` is a contiguous
-        # tensor of ``widths[i]`` elements per cache block. Widths, values
-        # and tile counts are constexpr; ``start`` is a runtime argument.
-        tile = tl.program_id(0)
-        page = start + tl.program_id(1)
-        # The unrolled field loop selects the one field whose tile range
-        # contains this program; ``first`` accumulates each field's starting
-        # tile at compile time.
-        first: tl.constexpr = 0
-        for field in tl.static_range(len(widths)):
-            if tile >= first and tile < first + tiles[field]:
-                offsets = (tile - first) * block + tl.arange(0, block)
-                # The cache block index widens to int64 before scaling by the
-                # field width, so offsets past 2**31 elements do not overflow.
-                tl.store(
-                    tensors[field]
-                    + page.to(tl.int64) * widths[field]
-                    + offsets,
-                    values[field],
-                    offsets < widths[field],
-                )
-            first += tiles[field]
 
 
 #: Cache dtypes a scatter may convert floating sources into; the store
@@ -322,53 +282,4 @@ def rescale_fp8_blocks(
                 torch.float32: tl.float32,
             }[dtype],
             num_warps=4,
-        )
-
-
-def can_fill_blocks(tensors: tuple[torch.Tensor, ...]) -> bool:
-    """Return whether contiguous CUDA fields of fillable dtypes fit."""
-    return (
-        bool(tensors)
-        and launchable(tensors[0].device)
-        and all(
-            tensor.device == tensors[0].device
-            and tensor.is_contiguous()
-            and tensor.dtype
-            in {
-                torch.bool,
-                torch.uint8,
-                torch.int8,
-                torch.int16,
-                torch.int32,
-                torch.int64,
-                torch.float16,
-                torch.bfloat16,
-                torch.float32,
-                torch.float64,
-            }
-            for tensor in tensors
-        )
-    )
-
-
-def fill_blocks(
-    tensors: tuple[torch.Tensor, ...],
-    values: tuple[int, ...],
-    widths: tuple[int, ...],
-    start: int,
-    stop: int,
-) -> None:
-    """Fill leading-axis blocks ``[start, stop)`` of every field in one launch.
-
-    ``widths`` holds each field's elements per block and ``values`` each
-    field's fill value, converted to the field dtype on store. The caller
-    must have passed ``tensors`` to ``can_fill_blocks`` and owns bounds
-    validation of the interval.
-    """
-    # The tile count and the kernel's ``block`` argument share the 1024
-    # element tile width.
-    tiles = tuple((width + 1023) // 1024 for width in widths)
-    with torch.cuda.device(tensors[0].device):
-        _fill_kernel[(sum(tiles), stop - start)](
-            tensors, widths, values, tiles, start, 1024
         )

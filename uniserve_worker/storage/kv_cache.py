@@ -1,18 +1,21 @@
-"""Request page assignment, cache publications, imports, and retirement.
+"""Request unit assignment, cache publications, imports, and retirement.
 
-``KVCacheManager`` wraps one ``PrefixCache`` of paged MHA K/V state on a
-worker rank and decides when each physical page interval may be rewritten
-or reused. Page allocation belongs to the engine scheduler; this manager
-validates the page ids it assigns and owns the request block tables
-(``BlockTables``) that model calls index. Three kinds of owner retain page
-intervals, each as ``page -> (token offset, token count)``:
+``KVCacheManager`` wraps one ``PrefixCache`` unit pool on a worker rank and
+decides when each physical unit interval may be rewritten or reused. Unit
+allocation belongs to the engine scheduler; this manager validates the unit
+ids it assigns and owns the request block tables (``BlockTables``) that model
+calls index. A cache group's logical page occupies ``units_per_page`` units
+that each hold the page's tokens of some of the group's layers, so an
+interval of a page's tokens is retained on every unit of the page. Three
+kinds of owner retain unit intervals, each as ``unit -> (token offset, token
+count)``:
 
-- Execution accesses (``CacheAccess``): the pages a model call reads or
+- Execution accesses (``CacheAccess``): the units a model call reads or
   writes, retained until the batch's completion future succeeds.
 - Publications (``CacheExport``): an immutable token interval exported
   through transports, retained until the buffer is released and every
   physical registration has retired.
-- Imports (``CacheImports``): scheduler-assigned destination pages that an
+- Imports (``CacheImports``): scheduler-assigned destination units that an
   import stream fills from a publication.
 
 Writers ask ``write_dependencies`` which futures must resolve first, and
@@ -34,17 +37,22 @@ from threading import RLock
 
 import torch
 
-from uniserve.cache import block_spans, mha
+from uniserve.math import ceil_div
 from uniserve.runtime import PrefixCache
 from uniserve_worker.errors import invalid_descriptor, resource_error
 from uniserve_worker.protocol.identity import BufferId, CallId, RequestKey
 from uniserve_worker.protocol.transfer import (
+    KvGroupTransfer,
     KvTransfer,
     Locator,
     TensorTransfer,
 )
 from uniserve_worker.protocol.worker_info import KVCacheInfo
-from uniserve_worker.storage.block_tables import BlockTables
+from uniserve_worker.storage.block_tables import (
+    BlockTables,
+    GroupShape,
+    GroupTable,
+)
 from uniserve_worker.storage.cache_imports import CacheImport, CacheImports
 from uniserve_worker.transport.exports import ExportLocations, release_exports
 from uniserve_worker.transport.interface import Transport
@@ -57,14 +65,13 @@ __all__ = ["KVCacheManager"]
 class CacheExport:
     """An immutable token interval retained by its physical publications.
 
-    Ranges map each physical page to its token offset and token count. A
+    Ranges map each physical unit to its token offset and token count. A
     publication covers every layer's K/V for these ranges, so appends outside
-    the interval remain independent even when they share its final physical
-    page.
+    the interval remain independent even when they share its final page.
 
     Attributes:
         buffer: Buffer identity the publication is registered under.
-        ranges: Retained interval per physical page.
+        ranges: Retained interval per physical unit.
         retirements: One future per physical registration, attached through
             ``KVCacheManager.retain_publication``.
         released: Whether semantic ownership has been revoked. The entry
@@ -80,11 +87,11 @@ class CacheExport:
 
 @dataclass(eq=False, slots=True)
 class CacheAccess:
-    """Physical page intervals retained by one computation's completion.
+    """Physical unit intervals retained by one computation's completion.
 
     Every model access that shares one ``completion`` future joins one
     access; ``requests`` names their request keys and ``ranges`` keeps one
-    interval per page.
+    interval per unit.
     """
 
     completion: Future[None]
@@ -92,10 +99,23 @@ class CacheAccess:
     ranges: dict[int, tuple[int, int]]
 
 
-class KVCacheManager:
-    """Coordinate request ownership around one numerical cache.
+@dataclass(frozen=True, slots=True)
+class GroupAxis:
+    """Where this rank's layers of one group lie in its transfer layer axis.
 
-    Physical page ``0`` is the padding sentinel and is never allocatable.
+    A published group tensor spans every layer of the group across pipeline
+    stages, ``total`` layers in global cache-layer order; this rank's layers
+    are the consecutive run starting at ``offset``.
+    """
+
+    offset: int
+    total: int
+
+
+class KVCacheManager:
+    """Coordinate request ownership around one numerical unit pool.
+
+    Physical unit ``0`` is the padding sentinel and is never allocatable.
     """
 
     def __init__(
@@ -103,66 +123,89 @@ class KVCacheManager:
         cache: PrefixCache,
         *,
         info: KVCacheInfo,
-        group_ranges: Sequence[tuple[int, int]] | None = None,
+        group_layers: Sequence[Sequence[int]] | None = None,
         import_capacity: int = 1,
         request_pool_size: int = 1,
-        max_blocks_per_request: int | None = None,
+        table_width: int | None = None,
         staging_depth: int = 1,
     ) -> None:
-        """Validate the cache backing and create the ownership tables.
+        """Validate the unit pool against ``info`` and create its owners.
 
         Args:
-            cache: Paged numerical K/V storage; closed by ``close``.
-            info: Advertised page count, page size, head and layer extents.
-            group_ranges: Physical ``(first page, page count)`` per cache
-                group. Defaults to one group covering the whole pool.
+            cache: Numerical K/V unit pool; closed by ``close``.
+            info: Advertised unit count and group page shapes and placement.
+            group_layers: Global cache-layer ids of every layer of each group
+                across all pipeline stages, in ascending order; defaults to
+                this rank's layers, the complete group without pipelining.
             import_capacity: Maximum copy tasks ``CacheImports`` admits at
                 once.
             request_pool_size: Request slots of the block tables.
-            max_blocks_per_request: Block-table width; defaults to every
-                non-sentinel page.
+            table_width: Most pages one slot's group table may hold; defaults
+                to every non-sentinel unit.
             staging_depth: Depth of the block tables' host staging rings.
 
         Raises:
-            ValueError: When the backing does not match ``info``, does not
-                hold MHA state, or ``staging_depth`` is below 1.
-            WorkerError: ``invalid_descriptor`` when the group ranges do not
-                tile the physical pool exactly or a block-table dimension is
-                below 1.
+            ValueError: When the pool does not match ``info``, a group's
+                layers are not one consecutive run of its transfer layers, or
+                ``staging_depth`` is below 1.
+            WorkerError: ``invalid_descriptor`` when a block-table dimension
+                is below 1.
         """
         self.cache, self.info = cache, info
-        self.layers = tuple(cache.config.layers)
-        if len(self.layers) != info.num_layers:
+        groups = cache.groups
+        if cache.num_units != info.num_units or len(groups) != len(info.groups):
             raise ValueError(
-                "cache backing must cover the advertised resident layers"
+                "cache backing must match the advertised unit pool"
             )
-        for name in self.layers:
-            state = cache.state(name)
-            if not isinstance(state, mha.State):
-                raise ValueError("cache backing must hold MHA state layers")
-            # Physical K/V pages are
-            # [page, token within page, KV head, head dim].
-            if state.key.shape != (
-                info.num_blocks,
-                info.block_size,
-                info.num_kv_heads,
-                info.head_dim,
+        for group, advertised in zip(groups, info.groups, strict=True):
+            if (
+                group.page_tokens != advertised.page_tokens
+                or group.units_per_page != advertised.units_per_page
+                or group.num_kv_heads != advertised.num_kv_heads
+                or group.head_dim != advertised.head_dim
+                or len(group.layers) != len(advertised.layer_ids)
             ):
                 raise ValueError(
-                    "cache backing must match the advertised page and head "
-                    "extents"
+                    "cache backing must match the advertised group shapes"
                 )
 
-        layout = cache.config.layers[self.layers[0]]
-        if not isinstance(layout, mha.Config):
-            raise ValueError("cache backing must hold MHA state layers")
-        self.compute_dtype = layout.compute_dtype
-        self.group_ranges = self._group_ranges(group_ranges)
-        self.group_count = len(self.group_ranges)
-        # Reuse normalized page tuples after their bounds and group ownership
-        # have been established by the validation path.
-        self._validated_page_tuples: dict[
-            tuple[tuple[int, ...], bool, int | None], tuple[int, ...]
+        # Every group's layers read one transfer layer axis; this rank's run
+        # must be consecutive and in order within it.
+        complete = (
+            [tuple(group.layer_ids) for group in info.groups]
+            if group_layers is None
+            else [tuple(int(layer) for layer in axis) for axis in group_layers]
+        )
+        if len(complete) != len(info.groups):
+            raise ValueError("every cache group requires its transfer layers")
+        self.axes: tuple[GroupAxis, ...] = ()
+        for axis, group in zip(complete, info.groups, strict=True):
+            local = tuple(group.layer_ids)
+            if local[0] not in axis:
+                raise ValueError(
+                    "cache group layers are missing from their transfer axis"
+                )
+            offset = axis.index(local[0])
+            if axis[offset : offset + len(local)] != local:
+                raise ValueError(
+                    "cache group layers must be one consecutive transfer run"
+                )
+            self.axes += (GroupAxis(offset, len(axis)),)
+
+        self.compute_dtypes = tuple(
+            cache.config.layers[group.layers[0]].compute_dtype
+            for group in groups
+        )
+        self.shapes = tuple(
+            GroupShape(group.page_tokens, group.units_per_page, group.window)
+            for group in groups
+        )
+        # The most tokens a unit holds in any group bounds a whole-unit span.
+        self._unit_tokens = max(group.page_tokens for group in groups)
+        # Reuse normalized unit tuples after their bounds have been
+        # established by the validation path.
+        self._validated_units: dict[
+            tuple[tuple[int, ...], bool], tuple[int, ...]
         ] = {}
 
         # Transport locations of committed exports, updated by the batch
@@ -170,21 +213,20 @@ class KVCacheManager:
         self.exports: dict[BufferId, ExportLocations] = {}
         self._sources: dict[BufferId, CacheExport] = {}
 
-        # Execution accesses by completion future, indexed by page.
+        # Execution accesses by completion future, indexed by unit.
         # ``_execution_completed`` runs as a future callback on the thread
         # that resolves the completion, so both maps are mutated under
         # ``_execution_lock``.
         self._executions: dict[Future[None], CacheAccess] = {}
-        self._execution_pages: dict[int, set[CacheAccess]] = {}
+        self._execution_units: dict[int, set[CacheAccess]] = {}
         self._execution_lock = RLock()
 
         self.block_tables = BlockTables(
-            group_count=self.group_count,
+            groups=self.shapes,
             request_pool_size=request_pool_size,
-            max_blocks_per_request=max(1, self.info.num_blocks - 1)
-            if max_blocks_per_request is None
-            else max_blocks_per_request,
-            block_size=self.info.block_size,
+            width=max(1, self.info.num_units - 1)
+            if table_width is None
+            else table_width,
             device=cache.device,
             staging_depth=staging_depth,
         )
@@ -204,36 +246,64 @@ class KVCacheManager:
 
         self.imports = CacheImports(self, capacity=import_capacity)
 
-    @contextmanager
-    def startup_pages(self, count: int, *, group: int = 0):
-        """Borrow bounded scratch pages before scheduler admission.
+    @property
+    def row_units(self) -> int:
+        """Return the units one page of every cache group occupies."""
+        return sum(shape.units_per_page for shape in self.shapes)
 
-        Yields the first ``count`` allocatable pages of ``group``, zeroed on
-        entry and again on exit, after the current stream drains on CUDA. The
-        startup caller serializes this lease with other preparation. Serving
+    @property
+    def token_capacity(self) -> int:
+        """Return the most tokens one request's tables can cover at once.
+
+        Every group holds whole pages of the same tokens. Page sizes are
+        powers of two, so whole pages of the largest size fill every group
+        exactly; the allocatable units (all but the sentinel) bound how many
+        such spans fit.
+        """
+        largest = max(shape.page_tokens for shape in self.shapes)
+        span_units = sum(
+            largest // shape.page_tokens * shape.units_per_page
+            for shape in self.shapes
+        )
+        return (self.info.num_units - 1) // span_units * largest
+
+    def page_units(self, tokens: int) -> int:
+        """Return the units of whole pages covering ``tokens`` in every group.
+
+        At least one page per group, even for zero tokens.
+        """
+        return sum(
+            ceil_div(max(1, tokens), shape.page_tokens) * shape.units_per_page
+            for shape in self.shapes
+        )
+
+    @contextmanager
+    def startup_units(self, count: int):
+        """Borrow bounded scratch units before scheduler admission.
+
+        Yields the first ``count`` allocatable units, reset on entry and
+        again on exit, after the current stream drains on CUDA. The startup
+        caller serializes this lease with other preparation. Serving
         allocation authority remains with the scheduler; no request or
         publication is introduced.
 
         Raises:
             RuntimeError: When any cache interval is still retained.
-            ValueError: When ``count`` is negative or exceeds the group's
-                allocatable pages.
-            WorkerError: ``invalid_descriptor`` when ``group`` is out of
-                range.
+            ValueError: When ``count`` is negative or exceeds the allocatable
+                units.
         """
         if self.has_pending_accesses:
             raise RuntimeError("startup scratch requires an idle KV pool")
-        available = self.page_ids(group)
-        if not 0 <= count <= len(available):
+        if not 0 <= count < self.info.num_units:
             raise ValueError("startup scratch exceeds KV capacity")
-        pages = tuple(available[:count])
-        self.zero_pages(group, pages)
+        units = tuple(range(1, count + 1))
+        self.zero_units(units)
         try:
-            yield pages
+            yield units
         finally:
             if self.cache.device.type == "cuda":
                 torch.cuda.current_stream(self.cache.device).synchronize()
-            self.zero_pages(group, pages)
+            self.zero_units(units)
 
     @property
     def has_pending_accesses(self) -> bool:
@@ -245,32 +315,31 @@ class KVCacheManager:
     def retain_execution(
         self,
         request: RequestKey,
-        page_ids: Sequence[int],
+        table: GroupTable,
         *,
-        group: int,
         length: int,
         completion: Future[None],
     ) -> None:
         """Retain a model access until its device work completes.
 
-        The access covers tokens ``[0, length)`` of ``page_ids`` in
-        ``group``. Model calls are ordered by the runner; this retention
-        keeps independent import streams and page reuse
+        The access covers the table's tokens from its start page up to
+        ``length``. Model calls are ordered by the runner; this retention
+        keeps independent import streams and unit reuse
         (``require_reusable``, ``write_dependencies``) away from these ranges
-        while a producer or consumer kernel may still run. A zero ``length``
-        retains nothing, and an already resolved ``completion`` retains
-        nothing and re-raises its failure or cancellation.
+        while a producer or consumer kernel may still run. An access that
+        reaches no held token retains nothing, and an already resolved
+        ``completion`` retains nothing and re-raises its failure or
+        cancellation.
 
         Raises:
-            WorkerError: ``invalid_descriptor`` when the pages are invalid
-                for ``group``.
+            WorkerError: ``invalid_descriptor`` when the table's units are
+                invalid or ``length`` exceeds its pages.
         """
-        if not length:
+        start = table.start_page * table.shape.page_tokens
+        if length <= start:
             return
-        pages = self.validate_pages(page_ids, group=group)
-        ranges = tuple(
-            block_spans(pages, 0, length, block_size=self.info.block_size)
-        )
+        self.validate_units(table.units)
+        ranges = table.spans(start, length - start)
 
         with self._execution_lock:
             if completion.done():
@@ -284,16 +353,16 @@ class KVCacheManager:
                 self._executions[completion] = execution
             execution.requests.add(request)
 
-            # Each page keeps one interval: the hull of every span retained
+            # Each unit keeps one interval: the hull of every span retained
             # on it by this access.
-            for page, offset, count in ranges:
-                previous = execution.ranges.get(page)
+            for unit, offset, count in ranges:
+                previous = execution.ranges.get(unit)
                 if previous is not None:
                     end = max(previous[0] + previous[1], offset + count)
                     offset = min(previous[0], offset)
                     count = end - offset
-                execution.ranges[page] = (offset, count)
-                self._execution_pages.setdefault(page, set()).add(execution)
+                execution.ranges[unit] = (offset, count)
+                self._execution_units.setdefault(unit, set()).add(execution)
 
         if register:
             completion.add_done_callback(self._execution_completed)
@@ -309,11 +378,11 @@ class KVCacheManager:
             if execution is None:
                 return
 
-            for page in execution.ranges:
-                uses = self._execution_pages[page]
+            for unit in execution.ranges:
+                uses = self._execution_units[unit]
                 uses.remove(execution)
                 if not uses:
-                    del self._execution_pages[page]
+                    del self._execution_units[unit]
 
     def _execution_dependencies(
         self, ranges: Sequence[tuple[int, int, int]]
@@ -323,52 +392,47 @@ class KVCacheManager:
             return tuple(
                 {
                     execution.completion
-                    for page, offset, count in ranges
-                    for execution in self._execution_pages.get(page, ())
+                    for unit, offset, count in ranges
+                    for execution in self._execution_units.get(unit, ())
                     if self._ranges_overlap(
-                        execution.ranges, ((page, offset, count),)
+                        execution.ranges, ((unit, offset, count),)
                     )
                 }
             )
 
-    def require_reusable(
-        self, page_ids: Sequence[int], *, group: int, start: int, length: int
-    ) -> None:
-        """Authorize page initialization or stream import before submission.
+    def unit_spans(
+        self, units: Iterable[int]
+    ) -> tuple[tuple[int, int, int], ...]:
+        """Span every token each unit can hold, in any group.
 
-        Applies ``require_writable`` and also rejects intervals that an
-        execution access still retains, including one whose completion
-        failed or was cancelled. ``zero_pages`` and
-        ``CacheImports.reserve`` call this before writing pages.
+        A whole-unit reset or import conflicts with any retained interval of
+        the unit, whichever group recorded it.
+        """
+        return tuple((unit, 0, self._unit_tokens) for unit in units)
+
+    def require_reusable(self, ranges: Sequence[tuple[int, int, int]]) -> None:
+        """Authorize unit initialization or stream import before submission.
+
+        ``ranges`` holds ``(unit, token offset, token count)`` spans. Applies
+        ``require_writable`` and also rejects spans that an execution access
+        still retains, including one whose completion failed or was
+        cancelled. ``zero_units`` and ``CacheImports.reserve`` call this
+        before writing units.
 
         Raises:
-            WorkerError: A resource error when the interval overlaps a
-                publication, an import destination or an execution access;
-                ``invalid_descriptor`` when the pages are invalid and a
-                publication or import is retained.
+            WorkerError: A resource error when a span overlaps a publication,
+                an import destination or an execution access.
         """
-        self.require_writable(page_ids, group=group, start=start, length=length)
-        if self._execution_dependencies(
-            tuple(
-                block_spans(
-                    page_ids, start, length, block_size=self.info.block_size
-                )
-            )
-        ):
+        self._require_unretained(ranges)
+        if self._execution_dependencies(ranges):
             raise resource_error(
                 "KV interval still has an executing producer or consumer"
             )
 
     def reserve_publication(
-        self,
-        buffer: BufferId,
-        page_ids: Sequence[int],
-        *,
-        group: int,
-        start: int,
-        length: int,
+        self, buffer: BufferId, ranges: Sequence[tuple[int, int, int]]
     ) -> CacheExport:
-        """Retain the exact published interval before exporting any view.
+        """Retain the exact published spans before exporting any view.
 
         The caller attaches every registration's retirement future with
         ``retain_publication`` and releases this reservation
@@ -376,23 +440,18 @@ class KVCacheManager:
         visibility.
 
         Raises:
-            WorkerError: ``invalid_descriptor`` when the pages are invalid,
-                the interval is empty, or ``buffer`` already has a retained
-                interval.
+            WorkerError: ``invalid_descriptor`` when the spans are empty or
+                ``buffer`` already has a retained interval.
         """
         self._reap_sources()
-        pages = self.validate_pages(page_ids, group=group)
-        ranges = {
-            page: (offset, count)
-            for page, offset, count in block_spans(
-                pages, start, length, block_size=self.info.block_size
-            )
-        }
         if not ranges or buffer in self._sources:
             raise invalid_descriptor(
                 "KV publication has an empty or already registered interval"
             )
-        source = CacheExport(buffer, ranges)
+        source = CacheExport(
+            buffer,
+            {unit: (offset, count) for unit, offset, count in ranges},
+        )
         self._sources[source.buffer] = source
         return source
 
@@ -459,10 +518,10 @@ class KVCacheManager:
                     future.result()
         self._reap_sources()
 
-        # Free retires a publication, not the request's resident KV pages.
+        # Free retires a publication, not the request's resident KV units.
         # Unrelated products can share that request while later computation
         # still reads its prefix. Only request retirement waits for all such
-        # call kinds; physical page reuse separately checks their ranges.
+        # call kinds; physical unit reuse separately checks their ranges.
         with self._execution_lock:
             executions = tuple(
                 execution
@@ -481,25 +540,17 @@ class KVCacheManager:
         )
 
     def write_dependencies(
-        self, page_ids: Sequence[int], *, group: int, start: int, length: int
+        self, ranges: Sequence[tuple[int, int, int]]
     ) -> tuple[Future[None], ...]:
-        """Return the futures that must resolve before writing an interval.
+        """Return the futures that must resolve before writing spans.
 
-        These are the completions of overlapping execution accesses and the
+        ``ranges`` holds ``(unit, token offset, token count)`` spans. These
+        are the completions of overlapping execution accesses and the
         retirements of overlapping import destinations and publications.
-        Returns an empty tuple without validating the pages when nothing is
-        retained.
-
-        Raises:
-            WorkerError: ``invalid_descriptor`` when the pages are invalid.
         """
         if not self.has_pending_accesses:
             return ()
         self._reap_sources()
-        pages = self.validate_pages(page_ids, group=group)
-        ranges = tuple(
-            block_spans(pages, start, length, block_size=self.info.block_size)
-        )
         return (
             self._execution_dependencies(ranges)
             + self.imports.dependencies(ranges)
@@ -512,30 +563,34 @@ class KVCacheManager:
         )
 
     def require_writable(
-        self, page_ids: Sequence[int], *, group: int, start: int, length: int
+        self, table: GroupTable, *, start: int, length: int
     ) -> None:
-        """Authorize the interval before staging any kernel that can write it.
+        """Authorize a table interval before staging a kernel that writes it.
 
         Device-indexed attention kernels borrow raw cache views. Their caller
         must validate the scheduler's write interval here before dispatch; no
-        device-to-host read of per-token addresses is needed in the kernel path.
-        When no publication or import is retained, this returns without
-        validating the pages.
+        device-to-host read of per-token addresses is needed in the kernel
+        path. When no publication or import is retained, this returns without
+        validating the units.
 
         Raises:
             WorkerError: A resource error when the interval overlaps a
                 publication or an import destination; ``invalid_descriptor``
-                when the pages are invalid.
+                when the interval exceeds the table.
         """
         # The runner orders model accesses. Only independent imports and
         # published immutable ranges add write conflicts at this boundary.
         if not self._sources and not self.imports:
             return
+        self._require_unretained(table.spans(start, length))
+
+    def _require_unretained(
+        self, ranges: Sequence[tuple[int, int, int]]
+    ) -> None:
+        """Reject spans overlapping a publication or import destination."""
+        if not self._sources and not self.imports:
+            return
         self._reap_sources()
-        pages = self.validate_pages(page_ids, group=group)
-        ranges = tuple(
-            block_spans(pages, start, length, block_size=self.info.block_size)
-        )
         if any(
             self._ranges_overlap(source.ranges, ranges)
             for source in self._sources.values()
@@ -549,16 +604,16 @@ class KVCacheManager:
         left: Mapping[int, tuple[int, int]],
         right: Sequence[tuple[int, int, int]],
     ) -> bool:
-        """Whether any ``right`` span meets ``left``'s interval on its page.
+        """Whether any ``right`` span meets ``left``'s interval on its unit.
 
-        Intervals overlap only on the same page and only when their token
+        Intervals overlap only on the same unit and only when their token
         ranges intersect.
         """
         return any(
-            (other := left.get(page)) is not None
+            (other := left.get(unit)) is not None
             and offset < other[0] + other[1]
             and other[0] < offset + count
-            for page, offset, count in right
+            for unit, offset, count in right
         )
 
     def _reap_sources(self) -> None:
@@ -603,197 +658,121 @@ class KVCacheManager:
         self._installed_bases.clear()
         self.cache.close()
 
-    def _group_ranges(
-        self,
-        declared: Sequence[tuple[int, int]] | None,
-    ) -> tuple[tuple[int, int], ...]:
-        """Normalize physical cache-group ranges.
-
-        The ranges must tile ``[0, num_blocks)`` exactly: no gaps, no
-        overlap. Page ``0`` lies in whichever group covers it but is never
-        allocatable (``page_ids``).
-
-        Raises:
-            WorkerError: ``invalid_descriptor`` when the ranges are empty,
-                out of bounds, overlapping or incomplete.
-        """
-        ranges = (
-            ((0, self.info.num_blocks),)
-            if declared is None
-            else tuple((int(offset), int(count)) for offset, count in declared)
-        )
-        if not ranges:
-            raise invalid_descriptor("KVCache declares no KV groups")
-
-        covered = [False] * self.info.num_blocks
-        for group, (offset, count) in enumerate(ranges):
-            end = offset + count
-            if offset < 0 or count < 1 or end > self.info.num_blocks:
-                raise invalid_descriptor(
-                    f"KV group {group} has invalid physical page bounds"
-                )
-            for page in range(offset, end):
-                if covered[page]:
-                    raise invalid_descriptor(
-                        "KV group physical page ranges overlap"
-                    )
-                covered[page] = True
-
-        if not all(covered):
-            raise invalid_descriptor(
-                "KV group physical page ranges do not cover the request pool"
-            )
-        return ranges
-
     def validate_group(self, group: int) -> int:
         """Return ``group`` as an integer after checking its range.
 
         Raises:
-            WorkerError: ``invalid_descriptor`` when ``group`` is outside
-                ``[0, group_count)``.
+            WorkerError: ``invalid_descriptor`` when ``group`` is outside the
+                advertised groups.
         """
         value = int(group)
-        if value < 0 or value >= self.group_count:
+        if value < 0 or value >= len(self.shapes):
             raise invalid_descriptor(
-                f"KV group {value} outside pool group count {self.group_count}"
+                f"KV group {value} outside pool group count {len(self.shapes)}"
             )
         return value
 
-    def page_ids(self, group: int) -> range:
-        """Return the allocatable page ids of one cache group.
-
-        The sentinel page ``0`` is excluded.
-        """
-        group_id = self.validate_group(group)
-        offset, count = self.group_ranges[group_id]
-        return range(max(1, offset), offset + count)
-
-    def validate_pages(
-        self,
-        page_ids: Iterable[int],
-        *,
-        allow_sentinel: bool = False,
-        group: int | None = None,
+    def validate_units(
+        self, unit_ids: Iterable[int], *, allow_sentinel: bool = False
     ) -> tuple[int, ...]:
-        """Validate physical page ids and return them as a tuple of ints.
+        """Validate physical unit ids and return them as a tuple of ints.
 
-        Real (non-zero) pages must be unique, in ``[1, num_blocks)`` and,
-        when ``group`` is given, inside that group's range. The sentinel page
-        ``0`` is accepted, possibly repeated, only with ``allow_sentinel``.
-        Accepted tuples are memoized; the checks depend only on the pool
-        layout fixed at construction.
+        Real (non-zero) units must be unique and in ``[1, num_units)``. The
+        sentinel unit ``0`` is accepted, possibly repeated, only with
+        ``allow_sentinel``. Accepted tuples are memoized; the checks depend
+        only on the pool size fixed at construction.
 
         Raises:
             WorkerError: ``invalid_descriptor`` when any check fails.
         """
-        # Resident scheduler tables already use immutable integer tuples. Check
-        # their validated identity before normalizing every element again.
-        pages = tuple(page_ids)
-        key = (pages, bool(allow_sentinel), group)
-        cached = self._validated_page_tuples.get(key)
+        # Resident scheduler tables already use immutable integer tuples.
+        # Check their validated identity before normalizing every element.
+        units = tuple(unit_ids)
+        key = (units, bool(allow_sentinel))
+        cached = self._validated_units.get(key)
         if cached is not None:
             return cached
-        pages = tuple(int(page) for page in pages)
-        key = (pages, bool(allow_sentinel), group)
+        units = tuple(int(unit) for unit in units)
+        key = (units, bool(allow_sentinel))
 
-        # Page 0 is the padding sentinel; uniqueness and group bounds apply
-        # only to real pages.
-        real_pages = tuple(page for page in pages if page != 0)
-        if len(set(real_pages)) != len(real_pages):
-            raise invalid_descriptor("KV allocation repeats a physical page")
-
+        # Unit 0 is the padding sentinel; uniqueness applies only to real
+        # units.
+        real_units = tuple(unit for unit in units if unit != 0)
+        if len(set(real_units)) != len(real_units):
+            raise invalid_descriptor("KV allocation repeats a physical unit")
         lower = 0 if allow_sentinel else 1
-        upper = self.info.num_blocks
-        if pages and (min(pages) < lower or max(pages) >= upper):
+        if units and (min(units) < lower or max(units) >= self.info.num_units):
             raise invalid_descriptor(
                 "KV allocation exceeds the fixed physical pool"
             )
 
-        if group is not None:
-            group_id = self.validate_group(group)
-            offset, count = self.group_ranges[group_id]
-            end = offset + count
-            if any(page < offset or page >= end for page in real_pages):
-                raise invalid_descriptor(
-                    "KV allocation addresses another cache group"
-                )
-
         # Bound the memo by clearing it wholesale.
-        if len(self._validated_page_tuples) >= 16_384:
-            self._validated_page_tuples.clear()
-        self._validated_page_tuples[key] = pages
-        return pages
+        if len(self._validated_units) >= 16_384:
+            self._validated_units.clear()
+        self._validated_units[key] = units
+        return units
 
-    def zero_pages(self, group: int, page_ids: Iterable[int]) -> None:
-        """Zero every layer and field for the selected physical KV pages.
+    def zero_units(self, unit_ids: Iterable[int]) -> None:
+        """Reset every column and field of the selected physical units.
 
         Raises:
-            WorkerError: ``invalid_descriptor`` when the pages are invalid
-                for ``group``; a resource error from ``require_reusable``
-                when any selected page is still retained.
+            WorkerError: ``invalid_descriptor`` when the units are invalid;
+                a resource error from ``require_reusable`` when any selected
+                unit is still retained.
         """
-        pages = self.validate_pages(page_ids, group=group)
-        if not pages:
+        units = self.validate_units(unit_ids)
+        if not units:
             return
-        self.require_reusable(
-            pages,
-            group=group,
-            start=0,
-            length=len(pages) * self.info.block_size,
-        )
-        for name in self.layers:
-            self.cache.zero_blocks(name, pages)
+        self.require_reusable(self.unit_spans(units))
+        self.cache.zero_units(units)
 
-    def _layer_stacks(
-        self, buffer: str
-    ) -> tuple[tuple[int, torch.Tensor], ...]:
-        """Pair each allocation run of `buffer` with its first logical layer.
+    def _published_start(self, group: int, base: int, visible: int) -> int:
+        """Return the first token a group carries in a publication.
 
-        Runs cover the resident layers in order, so a run's first logical
-        layer is this rank's layer offset plus the layers of earlier runs.
+        A full-attention group carries the whole suffix after ``base``; a
+        sliding-window group only the history a reader of ``visible`` needs.
         """
-        stacks = []
-        layer = self.info.layer_offset
-        for names, stack in self.cache.layer_stacks(buffer):
-            stacks.append((layer, stack))
-            layer += len(names)
-        return tuple(stacks)
+        window = self.shapes[group].window
+        return base if window is None else max(base, visible - window)
 
     def publish(
         self,
         *,
         request_pool_idx: int,
-        group_id: int,
         visible_length: int,
         destination: str,
         buffer: BufferId,
         transports: Mapping[str, Transport],
         consumers: Sequence[int] = (),
     ) -> KvTransfer:
-        """Export a visible KV extent under its exact buffer identity.
+        """Export a visible KV extent of every group under its buffer identity.
 
         Publications to one ``(request, destination)`` form a chain: this one
-        exports only tokens ``[base_extent, visible_length)``, where the base
-        is the latest committed publication to that destination. An empty
-        suffix exports no tensors. The suffix interval is reserved before
-        any view is exported. The returned ``KvTransfer`` becomes resident
-        only when the batch commits it (``validate_publications`` then
-        ``apply_publications``).
+        exports only tokens after ``base_extent``, the latest committed
+        publication to that destination, and a sliding-window group only its
+        window before ``visible_length``. An empty suffix exports no tensors.
+        The exported spans are reserved before any view is exported. The
+        returned ``KvTransfer`` becomes resident only when the batch commits
+        it (``validate_publications`` then ``apply_publications``).
 
         `consumers` are the acknowledgment slots of the ranks that install it.
 
         Raises:
             WorkerError: ``invalid_descriptor`` when the slot has no installed
-                table for ``group_id``, ``visible_length`` exceeds its
-                allocated length or trails the destination base, or the
-                reservation fails. A transport failure propagates after every
-                exported locator and the reservation are released.
+                table for a group, ``visible_length`` exceeds its allocated
+                length or trails the destination base, a group interval
+                reaches retired pages, or the reservation fails. A transport
+                failure propagates after every exported locator and the
+                reservation are released.
         """
         installed = self._destination_bases.get((buffer.owner, destination))
         base, base_extent = (None, 0) if installed is None else installed
 
-        pages = self.block_tables.pages(request_pool_idx, group_id)
         visible = int(visible_length)
+        tables = tuple(
+            self.block_tables.table(request_pool_idx, group)
+            for group in range(len(self.shapes))
+        )
         if visible > self.block_tables.allocated_length(request_pool_idx):
             raise invalid_descriptor(
                 "KV publication exceeds its scheduler block table"
@@ -803,123 +782,44 @@ class KVCacheManager:
                 "KV publication destination is ahead of its source"
             )
 
-        suffix = visible - base_extent
+        starts = tuple(
+            self._published_start(group, base_extent, visible)
+            for group in range(len(tables))
+        )
+        spans = tuple(
+            table.spans(start, visible - start)
+            for table, start in zip(tables, starts, strict=True)
+        )
         source = (
             self.reserve_publication(
-                buffer, pages, group=group_id, start=base_extent, length=suffix
+                buffer, tuple(span for group in spans for span in group)
             )
-            if suffix
+            if visible > base_extent
             else None
         )
 
         locators: list[Locator] = []
-        tensors: list[TensorTransfer] = []
+        groups: list[KvGroupTransfer] = []
         try:
-            if suffix:
-                assert source is not None
-                spans = block_spans(
-                    pages, base_extent, suffix, self.info.block_size
-                )
-                encoded = self.info.dtype == "float8_e4m3fn"
-                fields = ("key", "value")
-                # Each run of layers sharing one backing exports as a single
-                # tensor per mechanism, so the descriptor's locator count
-                # follows the cache's allocation runs and the rank's
-                # mechanisms, never the model's depth, which keeps the
-                # descriptor within its byte bound.
-                for field in fields:
-                    locations: list[Locator] = []
-                    for layer, stack in self._layer_stacks(f"{field}.values"):
-                        # Stacks are [layers, pages, page tokens, kv heads,
-                        # head dim]; each span view is [tokens, layers, kv
-                        # heads, head dim] over the run's layers. Unencoded
-                        # views alias the live pages: ``require_writable``
-                        # rejects writes into the reserved interval until it
-                        # is released and retired.
-                        views = tuple(
-                            stack[:, page, start : start + count].permute(
-                                1, 0, 2, 3
-                            )
-                            for page, start, count in spans
-                        )
-                        if encoded:
-                            # Appending can enlarge a block's scale and
-                            # re-encode its prefix. Freeze exported bytes so
-                            # an immutable publication survives later
-                            # numerical block updates.
-                            views = (torch.cat(views, dim=0),)
-                        # The offset places this run inside the global
-                        # [suffix, total layers, total KV heads, head dim]
-                        # transfer at the run's first layer and this rank's
-                        # first KV head.
-                        exported = publish_tensor(
-                            transports,
-                            views,
-                            retain=partial(self.retain_publication, source),
-                            offset=(0, layer, self.info.kv_head_offset, 0),
-                            consumers=consumers,
-                        )
-                        locations.extend(exported)
-                        locators.extend(exported)
-                    tensors.append(
-                        TensorTransfer(
-                            shape=(
-                                suffix,
-                                self.info.total_layers,
-                                self.info.total_kv_heads,
-                                self.info.head_dim,
-                            ),
-                            locations=tuple(locations),
-                        )
+            if source is not None:
+                for group, (table, start) in enumerate(
+                    zip(tables, starts, strict=True)
+                ):
+                    tensors = self._publish_group(
+                        group,
+                        table,
+                        start,
+                        visible,
+                        source=source,
+                        transports=transports,
+                        consumers=consumers,
+                        locators=locators,
                     )
-
-                # FP8 exports additionally carry one scale row per
-                # published page.
-                if encoded:
-                    locations = []
-                    for field_index, field in enumerate(fields):
-                        for layer, stack in self._layer_stacks(
-                            f"{field}.scale"
-                        ):
-                            # Scale stacks are [layers, pages, 1, 1, 1] with
-                            # one scale per page; published rows are [page,
-                            # K/V, layers, head group], frozen like the values
-                            # they encode. A rank's head group is its KV-head
-                            # offset divided by its local KV-head count.
-                            views = (
-                                torch.cat(
-                                    tuple(
-                                        stack[:, page].reshape(1, 1, -1, 1)
-                                        for page, _, _ in spans
-                                    ),
-                                    dim=0,
-                                ),
-                            )
-                            exported = publish_tensor(
-                                transports,
-                                views,
-                                retain=partial(self.retain_publication, source),
-                                consumers=consumers,
-                                offset=(
-                                    0,
-                                    field_index,
-                                    layer,
-                                    self.info.kv_head_offset
-                                    // self.info.num_kv_heads,
-                                ),
-                            )
-                            locations.extend(exported)
-                            locators.extend(exported)
-                    tensors.append(
-                        TensorTransfer(
-                            shape=(
-                                len(spans),
-                                2,
-                                self.info.total_layers,
-                                self.info.total_kv_heads
-                                // self.info.num_kv_heads,
-                            ),
-                            locations=tuple(locations),
+                    groups.append(
+                        KvGroupTransfer(
+                            start=start,
+                            page_tokens=table.shape.page_tokens,
+                            tensors=tensors,
                         )
                     )
         except BaseException:
@@ -928,18 +828,160 @@ class KVCacheManager:
             self.release_buffers((buffer,))
             raise
 
+        # Every group of one pool shares a compute dtype; the first names it.
         publication = KvTransfer(
-            tensors=tuple(tensors),
+            groups=tuple(groups),
             source=buffer,
             destination=destination,
             base=base,
             base_extent=base_extent,
             published_extent=visible,
-            group_id=int(group_id),
-            compute_dtype=str(self.compute_dtype).removeprefix("torch."),
-            page_size=self.info.block_size,
+            compute_dtype=str(self.compute_dtypes[0]).removeprefix("torch."),
         )
         return publication
+
+    def _publish_group(
+        self,
+        group: int,
+        table: GroupTable,
+        start: int,
+        visible: int,
+        *,
+        source: CacheExport,
+        transports: Mapping[str, Transport],
+        consumers: Sequence[int],
+        locators: list[Locator],
+    ) -> tuple[TensorTransfer, ...]:
+        """Export one group's tokens ``[start, visible)`` of every layer.
+
+        Returns the group's key, value and, with FP8, scale transfers; appends
+        every exported locator to ``locators``.
+        """
+        count = visible - start
+        if not count:
+            return ()
+        advertised = self.info.groups[group]
+        axis = self.axes[group]
+        columns = self.cache.planes.columns
+        page_tokens = table.shape.page_tokens
+        encoded = self.info.dtype == "float8_e4m3fn"
+        # Pages the carried tokens touch, as (absolute page, offset, count).
+        pages = []
+        position = start
+        while position < visible:
+            page, offset = divmod(position, page_tokens)
+            length = min(visible - position, page_tokens - offset)
+            pages.append((page, offset, length))
+            position += length
+
+        tensors = []
+        for field in ("key", "value"):
+            planes = self.cache.planes_of(group, field)
+            locations: list[Locator] = []
+            # The layers in unit ``row`` of every page are one consecutive
+            # run of ``columns`` layers, exported as one tensor per
+            # mechanism: the descriptor's locator count follows the group's
+            # units per page and the rank's mechanisms, never the model's
+            # depth, which keeps it within its byte bound.
+            for row in range(table.shape.units_per_page):
+                units = table.row(row)
+                # Planes are [columns, units, page tokens, heads, dim]; each
+                # page view is [tokens, columns, heads, dim]. Unencoded views
+                # alias the live units: ``require_writable`` rejects writes
+                # into the reserved interval until it is released and
+                # retired.
+                views = tuple(
+                    planes[
+                        :,
+                        units[page - table.start_page],
+                        offset : offset + length,
+                    ].permute(1, 0, 2, 3)
+                    for page, offset, length in pages
+                )
+                if encoded:
+                    # Appending can enlarge a unit's scale and re-encode its
+                    # prefix. Freeze exported bytes so an immutable
+                    # publication survives later numerical updates.
+                    views = (torch.cat(views, dim=0),)
+                # The offset places this run inside the group's
+                # [tokens, layers, KV heads, head dim] transfer at the run's
+                # first layer and this rank's first KV head.
+                exported = publish_tensor(
+                    transports,
+                    views,
+                    retain=partial(self.retain_publication, source),
+                    offset=(
+                        0,
+                        axis.offset + row * columns,
+                        advertised.kv_head_offset,
+                        0,
+                    ),
+                    consumers=consumers,
+                )
+                locations.extend(exported)
+                locators.extend(exported)
+            tensors.append(
+                TensorTransfer(
+                    shape=(
+                        count,
+                        axis.total,
+                        advertised.total_kv_heads,
+                        advertised.head_dim,
+                    ),
+                    locations=tuple(locations),
+                )
+            )
+
+        # FP8 exports additionally carry one scale row per touched page.
+        if encoded:
+            locations = []
+            for field_index, field in enumerate(("key", "value")):
+                scales = self.cache.scales_of(field)
+                for row in range(table.shape.units_per_page):
+                    units = table.row(row)
+                    # Scale planes are [columns, units, 1, 1, 1] with one scale
+                    # per unit and column; published rows are [page, K/V,
+                    # layers, head group], frozen like the values they
+                    # encode. A rank's head group is its KV-head offset
+                    # divided by its local KV-head count.
+                    views = (
+                        torch.cat(
+                            tuple(
+                                scales[
+                                    :, units[page - table.start_page]
+                                ].reshape(1, 1, -1, 1)
+                                for page, _, _ in pages
+                            ),
+                            dim=0,
+                        ),
+                    )
+                    exported = publish_tensor(
+                        transports,
+                        views,
+                        retain=partial(self.retain_publication, source),
+                        consumers=consumers,
+                        offset=(
+                            0,
+                            field_index,
+                            axis.offset + row * columns,
+                            advertised.kv_head_offset
+                            // advertised.num_kv_heads,
+                        ),
+                    )
+                    locations.extend(exported)
+                    locators.extend(exported)
+            tensors.append(
+                TensorTransfer(
+                    shape=(
+                        len(pages),
+                        2,
+                        axis.total,
+                        advertised.total_kv_heads // advertised.num_kv_heads,
+                    ),
+                    locations=tuple(locations),
+                )
+            )
+        return tuple(tensors)
 
     def publication(self, buffer: BufferId) -> KvTransfer:
         """Return the resident KV publication registered for ``buffer``.
@@ -964,17 +1006,16 @@ class KVCacheManager:
         buffer: BufferId,
         *,
         request_pool_idx: int,
-        group_id: int,
         visible_length: int,
         publication: KvTransfer | None = None,
     ) -> KvTransfer:
         """Verify that a request's allocation still covers a publication.
 
-        ``buffer`` must belong to ``request_key``, ``group_id`` must be the
-        publication's group, the published extent must lie within both
-        ``visible_length`` and the slot's allocated length, and the slot must
-        have an installed table for the group. ``publication`` skips
-        the directory lookup when the caller already holds it.
+        ``buffer`` must belong to ``request_key``, the published extent must
+        lie within both ``visible_length`` and the slot's allocated length,
+        and the slot must have an installed table for every group.
+        ``publication`` skips the directory lookup when the caller already
+        holds it.
 
         Returns:
             The publication.
@@ -992,24 +1033,25 @@ class KVCacheManager:
             )
         if (
             int(visible_length) < publication.published_extent
-            or int(group_id) != publication.group_id
             or self.block_tables.allocated_length(request_pool_idx)
             < publication.published_extent
         ):
             raise invalid_descriptor(
                 "KV conditioning allocation disagrees with its publication"
             )
-        self.block_tables.pages(request_pool_idx, group_id)
+        for group in range(len(self.shapes)):
+            self.block_tables.table(request_pool_idx, group)
         return publication
 
     def _validate_install(self, publication: KvTransfer) -> None:
-        """Check lineage and transfer shape before destination access.
+        """Check lineage and every group's transfer shape before access.
 
         A first installation into ``(request, destination)`` has no base and
         a zero base extent; a later one must name the currently installed
-        base and extent. When the publication carries tensors, the first
-        must have this worker's global
-        ``[suffix, total layers, total KV heads, head dim]`` shape.
+        base and extent. A publication carrying tensors must carry one entry
+        per group, each ``[tokens, group layers, KV heads, head dim]`` over
+        this worker's transfer axes and starting where this worker's group
+        needs it.
 
         Raises:
             WorkerError: ``invalid_descriptor`` when either check fails.
@@ -1024,15 +1066,28 @@ class KVCacheManager:
             raise invalid_descriptor(
                 "KV installation base does not match destination"
             )
-        if publication.tensors:
-            suffix = publication.published_extent - publication.base_extent
-            expected = (
-                suffix,
-                self.info.total_layers,
-                self.info.total_kv_heads,
-                self.info.head_dim,
+        if not publication.groups:
+            return
+        if len(publication.groups) != len(self.shapes):
+            raise invalid_descriptor(
+                "KV transfer groups do not match destination groups"
             )
-            if publication.tensors[0].shape != expected:
+        for group, value in enumerate(publication.groups):
+            advertised = self.info.groups[group]
+            expected_start = self._published_start(
+                group, publication.base_extent, publication.published_extent
+            )
+            carried = publication.published_extent - value.start
+            if value.start != expected_start or (
+                value.tensors
+                and value.tensors[0].shape
+                != (
+                    carried,
+                    self.axes[group].total,
+                    advertised.total_kv_heads,
+                    advertised.head_dim,
+                )
+            ):
                 raise invalid_descriptor(
                     "KV transfer shape does not match destination layers"
                 )
@@ -1042,60 +1097,83 @@ class KVCacheManager:
         publication: KvTransfer,
         *,
         request_pool_idx: int,
-        page_ids: tuple[int, ...],
-        allocated_length: int,
-        initialized_pages: tuple[int, ...],
+        tables: Sequence[GroupTable],
+        initialized_units: tuple[int, ...],
         transports: Mapping[str, Transport],
     ) -> CacheImport:
-        """Reserve scheduler pages and start their bounded physical import.
+        """Reserve scheduler units and start their bounded physical import.
 
-        ``page_ids`` is the destination's page table, ``allocated_length``
-        its token capacity, and ``initialized_pages`` the new pages the
-        import zeroes before copying. Pages that hold the installed base must
-        stay in place and must not be re-initialized. The copy runs in
-        ``CacheImports``; ``install`` adopts it once complete.
+        ``tables`` is the destination's table of every group and
+        ``initialized_units`` the new units the import resets before copying.
+        Units that hold the installed base must stay in place and must not
+        be reset. The copy runs in ``CacheImports``; ``install`` adopts it
+        once complete.
 
         Raises:
-            WorkerError: ``invalid_descriptor`` when lineage, shape, pages or
+            WorkerError: ``invalid_descriptor`` when lineage, shape, units or
                 capacity are invalid, imports are closed, or the publication
                 source already has a registered import; a resource error
                 when a destination interval is still retained or the import
                 lane is closed or has no capacity.
         """
         self._validate_install(publication)
-        group_id = publication.group_id
-        pages = self.validate_pages(page_ids, group=group_id)
-        initialized = self.validate_pages(initialized_pages, group=group_id)
-        if (
-            allocated_length > len(pages) * self.info.block_size
-            or allocated_length < publication.published_extent
-            or not set(initialized).issubset(pages)
-        ):
+        if len(tables) != len(self.shapes):
             raise invalid_descriptor(
-                "KV import exceeds its scheduler block table"
+                "KV import requires a destination table per group"
+            )
+        initialized = self.validate_units(initialized_units)
+        held = set()
+        for table in tables:
+            held.update(self.validate_units(table.units))
+            if (
+                table.allocated_tokens < publication.published_extent
+                or table.start_page * table.shape.page_tokens
+                > publication.published_extent
+            ):
+                raise invalid_descriptor(
+                    "KV import exceeds its scheduler block table"
+                )
+        if not set(initialized).issubset(held):
+            raise invalid_descriptor(
+                "KV import resets units outside its block tables"
             )
 
         if publication.base_extent:
-            base_pages = (
-                publication.base_extent + self.info.block_size - 1
-            ) // self.info.block_size
-            # The installed base pages must stay identical and must not be
-            # re-initialized by this import.
-            installed_pages = self.block_tables.pages(
-                request_pool_idx, group_id
-            )[:base_pages]
-            if pages[:base_pages] != installed_pages or set(
-                initialized
-            ).intersection(installed_pages):
-                raise invalid_descriptor(
-                    "KV import would replace its installed base pages"
+            # Units of the pages that hold the installed base must stay
+            # identical and must not be reset by this import.
+            for group, table in enumerate(tables):
+                installed = self.block_tables.table(request_pool_idx, group)
+                page_tokens = table.shape.page_tokens
+                first = max(table.start_page, installed.start_page)
+                last = min(
+                    -(-publication.base_extent // page_tokens),
+                    table.end_page,
+                    installed.end_page,
                 )
+                per_page = table.shape.units_per_page
+                for page in range(first, last):
+                    new = table.units[
+                        (page - table.start_page) * per_page : (
+                            page - table.start_page + 1
+                        )
+                        * per_page
+                    ]
+                    old = installed.units[
+                        (page - installed.start_page) * per_page : (
+                            page - installed.start_page + 1
+                        )
+                        * per_page
+                    ]
+                    if new != old or set(new).intersection(initialized):
+                        raise invalid_descriptor(
+                            "KV import would replace its installed base units"
+                        )
 
         return self.imports.reserve(
             publication,
             request_pool_idx=request_pool_idx,
-            pages=pages,
-            initialized_pages=initialized,
+            tables=tuple(tables),
+            initialized_units=initialized,
             transports=transports,
         )
 
@@ -1107,7 +1185,7 @@ class KVCacheManager:
     ) -> KvTransfer:
         """Adopt a completed physical import under its source and base.
 
-        The request's block table must be unchanged since
+        The request's block tables must be unchanged since
         ``prepare_install``. The slot's verified length becomes the published
         extent; the returned ``KvTransfer`` becomes resident when the batch
         commits (``apply_publications``).
@@ -1115,7 +1193,7 @@ class KVCacheManager:
         Raises:
             RuntimeError: When the import has not completed.
             WorkerError: ``invalid_descriptor`` when identities, lineage or
-                the block table disagree, or the import was abandoned.
+                the block tables disagree, or the import was abandoned.
             Exception: The import's own failure, re-raised.
         """
         publication = write.publication
@@ -1123,12 +1201,13 @@ class KVCacheManager:
             raise invalid_descriptor("installed KV buffer identity is invalid")
 
         self._validate_install(publication)
-        request_pool_idx, group_id = (
-            write.request_pool_idx,
-            publication.group_id,
-        )
+        request_pool_idx = write.request_pool_idx
         if (
-            self.block_tables.pages(request_pool_idx, group_id) != write.pages
+            tuple(
+                self.block_tables.table(request_pool_idx, group)
+                for group in range(len(self.shapes))
+            )
+            != write.tables
             or self.block_tables.allocated_length(request_pool_idx)
             < publication.published_extent
         ):
@@ -1139,11 +1218,11 @@ class KVCacheManager:
         self.imports.adopt(write)
         self.block_tables.set_verified(
             torch.tensor(
-                (request_pool_idx,), device=self.block_tables.page_tables.device
+                (request_pool_idx,), device=self.block_tables.unit_tables.device
             ),
             torch.tensor(
                 (publication.published_extent,),
-                device=self.block_tables.page_tables.device,
+                device=self.block_tables.unit_tables.device,
             ),
         )
         return publication

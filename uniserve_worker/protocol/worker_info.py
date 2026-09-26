@@ -68,23 +68,57 @@ class KvGroupKind(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class KvGroup:
-    """Describe the page count and retention policy of one KV cache group.
+    """Describe one cache group of a worker's KV unit pool.
+
+    A logical page of the group holds ``page_tokens`` tokens of every layer
+    in the group and occupies ``units_per_page`` units of the pool.
 
     Attributes:
-        num_blocks: Physical pages in this group's share of the page pool.
-        kind: Attention retention policy of the group.
-        window: With `KvGroupKind.SLIDING_WINDOW`, the number of recent tokens
-            retained for attention. Encoded only for a sliding window and
+        kind: History retention policy of the group.
+        window: With `KvGroupKind.SLIDING_WINDOW`, the history tokens any
+            reader of the group needs. Encoded only for a sliding window and
             decoded as zero when absent.
-        sink: With `KvGroupKind.SLIDING_WINDOW`, the number of prefix tokens
-            retained outside the window. Encoded only for a sliding window
-            and decoded as zero when absent.
+        sink: With `KvGroupKind.SLIDING_WINDOW`, prefix tokens retained
+            outside the window; the unit pool supports only zero. Encoded
+            only for a sliding window and decoded as zero when absent.
+        page_tokens: Tokens per logical page; a power of two.
+        units_per_page: Units one logical page occupies.
+        layer_ids: Global cache-layer ids of this rank's layers in the
+            group, in column order.
+        num_kv_heads: KV heads this rank stores per layer.
+        total_kv_heads: Logical KV heads of each layer.
+        kv_head_offset: First logical KV head stored by this rank.
+        head_dim: Elements per KV head.
     """
 
-    num_blocks: int
     kind: KvGroupKind
     window: int
     sink: int
+    page_tokens: int
+    units_per_page: int
+    layer_ids: tuple[int, ...]
+    num_kv_heads: int
+    total_kv_heads: int
+    kv_head_offset: int
+    head_dim: int
+
+    def __post_init__(self) -> None:
+        """Validate the page shape and this rank's layers and heads."""
+        if (
+            self.page_tokens < 1
+            or self.page_tokens & (self.page_tokens - 1)
+            or self.units_per_page < 1
+            or not self.layer_ids
+            or len(set(self.layer_ids)) != len(self.layer_ids)
+            or self.num_kv_heads < 1
+            or self.head_dim < 1
+            or self.kv_head_offset + self.num_kv_heads > self.total_kv_heads
+        ):
+            raise invalid_descriptor("worker KV group is invalid")
+        if self.kind is KvGroupKind.SLIDING_WINDOW and self.sink:
+            raise invalid_descriptor(
+                "worker KV group retains sliding-window sink tokens"
+            )
 
     @classmethod
     def from_mapping(cls, value: object, where: str) -> KvGroup:
@@ -96,111 +130,20 @@ class KvGroup:
         data = _map(value, where)
         kind_data = _map(data.get("kind"), f"{where}.kind")
         return cls(
-            num_blocks=_uint(data.get("num_blocks"), f"{where}.num_blocks"),
             kind=_enum(
                 KvGroupKind, kind_data.get("kind"), f"{where}.kind.kind"
             ),
             window=_uint(kind_data.get("window", 0), f"{where}.kind.window"),
             sink=_uint(kind_data.get("sink", 0), f"{where}.kind.sink"),
-        )
-
-    def to_mapping(self) -> dict[str, object]:
-        """Encode KV group settings for the scheduler wire format.
-
-        Covers full-context and sliding-window settings.
-        """
-        kind: dict[str, object] = {"kind": self.kind.value}
-        if self.kind is KvGroupKind.SLIDING_WINDOW:
-            kind.update(window=self.window, sink=self.sink)
-        return {
-            "num_blocks": self.num_blocks,
-            "kind": kind,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class KVCacheInfo:
-    """Publish KV cache layout to the scheduler.
-
-    `num_layers` and `num_kv_heads` describe this rank's share of the model's
-    logical cache; `total_layers`, `total_kv_heads`, and the two offsets place
-    that share within it. `block_size` is tokens per physical page,
-    `num_blocks` the pages in the pool, which `groups` partition, and
-    `bytes_per_token` the physical bytes one token occupies on this rank.
-    """
-
-    block_size: int
-    num_blocks: int
-    num_layers: int
-    total_layers: int
-    layer_offset: int
-    num_kv_heads: int
-    total_kv_heads: int
-    kv_head_offset: int
-    head_dim: int
-    bytes_per_token: int
-    groups: tuple[KvGroup, ...]
-    dtype: str
-
-    def __post_init__(self) -> None:
-        """Validate the KV dimensions and the page partition.
-
-        Requires positive dimensions and a non-empty dtype, layer and head
-        intervals inside their logical totals, and groups whose positive page
-        counts sum to `num_blocks`.
-        """
-        if (
-            min(
-                self.block_size,
-                self.num_blocks,
-                self.num_layers,
-                self.num_kv_heads,
-                self.head_dim,
-                self.bytes_per_token,
-            )
-            < 1
-            or not self.groups
-            or not self.dtype
-        ):
-            raise invalid_descriptor(
-                "worker info declares incomplete KV dimensions"
-            )
-        if (
-            self.kv_head_offset < 0
-            or self.kv_head_offset + self.num_kv_heads > self.total_kv_heads
-        ):
-            raise invalid_descriptor(
-                "worker KV head interval exceeds its logical bounds"
-            )
-        if (
-            self.layer_offset < 0
-            or self.layer_offset + self.num_layers > self.total_layers
-        ):
-            raise invalid_descriptor(
-                "worker KV layer interval exceeds its logical bounds"
-            )
-        if any(group.num_blocks < 1 for group in self.groups):
-            raise invalid_descriptor(
-                "worker info KV groups must be physical page partitions"
-            )
-        if sum(group.num_blocks for group in self.groups) != self.num_blocks:
-            raise invalid_descriptor(
-                "worker info KV groups must cover the physical page pool"
-            )
-
-    @classmethod
-    def from_mapping(cls, value: object, where: str) -> KVCacheInfo:
-        """Decode and validate physical KV dimensions from the wire mapping."""
-        data = _map(value, where)
-        return cls(
-            block_size=_uint(data.get("block_size"), f"{where}.block_size"),
-            num_blocks=_uint(data.get("num_blocks"), f"{where}.num_blocks"),
-            num_layers=_uint(data.get("num_layers"), f"{where}.num_layers"),
-            total_layers=_uint(
-                data.get("total_layers"), f"{where}.total_layers"
+            page_tokens=_uint(data.get("page_tokens"), f"{where}.page_tokens"),
+            units_per_page=_uint(
+                data.get("units_per_page"), f"{where}.units_per_page"
             ),
-            layer_offset=_uint(
-                data.get("layer_offset"), f"{where}.layer_offset"
+            layer_ids=tuple(
+                _uint(item, f"{where}.layer_ids[{index}]")
+                for index, item in enumerate(
+                    _seq(data.get("layer_ids"), f"{where}.layer_ids")
+                )
             ),
             num_kv_heads=_uint(
                 data.get("num_kv_heads"), f"{where}.num_kv_heads"
@@ -212,33 +155,86 @@ class KVCacheInfo:
                 data.get("kv_head_offset"), f"{where}.kv_head_offset"
             ),
             head_dim=_uint(data.get("head_dim"), f"{where}.head_dim"),
-            bytes_per_token=_uint(
-                data.get("bytes_per_token"), f"{where}.bytes_per_token"
-            ),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        """Encode the group's policy, page shape and placement."""
+        kind: dict[str, object] = {"kind": self.kind.value}
+        if self.kind is KvGroupKind.SLIDING_WINDOW:
+            kind.update(window=self.window, sink=self.sink)
+        return {
+            "kind": kind,
+            "page_tokens": self.page_tokens,
+            "units_per_page": self.units_per_page,
+            "layer_ids": list(self.layer_ids),
+            "num_kv_heads": self.num_kv_heads,
+            "total_kv_heads": self.total_kv_heads,
+            "kv_head_offset": self.kv_head_offset,
+            "head_dim": self.head_dim,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class KVCacheInfo:
+    """Publish the KV unit pool to the scheduler.
+
+    The pool is `num_units` units of `unit_bytes` bytes each on this rank,
+    unit zero being the padding sentinel; every group's pages draw from it.
+    """
+
+    num_units: int
+    unit_bytes: int
+    dtype: str
+    groups: tuple[KvGroup, ...]
+
+    def __post_init__(self) -> None:
+        """Validate the pool size and the groups' combined page shapes.
+
+        Requires an allocatable unit beyond the sentinel, a positive unit
+        size, a dtype, and groups whose page sizes divide the largest one and
+        whose layers are distinct.
+        """
+        if (
+            self.num_units < 2
+            or self.unit_bytes < 1
+            or not self.groups
+            or not self.dtype
+        ):
+            raise invalid_descriptor(
+                "worker info declares an incomplete KV unit pool"
+            )
+        largest = max(group.page_tokens for group in self.groups)
+        if any(largest % group.page_tokens for group in self.groups) or any(
+            group.units_per_page >= self.num_units for group in self.groups
+        ):
+            raise invalid_descriptor("worker KV group page shape is invalid")
+        layers = [layer for group in self.groups for layer in group.layer_ids]
+        if len(set(layers)) != len(layers):
+            raise invalid_descriptor("worker KV groups must not repeat a layer")
+
+    @classmethod
+    def from_mapping(cls, value: object, where: str) -> KVCacheInfo:
+        """Decode and validate the KV unit pool from the wire mapping."""
+        data = _map(value, where)
+        return cls(
+            num_units=_uint(data.get("num_units"), f"{where}.num_units"),
+            unit_bytes=_uint(data.get("unit_bytes"), f"{where}.unit_bytes"),
+            dtype=_str(data.get("dtype"), f"{where}.dtype"),
             groups=tuple(
                 KvGroup.from_mapping(item, f"{where}.groups[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("groups"), f"{where}.groups")
                 )
             ),
-            dtype=_str(data.get("dtype"), f"{where}.dtype"),
         )
 
     def to_mapping(self) -> dict[str, object]:
-        """Encode KV dimensions and page groups for scheduler discovery."""
+        """Encode the unit pool and its groups for scheduler discovery."""
         return {
-            "block_size": self.block_size,
-            "num_blocks": self.num_blocks,
-            "num_layers": self.num_layers,
-            "total_layers": self.total_layers,
-            "layer_offset": self.layer_offset,
-            "num_kv_heads": self.num_kv_heads,
-            "total_kv_heads": self.total_kv_heads,
-            "kv_head_offset": self.kv_head_offset,
-            "head_dim": self.head_dim,
-            "bytes_per_token": self.bytes_per_token,
-            "groups": [group.to_mapping() for group in self.groups],
+            "num_units": self.num_units,
+            "unit_bytes": self.unit_bytes,
             "dtype": self.dtype,
+            "groups": [group.to_mapping() for group in self.groups],
         }
 
 

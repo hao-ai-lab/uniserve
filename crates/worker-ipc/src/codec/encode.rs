@@ -284,8 +284,8 @@ fn block_table<'a>(
     b: &mut FlatBufferBuilder<'a>,
     v: &BlockTable,
 ) -> WIPOffset<fbs::BlockTable<'a>> {
-    let page_ids = {
-        let values = v.page_ids.iter().map(|page| page.0).collect::<Vec<_>>();
+    let unit_ids = {
+        let values = v.unit_ids.iter().map(|unit| unit.0).collect::<Vec<_>>();
         Some(b.create_vector(&values))
     };
     fbs::BlockTable::create(
@@ -293,26 +293,27 @@ fn block_table<'a>(
         &fbs::BlockTableArgs {
             request_pool_idx: v.request_pool_idx,
             group_id: v.group_id,
-            page_ids,
+            start_page: v.start_page,
+            unit_ids,
             allocated_tokens: v.allocated_tokens,
         },
     )
 }
 
-fn cache_pages<'a>(
+fn cache_units<'a>(
     b: &mut FlatBufferBuilder<'a>,
-    v: &CachePageAllocation,
-) -> WIPOffset<fbs::CachePageAllocation<'a>> {
-    let page_ids = {
-        let values = v.page_ids.iter().map(|page| page.0).collect::<Vec<_>>();
+    v: &CacheUnitAllocation,
+) -> WIPOffset<fbs::CacheUnitAllocation<'a>> {
+    let unit_ids = {
+        let values = v.unit_ids.iter().map(|unit| unit.0).collect::<Vec<_>>();
         Some(b.create_vector(&values))
     };
-    fbs::CachePageAllocation::create(
+    fbs::CacheUnitAllocation::create(
         b,
-        &fbs::CachePageAllocationArgs {
+        &fbs::CacheUnitAllocationArgs {
             request_pool_idx: v.request_pool_idx,
             group_id: v.group_id,
-            page_ids,
+            unit_ids,
         },
     )
 }
@@ -381,7 +382,7 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
     // The schema has no `Bounds` table: the bounds are scalar fields of the
     // `Call` table, which `call_from_table` reassembles.
     let max_tokens = v.bounds.max_tokens;
-    let max_kv_pages = v.bounds.max_kv_pages;
+    let max_kv_units = v.bounds.max_kv_units;
     let max_latent_bytes = v.bounds.max_latent_bytes;
     let max_completion_bytes = v.bounds.max_completion_bytes;
     let max_transfer_bytes = v.bounds.max_transfer_bytes;
@@ -445,7 +446,7 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
             component,
             code: Some(&code),
             max_tokens,
-            max_kv_pages,
+            max_kv_units,
             max_latent_bytes,
             max_completion_bytes,
             max_transfer_bytes,
@@ -576,11 +577,11 @@ fn kv_transfer<'a>(
     b: &mut FlatBufferBuilder<'a>,
     v: &KvTransfer,
 ) -> WIPOffset<fbs::KvTransfer<'a>> {
-    let tensors = {
+    let groups = {
         let items = v
-            .tensors
+            .groups
             .iter()
-            .map(|item| tensor_transfer(b, item))
+            .map(|item| kv_group_transfer(b, item))
             .collect::<Vec<_>>();
         Some(b.create_vector(&items))
     };
@@ -591,15 +592,35 @@ fn kv_transfer<'a>(
     fbs::KvTransfer::create(
         b,
         &fbs::KvTransferArgs {
-            tensors,
+            groups,
             source,
             destination,
             base,
             base_extent: v.base_extent,
             published_extent: v.published_extent,
-            group_id: v.group_id,
             compute_dtype,
-            page_size: v.page_size,
+        },
+    )
+}
+
+fn kv_group_transfer<'a>(
+    b: &mut FlatBufferBuilder<'a>,
+    v: &KvGroupTransfer,
+) -> WIPOffset<fbs::KvGroupTransfer<'a>> {
+    let tensors = {
+        let items = v
+            .tensors
+            .iter()
+            .map(|item| tensor_transfer(b, item))
+            .collect::<Vec<_>>();
+        Some(b.create_vector(&items))
+    };
+    fbs::KvGroupTransfer::create(
+        b,
+        &fbs::KvGroupTransferArgs {
+            start: v.start,
+            page_tokens: v.page_tokens,
+            tensors,
         },
     )
 }
@@ -767,11 +788,11 @@ fn batch<'a>(b: &mut FlatBufferBuilder<'a>, v: &Batch) -> WIPOffset<fbs::Batch<'
             .collect::<Vec<_>>();
         Some(b.create_vector(&items))
     };
-    let new_cache_pages = {
+    let new_cache_units = {
         let items = v
-            .new_cache_pages
+            .new_cache_units
             .iter()
-            .map(|item| cache_pages(b, item))
+            .map(|item| cache_units(b, item))
             .collect::<Vec<_>>();
         Some(b.create_vector(&items))
     };
@@ -835,7 +856,7 @@ fn batch<'a>(b: &mut FlatBufferBuilder<'a>, v: &Batch) -> WIPOffset<fbs::Batch<'
             collective_seq: v.collective_seq,
             calls,
             block_tables,
-            new_cache_pages,
+            new_cache_units,
             forward_call_indices,
             request_pool_indices,
             seq_lens,
@@ -1071,13 +1092,20 @@ fn kv_group<'a>(b: &mut FlatBufferBuilder<'a>, v: &KvCacheGroup) -> WIPOffset<fb
             (fbs::KvGroupKind::SlidingWindow, window, sink)
         }
     };
+    let layer_ids = Some(b.create_vector(&v.layer_ids));
     fbs::KvGroup::create(
         b,
         &fbs::KvGroupArgs {
-            num_blocks: v.num_blocks,
             kind,
             window,
             sink,
+            page_tokens: v.page_tokens,
+            units_per_page: v.units_per_page,
+            layer_ids,
+            num_kv_heads: v.num_kv_heads,
+            total_kv_heads: v.total_kv_heads,
+            kv_head_offset: v.kv_head_offset,
+            head_dim: v.head_dim,
         },
     )
 }
@@ -1095,18 +1123,10 @@ fn kv_cache<'a>(b: &mut FlatBufferBuilder<'a>, v: &KvCacheInfo) -> WIPOffset<fbs
     fbs::KVCacheInfo::create(
         b,
         &fbs::KVCacheInfoArgs {
-            block_size: v.block_size,
-            num_blocks: v.num_blocks,
-            num_layers: v.num_layers,
-            total_layers: v.total_layers,
-            layer_offset: v.layer_offset,
-            num_kv_heads: v.num_kv_heads,
-            total_kv_heads: v.total_kv_heads,
-            kv_head_offset: v.kv_head_offset,
-            head_dim: v.head_dim,
-            bytes_per_token: v.bytes_per_token,
-            groups,
+            num_units: v.num_units,
+            unit_bytes: v.unit_bytes,
             dtype,
+            groups,
         },
     )
 }
