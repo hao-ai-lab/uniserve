@@ -3,7 +3,7 @@
 The sources in ``csrc/`` build as a PyTorch JIT extension on the first
 :func:`load`; :func:`unsupported` never compiles. The launches run on
 the current CUDA stream with device-resident per-row values and static
-shapes. Apart from the first :func:`product` of each shape, which measures
+shapes. Apart from the first :func:`product` of each shape, which chooses
 its algorithm, they never synchronize with the host, so CUDA graphs capture
 them:
 
@@ -17,8 +17,8 @@ them:
 - :func:`advance` decides every row: entropy-bound acceptance, re-noise,
   the stable-and-confident stop, and end-of-sequence truncation.
 - :func:`product` multiplies the self-conditioning weights by the
-  embedding table through cuBLASLt, with the algorithm measured on the
-  first product of each shape.
+  embedding table through cuBLASLt, with the algorithm a shipped table
+  names for the device model and shape, or else the fastest by timing.
 - :func:`condition` turns the self-conditioning product into the next
   step's embedding.
 
@@ -30,7 +30,8 @@ contract, including where the kernels round differently.
 from __future__ import annotations
 
 import hashlib
-from functools import lru_cache
+import json
+from functools import cache, lru_cache
 from pathlib import Path
 
 import torch
@@ -41,8 +42,12 @@ __all__ = [
     "cluster_size",
     "condition",
     "load",
+    "PRODUCT_CONFIG_FIELDS",
+    "PRODUCT_TABLE",
     "product",
     "product_algorithm",
+    "product_scratch_bytes",
+    "product_table_key",
     "score",
     "start",
     "supported",
@@ -256,29 +261,15 @@ def advance(
     )
 
 
-def product(
-    weights: torch.Tensor,
-    table: torch.Tensor,
-    output: torch.Tensor,
-    scratch: torch.Tensor,
-) -> None:
-    """Write ``weights @ table`` into ``output``, accumulating in FP32.
+# The product's cuBLASLt workspace holds split-K partial sums: room for
+# eight FP32 products of the step's shape, within 32 MiB to 256 MiB.
+_SCRATCH_PARTIALS = 8
+_SCRATCH_BYTES = (32 << 20, 256 << 20)
 
-    ``weights`` is BF16 ``[positions, vocab]``, ``table`` the BF16 ``[vocab,
-    hidden]`` embedding rows and ``output`` FP32 ``[positions, hidden]``, all
-    with unit column stride; ``scratch`` is the contiguous uint8 cuBLASLt
-    workspace, which concurrent products must not share. The first product
-    of each shape and workspace size times the algorithms cuBLASLt proposes
-    on the current stream, which synchronizes the device, and keeps the
-    fastest; later products launch it without synchronizing, and CUDA graphs
-    capture them. Run one product of every shape before capturing a graph.
-    The candidates differ only in FP32 summation order.
-    """
-    _extension().product(weights, table, output, scratch)
-
-
-_ALGORITHM_FIELDS = (
-    "cublaslt_version",
+# Algorithms measured per device model, cuBLASLt version and shape; the
+# product_table module of this package writes the file.
+PRODUCT_TABLE = Path(__file__).with_name("product_algorithms.json")
+PRODUCT_CONFIG_FIELDS = (
     "algorithm",
     "tile",
     "stages",
@@ -291,21 +282,120 @@ _ALGORITHM_FIELDS = (
 )
 
 
+def product_scratch_bytes(positions: int, hidden_size: int) -> int:
+    """Bytes of cuBLASLt workspace :func:`product` expects for its shape.
+
+    ``positions`` rows of ``hidden_size`` FP32 outputs: eight such products
+    of split-K partial sums, clamped to 32 MiB .. 256 MiB. The shipped
+    algorithm table is keyed by this size.
+    """
+    partials = _SCRATCH_PARTIALS * positions * hidden_size * 4
+    return min(max(partials, _SCRATCH_BYTES[0]), _SCRATCH_BYTES[1])
+
+
+def product_table_key(
+    device: torch.device, positions: int, hidden: int, vocab: int, scratch: int
+) -> tuple[str, int, int, int, int, int]:
+    """The shipped-table key of a product on ``device``.
+
+    (device name, cuBLASLt version, positions, hidden, vocab, scratch
+    bytes); loads the extension to read the cuBLASLt version.
+    """
+    return (
+        torch.cuda.get_device_name(device),
+        _extension().cublaslt_version(),
+        positions,
+        hidden,
+        vocab,
+        scratch,
+    )
+
+
+@lru_cache(maxsize=1)
+def _shipped() -> dict[tuple, list[int]]:
+    entries = json.loads(PRODUCT_TABLE.read_text())["entries"]
+    return {
+        (
+            entry["device"],
+            entry["cublaslt_version"],
+            entry["m"],
+            entry["n"],
+            entry["k"],
+            entry["scratch_bytes"],
+        ): [entry["algorithm"][field] for field in PRODUCT_CONFIG_FIELDS]
+        for entry in entries
+    }
+
+
+@cache
+def _preferred(
+    device: int, positions: int, hidden: int, vocab: int, scratch: int
+) -> list[int]:
+    key = product_table_key(
+        torch.device("cuda", device), positions, hidden, vocab, scratch
+    )
+    return _shipped().get(key, [])
+
+
+def product(
+    weights: torch.Tensor,
+    table: torch.Tensor,
+    output: torch.Tensor,
+    scratch: torch.Tensor,
+) -> None:
+    """Write ``weights @ table`` into ``output``, accumulating in FP32.
+
+    ``weights`` is BF16 ``[positions, vocab]``, ``table`` the BF16 ``[vocab,
+    hidden]`` embedding rows and ``output`` FP32 ``[positions, hidden]``, all
+    with unit column stride; ``scratch`` is the contiguous uint8 cuBLASLt
+    workspace (see :func:`product_scratch_bytes`), which concurrent products
+    must not share.
+
+    The first product of each shape and workspace size chooses the cuBLASLt
+    algorithm, which synchronizes the device; later products launch it
+    without synchronizing, and CUDA graphs capture them, so run one product
+    of every shape before capturing a graph. The algorithms differ only in
+    FP32 summation order, and so in the last bits of the product. When
+    :data:`PRODUCT_TABLE` names an algorithm for the device model, cuBLASLt
+    version and shape, the product uses it and every process rounds the
+    same way. Otherwise the first product times cuBLASLt's proposals and
+    keeps the fastest: the same performance, but another process may choose
+    another algorithm, so results are not reproducible across restarts.
+    :func:`product_algorithm` reports which case applies.
+    """
+    preferred = _preferred(
+        weights.device.index,
+        weights.shape[0],
+        table.shape[1],
+        weights.shape[1],
+        scratch.numel(),
+    )
+    _extension().product(weights, table, output, scratch, preferred)
+
+
 def product_algorithm(
     weights: torch.Tensor,
     table: torch.Tensor,
     output: torch.Tensor,
     scratch: torch.Tensor,
-) -> dict[str, int] | None:
+) -> dict[str, int | str] | None:
     """Return the cuBLASLt algorithm :func:`product` uses for these operands.
 
-    The configuration (cuBLASLt version, algorithm id, tile, stages, split-K
-    count, reduction scheme, CTA swizzling, custom option, inner and cluster
-    shape) identifies the measured choice for the operands' shape and
-    workspace size; ``None`` before the first product of that shape.
+    ``None`` before the first product of the operands' shape and workspace
+    size. Otherwise ``source`` is ``"table"`` when :data:`PRODUCT_TABLE`
+    chose the algorithm (reproducible across restarts) or ``"measured"``
+    when the first product timed the proposals (not reproducible), followed
+    by the cuBLASLt version and the configuration fields of
+    :data:`PRODUCT_CONFIG_FIELDS`.
     """
     values = _extension().product_algorithm(weights, table, output, scratch)
-    return dict(zip(_ALGORITHM_FIELDS, values, strict=True)) if values else None
+    if not values:
+        return None
+    return {
+        "source": "table" if values[0] else "measured",
+        "cublaslt_version": _extension().cublaslt_version(),
+        **dict(zip(PRODUCT_CONFIG_FIELDS, values[1:], strict=True)),
+    }
 
 
 def condition(
