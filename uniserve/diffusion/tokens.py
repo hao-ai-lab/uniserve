@@ -265,9 +265,13 @@ def self_conditioning_embedding(
     dtype, take an FP32 softmax that rounds back to that dtype, multiply the
     embedding table ``[V, H]``, and scale by the embedding scale rounded to
     the embedding dtype. Returns ``[R, H]`` in the embedding dtype.
+
+    The product accumulates in FP32 and rounds once, as the reference's
+    CUDA GEMM does; CPU BF16 matmul kernels need not accumulate in FP32.
     """
     dtype = embedding.dtype
     probabilities = torch.softmax(
         logits.to(dtype), dim=-1, dtype=torch.float32
     ).to(dtype)
-    return torch.matmul(probabilities, embedding) * scale.to(dtype)
+    product = torch.matmul(probabilities.float(), embedding.float()).to(dtype)
+    return product * scale.to(dtype)

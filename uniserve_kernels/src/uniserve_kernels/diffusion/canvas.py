@@ -1,0 +1,269 @@
+"""SM100 kernels of one block-diffusion denoising step over token canvases.
+
+The sources in ``csrc/canvas.cu`` build as a PyTorch JIT extension on the
+first :func:`load`; :func:`unsupported` never compiles. The launches run on
+the current CUDA stream with device-resident per-row values, static shapes
+and no host synchronization, so CUDA graphs capture them:
+
+- :func:`start` begins a block on the rows whose step is zero.
+- :func:`score` sweeps the FP32 logits of every canvas position. A
+  persistent grid of CTA clusters splits each position's vocabulary; a
+  loading warp streams the slice twice through a shared-memory ring (HBM,
+  then L2) while eight arithmetic warps compute the entropy, the first
+  argmax, the Gumbel sample and the self-conditioning weights. Only tokens
+  that can still win the Gumbel race draw Philox bits.
+- :func:`advance` decides every row: entropy-bound acceptance, re-noise,
+  the stable-and-confident stop, and end-of-sequence truncation.
+- :func:`condition` turns the self-conditioning product into the next
+  step's embedding.
+
+``uniserve.diffusion.canvas`` calls these kernels and defines the portable
+formulas they follow; its module documentation states the numerical
+contract, including where the kernels round differently.
+"""
+
+from __future__ import annotations
+
+from functools import lru_cache
+from pathlib import Path
+
+import torch
+
+__all__ = [
+    "SLICE_TOKENS",
+    "advance",
+    "cluster_size",
+    "condition",
+    "load",
+    "score",
+    "start",
+    "supported",
+    "unsupported",
+]
+
+# Tokens of one position each sweep CTA owns at most; a position splits over
+# a cluster of vocab_size / SLICE_TOKENS CTAs (rounded up to a power of two).
+SLICE_TOKENS = 65536
+# Tokens per bulk-copy chunk (``kChunkFloats`` in the kernel source).
+_CHUNK_TOKENS = 4096
+_CLUSTERS = (1, 2, 4, 8, 16)
+_MAX_EOS = 8
+
+
+def supported(device: torch.device | None = None) -> bool:
+    """Report whether ``device`` runs the extension, without compiling it.
+
+    The extension targets sm_100a, whose architecture-conditional code has
+    no cross-generation compatibility.
+    """
+    return torch.cuda.is_available() and torch.cuda.get_device_capability(
+        device
+    ) == (10, 0)
+
+
+def cluster_size(vocab_size: int) -> int:
+    """CTAs per position: the smallest cluster whose slices fit SLICE_TOKENS.
+
+    Each CTA owns ``vocab_size / cluster`` tokens in whole chunks of
+    _CHUNK_TOKENS. Returns 0 when no supported cluster divides the
+    vocabulary that way.
+    """
+    for cluster in _CLUSTERS:
+        if (
+            vocab_size % (_CHUNK_TOKENS * cluster) == 0
+            and vocab_size // cluster <= SLICE_TOKENS
+        ):
+            return cluster
+    return 0
+
+
+def unsupported(
+    logits: torch.Tensor,
+    *,
+    canvas_length: int,
+    hidden_size: int,
+    eos_ids: tuple[int, ...],
+) -> str | None:
+    """Return why the kernels cannot run a step on ``logits``, or ``None``.
+
+    ``logits`` are the step's FP32 ``[rows, canvas, vocab]`` logits.
+    """
+    if not logits.is_cuda:
+        return f"logits reside on {logits.device}, not a CUDA device"
+    if not supported(logits.device):
+        return "the canvas kernels require an SM100 (compute capability 10.0)"
+    if logits.dtype != torch.float32 or logits.ndim != 3:
+        return "logits must be FP32 [rows, canvas, vocab]"
+    if not logits.is_contiguous() or logits.data_ptr() % 16:
+        return "logits must be contiguous and 16-byte aligned"
+    if cluster_size(logits.shape[-1]) == 0:
+        return (
+            f"the vocabulary must split into whole {_CHUNK_TOKENS}-token "
+            f"chunks, at most {SLICE_TOKENS} tokens on each of at most 16 CTAs"
+        )
+    if canvas_length % 32 or not 0 < canvas_length <= 1024:
+        return "the canvas length must be a multiple of 32 up to 1024"
+    if hidden_size % 8:
+        return "the hidden size must be a multiple of 8"
+    if len(eos_ids) > _MAX_EOS:
+        return f"at most {_MAX_EOS} end-of-sequence ids"
+    return None
+
+
+def load() -> None:
+    """Compile or load the cached extension before serving or CUDA capture.
+
+    The first :func:`score` launch of each cluster size also sets function
+    attributes and queries occupancy on the host; run one step before
+    capturing a graph.
+    """
+    _extension()
+
+
+@lru_cache(maxsize=1)
+def _extension():
+    # One build or cache lookup per process. The file is compiled without
+    # fast math: the Gumbel scores use the accurate logf, and the divisions
+    # and temperature use explicit round-to-nearest intrinsics.
+    from torch.utils.cpp_extension import load as load_extension
+
+    source = Path(__file__).parent / "csrc" / "canvas.cu"
+    return load_extension(
+        "uniserve_canvas_sm100",
+        sources=[str(source)],
+        extra_cflags=["-O3", "-std=c++20"],
+        extra_cuda_cflags=[
+            "-O3",
+            "-std=c++20",
+            "--expt-relaxed-constexpr",
+            "-gencode=arch=compute_100a,code=sm_100a",
+        ],
+    )
+
+
+def score(
+    logits: torch.Tensor,
+    weights: torch.Tensor,
+    normalizer: torch.Tensor,
+    entropy: torch.Tensor,
+    argmax: torch.Tensor,
+    sample: torch.Tensor,
+    seed: torch.Tensor,
+    block: torch.Tensor,
+    step: torch.Tensor,
+    *,
+    steps: int,
+    t_min: float,
+    t_delta: float,
+) -> None:
+    """Score every canvas position of ``logits`` in one persistent sweep.
+
+    ``logits`` is contiguous FP32 ``[rows, canvas, vocab]``; ``seed``,
+    ``block`` and ``step`` are int64 ``[rows]``. The row temperature is
+    ``t_min + t_delta * ((steps - step) / steps)`` in FP32, where ``t_min``
+    and ``t_delta`` are FP32 values. Writes per position ``entropy`` (FP32),
+    the first ``argmax`` of the exact processed logits and the Gumbel
+    ``sample`` (int64), each contiguous ``[rows, canvas]``, the BF16
+    self-conditioning ``weights`` ``[positions, vocab]`` (unit column
+    stride, row stride divisible by four; must not overlap ``logits``) and
+    their FP32 ``normalizer`` ``[positions]``.
+    """
+    _extension().score(
+        logits,
+        weights,
+        normalizer,
+        entropy,
+        argmax,
+        sample,
+        seed,
+        block,
+        step,
+        int(steps),
+        float(t_min),
+        float(t_delta),
+        cluster_size(logits.shape[-1]),
+    )
+
+
+def advance(
+    entropy: torch.Tensor,
+    argmax: torch.Tensor,
+    sample: torch.Tensor,
+    seed: torch.Tensor,
+    block: torch.Tensor,
+    step: torch.Tensor,
+    history: torch.Tensor,
+    canvas: torch.Tensor,
+    tokens: torch.Tensor,
+    finished: torch.Tensor,
+    *,
+    vocab_size: int,
+    steps: int,
+    entropy_bound: float,
+    confidence: float,
+    eos_ids: tuple[int, ...],
+    pad_id: int,
+) -> None:
+    """Accept, re-noise and decide every canvas row from its scores.
+
+    Reads the per-position ``entropy``, ``argmax`` and ``sample`` of
+    :func:`score`; replaces ``canvas`` (int64 ``[rows, canvas]``) and
+    shifts ``history`` (int64 ``[rows, stability, canvas]``) in place;
+    writes the end-of-sequence truncated argmax canvas into ``tokens`` and
+    ``(block done, end of sequence seen)`` into bool ``finished``
+    ``[rows, 2]``. ``entropy_bound`` and ``confidence`` are FP32 values.
+    """
+    _extension().advance(
+        entropy,
+        argmax,
+        sample,
+        seed,
+        block,
+        step,
+        history,
+        canvas,
+        tokens,
+        finished,
+        int(vocab_size),
+        int(steps),
+        float(entropy_bound),
+        float(confidence),
+        [int(token) for token in eos_ids],
+        int(pad_id),
+    )
+
+
+def condition(
+    product: torch.Tensor,
+    normalizer: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    scale: float,
+) -> None:
+    """Write ``bf16(product * scale / normalizer)`` row by row into ``output``.
+
+    ``product`` is contiguous FP32 ``[positions, hidden]`` (hidden divisible
+    by four), ``normalizer`` FP32 ``[positions]`` and ``output`` contiguous
+    BF16 shaped like ``product``.
+    """
+    _extension().condition(product, normalizer, float(scale), output)
+
+
+def start(
+    seed: torch.Tensor,
+    block: torch.Tensor,
+    step: torch.Tensor,
+    canvas: torch.Tensor,
+    history: torch.Tensor,
+    self_conditioning: torch.Tensor,
+    *,
+    vocab_size: int,
+) -> None:
+    """Begin a block on every row whose ``step`` is zero; leave others.
+
+    Such a row receives its initial canvas, a history of -1 and zero
+    self-conditioning rows (``[rows * canvas, hidden]``, 16-byte rows).
+    """
+    _extension().start(
+        seed, block, step, canvas, history, self_conditioning, int(vocab_size)
+    )
