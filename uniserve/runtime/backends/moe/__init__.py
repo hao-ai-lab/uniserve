@@ -25,10 +25,15 @@ from uniserve.quantization import QuantizedTensor, RowOrder, ScaleLayout
 from uniserve.tensors import BufferConfig
 
 # Native providers in automatic selection order. Their representations are
-# disjoint: trtllm-gen serves NVFP4 experts, CUTLASS BF16 and FP16 experts.
-# CuTeDSL also serves NVFP4 experts, by explicit selection.
-_NATIVE = ("trtllm", "cutlass")
-_PROVIDERS = frozenset((*_NATIVE, "cutedsl", "torch"))
+# disjoint: CuTeDSL serves NVFP4 experts, CUTLASS BF16 and FP16 experts.
+# trtllm-gen also serves NVFP4 experts, by explicit selection. CuTeDSL leads
+# for NVFP4 because routed-expert layers of 256 tokens or more, the calls
+# that prefill chunks and 256-token canvases make, take 0.78-0.93 of
+# trtllm-gen's median time on SM100 (trtllm-gen is anomalously slow at 4096
+# tokens), while 1 to 64 tokens take 1.17-1.51 of it
+# (artifacts/diffusion_gemma/stage0/moe/measurements-cutedsl-separate/).
+_NATIVE = ("cutedsl", "cutlass")
+_PROVIDERS = frozenset((*_NATIVE, "trtllm", "torch"))
 
 
 class Operator:
