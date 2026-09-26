@@ -2785,6 +2785,7 @@ gpu = [
     { name = "uniserve-kernels", extra = ["flash-attn-4", "peer-storage", "sparse-attention"] },
 ]
 test = [
+    { name = "ninja" },
     { name = "pytest" },
     { name = "pytest-timeout" },
 ]
@@ -2799,6 +2800,7 @@ requires-dist = [
     { name = "markdown-it-py", marker = "extra == 'dev'", specifier = "<4.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11" },
     { name = "ninja", marker = "extra == 'gpu'", specifier = ">=1.13" },
+    { name = "ninja", marker = "extra == 'test'", specifier = ">=1.13" },
     { name = "numpy" },
     { name = "packaging", specifier = "<=25.0" },
     { name = "pillow" },
