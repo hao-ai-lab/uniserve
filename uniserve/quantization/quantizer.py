@@ -18,6 +18,7 @@ from .tensor import (
     _FP8Tensor,
     _MXFP8Tensor,
     _NVFP4Tensor,
+    _row_block,
 )
 
 if TYPE_CHECKING:
@@ -611,17 +612,20 @@ class Quantizer:
         physical scale layout and row order; borrowed buffers keep their
         storage owner. A non-linear row order describes a stacked block-
         scaled ``[E, rows, K]`` tensor whose values and block scales store
-        every expert's rows permuted; it requires whole 32-row blocks.
+        every expert's rows permuted; each matrix must consist of whole
+        blocks of the order (32 rows for the shuffled orders, 128 rows for
+        ``INTERLEAVED_64``).
         """
         self._shape(shape, dtype)
         if not isinstance(row_order, RowOrder):
             raise ValueError("unknown row order")
+        block = _row_block(row_order)
         if row_order is not RowOrder.LINEAR and (
-            self.format == "fp8" or len(shape) != 3 or shape[1] % 32
+            self.format == "fp8" or len(shape) != 3 or shape[1] % block
         ):
             raise ValueError(
-                "row orders apply only to stacked block-scaled tensors "
-                "of whole 32-row blocks"
+                f"row order {row_order.value} applies only to stacked "
+                f"block-scaled tensors of whole {block}-row blocks"
             )
         keys = (
             {"values", "block_scale", "tensor_scale"}
