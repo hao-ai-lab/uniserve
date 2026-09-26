@@ -84,6 +84,10 @@ from uniserve_worker.protocol.transfer import WorkerEndpoint
 from uniserve_worker.protocol.worker_info import ComponentInfo, WorkerInfo
 from uniserve_worker.storage.block_tables import BlockTables, GroupShape
 from uniserve_worker.storage.cache_imports import cache_transfer_workspace_bytes
+from uniserve_worker.storage.canvas_slots import (
+    CanvasSlots,
+    generating_denoiser,
+)
 from uniserve_worker.storage.decode_state import DecodeState
 
 __all__ = [
@@ -501,6 +505,24 @@ def _token_worker_layout(
                     )
                     fixed_bytes[target] = fixed_bytes.get(target, 0) + sum(
                         field.nbytes for field in allocation.buffers().values()
+                    )
+
+                # A generating token denoiser keeps every request slot's
+                # canvas resident, with one step chunk's sampler workspace.
+                denoiser = (
+                    generating_denoiser(call.module)
+                    if ForwardMode.TOKEN_DENOISING in kinds
+                    else None
+                )
+                if denoiser is not None:
+                    fixed_bytes[target] = fixed_bytes.get(target, 0) + sum(
+                        field.nbytes
+                        for field in CanvasSlots.denoiser_buffers(
+                            denoiser,
+                            request_pool_size=worker_config.max_request_pool_size,
+                            max_rows=input_config.max_rows,
+                            cuda=torch.device(target).type == "cuda",
+                        ).values()
                     )
 
         # Block tables, decode state and the KV import workspaces are charged

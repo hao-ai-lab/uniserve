@@ -472,6 +472,20 @@ def prepare_forward_rows(
                 device=model_runner.call_devices(call)[1],
             )
             forward.extend((index, task) for task in rows)
+        elif (
+            call.kind is ForwardMode.TOKEN_DENOISING and call.canvas is not None
+        ):
+            forward.append(
+                (
+                    index,
+                    canvas.prepare_step(
+                        call,
+                        state=state,
+                        request_tables=request_tables,
+                        canvas_slots=model_runner.canvas_slots,
+                    ),
+                )
+            )
         elif call.kind is ForwardMode.TOKEN_DENOISING:
             forward.extend(
                 (index, task)
@@ -579,7 +593,8 @@ def publish_forward_values(
     Dispatches each forward value by its call: denoiser predictions are
     collected per trajectory index and returned for
     ``integrate_predictions``; canvas readouts are collected per call and
-    published by ``canvas.publish``; sequence rows become sampling
+    published by ``canvas.publish``, and canvas steps by
+    ``canvas.publish_step``; sequence rows become sampling
     candidates (or finish directly when ``token.prepare_sampling`` returns an
     outcome);
     encoder values publish features; image-decoder values publish images.
@@ -603,6 +618,12 @@ def publish_forward_values(
         value, sampling_index, graph_sample, layout = numerical_result
         if index in trajectories:
             predictions[index].append(value)
+        elif (
+            call.kind is ForwardMode.TOKEN_DENOISING and call.canvas is not None
+        ):
+            outcomes[index] = canvas.publish_step(
+                call, value, request_tables=request_tables, state=state
+            )
         elif call.kind is ForwardMode.TOKEN_DENOISING:
             # Canvas rows of one call arrive in row order.
             readouts[index].append(value)

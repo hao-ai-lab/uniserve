@@ -10,6 +10,7 @@ from torch import nn
 
 from uniserve.model import (
     DEFAULT_COMPONENT,
+    CanvasTokens,
     CausalLM,
     ComponentEntry,
     EntryPoint,
@@ -68,6 +69,11 @@ class Model(nn.Module):
                     activation="gelu_pytorch_tanh",
                 ),
                 RMSNorm(size, eps, elementwise_affine=False),
+            ),
+            CanvasTokens(
+                config.diffusion.canvas_length,
+                config.diffusion.pad_token_id,
+                config.diffusion.eos_token_ids,
             ),
         )
 

@@ -114,6 +114,7 @@ from uniserve_worker.model_executor.graph_inputs import (
 from uniserve_worker.model_executor.graph_storage import GraphStorage
 from uniserve_worker.model_executor.image_inputs import DecodeRow, VisionRow
 from uniserve_worker.model_executor.input_batch import (
+    CanvasStepRow,
     InputRow,
     TokenRow,
 )
@@ -141,8 +142,10 @@ from uniserve_worker.protocol.output import ForwardStats
 from uniserve_worker.sampling.metadata import TokenSelection
 
 if TYPE_CHECKING:
+    from uniserve_worker.model_executor.canvas_runner import CanvasRunner
     from uniserve_worker.model_executor.media_inputs import MediaBuilder
     from uniserve_worker.storage.block_tables import BlockTables
+    from uniserve_worker.storage.canvas_slots import CanvasSlots
     from uniserve_worker.storage.decode_state import DecodeState
     from uniserve_worker.storage.kv_cache import KVCacheManager
     from uniserve_worker.storage.latent_pool import LatentPool
@@ -301,6 +304,9 @@ class ModelExecutor:
         self.diffusion_bank: Mapping[str, torch.Tensor] = {}
         self.latent_pool: LatentPool | None = None
         self._diffusion: DiffusionRunner | None = None
+        # The resident sampler state of generating canvases, bound when this
+        # rank runs token denoising (``bind_canvas_slots``).
+        self.canvas_slots: CanvasSlots | None = None
 
         self.uses_lanes = False
         self._startup_complete = self._closed = False
@@ -890,6 +896,26 @@ class ModelExecutor:
             )
         self.diffusion_bank = dict(bank)
         self.latent_pool = pool
+
+    @property
+    def canvas_runner(self) -> CanvasRunner | None:
+        """The runner of this rank's token denoising, if it has one."""
+        for (_name, kind), entry in self._forward_calls.items():
+            if kind is ForwardMode.TOKEN_DENOISING:
+                return cast("CanvasRunner", entry)
+        return None
+
+    def bind_canvas_slots(self, slots: CanvasSlots) -> None:
+        """Lend the resident sampler state to the token-denoising runner.
+
+        Raises:
+            RuntimeError: When this rank runs no token denoising.
+        """
+        runner = self.canvas_runner
+        if runner is None:
+            raise RuntimeError("this rank runs no token denoising")
+        runner.bind_canvas_slots(slots)
+        self.canvas_slots = slots
 
     @property
     def diffusion(self) -> DiffusionRunner:
@@ -1711,8 +1737,9 @@ class ModelExecutor:
         Fatal failures propagate immediately because later device work is
         unsafe.
         """
-        # Rows sharing an entry, forward mode, device, and media shape form
-        # one homogeneous numerical call.
+        # Rows sharing an entry, forward mode, device, row type, and media
+        # shape form one homogeneous numerical call; a canvas readout and a
+        # canvas step of one pass are separate calls.
         grouped: dict[tuple[object, ...], list[int]] = defaultdict(list)
         bindings: dict[int, ModelRunner] = {}
         for index, (task, call) in enumerate(tasks):
@@ -1734,9 +1761,9 @@ class ModelExecutor:
                 shape = tuple(int(value) for value in task.encode_pixels.shape)
             elif isinstance(task, (DiffusionRow, DecodeRow)):
                 shape = (task.image_height, task.image_width)
-            grouped[(entry, task.forward_mode, str(target), shape)].append(
-                index
-            )
+            grouped[
+                (entry, task.forward_mode, str(target), type(task), shape)
+            ].append(index)
 
         groups = list(grouped.values())
         for group_index, indexes in enumerate(groups):
@@ -1958,6 +1985,13 @@ def _validate_outputs(
             raise ValueError(
                 f"model output is on {value.device}, expected {device}"
             )
+        # A canvas step reports the sampler's decision, not a raw output.
+        if isinstance(task, CanvasStepRow):
+            if value.dtype != torch.int64 or value.shape != (
+                1 + task.canvas_length,
+            ):
+                raise ValueError("a canvas step reports its stop and canvas")
+            continue
         if not value.is_floating_point():
             raise ValueError("raw neural outputs must use a floating dtype")
 

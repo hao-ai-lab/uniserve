@@ -13,6 +13,7 @@ from typing import Generic, TypeVar
 
 import torch
 
+from uniserve.diffusion.canvas import CanvasSampling, CanvasState
 from uniserve.model import CanvasInput
 from uniserve_worker.protocol.call import ForwardMode, MediaCall
 from uniserve_worker.sampling.metadata import TokenSelection
@@ -201,6 +202,77 @@ class ReadoutInput:
     candidates: torch.Tensor
     selection: torch.Tensor
     row_candidates: tuple[int, ...]
+
+    @property
+    def attention(self):
+        """The canvas rows' attention input, which execution binds."""
+        return self.canvas.attention
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasStepRow(AttentionRow):
+    """One denoising step of a request's resident generation canvas.
+
+    The canvas lives in the request slot's sampler state, so the row carries
+    no tokens: it attends non-causally to the request's first ``seq_len``
+    cached tokens and to its ``canvas_length`` canvas tokens at host int64
+    ``positions``, and writes no KV. ``block`` counts the blocks the request
+    has committed and ``step`` the steps already run on this canvas; step
+    zero starts the canvas. ``seed`` and ``sampling`` are the request's
+    admitted seed and the sampler constants of its canvas sampling.
+    """
+
+    canvas_length: int = 0
+    seed: int = 0
+    block: int = 0
+    step: int = 0
+    sampling: CanvasSampling | None = None
+
+    def __post_init__(self):
+        if (
+            self.write_kv
+            or self.causal
+            or self.canvas_length < 1
+            or self.request_pool_idx < 1
+            or self.positions is None
+            or self.positions.shape[-1] != self.canvas_length
+        ):
+            raise ValueError(
+                "a canvas step is a read-only noncausal canvas of its slot"
+            )
+        if (
+            self.sampling is None
+            or min(self.block, self.step) < 0
+            or self.step >= self.sampling.steps
+        ):
+            raise ValueError(
+                "a canvas step runs within its request's canvas sampling"
+            )
+
+    @property
+    def query_tokens(self) -> int:
+        """Return the canvas length."""
+        return self.canvas_length
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasStepInput:
+    """Staged canvas steps of one numerical call.
+
+    ``canvas`` packs every row's resident canvas back to back, with its
+    self-conditioning embeddings. ``state`` is the rows' gathered sampler
+    state, whose canvas and self-conditioning rows ``canvas`` reads, and
+    ``views`` the same staged tensors by ``CanvasSlots`` field. ``slots``
+    holds the rows' request slots as a device int64 ``[rows]`` vector,
+    through which the stepped state returns to its slots, and ``sampling``
+    each row's sampler constants.
+    """
+
+    canvas: CanvasInput
+    state: CanvasState
+    views: dict[str, torch.Tensor]
+    slots: torch.Tensor
+    sampling: tuple[CanvasSampling, ...]
 
     @property
     def attention(self):

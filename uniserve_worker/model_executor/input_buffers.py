@@ -22,6 +22,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from uniserve.diffusion.canvas import CanvasState
 from uniserve.math import bucketed_length
 from uniserve.media import image
 from uniserve.model import (
@@ -56,6 +57,8 @@ from uniserve_worker.model_executor.diffusion_inputs import (
 from uniserve_worker.model_executor.image_inputs import DecodeRow, VisionRow
 from uniserve_worker.model_executor.input_batch import (
     CanvasRow,
+    CanvasStepInput,
+    CanvasStepRow,
     InputBatch,
     InputRow,
     ReadoutInput,
@@ -175,17 +178,24 @@ class TokenBufferConfig(AttentionBufferConfig):
 
 @dataclass(frozen=True, slots=True)
 class CanvasBufferConfig(AttentionBufferConfig):
-    """Canvas token and slot columns of a token-denoising call.
+    """Canvas token, slot and sampling columns of a token-denoising call.
 
     ``max_rows`` bounds the canvas rows of one call and ``max_tokens`` their
-    tokens, which also bounds the slots they read.
+    tokens, which also bounds the slots they read. A generating canvas step
+    stages its row's request slot and sampling coordinates in the
+    ``step_*`` columns.
     """
 
     def buffers(self):
+        rows = self.max_rows
         return {
             **AttentionBufferConfig.buffers(self),
             "input_ids": BufferConfig((self.max_tokens,), torch.int64),
             "slot_tokens": BufferConfig((self.max_tokens,), torch.int64),
+            "step_slots": BufferConfig((rows,), torch.int64),
+            "step_seeds": BufferConfig((rows,), torch.int64),
+            "step_blocks": BufferConfig((rows,), torch.int64),
+            "step_indices": BufferConfig((rows,), torch.int64),
         }
 
 
@@ -211,7 +221,8 @@ class InputBuffers:
     stream that stages them.
     """
 
-    row_type: type[InputRow]
+    # The row types this staging accepts.
+    row_type: type[InputRow] | tuple[type[InputRow], ...]
 
     # Each field ``config.buffers()`` names becomes a fixed-address column
     # attribute of the same name at construction.
@@ -257,9 +268,13 @@ class InputBuffers:
         if not 0 < len(rows) <= self.max_rows:
             raise ValueError("row count exceeds input-buffer capacity")
         if any(not isinstance(row, self.row_type) for row in rows):
-            raise TypeError(
-                f"this staging requires {self.row_type.__name__} inputs"
+            types = (
+                self.row_type
+                if isinstance(self.row_type, tuple)
+                else (self.row_type,)
             )
+            names = " or ".join(kind.__name__ for kind in types)
+            raise TypeError(f"this staging requires {names} inputs")
         # Token rows of any ForwardMode share one staging layout; a media row
         # must match the call kind exactly.
         if any(
@@ -772,17 +787,31 @@ class CanvasBuffers(AttentionBuffers):
     call reads have no configured bound, so their backing grows to the
     largest call staged so far and keeps its address until a larger call
     arrives; the readout head that consumes them runs outside any graph.
+
+    Generating canvas steps (``CanvasStepRow``) stage their rows' resident
+    sampler state from the ``CanvasSlots`` bound with ``bind_canvas_slots``;
+    their canvas tokens and self-conditioning embeddings are the model's
+    inputs. One call stages either readout rows or step rows.
     """
 
-    row_type = CanvasRow
+    row_type = (CanvasRow, CanvasStepRow)
 
     input_ids: torch.Tensor
     slot_tokens: torch.Tensor
+    step_slots: torch.Tensor
+    step_seeds: torch.Tensor
+    step_blocks: torch.Tensor
+    step_indices: torch.Tensor
 
     def __init__(self, *, config: CanvasBufferConfig, **options):
         super().__init__(config=config, **options)
         # Candidate matrix and selection indices share one int64 backing.
         self._candidates = torch.empty(0, dtype=torch.int64, device=self.device)
+        self._canvas_slots = None
+
+    def bind_canvas_slots(self, slots) -> None:
+        """Borrow the resident sampler state that canvas steps stage from."""
+        self._canvas_slots = slots
 
     def _prepare_inputs(
         self, rows, *, attention=None, cache=None, tables=None, states=None
@@ -793,6 +822,13 @@ class CanvasBuffers(AttentionBuffers):
             else attention
         )
         staged = self.stage_attention(attention)
+        steps = sum(isinstance(row, CanvasStepRow) for row in rows)
+        if steps:
+            if steps != len(rows):
+                raise ValueError(
+                    "one canvas call stages readout rows or canvas steps"
+                )
+            return self._prepare_steps(rows, staged), (), None
 
         lengths = tuple(row.query_tokens for row in rows)
         total = sum(lengths)
@@ -853,6 +889,71 @@ class CanvasBuffers(AttentionBuffers):
             tuple(len(row.candidate_ids) for row in rows),
         )
         return inputs, (), None
+
+    def _prepare_steps(self, rows, staged):
+        """Stage canvas steps: their sampling coordinates and gathered state.
+
+        Every row's canvas follows the previous one in the packed tokens.
+        The rows' argmax histories are staged at the depth of their shared
+        stability threshold.
+        """
+        state = self._canvas_slots
+        if state is None:
+            raise ValueError("canvas steps require bound sampler state")
+        depths = {row.sampling.stability for row in rows}
+        lengths = {row.canvas_length for row in rows}
+        if len(depths) != 1 or lengths != {state.canvas_length}:
+            raise ValueError(
+                "canvas steps of one call share the resident canvas length "
+                "and one stability threshold"
+            )
+
+        count, length = len(rows), state.canvas_length
+        if count * length > self.max_tokens:
+            raise ValueError("canvas tokens exceed input-buffer capacity")
+        for index, row in enumerate(rows):
+            self._positions(row.positions, index * length, length)
+        columns = {
+            "step_slots": [row.request_pool_idx for row in rows],
+            "step_seeds": [row.seed for row in rows],
+            "step_blocks": [row.block for row in rows],
+            "step_indices": [row.step for row in rows],
+        }
+        vectors = {}
+        for name, values in columns.items():
+            vector = getattr(self, name)[:count]
+            vector.copy_(
+                torch.tensor(values, dtype=torch.int64), non_blocking=True
+            )
+            vectors[name] = vector
+
+        # The staged canvases are the model's input tokens, and their
+        # self-conditioning rows its self-conditioning input, back to back.
+        views = state.stage(vectors["step_slots"], depths.pop())
+        self_conditioning = views["self_conditioning"].view(
+            count * length, state.hidden_size
+        )
+        rows_state = CanvasState(
+            seed=vectors["step_seeds"],
+            block=vectors["step_blocks"],
+            step=vectors["step_indices"],
+            canvas=views["canvas"],
+            history=views["history"],
+            self_conditioning=self_conditioning,
+        )
+        canvas = CanvasInput(
+            views["canvas"].view(-1),
+            self.positions[0, : count * length],
+            staged,
+            self_conditioning=self_conditioning,
+        )
+        return CanvasStepInput(
+            canvas,
+            rows_state,
+            views,
+            vectors["step_slots"],
+            tuple(row.sampling for row in rows),
+        )
 
     def _candidate_backing(self, size):
         """Return candidate storage of at least ``size`` int64 elements.
