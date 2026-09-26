@@ -10,7 +10,8 @@
 //! discovery share it immutably.
 //!
 //! Submodules own checkpoint asset resolution ([`assets`]), the multimodal
-//! family profiles ([`omni`]), streaming reasoning and tool-call parsers
+//! family profiles ([`omni`]), the DiffusionGemma checkpoint facts
+//! ([`diffusion_gemma`]), streaming reasoning and tool-call parsers
 //! ([`reasoning`], [`tools`]), and the tokenizer ([`tokenizer`]).
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -22,11 +23,13 @@ use crate::profile::assets::{
     GenerationConfig, HfTokenizerConfig, ResolvedModelFiles, load_generation_config,
     load_model_config, load_tokenizer_config,
 };
+use crate::profile::diffusion_gemma::DiffusionGemmaProfile;
 use crate::profile::omni::bagel::BagelProfile;
 use crate::profile::omni::sensenova::SenseNovaProfile;
 use crate::profile::tokenizer::HuggingFaceTokenizer;
 
 pub mod assets;
+pub mod diffusion_gemma;
 pub mod omni;
 pub mod reasoning;
 pub mod tokenizer;
@@ -46,6 +49,9 @@ pub enum ModelDescription {
     Bagel,
     /// MiniMax H3 video-generation profile.
     MiniMaxH3,
+    /// DiffusionGemma block-diffusion profile: System One decision readout
+    /// and block-diffusion chat generation.
+    DiffusionGemma,
 }
 
 impl ModelDescription {
@@ -54,7 +60,13 @@ impl ModelDescription {
     /// `from_model_type` and `from_pipeline_class` search only this list, so a
     /// variant missing from it compiles but is never selected from checkpoint
     /// metadata.
-    const ALL: [Self; 4] = [Self::Qwen3, Self::SenseNova, Self::Bagel, Self::MiniMaxH3];
+    const ALL: [Self; 5] = [
+        Self::Qwen3,
+        Self::SenseNova,
+        Self::Bagel,
+        Self::MiniMaxH3,
+        Self::DiffusionGemma,
+    ];
 
     /// Returns the stable profile identifier.
     pub const fn id(self) -> &'static str {
@@ -63,6 +75,7 @@ impl ModelDescription {
             Self::SenseNova => "sensenova",
             Self::Bagel => "bagel",
             Self::MiniMaxH3 => "minimax_h3",
+            Self::DiffusionGemma => "diffusion_gemma",
         }
     }
 
@@ -73,17 +86,30 @@ impl ModelDescription {
             Self::Qwen3 => Some("qwen3"),
             Self::SenseNova => Some("neo_chat"),
             Self::Bagel => Some("bagel"),
+            Self::DiffusionGemma => Some("diffusion_gemma"),
             Self::MiniMaxH3 => None,
         }
     }
 
-    /// Returns the pipeline class a family that ships as a diffusers pipeline
-    /// declares in its root index.
+    /// Returns the pipeline class a family's checkpoint declares in a root
+    /// diffusers index.
+    ///
+    /// MiniMax H3 ships only as a pipeline. A DiffusionGemma checkpoint
+    /// publishes a `DiffusionGemmaPipeline` index beside its root transformers
+    /// `config.json`, which remains the source of its settings (see
+    /// [`ModelDescription::is_pipeline`]).
     const fn pipeline_class(self) -> Option<&'static str> {
         match self {
             Self::MiniMaxH3 => Some("MiniMaxH3ModularPipeline"),
+            Self::DiffusionGemma => Some("DiffusionGemmaPipeline"),
             Self::Qwen3 | Self::SenseNova | Self::Bagel => None,
         }
+    }
+
+    /// Returns whether the family ships only as a diffusers pipeline, whose
+    /// root index rather than a root `config.json` describes the checkpoint.
+    pub const fn is_pipeline(self) -> bool {
+        self.model_type().is_none()
     }
 
     /// Resolves the served profile from a checkpoint's `model_type` field.
@@ -97,7 +123,10 @@ impl ModelDescription {
             .find(|description| description.model_type() == Some(model_type))
     }
 
-    /// Resolves the served profile from a pipeline checkpoint's `_class_name`.
+    /// Resolves the served profile from a checkpoint index's `_class_name`.
+    ///
+    /// The result may be a family described by its root configuration, which
+    /// [`ModelDescription::is_pipeline`] distinguishes.
     pub fn from_pipeline_class(class_name: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
@@ -109,13 +138,15 @@ impl std::str::FromStr for ModelDescription {
     type Err = ModelDescriptionParseError;
 
     /// Parses a profile identifier as returned by [`ModelDescription::id`],
-    /// also accepting the hyphenated spelling `minimax-h3`.
+    /// also accepting the hyphenated spellings `minimax-h3` and
+    /// `diffusion-gemma`.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "qwen3" => Ok(Self::Qwen3),
             "sensenova" => Ok(Self::SenseNova),
             "bagel" => Ok(Self::Bagel),
             "minimax-h3" | "minimax_h3" => Ok(Self::MiniMaxH3),
+            "diffusion-gemma" | "diffusion_gemma" => Ok(Self::DiffusionGemma),
             _ => Err(ModelDescriptionParseError(value.to_owned())),
         }
     }
@@ -163,6 +194,8 @@ pub enum ModelParameters {
         /// binds the count the worker advertises in its startup handshake.
         num_inference_steps: u32,
     },
+    /// DiffusionGemma canvas, control-token, image, and sampler settings.
+    DiffusionGemma(DiffusionGemmaProfile),
 }
 
 /// Immutable model facts shared by startup, request preprocessing, and discovery.
@@ -198,16 +231,19 @@ impl ModelConfig {
     /// were resolved for the checkpoint `model` (a local directory or Hub
     /// repository id). Bagel also reads its latent position grid side from
     /// the checkpoint's safetensors header (see
-    /// `BagelProfile::read_max_latent_size`). A configured `max_model_tokens`
-    /// takes precedence over the checkpoint's `max_position_embeddings`.
+    /// `BagelProfile::read_max_latent_size`), and DiffusionGemma its canvas,
+    /// image, and sampler settings (see `DiffusionGemmaProfile::resolve`). A
+    /// configured `max_model_tokens` takes precedence over the checkpoint's
+    /// `max_position_embeddings`.
     ///
     /// # Errors
     ///
     /// Fails when a present metadata file cannot be read or parsed, when
     /// `model_type` is missing or names no family served from a root
-    /// configuration, when a multimodal profile cannot resolve its control
-    /// tokens from `tokenizer`, or when Bagel's latent position table cannot
-    /// be read.
+    /// configuration, when a multimodal or DiffusionGemma profile cannot
+    /// resolve its control tokens from `tokenizer`, when DiffusionGemma
+    /// metadata lacks a required field, or when Bagel's latent position table
+    /// cannot be read.
     pub async fn from_files(
         served_name: &str,
         model: &str,
@@ -242,6 +278,13 @@ impl ModelConfig {
                 tokenizer,
                 BagelProfile::read_max_latent_size(model).await?,
             )?),
+            ModelDescription::DiffusionGemma => {
+                ModelParameters::DiffusionGemma(DiffusionGemmaProfile::resolve(
+                    files.config_path.as_deref(),
+                    &generation_config,
+                    tokenizer,
+                )?)
+            }
             // `from_model_type` resolves only families described by a root
             // configuration; a pipeline family resolves through `from_pipeline`.
             ModelDescription::MiniMaxH3 => {
@@ -288,7 +331,10 @@ impl ModelConfig {
                 },
                 16_384,
             ),
-            ModelDescription::Qwen3 | ModelDescription::SenseNova | ModelDescription::Bagel => {
+            ModelDescription::Qwen3
+            | ModelDescription::SenseNova
+            | ModelDescription::Bagel
+            | ModelDescription::DiffusionGemma => {
                 return Err(assets::Error::UnsupportedPipeline {
                     class_name: description.id().to_owned(),
                 });
@@ -312,6 +358,7 @@ impl ModelConfig {
             ModelParameters::SenseNova(_) => ModelDescription::SenseNova,
             ModelParameters::Bagel(_) => ModelDescription::Bagel,
             ModelParameters::MiniMaxH3 { .. } => ModelDescription::MiniMaxH3,
+            ModelParameters::DiffusionGemma(_) => ModelDescription::DiffusionGemma,
         }
     }
 }
@@ -517,6 +564,9 @@ mod tests {
                 }
                 ModelParameters::MiniMaxH3 { .. } => {
                     assert_eq!(description, ModelDescription::MiniMaxH3);
+                }
+                ModelParameters::DiffusionGemma(_) => {
+                    assert_eq!(description, ModelDescription::DiffusionGemma);
                 }
             }
         }

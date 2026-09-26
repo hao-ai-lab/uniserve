@@ -51,6 +51,8 @@ pub enum ServedEndpoint {
     ImageGenerations,
     /// OpenAI-compatible video-generations endpoint.
     VideoGenerations,
+    /// TypeSafe System One decision-readout endpoint (`POST /v1/systemone`).
+    SystemOne,
 }
 
 #[derive(
@@ -214,6 +216,16 @@ pub enum ModelResolutionError {
         #[source]
         source: std::io::Error,
     },
+    /// The engine has no runtime family that executes the selected profile.
+    #[error(
+        "model description `{description}` has no engine runtime: {computation} is not implemented"
+    )]
+    UnsupportedRuntime {
+        /// Stable model-profile identifier.
+        description: &'static str,
+        /// The computation the missing runtime family would execute.
+        computation: &'static str,
+    },
     /// The running worker lacks a feature required by the selected profile.
     #[error("configured model description `{description}` requires worker feature `{feature}`")]
     MissingFeature {
@@ -227,7 +239,9 @@ pub enum ModelResolutionError {
 impl ModelConfig {
     /// Loads model facts and the tokenizer/template resources needed by preprocessing.
     ///
-    /// Returns the renderer as `None` for a diffusers pipeline. The returned
+    /// Returns the renderer as `None` for a diffusers pipeline. A checkpoint whose index
+    /// names a family described by its root configuration (DiffusionGemma) resolves from
+    /// that configuration, which must name the same family. The returned
     /// `max_model_tokens` is always set: the configured `max_model_len`, else, for a root
     /// configuration, its `max_position_embeddings` or `EngineSettings::DEFAULT_MAX_MODEL_LEN`,
     /// and for a pipeline the model's default prompt limit.
@@ -243,6 +257,7 @@ impl ModelConfig {
         // root index rather than a root `config.json`, so the index selects the
         // profile and locates the tokenizer component before any other asset
         // is resolved.
+        let mut indexed_description = None;
         if let Some(index) = resolve_pipeline_index(&config.model).await? {
             let description =
                 ModelDescription::from_pipeline_class(&index.class_name).ok_or_else(|| {
@@ -250,19 +265,25 @@ impl ModelConfig {
                         class_name: index.class_name.clone(),
                     }
                 })?;
-            let tokenizer_path = resolve_model_file(
-                &config.model,
-                &index.component_file("tokenizer", "tokenizer.json")?,
-            )
-            .await?;
-            let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&tokenizer_path)?);
-            let model = Self::from_pipeline(
-                &served_name,
-                description,
-                config.engine.max_video_seconds,
-                config.engine.max_model_len,
-            )?;
-            return Ok((model, tokenizer, None));
+            if description.is_pipeline() {
+                let tokenizer_path = resolve_model_file(
+                    &config.model,
+                    &index.component_file("tokenizer", "tokenizer.json")?,
+                )
+                .await?;
+                let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&tokenizer_path)?);
+                let model = Self::from_pipeline(
+                    &served_name,
+                    description,
+                    config.engine.max_video_seconds,
+                    config.engine.max_model_len,
+                )?;
+                return Ok((model, tokenizer, None));
+            }
+            // A family described by its root configuration may also publish an
+            // index (a DiffusionGemma checkpoint does); the root configuration
+            // resolves the model below and must name the same family.
+            indexed_description = Some(description);
         }
 
         let files = ResolvedModelFiles::new(&config.model).await?;
@@ -275,6 +296,16 @@ impl ModelConfig {
             tokenizer.as_ref(),
         )
         .await?;
+        if let Some(indexed) = indexed_description
+            && indexed != model.description()
+        {
+            return Err(crate::profile::assets::Error::invalid(format!(
+                "the checkpoint index names `{}` but config.json describes `{}`",
+                indexed.id(),
+                model.description().id()
+            ))
+            .into());
+        }
         model.max_model_tokens = Some(
             config
                 .engine
@@ -328,18 +359,32 @@ impl ModelConfig {
         match &self.parameters {
             ModelParameters::SenseNova(value) => Some(&value.controls),
             ModelParameters::Bagel(value) => Some(&value.controls),
-            ModelParameters::Qwen3 | ModelParameters::MiniMaxH3 { .. } => None,
+            ModelParameters::Qwen3
+            | ModelParameters::MiniMaxH3 { .. }
+            | ModelParameters::DiffusionGemma(_) => None,
         }
     }
 
     /// Execution family selected by the loaded model settings.
-    pub(crate) fn runtime_family(&self) -> uniserve_core::RuntimeFamily {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelResolutionError::UnsupportedRuntime`] for DiffusionGemma,
+    /// whose block-diffusion readout and generation have no engine runtime
+    /// family yet.
+    pub(crate) fn runtime_family(
+        &self,
+    ) -> std::result::Result<uniserve_core::RuntimeFamily, ModelResolutionError> {
         match self.parameters {
-            ModelParameters::Qwen3 => uniserve_core::RuntimeFamily::Ar,
+            ModelParameters::Qwen3 => Ok(uniserve_core::RuntimeFamily::Ar),
             ModelParameters::SenseNova(_) | ModelParameters::Bagel(_) => {
-                uniserve_core::RuntimeFamily::Umm
+                Ok(uniserve_core::RuntimeFamily::Umm)
             }
-            ModelParameters::MiniMaxH3 { .. } => uniserve_core::RuntimeFamily::Diffusion,
+            ModelParameters::MiniMaxH3 { .. } => Ok(uniserve_core::RuntimeFamily::Diffusion),
+            ModelParameters::DiffusionGemma(_) => Err(ModelResolutionError::UnsupportedRuntime {
+                description: self.description().id(),
+                computation: "block-diffusion readout and generation",
+            }),
         }
     }
 
@@ -362,6 +407,15 @@ impl ModelConfig {
             },
             ModelParameters::SenseNova(_) => SenseNovaProfile::runtime_limits(model_dtype),
             ModelParameters::Bagel(_) => BagelProfile::runtime_limits(model_dtype),
+            // The encoder prefill understands text and encoded images; the
+            // denoising canvas has no generation feature of its own yet.
+            ModelParameters::DiffusionGemma(_) => uniserve_core::GenerationLimits {
+                features: uniserve_core::GenerationFeatures::UNDERSTANDING
+                    | uniserve_core::GenerationFeatures::VISION_ENCODE,
+                latent_downsample: 1,
+                max_cfg_branches: 1,
+                ..Default::default()
+            },
         }
     }
 }
@@ -411,7 +465,9 @@ impl InputProcessor {
         } = worker;
 
         let needs = match &config.parameters {
-            ModelParameters::Qwen3 => GenerationFeatures::UNDERSTANDING,
+            ModelParameters::Qwen3 | ModelParameters::DiffusionGemma(_) => {
+                GenerationFeatures::UNDERSTANDING
+            }
             ModelParameters::SenseNova(profile) => {
                 configured_omni_needs(&profile.image_generation, &profile.image_encoders)
             }
@@ -631,7 +687,9 @@ impl InputProcessor {
     pub fn supports_image_input(&self) -> bool {
         matches!(
             self.config.parameters,
-            ModelParameters::SenseNova(_) | ModelParameters::Bagel(_)
+            ModelParameters::SenseNova(_)
+                | ModelParameters::Bagel(_)
+                | ModelParameters::DiffusionGemma(_)
         )
     }
 
@@ -647,6 +705,34 @@ impl InputProcessor {
                 output_modalities: vec![ServedModality::Video, ServedModality::Audio],
                 features: Vec::new(),
                 sampling_controls: Vec::new(),
+            };
+        }
+        if matches!(self.config.parameters, ModelParameters::DiffusionGemma(_)) {
+            // Block diffusion commits whole denoised canvases, so of the token
+            // sampling controls only the stopping ones apply; temperature,
+            // truncation, penalties, and logprobs have no meaning there.
+            let sampling_controls = self
+                .sampling_controls
+                .iter()
+                .copied()
+                .filter(|control| {
+                    matches!(
+                        control,
+                        ServedSamplingControl::Eos | ServedSamplingControl::StopStrings
+                    )
+                })
+                .collect();
+            return ModelSupport {
+                endpoints: vec![ServedEndpoint::SystemOne, ServedEndpoint::ChatCompletions],
+                input_modalities: vec![ServedModality::Text, ServedModality::Image],
+                output_modalities: vec![ServedModality::Text],
+                features: vec![
+                    ServedFeature::Streaming,
+                    ServedFeature::Usage,
+                    ServedFeature::Reasoning,
+                    ServedFeature::ToolCalling,
+                ],
+                sampling_controls,
             };
         }
         let mut endpoints = vec![ServedEndpoint::ChatCompletions];
@@ -674,7 +760,9 @@ impl InputProcessor {
                 input_modalities.push(ServedModality::Image);
                 output_modalities.push(ServedModality::Image);
             }
-            ModelParameters::MiniMaxH3 { .. } => unreachable!("media limits returned above"),
+            ModelParameters::MiniMaxH3 { .. } | ModelParameters::DiffusionGemma(_) => {
+                unreachable!("media and block-diffusion support returned above")
+            }
         }
         ModelSupport {
             endpoints,
@@ -687,9 +775,11 @@ impl InputProcessor {
 
     /// Validates the prompt and requested modalities against the loaded model.
     ///
-    /// Every refusal is `ServeError::UnsupportedFeature`. The final check asks the worker
-    /// limits to cover the features this request reaches; for SenseNova and Bagel these
-    /// depend on the selected modalities and on whether the request carries an input image.
+    /// Every refusal is `ServeError::UnsupportedFeature`. DiffusionGemma chat generation is
+    /// refused as `block_diffusion_generation`: its block-diffusion preprocessing and engine
+    /// submission are not implemented. The final check asks the worker limits to cover the
+    /// features this request reaches; for SenseNova and Bagel these depend on the selected
+    /// modalities and on whether the request carries an input image.
     fn validate_generation_features(
         &self,
         request_id: &crate::serving::ServeRequestId,
@@ -703,6 +793,9 @@ impl InputProcessor {
         };
         if matches!(self.config.parameters, ModelParameters::MiniMaxH3 { .. }) {
             return Err(reject("generation_endpoint"));
+        }
+        if matches!(self.config.parameters, ModelParameters::DiffusionGemma(_)) {
+            return Err(reject("block_diffusion_generation"));
         }
         if has_input_image && !self.supports_image_input() {
             return Err(reject("image_input"));
@@ -748,7 +841,9 @@ impl InputProcessor {
                 has_input_image,
                 modalities,
             ),
-            ModelParameters::MiniMaxH3 { .. } => unreachable!("video endpoint checked above"),
+            ModelParameters::MiniMaxH3 { .. } | ModelParameters::DiffusionGemma(_) => {
+                unreachable!("video and block-diffusion generation refused above")
+            }
         };
         self.limits
             .covers(needs)
@@ -901,7 +996,7 @@ impl InputProcessor {
                         image_gen,
                         &mut generation,
                     )?,
-                    ModelParameters::MiniMaxH3 { .. } => {
+                    ModelParameters::MiniMaxH3 { .. } | ModelParameters::DiffusionGemma(_) => {
                         unreachable!("generation features checked above")
                     }
                 };
@@ -1196,4 +1291,227 @@ fn stable_hash(value: &str) -> u64 {
         .fold(0xcbf29ce484222325, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::fs;
+
+    use serde_json::json;
+    use tempfile::TempDir;
+    use tokenizers::models::bpe::{BPE, Vocab};
+    use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
+    use uniserve_core::{GenerationFeatures, GenerationLimits};
+
+    use super::ModelResolutionError;
+    use crate::Config;
+    use crate::profile::tokenizer::HuggingFaceTokenizer;
+    use crate::profile::{ModelConfig, ModelDescription, ModelParameters};
+    use crate::serving::{
+        InputProcessor, ServeRequestId, ServedEndpoint, ServedFeature, ServedModality,
+        ServedSamplingControl, WorkerCapabilities,
+    };
+
+    /// Writes a checkpoint laid out as DiffusionGemma publishes it: a root
+    /// transformers `config.json` whose `model_type` is `root_model_type`,
+    /// beside a `DiffusionGemmaPipeline` diffusers index. The tokenizer maps
+    /// each ASCII character to one token and adds the Gemma control tokens.
+    fn indexed_checkpoint(root_model_type: &str) -> TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let mut vocab = Vocab::from_iter([("<unk>".to_owned(), 0_u32)]);
+        for code in 1_u32..=127 {
+            vocab.insert(char::from_u32(code).unwrap().to_string(), code);
+        }
+        let model = BPE::builder()
+            .vocab_and_merges(vocab, Vec::new())
+            .unk_token("<unk>".to_owned())
+            .build()
+            .unwrap();
+        let mut builder = TokenizerBuilder::new(model);
+        builder.add_special_tokens(
+            &[
+                "<pad>",
+                "<eos>",
+                "<bos>",
+                "<mask>",
+                "<turn|>",
+                "<|image>",
+                "<|image|>",
+                "<image|>",
+            ]
+            .map(|token| AddedToken::from(token, true)),
+        );
+        let tokenizer_path = directory.path().join("tokenizer.json");
+        builder.save(&tokenizer_path, false).unwrap();
+        let tokenizer = HuggingFaceTokenizer::new(&tokenizer_path).unwrap();
+        let id = |token: &str| tokenizer.token_to_id(token).unwrap();
+
+        let write = |name: &str, value: serde_json::Value| {
+            fs::write(directory.path().join(name), value.to_string()).unwrap();
+        };
+        write(
+            "tokenizer_config.json",
+            json!({"bos_token": "<bos>", "eos_token": "<eos>",
+                   "chat_template": "{{ bos_token }}{{ messages[0]['content'] }}"}),
+        );
+        write(
+            "config.json",
+            json!({
+                "architectures": ["DiffusionGemmaForBlockDiffusion"],
+                "model_type": root_model_type,
+                "canvas_length": 256,
+                "image_token_id": id("<|image|>"),
+                "boi_token_id": id("<|image>"),
+                "eoi_token_id": id("<image|>"),
+                "vision_soft_tokens_per_image": 280,
+                "vision_config": {"patch_size": 16, "pooling_kernel_size": 3},
+                "text_config": {"model_type": "diffusion_gemma_text", "max_position_embeddings": 262144},
+            }),
+        );
+        write(
+            "generation_config.json",
+            json!({
+                "eos_token_id": [1, 106, 50],
+                "max_new_tokens": 256,
+                "max_denoising_steps": 48,
+                "sampler_config": {"_cls_name": "EntropyBoundSamplerConfig", "entropy_bound": 0.1},
+                "t_min": 0.4,
+                "t_max": 0.8,
+                "confidence_threshold": 0.005,
+                "stability_threshold": 1,
+            }),
+        );
+        write(
+            "model_index.json",
+            json!({
+                "_class_name": "DiffusionGemmaPipeline",
+                "model": ["transformers", "DiffusionGemmaForBlockDiffusion"],
+                "scheduler": ["diffusers", "BlockRefinementScheduler"],
+            }),
+        );
+        directory
+    }
+
+    fn config(directory: &TempDir) -> Config {
+        Config {
+            model: directory.path().to_str().unwrap().to_owned(),
+            served_model_name: Some("diffusion-gemma".to_owned()),
+            ..Config::default()
+        }
+    }
+
+    /// The diffusers index beside the root configuration does not make the
+    /// checkpoint a pipeline: the root configuration resolves the model, its
+    /// text limit from `text_config`, and its block-diffusion settings.
+    #[tokio::test]
+    async fn an_indexed_diffusion_gemma_checkpoint_resolves_from_its_root_config() {
+        let directory = indexed_checkpoint("diffusion_gemma");
+
+        let (model, tokenizer, renderer) = ModelConfig::load(&config(&directory)).await.unwrap();
+
+        assert_eq!(model.description(), ModelDescription::DiffusionGemma);
+        assert_eq!(model.max_model_tokens, Some(262_144));
+        assert!(model.eos_token_ids.is_superset(&[1, 50, 106].into()));
+        assert!(renderer.is_some());
+        let ModelParameters::DiffusionGemma(profile) = &model.parameters else {
+            unreachable!("the description is DiffusionGemma");
+        };
+        assert_eq!(profile.canvas_length, 256);
+        assert_eq!(
+            profile.tokens.mask,
+            tokenizer.token_to_id("<mask>").unwrap()
+        );
+        assert_eq!(
+            profile.tokens.turn_end,
+            tokenizer.token_to_id("<turn|>").unwrap()
+        );
+        assert_eq!(profile.denoising.max_denoising_steps, 48);
+        assert!(!profile.quantized);
+        // Block-diffusion execution has no engine runtime yet.
+        assert!(matches!(
+            model.runtime_family(),
+            Err(ModelResolutionError::UnsupportedRuntime { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_index_must_name_the_family_of_its_root_config() {
+        let directory = indexed_checkpoint("qwen3");
+
+        let error = ModelConfig::load(&config(&directory)).await.err().unwrap();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("`diffusion_gemma`") && message.contains("`qwen3`"),
+            "{message}"
+        );
+    }
+
+    /// DiffusionGemma declares the System One readout and chat completions;
+    /// chat generation is refused until block diffusion is executed.
+    #[tokio::test]
+    async fn diffusion_gemma_declares_its_endpoints_and_refuses_chat_generation() {
+        let directory = indexed_checkpoint("diffusion_gemma");
+        let (model, tokenizer, renderer) = ModelConfig::load(&config(&directory)).await.unwrap();
+        let processor = InputProcessor::new(
+            model,
+            tokenizer,
+            renderer,
+            WorkerCapabilities {
+                limits: GenerationLimits {
+                    features: GenerationFeatures::UNDERSTANDING | GenerationFeatures::VISION_ENCODE,
+                    latent_downsample: 1,
+                    max_cfg_branches: 1,
+                    ..Default::default()
+                },
+                sampling_controls: ServedSamplingControl::ALL.to_vec(),
+                max_model_tokens: 65_536,
+                denoise_steps: 0,
+            },
+            true,
+        )
+        .unwrap();
+
+        let support = processor.support();
+        assert_eq!(
+            support.endpoints,
+            [ServedEndpoint::SystemOne, ServedEndpoint::ChatCompletions]
+        );
+        assert_eq!(
+            support.input_modalities,
+            [ServedModality::Text, ServedModality::Image]
+        );
+        assert_eq!(support.output_modalities, [ServedModality::Text]);
+        assert_eq!(
+            support.features,
+            [
+                ServedFeature::Streaming,
+                ServedFeature::Usage,
+                ServedFeature::Reasoning,
+                ServedFeature::ToolCalling
+            ]
+        );
+        assert_eq!(
+            support.sampling_controls,
+            [
+                ServedSamplingControl::Eos,
+                ServedSamplingControl::StopStrings
+            ]
+        );
+
+        let request = serde_json::from_value(json!({
+            "model": "diffusion-gemma",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }))
+        .unwrap();
+        let error = processor
+            .preprocess_chat_request(ServeRequestId::new("chat"), request)
+            .err()
+            .unwrap();
+        assert_eq!(error.status_code().as_u16(), 400);
+        let message = error.to_error_response().error.message;
+        assert!(message.contains("block_diffusion_generation"), "{message}");
+    }
 }
