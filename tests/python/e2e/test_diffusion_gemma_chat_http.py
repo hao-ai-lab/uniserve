@@ -4,8 +4,8 @@ Each precision's DiffusionGemma checkpoint is served by ``uniserve serve``
 on one GPU with its default flags and answers ``POST /v1/chat/completions``
 end to end: the server renders the Gemma-4 chat template, the engine
 prefills the prompt and denoises the reply canvas by canvas, committing
-each finished canvas to the context, and the Gemma-4 parser splits the
-thought channel from the content. The tests check what a client observes:
+each finished canvas to the context, and the Gemma-4 parsers split the
+thought channel and tool calls. The tests check what a client observes:
 
 - a seeded reply streams exactly what the same request returns in one
   response, with usage, and ends at an end-of-sequence token;
@@ -14,7 +14,8 @@ thought channel from the content. The tests check what a client observes:
 - the same request, seed included, served alone again returns the same
   reply;
 - ``chat_template_kwargs.enable_thinking`` opens and closes the thought
-  channel, and an attached image is read;
+  channel, a tool call parses into ``tool_calls``, and an attached image is
+  read;
 - token-sampling controls are refused with 400.
 
 The checkpoint directories come from ``UNISERVE_DIFFUSION_GEMMA_MODEL``
@@ -58,6 +59,11 @@ APPLES = (
     "How many apples does it have?"
 )
 STORY = "Write a 300-word story about a lighthouse keeper."
+# A BF16 seed whose reply to the weather question is a well-formed call.
+# Whether a reply's call is well formed depends on the seed, as in the
+# reference implementation, and the self-conditioning product uses the
+# same algorithm in every launch, so the seed's reply repeats.
+TOOL_CALL_SEED = 0
 
 
 def _checkpoint(precision: str) -> Path:
@@ -220,6 +226,37 @@ def test_thinking_opens_and_closes_the_thought_channel(served):
     assert not direct["choices"][0]["message"].get("reasoning_content")
     for reply in (thinking, direct):
         assert "15" in reply["choices"][0]["message"]["content"]
+
+
+@pytest.mark.parametrize("served", ["bf16"], indirect=True)
+def test_a_tool_call_is_returned_as_a_call(served):
+    """A reply that calls a declared tool returns the call with arguments."""
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+    reply = _complete(
+        served,
+        _body(
+            "What is the weather in Paris right now?",
+            seed=TOOL_CALL_SEED,
+            tools=[tool],
+        ),
+    )
+
+    (choice,) = reply["choices"]
+    assert choice["finish_reason"] == "tool_calls"
+    (call,) = choice["message"]["tool_calls"]
+    assert call["function"]["name"] == "get_weather"
+    assert json.loads(call["function"]["arguments"]) == {"city": "Paris"}
 
 
 def test_an_attached_image_is_read(served):
