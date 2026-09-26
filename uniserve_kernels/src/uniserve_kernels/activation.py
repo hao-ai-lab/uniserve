@@ -26,6 +26,12 @@ ACTIVATIONS = ("silu", "gelu", "gelu_tanh")
 #: Elements per program for the kernels that neither quantize per row nor
 #: report absmax partials.
 _ACT_BLOCK = 1024
+#: Output elements per program and warps of the packed ``act_and_mul``
+#: kernel. Programs tile the flattened output, so no row width leaves a
+#: mostly masked tail program; 16 elements per thread keep enough loads in
+#: flight to stream HBM (measured on SM100 against the registered copy line).
+_GATED_BLOCK = 4096
+_GATED_WARPS = 8
 #: Widest row an FP8 kernel accepts: one program loads and reduces a complete
 #: row to find its scale.
 MAX_FP8_WIDTH = 32768
@@ -65,31 +71,36 @@ if triton is not None:
     def _act_and_mul_kernel(
         x_ptr,
         out_ptr,
+        elements,
         x_row_stride,
         n_cols: tl.constexpr,
         ACTIVATION: tl.constexpr,  # noqa: N803
-        block: tl.constexpr,
+        BLOCK: tl.constexpr,  # noqa: N803
+        WIDE: tl.constexpr,  # noqa: N803
     ):
-        """Store ``act(gate) * value`` for one column block of a packed row.
+        """Store ``act(gate) * value`` for one block of the flattened output.
 
-        Grid: ``(rows, ceil(n_cols / block))``. Input rows start
-        ``x_row_stride`` elements apart; the output is contiguous
-        ``[rows, n_cols]``. Row bases widen to int64, so one launch covers
-        tensors past ``2**31`` elements.
+        Grid: ``ceil(elements / BLOCK)`` programs over the contiguous
+        ``[rows, n_cols]`` output. Input rows start ``x_row_stride``
+        elements apart. ``WIDE`` computes offsets in int64, which launches
+        whose input or output spans ``2**31`` elements require.
         """
-        row = tl.program_id(0).to(tl.int64)
-        cols = tl.program_id(1) * block + tl.arange(0, block)
-        mask = cols < n_cols
-        base = row * x_row_stride
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        if WIDE:
+            offsets = offsets.to(tl.int64)
+        mask = offsets < elements
+        row = offsets // n_cols
+        column = offsets - row * n_cols
+        base = row * x_row_stride + column
 
         # The gate occupies the first half of each row and its multiplicative
         # value occupies the second half.
-        gate = tl.load(x_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
-        value = tl.load(x_ptr + base + n_cols + cols, mask=mask, other=0.0).to(
+        gate = tl.load(x_ptr + base, mask=mask, other=0.0).to(tl.float32)
+        value = tl.load(x_ptr + base + n_cols, mask=mask, other=0.0).to(
             tl.float32
         )
         out = _activate(gate, ACTIVATION) * value
-        tl.store(out_ptr + row * n_cols + cols, out, mask=mask)
+        tl.store(out_ptr + offsets, out, mask=mask)
 
     @triton.jit
     def _act_and_mul_fp8_kernel(
@@ -353,14 +364,21 @@ def act_and_mul(x: torch.Tensor, out: torch.Tensor, *, activation: str) -> None:
     rows = out.numel() // width
     if rows == 0:
         return
-    _act_and_mul_kernel[(rows, triton.cdiv(width, _ACT_BLOCK))](
+    stride = row_stride(x)
+    elements = rows * width
+    # The last program's offsets reach elements + BLOCK; input offsets reach
+    # rows * stride (packed rows span at least 2 * width).
+    span = max(rows * max(stride, 2 * width), elements) + _GATED_BLOCK
+    _act_and_mul_kernel[(triton.cdiv(elements, _GATED_BLOCK),)](
         x,
         out,
-        row_stride(x),
+        elements,
+        stride,
         width,
         activation,
-        _ACT_BLOCK,
-        num_warps=4,
+        _GATED_BLOCK,
+        span >= 2**31,
+        num_warps=_GATED_WARPS,
     )
 
 
