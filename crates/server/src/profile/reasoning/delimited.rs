@@ -2,9 +2,11 @@
 //!
 //! Delimiters are matched as text in the decoded stream, so text that may be
 //! the start of a delimiter split across deltas is held back until later text
-//! completes or rules it out, or the stream ends. Each delimiter must also be
-//! a single vocabulary token, whose id `initialize` looks for in the prompt to
-//! choose the initial region.
+//! completes or rules it out, or the stream ends. Each delimiter begins with a
+//! single vocabulary token, whose id `initialize` looks for in the prompt to
+//! choose the initial region. The start delimiter may continue with a section
+//! label after its token, such as the channel name in Gemma-4's
+//! `<|channel>thought\n`.
 
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 
@@ -21,8 +23,11 @@ pub struct DelimitedReasoningParser {
     /// Trailing text that may be the start of a delimiter, held until a later
     /// delta disambiguates it or `finish` flushes it.
     buffer: String,
-    start_token: String,
-    end_token: String,
+    /// Text that opens a reasoning section: the start token followed by the
+    /// optional section label.
+    start_delimiter: String,
+    /// Text that closes a reasoning section: the end token.
+    end_delimiter: String,
     start_token_id: u32,
     end_token_id: u32,
     default_in_reasoning: bool,
@@ -31,6 +36,8 @@ pub struct DelimitedReasoningParser {
 impl DelimitedReasoningParser {
     /// Creates one delimited parser state machine.
     ///
+    /// `start_token` and `end_token` are the delimiter texts, each a single
+    /// vocabulary token; `with_start_label` extends the start delimiter.
     /// `default_in_reasoning` is the initial region when `initialize` finds no
     /// delimiter token after the prompt's last other special token, and also
     /// when `initialize` is never called.
@@ -70,12 +77,25 @@ impl DelimitedReasoningParser {
             tokenizer,
             current_in_reasoning: default_in_reasoning,
             buffer: String::new(),
-            start_token,
-            end_token,
+            start_delimiter: start_token,
+            end_delimiter: end_token,
             start_token_id,
             end_token_id,
             default_in_reasoning,
         })
+    }
+
+    /// Extends the start delimiter with a section label that follows the
+    /// start token.
+    ///
+    /// The label belongs to the delimiter, so it is neither reasoning nor
+    /// content text: Gemma-4 opens reasoning with the `<|channel>` token, the
+    /// channel name `thought`, and a newline. Prompt initialization still
+    /// matches the start token alone, because a prompt that opens the section
+    /// ends with the token followed by its label.
+    pub fn with_start_label(mut self, label: &str) -> Self {
+        self.start_delimiter.push_str(label);
+        self
     }
 
     /// Parses text that is known not to end with a partial delimiter suffix.
@@ -84,17 +104,17 @@ impl DelimitedReasoningParser {
 
         while !stable.is_empty() {
             if self.current_in_reasoning {
-                if let Some(end_idx) = stable.find(&self.end_token) {
+                if let Some(end_idx) = stable.find(&self.end_delimiter) {
                     delta.push_reasoning(&stable[..end_idx]);
-                    stable = &stable[end_idx + self.end_token.len()..];
+                    stable = &stable[end_idx + self.end_delimiter.len()..];
                     self.current_in_reasoning = false;
                 } else {
                     delta.push_reasoning(stable);
                     break;
                 }
-            } else if let Some(start_idx) = stable.find(&self.start_token) {
+            } else if let Some(start_idx) = stable.find(&self.start_delimiter) {
                 delta.push_content(&stable[..start_idx]);
-                stable = &stable[start_idx + self.start_token.len()..];
+                stable = &stable[start_idx + self.start_delimiter.len()..];
                 self.current_in_reasoning = true;
             } else {
                 delta.push_content(stable);
@@ -110,15 +130,15 @@ impl DelimitedReasoningParser {
     ///
     /// A trailing suffix can only be a *strict* prefix of a delimiter when it
     /// is shorter than that delimiter, so only the final
-    /// `max(start_token, end_token)` bytes of `text` can ever match. Scanning
-    /// just that trailing window keeps the cost bounded by the delimiter
-    /// length rather than the length of `text`.
+    /// `max(start_delimiter, end_delimiter)` bytes of `text` can ever match.
+    /// Scanning just that trailing window keeps the cost bounded by the
+    /// delimiter length rather than the length of `text`.
     fn partial_suffix_len(&self, text: &str) -> usize {
-        let max_token_len = self.start_token.len().max(self.end_token.len());
-        // Suffixes at least `max_token_len` bytes long cannot be a strict
+        let max_delimiter_len = self.start_delimiter.len().max(self.end_delimiter.len());
+        // Suffixes at least `max_delimiter_len` bytes long cannot be a strict
         // prefix of either delimiter, so start scanning from there. Clamp to a
         // char boundary so the slice below is always valid.
-        let mut window_start = text.len().saturating_sub(max_token_len);
+        let mut window_start = text.len().saturating_sub(max_delimiter_len);
         while window_start < text.len() && !text.is_char_boundary(window_start) {
             window_start += 1;
         }
@@ -127,10 +147,10 @@ impl DelimitedReasoningParser {
         for (idx, _) in text[window_start..].char_indices() {
             let idx = window_start + idx;
             let suffix = &text[idx..];
-            if self.start_token.starts_with(suffix) && self.start_token != suffix {
+            if self.start_delimiter.starts_with(suffix) && self.start_delimiter != suffix {
                 best = best.max(text.len() - idx);
             }
-            if self.end_token.starts_with(suffix) && self.end_token != suffix {
+            if self.end_delimiter.starts_with(suffix) && self.end_delimiter != suffix {
                 best = best.max(text.len() - idx);
             }
         }

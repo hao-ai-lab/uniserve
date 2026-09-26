@@ -6,9 +6,10 @@
 //! [`Qwen3ChatOutputProcessor`], and renders the request into a prompt with
 //! [`HfChatRenderer`]. During generation, `assemble_chat_event_stream` feeds
 //! decoded text through that processor and assembles the resulting assistant
-//! events into public serving events. The omni models render chat requests
-//! with the same renderer, but their output bypasses this module's output
-//! processors.
+//! events into public serving events. [`Gemma4ChatOutputProcessor`] composes
+//! the same output stages for Gemma-4's chat format. The omni models render
+//! chat requests with the same renderer, but their output bypasses this
+//! module's output processors.
 //!
 //! The template comes from the model files or [`ChatTemplateLoadOptions`], and
 //! the server's `reasoning_parsing` setting decides whether Qwen3 `<think>`
@@ -21,7 +22,7 @@ pub use crate::profile::tools::ToolParserError;
 pub use crate::serving::text::{FinishReason, StopReason};
 pub use error::{Error, Result};
 pub use event::{AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantToolCall};
-pub use output::Qwen3ChatOutputProcessor;
+pub use output::{Gemma4ChatOutputProcessor, Qwen3ChatOutputProcessor};
 pub use request::{
     ChatContent, ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatToolChoice,
     GenerationPromptMode, ReasoningEffort, Tool,
