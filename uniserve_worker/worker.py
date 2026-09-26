@@ -733,7 +733,7 @@ class Worker:
                 self.canvas_slots = CanvasSlots.for_denoiser(
                     denoiser,
                     request_pool_size=int(info.request_slots),
-                    max_rows=canvas_runner.input_buffers.max_rows,
+                    max_rows=canvas_runner.max_canvases,
                     sampling=worker_config.canvas_sampling,
                     device=canvas_runner.device,
                 )

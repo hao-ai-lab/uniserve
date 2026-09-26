@@ -261,7 +261,7 @@ IMAGE, BEGIN_IMAGE, END_IMAGE = 60, 58, 59
 
 
 def diffusion_gemma_checkpoint(
-    root, *, text=None, vision=None, unit_scores=False
+    root, *, text=None, vision=None, unit_scores=False, canvas_length=16
 ):
     """Save a two-layer DiffusionGemma checkpoint; return its reference.
 
@@ -276,6 +276,7 @@ def diffusion_gemma_checkpoint(
     inverse square root of its head width, so the unscaled attention scores
     of normalized queries and keys have unit variance, as trained query
     norms keep them, instead of growing with the head width.
+    ``canvas_length`` is the tokens of one generated canvas.
     """
     config = DiffusionGemmaConfig(
         text_config={
@@ -314,7 +315,7 @@ def diffusion_gemma_checkpoint(
             "use_clipped_linears": False,
             **(vision or {}),
         },
-        canvas_length=16,
+        canvas_length=canvas_length,
         image_token_id=IMAGE,
         boi_token_id=BEGIN_IMAGE,
         eoi_token_id=END_IMAGE,
