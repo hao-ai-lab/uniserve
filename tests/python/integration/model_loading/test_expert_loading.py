@@ -203,3 +203,23 @@ def test_checkpoint_encoding_must_match_the_configured_format(tmp_path):
     _checkpoint(tmp_path, fp8_down=True)
     with pytest.raises(ValueError, match="not the configured nvfp4"):
         _load(tmp_path, _module())
+
+
+def test_dense_experts_are_not_encoded_at_load(tmp_path):
+    """Encoded experts come only from checkpoints that store them encoded."""
+    generator = torch.Generator().manual_seed(37)
+    save_file(
+        {
+            f"experts.{expert}.{name}_proj.weight": torch.randn(
+                (HIDDEN, INTERMEDIATE)
+                if name == "down"
+                else (INTERMEDIATE, HIDDEN),
+                generator=generator,
+            )
+            for expert in range(EXPERTS)
+            for name in ("gate", "up", "down")
+        },
+        tmp_path / "model.safetensors",
+    )
+    with pytest.raises(ValueError, match="load only from a checkpoint"):
+        _load(tmp_path, _module())

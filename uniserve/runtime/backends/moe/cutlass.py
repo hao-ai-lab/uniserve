@@ -113,8 +113,15 @@ class Backend(_Backend):
                 and down.shape[1] % 128 == 0
                 and weight.shape[2] % 64 == 0
                 and down.shape[2] % 64 == 0
-                and module.up_gate.input_quantizer is not None
-                and module.down.input_quantizer is not None
+                # W4A4 encodes activations with static calibrated scales.
+                and all(
+                    quantizer is not None
+                    and quantizer.calibrated_scale is not None
+                    for quantizer in (
+                        module.up_gate.input_quantizer,
+                        module.down.input_quantizer,
+                    )
+                )
             )
         return weight.dtype in {torch.bfloat16, torch.float16}
 

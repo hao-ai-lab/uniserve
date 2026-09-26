@@ -236,8 +236,8 @@ def test_nvfp4_experts_apply_per_expert_scales_and_static_activations(
     _replay_matches(module, hidden, ids, weights, expected, rtol=_gamma(3))
 
 
-@torch.inference_mode()
-def test_representations_without_a_native_kernel_fail_at_preparation():
+def _uncalibrated_nvfp4():
+    """NVFP4 experts whose activations have no static encoding scale."""
     module = FusedMoE(
         EXPERTS,
         HIDDEN,
@@ -245,8 +245,44 @@ def test_representations_without_a_native_kernel_fail_at_preparation():
         top_k=TOP_K,
         activation="silu",
         device=DEVICE,
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
     )
+    for linear, rows, width in (
+        (module.up_gate, 2 * INTERMEDIATE, HIDDEN),
+        (module.down, HIDDEN, INTERMEDIATE),
+    ):
+        codes = torch.ones(EXPERTS, rows, width, dtype=torch.long)
+        linear.weight = torch.nn.Parameter(
+            _nvfp4(
+                codes,
+                torch.full((EXPERTS,), E4M3_ONE),
+                torch.ones(EXPERTS),
+            ),
+            requires_grad=False,
+        )
+        linear.input_quantizer = Quantizer("nvfp4")
+    return module
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: FusedMoE(
+            EXPERTS,
+            HIDDEN,
+            INTERMEDIATE,
+            top_k=TOP_K,
+            activation="silu",
+            device=DEVICE,
+            dtype=torch.float32,
+        ),
+        _uncalibrated_nvfp4,
+    ],
+    ids=["fp32", "uncalibrated-nvfp4"],
+)
+@torch.inference_mode()
+def test_representations_without_a_native_kernel_fail_at_preparation(build):
+    module = build()
     with pytest.raises(ValueError, match="no native expert kernel covers"):
         with ExecutionContext(module) as context:
             context.prepare(TextSize(TOKENS, 1))
