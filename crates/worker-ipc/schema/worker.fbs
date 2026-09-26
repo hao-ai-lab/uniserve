@@ -236,6 +236,9 @@ table WorkerInfo {
   /// stub model; the engine refuses ranks or pools that report different
   /// values.
   checkpoint_identity:string;
+  /// Maximum calls in one prefill run, the rows the rank's captured prefill
+  /// graphs hold; zero leaves prefill runs bounded by `max_batch_calls`.
+  max_prefill_calls:uint;
 }
 
 // Request identities and call records.

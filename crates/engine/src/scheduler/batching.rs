@@ -15,6 +15,11 @@
 //!
 //! The lane (`BatchKind`) only separates prefill from decode. `BatchKind::Media`
 //! calls are eligible in every pass, and a pass with no lane applies no filter.
+//!
+//! A pass's prefill calls travel as one numerical call, which workers
+//! evaluate with graphs captured at startup; a prefill batch holds at most
+//! the calls those graphs hold, as the workers report it
+//! (`Scheduler::prefill_call_limit`).
 
 use super::*;
 use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
@@ -162,10 +167,24 @@ impl Scheduler {
         Some(buffer_allocations)
     }
 
+    /// Returns the most calls one prefill batch may hold.
+    ///
+    /// Workers report the rows their captured prefill graphs hold
+    /// (`WorkerInfo::max_prefill_calls`); zero means prefill runs eagerly and
+    /// only the pass's call bound applies.
+    pub(super) fn prefill_call_limit(&self) -> usize {
+        match self.info.max_prefill_calls {
+            0 => self.config.max_batch,
+            limit => self.config.max_batch.min(limit as usize),
+        }
+    }
+
     /// Selects compatible call kinds within one lane's token and sequence budgets.
     ///
     /// Walks `ids` in assembly order until `max_batch` calls are selected or
-    /// the token budget is spent. Every selected call is registered in flight
+    /// the token budget is spent. The prefill batch stops growing at
+    /// `prefill_call_limit` calls; requests whose next call is a prefill then
+    /// wait for a later pass. Every selected call is registered in flight
     /// before this returns. A failed call preparation returns no batches; most
     /// such failures latch engine-fatal first.
     pub(super) fn assemble_batch(
@@ -197,6 +216,13 @@ impl Scheduler {
         // bounded by the worker's per-call row staging.
         let mut canvas_rows_left =
             (self.info.max_batch_calls.min(self.info.request_slots) as usize).max(1);
+        let prefill = CallKind::Forward(ForwardMode::Prefill);
+        let prefill_limit = self.prefill_call_limit();
+        let prefill_full = |batches: &HashMap<CallKind, ExecutionBatch>| {
+            batches
+                .get(&prefill)
+                .is_some_and(|batch| batch.requests.len() >= prefill_limit)
+        };
         let mut selected = 0usize;
         for id in ids.iter().copied() {
             if selected >= self.config.max_batch {
@@ -217,6 +243,9 @@ impl Scheduler {
                 continue;
             }
             let next_type = self.peek_next_call_variant(id);
+            if next_type == Some(prefill) && prefill_full(&code_batches) {
+                continue;
+            }
             // A decode pass may co-schedule text prefill rows. They are
             // dispatched as their own batch, so the two call kinds remain
             // separate numerical calls. Only replayable text requests without
@@ -260,6 +289,17 @@ impl Scheduler {
             if let Some(mut call) =
                 self.next_generation_computation(id, call_budget, canvas_rows_left)
             {
+                // A call planned as a prefill joins the prefill batch only
+                // while it has room; otherwise it waits for a later pass, as a
+                // call without resources does below.
+                if call.code == prefill && prefill_full(&code_batches) {
+                    if let Some(state) = self.running.get_mut(&id) {
+                        state.num_kv_units_sent = state
+                            .num_kv_units_sent
+                            .saturating_sub(u64::from(call.bounds.max_kv_units));
+                    }
+                    continue;
+                }
                 let planned_us = uniserve_core::now_monotonic_us();
 
                 // Only a call that obtains its storage is charged to the

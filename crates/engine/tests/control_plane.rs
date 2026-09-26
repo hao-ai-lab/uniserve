@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
-use uniserve_worker_ipc::{ForwardMode, MediaCall};
+use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
 
 use uniserve_core::{EngineCoreOutput, FinishReason};
 use uniserve_core::{
@@ -59,7 +59,6 @@ fn ctrl() -> SpecialTokenIds {
 #[test]
 fn generation_capabilities_require_complete_paths_and_distinct_encoders() {
     use uniserve_core::GenerationFeatures;
-    use uniserve_worker_ipc::CallKind;
 
     let image_path = vec![
         CallKind::Media(MediaCall::LatentPreparation),
@@ -596,6 +595,77 @@ fn scheduler_clamps_max_batch_to_worker_info() {
     let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
 
     assert_eq!(sched.config().max_batch, 3);
+}
+
+/// Prefill batches hold at most the calls the workers' captured prefill
+/// graphs hold, while decode batches keep the worker's call bound: eight
+/// concurrent prompts prefill three at a time and still all finish, and their
+/// decode steps share batches wider than three.
+#[test]
+fn prefill_batches_hold_at_most_the_calls_prefill_graphs_hold() {
+    let mut sim = SimEngine::new();
+    sim.mut_info_for_test().max_prefill_calls = 3;
+    let mut executor = SimExecutor::new(sim);
+    let dispatched = executor.observe();
+    let sched = Scheduler::new(Box::new(executor), ctrl(), 32).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let mut receivers = (1..=8u64)
+        .map(|id| {
+            handle
+                .submit(generation_request(
+                    RequestId(id),
+                    text_input(vec![1, 2, 3, 4, 5]),
+                    SamplingParams::default(),
+                    ImageParams::default(),
+                    GenerationConstraint::UndOnly,
+                    16,
+                ))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut finished = 0;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while finished < receivers.len() && Instant::now() < deadline {
+        for receiver in &mut receivers {
+            while let Ok(event) = receiver.try_recv() {
+                if let EngineCoreOutput::Finished { reason, .. } = event {
+                    assert_ne!(reason, FinishReason::Error);
+                    finished += 1;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    handle.shutdown();
+    let _ = jh.join();
+    assert_eq!(finished, receivers.len(), "every request finishes");
+
+    let mut prefill_calls = Vec::new();
+    let mut widest_decode = 0;
+    for event in dispatched.try_iter() {
+        let BatchEvent::Submitted(batch) = event else {
+            continue;
+        };
+        let code = batch.requests.first().map(|(call, _)| call.code);
+        match code {
+            Some(CallKind::Forward(ForwardMode::Prefill)) => {
+                prefill_calls.push(batch.requests.len())
+            }
+            Some(CallKind::Forward(ForwardMode::Decode)) => {
+                widest_decode = widest_decode.max(batch.requests.len())
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        prefill_calls.iter().all(|&calls| calls <= 3),
+        "prefill batches {prefill_calls:?}"
+    );
+    assert_eq!(prefill_calls.iter().sum::<usize>(), 8);
+    assert!(widest_decode > 3, "widest decode batch {widest_decode}");
 }
 
 /// Single-worker results must be identical regardless of queue depth:
