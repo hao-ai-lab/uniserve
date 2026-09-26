@@ -717,22 +717,24 @@ class Worker:
                     max_inflight=int(queue_depth),
                 )
 
-            # A rank whose token denoiser generates canvases keeps every
-            # request slot's canvas resident between its steps.
+            # A rank whose token denoiser generates the deployment's canvases
+            # keeps every request slot's canvas resident between its steps.
             self.canvas_slots = None
             canvas_runner = runner.canvas_runner if owns_kv else None
             denoiser = (
                 None
                 if canvas_runner is None
+                or worker_config.canvas_sampling is None
                 else generating_denoiser(canvas_runner.model)
             )
             if denoiser is not None:
                 assert canvas_runner is not None
+                assert worker_config.canvas_sampling is not None
                 self.canvas_slots = CanvasSlots.for_denoiser(
                     denoiser,
                     request_pool_size=int(info.request_slots),
                     max_rows=canvas_runner.input_buffers.max_rows,
-                    history_depth=worker_config.canvas_history_depth,
+                    sampling=worker_config.canvas_sampling,
                     device=canvas_runner.device,
                 )
                 startup.callback(self.canvas_slots.close)

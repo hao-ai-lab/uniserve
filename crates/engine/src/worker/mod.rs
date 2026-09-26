@@ -147,11 +147,12 @@ pub struct WorkerProcessArgs {
     /// Optional text capacities, in prompt tokens, of a video denoiser's
     /// layouts, as a comma-separated increasing list.
     pub video_text_capacities: Option<String>,
-    /// Argmax canvases each generating block-diffusion canvas keeps for its
-    /// stopping rule: the stability threshold of the canvas sampling the
-    /// deployment serves, which no admitted request exceeds. Zero keeps
-    /// none, which serves confidence-only sampling and readouts.
-    pub canvas_history_depth: u32,
+    /// Block-diffusion sampling of every canvas the deployment generates, as
+    /// the server resolves it; `None` when the served model generates no
+    /// canvases. The worker keeps the argmax history its stability
+    /// threshold needs, prepares its canvas steps for exactly this sampling,
+    /// and refuses a request that carries another.
+    pub canvas_sampling: Option<uniserve_core::CanvasSampling>,
     /// FlashInfer workspace capacity in bytes.
     pub flashinfer_workspace_size: u64,
     /// Optional FlashInfer tensor-core selection forwarded to the worker.

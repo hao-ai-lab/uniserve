@@ -10,7 +10,8 @@ public model driven directly by the block-diffusion sampler of
 ``uniserve.diffusion.canvas``: a prompt pass that writes a prefix cache,
 then per step a canvas pass that reads it with the previous step's
 self-conditioning, in FP32 on the CPU with the torch attention backend. A
-step that does not continue its slot's canvas is refused.
+step that does not continue its slot's canvas, or of a canvas whose sampling
+is not the one the worker serves, is refused.
 """
 
 from dataclasses import replace
@@ -91,13 +92,13 @@ SAMPLING = sampler.CanvasSampling(
 )
 
 
-def _admission():
+def _admission(canvas=ADMITTED):
     return Start(
         NewRequest(
             REQUEST,
             SLOT,
             generation=GenerationParams(
-                sampling=SamplingParams(seed=SEED), canvas=ADMITTED
+                sampling=SamplingParams(seed=SEED), canvas=canvas
             ),
         )
     )
@@ -265,9 +266,7 @@ def test_canvas_steps_follow_the_public_model_and_sampler(tmp_path):
     finally:
         reference.close()
 
-    worker = _worker(
-        tmp_path, canvas_history_depth=ADMITTED.stability_threshold
-    )
+    worker = _worker(tmp_path, canvas_sampling=ADMITTED)
     with worker:
         prefill = replace(
             _prefill(1, 0, tokens=prompt),
@@ -305,23 +304,36 @@ def test_canvas_steps_follow_the_public_model_and_sampler(tmp_path):
     assert [len(tokens) for tokens in expected if tokens] == [CANVAS, CANVAS]
 
 
-def test_a_step_that_skips_its_canvas_is_refused(tmp_path):
-    """A slot's canvas starts at step zero and advances one step per call."""
-    diffusion_gemma_checkpoint(tmp_path)
-    worker = _worker(
-        tmp_path, canvas_history_depth=ADMITTED.stability_threshold
-    )
+def _first_step_status(root, admitted, step):
+    """Admit with ``admitted`` sampling; the status of canvas step ``step``.
+
+    The worker serves ``ADMITTED``.
+    """
+    worker = _worker(root, canvas_sampling=ADMITTED)
     with worker:
         prefill = replace(
             _prefill(1, 0, tokens=list(range(7, 20))),
-            commands=(_admission(),),
+            commands=(_admission(admitted),),
             new_cache_units=tuple(
                 CacheUnitAllocation(SLOT, table.group_id, table.unit_ids)
                 for table in _tables(13)
             ),
         )
         _run(worker, prefill)
-        (record,) = _run(worker, _step(2, 13, 0, 1)).completions
+        (record,) = _run(worker, _step(2, 13, 0, step)).completions
         _run(worker, Batch(batch_id=3, commands=(Finish(REQUEST),)))
+    return record.status
 
-    assert record.status is CallStatus.ERROR
+
+def test_a_step_that_skips_its_canvas_is_refused(tmp_path):
+    """A slot's canvas starts at step zero and advances one step per call."""
+    diffusion_gemma_checkpoint(tmp_path)
+    assert _first_step_status(tmp_path, ADMITTED, 1) is CallStatus.ERROR
+
+
+def test_a_canvas_with_other_sampling_is_refused(tmp_path):
+    """A worker steps only canvases of the sampling it serves."""
+    diffusion_gemma_checkpoint(tmp_path)
+    other = replace(ADMITTED, max_steps=ADMITTED.max_steps + 1)
+    assert _first_step_status(tmp_path, other, 0) is CallStatus.ERROR
+    assert _first_step_status(tmp_path, ADMITTED, 0) is CallStatus.OK

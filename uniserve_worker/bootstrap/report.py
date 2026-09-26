@@ -530,21 +530,23 @@ def _token_worker_layout(
                         field.nbytes for field in allocation.buffers().values()
                     )
 
-                # A generating token denoiser keeps every request slot's
-                # canvas resident, with one step chunk's sampler workspace.
+                # A token denoiser that generates the deployment's canvases
+                # keeps every request slot's canvas resident, with one step
+                # chunk's sampler workspace.
                 denoiser = (
                     generating_denoiser(call.module)
                     if ForwardMode.TOKEN_DENOISING in kinds
                     else None
                 )
-                if denoiser is not None:
+                sampling = worker_config.canvas_sampling
+                if denoiser is not None and sampling is not None:
                     fixed_bytes[target] = fixed_bytes.get(
                         target, 0
                     ) + CanvasSlots.denoiser_bytes(
                         denoiser,
                         request_pool_size=worker_config.max_request_pool_size,
                         max_rows=input_config.max_rows,
-                        history_depth=worker_config.canvas_history_depth,
+                        history_depth=sampling.stability_threshold,
                         device_type=torch.device(target).type,
                     )
 
