@@ -146,13 +146,14 @@ if triton is not None:
         with valid rows attends densely to that live list; one without valid
         rows attends to key tile 0, as a padding tile does, so its count stays
         positive. A video query tile attends to the live prefix, then to
-        ``selected`` video tiles whose pooled scores clear a threshold found
-        by interpolation search. When more than ``selected`` columns clear the
-        final threshold (ties, or a bracket not yet narrowed to one score
-        after ``iterations`` steps), the lowest-indexed ones are kept, so the
-        list is deterministic but can differ from an exact top-k. Entries past
-        a row's count are not written and keep whatever the buffer held, so
-        readers must bound their reads by the count.
+        ``selected`` video tiles: exactly its ``selected`` highest pooled
+        scores, the checkpoint's top-k policy. The ``selected``-th largest
+        score is found exactly by bisection over order-preserving integer keys
+        of the FP32 scores, one bit per iteration; every column above it is
+        kept, and columns equal to it fill the remainder in column order, so
+        only exact ties are resolved by index. Entries past a row's count are
+        not written and keep whatever the buffer held, so readers must bound
+        their reads by the count.
         """
         row = tl.program_id(0)
         head = row // tiles
@@ -201,51 +202,45 @@ if triton is not None:
                 other=-float("inf"),
             ).to(tl.float32)
 
-            # Maintain score bounds and the number of candidates at each
-            # bound. Interpolation converges toward a threshold with at least
-            # ``selected`` values while avoiding a full per-row sort. Invariant:
-            # at least ``selected`` valid values are ``>= lower``. It holds
-            # initially because ``lower`` is the row minimum and
-            # ``_write_block_map`` checks ``columns >= selected`` whenever
-            # video rows exist; ``lower`` then moves only to a threshold whose
-            # count is still at least ``selected``.
-            lower = tl.min(tl.where(valid, values, float("inf")))
-            upper = tl.max(tl.where(valid, values, -float("inf"))) + 1.0
-            lower_count = tl.sum(valid.to(tl.int32), axis=0).to(tl.float32)
-            upper_count = 0.0
+            # Map each FP32 score to an int32 key whose signed order matches
+            # the float order: flipping the magnitude bits of negative values
+            # reverses their order. Invalid columns take the lowest key, below
+            # every finite or infinite score's key.
+            bits = values.to(tl.int32, bitcast=True)
+            keys = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
+            keys = tl.where(valid, keys, -2147483648).to(tl.int64)
+
+            # Bisection for the largest key ``lower`` with at least
+            # ``selected`` valid keys at or above it, which is exactly the
+            # ``selected``-th largest key. Invariant: count(keys >= lower) >=
+            # selected > count(keys >= upper). The row minimum satisfies the
+            # left side because ``_write_block_map`` checks ``columns >=
+            # selected`` whenever video rows exist, and the key range spans
+            # fewer than 2**32 values, so ``iterations`` = 32 halvings close
+            # the bracket to adjacent keys.
+            lower = tl.min(tl.where(valid, keys, 2147483647), axis=0)
+            upper = tl.max(keys, axis=0) + 1
             for _ in tl.static_range(iterations):
-                # Clamping the step keeps each iteration inside the bracket.
-                denominator = lower_count - upper_count
-                fraction = (lower_count - selected) / tl.where(
-                    denominator > 0.5,
-                    denominator,
-                    1.0,
-                )
-                fraction = tl.minimum(tl.maximum(fraction, 0.05), 0.95)
-
-                threshold = lower + (upper - lower) * fraction
-                count = tl.sum(
-                    ((values >= threshold) & valid).to(tl.int32),
-                    axis=0,
-                ).to(tl.float32)
-
+                middle = lower + (upper - lower) // 2
+                count = tl.sum(((keys >= middle) & valid).to(tl.int32), axis=0)
                 enough = count >= selected
-                lower = tl.where(enough, threshold, lower)
-                lower_count = tl.where(enough, count, lower_count)
-                upper = tl.where(enough, upper, threshold)
-                upper_count = tl.where(enough, upper_count, count)
+                lower = tl.where(enough, middle, lower)
+                upper = tl.where(enough, upper, middle)
 
-            # Selected score columns are video key tiles offset by the prefix,
-            # stored after the live prefix entries and capped at the
-            # selection. The running count ranks chosen columns in column
-            # order, and the invariant above guarantees at least ``selected``
-            # of them, so the stored count is exact.
-            chosen = (values >= lower) & valid
+            # Keep every column above the threshold key, then the columns at
+            # it in column order until ``selected`` are kept. Selected score
+            # columns are video key tiles offset by the prefix, stored after
+            # the live prefix entries.
+            above = (keys > lower) & valid
+            tied = (keys == lower) & valid
+            room = selected - tl.sum(above.to(tl.int32), axis=0)
+            tie_rank = tl.cumsum(tied.to(tl.int32), axis=0)
+            chosen = above | (tied & (tie_rank <= room))
             positions = tl.cumsum(chosen.to(tl.int32), axis=0) - 1
             tl.store(
                 index_row + live + positions,
                 (offsets + prefix_tiles).to(tl.int32),
-                mask=chosen & (positions < selected),
+                mask=chosen,
             )
             tl.store(count_row, live + selected)
         else:
@@ -705,7 +700,7 @@ def _write_block_map(
 
     # Each program writes one head/query row: a dense prefix row, a video row
     # searched over a power-of-two score tile, or a padding row. The final
-    # constant is the fixed number of interpolation-search iterations.
+    # constant is the number of bisection steps over 32-bit score keys.
     _select_block_map_kernel[(heads * tiles,)](
         scores,
         prefix_key_indices,
