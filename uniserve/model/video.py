@@ -120,6 +120,16 @@ class AudioDecoder(nn.Module):
     def latent_frames(self, num_samples: int) -> int:
         raise NotImplementedError
 
+    def track_samples(self, num_frames: int, frame_rate: int) -> int:
+        """Return the sample count of the audio track generated with a video.
+
+        The track is the decode of the latent timeline the model generates
+        for ``num_frames`` video frames at ``frame_rate``, so it spans whole
+        latent frames and may differ slightly from the video duration; the
+        muxer aligns the two.
+        """
+        raise NotImplementedError
+
     def output_layout(self, num_samples: int) -> Mapping[str, OutputLayout]:
         """Describe the decoded sample-major track of ``num_samples``."""
         raise NotImplementedError

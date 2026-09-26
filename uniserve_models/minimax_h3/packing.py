@@ -61,8 +61,14 @@ def video_latent_frames(num_frames: int) -> int:
 
 
 def audio_latent_frames(num_frames: int) -> int:
-    """Size the 40 Hz audio latent timeline for a 24 Hz video frame count."""
-    return math.ceil(num_frames / FPS * AUDIO_LATENTS_PER_SECOND)
+    """Size the 40 Hz audio latent timeline for a 24 Hz video frame count.
+
+    The count is the video duration in audio latents rounded to the nearest
+    integer, as the checkpoint's training pipeline sizes it. At 24 fps and
+    40 Hz the exact value ``num_frames * 5 / 3`` is never halfway between
+    two integers, so the rounding direction is unambiguous.
+    """
+    return round(num_frames * AUDIO_LATENTS_PER_SECOND / FPS)
 
 
 @dataclass(frozen=True, slots=True)

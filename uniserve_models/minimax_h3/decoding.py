@@ -21,7 +21,13 @@ from uniserve.tensors import BufferConfig, OutputLayout
 
 from . import audio_vae, video_vae
 from .output import frame_slices
-from .packing import build_packing, unpatchify_video_into, video_latent_frames
+from .packing import (
+    FPS,
+    audio_latent_frames,
+    build_packing,
+    unpatchify_video_into,
+    video_latent_frames,
+)
 
 
 class VideoDecoder(BaseVideoDecoder):
@@ -170,6 +176,13 @@ class AudioDecoder(BaseAudioDecoder):
                 "audio duration must contain a positive sample count"
             )
         return math.ceil(num_samples / self.latent_rate)
+
+    def track_samples(self, num_frames: int, frame_rate: int) -> int:
+        # The denoiser generates audio_latent_frames(num_frames) latents per
+        # channel (packing.py), and each decodes to latent_rate samples.
+        if frame_rate != FPS:
+            raise ValueError(f"H3 audio accompanies {FPS} fps video")
+        return audio_latent_frames(num_frames) * self.latent_rate
 
     @property
     def latent_rate(self) -> int:
