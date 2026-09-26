@@ -14,6 +14,7 @@ from uniserve.diffusion import NoiseScale
 from uniserve.processing import (
     ImageProcessor,
     PatchTransform,
+    PixelBounds,
     StrideResize,
     TowerTransform,
 )
@@ -60,7 +61,7 @@ def test_encoded_pixels_match_channel_normalization(
     encoded = io.BytesIO()
     image.save(encoded, format="PNG")
     transform = (
-        PatchTransform(4, 1.0, 24 * 32, 24 * 32, normalization)
+        PatchTransform(4, 1, PixelBounds(24 * 32, 24 * 32), normalization)
         if patches
         else TowerTransform(StrideResize(32, 24, 1, 24 * 32), normalization)
     )

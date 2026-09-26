@@ -131,8 +131,12 @@ def test_explicit_pages_cannot_displace_resident_encoder_storage() -> None:
     build_worker_layout(model, config, image_processor=processor).info
     # The processor's admitted image area owns the complete resident feature
     # bound.
+    vit = processor.vit
     processor = replace(
-        processor, vit=replace(processor.vit, max_pixels=1024**3 * 16**2)
+        processor,
+        vit=replace(
+            vit, resize=replace(vit.resize, max_pixels=1024**3 * 16**2)
+        ),
     )
     with pytest.raises(ValueError, match="grant"):
         build_worker_layout(model, config, image_processor=processor).info

@@ -361,11 +361,12 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         flow_graph_shapes=((16, 16),),
         flow_graph_batch_sizes=(1,),
     )
-    from uniserve.processing import ImageProcessor, PatchTransform
+    from uniserve.processing import ImageProcessor, PatchTransform, PixelBounds
 
     processor = (
         ImageProcessor(
-            vit=PatchTransform(2, 0.5, 16, 256), staging_dtype=torch.bfloat16
+            vit=PatchTransform(2, 2, PixelBounds(16, 256)),
+            staging_dtype=torch.bfloat16,
         )
         if name == "sensenova_u1"
         else None
