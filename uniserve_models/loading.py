@@ -758,7 +758,73 @@ def _require_static_nvfp4(source: str, declared: Mapping) -> None:
         )
 
 
-def _calibrated_quantization(model, declarations, sources, declared, io):
+def _manifest_scales(root: Path, model: nn.Module) -> dict[str, float] | None:
+    """Read native module calibration from a packed ModelOpt manifest.
+
+    The manifest owns the W4A4 representation, including on ranks without a
+    quantized component. Per-module amax is converted to ModelOpt's tensor
+    scale; K16 block encoding remains a numerical layer operation.
+    """
+    path = root / "modelopt_manifest.json"
+    if not path.is_file():
+        return None
+    manifest = _json(path)
+    expected = {
+        "activation": "a4",
+        "block_scale": "fp8_e4m3",
+        "block_size": 16,
+        "output": "bf16",
+        "tensor_scale": "fp32",
+        "values": "e2m1",
+        "weight": "w4",
+    }
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("numerical_format") != expected
+    ):
+        raise ValueError("ModelOpt manifest must declare static NVFP4 W4A4 K16")
+    components = manifest.get("components")
+    if not isinstance(components, dict) or not components:
+        raise ValueError("ModelOpt manifest requires component calibration")
+    paths = dict(model.named_modules(remove_duplicate=False))
+    scales = {}
+    for name, component in components.items():
+        if not isinstance(component, dict) or not isinstance(
+            component.get("enabled"), bool
+        ):
+            raise ValueError(f"invalid ModelOpt component {name!r}")
+        modules = component.get("modules")
+        if (
+            not isinstance(modules, dict)
+            or bool(modules) != component["enabled"]
+        ):
+            raise ValueError(f"invalid ModelOpt calibration for {name!r}")
+        for path, calibration in modules.items():
+            amax = (
+                calibration.get("activation_amax")
+                if isinstance(calibration, dict)
+                else None
+            )
+            if (
+                not isinstance(paths.get(path), Linear)
+                or path in scales
+                or not isinstance(amax, (int, float))
+                or isinstance(amax, bool)
+                or not math.isfinite(amax)
+                or amax <= 0
+            ):
+                raise ValueError(
+                    f"invalid ModelOpt activation calibration for {path!r}"
+                )
+            scales[path] = amax / (6 * 448)
+    if not scales:
+        raise ValueError("ModelOpt manifest declares no calibrated modules")
+    return scales
+
+
+def _calibrated_quantization(
+    model, declarations, sources, declared, io, manifest_scales=None
+):
     """Configure every Linear a ModelOpt NVFP4 export stores packed.
 
     The checkpoint tensors decide which modules are quantized: a module whose
@@ -770,10 +836,13 @@ def _calibrated_quantization(model, declarations, sources, declared, io):
     Args:
         model: Meta-device model whose module paths receive the result.
         declarations: The package's checkpoint mappings for ``model``.
-        sources: Resolved sources; only those named in ``declared`` are read.
+        sources: Resolved sources; unified exports read those named in
+            ``declared`` and manifest exports inspect every resolved source.
         declared: ModelOpt ``quantization_config`` per source name, each
             checked against ``_require_static_nvfp4``.
         io: Checkpoint IO policy for opening the sources.
+        manifest_scales: Native module activation scales from a packed
+            manifest, or ``None`` for unified exports with input_scale tensors.
 
     Returns:
         A ``QuantizationConfig`` for every module path that owns a packed
@@ -796,7 +865,7 @@ def _calibrated_quantization(model, declarations, sources, declared, io):
 
     scales: dict[str, float] = {}
     for source in sources:
-        if source.name not in declared:
+        if manifest_scales is None and source.name not in declared:
             continue
         packed = 0
         with source.open(io=io) as reader:
@@ -805,15 +874,38 @@ def _calibrated_quantization(model, declarations, sources, declared, io):
                     continue
                 for assignment in component.map_weights(reader):
                     weight = assignment.source
+                    targets = owners[id(assignment.target)]
                     if not isinstance(weight, checkpoint.NVFP4Weight):
+                        if manifest_scales is not None and any(
+                            path in manifest_scales
+                            and assignment.target is paths[path].weight
+                            for path in targets
+                        ):
+                            raise ValueError(
+                                f"ModelOpt calibrated weight {weight.name!r} "
+                                "is not packed"
+                            )
                         continue
-                    value = weight.input_scale()
-                    if value is None or not math.isfinite(value) or value <= 0:
-                        raise ValueError(
-                            f"ModelOpt weight {weight.name!r} requires a "
-                            "positive static input_scale"
+                    stored_scale = weight.input_scale()
+                    for path in targets:
+                        value = (
+                            stored_scale
+                            if manifest_scales is None
+                            else manifest_scales.get(path)
                         )
-                    for path in owners[id(assignment.target)]:
+                        if (
+                            value is None
+                            or not math.isfinite(value)
+                            or value <= 0
+                        ):
+                            raise ValueError(
+                                f"ModelOpt weight {weight.name!r} requires a "
+                                "positive static input_scale"
+                            )
+                        if stored_scale is not None and stored_scale != value:
+                            raise ValueError(
+                                f"{path} has conflicting activation calibration"
+                            )
                         if not isinstance(paths[path], Linear):
                             raise ValueError(
                                 f"ModelOpt weight {weight.name!r} maps onto "
@@ -825,7 +917,7 @@ def _calibrated_quantization(model, declarations, sources, declared, io):
                                 "activation scales"
                             )
                     packed += 1
-        if not packed:
+        if not packed and source.name in declared:
             raise ValueError(
                 f"ModelOpt source {source.name} stores no packed NVFP4 weights"
             )
@@ -1012,7 +1104,7 @@ def read_config(
     if quantization is not None and not isinstance(quantization, dict):
         raise ValueError("checkpoint quantization_config must be an object")
 
-    # A ModelOpt export declares `quant_method: modelopt` in the root
+    # A unified ModelOpt export declares `quant_method: modelopt` in the root
     # configuration of a single-model checkpoint, or in each quantized
     # component's config.json of a diffusers pipeline.
     modelopt = {}
@@ -1032,12 +1124,19 @@ def read_config(
         declared = _component_quantization(root, declaration)
         if declared is not None:
             modelopt[declaration.name] = declared
-    if modelopt and quantization is not None:
+    # Packed exports instead publish native module calibration in a root
+    # manifest. Its metadata is fetched with the architecture sidecars.
+    manifest_scales = _manifest_scales(root, model)
+    if modelopt and manifest_scales is not None:
+        raise ValueError(
+            "checkpoint declares both unified and manifest ModelOpt calibration"
+        )
+    if (modelopt or manifest_scales is not None) and quantization is not None:
         raise ValueError(
             "a calibrated ModelOpt checkpoint cannot also declare a "
             "dynamic quantization_config"
         )
-    if modelopt:
+    if modelopt or manifest_scales is not None:
         # Packed weights and their calibrated scales form one immutable
         # checkpoint contract. Runtime precision presets apply only to dense
         # checkpoints and must not be offered for this source.
@@ -1047,7 +1146,7 @@ def read_config(
             quantization={
                 **base.quantization,
                 **_calibrated_quantization(
-                    model, declarations, sources, modelopt, io
+                    model, declarations, sources, modelopt, io, manifest_scales
                 ),
             },
         )

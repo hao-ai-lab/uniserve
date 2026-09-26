@@ -360,8 +360,9 @@ class FP8Weight(Weight):
 class NVFP4Weight(Weight):
     """Expose packed ModelOpt NVFP4 values in their calibrated scale domain.
 
-    `tensor_scale` is ModelOpt's `weight_scale_2`, the weight's global amax
-    divided by 6 * 448. `activation_scale` is the static `input_scale` the
+    `tensor_scale` is ModelOpt's `weight_scale_2` (or the packed export's
+    `weight_tensor_scale`), the weight's global amax divided by 6 * 448.
+    `activation_scale` is the static `input_scale` the
     same calibration recorded for the module's input, in the same domain,
     when the export quantizes activations.
     """
@@ -527,19 +528,39 @@ class Reader:
         # architecture mappings and TP slicing identical to a dense
         # checkpoint.
         for name, values in tuple(self._weights.items()):
-            if values.dtype != torch.uint8 or not name.endswith(".weight"):
+            packed = name.endswith(".weight_packed")
+            if values.dtype != torch.uint8 or not (
+                packed or name.endswith(".weight")
+            ):
                 continue
-            prefix = name.removesuffix(".weight")
-            tensor_scale = self._weights.get(prefix + ".weight_scale_2")
+            prefix = name.removesuffix(
+                ".weight_packed" if packed else ".weight"
+            )
+            tensor_scale = self._weights.get(
+                prefix
+                + (".weight_tensor_scale" if packed else ".weight_scale_2")
+            )
             if tensor_scale is None:
+                if packed:
+                    raise ValueError(
+                        f"NVFP4 checkpoint {name!r} requires its tensor scale"
+                    )
                 continue
             block_scale = self._weights.get(prefix + ".weight_scale")
             if block_scale is None:
                 raise ValueError(
                     f"NVFP4 checkpoint {name!r} requires its K16 block scales"
                 )
-            self._weights[name] = NVFP4Weight(
-                name,
+            logical = prefix + ".weight"
+            if packed and logical in self._weights:
+                raise ValueError(
+                    f"checkpoint declares two weights for {logical!r}"
+                )
+            # Packed exports keep the physical byte field separately. The
+            # logical weight preserves ordinary mappings and slice semantics;
+            # its source accounting includes every physical scale and value.
+            self._weights[logical] = NVFP4Weight(
+                logical,
                 values,
                 block_scale,
                 tensor_scale,
