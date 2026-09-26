@@ -26,9 +26,10 @@ pytestmark = [
     ),
 ]
 
-_HEAD_DIM = 256
-_QUERY_HEADS = 16
-_KV_HEADS = 8
+# (query heads, KV heads, head dim) of the model's sliding-window and
+# full-attention layers.
+_SLIDING = (16, 8, 256)
+_FULL = (16, 2, 512)
 # Packed rows after the last sequence, as in a graph-captured buffer.
 _PADDING_ROWS = 9
 _UNWRITTEN = 7.0
@@ -65,6 +66,7 @@ def _batch(
     prefixes,
     *,
     page_tokens,
+    heads=_SLIDING,
     start_pages=None,
     prefix_starts=None,
     seed=0,
@@ -82,11 +84,12 @@ def _batch(
     generator = torch.Generator(device="cuda").manual_seed(seed)
     starts = start_pages or (0,) * len(lengths)
     tokens = sum(lengths)
+    query_heads, kv_heads, head_dim = heads
 
     query = _normalized(
-        (tokens + _PADDING_ROWS, _QUERY_HEADS, _HEAD_DIM), generator
+        (tokens + _PADDING_ROWS, query_heads, head_dim), generator
     )
-    key = _normalized((tokens + _PADDING_ROWS, _KV_HEADS, _HEAD_DIM), generator)
+    key = _normalized((tokens + _PADDING_ROWS, kv_heads, head_dim), generator)
     value = torch.randn(key.shape, generator=generator, device="cuda")
     value = value.to(torch.bfloat16)
     for tensor in (query, key, value):
@@ -97,7 +100,7 @@ def _batch(
         for prefix, start in zip(prefixes, starts, strict=True)
     ]
     pages = pages or 1 + sum(owned) + 3
-    shape = (pages, page_tokens, _KV_HEADS, _HEAD_DIM)
+    shape = (pages, page_tokens, kv_heads, head_dim)
     key_cache = torch.full(shape, float("nan"), device="cuda")
     value_cache = torch.full(shape, float("nan"), device="cuda")
     key_cache = key_cache.to(torch.bfloat16)
@@ -119,7 +122,7 @@ def _batch(
             used += 1
             table[row, column] = page
             written = min(page_tokens, prefix - (start + column) * page_tokens)
-            rows = (written, _KV_HEADS, _HEAD_DIM)
+            rows = (written, kv_heads, head_dim)
             key_cache[page, :written] = _normalized(rows, generator)
             value_cache[page, :written] = torch.randn(
                 rows, generator=generator, device="cuda"
@@ -147,10 +150,11 @@ def _reference(batch, *, window, query_window, scale):
     """
     offsets = batch.query_offsets.tolist()
     page_tokens = batch.key_cache.shape[1]
-    group = _QUERY_HEADS // _KV_HEADS
-    kv_of_head = torch.arange(_QUERY_HEADS, device="cuda") // group
-    output = torch.empty((offsets[-1], _QUERY_HEADS, _HEAD_DIM), device="cuda")
-    lse = torch.empty((offsets[-1], _QUERY_HEADS), device="cuda")
+    _tokens, query_heads, head_dim = batch.query.shape
+    group = query_heads // batch.key.shape[1]
+    kv_of_head = torch.arange(query_heads, device="cuda") // group
+    output = torch.empty((offsets[-1], query_heads, head_dim), device="cuda")
+    lse = torch.empty((offsets[-1], query_heads), device="cuda")
 
     for row, prefix in enumerate(batch.prefix_lengths.tolist()):
         begin, end = offsets[row], offsets[row + 1]
@@ -162,7 +166,8 @@ def _reference(batch, *, window, query_window, scale):
             history = prefix - window + (positions if query_window else 0)
             lower = torch.maximum(lower, torch.as_tensor(history).cuda())
         first = int(lower.clamp(0, prefix).min())
-        # Gather the prefix tokens any row can see through the table.
+        # Gather, through the table, the written prefix tokens that any row
+        # can see.
         tokens = torch.arange(first, prefix, device="cuda")
         start = 0 if batch.start_page is None else int(batch.start_page[row])
         pages = batch.block_table[row, tokens // page_tokens - start].long()
@@ -182,8 +187,6 @@ def _reference(batch, *, window, query_window, scale):
             ),
             dim=1,
         )
-        # Invisible gathered keys may be NaN-free here, but zero them anyway
-        # so that masked entries cannot leak NaN into the reference.
         scores = torch.einsum(
             "qhd,khd->hqk",
             batch.query[begin:end].float(),
@@ -306,15 +309,16 @@ def test_image_block_window_follows_each_query(page_tokens):
     )
 
 
+@pytest.mark.parametrize("heads", [_SLIDING, _FULL], ids=["hd256", "hd512"])
 @pytest.mark.parametrize("query_window", [False, True])
 @torch.inference_mode()
-def test_short_window_bounds_are_exact(query_window):
+def test_short_window_bounds_are_exact(heads, query_window):
     # With a few visible keys per row every key carries a large share of
     # the softmax, so a key admitted or dropped at either window edge moves
     # the output well past the tolerance. Windows cut pages mid-way.
     lengths = (5, 3, 9)
     prefixes = (20, 37, 3)
-    batch = _batch(lengths, prefixes, page_tokens=16, seed=23)
+    batch = _batch(lengths, prefixes, page_tokens=16, heads=heads, seed=23)
     out, lse = _outputs(batch)
 
     _launch(
@@ -333,6 +337,39 @@ def test_short_window_bounds_are_exact(query_window):
         window=3,
         query_window=query_window,
         scale=1.0,
+        base2=False,
+    )
+
+
+@pytest.mark.parametrize("page_tokens", [32, 64])
+@torch.inference_mode()
+def test_full_layer_reads_whole_prefix(page_tokens):
+    # Head dim 512 with 8 query heads per KV head: canvas blocks and image
+    # blocks read the whole prefix; lengths and prefixes are not tile or page
+    # multiples.
+    lengths = (256, 256, 280, 17)
+    prefixes = (0, 1025, 300, 4097)
+    batch = _batch(
+        lengths, prefixes, page_tokens=page_tokens, heads=_FULL, seed=31
+    )
+    out, lse = _outputs(batch)
+
+    _launch(
+        batch,
+        window=None,
+        query_window=False,
+        scale=512**-0.5,
+        out=out,
+        lse=lse,
+    )
+
+    _assert_matches(
+        batch,
+        out,
+        lse,
+        window=None,
+        query_window=False,
+        scale=512**-0.5,
         base2=False,
     )
 
@@ -474,7 +511,7 @@ def test_eligibility_reports_unsupported_page_size():
     ]
     assert prefix_block.can_run(*arguments, window=1023)
 
-    wide = batch.key_cache.new_zeros((4, 128, _KV_HEADS, _HEAD_DIM))
+    wide = batch.key_cache.new_zeros((4, 128, *batch.key_cache.shape[2:]))
     arguments[3:5] = [wide, wide]
     assert not prefix_block.can_run(*arguments, window=1023)
     with pytest.raises(ValueError, match="page_tokens"):

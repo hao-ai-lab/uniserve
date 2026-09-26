@@ -8,13 +8,25 @@ query position (image blocks); see :class:`PrefixBlockAttentionSm100`.
 
 Work decomposition. Query heads that share a KV head are packed into the row
 dimension: packed row ``r`` of a sequence is query position ``r // G`` of
-query head ``kv_head * G + r % G``. A work tile is 256 packed rows of one
-sequence and one KV head, computed by a two-CTA cluster: each CTA owns 128
-rows and the pair issues ``tcgen05`` two-SM MMAs, so every K/V tile is read
-once per 256 rows and each CTA stages only half of it. The persistent grid
-walks work tiles with a static stride; tiles beyond a sequence's device
-length are skipped, so one launch serves every length column it is replayed
-with.
+query head ``kv_head * G + r % G``. A work tile is a block of packed rows of
+one sequence and one KV head, computed by a two-CTA cluster that issues
+``tcgen05`` two-SM MMAs, so each CTA stages only half of every K/V tile. The
+persistent grid walks work tiles with a static stride; tiles beyond a
+sequence's device length are skipped, so one launch serves every length
+column it is replayed with.
+
+Head-dimension shapes. With head dimension 256 a work tile is 256 rows
+(128 per CTA, the full tensor-memory lane count), the output accumulator
+takes 256 of the 512 tensor-memory columns and two 128-column score stages
+the rest; BF16 probabilities overwrite their scores and feed the PV MMA
+from tensor memory. With head dimension 512 a 128-row accumulator per CTA
+would fill all 512 columns, so a work tile is 128 rows (64 per CTA): the
+two-SM M = 128 MMA stores each CTA's 64 rows in the "2x2" layout, the first
+half of the columns in lanes 0-63 and the second half in lanes 64-127, which
+keeps every data path busy while halving the columns (256 for the output,
+64 per score stage). Each row's scores are then split between two threads
+(lanes ``r`` and ``r + 64``), which exchange row maxima through shared
+memory, and the probabilities reach the PV MMA through shared memory.
 
 Key tiles. A work tile streams 128-key tiles: prefix tiles first, then the
 tiles of its own block. Prefix tiles start at the page containing the
@@ -41,11 +53,10 @@ prefix tokens before the window in its first page, and other sequences'
 current rows. Unused pages, unwritten page tails and trailing padding rows
 may therefore hold NaN.
 
-Warp roles (per CTA, 12 warps): softmax (0-3, one thread per row), output
-correction and epilogue (4-7), MMA issue (8, leader CTA only), TMA loads
-(9), and two idle warps. Tensor memory holds two 128-column score stages
-(probabilities overwrite scores in place as the PV operand) and the
-256-column output accumulator. These mechanisms follow the FlashAttention-4
+Warp roles (per CTA, 12 warps): softmax (0-3, one thread per tensor-memory
+lane), output correction and epilogue (4-7), MMA issue (8, leader CTA
+only), TMA loads (9), and two idle warps. K and V stages share one ring of
+16 KiB shared-memory stages. These mechanisms follow the FlashAttention-4
 head-dimension-256 SM100 kernel.
 """
 
@@ -65,6 +76,12 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 _TMEM_COLUMNS = 512
+# Named barriers: 1 publishes the tensor-memory allocation; 2 and 3 pair
+# softmax warps (0, 2) and (1, 3), whose lanes share rows at head dim 512.
+_TMEM_BARRIER = 1
+_PAIR_BARRIER = 2
+# Tensor-memory addresses carry the lane above bit 16 and the column below.
+_TMEM_LANE = 1 << 16
 
 
 def _group(size: int) -> pipeline.CooperativeGroup:
@@ -78,8 +95,9 @@ class PrefixBlockAttentionSm100:
     Constructor arguments are compile-time specializations:
 
     Args:
-        head_dim: Q/K/V head dimension; 256.
-        group_size: Query heads per KV head ``G``; a divisor of 128.
+        head_dim: Q/K/V head dimension; 256 or 512.
+        group_size: Query heads per KV head ``G``; must divide the CTA rows
+            (128 at head dim 256, 64 at head dim 512).
         page_tokens: Tokens per cache page; 16, 32 or 64.
         query_window: If true, row ``i`` of a block reads prefix keys from
             ``P + i - window`` (an image block whose history window follows
@@ -108,10 +126,8 @@ class PrefixBlockAttentionSm100:
         has_lse: bool,
         lse_base2: bool,
     ) -> None:
-        if head_dim != 256:
-            raise ValueError("the SM100 prefix-block kernel supports hd256")
-        if group_size < 1 or 128 % group_size:
-            raise ValueError("query heads per KV head must divide 128")
+        if head_dim not in (256, 512):
+            raise ValueError("head_dim must be 256 or 512")
         if page_tokens not in (16, 32, 64):
             raise ValueError("page_tokens must be 16, 32 or 64")
 
@@ -125,11 +141,20 @@ class PrefixBlockAttentionSm100:
         self.has_lse = has_lse
         self.lse_base2 = lse_base2
 
-        # A cluster tile is 256 packed rows (128 per CTA) against 128-key
-        # tiles; the head dimension is consumed in 128-wide chunks so that a
-        # K or V stage is 16 KiB per CTA.
-        self.cta_rows = 128
-        self.tile_rows = 256
+        # Rows per cluster tile and per CTA; see the module docstring.
+        self.tile_rows = 256 if head_dim == 256 else 128
+        self.cta_rows = self.tile_rows // 2
+        if group_size < 1 or self.cta_rows % group_size:
+            raise ValueError("query heads per KV head must divide CTA rows")
+        # Threads (tensor-memory lanes) per row: the 2x2 layout of a 64-row
+        # accumulator puts the two column halves of a row in two lanes.
+        self.row_split = 128 // self.cta_rows
+        # Probabilities feed the PV MMA from tensor memory at 128 rows per
+        # CTA and from shared memory at 64 rows per CTA.
+        self.p_in_tmem = self.cta_rows == 128
+
+        # The head dimension is consumed in 128-wide chunks so that every K
+        # or V stage is 16 KiB per CTA; keys come in 128-key tiles.
         self.tile_keys = 128
         self.chunk = 128
         self.qk_mma_tiler = (self.tile_rows, self.tile_keys, self.chunk)
@@ -145,7 +170,7 @@ class PrefixBlockAttentionSm100:
         self.slots_per_half = self.half_keys // page_tokens
 
         self.q_stage = self.qk_chunks
-        self.kv_stage = 4
+        self.kv_stage = 8 if head_dim == 256 else 6
         self.s_stage = 2
 
         self.softmax_warps = (0, 1, 2, 3)
@@ -154,15 +179,20 @@ class PrefixBlockAttentionSm100:
         self.load_warp = 9
         self.idle_warps = (10, 11)
         self.threads = 32 * 12
-        self.row_threads = 128
+        self.lane_threads = 128
 
-        # Tensor memory columns: score stages at [0, 256), output at
-        # [256, 512). Probabilities (BF16) overwrite the first 64 columns of
-        # their score stage; the softmax row statistics handed to the
-        # correction warps occupy the two columns after them.
+        # Tensor-memory columns of one score stage and one output chunk, and
+        # their placement: score stages from column 0, the output from 256.
+        self.s_columns = self.tile_keys * self.cta_rows // 128
+        self.o_chunk_columns = self.chunk * self.cta_rows // 128
         self.tmem_s_offset = 0
         self.tmem_o_offset = 256
-        self.p_columns = self.tile_keys * 16 // 32
+        # BF16 probabilities kept in tensor memory occupy the first half of
+        # their score stage. The softmax row statistics for the correction
+        # warps take two columns of the stage after its scores are read:
+        # after the probabilities, or at its start when they go to SMEM.
+        self.p_columns = self.tile_keys // 2
+        self.stats_column = self.p_columns if self.p_in_tmem else 0
 
         self.regs_softmax = 256
         self.regs_correction = 160
@@ -198,8 +228,8 @@ class PrefixBlockAttentionSm100:
         ``[tokens, Hkv, D]``, caches ``[pages, page_tokens, Hkv, D]``,
         ``block_table`` ``[B, W]`` int32, ``query_offsets`` ``[B + 1]``,
         ``prefix_lengths``/``start_page``/``prefix_start`` ``[B]`` int32 and
-        ``lse`` ``[tokens, Hq]`` FP32. ``num_m_blocks`` bounds the 256-row
-        tiles of any sequence and ``num_clusters`` sizes the grid.
+        ``lse`` ``[tokens, Hq]`` FP32. ``num_m_blocks`` bounds the work tiles
+        of any sequence and ``num_clusters`` sizes the grid.
         """
         dtype = query.element_type
         group = self.group_size
@@ -274,8 +304,8 @@ class PrefixBlockAttentionSm100:
             cta_group,
             self.qk_mma_tiler[:2],
         )
-        # P is read from tensor memory, K-major; V is MN-major (head dim
-        # contiguous).
+        # P is K-major, from tensor memory or shared memory; V is MN-major
+        # (head dim contiguous).
         pv_mma = sm100_utils.make_trivial_tiled_mma(
             dtype,
             dtype,
@@ -284,7 +314,9 @@ class PrefixBlockAttentionSm100:
             Float32,
             cta_group,
             self.pv_mma_tiler[:2],
-            tcgen05.OperandSource.TMEM,
+            tcgen05.OperandSource.TMEM
+            if self.p_in_tmem
+            else tcgen05.OperandSource.SMEM,
         )
         cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((2, 1, 1)), (qk_mma.thr_id.shape,)
@@ -299,14 +331,15 @@ class PrefixBlockAttentionSm100:
         v_smem = sm100_utils.make_smem_layout_b(
             pv_mma, self.pv_mma_tiler, dtype, self.kv_stage
         )
-        # Layout of one BF16 probability tile as the tensor-memory A operand
-        # of the PV MMA; it aliases the first columns of a score stage.
-        p_tmem = cute.select(
-            sm100_utils.make_smem_layout_a(
-                pv_mma, self.pv_mma_tiler, dtype, self.s_stage
-            ),
-            mode=[0, 1, 2],
+        # One probability tile per score stage, as the PV A operand: in
+        # tensor memory (aliasing the stage's first columns) or in SMEM.
+        p_layout = sm100_utils.make_smem_layout_a(
+            pv_mma, self.pv_mma_tiler, dtype, self.s_stage
         )
+        # K and V stages alias one ring: both are 16 KiB per CTA with the
+        # same swizzle, and a stage holds one of them at a time.
+        assert cute.cosize(k_smem) == cute.cosize(v_smem)
+        assert str(k_smem.inner) == str(v_smem.inner)
         # Plain (rows, cols) views of one K or V stage for the slot TMA
         # copies. They tile the same swizzle atom in the same order as the
         # MMA-partitioned stages above, so element offsets coincide.
@@ -361,6 +394,10 @@ class PrefixBlockAttentionSm100:
             o_full_empty: cute.struct.MemRange[Int64, 2]
             tmem_dealloc: Int64
             tmem_holding: Int32
+            # Row sums for the epilogue, and the row-half exchange buffer
+            # (two alternating parities of one value per lane).
+            row_sums: cute.struct.MemRange[Float32, self.cta_rows]
+            pair_values: cute.struct.MemRange[Float32, 2 * self.lane_threads]
 
         self.shared_storage = SharedStorage
 
@@ -394,7 +431,7 @@ class PrefixBlockAttentionSm100:
             q_smem,
             k_smem,
             v_smem,
-            p_tmem,
+            p_layout,
             k_plain,
             v_plain,
         ).launch(
@@ -409,20 +446,10 @@ class PrefixBlockAttentionSm100:
 
     @no_type_check
     @cute.jit
-    def work_tile(
-        self,
-        tile: Int32,
-        num_m_blocks: Int32,
-        kv_heads: Int32,
-        query_offsets: cute.Tensor,
-        prefix_lengths: cute.Tensor,
-        start_page: cute.Tensor | None,
-        prefix_start: cute.Tensor | None,
-        window: Int32,
-    ):
+    def work_tile(self, tile: Int32, schedule):
         """Decode a linear work tile and its sequence's key ranges.
 
-        Tiles are ordered with the 256-row block fastest, then KV head, then
+        Tiles are ordered with the row block fastest, then KV head, then
         sequence, so concurrently running clusters share K/V in L2.
 
         Returns:
@@ -434,6 +461,18 @@ class PrefixBlockAttentionSm100:
             ``lower_last`` are the prefix lower bounds of the tile's first
             and last query positions.
         """
+        (
+            _cluster_id,
+            _num_clusters,
+            _total_tiles,
+            num_m_blocks,
+            kv_heads,
+            query_offsets,
+            prefix_lengths,
+            start_page,
+            prefix_start,
+            window,
+        ) = schedule
         m_block = tile % num_m_blocks
         rest = tile // num_m_blocks
         kv_head = rest % kv_heads
@@ -546,7 +585,7 @@ class PrefixBlockAttentionSm100:
         q_smem: cute.ComposedLayout,
         k_smem: cute.ComposedLayout,
         v_smem: cute.ComposedLayout,
-        p_tmem: cute.ComposedLayout,
+        p_layout: cute.ComposedLayout,
         k_plain: cute.ComposedLayout,
         v_plain: cute.ComposedLayout,
     ):
@@ -559,9 +598,9 @@ class PrefixBlockAttentionSm100:
             cpasync.prefetch_descriptor(tma_vc)
 
         bidx, _, _ = cute.arch.block_idx()
-        # Position of this CTA in the MMA pair: rows [v * 128, v * 128 + 128)
-        # of a tile, keys [v * 64, v * 64 + 64) of each K tile and head dims
-        # [v * 64, v * 64 + 64) of each V chunk.
+        # Position of this CTA in the MMA pair: rows [v * R, v * R + R) of a
+        # tile (R rows per CTA), keys [v * 64, v * 64 + 64) of each K tile
+        # and head dims [v * 64, v * 64 + 64) of each V chunk.
         cta_v = bidx % 2
         cluster_id = bidx // 2
         num_clusters = cute.arch.grid_dim()[0] // 2
@@ -570,14 +609,26 @@ class PrefixBlockAttentionSm100:
         is_leader = cta_rank % 2 == 0
         kv_heads = o_packed.shape[2]
         total_tiles = (query_offsets.shape[0] - 1) * kv_heads * num_m_blocks
+        schedule = (
+            cluster_id,
+            num_clusters,
+            total_tiles,
+            num_m_blocks,
+            kv_heads,
+            query_offsets,
+            prefix_lengths,
+            start_page,
+            prefix_start,
+            window,
+        )
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         load_warp_group = _group(1)
         mma_warp_group = _group(1)
-        softmax_pair = _group(self.row_threads * 2)
-        correction_pair = _group(self.row_threads * 2)
+        softmax_pair = _group(self.lane_threads * 2)
+        correction_pair = _group(self.lane_threads * 2)
         q_producer, q_consumer = pipeline.PipelineTmaUmma.create(
             num_stages=self.q_stage,
             producer_group=load_warp_group,
@@ -614,15 +665,15 @@ class PrefixBlockAttentionSm100:
         ).make_participants()
         stats_producer, stats_consumer = pipeline.PipelineAsync.create(
             num_stages=self.s_stage,
-            producer_group=_group(self.row_threads),
-            consumer_group=_group(self.row_threads),
+            producer_group=_group(self.lane_threads),
+            consumer_group=_group(self.lane_threads),
             barrier_storage=storage.stats_full_empty.data_ptr(),
             defer_sync=True,
         ).make_participants()
         sum_producer, sum_consumer = pipeline.PipelineAsync.create(
             num_stages=1,
-            producer_group=_group(self.row_threads),
-            consumer_group=_group(self.row_threads),
+            producer_group=_group(self.lane_threads),
+            consumer_group=_group(self.lane_threads),
             barrier_storage=storage.sum_full_empty.data_ptr(),
             defer_sync=True,
         ).make_participants()
@@ -638,7 +689,7 @@ class PrefixBlockAttentionSm100:
         tmem = utils.TmemAllocator(
             storage.tmem_holding.ptr,
             barrier_for_retrieve=pipeline.NamedBarrier(
-                barrier_id=1, num_threads=self.threads
+                barrier_id=_TMEM_BARRIER, num_threads=self.threads
             ),
             allocator_warp_id=self.correction_warps[0],
             is_two_cta=True,
@@ -662,18 +713,21 @@ class PrefixBlockAttentionSm100:
             element_type=self.dtype,
             layout=k_smem.outer,
             swizzle=k_smem.inner,
-            byte_alignment=128,
+            byte_alignment=1024,
         )
-        s_v = smem.allocate_tensor(
-            element_type=self.dtype,
-            layout=v_smem.outer,
-            swizzle=v_smem.inner,
-            byte_alignment=128,
-        )
-        s_sum = smem.allocate_tensor(
-            element_type=Float32,
-            layout=cute.make_layout(self.row_threads),
-            byte_alignment=128,
+        # V stages alias the K stages of the shared ring.
+        s_v = cute.make_tensor(s_k.iterator, v_smem.outer)
+        s_p = None
+        if const_expr(not self.p_in_tmem):
+            s_p = smem.allocate_tensor(
+                element_type=self.dtype,
+                layout=p_layout.outer,
+                swizzle=p_layout.inner,
+                byte_alignment=1024,
+            )
+        s_sum = storage.row_sums.get_tensor(cute.make_layout(self.cta_rows))
+        s_pair = storage.pair_values.get_tensor(
+            cute.make_layout((self.lane_threads, 2))
         )
 
         qk_thr = qk_mma.get_slice(cta_v)
@@ -684,15 +738,23 @@ class PrefixBlockAttentionSm100:
         s_shape = qk_thr.partition_shape_C(self.qk_mma_tiler[:2])
         t_s = qk_thr.make_fragment_C(cute.append(s_shape, self.s_stage))
         t_s = cute.make_tensor(t_s.iterator + self.tmem_s_offset, t_s.layout)
+        # (row, key) of every score of this CTA, relative to the work tile.
+        c_s = qk_thr.partition_C(
+            cute.make_identity_tensor(self.qk_mma_tiler[:2])
+        )
         o_shape = pv_thr.partition_shape_C(self.pv_mma_tiler[:2])
         t_o = pv_thr.make_fragment_C(o_shape)
         t_o = cute.make_tensor(
             t_o.iterator + self.tmem_o_offset,
             cute.append(
                 t_o.layout,
-                cute.make_layout(self.pv_chunks, stride=self.chunk),
+                cute.make_layout(self.pv_chunks, stride=self.o_chunk_columns),
             ),
         )
+        # The PV A operand in SMEM; in tensor memory it is built per stage.
+        t_p = None
+        if const_expr(not self.p_in_tmem):
+            t_p = pv_thr.make_fragment_A(s_p)
 
         pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
@@ -700,23 +762,12 @@ class PrefixBlockAttentionSm100:
         if warp == self.load_warp:
             cute.arch.setmaxregister_decrease(self.regs_other)
             self.load(
-                tile_args=(
-                    cluster_id,
-                    num_clusters,
-                    total_tiles,
-                    num_m_blocks,
-                    kv_heads,
-                    query_offsets,
-                    prefix_lengths,
-                    start_page,
-                    prefix_start,
-                    window,
-                ),
-                cta_v=cta_v,
-                cta_coord_vmnk=cta_coord_vmnk,
-                cluster_layout_vmnk=cluster_layout_vmnk,
-                qk_thr=qk_thr,
-                tma=(
+                schedule,
+                cta_v,
+                cta_coord_vmnk,
+                cluster_layout_vmnk,
+                qk_thr,
+                (
                     tma_q,
                     tma_q_tensor,
                     tma_kp,
@@ -728,88 +779,56 @@ class PrefixBlockAttentionSm100:
                     tma_vc,
                     tma_vc_tensor,
                 ),
-                smem_tensors=(s_q, s_k, s_v, k_plain, v_plain),
-                block_table=block_table,
-                num_pages=num_pages,
-                producers=(q_producer, kv_producer),
+                (s_q, s_k, k_plain, v_plain),
+                block_table,
+                num_pages,
+                q_producer,
+                kv_producer,
             )
 
         # ------------------------------------------------------------- mma
         if warp == self.mma_warp:
             cute.arch.setmaxregister_decrease(self.regs_other)
             self.mma(
-                tile_args=(
-                    cluster_id,
-                    num_clusters,
-                    total_tiles,
-                    num_m_blocks,
-                    kv_heads,
-                    query_offsets,
-                    prefix_lengths,
-                    start_page,
-                    prefix_start,
-                    window,
-                ),
-                is_leader=is_leader,
-                mmas=(qk_mma, pv_mma, pv_thr),
-                fragments=(t_q, t_k, t_v, t_s, t_o, p_tmem),
-                pipes=(
-                    q_consumer,
-                    kv_consumer,
-                    s_producer,
-                    p_consumer,
-                    o_producer,
-                ),
+                schedule,
+                is_leader,
+                qk_mma,
+                pv_mma,
+                pv_thr,
+                (t_q, t_k, t_v, t_s, t_o, t_p, p_layout),
+                (q_consumer, kv_consumer, s_producer, p_consumer, o_producer),
             )
 
         # --------------------------------------------------------- softmax
         if warp < self.correction_warps[0]:
             cute.arch.setmaxregister_increase(self.regs_softmax)
             self.softmax(
-                tile_args=(
-                    cluster_id,
-                    num_clusters,
-                    total_tiles,
-                    num_m_blocks,
-                    kv_heads,
-                    query_offsets,
-                    prefix_lengths,
-                    start_page,
-                    prefix_start,
-                    window,
-                ),
-                cta_v=cta_v,
-                t_s=t_s,
-                s_sum=s_sum,
-                lse=lse,
-                scale=scale,
-                scale_log2=scale_log2,
-                pipes=(s_consumer, p_producer, stats_producer, sum_producer),
+                schedule,
+                cta_v,
+                t_s,
+                c_s,
+                s_p,
+                p_layout,
+                s_sum,
+                s_pair,
+                lse,
+                scale,
+                scale_log2,
+                (s_consumer, p_producer, stats_producer, sum_producer),
             )
 
         # ------------------------------------------------------ correction
         if warp >= self.correction_warps[0] and warp < self.mma_warp:
             cute.arch.setmaxregister_decrease(self.regs_correction)
             self.correction(
-                tile_args=(
-                    cluster_id,
-                    num_clusters,
-                    total_tiles,
-                    num_m_blocks,
-                    kv_heads,
-                    query_offsets,
-                    prefix_lengths,
-                    start_page,
-                    prefix_start,
-                    window,
-                ),
-                cta_v=cta_v,
-                t_s=t_s,
-                t_o=t_o,
-                s_sum=s_sum,
-                o_packed=o_packed,
-                scale_log2=scale_log2,
-                pipes=(stats_consumer, sum_consumer, o_consumer),
+                schedule,
+                cta_v,
+                t_s,
+                t_o,
+                s_sum,
+                o_packed,
+                scale_log2,
+                (stats_consumer, sum_consumer, o_consumer),
             )
 
         if warp > self.load_warp:
@@ -831,7 +850,7 @@ class PrefixBlockAttentionSm100:
     @cute.jit
     def load(
         self,
-        tile_args,
+        schedule,
         cta_v: Int32,
         cta_coord_vmnk,
         cluster_layout_vmnk: cute.Layout,
@@ -840,25 +859,15 @@ class PrefixBlockAttentionSm100:
         smem_tensors,
         block_table: cute.Tensor,
         num_pages: Int32,
-        producers,
+        q_producer,
+        kv_producer,
     ):
         """Issue the TMA loads of Q and of every K/V stage of each tile.
 
         K tile ``j`` is loaded before V tile ``j - 1``, the order in which
         the MMA warp consumes the stages.
         """
-        (
-            cluster_id,
-            num_clusters,
-            total_tiles,
-            num_m_blocks,
-            kv_heads,
-            query_offsets,
-            prefix_lengths,
-            start_page,
-            prefix_start,
-            window,
-        ) = tile_args
+        cluster_id, num_clusters, total_tiles = schedule[:3]
         (
             tma_q,
             tma_q_tensor,
@@ -871,40 +880,25 @@ class PrefixBlockAttentionSm100:
             tma_vc,
             tma_vc_tensor,
         ) = tma
-        s_q, s_k, s_v, k_plain, v_plain = smem_tensors
-        q_producer, kv_producer = producers
+        s_q, s_k, k_plain, v_plain = smem_tensors
 
-        # Plain (row, col, stage) views of the K and V stage buffers.
+        # Plain (row, col, stage) views of the K and V stages of the ring.
+        stages = cute.make_layout(self.kv_stage, stride=cute.cosize(k_plain))
         s_k_plain = cute.make_tensor(
-            s_k.iterator,
-            cute.append(
-                k_plain.outer,
-                cute.make_layout(
-                    self.kv_stage, stride=cute.cosize(k_plain.outer)
-                ),
-            ),
+            s_k.iterator, cute.append(k_plain.outer, stages)
         )
         s_v_plain = cute.make_tensor(
-            s_v.iterator,
-            cute.append(
-                v_plain.outer,
-                cute.make_layout(
-                    self.kv_stage, stride=cute.cosize(v_plain.outer)
-                ),
-            ),
+            s_k.iterator, cute.append(v_plain.outer, stages)
         )
         # Page slots (page_tokens, chunk, slots, 1, stage) of a K half and
         # (half_dims, page_tokens, 1, slots, stage) of a V half, and the
         # whole-stage views used for current-block tiles.
-        s_k_slots = cute.flat_divide(s_k_plain, (self.page_tokens, self.chunk))
-        s_v_slots = cute.flat_divide(
-            s_v_plain, (self.half_dims, self.page_tokens)
+        views = (
+            cute.flat_divide(s_k_plain, (self.page_tokens, self.chunk)),
+            cute.flat_divide(s_k_plain, (self.half_keys, self.chunk)),
+            cute.flat_divide(s_v_plain, (self.half_dims, self.page_tokens)),
+            cute.flat_divide(s_v_plain, (self.half_dims, self.tile_keys)),
         )
-        s_k_whole = cute.flat_divide(s_k_plain, (self.half_keys, self.chunk))
-        s_v_whole = cute.flat_divide(
-            s_v_plain, (self.half_dims, self.tile_keys)
-        )
-        views = (s_k_slots, s_k_whole, s_v_slots, s_v_whole)
         q_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
         )
@@ -925,18 +919,9 @@ class PrefixBlockAttentionSm100:
                 key_tiles,
                 _lower_first,
                 _lower_last,
-            ) = self.work_tile(
-                tile,
-                num_m_blocks,
-                kv_heads,
-                query_offsets,
-                prefix_lengths,
-                start_page,
-                prefix_start,
-                window,
-            )
+            ) = self.work_tile(tile, schedule)
             if valid:
-                # Q: this CTA's 128 of the tile's 256 packed rows, per chunk.
+                # Q: this CTA's rows of the tile's packed rows, per chunk.
                 q_seq = cute.domain_offset(
                     ((0, query_start), 0, 0), tma_q_tensor
                 )
@@ -1256,7 +1241,9 @@ class PrefixBlockAttentionSm100:
 
     @no_type_check
     @cute.jit
-    def mma(self, tile_args, is_leader, mmas, fragments, pipes):
+    def mma(
+        self, schedule, is_leader, qk_mma, pv_mma, pv_thr, fragments, pipes
+    ):
         """Issue the QK and PV MMAs of every tile from the leader CTA.
 
         Scores of tile ``j`` are computed before the PV product of tile
@@ -1264,34 +1251,13 @@ class PrefixBlockAttentionSm100:
         neighbours; the two score stages alternate. The peer CTA's MMA warp
         only walks the tiles.
         """
-        (
-            cluster_id,
-            num_clusters,
-            total_tiles,
-            num_m_blocks,
-            kv_heads,
-            query_offsets,
-            prefix_lengths,
-            start_page,
-            prefix_start,
-            window,
-        ) = tile_args
-        qk_mma, pv_mma, pv_thr = mmas
-        t_q, t_k, t_v, t_s, t_o, p_tmem = fragments
+        cluster_id, num_clusters, total_tiles = schedule[:3]
+        t_q, t_k, t_v, t_s, t_o, t_p, p_layout = fragments
         q_consumer, kv_consumer, s_producer, p_consumer, o_producer = pipes
 
         tile = cluster_id
         while tile < total_tiles:
-            info = self.work_tile(
-                tile,
-                num_m_blocks,
-                kv_heads,
-                query_offsets,
-                prefix_lengths,
-                start_page,
-                prefix_start,
-                window,
-            )
+            info = self.work_tile(tile, schedule)
             valid = info[0]
             key_tiles = info[10]
             if valid and is_leader:
@@ -1333,10 +1299,7 @@ class PrefixBlockAttentionSm100:
                         ) = self.pv_step(
                             pv_mma,
                             pv_thr,
-                            t_v,
-                            t_s,
-                            t_o,
-                            p_tmem,
+                            (t_v, t_s, t_o, t_p, p_layout),
                             kv_consumer,
                             p_consumer,
                             o_producer,
@@ -1344,10 +1307,7 @@ class PrefixBlockAttentionSm100:
                 pv_mma, kv_consumer, p_consumer, o_producer = self.pv_step(
                     pv_mma,
                     pv_thr,
-                    t_v,
-                    t_s,
-                    t_o,
-                    p_tmem,
+                    (t_v, t_s, t_o, t_p, p_layout),
                     kv_consumer,
                     p_consumer,
                     o_producer,
@@ -1359,33 +1319,32 @@ class PrefixBlockAttentionSm100:
     @no_type_check
     @cute.jit
     def pv_step(
-        self,
-        pv_mma,
-        pv_thr,
-        t_v,
-        t_s,
-        t_o,
-        p_tmem,
-        kv_consumer,
-        p_consumer,
-        o_producer,
+        self, pv_mma, pv_thr, operands, kv_consumer, p_consumer, o_producer
     ):
         """Accumulate ``P V`` of the oldest pending tile into the output.
 
         Waits for the tile's probabilities and for the correction warps to
         release the output, which they rescale between consecutive tiles.
         """
+        t_v, t_s, t_o, t_p, p_layout = operands
         p_handle = p_consumer.wait_and_advance()
         o_handle = o_producer.acquire_and_advance()
         accumulate = pv_mma.get(tcgen05.Field.ACCUMULATE)
-        t_s_stage = t_s[None, None, None, p_handle.index]
-        # BF16 probabilities in place of the scores, as the TMEM A operand.
-        t_p = pv_thr.make_fragment_A(
-            cute.make_tensor(t_s_stage.iterator, p_tmem.outer)
-        )
-        t_p = cute.make_tensor(
-            cute.recast_ptr(t_s_stage.iterator, dtype=self.dtype), t_p.layout
-        )
+        if const_expr(self.p_in_tmem):
+            # BF16 probabilities in place of the stage's scores.
+            t_s_stage = t_s[None, None, None, p_handle.index]
+            t_p_stage = pv_thr.make_fragment_A(
+                cute.make_tensor(
+                    t_s_stage.iterator,
+                    cute.select(p_layout.outer, mode=[0, 1, 2]),
+                )
+            )
+            t_p_stage = cute.make_tensor(
+                cute.recast_ptr(t_s_stage.iterator, dtype=self.dtype),
+                t_p_stage.layout,
+            )
+        else:
+            t_p_stage = t_p[None, None, None, p_handle.index]
         for chunk in cutlass.range(self.pv_chunks, unroll=1):
             v_handle = kv_consumer.wait_and_advance()
             pv_mma.set(tcgen05.Field.ACCUMULATE, accumulate)
@@ -1397,7 +1356,7 @@ class PrefixBlockAttentionSm100:
                 cute.gemm(
                     pv_mma,
                     t_o_chunk,
-                    t_p[None, None, kphase],
+                    t_p_stage[None, None, kphase],
                     t_v_stage[None, None, kphase],
                     t_o_chunk,
                 )
@@ -1415,10 +1374,14 @@ class PrefixBlockAttentionSm100:
     @cute.jit
     def softmax(
         self,
-        tile_args,
+        schedule,
         cta_v: Int32,
         t_s: cute.Tensor,
+        c_s: cute.Tensor,
+        s_p: cute.Tensor | None,
+        p_layout: cute.ComposedLayout,
         s_sum: cute.Tensor,
+        s_pair: cute.Tensor,
         lse: cute.Tensor | None,
         scale: Float32,
         scale_log2: Float32,
@@ -1426,25 +1389,35 @@ class PrefixBlockAttentionSm100:
     ):
         """Turn each score tile into BF16 probabilities with online softmax.
 
-        Thread ``t`` owns row ``t`` of this CTA's 128 rows. Scores outside
-        the row's visible set are replaced by -inf before the row maximum,
-        so masked keys contribute exactly zero probability.
+        Thread ``t`` reads tensor-memory lane ``t``: a whole row at head dim
+        256, half a row at head dim 512. Scores outside the row's visible set
+        are replaced by -inf before the row maximum, so masked keys
+        contribute exactly zero probability.
         """
-        (
-            cluster_id,
-            num_clusters,
-            total_tiles,
-            num_m_blocks,
-            kv_heads,
-            query_offsets,
-            prefix_lengths,
-            start_page,
-            prefix_start,
-            window,
-        ) = tile_args
+        cluster_id, num_clusters, total_tiles = schedule[:3]
+        window = schedule[9]
+        prefix_start = schedule[8]
         s_consumer, p_producer, stats_producer, sum_producer = pipes
-        tidx = cute.arch.thread_idx()[0] % self.row_threads
+        tidx = cute.arch.thread_idx()[0] % self.lane_threads
 
+        # Tensor-memory load of this thread's scores and their coordinates;
+        # the layouts are static, only the stage address changes per tile.
+        load_s = tcgen05.make_tmem_copy(
+            cute.make_copy_atom(
+                tcgen05.Ld32x32bOp(tcgen05.Repetition(32)), Float32
+            ),
+            t_s[(None, None), 0, 0, 0],
+        )
+        thr_load = load_s.get_slice(tidx)
+        coords = thr_load.partition_D(c_s[(None, None), 0, 0])
+        # Each thread's scores lie in one row; its offset within the tile.
+        tile_row = coords[0][0]
+        local_row = tile_row - cta_v * self.cta_rows
+        s_p_views = None
+        if const_expr(not self.p_in_tmem):
+            s_p_views = self.probability_views(load_s, tidx, s_p, p_layout)
+
+        exchanges = Int32(0)
         tile = cluster_id
         while tile < total_tiles:
             (
@@ -1461,20 +1434,9 @@ class PrefixBlockAttentionSm100:
                 key_tiles,
                 _lower_first,
                 lower_last,
-            ) = self.work_tile(
-                tile,
-                num_m_blocks,
-                kv_heads,
-                query_offsets,
-                prefix_lengths,
-                start_page,
-                prefix_start,
-                window,
-            )
+            ) = self.work_tile(tile, schedule)
             if valid:
-                packed_row = (
-                    m_block * self.tile_rows + cta_v * self.cta_rows + tidx
-                )
+                packed_row = m_block * self.tile_rows + tile_row
                 query_pos = packed_row // self.group_size
                 lower = self.lower_bound(
                     query_pos, prefix_len, batch, prefix_start, window
@@ -1507,12 +1469,14 @@ class PrefixBlockAttentionSm100:
                     (
                         row_max,
                         row_sum,
+                        exchanges,
                         s_consumer,
                         p_producer,
                         stats_producer,
                     ) = self.softmax_step(
                         row_max,
                         row_sum,
+                        exchanges,
                         scale_log2,
                         (
                             need_mask,
@@ -1525,10 +1489,22 @@ class PrefixBlockAttentionSm100:
                             threshold,
                         ),
                         t_s,
+                        load_s,
+                        thr_load,
+                        coords,
+                        s_p_views,
+                        s_pair,
                         s_consumer,
                         p_producer,
                         stats_producer,
                     )
+                if const_expr(self.row_split == 2):
+                    # Both halves share the running maximum, so the row sum
+                    # is the sum of their partial sums.
+                    row_sum = row_sum + self.exchange(
+                        row_sum, exchanges, s_pair
+                    )
+                    exchanges += 1
                 sum_producer = self.store_row_stats(
                     row_max,
                     row_sum,
@@ -1537,6 +1513,7 @@ class PrefixBlockAttentionSm100:
                     lse,
                     scale,
                     scale_log2,
+                    local_row,
                     query_pos,
                     packed_row,
                     query_start,
@@ -1546,6 +1523,63 @@ class PrefixBlockAttentionSm100:
             tile += num_clusters
         p_producer.tail()
         stats_producer.tail()
+
+    @no_type_check
+    @cute.jit
+    def probability_views(self, load_s, tidx, s_p, p_layout):
+        """SMEM copy of this thread's probabilities into the P tiles.
+
+        The copy has the thread-to-(row, key) mapping of the score load, so
+        each thread writes the probabilities of its own scores. Returns the
+        tiled copy, the thread's slice, and the destination partition of
+        every P stage.
+        """
+        copy = cute.make_tiled_copy_D(
+            cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                self.dtype,
+                num_bits_per_copy=128,
+            ),
+            load_s,
+        )
+        thr_copy = copy.get_slice(tidx)
+        # (row, key, stage) view of the MMA-partitioned P tiles.
+        outer = p_layout.outer
+        rows_keys = cute.make_tensor(
+            s_p.iterator,
+            cute.make_layout(
+                (
+                    (outer.shape[0][0], outer.shape[1]),
+                    (outer.shape[0][1], outer.shape[2]),
+                    outer.shape[3],
+                ),
+                stride=(
+                    (outer.stride[0][0], outer.stride[1]),
+                    (outer.stride[0][1], outer.stride[2]),
+                    outer.stride[3],
+                ),
+            ),
+        )
+        return copy, thr_copy, thr_copy.partition_D(rows_keys)
+
+    @no_type_check
+    @cute.jit
+    def exchange(self, value: Float32, exchanges: Int32, s_pair: cute.Tensor):
+        """Swap ``value`` with the thread holding the other half of the row.
+
+        Lanes ``t`` and ``t ^ 64`` (warps ``w`` and ``w ^ 2``) share a row at
+        head dim 512. Consecutive exchanges alternate between two buffers:
+        the barrier of one exchange guarantees that both threads have read
+        the buffer of the previous exchange before it is written again.
+        """
+        tidx = cute.arch.thread_idx()[0] % self.lane_threads
+        parity = exchanges % 2
+        s_pair[tidx, parity] = value
+        cute.arch.barrier(
+            barrier_id=_PAIR_BARRIER + (tidx // 32) % 2,
+            number_of_threads=64,
+        )
+        return s_pair[tidx ^ 64, parity]
 
     @no_type_check
     @cute.jit
@@ -1589,39 +1623,35 @@ class PrefixBlockAttentionSm100:
         self,
         row_max: Float32,
         row_sum: Float32,
+        exchanges: Int32,
         scale_log2: Float32,
         mask_args,
         t_s: cute.Tensor,
+        load_s,
+        thr_load,
+        coords: cute.Tensor,
+        s_p_views,
+        s_pair: cute.Tensor,
         s_consumer,
         p_producer,
         stats_producer,
     ):
-        """Process one score tile of this thread's row.
+        """Process one score tile of this thread's lane.
 
-        Loads the 128 FP32 scores, masks them if needed, updates the running
-        maximum, publishes ``(previous max, new max)`` for the output
-        correction, writes ``exp2((s - max) * scale_log2)`` as BF16 in place
-        and returns the updated running maximum and sum with the advanced
-        pipeline participants.
+        Loads the lane's FP32 scores, masks them if needed, updates the
+        running row maximum (combined across the two lanes of a row at head
+        dim 512), publishes ``(previous max, new max)`` for the output
+        correction, writes ``exp2((s - max) * scale_log2)`` in BF16 as the PV
+        operand, and returns the running maximum and this lane's running
+        sum with the advanced exchange count and pipeline participants.
         """
-        tidx = cute.arch.thread_idx()[0] % self.row_threads
+        tidx = cute.arch.thread_idx()[0] % self.lane_threads
         need_mask = mask_args[0]
 
         s_handle = s_consumer.wait_and_advance()
         t_s_stage = t_s[(None, None), 0, 0, s_handle.index]
-        tiled_load = tcgen05.make_tmem_copy(
-            cute.make_copy_atom(
-                tcgen05.Ld32x32bOp(tcgen05.Repetition(32)), Float32
-            ),
-            t_s_stage,
-        )
-        thr_load = tiled_load.get_slice(tidx)
-        # (row, key column) of every score this thread holds.
-        coords = thr_load.partition_D(
-            cute.make_identity_tensor((self.cta_rows, self.tile_keys))
-        )
         scores = cute.make_rmem_tensor(coords.shape, Float32)
-        cute.copy(tiled_load, thr_load.partition_S(t_s_stage), scores)
+        cute.copy(load_s, thr_load.partition_S(t_s_stage), scores)
         cute.arch.fence_view_async_tmem_load()
         s_handle.release()
 
@@ -1630,18 +1660,21 @@ class PrefixBlockAttentionSm100:
 
         previous_max = row_max
         row_max = scores.load().reduce(cute.ReductionOp.MAX, row_max, 0)
+        if const_expr(self.row_split == 2):
+            row_max = cutlass.max(
+                row_max, self.exchange(row_max, exchanges, s_pair)
+            )
+            exchanges += 1
         safe_max = row_max
         if row_max == -Float32.inf:
             safe_max = Float32(0.0)
 
-        # Row statistics for the correction warps, just after the P columns.
+        # Row statistics for the correction warps, in this lane of the
+        # stage's statistics columns.
         stats_handle = stats_producer.acquire_and_advance()
         t_stats = cute.make_tensor(
-            t_s_stage.iterator + self.p_columns,
-            cute.composition(
-                t_s_stage.layout,
-                cute.make_layout((t_s_stage.shape[0], 2)),
-            ),
+            t_s_stage.iterator + self.stats_column,
+            cute.make_layout((self.lane_threads, 2), stride=(_TMEM_LANE, 1)),
         )
         store_stats = tcgen05.make_tmem_copy(
             cute.make_copy_atom(
@@ -1652,7 +1685,7 @@ class PrefixBlockAttentionSm100:
         thr_stats = store_stats.get_slice(tidx)
         stats = cute.make_rmem_tensor(
             thr_stats.partition_S(
-                cute.make_identity_tensor((self.cta_rows, 2))
+                cute.make_identity_tensor((self.lane_threads, 2))
             ).shape,
             Float32,
         )
@@ -1675,39 +1708,58 @@ class PrefixBlockAttentionSm100:
         probs = cute.make_rmem_tensor(scores.shape, self.dtype)
         probs.store(scores.load().to(self.dtype))
 
-        # Store the BF16 probabilities as packed 32-bit words over the first
-        # p_columns columns of the score stage.
-        t_p = cute.make_tensor(
-            t_s_stage.iterator,
-            cute.composition(
-                t_s_stage.layout,
-                cute.make_layout((t_s_stage.shape[0], self.p_columns)),
-            ),
-        )
-        store_p = tcgen05.make_tmem_copy(
-            cute.make_copy_atom(
-                tcgen05.St32x32bOp(tcgen05.Repetition(32)), Float32
-            ),
-            t_p,
-        )
-        thr_store = store_p.get_slice(tidx)
-        packed = cute.make_tensor(
-            cute.recast_ptr(probs.iterator, dtype=Float32),
-            thr_store.partition_S(
-                cute.make_identity_tensor((self.cta_rows, self.p_columns))
-            ).shape,
-        )
-        cute.copy(store_p, packed, thr_store.partition_D(t_p))
-        cute.arch.fence_view_async_tmem_store()
+        if const_expr(self.p_in_tmem):
+            # BF16 pairs as 32-bit words over the stage's first columns.
+            t_p = cute.make_tensor(
+                t_s_stage.iterator,
+                cute.composition(
+                    t_s_stage.layout,
+                    cute.make_layout((t_s_stage.shape[0], self.p_columns)),
+                ),
+            )
+            store_p = tcgen05.make_tmem_copy(
+                cute.make_copy_atom(
+                    tcgen05.St32x32bOp(tcgen05.Repetition(32)), Float32
+                ),
+                t_p,
+            )
+            thr_store = store_p.get_slice(tidx)
+            packed = cute.make_tensor(
+                cute.recast_ptr(probs.iterator, dtype=Float32),
+                thr_store.partition_S(
+                    cute.make_identity_tensor(
+                        (self.lane_threads, self.p_columns)
+                    )
+                ).shape,
+            )
+            cute.copy(store_p, packed, thr_store.partition_D(t_p))
+            cute.arch.fence_view_async_tmem_store()
+        else:
+            copy, thr_copy, s_p_dst = s_p_views
+            cute.copy(
+                copy,
+                thr_copy.retile(probs),
+                s_p_dst[None, None, None, p_handle.index],
+            )
+            # Make the generic-proxy stores visible to the MMA's reads.
+            cute.arch.fence_view_async_shared()
         p_handle.commit()
 
-        # Rescale the running sum to the new maximum and add this tile.
+        # Rescale this lane's running sum to the new maximum and add the
+        # tile.
         correction = cute.math.exp2(
             scale_log2 * (previous_max - safe_max), fastmath=True
         )
         tile_sum = scores.load().reduce(cute.ReductionOp.ADD, Float32(0.0), 0)
         row_sum = row_sum * correction + tile_sum
-        return row_max, row_sum, s_consumer, p_producer, stats_producer
+        return (
+            row_max,
+            row_sum,
+            exchanges,
+            s_consumer,
+            p_producer,
+            stats_producer,
+        )
 
     @no_type_check
     @cute.jit
@@ -1720,6 +1772,7 @@ class PrefixBlockAttentionSm100:
         lse: cute.Tensor | None,
         scale: Float32,
         scale_log2: Float32,
+        local_row: Int32,
         query_pos: Int32,
         packed_row: Int32,
         query_start: Int32,
@@ -1730,10 +1783,14 @@ class PrefixBlockAttentionSm100:
 
         The LSE is of the scaled scores, ``log(sum_k exp(scale * s_k))``, in
         base 2 or natural logarithm; rows without visible keys store -inf.
+        At head dim 512 both lanes of a row hold the same values and the
+        first one stores them.
         """
-        tidx = cute.arch.thread_idx()[0] % self.row_threads
+        tidx = cute.arch.thread_idx()[0] % self.lane_threads
+        writer = tidx < self.cta_rows
         handle = sum_producer.acquire_and_advance()
-        s_sum[tidx] = row_sum
+        if writer:
+            s_sum[local_row] = row_sum
         cute.arch.fence_view_async_shared()
         handle.commit()
         if const_expr(self.has_lse):
@@ -1745,7 +1802,7 @@ class PrefixBlockAttentionSm100:
                     value = scale_log2 * row_max + log2_sum
                 else:
                     value = scale * row_max + log2_sum * Float32(_LN_2)
-            if query_pos < query_len:
+            if writer and query_pos < query_len:
                 head = kv_head * self.group_size + packed_row % self.group_size
                 lse[query_start + query_pos, head] = value
         return sum_producer
@@ -1756,7 +1813,7 @@ class PrefixBlockAttentionSm100:
     @cute.jit
     def correction(
         self,
-        tile_args,
+        schedule,
         cta_v: Int32,
         t_s: cute.Tensor,
         t_o: cute.Tensor,
@@ -1766,18 +1823,7 @@ class PrefixBlockAttentionSm100:
         pipes,
     ):
         """Rescale the output after each tile and store the final rows."""
-        (
-            cluster_id,
-            num_clusters,
-            total_tiles,
-            num_m_blocks,
-            kv_heads,
-            query_offsets,
-            prefix_lengths,
-            start_page,
-            prefix_start,
-            window,
-        ) = tile_args
+        cluster_id, num_clusters, total_tiles = schedule[:3]
         stats_consumer, sum_consumer, o_consumer = pipes
 
         tile = cluster_id
@@ -1796,16 +1842,7 @@ class PrefixBlockAttentionSm100:
                 key_tiles,
                 _lower_first,
                 _lower_last,
-            ) = self.work_tile(
-                tile,
-                num_m_blocks,
-                kv_heads,
-                query_offsets,
-                prefix_lengths,
-                start_page,
-                prefix_start,
-                window,
-            )
+            ) = self.work_tile(tile, schedule)
             if valid:
                 # The first tile's statistics need no rescale.
                 stats_consumer.wait_and_advance().release()
@@ -1832,17 +1869,16 @@ class PrefixBlockAttentionSm100:
         """Scale the accumulated output by ``exp2(old max - new max)``.
 
         Runs between the PV product of the previous tile and that of the
-        current one, which waits for this release.
+        current one, which waits for this release. Each thread scales the
+        output columns of its own tensor-memory lane with the statistics
+        stored in that lane.
         """
-        tidx = cute.arch.thread_idx()[0] % self.row_threads
+        tidx = cute.arch.thread_idx()[0] % self.lane_threads
         stats_handle = stats_consumer.wait_and_advance()
         t_s_stage = t_s[(None, None), 0, 0, stats_handle.index]
         t_stats = cute.make_tensor(
-            t_s_stage.iterator + self.p_columns,
-            cute.composition(
-                t_s_stage.layout,
-                cute.make_layout((t_s_stage.shape[0], 2)),
-            ),
+            t_s_stage.iterator + self.stats_column,
+            cute.make_layout((self.lane_threads, 2), stride=(_TMEM_LANE, 1)),
         )
         load_stats = tcgen05.make_tmem_copy(
             cute.make_copy_atom(
@@ -1853,7 +1889,7 @@ class PrefixBlockAttentionSm100:
         thr_stats = load_stats.get_slice(tidx)
         stats = cute.make_rmem_tensor(
             thr_stats.partition_D(
-                cute.make_identity_tensor((self.cta_rows, 2))
+                cute.make_identity_tensor((self.lane_threads, 2))
             ).shape,
             Float32,
         )
@@ -1936,28 +1972,41 @@ class PrefixBlockAttentionSm100:
         sum_consumer,
         o_consumer,
     ):
-        """Normalize this CTA's 128 output rows and store the valid ones.
+        """Normalize this CTA's output rows and store the valid ones.
 
-        Row ``t`` is packed row ``cta_block * 128 + t`` of the sequence; the
-        packed view maps it to query position ``row // G`` of head
-        ``kv_head * G + row % G``.
+        CTA row ``r`` is packed row ``cta_block * R + r`` of the sequence (R
+        rows per CTA); the packed view maps it to query position ``row // G``
+        of head ``kv_head * G + row % G``.
         """
-        tidx = cute.arch.thread_idx()[0] % self.row_threads
-        sum_handle = sum_consumer.wait_and_advance()
-        row_sum = s_sum[tidx]
-        cute.arch.fence_view_async_shared()
-        sum_handle.release()
-        empty = row_sum == Float32(0.0) or row_sum != row_sum
-        factor = Float32(0.0)
-        if not empty:
-            factor = cute.arch.rcp_approx(row_sum)
-
+        tidx = cute.arch.thread_idx()[0] % self.lane_threads
         g_o = cute.flat_divide(o_seq, self.pv_block_tiler)
         c_o = cute.flat_divide(
             cute.make_identity_tensor(o_seq.shape), self.pv_block_tiler
         )
         g_o = g_o[None, None, cta_block, None, kv_head]
         c_o = c_o[None, None, cta_block, None, kv_head]
+
+        # This lane's row within the CTA block selects its row sum; every
+        # chunk maps lanes to rows alike.
+        rows = tcgen05.make_tmem_copy(
+            cute.make_copy_atom(
+                tcgen05.Ld32x32bOp(tcgen05.Repetition(32)), Float32
+            ),
+            cute.zipped_divide(t_o[(None, None), 0, 0, 0], self.pv_block_tiler),
+        ).get_slice(tidx)
+        local = rows.partition_D(
+            cute.zipped_divide(
+                cute.make_identity_tensor(self.pv_block_tiler),
+                self.pv_block_tiler,
+            )
+        )
+        sum_handle = sum_consumer.wait_and_advance()
+        row_sum = s_sum[local[0, 0, 0][0]]
+        sum_handle.release()
+        empty = row_sum == Float32(0.0) or row_sum != row_sum
+        factor = Float32(0.0)
+        if not empty:
+            factor = cute.arch.rcp_approx(row_sum)
 
         o_handle = o_consumer.wait_and_advance()
         for chunk in cutlass.range(self.pv_chunks, unroll=1):
