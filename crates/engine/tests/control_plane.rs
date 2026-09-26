@@ -597,14 +597,14 @@ fn scheduler_clamps_max_batch_to_worker_info() {
     assert_eq!(sched.config().max_batch, 3);
 }
 
-/// Prefill batches hold at most the calls the workers' captured prefill
-/// graphs hold, while decode batches keep the worker's call bound: eight
-/// concurrent prompts prefill three at a time and still all finish, and their
-/// decode steps share batches wider than three.
-#[test]
-fn prefill_batches_hold_at_most_the_calls_prefill_graphs_hold() {
+/// Serves eight concurrent eight-token generations on a simulator whose
+/// workers report `prefill` and `decode` call bounds (zero for none), and
+/// returns the call count of every prefill batch and every decode batch the
+/// scheduler submitted, after checking that every request finished.
+fn forward_batch_calls(prefill: u32, decode: u32) -> (Vec<usize>, Vec<usize>) {
     let mut sim = SimEngine::new();
-    sim.mut_info_for_test().max_prefill_calls = 3;
+    sim.mut_info_for_test().max_prefill_calls = prefill;
+    sim.mut_info_for_test().max_decode_calls = decode;
     let mut executor = SimExecutor::new(sim);
     let dispatched = executor.observe();
     let sched = Scheduler::new(Box::new(executor), ctrl(), 32).unwrap();
@@ -643,29 +643,55 @@ fn prefill_batches_hold_at_most_the_calls_prefill_graphs_hold() {
     let _ = jh.join();
     assert_eq!(finished, receivers.len(), "every request finishes");
 
-    let mut prefill_calls = Vec::new();
-    let mut widest_decode = 0;
+    let (mut prefill_calls, mut decode_calls) = (Vec::new(), Vec::new());
     for event in dispatched.try_iter() {
         let BatchEvent::Submitted(batch) = event else {
             continue;
         };
-        let code = batch.requests.first().map(|(call, _)| call.code);
-        match code {
+        match batch.requests.first().map(|(call, _)| call.code) {
             Some(CallKind::Forward(ForwardMode::Prefill)) => {
                 prefill_calls.push(batch.requests.len())
             }
-            Some(CallKind::Forward(ForwardMode::Decode)) => {
-                widest_decode = widest_decode.max(batch.requests.len())
-            }
+            Some(CallKind::Forward(ForwardMode::Decode)) => decode_calls.push(batch.requests.len()),
             _ => {}
         }
     }
+    (prefill_calls, decode_calls)
+}
+
+/// Prefill batches hold at most the calls the workers' captured prefill
+/// graphs hold, while decode batches keep the worker's call bound: eight
+/// concurrent prompts prefill three at a time and still all finish, and their
+/// decode steps share batches wider than three.
+#[test]
+fn prefill_batches_hold_at_most_the_calls_prefill_graphs_hold() {
+    let (prefill_calls, decode_calls) = forward_batch_calls(3, 0);
     assert!(
         prefill_calls.iter().all(|&calls| calls <= 3),
         "prefill batches {prefill_calls:?}"
     );
     assert_eq!(prefill_calls.iter().sum::<usize>(), 8);
-    assert!(widest_decode > 3, "widest decode batch {widest_decode}");
+    assert!(
+        decode_calls.iter().any(|&calls| calls > 3),
+        "decode batches {decode_calls:?}"
+    );
+}
+
+/// Decode batches hold at most the calls the workers' captured decode graphs
+/// hold, while prefill batches keep the worker's call bound: eight concurrent
+/// generations decode three at a time and still all finish, and their
+/// prompts share batches wider than three.
+#[test]
+fn decode_batches_hold_at_most_the_calls_decode_graphs_hold() {
+    let (prefill_calls, decode_calls) = forward_batch_calls(0, 3);
+    assert!(
+        !decode_calls.is_empty() && decode_calls.iter().all(|&calls| calls <= 3),
+        "decode batches {decode_calls:?}"
+    );
+    assert!(
+        prefill_calls.iter().any(|&calls| calls > 3),
+        "prefill batches {prefill_calls:?}"
+    );
 }
 
 /// Single-worker results must be identical regardless of queue depth:

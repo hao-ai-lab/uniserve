@@ -243,17 +243,14 @@ def prepare_decode(
 ) -> None:
     """Prepare valid one-token prefixes, then capture each decode bucket.
 
-    Buckets are captured from the largest row count down. With graphs
-    disabled, one single-row decode runs eagerly instead.
+    Buckets are captured from the largest row count down. An entry without
+    decode buckets (graphs disabled, or no CUDA device) runs one single-row
+    decode eagerly instead.
 
     Raises:
         ValueError: A bucket is prepared on a worker without a KV cache.
     """
-    row_counts = (
-        tuple(reversed(runner.decode_shapes[entry]))
-        if runner.worker_config.graph_policy != "off"
-        else (1,)
-    )
+    row_counts = tuple(reversed(runner.decode_shapes[entry])) or (1,)
     for rows in row_counts:
         cache = runner.kv_cache
         if cache is None:

@@ -300,6 +300,16 @@ impl ExecutorInfo {
             .min()
             .unwrap_or(0)
             .min(merged.max_batch_calls);
+        // Likewise, the narrowest decode graph capacity binds every decode
+        // call.
+        merged.max_decode_calls = self
+            .workers
+            .iter()
+            .map(|(_, info)| info.max_decode_calls)
+            .filter(|limit| *limit > 0)
+            .min()
+            .unwrap_or(0)
+            .min(merged.max_batch_calls);
         merged.request_slots = if merged.media_components.contains_key(&MediaCall::Muxing) {
             // A replicated media route owns an independent request-row bank in
             // every WorkerGroup. End-to-end concurrency is the narrowest sum
