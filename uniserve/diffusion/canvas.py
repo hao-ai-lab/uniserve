@@ -9,7 +9,10 @@ functions of borrowed device tensors. The caller keeps the per-row state
 resident (:class:`CanvasState`) and supplies each row's Philox coordinates
 (seed, block, step) as device columns; nothing here reads a device value on
 the host, allocates, or knows request identities, so a CUDA graph can
-capture ``start_canvas`` and ``denoise_canvas`` for a fixed row count.
+capture ``start_canvas`` and ``denoise_canvas`` for a fixed row count. On
+CUDA, run one eager step of each row count before capturing it: that step
+configures the kernels and measures the self-conditioning product's
+algorithm, which synchronizes the device.
 
 A block runs ``start_canvas`` before its first pass (rows at step 0 draw
 their initial canvas and clear history and self-conditioning), then per
@@ -263,20 +266,30 @@ class CanvasDecision:
         )
 
 
+# The CUDA self-conditioning product's cuBLASLt workspace holds split-K
+# partial sums: room for eight FP32 products of the step's shape, within
+# 32 MiB to 256 MiB.
+_SCRATCH_PARTIALS = 8
+_SCRATCH_BYTES = (32 << 20, 256 << 20)
+
+
 @dataclass(frozen=True, slots=True)
 class CanvasWorkspace:
     """Scratch of one step: the self-conditioning distribution in transit.
 
     ``weights`` ``[R * C, V]`` in the embedding dtype, ``normalizer`` FP32
-    ``[R * C]`` and ``product`` FP32 ``[R * C, H]``. ``score_canvas`` fills
-    the first two in an implementation-defined form that
-    ``condition_canvas`` consumes; the contents are otherwise unspecified.
-    ``weights`` must not share storage with the logits.
+    ``[R * C]``, ``product`` FP32 ``[R * C, H]`` and ``scratch`` uint8 bytes
+    the CUDA product uses as its cuBLASLt workspace (empty on the CPU).
+    ``score_canvas`` fills the first two in an implementation-defined form
+    that ``condition_canvas`` consumes; the contents are otherwise
+    unspecified. ``weights`` must not share storage with the logits. Steps
+    that may run concurrently need separate workspaces.
     """
 
     weights: torch.Tensor
     normalizer: torch.Tensor
     product: torch.Tensor
+    scratch: torch.Tensor
 
     @classmethod
     def empty(
@@ -290,6 +303,10 @@ class CanvasWorkspace:
         device: torch.device | str | None = None,
     ) -> CanvasWorkspace:
         positions = rows * canvas_length
+        scratch = 0
+        if torch.empty(0, device=device).is_cuda:
+            partials = _SCRATCH_PARTIALS * positions * hidden_size * 4
+            scratch = min(max(partials, _SCRATCH_BYTES[0]), _SCRATCH_BYTES[1])
         return cls(
             weights=torch.empty(
                 positions, vocab_size, dtype=dtype, device=device
@@ -300,6 +317,7 @@ class CanvasWorkspace:
             product=torch.empty(
                 positions, hidden_size, dtype=torch.float32, device=device
             ),
+            scratch=torch.empty(scratch, dtype=torch.uint8, device=device),
         )
 
 
@@ -529,11 +547,8 @@ def condition_canvas(
     table = embedding[:vocab]
     scale = float(torch.tensor(embedding_scale, dtype=embedding.dtype))
     if workspace.weights.is_cuda:
-        torch.mm(
-            workspace.weights,
-            table,
-            out_dtype=torch.float32,
-            out=workspace.product,
+        _kernels().product(
+            workspace.weights, table, workspace.product, workspace.scratch
         )
         _kernels().condition(
             workspace.product,
