@@ -240,7 +240,12 @@ def parallelize_(
         )
 
     # Deferred import: uniserve.model depends on the modules bound here.
-    from uniserve.model import CausalLM, Encoder, TransformerDecoder
+    from uniserve.model import (
+        CausalLM,
+        Encoder,
+        TokenDenoiser,
+        TransformerDecoder,
+    )
 
     # An encoder consumes complete samples through its own numerical call.
     # A surrounding denoiser's token partition does not partition those input
@@ -310,8 +315,10 @@ def parallelize_(
             mesh.get_group(axes) for axes in requirements[child]
         )
     for child in modules:
+        # Vocabulary heads project only on the last stage, including a head
+        # a causal model and a token denoiser share.
         if (
-            isinstance(child, CausalLM)
+            isinstance(child, (CausalLM, TokenDenoiser))
             and child.backbone._pipeline.rank != pipeline.size - 1
         ):
             child.lm_head = None

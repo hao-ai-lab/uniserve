@@ -22,9 +22,17 @@ from uniserve.nn.routing import RoutedTensor, RouteSpan
 class TransformerDecoder(nn.Module):
     """Traverse resident layers, carrying a separate residual stream.
 
-    Layers return (hidden, residual). Pipeline peers exchange those two values
-    with their original dtypes; only the final stage normalizes and gathers the
-    token shards. Placement binding selects resident modules before loading.
+    Layers are called as ``layer(hidden, residual, positions, attention)`` and
+    return ``(hidden, residual)``. With ``separate_residual`` (the default) a
+    layer may defer its residual addition: ``hidden`` is its unsummed update
+    and ``residual`` the stream it carries forward, and the first layer of
+    the first stage receives ``residual=None``. Without it every layer
+    receives and returns ``residual=None``, and ``hidden`` is the complete
+    stream; architectures whose layer output rescales the whole stream
+    cannot defer the addition. Pipeline peers exchange the carried values
+    with their original dtypes; only the final stage normalizes and gathers
+    the token shards. Placement binding selects resident modules before
+    loading.
     """
 
     # Pipeline binding drops the embedding outside the first stage and the
@@ -43,6 +51,7 @@ class TransformerDecoder(nn.Module):
         norm: nn.Module,
         *,
         default_route: str | None = None,
+        separate_residual: bool = True,
     ):
         super().__init__()
         if not layers:
@@ -50,6 +59,7 @@ class TransformerDecoder(nn.Module):
                 "a transformer decoder requires at least one layer"
             )
         self.embedding, self.layers, self.norm = embedding, layers, norm
+        self.separate_residual = separate_residual
         self.mesh = DeviceMesh(ranks=(0,), shape=(1,), axes=("tp",), rank=0)
         self._pipeline = Communicator()
         self._tokens = Communicator()
@@ -130,9 +140,12 @@ class TransformerDecoder(nn.Module):
         else:
             reference = next(self.layers.parameters())
             hidden = reference.new_empty((partition.count, self.hidden_size))
-            residual = torch.empty_like(hidden)
+            residual = (
+                torch.empty_like(hidden) if self.separate_residual else None
+            )
             for value in (hidden, residual):
-                self._pipeline.recv(src=self._pipeline.rank - 1, out=value)
+                if value is not None:
+                    self._pipeline.recv(src=self._pipeline.rank - 1, out=value)
 
         # Clip route spans to this rank's token shard, in shard-local offsets.
         local_routes: tuple[RouteSpan, ...] = ()
@@ -163,12 +176,19 @@ class TransformerDecoder(nn.Module):
                 )
             else:
                 hidden, residual = layer(hidden, residual, positions, attention)
-        # Every layer returns the residual stream it carries forward.
-        assert residual is not None
+        # Layers that defer their residual addition return the stream they
+        # carry forward; complete-stream layers return none.
+        if (residual is None) == self.separate_residual:
+            raise ValueError(
+                "decoder layers must return a residual stream exactly when "
+                "the decoder carries one separately"
+            )
 
         last = self._pipeline.rank == self._pipeline.size - 1
         if not last:
             for stream in (hidden, residual):
+                if stream is None:
+                    continue
                 packed = (
                     stream.packed(local_routes)
                     if isinstance(stream, RoutedTensor)
@@ -185,7 +205,13 @@ class TransformerDecoder(nn.Module):
         # which retains the norm. Layers keep both streams in one form.
         norm = self.norm
         assert norm is not None
-        if isinstance(hidden, RoutedTensor):
+        if residual is None:
+            result = (
+                hidden.apply(norm).packed(local_routes)
+                if isinstance(hidden, RoutedTensor)
+                else norm(hidden)
+            )
+        elif isinstance(hidden, RoutedTensor):
             assert isinstance(residual, RoutedTensor)
             assert isinstance(norm, nn.ModuleDict)
             result = hidden.add(residual).apply(norm).packed(local_routes)
