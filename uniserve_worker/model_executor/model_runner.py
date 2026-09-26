@@ -176,6 +176,15 @@ class ModelRunner(Execution, ABC):
         """Numerical constants and workspace borrowed by a standalone call."""
         return {}
 
+    def kernels(self) -> list[dict[str, object]]:
+        """Records of the kernels behind this runner's call sites.
+
+        The prepared context's ``ExecutionContext.kernels`` records; a runner
+        that calls kernels outside its model's layers adds theirs. The worker
+        kernel table (``execution.kernel_table``) gathers them.
+        """
+        return self.context.kernels()
+
     @torch.inference_mode()
     def execute_model(self, *args, **kwargs):
         """Evaluate numerical arguments and return owned results.

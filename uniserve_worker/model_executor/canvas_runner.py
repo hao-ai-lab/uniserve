@@ -147,6 +147,47 @@ class CanvasRunner(ModelRunner):
         slots.commit(inputs.slots, inputs.views)
         return tuple(results.unbind(0))
 
+    def kernels(self) -> list[dict[str, object]]:
+        """The model's kernel records and the sampler's product algorithms.
+
+        Generating canvases on CUDA adds one ``product`` record per step
+        chunk shape the self-conditioning product has run: its positions
+        (canvases times canvas length), vocabulary and hidden sizes, and the
+        cuBLASLt algorithm it uses (``source`` ``table`` when a reproducible
+        table chose it, ``measured`` when its first product timed the
+        candidates, then the cuBLASLt version and the configuration).
+        """
+        records = super().kernels()
+        slots = self.canvas_slots
+        if slots is None or slots.workspace is None:
+            return records
+        workspace = slots.workspace
+        if workspace.weights.device.type != "cuda":
+            return records
+
+        from uniserve_kernels.diffusion import canvas as kernels
+
+        table = self.model.backbone.embedding.weight[: slots.vocab_size]
+        for rows in range(1, slots.step_rows + 1):
+            positions = rows * slots.canvas_length
+            chunk = _chunk_workspace(workspace, positions)
+            algorithm = kernels.product_algorithm(
+                chunk.weights, table, chunk.product, chunk.scratch
+            )
+            if algorithm is not None:
+                records.append(
+                    {
+                        "path": "canvas_sampler.self_conditioning",
+                        "op": "product",
+                        "positions": positions,
+                        "vocab": slots.vocab_size,
+                        "hidden": slots.hidden_size,
+                        "provider": "cublaslt",
+                        **algorithm,
+                    }
+                )
+        return records
+
     def select_graph_shape(self, batch, *, eligible):
         """Run every canvas pass eagerly; see the class description."""
         return None

@@ -13,11 +13,13 @@ complete record. The JSON object has these fields:
   kinds), with ``runner``, ``device`` and ``call_sites``. Each call site
   groups the layers whose records are identical apart from their module
   path: ``layers`` lists the paths, with runs of layer indices compressed as
-  ``{0-63}``, and the remaining fields are the ``ExecutionContext.kernels``
-  record: ``op`` (``attention``, ``vsa``, ``moe`` or ``matmul``), the
-  representation, the resolved ``provider`` and, for automatic attention
-  selection, ``inputs``, the provider that served each input class. An
-  attention call site not called yet has ``dtype`` and ``provider`` None;
+  ``{0-63}``, and the remaining fields are the runner's kernel record
+  (``ModelRunner.kernels``): ``op`` (``attention``, ``vsa``, ``moe`` or
+  ``matmul`` from ``ExecutionContext.kernels``, or ``product`` for the
+  canvas sampler's self-conditioning product), the representation, the
+  resolved ``provider`` and, for automatic attention selection, ``inputs``,
+  the provider that served each input class. An attention call site not
+  called yet has ``dtype`` and ``provider`` None;
 - ``portable``: every call site a CUDA runner serves with the portable torch
   provider, listed again so that no such call site is silent.
 
@@ -125,7 +127,7 @@ class KernelRecords:
         """Gather the current records of ``runners``; report any change.
 
         ``runners`` are the worker's runners, each with ``name``, ``call``,
-        ``device`` and an ``ExecutionContext`` as ``context``. Runners with
+        ``device`` and ``kernels()`` (``ModelRunner.kernels``). Runners with
         the same label (one computation prepared at several sizes) merge.
         """
         current: dict[str, tuple[str, dict[str, dict[str, dict]]]] = {}
@@ -133,7 +135,7 @@ class KernelRecords:
             _, paths = current.setdefault(
                 _label(runner), (str(runner.device), {})
             )
-            for record in runner.context.kernels():
+            for record in runner.kernels():
                 record = dict(record)
                 site = paths.setdefault(record.pop("path"), {})
                 site[json.dumps(record, sort_keys=True)] = record
