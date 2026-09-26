@@ -308,6 +308,12 @@ pub struct WorkerInfo {
     pub max_batch_calls: u32,
     /// Maximum text tokens represented in one run.
     pub max_batch_tokens: u32,
+    /// Maximum calls in one prefill run: the rows the rank's captured
+    /// prefill graphs hold. A prefill run no captured graph holds fails, so
+    /// the scheduler never forms one. Zero leaves prefill runs bounded by
+    /// `max_batch_calls` alone, as when they run eagerly.
+    #[serde(default)]
+    pub max_prefill_calls: u32,
     /// Number of resident request slots.
     pub request_slots: u32,
     /// Paged KV geometry when autoregressive work is supported.
@@ -462,6 +468,10 @@ impl WorkerInfo {
             "worker info declare a zero scheduling bound"
         );
         ensure_valid!(self.queue_depth > 0, "worker queue depth must be positive");
+        ensure_valid!(
+            self.max_prefill_calls <= self.max_batch_calls,
+            "worker prefill call bound exceeds its batch call bound"
+        );
 
         // Advertised call families require their corresponding pools; every
         // token-model forward reads or extends a request's KV cache.
@@ -537,6 +547,7 @@ impl Default for WorkerInfo {
             queue_depth: 1,
             max_batch_calls: 1,
             max_batch_tokens: 8192,
+            max_prefill_calls: 0,
             request_slots: 128,
             // One full-attention group of 28 layers with 8 BF16 heads of 128:
             // each 64-token page is one unit of 28 columns of 128 KiB K and V

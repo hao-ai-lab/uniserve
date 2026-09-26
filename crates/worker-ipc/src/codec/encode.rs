@@ -1397,6 +1397,7 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
             num_inference_steps: v.num_inference_steps,
             host_lane_capacity: v.host_lane_capacity,
             checkpoint_identity,
+            max_prefill_calls: v.max_prefill_calls,
         },
     )
 }

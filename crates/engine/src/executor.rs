@@ -290,6 +290,16 @@ impl ExecutorInfo {
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
+        // A prefill call may reach any pool, so the narrowest prefill graph
+        // capacity binds; a pool without one leaves the batch bound.
+        merged.max_prefill_calls = self
+            .workers
+            .iter()
+            .map(|(_, info)| info.max_prefill_calls)
+            .filter(|limit| *limit > 0)
+            .min()
+            .unwrap_or(0)
+            .min(merged.max_batch_calls);
         merged.request_slots = if merged.media_components.contains_key(&MediaCall::Muxing) {
             // A replicated media route owns an independent request-row bank in
             // every WorkerGroup. End-to-end concurrency is the narrowest sum
