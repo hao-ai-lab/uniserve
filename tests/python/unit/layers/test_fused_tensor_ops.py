@@ -361,3 +361,18 @@ def test_video_patch_geometry_preserves_logical_channel_coordinates(
         patch_shape=patch_shape,
     )
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_residual_norms_of_strided_rows_raise():
+    rows = torch.randn((8, 2 * 256), device="cuda")[:, :256]
+    weight = torch.ones(256, device="cuda")
+    with pytest.raises(ValueError, match="weighted_rms_norm.*contiguous"):
+        weighted_rms_norm_absmax(rows, weight, eps=1e-6)
+    with pytest.raises(
+        ValueError, match="scaled_residual_rms_norm_absmax_.*contiguous"
+    ):
+        scaled_residual_rms_norm_absmax_(
+            rows, torch.zeros_like(rows), weight, weight, eps=1e-6
+        )

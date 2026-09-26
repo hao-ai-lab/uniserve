@@ -339,3 +339,62 @@ def test_modulated_rms_norm_retains_its_source_rows():
             eps=1e-6,
             retain=retained[:, :128],
         )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "tolerance"),
+    ((torch.bfloat16, 2e-2), (torch.float16, 2e-3), (torch.float32, 1e-5)),
+)
+def test_modulation_kernels_cover_every_floating_activation(dtype, tolerance):
+    generator = torch.Generator(device="cuda").manual_seed(43)
+    rows, width, states = 12, 3072, 3
+    hidden = torch.randn((rows, width), generator=generator, device="cuda").to(
+        dtype
+    )
+    update = torch.randn((rows, width), generator=generator, device="cuda").to(
+        dtype
+    )
+    weight = torch.rand(width, generator=generator, device="cuda") + 0.5
+    shift, scale, gate = (
+        torch.randn((states, 3 * width), generator=generator, device="cuda")
+        .to(dtype)
+        .chunk(3, dim=-1)
+    )
+    row_indices = torch.randint(
+        states, (rows,), generator=generator, device="cuda"
+    )
+
+    def modulate(value):
+        return (
+            _rmsnorm(value, weight, 1e-6)
+            * (1.0 + scale.index_select(0, row_indices).double())
+            + shift.index_select(0, row_indices).double()
+        )
+
+    summed = (
+        hidden.double()
+        + gate.index_select(0, row_indices).double() * update.double()
+    )
+    normalized = modulated_rms_norm(
+        hidden, weight, shift, scale, row_indices, eps=1e-6
+    )
+    residual, gated = gated_residual_rms_norm(
+        hidden,
+        update.clone(),
+        gate,
+        weight,
+        shift,
+        scale,
+        row_indices,
+        eps=1e-6,
+    )
+
+    for actual, expected in (
+        (normalized, modulate(hidden)),
+        (residual, summed),
+        (gated, modulate(summed)),
+    ):
+        assert actual.dtype == dtype
+        torch.testing.assert_close(
+            actual.double(), expected, rtol=tolerance, atol=tolerance
+        )
