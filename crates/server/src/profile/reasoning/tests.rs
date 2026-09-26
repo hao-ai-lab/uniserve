@@ -211,6 +211,36 @@ fn gemma4_splits_thought_channel_from_content() {
     }
 }
 
+/// A thought channel whose name lacks its newline still opens reasoning and
+/// its name is stripped, however the text is split, so neither the channel
+/// markup nor its name reaches the reasoning or the content. A channel name
+/// that the stream ends on is stripped too.
+#[test]
+fn gemma4_strips_a_channel_name_without_its_newline() {
+    for (reply, expected) in [
+        ("<|channel>thought<channel|>Paris.", ("", "Paris.")),
+        (
+            "<|channel>thoughtIt is sunny.<channel|>Sunny today.",
+            ("It is sunny.", "Sunny today."),
+        ),
+        ("<|channel>thought", ("", "")),
+    ] {
+        let characters: Vec<String> = reply.chars().map(String::from).collect();
+        let characters: Vec<&str> = characters.iter().map(String::as_str).collect();
+        for chunks in [characters, vec![reply]] {
+            let mut parser = Gemma4ReasoningParser::new(gemma4_tokenizer()).unwrap();
+            parser.initialize(&[GEMMA4_TURN_START, GEMMA4_MODEL, GEMMA4_NEWLINE]);
+
+            assert_eq!(
+                collect_reasoning(&mut parser, &chunks),
+                (expected.0.to_string(), expected.1.to_string()),
+                "{reply:?} in {} chunks",
+                chunks.len()
+            );
+        }
+    }
+}
+
 /// The empty thought channel that opens a reply without thinking carries no
 /// reasoning, and its delimiters do not reach the content.
 #[test]

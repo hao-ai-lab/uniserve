@@ -7,8 +7,10 @@ use super::{DelimitedReasoningParser, ReasoningDelta, ReasoningParser, Result};
 /// Special token that opens a Gemma-4 channel.
 const CHANNEL_START: &str = "<|channel>";
 
-/// Name line of the thought channel, written right after [`CHANNEL_START`].
-const THOUGHT_CHANNEL_LABEL: &str = "thought\n";
+/// Name line of the thought channel, written right after [`CHANNEL_START`]:
+/// the channel name and a newline, or the name alone when a reply omits the
+/// newline.
+const THOUGHT_CHANNEL_LABELS: [&str; 2] = ["thought\n", "thought"];
 
 /// Special token that closes a Gemma-4 channel.
 const CHANNEL_END: &str = "<channel|>";
@@ -25,9 +27,12 @@ const CHANNEL_END: &str = "<channel|>";
 /// thought channel. A new model turn (`<|turn>model\n`) starts in content;
 /// with thinking enabled the model then opens the channel itself, and with
 /// thinking disabled it may still emit an empty channel
-/// (`<|channel>thought\n<channel|>`), which yields no reasoning text. A prompt
-/// that ends with `<|channel>thought\n`, as the Gemma-4 template renders a
-/// thinking continuation after tool responses, starts inside reasoning.
+/// (`<|channel>thought\n<channel|>`), which yields no reasoning text. Every
+/// `<|channel>` opens reasoning, and its channel name is stripped whether or
+/// not the newline follows it, so no channel markup reaches the reasoning or
+/// the content. A prompt that ends with `<|channel>thought\n`, as the Gemma-4
+/// template renders a thinking continuation after tool responses, starts
+/// inside reasoning.
 pub struct Gemma4ReasoningParser {
     inner: DelimitedReasoningParser,
 }
@@ -41,7 +46,7 @@ impl Gemma4ReasoningParser {
     /// tokens.
     pub fn new(tokenizer: DynTokenizer) -> Result<Self> {
         let inner = DelimitedReasoningParser::new(tokenizer, CHANNEL_START, CHANNEL_END, false)?
-            .with_start_label(THOUGHT_CHANNEL_LABEL);
+            .with_start_labels(THOUGHT_CHANNEL_LABELS);
         Ok(Self { inner })
     }
 }
