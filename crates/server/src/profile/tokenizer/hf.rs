@@ -19,14 +19,20 @@ use crate::profile::tokenizer::incremental::IncrementalDecoder;
 /// `fastokens` upgrade that adds decoder kinds fails to compile here until each
 /// new kind is classified for the byte-level fast path.
 fn is_byte_level_only(decoder: &FastokensDecoder) -> bool {
-    /// Counts `ByteLevel` steps across nested decoder sequences.
-    fn count_byte_level(decoder: &FastokensDecoder) -> usize {
+    /// Counts `ByteLevel` steps across nested decoder sequences, or `None`
+    /// when any other step (such as a SentencePiece-style `Replace`,
+    /// `ByteFallback`, `Fuse`, or `Strip`) transforms the text.
+    fn byte_level_steps(decoder: &FastokensDecoder) -> Option<usize> {
         match decoder {
-            FastokensDecoder::ByteLevel(_) => 1,
-            FastokensDecoder::Sequence(steps) => steps.iter().map(count_byte_level).sum(),
+            FastokensDecoder::ByteLevel(_) => Some(1),
+            FastokensDecoder::Sequence(steps) => steps.iter().map(byte_level_steps).sum(),
+            FastokensDecoder::ByteFallback(_)
+            | FastokensDecoder::Replace(_)
+            | FastokensDecoder::Fuse
+            | FastokensDecoder::Strip { .. } => None,
         }
     }
-    count_byte_level(decoder) == 1
+    byte_level_steps(decoder) == Some(1)
 }
 
 /// Decodes token IDs by looking up each vocabulary piece and unescaping the
