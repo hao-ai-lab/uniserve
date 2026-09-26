@@ -39,7 +39,9 @@ pub mod tools;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelDescription {
-    /// Qwen3 text-generation profile.
+    /// Qwen3 text-generation profile, serving dense and mixture-of-experts
+    /// checkpoints alike: they share tokenizer, chat template, output parsing
+    /// and autoregressive runtime, and differ only in worker numerics.
     #[default]
     Qwen3,
     /// SenseNova multimodal-generation profile.
@@ -79,15 +81,15 @@ impl ModelDescription {
         }
     }
 
-    /// Returns the `model_type` a root `config.json` declares for this family,
-    /// or `None` for a family that ships as a diffusers pipeline.
-    const fn model_type(self) -> Option<&'static str> {
+    /// Returns every `model_type` a root `config.json` of this family may
+    /// declare, empty for a family that ships as a diffusers pipeline.
+    const fn model_types(self) -> &'static [&'static str] {
         match self {
-            Self::Qwen3 => Some("qwen3"),
-            Self::SenseNova => Some("neo_chat"),
-            Self::Bagel => Some("bagel"),
-            Self::DiffusionGemma => Some("diffusion_gemma"),
-            Self::MiniMaxH3 => None,
+            Self::Qwen3 => &["qwen3", "qwen3_moe"],
+            Self::SenseNova => &["neo_chat"],
+            Self::Bagel => &["bagel"],
+            Self::DiffusionGemma => &["diffusion_gemma"],
+            Self::MiniMaxH3 => &[],
         }
     }
 
@@ -109,7 +111,7 @@ impl ModelDescription {
     /// Returns whether the family ships only as a diffusers pipeline, whose
     /// root index rather than a root `config.json` describes the checkpoint.
     pub const fn is_pipeline(self) -> bool {
-        self.model_type().is_none()
+        self.model_types().is_empty()
     }
 
     /// Resolves the served profile from a checkpoint's `model_type` field.
@@ -120,7 +122,7 @@ impl ModelDescription {
     pub fn from_model_type(model_type: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
-            .find(|description| description.model_type() == Some(model_type))
+            .find(|description| description.model_types().contains(&model_type))
     }
 
     /// Resolves the served profile from a checkpoint index's `_class_name`.
@@ -520,6 +522,7 @@ mod tests {
     async fn configured_descriptions_resolve_their_serving_behavior() {
         for (description, model_type) in [
             (ModelDescription::Qwen3, "qwen3"),
+            (ModelDescription::Qwen3, "qwen3_moe"),
             (ModelDescription::SenseNova, "neo_chat"),
             (ModelDescription::Bagel, "bagel"),
         ] {

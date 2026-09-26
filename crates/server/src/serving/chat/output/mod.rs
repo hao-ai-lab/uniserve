@@ -18,7 +18,7 @@ mod tool;
 pub use processor::AssistantEvent;
 
 pub use gemma4::Gemma4ChatOutputProcessor;
-pub use qwen3::Qwen3ChatOutputProcessor;
+pub use qwen3::{Qwen3ChatOutputProcessor, template_instructs_json_tool_calls};
 
 pub use crate::profile::reasoning::ReasoningDelta;
 pub use crate::profile::tools::ToolParserError;

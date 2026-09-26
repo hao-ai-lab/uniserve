@@ -20,7 +20,9 @@ use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRend
 use uniserve_server::serving::media::{
     ImageFetchError, ImageFetchPolicy, ImageFetcher, ImageInput, ImageListError,
 };
-use uniserve_server::serving::{InputProcessor, ResponseOptions, ServeRequestId, chat_image_urls};
+use uniserve_server::serving::{
+    InputProcessor, ResponseOptions, ServeRequestId, ServedFeature, chat_image_urls,
+};
 
 /// Base64 payload of a 1x1 PNG image.
 const PNG_1X1: &str =
@@ -999,4 +1001,90 @@ fn omitted_video_duration_uses_the_advertised_model_default() {
         )
         .unwrap();
     assert_eq!(implicit.sampling, explicit.sampling);
+}
+
+/// Qwen3 chat template shipped by Qwen3 and Qwen3-MoE checkpoints; it asks for
+/// JSON tool calls inside `<tool_call>` lines.
+const QWEN3_TEMPLATE: &str = include_str!("templates/qwen3.jinja");
+/// Tool instruction in the style of Qwen3-Coder templates, which ask for XML
+/// `<function=...>` calls instead of JSON objects.
+const XML_CALL_TEMPLATE: &str = "{%- if tools -%}<|im_start|>system\n# Tools\n<tools>{%- for tool in tools -%}{{ tool | tojson }}{%- endfor -%}</tools>\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter>\nvalue\n</parameter>\n</function>\n</tool_call><|im_end|>\n{%- endif -%}{%- for message in messages -%}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n{%- endif -%}";
+
+/// Rebinds a resolved Qwen3-family model to `template`.
+fn with_template(model_type: &str, template: &str) -> InputProcessor {
+    let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::Qwen3, model_type);
+    let renderer = HfChatRenderer::new(
+        Some(template.to_string()),
+        HashMap::new(),
+        ChatTemplateContentFormatOption::String,
+    )
+    .unwrap();
+    InputProcessor::new(
+        loaded.config().clone(),
+        tokenizer,
+        Some(renderer),
+        uniserve_server::serving::WorkerCapabilities {
+            limits: runtime_limits(),
+            sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
+            max_model_tokens: 4096,
+            denoise_steps: 0,
+        },
+        true,
+    )
+    .unwrap()
+}
+
+/// Dense and mixture-of-experts Qwen3 checkpoints serve tool calls only when
+/// their chat template asks for the JSON calls the Qwen3 parser reads; a
+/// template asking for another call format refuses requests with tools
+/// instead of returning their calls as unparsed text.
+#[test]
+fn qwen3_family_declares_tool_calling_only_for_json_calls() {
+    let tool_request = serde_json::json!({
+        "model": "qwen3",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{"type": "function", "function": {
+            "name": "weather",
+            "parameters": {"type": "object", "properties": {}}
+        }}]
+    });
+    for model_type in ["qwen3", "qwen3_moe"] {
+        let json_calls = with_template(model_type, QWEN3_TEMPLATE);
+        assert!(
+            json_calls
+                .support()
+                .features
+                .contains(&ServedFeature::ToolCalling),
+            "{model_type}"
+        );
+        json_calls
+            .preprocess_chat_request(
+                ServeRequestId::new("json-tools"),
+                serde_json::from_value(tool_request.clone()).unwrap(),
+                Vec::new(),
+            )
+            .unwrap();
+
+        for template in [XML_CALL_TEMPLATE, CHAT_TEMPLATE] {
+            let other = with_template(model_type, template);
+            assert!(
+                !other
+                    .support()
+                    .features
+                    .contains(&ServedFeature::ToolCalling),
+                "{model_type}"
+            );
+            let error = other
+                .preprocess_chat_request(
+                    ServeRequestId::new("other-tools"),
+                    serde_json::from_value(tool_request.clone()).unwrap(),
+                    Vec::new(),
+                )
+                .err()
+                .unwrap();
+            assert_eq!(error.status_code().as_u16(), 400, "{model_type}");
+            let message = error.to_error_response().error.message;
+            assert!(message.contains("tool_calling"), "{message}");
+        }
+    }
 }
