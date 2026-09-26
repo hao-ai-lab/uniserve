@@ -29,10 +29,12 @@ streams; it then carries that persistence error as `artifact_error`.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import resource
 import time
+from collections.abc import Iterator, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -57,7 +59,7 @@ from .report import build_summary, render_markdown
 
 
 async def run_point(
-    base_url: str,
+    base_urls: Sequence[str],
     point: BenchmarkPoint,
     output_dir: str | Path,
     *,
@@ -67,10 +69,12 @@ async def run_point(
     """Run dataset loading, warmup, measured load, validation, and persistence.
 
     Args:
-        base_url: The server origin, with or without a trailing slash.
+        base_urls: The deployment's server origins, with or without a
+            trailing slash. With several replicas, `ReplicaRouter` sends
+            each request to one of them.
         point: The resolved benchmark point to execute.
         output_dir: The bundle directory; it must be absent or empty.
-        launch: The `describe_launch` provenance record, if any.
+        launch: The `describe_deployment` provenance record, if any.
         timeout_s: Override the profile's logical video request deadline and
             HTTP operation timeout. Provenance uses a separate short timeout.
 
@@ -90,6 +94,7 @@ async def run_point(
     """  # noqa: E501
     output_path = Path(output_dir)
     timeout_s = point.load.request_timeout_s if timeout_s is None else timeout_s
+    router = ReplicaRouter([url.rstrip("/") for url in base_urls])
     if output_path.exists() and any(output_path.iterdir()):
         raise FileExistsError(f"result directory is not empty: {output_path}")
 
@@ -198,17 +203,20 @@ async def run_point(
                     if example.output_len is not None
                     else point.sampling.max_tokens or 0
                 )
-                record = await send_request(
-                    client,
-                    base_url.rstrip("/"),
-                    request,
-                    request_id=example.id,
-                    task=point.task.value,
-                    prompt_len=int(example.prompt_len or 0),
-                    output_len_fallback=output_len_fallback,
-                    scheduled_time=scheduled,
-                    timeout_s=timeout_s,
-                )
+                # Routing happens inside the submission slot, so a request
+                # waits on its chosen replica like on any queueing server.
+                with router.route() as base_url:
+                    record = await send_request(
+                        client,
+                        base_url,
+                        request,
+                        request_id=example.id,
+                        task=point.task.value,
+                        prompt_len=int(example.prompt_len or 0),
+                        output_len_fallback=output_len_fallback,
+                        scheduled_time=scheduled,
+                        timeout_s=timeout_s,
+                    )
                 record.example = examples[id(example)]
 
                 # Measured records are kept as they finish, so a load that
@@ -279,11 +287,13 @@ async def run_point(
             inspect(priming_records)
 
             # Provenance is fetched after the measured window closes.
-            server_version = await _fetch_server_version(client, base_url)
+            server_version = await _fetch_server_version(
+                client, router.base_urls[0]
+            )
 
         summary = build_summary(
             point,
-            base_url.rstrip("/"),
+            router.base_urls,
             records,
             duration,
             task=task,
@@ -378,6 +388,37 @@ async def run_point(
             }
         writer.write_json("run.json", failure)
         raise
+
+
+class ReplicaRouter:
+    """Route each request to the replica with the fewest in-flight requests.
+
+    This is client-side dispatch over independent replica endpoints, the
+    least-outstanding-requests policy of common HTTP load balancers. Ties
+    resolve in rotation starting after the previous choice, so an idle
+    deployment receives requests round-robin. A single origin always wins.
+    """
+
+    def __init__(self, base_urls: Sequence[str]) -> None:
+        """Track the in-flight count of each origin, in the given order."""
+        if not base_urls:
+            raise ValueError("a deployment requires at least one origin")
+        self.base_urls = tuple(base_urls)
+        self.active = [0] * len(self.base_urls)
+        self.last = len(self.base_urls) - 1
+
+    @contextlib.contextmanager
+    def route(self) -> Iterator[str]:
+        """Yield the chosen origin and count it busy until the block exits."""
+        count = len(self.base_urls)
+        order = [(self.last + offset) % count for offset in range(1, count + 1)]
+        index = min(order, key=lambda candidate: self.active[candidate])
+        self.last = index
+        self.active[index] += 1
+        try:
+            yield self.base_urls[index]
+        finally:
+            self.active[index] -= 1
 
 
 def _write_empty_streams(writer: ArtifactWriter) -> None:

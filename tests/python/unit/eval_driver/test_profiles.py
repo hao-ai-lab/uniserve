@@ -203,9 +203,8 @@ output_throughput = "higher"
     )
     plan = json.loads(result.stdout)[0]
 
-    assert plan["server_command"][0] == str(tree / "target/release/uniserve")
-    worker_python = plan["server_command"].index("--worker-python") + 1
-    assert plan["server_command"][worker_python] == str(
-        tree / ".venv/bin/python"
-    )
+    (command,) = plan["server_commands"]
+    assert command[0] == str(tree / "target/release/uniserve")
+    worker_python = command.index("--worker-python") + 1
+    assert command[worker_python] == str(tree / ".venv/bin/python")
     assert plan["server_working_directory"] == str(tree)

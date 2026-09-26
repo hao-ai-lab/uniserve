@@ -103,7 +103,7 @@ def test_failed_warmup_writes_terminal_diagnostic_artifacts(
         with pytest.raises(WarmupFailure, match="response_empty_output"):
             asyncio.run(
                 run_point(
-                    f"http://127.0.0.1:{server.server_port}",
+                    [f"http://127.0.0.1:{server.server_port}"],
                     point,
                     output,
                 )
@@ -187,7 +187,7 @@ def test_interrupted_measurement_persists_the_finished_requests(
         with pytest.raises(ValueError, match="base64"):
             asyncio.run(
                 run_point(
-                    f"http://127.0.0.1:{server.server_port}",
+                    [f"http://127.0.0.1:{server.server_port}"],
                     point,
                     output,
                 )
@@ -268,7 +268,7 @@ def test_failed_sample_persistence_still_records_the_failed_run(
         with pytest.raises(IsADirectoryError):
             asyncio.run(
                 run_point(
-                    f"http://127.0.0.1:{server.server_port}",
+                    [f"http://127.0.0.1:{server.server_port}"],
                     point,
                     output,
                 )

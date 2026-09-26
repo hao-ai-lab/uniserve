@@ -80,18 +80,37 @@ _Settings = TypeVar(
 
 @dataclass(frozen=True)
 class ServerProfile:
-    """Describes one benchmark server and its launch environment."""
+    """Describes one benchmark deployment and its launch environment.
+
+    A deployment is either one server process, described by `command`,
+    `host`, `port` and `environment`, or independent `replicas`, each a
+    complete single-process profile. Replicas are separate engines on
+    disjoint devices; the client routes each request to one of them.
+    """
 
     name: str
     command: tuple[str, ...]
     host: str
     port: int
     environment: dict[str, str]
+    replicas: tuple[ServerProfile, ...] = ()
+
+    @property
+    def instances(self) -> tuple[ServerProfile, ...]:
+        """Return the single-process profiles that form this deployment."""
+        return self.replicas or (self,)
 
     @property
     def base_url(self) -> str:
-        """Return the server's HTTP origin."""
+        """Return the HTTP origin of a single-process profile."""
+        if self.replicas:
+            raise ValueError(f"server {self.name} has replica origins")
         return f"http://{self.host}:{self.port}"
+
+    @property
+    def base_urls(self) -> tuple[str, ...]:
+        """Return every HTTP origin requests may be routed to."""
+        return tuple(instance.base_url for instance in self.instances)
 
 
 @dataclass(frozen=True)
@@ -311,39 +330,102 @@ def _resolve_command_path(command: list[str], option: str, base: Path) -> None:
 
 
 def _server_profile(name: str, raw: Any) -> ServerProfile:
-    """Validate and construct one server profile table."""
+    """Validate and construct one server profile table.
+
+    A table with `replicas` declares an array of single-process tables. Each
+    replica inherits the table's `host` and merges the table's `environment`
+    under its own, and must not repeat a port.
+    """
     value = expand_environment(_mapping(raw, f"servers.{name}"))
     _reject_unknown(
-        value, {"command", "host", "port", "environment"}, f"servers.{name}"
+        value,
+        {"command", "host", "port", "environment", "replicas"},
+        f"servers.{name}",
     )
+    if "replicas" not in value:
+        return _server_process(name, value)
+
+    replicas_value = value["replicas"]
+    if "command" in value or "port" in value:
+        raise ValueError(
+            f"servers.{name} declares replicas and cannot also declare "
+            "a command or port"
+        )
+    if not isinstance(replicas_value, list) or len(replicas_value) < 2:
+        raise ValueError(f"servers.{name}.replicas must list two or more")
+    host = _server_host(value, f"servers.{name}")
+    shared = _server_environment(value, f"servers.{name}")
+    replicas = []
+    for index, item in enumerate(replicas_value):
+        context = f"servers.{name}.replicas[{index}]"
+        item = _mapping(item, context)
+        _reject_unknown(item, {"command", "port", "environment"}, context)
+        environment = {**shared, **_server_environment(item, context)}
+        replicas.append(
+            _server_process(
+                f"{name}.replica-{index}",
+                {**item, "host": host, "environment": environment},
+                context,
+            )
+        )
+    if len({replica.port for replica in replicas}) != len(replicas):
+        raise ValueError(f"servers.{name}.replicas must use distinct ports")
+    first = replicas[0]
+    return ServerProfile(
+        name,
+        first.command,
+        host,
+        first.port,
+        shared,
+        tuple(replicas),
+    )
+
+
+def _server_process(
+    name: str, value: dict[str, Any], context: str | None = None
+) -> ServerProfile:
+    """Validate the fields of one single-process server description."""
+    context = context or f"servers.{name}"
     command = value.get("command")
     if (
         not isinstance(command, list)
         or not command
         or not all(isinstance(item, str) for item in command)
     ):
-        raise ValueError(
-            f"servers.{name}.command must be a non-empty string array"
-        )
-    host = value.get("host", "127.0.0.1")
+        raise ValueError(f"{context}.command must be a non-empty string array")
     port = value.get("port")
-    environment = value.get("environment", {})
-    if not isinstance(host, str) or not host:
-        raise ValueError(f"servers.{name}.host must be a non-empty string")
     if (
         isinstance(port, bool)
         or not isinstance(port, int)
         or not 0 < port < 65536
     ):
-        raise ValueError(f"servers.{name}.port must be a valid TCP port")
+        raise ValueError(f"{context}.port must be a valid TCP port")
+    return ServerProfile(
+        name,
+        tuple(command),
+        _server_host(value, context),
+        port,
+        _server_environment(value, context),
+    )
+
+
+def _server_host(value: dict[str, Any], context: str) -> str:
+    """Return a table's validated listener host."""
+    host = value.get("host", "127.0.0.1")
+    if not isinstance(host, str) or not host:
+        raise ValueError(f"{context}.host must be a non-empty string")
+    return host
+
+
+def _server_environment(value: dict[str, Any], context: str) -> dict[str, str]:
+    """Return a table's validated launch environment."""
+    environment = value.get("environment", {})
     if not isinstance(environment, dict) or not all(
         isinstance(key, str) and isinstance(item, str)
         for key, item in environment.items()
     ):
-        raise ValueError(
-            f"servers.{name}.environment must contain string values"
-        )
-    return ServerProfile(name, tuple(command), host, port, dict(environment))
+        raise ValueError(f"{context}.environment must contain string values")
+    return dict(environment)
 
 
 def _benchmark_point(

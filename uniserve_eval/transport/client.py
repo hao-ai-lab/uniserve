@@ -69,6 +69,7 @@ async def send_request(
         scheduled_time=scheduled_time,
         requested_output_len=int(output_len_fallback),
     )
+    record.base_url = base_url
     try:
         if request.video_backend is not None or request.endpoint == VIDEOS_SYNC:
             record.prompt_len = prompt_len
