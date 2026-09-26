@@ -454,6 +454,9 @@ class ModelExecutor:
                 scratch=None
                 if self._startup_complete
                 else self._module_scratch.setdefault(key[:3], Scratch()),
+                # Serving inputs carry their host sequence lengths; a call
+                # that lacks one fails rather than copying it from the device.
+                derive_host_lengths=False,
             )
             # An entry given graph devices captures a graph the first time it
             # executes each input signature during startup
@@ -1273,12 +1276,16 @@ class ModelExecutor:
                             call.module,
                             (CausalLM, ImageDenoiser, TokenDenoiser),
                         )
+                        # Staging supplies every host sequence length and
+                        # start page, so attention planning never copies
+                        # them from the device while serving.
                         context = ExecutionContext(
                             call.module,
                             cache=kv_cache.cache if reads_cache else None,
                             attention=self.attention,
                             stream=stream,
                             groups=call.groups,
+                            derive_host_lengths=False,
                         )
                         # Text staging counts canonical tokens. Spatial codecs
                         # and vision towers expand those into different query

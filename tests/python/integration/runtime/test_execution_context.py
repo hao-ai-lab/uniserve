@@ -400,6 +400,74 @@ def test_bound_metadata_serves_one_call_and_later_changes_are_planned(provider):
             )
 
 
+@pytest.mark.gpu
+@torch.inference_mode()
+def test_context_without_derived_lengths_plans_only_with_host_mirrors():
+    """A context that reads no lengths from the device uses the batch's own.
+
+    Planning with the host lengths a batch carries serves its calls, while a
+    batch whose lengths exist only on the device fails to bind and to run
+    rather than copying them to the host.
+    """
+    device = torch.device("cuda", 0)
+    dtype = torch.bfloat16
+    layer = Attention(2, 1, 64, cache_name="attention")
+    config = Config({"attention": mha.Config(1, 64, (0,), dtype)})
+    generator = torch.Generator(device=device).manual_seed(37)
+    q = torch.randn(5, 2, 64, dtype=dtype, device=device, generator=generator)
+    k, v = (
+        torch.randn(5, 1, 64, dtype=dtype, device=device, generator=generator)
+        for _ in range(2)
+    )
+    batch = PagedInput.from_blocks(
+        blocks=((0,), (1,)),
+        query_lengths=(4, 1),
+        prefix_lengths=(0, 0),
+        block_size=16,
+        causal=True,
+        device=device,
+    )
+    stripped = replace(
+        batch,
+        queries=replace(batch.queries, host=None),
+        prefixes=replace(batch.prefixes, host=None),
+    )
+    expected = torch.cat(
+        [
+            F.scaled_dot_product_attention(
+                query.transpose(0, 1).unsqueeze(0),
+                key.transpose(0, 1).unsqueeze(0),
+                value.transpose(0, 1).unsqueeze(0),
+                is_causal=True,
+                enable_gqa=True,
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+            for query, key, value in zip(
+                q.split((4, 1)), k.split((4, 1)), v.split((4, 1)), strict=True
+            )
+        ]
+    )
+    with (
+        PrefixCache(config, num_units=2, block_size=16, device=device) as cache,
+        ExecutionContext(
+            layer, cache=cache, attention="torch", derive_host_lengths=False
+        ) as context,
+    ):
+        context.prepare(TextSize(5, 2))
+        context.bind_attention(AttentionBatch.single(batch))
+        torch.testing.assert_close(
+            layer(q, k, v, AttentionBatch.single(batch)),
+            expected,
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        with pytest.raises(ValueError, match="host query lengths"):
+            context.bind_attention(AttentionBatch.single(stripped))
+        with pytest.raises(ValueError, match="host query lengths"):
+            layer(q, k, v, AttentionBatch.single(stripped))
+
+
 class _Workspace(nn.Module):
     """Declare one large workspace buffer and no numerical layers."""
 
