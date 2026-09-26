@@ -274,6 +274,9 @@ class TokenResult:
     # holding its FP32 log-probability's bits sign-extended from int32.
     candidate_range: tuple[int, int] | None = None
     candidate_logprobs: tuple[float, ...] = ()
+    # A canvas step's `(offset, count)` span: its stop flag, then its canvas
+    # tokens, which become the committed tokens when the flag is set.
+    canvas_range: tuple[int, int] | None = None
 
     # These borrowed numerical views survive until DecodeState accepts them.
     runtime_logical_position: int | torch.Tensor = 0
@@ -553,6 +556,13 @@ class PendingOutput:
                     self.token.candidate_logprobs = struct.unpack(
                         f"<{len(words)}f",
                         struct.pack(f"<{len(words)}i", *words),
+                    )
+                if self.token.canvas_range is not None:
+                    stopped, *canvas = self._buffer.read_tokens(
+                        *self.token.canvas_range
+                    )
+                    self.token.committed_tokens = (
+                        tuple(canvas) if stopped else ()
                     )
             except Exception:
                 logger.exception(

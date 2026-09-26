@@ -72,6 +72,30 @@ class CanvasInput:
         return queries.batch_size
 
 
+@dataclass(frozen=True, slots=True)
+class CanvasTokens:
+    """The block of text one generating canvas holds.
+
+    ``length`` is the canvas length in tokens. A canvas's text ends at its
+    first ``eos_token_ids`` token; the tokens after it are ``pad_token_id``.
+    """
+
+    length: int
+    pad_token_id: int
+    eos_token_ids: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            self.length < 1
+            or self.pad_token_id < 0
+            or not self.eos_token_ids
+            or min(self.eos_token_ids) < 0
+        ):
+            raise ValueError(
+                "a canvas has a positive length and token-id pad and EOS"
+            )
+
+
 class SelfConditioning(nn.Module):
     """Mix the previous pass's soft embeddings into canvas token embeddings.
 
@@ -106,8 +130,10 @@ class TokenDenoiser(nn.Module):
     ``forward(inputs)`` returns the final-normalized canvas rows
     ``[rows * canvas, hidden]`` on the last pipeline stage (earlier stages
     return the activations they forward). ``compute_logits`` projects
-    caller-selected rows through the head. Concrete models supply only the
-    ``SelfConditioning`` modules and the head's mathematics.
+    caller-selected rows through the head. ``canvas`` declares the canvases
+    the denoiser generates text in.
+    Concrete models supply only the ``SelfConditioning`` modules, the head's
+    mathematics and the canvas tokens.
     """
 
     # Pipeline binding drops the head outside the last stage.
@@ -118,10 +144,12 @@ class TokenDenoiser(nn.Module):
         backbone: TransformerDecoder,
         lm_head: nn.Module,
         self_conditioning: SelfConditioning,
+        canvas: CanvasTokens,
     ):
         super().__init__()
         self.backbone, self.lm_head = backbone, lm_head
         self.self_conditioning = self_conditioning
+        self.canvas = canvas
 
     @property
     def cache_config(self):

@@ -100,6 +100,10 @@ from uniserve_worker.protocol.worker_info import (
 from uniserve_worker.service import Service
 from uniserve_worker.storage.block_tables import BlockTables
 from uniserve_worker.storage.buffer_pool import BufferPool
+from uniserve_worker.storage.canvas_slots import (
+    CanvasSlots,
+    generating_denoiser,
+)
 from uniserve_worker.storage.decode_state import DecodeState
 from uniserve_worker.storage.kv_cache import KVCacheManager
 from uniserve_worker.storage.latent_pool import LatentPool
@@ -713,6 +717,26 @@ class Worker:
                     ),
                     max_inflight=int(queue_depth),
                 )
+
+            # A rank whose token denoiser generates canvases keeps every
+            # request slot's canvas resident between its steps.
+            self.canvas_slots = None
+            canvas_runner = runner.canvas_runner if owns_kv else None
+            denoiser = (
+                None
+                if canvas_runner is None
+                else generating_denoiser(canvas_runner.model)
+            )
+            if denoiser is not None:
+                assert canvas_runner is not None
+                self.canvas_slots = CanvasSlots.for_denoiser(
+                    denoiser,
+                    request_pool_size=int(info.request_slots),
+                    max_rows=canvas_runner.input_buffers.max_rows,
+                    device=canvas_runner.device,
+                )
+                startup.callback(self.canvas_slots.close)
+                runner.bind_canvas_slots(self.canvas_slots)
 
             # Only the muxer member that publishes the component's host
             # products (`WorkerInfo.output_rank`) holds a `MediaMux`; it

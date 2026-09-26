@@ -19,7 +19,12 @@ from .inputs import (
 )
 from .logits import Logits, VocabShard
 from .text import CausalLM
-from .token_denoiser import CanvasInput, SelfConditioning, TokenDenoiser
+from .token_denoiser import (
+    CanvasInput,
+    CanvasTokens,
+    SelfConditioning,
+    TokenDenoiser,
+)
 from .transformer import TransformerDecoder, TransformerEncoder
 from .video import AudioDecoder, VideoDecoder, VideoPostprocessor
 
@@ -37,6 +42,7 @@ __all__ = [
     "VocabShard",
     "CausalLM",
     "CanvasInput",
+    "CanvasTokens",
     "SelfConditioning",
     "TokenDenoiser",
     "TransformerDecoder",

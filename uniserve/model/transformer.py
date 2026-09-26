@@ -56,6 +56,9 @@ class TransformerDecoder(nn.Module):
     # output norm outside the last one.
     embedding: nn.Module | None
     norm: nn.Module | None
+    # Factor ``embed_input_ids`` multiplies embedding-table rows by; an
+    # architecture that scales its token embeddings overrides it.
+    embedding_scale: float = 1.0
 
     # Recorded by parallelize_ once the decoder is bound to its partition.
     _parallel_mesh: DeviceMesh

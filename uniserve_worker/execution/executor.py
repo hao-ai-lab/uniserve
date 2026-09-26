@@ -590,6 +590,8 @@ class Executor:
             slots = self.worker.requests.apply_commands((start,))
             if slots and self.worker.decode_state is not None:
                 self.worker.decode_state.reset(slots)
+            if slots and self.worker.canvas_slots is not None:
+                self.worker.canvas_slots.reset(slots)
             if slots and start.request.diffusion is not None:
                 # A video request's seeded noise is drawn while this batch and
                 # the ones before latent preparation run on the device.
@@ -988,8 +990,8 @@ class Executor:
 
         Buffers in ``retained`` are kept; every other export and tensor-store
         product the request owns is released with its KV imports and cache
-        state, decode state, block tables, prefix slots, media mux state and
-        latent slot.
+        state, decode state, canvas state, block tables, prefix slots, media
+        mux state and latent slot.
         """
         request = self.worker.requests.peek(request_id)
         if request is not None:
@@ -999,6 +1001,8 @@ class Executor:
                 )
             if self.worker.decode_state is not None:
                 self.worker.decode_state.reset((request.request_pool_idx,))
+            if self.worker.canvas_slots is not None:
+                self.worker.canvas_slots.reset((request.request_pool_idx,))
             if self.worker.block_tables is not None:
                 self.worker.block_tables.release((request.request_pool_idx,))
 

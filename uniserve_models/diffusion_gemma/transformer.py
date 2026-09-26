@@ -244,7 +244,7 @@ class Backbone(TransformerDecoder):
             RMSNorm(config.hidden_size, config.rms_norm_eps),
             separate_residual=False,
         )
-        self.embed_scale = config.embed_scale
+        self.embedding_scale = config.embed_scale
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Embed tokens and multiply by sqrt(hidden_size).
@@ -254,5 +254,5 @@ class Backbone(TransformerDecoder):
         substitute image features after this scaling.
         """
         embedded = super().embed_input_ids(input_ids)
-        scale = torch.tensor(self.embed_scale, dtype=embedded.dtype).item()
+        scale = torch.tensor(self.embedding_scale, dtype=embedded.dtype).item()
         return embedded * scale
