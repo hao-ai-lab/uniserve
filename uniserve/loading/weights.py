@@ -133,6 +133,18 @@ def _full(shape):
     return tuple(slice(0, size) for size in shape)
 
 
+def _placed(device) -> torch.device:
+    """Name the device a tensor moved to ``device`` reports.
+
+    An unindexed CUDA device means the current one, which moved tensors
+    report with its index.
+    """
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
 def _source_names(weight):
     if isinstance(weight, checkpoint.FP8Weight):
         return _source_names(weight.values) | _source_names(weight.scale)
@@ -873,6 +885,15 @@ class _Loader:
             )
         elif quantizer is not None:
             owner, _ = self._owners[key]
+            if isinstance(owner, ExpertLinear):
+                # Encoding stacked experts here would need per-expert scale
+                # statistics across their tensor-parallel shards and a
+                # calibrated activation scale; checkpoints supply both.
+                raise ValueError(
+                    f"{owner_path(self, key)} loads dense weights, but "
+                    f"{quantizer.format} experts load only from a checkpoint "
+                    "that stores them encoded with calibrated input scales"
+                )
             value = quantizer.quantize(
                 value, distribution=owner.weight_distribution
             )
@@ -915,7 +936,7 @@ class _Loader:
         for path, module, name, buffer in buffers:
             if id(module) not in active:
                 continue
-            device = _choice(path, self.devices, self.device)
+            device = _placed(_choice(path, self.devices, self.device))
             if buffer.is_meta:
                 raise RuntimeError(
                     f"derived buffer {path}.{name} was not materialized by "
