@@ -1,21 +1,22 @@
-"""Indexed RMS modulation and gated residuals over BF16 rows.
+"""Indexed RMS modulation and gated residuals over floating rows.
 
 Row indices select modulation parameters whose leading stride may include
 other parameter groups. Statistics and affine expressions accumulate in FP32;
 outputs use the activation dtype or carry a per-row E4M3 dequantization scale.
 
-``uniserve.nn.functional`` owns validation and the tensor-operation fallback
-for these kernels.
+``uniserve.nn.functional`` owns validation and raises on CUDA when
+:func:`unsupported` reports a reason.
 """
 
 from __future__ import annotations
 
 import torch
 
-from uniserve_kernels.triton import launchable, tl, triton
+from uniserve_kernels.triton import tl, triton, unsupported_operands
 
 #: One program reduces a complete row, bounding the normalized width.
 MAX_WIDTH = 32768
+_FLOATING = (torch.float16, torch.bfloat16, torch.float32)
 
 
 if triton is not None:
@@ -141,25 +142,37 @@ if triton is not None:
         tl.store(update_ptr + offsets, hidden + gate * update, mask=mask)
 
 
-def can_run(value: torch.Tensor, *operands: torch.Tensor) -> bool:
-    """Return whether contiguous BF16 CUDA rows and indexed operands fit.
+def unsupported(
+    value: torch.Tensor,
+    *operands: torch.Tensor,
+    rows: tuple[torch.Tensor, ...] = (),
+    normalizes: bool = True,
+) -> str | None:
+    """Return why the kernels cannot take these operands, or ``None``.
 
-    Operands may be strided between rows but are unit-strided per channel.
-    Contiguity of operands addressed as full activation rows (``update``,
-    ``retain``) and the ``MAX_WIDTH`` bound are checked by the callers in
-    ``uniserve.nn.functional``, not here.
+    ``value`` is the contiguous floating ``[..., width]`` activation.
+    ``operands`` are indexed parameters (weight, shift, scale, gate) and row
+    indices, which may be strided between rows but are unit-strided per
+    channel. ``rows`` are further tensors addressed as full activation rows
+    (``update``, ``retain``), which must be contiguous. A ``normalizes``
+    launch reduces a complete row in one program, bounding ``width`` by
+    :data:`MAX_WIDTH`.
     """
-    return (
-        launchable(value.device)
-        and value.is_cuda
-        and value.dtype == torch.bfloat16
-        and value.is_contiguous()
-        and value.numel() > 0
-        and all(
-            operand.device == value.device and operand.stride(-1) == 1
-            for operand in operands
-        )
-    )
+    reason = unsupported_operands(value, *operands, *rows)
+    if reason is not None:
+        return reason
+    width = int(value.shape[-1]) if value.ndim else 0
+    if value.dtype not in _FLOATING:
+        return f"dtype {value.dtype} is not float16, bfloat16 or float32"
+    if value.numel() == 0 or (normalizes and not 0 < width <= MAX_WIDTH):
+        return f"rows are empty or wider than the kernel's {MAX_WIDTH}"
+    if not value.is_contiguous() or any(
+        not row.is_contiguous() for row in rows
+    ):
+        return "the activation or an updated row tensor is not contiguous"
+    if any(operand.stride(-1) != 1 for operand in operands):
+        return "a modulation operand is not unit-strided per channel"
+    return None
 
 
 def modulated_rms_norm(
