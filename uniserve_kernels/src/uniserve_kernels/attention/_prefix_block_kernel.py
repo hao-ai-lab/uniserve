@@ -82,6 +82,12 @@ _TMEM_BARRIER = 1
 _PAIR_BARRIER = 2
 # Tensor-memory addresses carry the lane above bit 16 and the column below.
 _TMEM_LANE = 1 << 16
+# The running row maximum used for the probabilities is only raised when a
+# tile exceeds it by more than this many log2 units, so most tiles need no
+# output rescale. Probabilities then stay below 2**8, far inside the BF16
+# range, and the row sum uses the same maximum, so the result is exact up to
+# rounding.
+_RESCALE_THRESHOLD = 8.0
 
 
 def _group(size: int) -> pipeline.CooperativeGroup:
@@ -968,46 +974,73 @@ class PrefixBlockAttentionSm100:
                     v_seq,
                 )
 
+                # Lane s holds (physical page, row shift) of page slot s of
+                # a prefix tile; the lookups run one tile ahead of the copies
+                # that use them.
+                lookup = (sequence, block_table, num_pages)
+                slots = self.lane_slots(Int32(0), lookup)
+                ahead = self.lane_slots(Int32(1), lookup)
                 kv_producer = self.load_k(
-                    Int32(0),
-                    sequence,
-                    block_table,
-                    num_pages,
-                    sources,
-                    views,
-                    kv_producer,
+                    Int32(0), slots, sequence, sources, views, kv_producer
                 )
                 for key_tile in cutlass.range(1, key_tiles, unroll=1):
+                    following = self.lane_slots(key_tile + 1, lookup)
                     kv_producer = self.load_k(
-                        key_tile,
-                        sequence,
-                        block_table,
-                        num_pages,
-                        sources,
-                        views,
-                        kv_producer,
+                        key_tile, ahead, sequence, sources, views, kv_producer
                     )
                     kv_producer = self.load_v(
                         key_tile - 1,
+                        slots,
                         sequence,
-                        block_table,
-                        num_pages,
                         sources,
                         views,
                         kv_producer,
                     )
+                    slots = ahead
+                    ahead = following
                 kv_producer = self.load_v(
-                    key_tiles - 1,
-                    sequence,
-                    block_table,
-                    num_pages,
-                    sources,
-                    views,
-                    kv_producer,
+                    key_tiles - 1, slots, sequence, sources, views, kv_producer
                 )
             tile += num_clusters
         kv_producer.tail()
         q_producer.tail()
+
+    @no_type_check
+    @cute.jit
+    def lane_slots(self, key_tile: Int32, lookup):
+        """Page slot ``lane`` of prefix tile ``key_tile`` for this lane.
+
+        Each lane below ``128 / page_tokens`` looks up one slot, so a tile's
+        block table reads proceed in parallel and are shuffled to the
+        issuing lane; other lanes, and tiles that are not prefix tiles,
+        return an out-of-range page.
+        """
+        sequence, block_table, num_pages = lookup
+        (
+            batch,
+            _kv_head,
+            _cta_v,
+            _query_len,
+            prefix_len,
+            first_page,
+            prefix_base,
+            prefix_tiles,
+        ) = sequence
+        lane = cute.arch.lane_idx()
+        physical = num_pages
+        shift = Int32(0)
+        if key_tile < prefix_tiles and lane < self.slots_per_tile:
+            physical, shift = self.page_slot(
+                prefix_base // self.page_tokens
+                + key_tile * self.slots_per_tile
+                + lane,
+                batch,
+                prefix_len,
+                first_page,
+                block_table,
+                num_pages,
+            )
+        return physical, shift
 
     @no_type_check
     @cute.jit
@@ -1044,24 +1077,17 @@ class PrefixBlockAttentionSm100:
     @no_type_check
     @cute.jit
     def load_k(
-        self,
-        key_tile: Int32,
-        sequence,
-        block_table: cute.Tensor,
-        num_pages: Int32,
-        sources,
-        views,
-        kv_producer,
+        self, key_tile: Int32, slots, sequence, sources, views, kv_producer
     ):
         """Load this CTA's 64-key half of K tile ``key_tile``, per chunk."""
         (
-            batch,
+            _batch,
             kv_head,
             cta_v,
             query_len,
-            prefix_len,
-            first_page,
-            prefix_base,
+            _prefix_len,
+            _first_page,
+            _prefix_base,
             prefix_tiles,
         ) = sequence
         tma_kp, tma_kp_tensor, tma_kc, k_seq = sources[:4]
@@ -1071,18 +1097,10 @@ class PrefixBlockAttentionSm100:
         for chunk in cutlass.range(self.qk_chunks, unroll=1):
             handle = kv_producer.acquire_and_advance()
             if key_tile < prefix_tiles:
-                first = (
-                    prefix_base + key_tile * self.tile_keys
-                ) // self.page_tokens + cta_v * self.slots_per_half
                 for slot in cutlass.range(self.slots_per_half, unroll=1):
-                    physical, shift = self.page_slot(
-                        first + slot,
-                        batch,
-                        prefix_len,
-                        first_page,
-                        block_table,
-                        num_pages,
-                    )
+                    lane = cta_v * self.slots_per_half + slot
+                    physical = cute.arch.shuffle_sync(slots[0], lane)
+                    shift = cute.arch.shuffle_sync(slots[1], lane)
                     g_k = cute.domain_offset((shift, 0, 0, 0), tma_kp_tensor)
                     g_k = cute.flat_divide(
                         g_k[None, None, kv_head, None],
@@ -1127,14 +1145,7 @@ class PrefixBlockAttentionSm100:
     @no_type_check
     @cute.jit
     def load_v(
-        self,
-        key_tile: Int32,
-        sequence,
-        block_table: cute.Tensor,
-        num_pages: Int32,
-        sources,
-        views,
-        kv_producer,
+        self, key_tile: Int32, slots, sequence, sources, views, kv_producer
     ):
         """Load this CTA's head-dim half of every key of V tile ``key_tile``.
 
@@ -1143,13 +1154,13 @@ class PrefixBlockAttentionSm100:
         cta_v * 64``.
         """
         (
-            batch,
+            _batch,
             kv_head,
             cta_v,
             query_len,
-            prefix_len,
-            first_page,
-            prefix_base,
+            _prefix_len,
+            _first_page,
+            _prefix_base,
             prefix_tiles,
         ) = sequence
         tma_vp, tma_vp_tensor, tma_vc, v_seq = sources[4:]
@@ -1160,18 +1171,9 @@ class PrefixBlockAttentionSm100:
             handle = kv_producer.acquire_and_advance()
             dim_block = chunk * 2 + cta_v
             if key_tile < prefix_tiles:
-                first = (
-                    prefix_base + key_tile * self.tile_keys
-                ) // self.page_tokens
                 for slot in cutlass.range(self.slots_per_tile, unroll=1):
-                    physical, shift = self.page_slot(
-                        first + slot,
-                        batch,
-                        prefix_len,
-                        first_page,
-                        block_table,
-                        num_pages,
-                    )
+                    physical = cute.arch.shuffle_sync(slots[0], slot)
+                    shift = cute.arch.shuffle_sync(slots[1], slot)
                     g_v = cute.domain_offset((0, shift, 0, 0), tma_vp_tensor)
                     g_v = cute.flat_divide(
                         g_v[None, None, kv_head, None],
@@ -1659,12 +1661,18 @@ class PrefixBlockAttentionSm100:
             self.mask_scores(scores, coords, mask_args)
 
         previous_max = row_max
-        row_max = scores.load().reduce(cute.ReductionOp.MAX, row_max, 0)
+        tile_max = scores.load().reduce(cute.ReductionOp.MAX, row_max, 0)
         if const_expr(self.row_split == 2):
-            row_max = cutlass.max(
-                row_max, self.exchange(row_max, exchanges, s_pair)
+            tile_max = cutlass.max(
+                tile_max, self.exchange(tile_max, exchanges, s_pair)
             )
             exchanges += 1
+        # Keep the previous maximum unless this tile exceeds it by more than
+        # the rescale threshold (both lanes of a row decide alike).
+        row_max = tile_max
+        if previous_max != -Float32.inf:
+            if (previous_max - tile_max) * scale_log2 >= -_RESCALE_THRESHOLD:
+                row_max = previous_max
         safe_max = row_max
         if row_max == -Float32.inf:
             safe_max = Float32(0.0)
@@ -1898,10 +1906,24 @@ class PrefixBlockAttentionSm100:
             scale_log2 * (stats[0] - stats[1]), fastmath=True
         )
         stats_handle.release()
+        # Tensor-memory copies are warp collectives: a warp rescales when any
+        # of its rows raised its maximum.
+        rescale = cute.arch.vote_ballot_sync(factor < Float32(1.0)) != 0
 
-        # Load, scale and store 16 columns at a time, overlapping the load of
-        # one piece with the scaling of the previous one.
         o_handle = o_consumer.wait_and_advance()
+        if rescale:
+            self.scale_output(t_o, tidx, factor)
+        o_handle.release()
+        return stats_consumer, o_consumer
+
+    @no_type_check
+    @cute.jit
+    def scale_output(self, t_o: cute.Tensor, tidx: Int32, factor: Float32):
+        """Multiply this lane's output columns by ``factor`` in place.
+
+        Loads, scales and stores 16 columns at a time, overlapping the load
+        of one piece with the scaling of the previous one.
+        """
         for chunk in cutlass.range(self.pv_chunks, unroll_full=True):
             t_o_epi = cute.zipped_divide(
                 t_o[(None, None), 0, 0, chunk], self.pv_block_tiler
@@ -1956,8 +1978,6 @@ class PrefixBlockAttentionSm100:
                     store_o, values[None, previous], dst[None, piece - 1, 0]
                 )
         cute.arch.fence_view_async_tmem_store()
-        o_handle.release()
-        return stats_consumer, o_consumer
 
     @no_type_check
     @cute.jit
