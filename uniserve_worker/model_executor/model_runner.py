@@ -196,6 +196,13 @@ class ModelRunner(Execution, ABC):
                         ),
                         pools=self.pools,
                     )
+                    # The warm call and the capture leave storage in and
+                    # outside the pool; refuse an overrun at this graph.
+                    try:
+                        self.graph_storage.check()
+                    except BaseException:
+                        graph.close()
+                        raise
                     self.buckets[key] = GraphBucket({None: graph})
                     path = "graph_capture"
                 else:

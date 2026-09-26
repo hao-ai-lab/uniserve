@@ -42,7 +42,11 @@ from uniserve.processing import (
     ImageProcessor,
     PatchTransform,
 )
-from uniserve.runtime.device import canonical_device, device_storage_budget
+from uniserve.runtime.device import (
+    canonical_device,
+    device_storage_budget,
+    process_device_bytes,
+)
 from uniserve.tensors import BufferConfig
 from uniserve_worker.bootstrap.components import media_components
 from uniserve_worker.bootstrap.inputs import (
@@ -1077,15 +1081,18 @@ def check_startup_storage(
     arena's ``device_product_bytes``, split evenly across the worker's
     devices; on each CUDA device, the part not yet resident in
     ``tensor_store`` must fit both its current storage budget and, together
-    with the bytes the process has reserved, the ``kv_storage_fraction``
-    share of the device.
+    with everything the process holds on the device
+    (``process_device_bytes``), the ``kv_storage_fraction`` share of the
+    device.
 
     Raises:
         WorkerError: With ``UNSUPPORTED_SETUP`` when a device lacks room.
     """
-    # Warmup may retain backend plans and graph pools in addition to the
-    # explicit arenas. Readiness requires that these resident allocations
-    # leave room for every still-lazy public product within the same grant.
+    # Warmup may retain backend plans, graph pools, graph executables and
+    # communicator resources in addition to the explicit arenas, several of
+    # them outside the caching allocator. Readiness requires that these
+    # resident allocations leave room for every still-lazy public product
+    # within the same grant.
     devices = tuple(
         dict.fromkeys(
             (
@@ -1101,14 +1108,16 @@ def check_startup_storage(
         available, free = device_storage_budget(
             device, worker_config.kv_storage_fraction
         )
-        total = device_total_bytes(device)
+        grant = int(
+            device_total_bytes(device) * worker_config.kv_storage_fraction
+        )
         remaining = max(0, product_bytes - tensor_store.resident_bytes(device))
-        process_bytes = torch.cuda.memory_reserved(canonical_device(device))
-        if remaining > available or process_bytes + remaining > int(
-            total * worker_config.kv_storage_fraction
-        ):
+        process_bytes = process_device_bytes(device)
+        if remaining > available or process_bytes + remaining > grant:
             raise unsupported_setup(
                 f"initialized runtime on {device} exceeds its static storage "
-                f"grant: {process_bytes} process-resident bytes, {free} "
-                f"device-free bytes, and {remaining} reserved product bytes"
+                f"grant: it requires {process_bytes + remaining} bytes "
+                f"({process_bytes} process-resident bytes and {remaining} "
+                f"reserved product bytes) of a {grant}-byte grant, with "
+                f"{free} device-free bytes"
             )
