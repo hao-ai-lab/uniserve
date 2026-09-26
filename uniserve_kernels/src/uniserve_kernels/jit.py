@@ -1,5 +1,10 @@
 """Build or load PyTorch JIT extensions without stale-lock hangs.
 
+Each build takes its name from a digest of its sources, flags and target
+architecture, as the canvas extension does, so processes running different
+revisions share PyTorch's extension cache without one rebuilding or loading
+another's build.
+
 ``torch.utils.cpp_extension.load`` serializes builds of one extension name
 with a lock file in its build directory and waits, without a deadline, for
 that file to disappear. A builder killed mid-compilation leaves the file
@@ -13,6 +18,7 @@ builder and is removed before PyTorch builds or loads the extension.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -24,12 +30,13 @@ def load(
     cuda_flags: Sequence[str] = (),
     cxx_flags: Sequence[str] = ("-O3", "-std=c++20"),
 ):
-    """Compile ``sources`` into extension ``name`` or load the cached build.
+    """Compile ``sources`` into an extension named after ``name`` or load it.
 
     The device code targets the current CUDA device's architecture only
-    (rather than every entry of ``TORCH_CUDA_ARCH_LIST``). PyTorch's build
-    cache (``TORCH_EXTENSIONS_DIR`` or its default) keys the build by name
-    and rebuilds when the sources or flags change. Returns the loaded
+    (rather than every entry of ``TORCH_CUDA_ARCH_LIST``). The build is
+    named ``<name>_<digest>`` in PyTorch's build cache
+    (``TORCH_EXTENSIONS_DIR`` or its default), the digest covering the
+    source bytes, both flag lists and the architecture. Returns the loaded
     module. Compilation errors propagate.
     """
     import torch
@@ -37,9 +44,16 @@ def load(
     from torch.utils.cpp_extension import load as load_extension
 
     major, minor = torch.cuda.get_device_capability()
-    architecture = (
-        f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
-    )
+    device_flags = [
+        *cuda_flags,
+        f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}",
+    ]
+    digest = hashlib.sha256()
+    for source in sources:
+        digest.update(Path(source).read_bytes())
+    digest.update(repr((tuple(cxx_flags), device_flags)).encode())
+    name = f"{name}_{digest.hexdigest()[:16]}"
+
     build = Path(_get_build_directory(name, verbose=False))
     with open(build.parent / f"{name}.flock", "a") as guard:
         fcntl.flock(guard, fcntl.LOCK_EX)
@@ -51,7 +65,7 @@ def load(
                 name,
                 sources=[str(source) for source in sources],
                 extra_cflags=list(cxx_flags),
-                extra_cuda_cflags=[*cuda_flags, architecture],
+                extra_cuda_cflags=device_flags,
                 build_directory=str(build),
             )
         finally:
