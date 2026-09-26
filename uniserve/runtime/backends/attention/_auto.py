@@ -112,11 +112,27 @@ class _Automatic(_Operator):
         )
 
     def _operator(self, batch, *, ndim=None):
+        # A table with retired window pages is read only by providers that
+        # consume its start pages; no other provider may substitute for one.
+        table = getattr(batch, "block_table", None)
+        retired = table is not None and table.start_page is not None
         name = next(
-            name
-            for name in self._names(batch, ndim=ndim)
-            if name in self._providers
+            (
+                name
+                for name in self._names(batch, ndim=ndim)
+                if name in self._providers
+                and (
+                    not retired
+                    or self._providers[name].operator_class.reads_retired_tables
+                )
+            ),
+            None,
         )
+        if name is None:
+            raise ValueError(
+                "no available attention provider reads this input"
+                + (" over retired window pages" if retired else "")
+            )
 
         if name not in self._operators:
             # Workspace buffers are namespaced per provider; the shared

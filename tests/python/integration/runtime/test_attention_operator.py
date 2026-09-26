@@ -312,6 +312,109 @@ def test_segmented_window_reads_one_prefix_interval(prefix_length, window):
     torch.testing.assert_close(out, _expected(query, key, value, allowed))
 
 
+def _retire(state, units):
+    """Overwrite retired units with NaN, as reuse by another group may."""
+    poison = torch.full((2 * len(units), 1, 4), float("nan"))
+    state.write(units, start=0, key=poison, value=poison)
+
+
+@pytest.mark.parametrize("causal", [True, False])
+def test_paged_window_reads_each_row_from_its_start_page(causal):
+    generator = torch.Generator().manual_seed(37)
+    keys = [
+        torch.randn(length, 1, 4, generator=generator) for length in (11, 5)
+    ]
+    values = [
+        torch.randn(length, 1, 4, generator=generator) for length in (11, 5)
+    ]
+    query = torch.randn(5, 2, 4, generator=generator)
+    layout = mha.Config(1, 4, (0,), torch.float32)
+    with PrefixCache(
+        Config({"attention": layout}), num_blocks=10, block_size=2, device="cpu"
+    ) as cache:
+        state = cache.state("attention")
+        # Row 0: an eight-token prefix in pages 0..3 appends three tokens;
+        # its first query (position 8) reads from position 5, so pages 0
+        # and 1 are retired. Row 1: a three-token prefix appends two tokens
+        # and still reads from page 0.
+        state.write((5, 1, 6, 3), start=0, key=keys[0][:8], value=values[0][:8])
+        state.write((7, 8), start=0, key=keys[1][:3], value=values[1][:3])
+        _retire(state, (5, 1))
+        batch = PagedInput.from_blocks(
+            blocks=((6, 3, 2, 4), (7, 8, 9)),
+            query_lengths=(3, 2),
+            prefix_lengths=(8, 3),
+            block_size=2,
+            causal=causal,
+            device="cpu",
+            start_pages=(2, 0),
+        )
+        out = torch.empty_like(query)
+        _windowed(3, state)(
+            query,
+            torch.cat((keys[0][8:], keys[1][3:])),
+            torch.cat((values[0][8:], values[1][3:])),
+            batch,
+            scale=0.5,
+            out=out,
+        )
+
+    expected = torch.cat(
+        (
+            _expected(
+                query[:3],
+                keys[0],
+                values[0],
+                _history(3, 11, window=3, causal=causal),
+            ),
+            _expected(
+                query[3:],
+                keys[1],
+                values[1],
+                _history(2, 5, window=3, causal=causal),
+            ),
+        )
+    )
+    torch.testing.assert_close(out, expected)
+
+
+def test_segmented_window_reads_its_prefix_from_the_start_page():
+    generator = torch.Generator().manual_seed(41)
+    key = torch.randn(10, 1, 4, generator=generator)
+    value = torch.randn(10, 1, 4, generator=generator)
+    query = torch.randn(3, 2, 4, generator=generator)
+    layout = mha.Config(1, 4, (0,), torch.float32)
+    with PrefixCache(
+        Config({"attention": layout}), num_blocks=5, block_size=2, device="cpu"
+    ) as cache:
+        state = cache.state("attention")
+        # A seven-token prefix whose window [4, 7) starts on page 2, after
+        # the retired pages 0 and 1.
+        state.write((1, 2, 3, 4), start=0, key=key[:7], value=value[:7])
+        _retire(state, (1, 2))
+        batch = SegmentedInput(
+            SequenceLengths.from_lengths((3,), device="cpu"),
+            SequenceLengths.from_lengths((7,), device="cpu"),
+            BlockTable(
+                torch.tensor([[3, 4]], dtype=torch.int32),
+                2,
+                torch.tensor([2], dtype=torch.int32),
+                (2,),
+            ),
+            None,
+            torch.tensor([[3, 3, 3]], dtype=torch.int32),
+            True,
+        )
+        out = torch.empty_like(query)
+        _windowed(3, state)(
+            query, key[7:], value[7:], batch, scale=0.5, out=out
+        )
+
+    columns = torch.arange(10)
+    allowed = (columns >= 4).expand(3, -1)
+    torch.testing.assert_close(out, _expected(query, key, value, allowed))
+
+
 def test_windowed_attention_rejects_inputs_without_query_positions():
     queries = SequenceLengths.from_lengths((1,), device="cpu")
     batch = VisibleInput(

@@ -11,11 +11,40 @@ from uniserve.nn.attention.inputs import BlockTable, PagedInput, SequenceLengths
 def host_lengths(batch, *, prepared=None):
     """Supply exact mirrors at preparation, retaining borrowed device columns.
 
-    During capture, prepared mirrors must describe these same fixed addresses.
+    Sequence lengths and a block table's start pages are mirrored. During
+    capture, prepared mirrors must describe these same fixed addresses.
     Reading device values is forbidden there; replay metadata is prepared by
     the caller before each invocation that requires host-driven planning.
     """
     changes = {}
+    table = getattr(batch, "block_table", None)
+    if (
+        table is not None
+        and table.start_page is not None
+        and table.start_page_host is None
+    ):
+        if prepared is not None:
+            previous = prepared.block_table
+            if (
+                previous.start_page is None
+                or previous.start_page_host is None
+                or previous.start_page.data_ptr() != table.start_page.data_ptr()
+                or previous.start_page.shape != table.start_page.shape
+            ):
+                raise RuntimeError(
+                    "prepare these table start pages before CUDA capture"
+                )
+            host = previous.start_page_host
+        else:
+            if (
+                table.start_page.is_cuda
+                and torch.cuda.is_current_stream_capturing()
+            ):
+                raise RuntimeError(
+                    "prepare host table start pages before CUDA capture"
+                )
+            host = tuple(table.start_page.cpu().tolist())
+        changes["block_table"] = replace(table, start_page_host=host)
     for name in ("queries", "keys", "prefixes"):
         lengths = getattr(batch, name, None)
         if lengths is None or lengths.host is not None:
@@ -106,11 +135,18 @@ def causal_runs(batch):
 
         if isinstance(batch, PagedInput):
             # Paged keys stay in the cache; only the query domain is sliced.
+            table = batch.block_table
             changes.update(
                 prefixes=_lengths(batch.prefixes, start, stop),
                 block_table=BlockTable(
-                    batch.block_table.indices[start:stop],
-                    batch.block_table.block_size,
+                    table.indices[start:stop],
+                    table.block_size,
+                    None
+                    if table.start_page is None
+                    else table.start_page[start:stop],
+                    None
+                    if table.start_page_host is None
+                    else table.start_page_host[start:stop],
                 ),
                 write_indices=None,
             )
