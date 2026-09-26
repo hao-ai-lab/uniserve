@@ -27,12 +27,15 @@ class Attention(nn.Module):
     Cache state and mutable kernel resources are borrowed from the active call.
 
     ``window`` bounds the visible history in tokens; ``None`` reads the whole
-    history. A query at absolute position ``q`` reads history keys from
-    ``max(q - window, 0)`` on, and a causal query still reads itself. Queries
-    align to the end of their key sequence, so a paged query token ``i`` sits
-    at ``prefix + i``. A segmented input's queries read the fixed prefix
-    interval ``[max(P - window, 0), P)`` of their prefix length ``P`` together
-    with their declared current keys, which the window does not bound.
+    history. Queries align to the end of their key sequence, so a paged query
+    token ``i`` sits at ``prefix + i`` and a sequence's query tokens are its
+    final keys. A causal query at absolute position ``q`` reads keys
+    ``[max(q - window, 0), q]``. A non-causal query reads every query token
+    of its sequence, a block attending to itself in both directions, and the
+    keys before them from ``max(q - window, 0)`` on. A segmented input's
+    queries read the fixed prefix interval ``[max(P - window, 0), P)`` of
+    their prefix length ``P`` together with their declared current keys,
+    which the window does not bound.
     """
 
     # Recorded by parallelize_ once the layer is bound to its partition.

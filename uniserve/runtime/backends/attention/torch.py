@@ -118,9 +118,15 @@ def _dense(q, k, v, *, causal, scale, mask=None, window=None):
             if causal:
                 visible &= key_positions[None] <= query_positions[:, None]
             if window is not None:
-                visible &= (
+                history = (
                     key_positions[None] >= query_positions[:, None] - window
                 )
+                if not causal:
+                    # A non-causal row attends to its own tokens, the final
+                    # query-count keys, in both directions; the window bounds
+                    # only the keys before them.
+                    history |= key_positions[None] >= k.shape[-2] - q.shape[-2]
+                visible &= history
             if mask is None:
                 mask = visible
             elif mask.dtype.is_floating_point:
@@ -253,7 +259,11 @@ def _captured(q, k, v, batch, cache, scale, window):
         if isinstance(batch, (PagedInput, VarlenInput)) and batch.causal[row]:
             allowed &= local_key[None, :] <= position[:, None]
         if isinstance(batch, (PagedInput, VarlenInput)) and window is not None:
-            allowed &= local_key[None, :] >= position[:, None] - window
+            history = local_key[None, :] >= position[:, None] - window
+            if not batch.causal[row]:
+                # The row's own tokens stay visible to its non-causal queries.
+                history |= local_key[None, :] >= key_count - query_count
+            allowed &= history
         if isinstance(batch, SegmentedInput) and window is not None:
             # The segmented prefix keeps one fixed interval for all queries.
             allowed &= local_key[None, :] >= key_count - window

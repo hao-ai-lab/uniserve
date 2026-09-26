@@ -191,12 +191,18 @@ def _windowed(window, cache=None):
 
 
 def _history(queries, keys, *, window, causal):
-    """Visible [query, key] pairs for queries aligned to the key end."""
+    """Visible [query, key] pairs for queries aligned to the key end.
+
+    The window bounds the keys before each query; a non-causal row also
+    reads every one of its own tokens, the final ``queries`` keys.
+    """
     positions = torch.arange(queries) + keys - queries
     columns = torch.arange(keys)[None]
     allowed = columns >= positions[:, None] - window
     if causal:
         allowed &= columns <= positions[:, None]
+    else:
+        allowed |= columns >= keys - queries
     return allowed
 
 
