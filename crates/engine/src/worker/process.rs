@@ -223,8 +223,9 @@ impl Default for WorkerProcessArgs {
             lanes: Vec::new(),
             graph_policy: "auto".into(),
             decode_graph_batch_sizes: None,
-            prefill_cuda_graph: false,
+            prefill_cuda_graph: true,
             prefill_graph_token_sizes: None,
+            flow_cuda_graph: false,
             flow_graph_batch_sizes: None,
             flow_graph_shapes: None,
             video_text_capacities: None,
@@ -455,6 +456,7 @@ impl WorkerProcessArgs {
             "prefill_graph_token_sizes".into(),
             json!(self.prefill_graph_token_sizes),
         );
+        fields.insert("flow_cuda_graph".into(), json!(self.flow_cuda_graph));
         fields.insert(
             "flow_graph_batch_sizes".into(),
             json!(self.flow_graph_batch_sizes),

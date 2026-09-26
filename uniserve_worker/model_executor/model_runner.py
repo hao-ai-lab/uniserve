@@ -9,7 +9,8 @@ serves two call paths:
   ``InputBuffers``, and ``run_batch`` replays a graph bucket selected by
   ``select_graph_shape`` or runs eagerly. Buckets are captured during startup
   through ``capture_batch``; once ``ModelExecutor.complete_startup`` seals
-  the runner, no batch graph is captured.
+  the runner, no batch graph is captured, and a batch whose configured
+  bucket is not resident fails instead of running eagerly.
 - Standalone invocations: ``execute_model`` evaluates one module call from
   ``ModelExecutor.run_module``. When graph pools exist, startup captures a
   graph per exact input signature on first use; once startup is sealed, a
@@ -80,6 +81,7 @@ class ModelRunner(Execution, ABC):
         storage,
         devices,
         prefill_graph=True,
+        exact_graphs=False,
         cache=None,
         predicates=None,
         rank=0,
@@ -91,7 +93,10 @@ class ModelRunner(Execution, ABC):
         self.call_kinds, self.cuda_stream = tuple(kinds), stream
         self.input_buffers = inputs
         self.graph_storage = storage
-        self.prefill_graph = prefill_graph
+        # Text runners replay prefill buckets only with ``prefill_graph``;
+        # other runners capture exact input signatures only with
+        # ``exact_graphs`` (see ``select_graph_shape``).
+        self.prefill_graph, self.exact_graphs = prefill_graph, exact_graphs
         self.cache, self.decode_predicates = cache, predicates
         self.rank = rank
         self.decode_shapes: tuple[int, ...] = ()
@@ -124,13 +129,13 @@ class ModelRunner(Execution, ABC):
         """Use the exact numerical signature for non-text graph variants.
 
         Returns ``None`` for eager execution: when the caller marks the batch
-        ineligible, graphs are disabled (no pools), or ``prefill_graph`` is off,
-        which here also disables exact graphs. Otherwise returns ``(key,
-        execution, bucketed)``: the graph key, the batch to replay, and whether
-        the key names a configured bucket that may be captured on first use
-        before startup is sealed. Exact keys are never bucketed.
+        ineligible, graphs are disabled (no pools), or ``exact_graphs`` is
+        off. Otherwise returns ``(key, execution, bucketed)``: the graph key,
+        the batch to replay, and whether the key names a configured bucket
+        that may be captured on first use before startup is sealed. Exact
+        keys are never bucketed.
         """
-        if not eligible or not self.pools or not self.prefill_graph:
+        if not eligible or not self.pools or not self.exact_graphs:
             return None
 
         # Only token and denoising batches reach this point: ``ModelExecutor``
@@ -275,12 +280,15 @@ class ModelRunner(Execution, ABC):
 
         The lane stream waits for the caller's current stream first, and the
         caller's stream waits for the lane afterwards, also on failure. A
-        batch without a selectable graph shape runs once eagerly instead,
-        and a key that is already resident is not captured again.
+        batch for which ``select_graph_shape`` returns no shape runs once
+        eagerly instead, and a key that is already resident is not captured
+        again.
 
         Raises:
             CUDAGraphError: Startup preparation is sealed, graph residency
-                exceeds its byte budget, or the capture itself fails.
+                exceeds its byte budget, the runner has graphs for the
+                batch's kind but none of its shape, or the capture itself
+                fails.
         """
         context, stream = self.context, self.context.stream
         if stream is not None:
@@ -308,20 +316,15 @@ class ModelRunner(Execution, ABC):
         if key in self.buckets:
             return
 
-        invoke = partial(self.batch_forward, padded=True) if padded else forward
-
         # Text buckets use the entry's stable staging addresses, ordered on
         # its execution stream. Exact calls can include borrowed request
         # latents; own those inputs independently of their pool-slot lifetime.
         with self.graph_storage.allocate(self):
             static = execution if padded else clone_inputs(execution)
-        graph = capture_batch(
-            self.context,
+        graph = self.capture_graph(
+            key,
             static,
-            invoke,
-            pools=self.pools,
-            cache=self.cache,
-            predicates=self.decode_predicates,
+            partial(self.batch_forward, padded=True) if padded else forward,
         )
         try:
             self.graph_storage.check()
@@ -329,6 +332,45 @@ class ModelRunner(Execution, ABC):
             graph.close()
             raise
         self.buckets[key] = GraphBucket({None: graph})
+
+    def capture_graph(self, key, execution, forward):
+        """Capture the graph of ``key`` over its fixed input ``execution``.
+
+        ``forward`` evaluates the batch; the graph also computes greedy
+        decoding where ``graph_inputs.greedy_decode`` applies. Runners with
+        other captured computations override this together with
+        ``replay_graph``.
+        """
+        return capture_batch(
+            self.context,
+            execution,
+            forward,
+            pools=self.pools,
+            cache=self.cache,
+            predicates=self.decode_predicates,
+        )
+
+    def replay_graph(self, key, execution, batch, *, borrow):
+        """Replay the resident graph of ``key`` for ``batch``.
+
+        ``execution`` is the batch as the graph's inputs hold it (padded to
+        the bucket for text); outputs of padding rows are dropped. With
+        ``borrow`` the result may view graph storage the next replay
+        overwrites.
+        """
+        result = replay_batch(
+            self.buckets[key].graphs[None],
+            execution,
+            rows=batch.row_count,
+            borrow=borrow,
+        )
+        # A decode bucket carries a force-finish column even for a batch
+        # staged without one (see ``TextRunner.select_graph_shape``), so its
+        # graph can return greedy continuations that such a batch did not
+        # request.
+        if batch.decode_force_finish is None:
+            result = replace(result, greedy=None)
+        return result
 
     @torch.inference_mode()
     def run_batch(self, batch, forward, *, eligible, borrow_output=False):
@@ -342,8 +384,10 @@ class ModelRunner(Execution, ABC):
 
         Raises:
             CUDAGraphError: After startup, a configured text bucket that
-                the batch selects is not resident; before startup, capturing
-                a missing text bucket can also fail with it.
+                the batch selects is not resident, or a text runner with
+                prefill graphs has no bucket for a non-decode batch; before
+                startup, capturing a missing text bucket can also fail with
+                it.
         """
         with self.context.activate():
             return self._run_batch(
@@ -364,7 +408,7 @@ class ModelRunner(Execution, ABC):
         key, execution, bucketed = selected
         captured = False
         if key not in self.buckets:
-            # Only configured text buckets may capture at run time; an exact
+            # Only configured buckets may capture at run time; an exact
             # signature without a resident graph simply runs eager.
             if not bucketed:
                 return replace(
@@ -373,28 +417,9 @@ class ModelRunner(Execution, ABC):
                         cuda_graph_runtime_mode_counts={"eager": 1}
                     ),
                 )
+            # No capture happens after startup, which captured every
+            # configured bucket.
             if self._startup_complete:
-                # No capture happens after startup. A missing decode bucket
-                # (``key[1]`` is the text shape; its last field is the
-                # decode flag), or a missing prefill bucket whose causality
-                # and selection match a configured ``PrefillShape``, is an
-                # error. Only prefill variants matching no configured shape
-                # run eagerly.
-                configured = key[1][-1] or any(
-                    shape.causal
-                    == next(
-                        iter(execution.inputs.attention.entries.values())
-                    ).causal[0]
-                    and shape.selection is execution.token_selections[0]
-                    for shape in self.prefill_shapes
-                )
-                if not configured:
-                    return replace(
-                        self.eager_batch(batch, forward),
-                        stats=ForwardStats(
-                            cuda_graph_runtime_mode_counts={"eager": 1}
-                        ),
-                    )
                 raise CUDAGraphError(
                     f"configured graph bucket is not resident: {key!r}"
                 )
@@ -409,19 +434,7 @@ class ModelRunner(Execution, ABC):
         bucket_tokens = execution.query_tokens
         assert live_tokens is not None and bucket_tokens is not None
 
-        result = replay_batch(
-            self.buckets[key].graphs[None],
-            execution,
-            rows=batch.row_count,
-            borrow=borrow_output,
-        )
-        # A decode bucket carries a force-finish column even for a batch
-        # staged without one (see ``TextRunner.select_graph_shape``), so its
-        # graph can return greedy continuations that such a batch did not
-        # request.
-        if batch.decode_force_finish is None:
-            result = replace(result, greedy=None)
-
+        result = self.replay_graph(key, execution, batch, borrow=borrow_output)
         return replace(
             result,
             stats=ForwardStats(

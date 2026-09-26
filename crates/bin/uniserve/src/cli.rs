@@ -497,10 +497,16 @@ pub(crate) struct WorkerProcessOptions {
     pub graph_policy: String,
     #[arg(long, hide = true)]
     pub decode_graph_batch_sizes: Option<String>,
-    #[arg(long, action = ArgAction::Set, default_value_t = false, hide = true)]
+    /// Replay a startup-captured CUDA graph for every prefill call
+    /// (default). `false` runs prefill eagerly, for debugging only.
+    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
     pub prefill_cuda_graph: bool,
     #[arg(long, hide = true)]
     pub prefill_graph_token_sizes: Option<String>,
+    /// Capture image denoising calls at the configured flow shapes and
+    /// replay those whose exact input signature was captured.
+    #[arg(long, action = ArgAction::Set, default_value_t = false, hide = true)]
+    pub flow_cuda_graph: bool,
     #[arg(long, hide = true)]
     pub flow_graph_batch_sizes: Option<String>,
     #[arg(long, hide = true)]
@@ -549,6 +555,7 @@ impl WorkerProcessOptions {
             decode_graph_batch_sizes: self.decode_graph_batch_sizes.clone(),
             prefill_cuda_graph: self.prefill_cuda_graph,
             prefill_graph_token_sizes: self.prefill_graph_token_sizes.clone(),
+            flow_cuda_graph: self.flow_cuda_graph,
             flow_graph_batch_sizes: self.flow_graph_batch_sizes.clone(),
             flow_graph_shapes: self.flow_graph_shapes.clone(),
             video_text_capacities: self.video_text_capacities.clone(),

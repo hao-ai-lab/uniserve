@@ -163,6 +163,8 @@ curl -s http://127.0.0.1:8000/v1/systemone \
 | `--readout-canvas` | `full` | System One canvas length: `full` is the checkpoint's canvas length; `compact` the smallest multiple of 16 tokens holding the answer scaffold |
 | `--diffusion-generation-config` | Checkpoint `generation_config.json` | DiffusionGemma block-diffusion sampling for every reply, as a JSON object that replaces any of `max_denoising_steps`, `entropy_bound`, `t_min`, `t_max`, `confidence_threshold`, and `stability_threshold` |
 
+On a GPU, startup captures CUDA graphs for decode steps and for prefill steps before the server reports ready, and serving replays them. Prefill graphs cover every step the scheduler forms: up to `--max-num-batched-tokens` prompt tokens (plus one image's feature tokens for models that read images) and up to 31 prompts, or `--max-running-requests` when smaller. The worker reports that prompt bound, and the scheduler never places more prompts in one prefill step. A prefill that no captured graph holds fails instead of running eagerly. Larger token budgets capture more graphs, so startup takes longer. `--graph-policy off` serves every call without graphs.
+
 For tensor-parallel execution, select one rank per participating GPU:
 
 ```bash

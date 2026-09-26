@@ -132,10 +132,14 @@ pub struct WorkerProcessArgs {
     pub graph_policy: String,
     /// Optional decode batch sizes selected for CUDA graph capture.
     pub decode_graph_batch_sizes: Option<String>,
-    /// Whether prefill execution may use captured CUDA graphs.
+    /// Whether every prefill call replays a CUDA graph captured at
+    /// startup; without it prefill runs eagerly, for debugging.
     pub prefill_cuda_graph: bool,
     /// Optional prefill token counts selected for CUDA graph capture.
     pub prefill_graph_token_sizes: Option<String>,
+    /// Whether image denoising calls capture and replay CUDA graphs at the
+    /// configured flow shapes.
+    pub flow_cuda_graph: bool,
     /// Optional diffusion batch sizes selected for CUDA graph capture.
     pub flow_graph_batch_sizes: Option<String>,
     /// Optional diffusion tensor shapes selected for CUDA graph capture.

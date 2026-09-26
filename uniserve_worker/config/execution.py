@@ -313,6 +313,17 @@ class WorkerConfig:
     ``block_size`` is resolved from the model's cache layers and attention
     kernels (``bootstrap.cache.resolve_page_size``) before the unit pool is
     planned.
+
+    Graphs: ``graph_policy`` ``"off"`` disables every graph. Otherwise decode
+    calls replay graphs of ``decode_graph_batch_sizes`` rows, and with
+    ``prefill_cuda_graph`` every prefill call on a CUDA device replays a
+    graph captured at startup over ``prefill_graph_token_sizes`` token
+    buckets; a prefill call no bucket holds then fails, and the worker
+    reports the rows its buckets hold so the engine never forms one. Turning
+    ``prefill_cuda_graph`` off runs prefill eagerly, for debugging.
+    ``flow_cuda_graph`` captures image denoising calls at the
+    ``flow_graph_shapes`` and ``flow_graph_batch_sizes`` combinations and
+    replays those whose exact input signature was captured.
     """
 
     device: str = "cpu"
@@ -349,10 +360,11 @@ class WorkerConfig:
     lanes: tuple[LaneConfig, ...] = ()
     graph_policy: str = "auto"
     decode_graph_batch_sizes: tuple[int, ...] = DEFAULT_DECODE_GRAPH_BATCH_SIZES
-    prefill_cuda_graph: bool = False
+    prefill_cuda_graph: bool = True
     prefill_graph_token_sizes: tuple[int, ...] = (
         DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
     )
+    flow_cuda_graph: bool = False
     flow_graph_batch_sizes: tuple[int, ...] = (1, 2, 3, 4)
     flow_graph_shapes: tuple[tuple[int, int], ...] = (
         (1152, 2048),
@@ -478,6 +490,7 @@ def worker_config_from_namespace(
             default=DEFAULT_DECODE_GRAPH_BATCH_SIZES,
         ),
         prefill_cuda_graph=bool(namespace.prefill_cuda_graph),
+        flow_cuda_graph=bool(getattr(namespace, "flow_cuda_graph", False)),
         prefill_graph_token_sizes=_parse_positive_int_csv(
             namespace.prefill_graph_token_sizes,
             default=DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS,
