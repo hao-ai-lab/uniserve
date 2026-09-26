@@ -1,9 +1,10 @@
 //! Internal chat messages, content parts, tools, and render options.
 //!
 //! The Chat Completions preprocessing converts API requests into these types.
-//! `HfChatRenderer` renders a [`ChatRequest`] into the prompt, and
-//! `Qwen3ChatOutputProcessor` reads its tool configuration to decide whether
-//! generated text is parsed for tool calls.
+//! `HfChatRenderer` renders a [`ChatRequest`] into the prompt, and the chat
+//! output processors (`Qwen3ChatOutputProcessor`, `Gemma4ChatOutputProcessor`)
+//! read its tool configuration to decide whether generated text is parsed for
+//! tool calls.
 
 pub use crate::profile::tools::Tool;
 use crate::serving::text::TextDecodeOptions;
@@ -479,8 +480,8 @@ impl ChatRequest {
     /// choice and tool list.
     ///
     /// `HfChatRenderer` passes the request's `tools` to the template only when
-    /// this holds, and `Qwen3ChatOutputProcessor::new` applies the same
-    /// condition to decide whether to parse tool calls.
+    /// this holds, and the chat output processors apply the same condition to
+    /// decide whether to parse tool calls.
     pub fn tool_parsing_enabled(&self) -> bool {
         matches!(self.tool_choice, ChatToolChoice::Auto) && !self.tools.is_empty()
     }

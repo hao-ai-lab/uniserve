@@ -1,21 +1,23 @@
 //! Streaming tool-call parsers and normalized tool descriptors.
 //!
 //! The chat output tool stage (`serving::chat::output`) feeds visible
-//! assistant text chunk by chunk to a [`ToolParser`], such as
-//! `Qwen3XmlToolParser` for Qwen3. The parser turns each chunk into an ordered
-//! sequence of plain text and `ToolCallDelta` updates, holding back bytes it
-//! cannot classify yet, such as a partial marker or an incomplete tool-call
-//! header.
+//! assistant text chunk by chunk to a [`ToolParser`]: `Qwen3XmlToolParser`
+//! for Qwen3 and `Gemma4ToolParser` for Gemma-4. The parser turns each chunk
+//! into an ordered sequence of plain text and `ToolCallDelta` updates, holding
+//! back bytes it cannot classify yet, such as a partial marker or an
+//! incomplete tool call.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #[macro_use]
 mod error;
+mod gemma4;
 mod json;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_utils;
 mod utils;
 
 pub use error::{Result, ToolParserError};
+pub use gemma4::Gemma4ToolParser;
 pub use json::Qwen3XmlToolParser;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -85,8 +87,10 @@ pub struct ToolCallDelta {
     /// Function name, present on the first update for one tool call.
     pub name: Option<String>,
     /// Arguments text contributed by this update. Concatenating every update
-    /// for one `tool_index` yields the arguments JSON exactly as the model
-    /// wrote it; the text is neither parsed as JSON nor normalized.
+    /// for one `tool_index` yields the call's arguments as JSON text.
+    /// `Qwen3XmlToolParser` forwards the JSON exactly as the model wrote it,
+    /// neither parsed nor normalized; `Gemma4ToolParser` translates Gemma-4's
+    /// native argument encoding into JSON.
     pub arguments: String,
 }
 
