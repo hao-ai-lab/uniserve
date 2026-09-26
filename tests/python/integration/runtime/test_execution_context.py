@@ -9,11 +9,17 @@ from dataclasses import replace
 import pytest
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from uniserve.cache import Config, mha
 from uniserve.model import TextSize
 from uniserve.nn import Linear, MergedColumnParallelLinear
-from uniserve.nn.attention import Attention, AttentionBatch, PagedInput
+from uniserve.nn.attention import (
+    Attention,
+    AttentionBatch,
+    DenseInput,
+    PagedInput,
+)
 from uniserve.quantization import Quantizer
 from uniserve.runtime import (
     CUDAGraph,
@@ -528,3 +534,96 @@ def test_contexts_sharing_scratch_replay_their_own_values():
                         outputs[rows][name], value, rtol=2**-7, atol=2**-10
                     )
     scratch.close()
+
+
+def _reference(query, key, value, allowed):
+    """Grouped-query attention over ``[tokens, heads, dim]`` with a mask."""
+    return (
+        F.scaled_dot_product_attention(
+            query.transpose(0, 1).unsqueeze(0),
+            key.transpose(0, 1).unsqueeze(0),
+            value.transpose(0, 1).unsqueeze(0),
+            attn_mask=allowed,
+            enable_gqa=True,
+        )
+        .squeeze(0)
+        .transpose(0, 1)
+    )
+
+
+@torch.inference_mode()
+def test_table_batches_plan_cached_layers_beside_cacheless_layers():
+    # A windowed and a full-attention layer read two cache tables of one
+    # unit pool; a layer without a cache table reads its own single-entry
+    # batch. Planning the table batch must leave that layer alone.
+    generator = torch.Generator().manual_seed(47)
+    windowed = Attention(2, 1, 4, cache_name="windowed", window=1)
+    full = Attention(2, 1, 8, cache_name="full")
+    dense = Attention(2, 2, 4)
+    module = nn.ModuleDict({"windowed": windowed, "full": full, "dense": dense})
+    config = Config(
+        {
+            "windowed": mha.Config(1, 4, (0,), torch.float32, window=1),
+            "full": mha.Config(1, 8, (0,), torch.float32),
+        }
+    )
+    with (
+        PrefixCache(config, num_units=4, block_size=2, device="cpu") as cache,
+        ExecutionContext(module, cache=cache, attention="torch") as context,
+    ):
+        context.prepare(TextSize(3, 1))
+        # The full rows are the widest: two-token full pages, four-token
+        # windowed pages, and disjoint units for the two groups' tables.
+        assert (cache.table("windowed"), cache.table("full")) == (0, 1)
+        first = PagedInput.from_blocks(
+            blocks=((1,),),
+            query_lengths=(3,),
+            prefix_lengths=(0,),
+            block_size=4,
+            causal=True,
+            device="cpu",
+        )
+        second = PagedInput.from_blocks(
+            blocks=((2, 3),),
+            query_lengths=(3,),
+            prefix_lengths=(0,),
+            block_size=2,
+            causal=True,
+            device="cpu",
+        )
+        batch = AttentionBatch(
+            {
+                0: first,
+                1: replace(
+                    second, queries=first.queries, prefixes=first.prefixes
+                ),
+            },
+            first.queries,
+        )
+        context.bind_attention(batch)
+
+        positions = torch.arange(3)
+        causal = positions[None] <= positions[:, None]
+        for layer, width, allowed in (
+            (windowed, 4, causal & (positions[None] >= positions[:, None] - 1)),
+            (full, 8, causal),
+        ):
+            query = torch.randn(3, 2, width, generator=generator)
+            key, value = (
+                torch.randn(3, 1, width, generator=generator) for _ in range(2)
+            )
+            out = torch.empty_like(query)
+            layer(query, key, value, batch, out=out)
+            torch.testing.assert_close(
+                out, _reference(query, key, value, allowed)
+            )
+
+        single = AttentionBatch.single(DenseInput(causal=False, mask=None))
+        context.bind_attention(single)
+        query = torch.randn(3, 2, 4, generator=generator)
+        key, value = (
+            torch.randn(3, 2, 4, generator=generator) for _ in range(2)
+        )
+        out = torch.empty_like(query)
+        dense(query, key, value, single, out=out)
+        torch.testing.assert_close(out, _reference(query, key, value, None))

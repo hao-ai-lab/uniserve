@@ -653,25 +653,38 @@ class ExecutionContext(Generic[SizeT]):
         return buffers
 
     def bind_attention(self, batch):
-        """Plan one call's attention metadata on every attention layer.
+        """Plan one call's attention metadata on the layers that read it.
 
-        ``batch`` is the call's ``AttentionBatch``; each layer plans its own
-        table's entry. Required before graph capture. In eager execution the
-        next call of each layer on ``batch`` uses these plans instead of
-        planning again; bind again after changing lengths in place. Exact
-        host lengths are read at most once for all layers and tables.
+        ``batch`` is the call's ``AttentionBatch``. A layer with a cache
+        table reads that table's entry, and a layer without one reads only a
+        single-entry batch; every other layer, such as a vision tower beside
+        a batch of several text cache tables, keeps its plans, and running it
+        on this batch fails in the layer. Required before graph capture. In
+        eager execution the next call of each planned layer on ``batch`` uses
+        these plans instead of planning again; bind again after changing
+        lengths in place. Exact host lengths are read at most once for all
+        layers and tables.
         """
         from .backends.attention._sequences import batch_host_lengths
 
         self._open()
         with self.activate():
+            readers = tuple(
+                binding
+                for binding in self._attention.values()
+                if (
+                    len(batch.entries) == 1
+                    if binding.table is None
+                    else binding.table in batch.entries
+                )
+            )
             mirrored = batch
             if any(
                 binding.reads_host_lengths(batch.entry(binding.table))
-                for binding in self._attention.values()
+                for binding in readers
             ):
                 mirrored = batch_host_lengths(batch)
-            for binding in self._attention.values():
+            for binding in readers:
                 binding.bind(mirrored, source=batch)
 
     @contextmanager
