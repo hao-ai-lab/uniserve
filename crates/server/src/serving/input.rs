@@ -248,13 +248,13 @@ impl TextPromptRequest {
 pub enum OutputProcessorPolicy {
     /// Raw visible text.
     None,
-    /// Qwen3 chat reasoning and tool-call parsing over decoded text, selected
-    /// for Qwen3 chat prompts (Qwen3 text prompts use `None`). The processor
-    /// parses `<think>` reasoning only when the server's `reasoning_parsing`
-    /// setting is on, and otherwise passes that text through as visible
-    /// text; it parses tool calls only when
+    /// Chat reasoning and tool-call parsing over decoded text, selected for
+    /// the chat prompts of Qwen3 and DiffusionGemma (their text prompts use
+    /// `None`). The processor parses reasoning only when the server's
+    /// `reasoning_parsing` setting is on, and otherwise passes that text
+    /// through as visible text; it parses tool calls only when
     /// `ChatRequest::tool_parsing_enabled` holds.
-    Qwen3(crate::serving::chat::Qwen3ChatOutputProcessor),
+    Chat(crate::serving::chat::ChatOutputProcessor),
     /// SenseNova reasoning and visible-answer filtering over committed text.
     SenseNova(crate::profile::omni::OutputFilterPolicy),
 }

@@ -22,6 +22,7 @@ use uniserve_engine::{
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
     FlashInferBackend, LaneConfig, TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
+use uniserve_server::profile::diffusion_gemma::DenoisingOverrides;
 use uniserve_server::serving::systemone::{CanvasMode, ReadoutLayout, ReadoutOptions};
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineSettings, HttpListenerMode, ImageFetchPolicy,
@@ -297,6 +298,17 @@ pub(crate) struct SharedRuntimeArgs {
     /// multiple of 16 tokens that holds the answer scaffold.
     #[arg(long = "readout-canvas", default_value = "full")]
     pub readout_canvas: CanvasMode,
+    /// Block-diffusion sampling of every reply a DiffusionGemma server
+    /// generates, as a JSON object that replaces any of the checkpoint's
+    /// `generation_config.json` values `max_denoising_steps`,
+    /// `entropy_bound`, `t_min`, `t_max`, `confidence_threshold`, and
+    /// `stability_threshold`.
+    #[arg(
+        long = "diffusion-generation-config",
+        value_parser = parse_json::<DenoisingOverrides>,
+        value_name = "JSON"
+    )]
+    pub diffusion_generation_config: Option<DenoisingOverrides>,
 }
 
 impl SharedRuntimeArgs {
@@ -429,6 +441,7 @@ impl SharedRuntimeArgs {
                 layout: self.readout_layout,
                 canvas: self.readout_canvas,
             },
+            diffusion_generation: self.diffusion_generation_config.unwrap_or_default(),
         }
     }
 }
@@ -553,8 +566,8 @@ impl WorkerProcessOptions {
 
 /// Parses a JSON command-line value into `T` for clap.
 ///
-/// The error text says "invalid JSON object" whatever `T` is; both callers
-/// parse values that must be objects.
+/// The error text says "invalid JSON object" whatever `T` is; every caller
+/// parses values that must be objects.
 fn parse_json<T: DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_str(value).map_err(|e| format!("invalid JSON object: {}", e.as_report()))
 }

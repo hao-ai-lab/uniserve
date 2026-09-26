@@ -29,7 +29,10 @@ use uniserve_core::{
     ImageGenerationConfig, ImageParams, RequestId, SamplingParams,
 };
 
-use crate::serving::chat::{ChatTemplateLoadOptions, HfChatRenderer, Qwen3ChatOutputProcessor};
+use crate::serving::chat::template::renderer::hf::MultimodalRenderInfo;
+use crate::serving::chat::{
+    ChatOutputProcessor, ChatTemplateLoadOptions, HfChatRenderer, Qwen3ChatOutputProcessor,
+};
 use crate::serving::input::{
     ModelEventIdentity, OutputDetail, OutputProcessorPolicy, PromptInput, ResponseOptions,
     TextPromptRequest,
@@ -186,7 +189,7 @@ pub struct InputProcessor {
     // Worker-advertised generation features and resource limits.
     pub(super) limits: GenerationLimits,
     sampling_controls: Vec<ServedSamplingControl>,
-    parse_reasoning: bool,
+    pub(super) parse_reasoning: bool,
     // Whether a Qwen3-family chat template instructs the tool-call format
     // `Qwen3XmlToolParser` reads; false for every other family.
     qwen3_tool_calls: bool,
@@ -306,6 +309,15 @@ impl ModelConfig {
                 .or(model.max_model_tokens)
                 .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN),
         );
+        // DiffusionGemma's template renders each image part itself, as one
+        // image token that preprocessing expands; the omni models replace
+        // image parts before rendering.
+        let multimodal = match &model.parameters {
+            ModelParameters::DiffusionGemma(profile) => tokenizer
+                .id_to_token(profile.tokens.image)
+                .map(|placeholder_token| MultimodalRenderInfo { placeholder_token }),
+            _ => None,
+        };
         let renderer = HfChatRenderer::load(
             &files,
             ChatTemplateLoadOptions {
@@ -316,7 +328,7 @@ impl ModelConfig {
                     .clone()
                     .unwrap_or_default(),
             },
-            None,
+            multimodal,
         )?;
         Ok((model, tokenizer, Some(renderer)))
     }
@@ -775,11 +787,10 @@ impl InputProcessor {
 
     /// Validates the prompt and requested modalities against the loaded model.
     ///
-    /// Every refusal is `ServeError::UnsupportedFeature`. DiffusionGemma chat generation is
-    /// refused as `block_diffusion_generation`: its block-diffusion preprocessing and engine
-    /// submission are not implemented. The final check asks the worker limits to cover the
-    /// features this request reaches; for SenseNova and Bagel these depend on the selected
-    /// modalities and on whether the request carries an input image.
+    /// Every refusal is `ServeError::UnsupportedFeature`. The final check asks the worker
+    /// limits to cover the features this request reaches; for SenseNova and Bagel these depend
+    /// on the selected modalities, and for them and DiffusionGemma on whether the request
+    /// carries an input image.
     fn validate_generation_features(
         &self,
         request_id: &crate::serving::ServeRequestId,
@@ -793,9 +804,6 @@ impl InputProcessor {
         };
         if matches!(self.config.parameters, ModelParameters::MiniMaxH3 { .. }) {
             return Err(reject("generation_endpoint"));
-        }
-        if matches!(self.config.parameters, ModelParameters::DiffusionGemma(_)) {
-            return Err(reject("block_diffusion_generation"));
         }
         if has_input_image && !self.supports_image_input() {
             return Err(reject("image_input"));
@@ -841,8 +849,18 @@ impl InputProcessor {
                 has_input_image,
                 modalities,
             ),
-            ModelParameters::MiniMaxH3 { .. } | ModelParameters::DiffusionGemma(_) => {
-                unreachable!("video and block-diffusion generation refused above")
+            // Block diffusion denoises canvases over a prompt whose images the
+            // vision encoder writes into it.
+            ModelParameters::DiffusionGemma(_) => {
+                GenerationFeatures::TOKEN_DENOISING
+                    | if has_input_image {
+                        GenerationFeatures::VISION_ENCODE
+                    } else {
+                        GenerationFeatures::empty()
+                    }
+            }
+            ModelParameters::MiniMaxH3 { .. } => {
+                unreachable!("video generation refused above")
             }
         };
         self.limits
@@ -929,6 +947,13 @@ impl InputProcessor {
         let has_input_image = !images.is_empty()
             || matches!(&prompt, PromptInput::Chat(chat) if chat.has_multimodal());
         self.validate_generation_features(&request_id, &prompt, has_input_image, modalities)?;
+        if matches!(self.config.parameters, ModelParameters::DiffusionGemma(_)) {
+            crate::serving::diffusion_gemma::refuse_token_sampling_controls(
+                &request_id,
+                &sampling,
+                &stop,
+            )?;
+        }
         let constraint = crate::serving::omni::generation_constraint(modalities);
 
         let mut generation = GenerationRequest {
@@ -998,11 +1023,23 @@ impl InputProcessor {
                         image_gen,
                         &mut generation,
                     )?,
-                    ModelParameters::MiniMaxH3 { .. } | ModelParameters::DiffusionGemma(_) => {
+                    ModelParameters::DiffusionGemma(profile) => self
+                        .preprocess_diffusion_gemma_input(
+                            profile,
+                            prompt,
+                            &images,
+                            &sampling,
+                            &mut generation,
+                            &mut decode,
+                        )?,
+                    ModelParameters::MiniMaxH3 { .. } => {
                         unreachable!("generation features checked above")
                     }
                 };
-                if matches!(self.config.parameters, ModelParameters::Qwen3) {
+                if matches!(
+                    self.config.parameters,
+                    ModelParameters::Qwen3 | ModelParameters::DiffusionGemma(_)
+                ) {
                     generation.validate()?;
                 } else {
                     crate::serving::omni::prepare_generation_resources(
@@ -1197,7 +1234,11 @@ impl InputProcessor {
                     .render(&chat_request)?;
                 let ids = self.tokenizer.encode(&rendered_text, false)?;
                 let skip = chat_request.decode_options.skip_special_tokens;
-                (ids, OutputProcessorPolicy::Qwen3(processor), skip)
+                (
+                    ids,
+                    OutputProcessorPolicy::Chat(ChatOutputProcessor::Qwen3(processor)),
+                    skip,
+                )
             }
         };
 
@@ -1305,7 +1346,7 @@ mod tests {
     use tempfile::TempDir;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-    use uniserve_core::{GenerationFeatures, GenerationLimits};
+    use uniserve_core::{CanvasSampling, GenerationFeatures, GenerationLimits};
 
     use crate::Config;
     use crate::profile::tokenizer::HuggingFaceTokenizer;
@@ -1318,7 +1359,8 @@ mod tests {
     /// Writes a checkpoint laid out as DiffusionGemma publishes it: a root
     /// transformers `config.json` whose `model_type` is `root_model_type`,
     /// beside a `DiffusionGemmaPipeline` diffusers index. The tokenizer maps
-    /// each ASCII character to one token and adds the Gemma control tokens.
+    /// each ASCII character to one token and adds the Gemma control tokens,
+    /// including the thought-channel delimiters its reasoning parser reads.
     fn indexed_checkpoint(root_model_type: &str) -> TempDir {
         let directory = tempfile::tempdir().unwrap();
         let mut vocab = Vocab::from_iter([("<unk>".to_owned(), 0_u32)]);
@@ -1341,6 +1383,8 @@ mod tests {
                 "<|image>",
                 "<|image|>",
                 "<image|>",
+                "<|channel>",
+                "<channel|>",
             ]
             .map(|token| AddedToken::from(token, true)),
         );
@@ -1449,13 +1493,14 @@ mod tests {
         );
     }
 
-    /// DiffusionGemma declares the System One readout and chat completions;
-    /// chat generation is refused until block diffusion is executed.
-    #[tokio::test]
-    async fn diffusion_gemma_declares_its_endpoints_and_refuses_chat_generation() {
-        let directory = indexed_checkpoint("diffusion_gemma");
-        let (model, tokenizer, renderer) = ModelConfig::load(&config(&directory)).await.unwrap();
-        let processor = InputProcessor::new(
+    /// Binds a DiffusionGemma checkpoint to a block-diffusion worker whose
+    /// context holds `max_model_tokens` tokens.
+    async fn diffusion_gemma_processor(
+        directory: &TempDir,
+        max_model_tokens: u32,
+    ) -> InputProcessor {
+        let (model, tokenizer, renderer) = ModelConfig::load(&config(directory)).await.unwrap();
+        InputProcessor::new(
             model,
             tokenizer,
             renderer,
@@ -1465,15 +1510,38 @@ mod tests {
                         | GenerationFeatures::VISION_ENCODE,
                     latent_downsample: 1,
                     max_cfg_branches: 1,
+                    max_vit_grid_tokens: 280,
+                    max_vision_feature_bytes: u64::MAX,
+                    encoder_cache_entries: u32::MAX,
                     ..Default::default()
                 },
                 sampling_controls: ServedSamplingControl::ALL.to_vec(),
-                max_model_tokens: 65_536,
+                max_model_tokens,
                 denoise_steps: 0,
             },
             true,
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn chat_request(fields: serde_json::Value) -> crate::openai::ChatCompletionRequest {
+        let mut request = json!({
+            "model": "diffusion-gemma",
+            "messages": [{"role": "user", "content": "Hello"}],
+        });
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        serde_json::from_value(request).unwrap()
+    }
+
+    /// DiffusionGemma declares the System One readout and chat completions,
+    /// with only the stopping controls of token sampling.
+    #[tokio::test]
+    async fn diffusion_gemma_declares_its_endpoints() {
+        let directory = indexed_checkpoint("diffusion_gemma");
+        let processor = diffusion_gemma_processor(&directory, 65_536).await;
 
         let support = processor.support();
         assert_eq!(
@@ -1501,18 +1569,193 @@ mod tests {
                 ServedSamplingControl::StopStrings
             ]
         );
+    }
 
-        let request = serde_json::from_value(json!({
-            "model": "diffusion-gemma",
-            "messages": [{"role": "user", "content": "Hello"}],
-        }))
-        .unwrap();
+    /// A chat request generates its reply in canvases under the checkpoint's
+    /// block-diffusion sampling, seeded by the request or, without a seed,
+    /// by a fresh random one, and truncated at `max_completion_tokens`.
+    #[tokio::test]
+    async fn a_diffusion_gemma_chat_reply_is_generated_in_canvases() {
+        let directory = indexed_checkpoint("diffusion_gemma");
+        let processor = diffusion_gemma_processor(&directory, 65_536).await;
+
+        let (generation, _) = processor
+            .preprocess_chat_request(
+                ServeRequestId::new("chat"),
+                chat_request(json!({
+                    "seed": 5,
+                    "max_completion_tokens": 300,
+                    "stop": ["END"],
+                })),
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            generation.canvas,
+            Some(CanvasSampling {
+                canvas_length: 256,
+                max_steps: 48,
+                entropy_bound: 0.1,
+                t_min: 0.4,
+                t_max: 0.8,
+                confidence_threshold: 0.005,
+                stability_threshold: 1,
+            })
+        );
+        assert_eq!(generation.sampling.seed, Some(5));
+        assert_eq!(generation.max_und_tokens, 300);
+        assert_eq!(generation.stop_strings, ["END"]);
+        let tokenizer =
+            HuggingFaceTokenizer::new(&directory.path().join("tokenizer.json")).unwrap();
+        assert_eq!(
+            generation.prompt_token_ids,
+            tokenizer.encode("<bos>Hello", false).unwrap()
+        );
+        assert!(generation.multimodal_inputs.images.is_empty());
+
+        let (unseeded, _) = processor
+            .preprocess_chat_request(
+                ServeRequestId::new("unseeded"),
+                chat_request(json!({})),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(unseeded.sampling.seed.is_some());
+        // The checkpoint's `max_new_tokens` is the default length.
+        assert_eq!(unseeded.max_und_tokens, 256);
+    }
+
+    /// A reply fills only whole canvases of the context the prompt leaves.
+    #[tokio::test]
+    async fn a_diffusion_gemma_reply_fits_whole_canvases_of_the_context() {
+        let directory = indexed_checkpoint("diffusion_gemma");
+        // `<bos>Hello` is six tokens, which leave 594 positions: two canvases.
+        let processor = diffusion_gemma_processor(&directory, 600).await;
+        let (generation, _) = processor
+            .preprocess_chat_request(
+                ServeRequestId::new("long"),
+                chat_request(json!({"max_completion_tokens": 1000})),
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(generation.max_und_tokens, 512);
+
+        let processor = diffusion_gemma_processor(&directory, 200).await;
         let error = processor
-            .preprocess_chat_request(ServeRequestId::new("chat"), request, Vec::new())
+            .preprocess_chat_request(
+                ServeRequestId::new("full"),
+                chat_request(json!({})),
+                Vec::new(),
+            )
             .err()
             .unwrap();
         assert_eq!(error.status_code().as_u16(), 400);
         let message = error.to_error_response().error.message;
-        assert!(message.contains("block_diffusion_generation"), "{message}");
+        assert!(message.contains("256-token canvas"), "{message}");
+    }
+
+    /// An image part renders as the image token and expands into the image's
+    /// soft-token run, where the engine writes the image's vision features.
+    #[tokio::test]
+    async fn a_diffusion_gemma_chat_image_enters_at_its_part() {
+        let directory = indexed_checkpoint("diffusion_gemma");
+        let processor = diffusion_gemma_processor(&directory, 65_536).await;
+        let mut png = Vec::new();
+        image::RgbImage::new(64, 48)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let image = crate::serving::ImageInput::from_bytes(png).unwrap();
+
+        let request = chat_request(json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                {"type": "text", "text": "What is this?"},
+            ]}],
+        }));
+        let (generation, _) = processor
+            .preprocess_chat_request(ServeRequestId::new("image"), request, vec![image])
+            .unwrap();
+
+        // The image's soft-token run leaves the prompt between `<|image>` and
+        // `<image|>`; the image enters there with one position and one KV
+        // entry per soft token, as many as the Gemma-4 processor sizes.
+        let tokenizer =
+            HuggingFaceTokenizer::new(&directory.path().join("tokenizer.json")).unwrap();
+        let image_start = tokenizer.token_to_id("<|image>").unwrap();
+        let [input] = generation.multimodal_inputs.images.as_slice() else {
+            panic!("{:?}", generation.multimodal_inputs.images);
+        };
+        let ModelParameters::DiffusionGemma(profile) = &processor.config().parameters else {
+            unreachable!("the checkpoint is DiffusionGemma");
+        };
+        let soft_tokens = profile.images.soft_tokens(64, 48).unwrap();
+        assert_eq!(input.num_positions, soft_tokens);
+        assert_eq!(input.encoders[0].num_kv_tokens, Some(soft_tokens));
+        let position = input.position as usize;
+        assert_eq!(generation.prompt_token_ids[position - 1], image_start);
+        assert_eq!(
+            generation.prompt_token_ids[position],
+            tokenizer.token_to_id("<image|>").unwrap()
+        );
+        assert!(
+            !generation
+                .prompt_token_ids
+                .contains(&tokenizer.token_to_id("<|image|>").unwrap())
+        );
+    }
+
+    /// Token-sampling controls and grammar constraints have no meaning for a
+    /// denoised canvas; each is refused with a 400 that names it. Grammar
+    /// constraints (`response_format` and guided decoding) have no field in
+    /// the chat schema, so the request body itself is refused, naming the
+    /// field.
+    #[tokio::test]
+    async fn diffusion_gemma_refuses_token_sampling_controls() {
+        for field in ["response_format", "guided_json", "structured_outputs"] {
+            let error = serde_json::from_value::<crate::openai::ChatCompletionRequest>(json!({
+                "model": "diffusion-gemma",
+                "messages": [{"role": "user", "content": "Hello"}],
+                field: {"type": "json_object"},
+            }))
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown field `{field}`")),
+                "{error}"
+            );
+        }
+
+        let directory = indexed_checkpoint("diffusion_gemma");
+        let processor = diffusion_gemma_processor(&directory, 65_536).await;
+        for (control, value) in [
+            ("temperature", json!(0.7)),
+            ("top_p", json!(0.9)),
+            ("top_k", json!(5)),
+            ("min_p", json!(0.1)),
+            ("frequency_penalty", json!(0.5)),
+            ("presence_penalty", json!(0.5)),
+            ("repetition_penalty", json!(1.1)),
+            ("logit_bias", json!({"5": 1.0})),
+            ("allowed_token_ids", json!([5])),
+            ("bad_words", json!(["x"])),
+            ("logprobs", json!(true)),
+            ("prompt_logprobs", json!(1)),
+            ("min_tokens", json!(3)),
+            ("ignore_eos", json!(true)),
+        ] {
+            let error = processor
+                .preprocess_chat_request(
+                    ServeRequestId::new("refused"),
+                    chat_request(json!({ control: value })),
+                    Vec::new(),
+                )
+                .err()
+                .unwrap();
+            assert_eq!(error.status_code().as_u16(), 400, "{control}");
+            let body = error.to_error_response().error;
+            assert_eq!(body.param.as_deref(), Some(control));
+            assert!(body.message.contains(control), "{}", body.message);
+        }
     }
 }

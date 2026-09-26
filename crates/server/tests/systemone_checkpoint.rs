@@ -18,11 +18,12 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::Value;
 use uniserve_server::profile::assets::ResolvedModelFiles;
+use uniserve_server::profile::diffusion_gemma::ImagePlacement;
 use uniserve_server::profile::tokenizer::HuggingFaceTokenizer;
 use uniserve_server::profile::{ModelConfig, ModelDescription, ModelParameters};
 use uniserve_server::serving::systemone::{
-    CanvasMode, ImagePlacement, ImageSize, ReadoutEncoder, ReadoutLayout, ReadoutOptions,
-    ReadoutPlan, SystemOneRequest,
+    CanvasMode, ImageSize, ReadoutEncoder, ReadoutLayout, ReadoutOptions, ReadoutPlan,
+    SystemOneRequest,
 };
 
 #[derive(Deserialize)]

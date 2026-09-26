@@ -42,9 +42,8 @@ mod vocabulary;
 pub use answer::{Answer, OrderedMap, SystemOneResponse, Usage};
 pub use error::{LocItem, SystemOneError, ValidationIssue};
 pub use plan::{
-    CanvasMode, CanvasRow, ImagePlacement, ImageSize, MAX_REQUEST_CONTEXT, MAX_STATE_AND_QUESTION,
-    ReadoutEncoder, ReadoutLayout, ReadoutOptions, ReadoutPlan, ReadoutPrompt, ReadoutSlot,
-    StartupError,
+    CanvasMode, CanvasRow, ImageSize, MAX_REQUEST_CONTEXT, MAX_STATE_AND_QUESTION, ReadoutEncoder,
+    ReadoutLayout, ReadoutOptions, ReadoutPlan, ReadoutPrompt, ReadoutSlot, StartupError,
 };
 pub use prompt::PROMPT_FORMAT;
 pub use request::{

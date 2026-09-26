@@ -113,6 +113,19 @@ impl crate::serving::InputProcessor {
             OutputDetail::VisibleText
         };
 
+        // Template kwargs may not replace the variables the renderer derives
+        // from the request itself.
+        let template_kwargs = request.chat_template_kwargs.unwrap_or_default();
+        if let Some(name) = crate::serving::chat::ChatOptions::RESERVED_TEMPLATE_KWARGS
+            .into_iter()
+            .find(|name| template_kwargs.contains_key(*name))
+        {
+            bail_invalid_request!(
+                param = "chat_template_kwargs",
+                "chat_template_kwargs may not set `{name}`, which the request itself determines."
+            );
+        }
+
         // Normalize public chat content and tool declarations into the serving
         // layer's closed prompt representation.
         let modalities = convert_modalities(&request.modalities);
@@ -128,6 +141,7 @@ impl crate::serving::InputProcessor {
             tool_choice: convert_tool_choice(request.tool_choice),
             chat_options: crate::serving::chat::ChatOptions {
                 reasoning_effort: request.reasoning_effort.map(convert_reasoning_effort),
+                template_kwargs,
                 ..Default::default()
             },
             decode_options: Default::default(),

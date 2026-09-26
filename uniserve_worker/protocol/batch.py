@@ -209,21 +209,25 @@ class CanvasSampling:
     stability_threshold: int
 
     def __post_init__(self) -> None:
-        """Require positive lengths, bounds and temperatures."""
+        """Require positive lengths and finite sampling values.
+
+        The sampler (``uniserve.diffusion.canvas.CanvasSampling``) checks
+        the values' domain when the worker runs the canvas.
+        """
         if self.canvas_length < 1 or self.max_steps < 1:
             raise invalid_descriptor(
                 "a canvas requires a positive length and step limit"
             )
         if not all(
-            math.isfinite(value) and value > 0
-            for value in (self.entropy_bound, self.t_min, self.t_max)
-        ) or not (
-            math.isfinite(self.confidence_threshold)
-            and self.confidence_threshold >= 0
-        ):
-            raise invalid_descriptor(
-                "canvas sampling bounds and temperatures are out of range"
+            math.isfinite(value)
+            for value in (
+                self.entropy_bound,
+                self.t_min,
+                self.t_max,
+                self.confidence_threshold,
             )
+        ):
+            raise invalid_descriptor("canvas sampling values are not finite")
         _nonnegative(self.stability_threshold, "canvas stability threshold")
 
     @classmethod

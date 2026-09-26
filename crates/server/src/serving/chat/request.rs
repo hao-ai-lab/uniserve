@@ -369,6 +369,13 @@ pub struct ChatOptions {
 
     /// Effort level exposed to chat templates for reasoning models.
     pub reasoning_effort: Option<ReasoningEffort>,
+
+    /// The request's own template variables, such as `enable_thinking`. They
+    /// replace the server's default template kwargs of the same name, and
+    /// never name a variable the renderer sets itself
+    /// ([`ChatOptions::RESERVED_TEMPLATE_KWARGS`]).
+    #[serde(default)]
+    pub template_kwargs: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl Default for ChatOptions {
@@ -377,11 +384,22 @@ impl Default for ChatOptions {
         Self {
             generation_prompt_mode: GenerationPromptMode::StartNewAssistant,
             reasoning_effort: None,
+            template_kwargs: std::collections::HashMap::new(),
         }
     }
 }
 
 impl ChatOptions {
+    /// Template variables the renderer sets from the request itself, which
+    /// request template kwargs cannot replace.
+    pub const RESERVED_TEMPLATE_KWARGS: [&'static str; 5] = [
+        "messages",
+        "tools",
+        "documents",
+        "add_generation_prompt",
+        "continue_final_message",
+    ];
+
     /// Returns whether to add a generation prompt for a new assistant turn after the
     /// existing chat history.
     pub fn add_generation_prompt(&self) -> bool {

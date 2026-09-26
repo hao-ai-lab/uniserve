@@ -88,9 +88,19 @@ fn special_token_ids(model: &ModelConfig) -> SpecialTokenIds {
 /// when the model description cannot be bound to the capabilities the engine
 /// reports.
 pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
-    let (model_config, tokenizer, renderer) = ModelConfig::load(config)
+    let (mut model_config, tokenizer, renderer) = ModelConfig::load(config)
         .await
         .with_context(|| format!("failed to resolve model assets for `{}`", config.model))?;
+    // The server's block-diffusion sampling replaces the checkpoint's
+    // defaults once, before any request is lowered.
+    if let ModelParameters::DiffusionGemma(profile) = &mut model_config.parameters {
+        profile.denoising = profile
+            .denoising
+            .with_overrides(&config.diffusion_generation)
+            .map_err(|message| {
+                anyhow::anyhow!("invalid --diffusion-generation-config: {message}")
+            })?;
+    }
     let runtime_family = model_config.runtime_family();
     let effective_max_model_len = model_config.max_model_tokens();
     let channel_payload_capacity = model_config.channel_payload_capacity();

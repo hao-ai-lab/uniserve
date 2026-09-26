@@ -135,20 +135,21 @@ pub struct CanvasSampling {
 }
 
 impl CanvasSampling {
-    /// Returns the first invalid parameter, if any.
+    /// Returns the first parameter the scheduler cannot plan with, if any:
+    /// an empty canvas or step limit, or a non-finite sampling value. The
+    /// worker's sampler checks the sampling values' domain itself.
     fn invalid_parameter(&self) -> Option<&'static str> {
-        let positive = |value: f32| value.is_finite() && value > 0.0;
         if self.canvas_length == 0 {
             Some("canvas_length")
         } else if self.max_steps == 0 {
             Some("max_steps")
-        } else if !positive(self.entropy_bound) {
+        } else if !self.entropy_bound.is_finite() {
             Some("entropy_bound")
-        } else if !positive(self.t_min) {
+        } else if !self.t_min.is_finite() {
             Some("t_min")
-        } else if !positive(self.t_max) {
+        } else if !self.t_max.is_finite() {
             Some("t_max")
-        } else if !(self.confidence_threshold.is_finite() && self.confidence_threshold >= 0.0) {
+        } else if !self.confidence_threshold.is_finite() {
             Some("confidence_threshold")
         } else {
             None
