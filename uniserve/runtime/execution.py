@@ -700,8 +700,10 @@ class ExecutionContext(Generic[SizeT]):
         attention selection also reports, under ``inputs``, the provider
         that served each input class the call site met. Call sites prepare
         and select lazily, so read this after the calls to report have run,
-        for example after warmup and graph capture. A closed context reports
-        nothing.
+        for example after warmup and graph capture; an attention call site
+        that prepares at its first call and has not been called reports one
+        record whose ``dtype`` and ``provider`` are None. A closed context
+        reports nothing.
         """
         module = self.module
         if module is None:
