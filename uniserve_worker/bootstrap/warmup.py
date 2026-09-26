@@ -1150,7 +1150,8 @@ def _warmup_canvas(requests: _WarmupRequests) -> None:
         t_min=0.4,
         t_max=0.8,
         confidence_threshold=0.005,
-        stability_threshold=min(1, slots.history_depth),
+        # The served stability, so warmup stages the history requests use.
+        stability_threshold=slots.history_depth,
     )
     admissions = tuple(
         NewRequest(

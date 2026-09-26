@@ -89,12 +89,17 @@ SLOT = 1
 REQUEST = RequestKey(0, 7, 1)
 
 
-def _worker(root):
+def _worker(root, **settings):
+    """A CPU worker serving the checkpoint at ``root``.
+
+    ``settings`` replace further ``WorkerConfig`` fields.
+    """
     loaded = models.read_config(root)
     config = replace(
         stub_worker_config(PAGE, max_batch_tokens=256),
         model_dtype="float32",
         max_sequence_tokens=128,
+        **settings,
     )
     return Worker(
         load_diffusion_gemma(root),
