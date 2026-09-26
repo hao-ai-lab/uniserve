@@ -187,6 +187,9 @@ pub struct InputProcessor {
     pub(super) limits: GenerationLimits,
     sampling_controls: Vec<ServedSamplingControl>,
     parse_reasoning: bool,
+    // Whether a Qwen3-family chat template instructs the tool-call format
+    // `Qwen3XmlToolParser` reads; false for every other family.
+    qwen3_tool_calls: bool,
 }
 
 #[derive(Debug, Error)]
@@ -483,6 +486,15 @@ impl InputProcessor {
                 ModelResolutionError::MissingTemplate,
             ));
         }
+        // A Qwen3-family checkpoint serves tool calls only when its template
+        // asks for the format the Qwen3 parser reads; otherwise requests with
+        // tools are refused rather than returned with unparsed calls.
+        let qwen3_tool_calls = match (&config.parameters, &renderer) {
+            (ModelParameters::Qwen3, Some(renderer)) => {
+                crate::serving::chat::output::template_instructs_json_tool_calls(renderer)
+            }
+            _ => false,
+        };
         // Bind the actual worker ceilings once before sharing immutable model facts.
         config.max_model_tokens = Some(max_model_tokens);
         if let ModelParameters::MiniMaxH3 {
@@ -512,6 +524,7 @@ impl InputProcessor {
             limits,
             sampling_controls,
             parse_reasoning,
+            qwen3_tool_calls,
         })
     }
 
@@ -746,7 +759,9 @@ impl InputProcessor {
         match &self.config.parameters {
             ModelParameters::Qwen3 => {
                 features.push(ServedFeature::Reasoning);
-                features.push(ServedFeature::ToolCalling);
+                if self.qwen3_tool_calls {
+                    features.push(ServedFeature::ToolCalling);
+                }
             }
             ModelParameters::SenseNova(_) => {
                 endpoints.push(ServedEndpoint::ImageGenerations);
