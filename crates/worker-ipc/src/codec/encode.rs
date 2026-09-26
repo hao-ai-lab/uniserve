@@ -234,6 +234,20 @@ fn ar<'a>(
     let sampling = Some(sampling(b, &v.sampling));
     let negative_token_ids = Some(b.create_vector(&v.negative_token_ids));
     let finish_token_ids = Some(b.create_vector(&v.finish_token_ids));
+    let canvas = v.canvas.as_ref().map(|canvas| {
+        fbs::CanvasSampling::create(
+            b,
+            &fbs::CanvasSamplingArgs {
+                canvas_length: canvas.canvas_length,
+                max_steps: canvas.max_steps,
+                entropy_bound: canvas.entropy_bound,
+                t_min: canvas.t_min,
+                t_max: canvas.t_max,
+                confidence_threshold: canvas.confidence_threshold,
+                stability_threshold: canvas.stability_threshold,
+            },
+        )
+    });
     fbs::ArRequestParams::create(
         b,
         &fbs::ArRequestParamsArgs {
@@ -241,6 +255,7 @@ fn ar<'a>(
             negative_token_ids,
             finish_token_ids,
             initial_position: v.initial_position,
+            canvas,
         },
     )
 }
@@ -437,6 +452,15 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
     let kv_output = v.kv_output.as_ref().map(|value| buffer_id(b, value));
     let consumer_slots = Some(b.create_vector(&v.consumer_slots));
     let readout = v.readout.as_ref().map(|value| readout(b, value));
+    let canvas = v.canvas.as_ref().map(|value| {
+        fbs::CanvasStep::create(
+            b,
+            &fbs::CanvasStepArgs {
+                block: value.block,
+                step: value.step,
+            },
+        )
+    });
 
     fbs::Call::create(
         b,
@@ -473,6 +497,7 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
             kv_output,
             consumer_slots,
             readout,
+            canvas,
         },
     )
 }

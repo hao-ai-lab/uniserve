@@ -61,6 +61,22 @@ impl Scheduler {
             });
             return;
         }
+        // A canvas step and a block commit each spend a whole canvas of one
+        // scheduling step's token budget.
+        if let Some(canvas) = req
+            .canvas
+            .as_ref()
+            .filter(|canvas| canvas.canvas_length as usize > self.config.max_num_batched_tokens)
+        {
+            let _ = event_tx.send(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
+                message: format!(
+                    "a {}-token generation canvas exceeds the {}-token step budget",
+                    canvas.canvas_length, self.config.max_num_batched_tokens
+                ),
+            });
+            return;
+        }
         if let Some(feature) = self.missing_required_feature(&req) {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
                 kind: RejectionKind::Invalid,
@@ -149,6 +165,9 @@ impl Scheduler {
             transient_encoder_products: Vec::new(),
             readout_rows: 0,
             readout_logprobs: Vec::with_capacity(req.readout_candidates()),
+            canvas_block: 0,
+            canvas_step: 0,
+            canvas_commit: Vec::new(),
             output: RequestOutput::new(event_tx),
             queued_at: now(),
             terminal_intent: super::TerminalIntent::None,

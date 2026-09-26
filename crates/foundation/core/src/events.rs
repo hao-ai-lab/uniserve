@@ -81,6 +81,13 @@ pub enum EngineCoreOutput {
         /// Token log probability when requested.
         logprob: Option<f32>,
     },
+    /// Publishes generated text tokens committed together, in order, such as
+    /// a stopped block-diffusion canvas; they carry no log probabilities.
+    /// Consumers treat them as consecutive `TextToken`s.
+    TextTokens {
+        /// Vocabulary token identities.
+        ids: Vec<u32>,
+    },
     /// Publishes ranked candidates associated with a text token.
     TokenLogprobs {
         /// Generated token identity this payload scores.

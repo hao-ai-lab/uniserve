@@ -462,6 +462,23 @@ impl CallCoordinates {
     }
 }
 
+/// One denoising step of a block-diffusion request's resident canvas.
+///
+/// The request's admitted `ArRequestParams::canvas` fixes the sampling; the
+/// worker holds the canvas, its self-conditioning input and its stopping
+/// history in the request's slot. `block` counts the blocks already
+/// committed to the request's context and `step` the steps already run on
+/// this canvas; step zero starts the canvas from random tokens. The step
+/// that stops the canvas, by convergence or by reaching the admitted step
+/// limit, reports the canvas's argmax tokens as its committed tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CanvasStep {
+    /// Blocks committed to the request's context before this canvas.
+    pub block: u32,
+    /// Denoising steps already run on this canvas.
+    pub step: u32,
+}
+
 /// Candidate log-probabilities a token-denoising call reads at canvas slots.
 ///
 /// The call's `input_token_ids` hold its canvas rows back to back. Slot `i`
@@ -591,6 +608,9 @@ pub struct Call {
     /// Candidate slots a token-denoising readout reports; absent for every
     /// other call.
     pub readout: Option<Readout>,
+    /// The step a token-denoising call runs on its request's generation
+    /// canvas; absent for every other call.
+    pub canvas: Option<CanvasStep>,
     /// Encoded source image in base64, consumed by a vision or latent encoder.
     /// Dispatch and in-flight matching share these immutable bytes.
     pub input_image: Option<std::sync::Arc<str>>,
@@ -733,21 +753,32 @@ impl Call {
             );
         }
 
-        // A token-denoising call reads candidate log-probabilities at slots
-        // of the canvas rows it carries, and produces no sampled token.
+        // A token-denoising call either reads candidate log-probabilities at
+        // slots of the canvas rows it carries, or runs one step of its
+        // request's resident generation canvas of `max_tokens` tokens. Either
+        // way it produces no sampled token output.
         let denoises = self.code == CallKind::Forward(ForwardMode::TokenDenoising);
         ensure_valid!(
-            self.readout.is_some() == denoises,
-            "a candidate readout belongs exactly to a token-denoising call"
+            u8::from(self.readout.is_some()) + u8::from(self.canvas.is_some())
+                == u8::from(denoises),
+            "a token-denoising call carries exactly one readout or canvas step"
+        );
+        ensure_valid!(
+            !denoises || (self.token_output.is_none() && self.transition_output.is_none()),
+            "token denoising samples no token output"
         );
         if let Some(readout) = &self.readout {
             ensure_valid!(
-                !self.input_token_ids.is_empty()
-                    && self.token_output.is_none()
-                    && self.transition_output.is_none(),
-                "token denoising requires canvas tokens and samples no token"
+                !self.input_token_ids.is_empty(),
+                "a readout requires canvas tokens"
             );
             readout.validate(self.input_token_ids.len())?;
+        }
+        if self.canvas.is_some() {
+            ensure_valid!(
+                self.input_token_ids.is_empty() && self.bounds.max_tokens > 0,
+                "a canvas step denoises its resident canvas of max_tokens tokens"
+            );
         }
 
         // Every output must be uniquely owned by this producer and fit the
@@ -1146,9 +1177,12 @@ pub struct ArRequestParams {
     pub finish_token_ids: Vec<u32>,
     /// Logical position assigned to the first request token.
     pub initial_position: u32,
+    /// Block-diffusion sampling of a request that generates its text in
+    /// canvases; its seed is `sampling.seed`.
+    pub canvas: Option<CanvasSampling>,
 }
 
-pub use uniserve_core::DiffusionSamplingParams;
+pub use uniserve_core::{CanvasSampling, DiffusionSamplingParams};
 
 /// Request-start framing. Carries the per-domain parameters a request
 /// needs before its calls run.

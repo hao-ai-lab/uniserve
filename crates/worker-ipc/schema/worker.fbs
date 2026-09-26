@@ -293,6 +293,13 @@ table SamplingState {
   force_finish:bool;
 }
 
+/// One denoising step of a block-diffusion request's resident canvas,
+/// decoded into `CanvasStep`.
+table CanvasStep {
+  block:uint;
+  step:uint;
+}
+
 /// Candidate slots of a token-denoising readout, decoded into `Readout`.
 /// Slot `i` is canvas token `slot_tokens[i]` of the call's `input_token_ids`
 /// and reads `candidate_ids[candidate_offsets[i]..candidate_offsets[i + 1]]`.
@@ -363,6 +370,7 @@ table Call {
   /// Present exactly on a token-denoising call, whose `input_token_ids` hold
   /// its canvas rows back to back.
   readout:Readout;
+  canvas:CanvasStep;
 }
 
 /// Units of logical pages `start_page..` of one request slot and cache group,
@@ -488,11 +496,24 @@ table BatchCommandEnvelope { command:BatchCommand; }
 
 // Static request admission and physical run binding.
 
+/// Block-diffusion sampling of a canvas-generating request, decoded into
+/// `CanvasSampling`.
+table CanvasSampling {
+  canvas_length:uint;
+  max_steps:uint;
+  entropy_bound:float;
+  t_min:float;
+  t_max:float;
+  confidence_threshold:float;
+  stability_threshold:uint;
+}
+
 table ArRequestParams {
   sampling:SamplingParams;
   negative_token_ids:[uint];
   finish_token_ids:[uint];
   initial_position:uint;
+  canvas:CanvasSampling;
 }
 
 table DiffusionSamplingParams {

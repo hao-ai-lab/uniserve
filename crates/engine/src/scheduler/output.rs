@@ -15,6 +15,19 @@
 use super::*;
 use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
 
+/// How one understanding token ends or continues its request
+/// (`Scheduler::und_token_outcome`).
+enum TokenOutcome {
+    /// The token is ordinary output.
+    Continue,
+    /// The token is one of the request's stop tokens, published only with
+    /// `include_stop_token`.
+    StopToken,
+    /// The token ends the request by EOS or the token limit; it is published
+    /// unless it is an EOS token.
+    Finish(FinishReason),
+}
+
 /// Flushes journaled public events into the output channel in order.
 ///
 /// Returns `true` only when the receiver has closed, in which case the journal
@@ -381,8 +394,9 @@ impl Scheduler {
                         }
 
                         // Ingesting the last image of a fully consumed prompt
-                        // starts a readout's canvases, or understanding decode
-                        // from BOS.
+                        // starts a readout's canvases, a canvas-generating
+                        // request's first block, or understanding decode from
+                        // BOS.
                         if is_final_step
                             && self.running.get(&id).is_some_and(|st| {
                                 st.num_ingested_images >= st.req.multimodal_inputs.images.len()
@@ -394,6 +408,8 @@ impl Scheduler {
                             if let Some(st) = self.running.get_mut(&id) {
                                 if st.req.is_readout() {
                                     st.phase = Phase::Readout;
+                                } else if st.req.is_canvas_generation() {
+                                    st.phase = Phase::Canvas;
                                 } else {
                                     st.next_token = bos;
                                     st.round_token_ids.clear();
@@ -516,11 +532,17 @@ impl Scheduler {
                 }
 
                 // A readout's complete prompt samples nothing; its canvases
-                // follow.
+                // follow. So does a canvas-generating request's, and each of
+                // its block commits, which extend the context the same way;
+                // the next block follows.
                 if let Some(st) = self.running.get_mut(&id)
-                    && st.req.is_readout()
+                    && (st.req.is_readout() || st.req.is_canvas_generation())
                 {
-                    st.phase = Phase::Readout;
+                    st.phase = if st.req.is_readout() {
+                        Phase::Readout
+                    } else {
+                        Phase::Canvas
+                    };
                     return;
                 }
 
@@ -605,6 +627,16 @@ impl Scheduler {
                 {
                     self.begin_image(id);
                 }
+            }
+            // A canvas step that stopped its block left the block's tokens
+            // for their commit; they are published first, in order, and the
+            // request finishes on the first that ends it.
+            CallKind::Forward(ForwardMode::TokenDenoising) if call.canvas.is_some() => {
+                let tokens = match self.running.get(&id) {
+                    Some(st) if st.phase == Phase::CommitCanvas => st.canvas_commit.clone(),
+                    _ => return,
+                };
+                self.emit_or_finish_block(id, &tokens);
             }
             CallKind::Forward(ForwardMode::TokenDenoising) => {
                 // `process_generation_result` accepted the pass's rows and
@@ -1072,6 +1104,101 @@ impl Scheduler {
         true
     }
 
+    /// Records accepted text tokens and publishes them as one event when the
+    /// request emits text.
+    ///
+    /// A running request always records the tokens in `generated_token_ids`.
+    /// `tokens_sent` advances only when the event was accepted.
+    pub(super) fn emit_text_tokens(&mut self, id: RequestId, tokens: Vec<u32>) {
+        let Some(st) = self.running.get_mut(&id) else {
+            return;
+        };
+        st.generated_token_ids.extend_from_slice(&tokens);
+        st.text_tokens_since_image = st.text_tokens_since_image.saturating_add(tokens.len());
+        if !st.req.emits_text() || tokens.is_empty() {
+            return;
+        }
+        let count = tokens.len();
+        let published = self.emit(id, EngineCoreOutput::TextTokens { ids: tokens });
+        if published && let Some(state) = self.running.get_mut(&id) {
+            state.output.tokens_sent = state.output.tokens_sent.saturating_add(count);
+        }
+    }
+
+    /// Resolves the stop conditions of a stopped canvas block's tokens in
+    /// order and publishes the visible ones as one event.
+    ///
+    /// Every token counts toward `num_generated_tokens` and is resolved as
+    /// `emit_or_finish_und_token` resolves a sampled token: the first token
+    /// that ends the request (a stop token, EOS, or the token limit) closes
+    /// the block, which is published up to it, and the request finishes after
+    /// its in-flight work. Tokens after it are never generated output.
+    pub(super) fn emit_or_finish_block(&mut self, id: RequestId, tokens: &[u32]) {
+        let mut visible = Vec::with_capacity(tokens.len());
+        let mut finish = None;
+        for &token_id in tokens {
+            let Some(state) = self.running.get_mut(&id) else {
+                return;
+            };
+            state.num_generated_tokens += 1;
+            match self.und_token_outcome(id, token_id) {
+                TokenOutcome::Continue => visible.push(token_id),
+                TokenOutcome::StopToken => {
+                    if self
+                        .running
+                        .get(&id)
+                        .is_some_and(|state| state.req.include_stop_token)
+                    {
+                        visible.push(token_id);
+                    }
+                    finish = Some((
+                        FinishReason::Stop,
+                        Some(uniserve_core::StopReason::Token(token_id)),
+                    ));
+                    break;
+                }
+                TokenOutcome::Finish(reason) => {
+                    if !self.ctrl.eos.contains(&token_id) {
+                        visible.push(token_id);
+                    }
+                    finish = Some((reason, None));
+                    break;
+                }
+            }
+        }
+        self.emit_text_tokens(id, visible);
+        if let Some((reason, stop_reason)) = finish {
+            self.finish_after_inflight(id, reason, stop_reason);
+        }
+    }
+
+    /// Decides how one understanding token, already counted in
+    /// `num_generated_tokens`, ends or continues its request.
+    ///
+    /// Stop tokens and EOS are honored only once at least `min_tokens` tokens
+    /// precede the token; the token limit applies regardless of that floor,
+    /// and a stop-token match takes precedence over EOS and the limit. A
+    /// request that is not running continues, and its caller finds it gone.
+    fn und_token_outcome(&self, id: RequestId, token_id: u32) -> TokenOutcome {
+        let Some(state) = self.running.get(&id) else {
+            return TokenOutcome::Continue;
+        };
+        let generated = state.num_generated_tokens;
+        let under_floor = generated <= state.req.sampling.min_tokens;
+        if !under_floor && state.req.stop_token_ids.contains(&token_id) {
+            TokenOutcome::StopToken
+        } else if generated >= state.req.max_und_tokens {
+            TokenOutcome::Finish(FinishReason::MaxTokens)
+        } else if self.ctrl.eos.contains(&token_id)
+            && !state.req.sampling.ignore_eos
+            && !under_floor
+        {
+            TokenOutcome::Finish(FinishReason::Eos)
+        } else {
+            TokenOutcome::Continue
+        }
+    }
+
     /// Emits one visible token and its requested candidate log probabilities.
     pub(super) fn emit_sampled_text(
         &mut self,
@@ -1128,46 +1255,31 @@ impl Scheduler {
         top_logprobs: Option<Vec<TokenLogprob>>,
         sampled: bool,
     ) -> bool {
-        let Some(state) = self.running.get(&id) else {
-            return true;
-        };
-        // `num_generated_tokens` already counts the token being resolved, so
-        // stop tokens and EOS are honored only once at least `min_tokens`
-        // tokens precede it. The token limit applies regardless of the floor.
-        let generated = state.num_generated_tokens;
-        let under_floor = generated <= state.req.sampling.min_tokens;
-        let stop_hit = !under_floor && state.req.stop_token_ids.contains(&token_id);
-        let eos_hit =
-            self.ctrl.eos.contains(&token_id) && !state.req.sampling.ignore_eos && !under_floor;
-        let max_hit = generated >= state.req.max_und_tokens;
-
-        if stop_hit {
-            self.emit_terminal_stop_token(id, token_id, logprob, top_logprobs);
-            self.finish_after_inflight(
-                id,
-                FinishReason::Stop,
-                Some(uniserve_core::StopReason::Token(token_id)),
-            );
+        if !self.running.contains_key(&id) {
             return true;
         }
-        if eos_hit || max_hit {
-            if !self.ctrl.eos.contains(&token_id) {
-                if sampled {
-                    self.emit_sampled_text(id, token_id, logprob, top_logprobs);
-                } else {
-                    self.emit_text(id, token_id, logprob);
-                }
+        match self.und_token_outcome(id, token_id) {
+            TokenOutcome::StopToken => {
+                self.emit_terminal_stop_token(id, token_id, logprob, top_logprobs);
+                self.finish_after_inflight(
+                    id,
+                    FinishReason::Stop,
+                    Some(uniserve_core::StopReason::Token(token_id)),
+                );
+                return true;
             }
-            self.finish_after_inflight(
-                id,
-                if max_hit {
-                    FinishReason::MaxTokens
-                } else {
-                    FinishReason::Eos
-                },
-                None,
-            );
-            return true;
+            TokenOutcome::Finish(reason) => {
+                if !self.ctrl.eos.contains(&token_id) {
+                    if sampled {
+                        self.emit_sampled_text(id, token_id, logprob, top_logprobs);
+                    } else {
+                        self.emit_text(id, token_id, logprob);
+                    }
+                }
+                self.finish_after_inflight(id, reason, None);
+                return true;
+            }
+            TokenOutcome::Continue => {}
         }
         if sampled {
             self.emit_sampled_text(id, token_id, logprob, top_logprobs);

@@ -55,6 +55,7 @@ fn ar_decode_call() -> Call {
         kv_output: None,
         input_token_ids: Vec::new(),
         readout: None,
+        canvas: None,
         sampling_state: None,
         request_key: request_key(),
         call_id: CallId::new(11, 0),
@@ -128,6 +129,7 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
             Vec::new()
         },
         readout: denoises.then(readout),
+        canvas: None,
         sampling_state: None,
         request_key: request_key(),
         call_id,
@@ -196,6 +198,7 @@ fn admission() -> NewRequest {
             negative_token_ids: Vec::new(),
             finish_token_ids: vec![2, 7],
             initial_position: 0,
+            canvas: None,
         }),
         None,
         3,
@@ -461,6 +464,87 @@ fn a_readout_must_address_the_canvas_of_a_token_denoising_call() {
     }
 }
 
+/// A canvas step of a block-diffusion request whose admission names its
+/// canvas sampling.
+fn canvas_step_batch() -> Batch {
+    let call_id = CallId::new(6, 0);
+    let mut call = call_for(CallKind::Forward(ForwardMode::TokenDenoising), call_id);
+    call.readout = None;
+    call.input_token_ids.clear();
+    call.bounds.max_tokens = 256;
+    call.canvas = Some(CanvasStep { block: 2, step: 5 });
+    let admission = NewRequest::new(
+        request_key(),
+        u32::try_from(request_key().request_id.0).unwrap(),
+        Some(ArRequestParams {
+            sampling: SamplingParams {
+                seed: Some(11),
+                ..SamplingParams::default()
+            },
+            negative_token_ids: Vec::new(),
+            finish_token_ids: vec![1, 50, 106],
+            initial_position: 0,
+            canvas: Some(CanvasSampling {
+                canvas_length: 256,
+                max_steps: 48,
+                entropy_bound: 0.1,
+                t_min: 0.4,
+                t_max: 0.8,
+                confidence_threshold: 0.005,
+                stability_threshold: 1,
+            }),
+        }),
+        None,
+        0,
+    )
+    .unwrap();
+    batch_with_calls(6, vec![admission], vec![call])
+}
+
+/// A canvas step reaches the rank with its block and step and its request's
+/// admitted sampling, and its completion returns the stopped block's tokens.
+#[test]
+fn a_canvas_step_its_sampling_and_its_block_round_trip() {
+    let batch = canvas_step_batch();
+    assert_eq!(execute_round_trip(batch.clone()), batch);
+
+    let mut record = completion_record();
+    record.call_id = CallId::new(6, 0);
+    record.code = CallKind::Forward(ForwardMode::TokenDenoising);
+    record.sampled_logprob = None;
+    record.top_logprobs.clear();
+    record.prompt_logprobs.clear();
+    record.product_generations.clear();
+    record.committed_tokens = (0..256).collect();
+    let report = lane_report(6, vec![record], Vec::new(), None, None);
+    let decoded =
+        decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
+            .unwrap();
+    assert_eq!(decoded.report().unwrap(), &report);
+}
+
+/// A canvas step belongs to a token-denoising call, which carries either a
+/// readout or a canvas step, and denoises its resident canvas without input
+/// tokens.
+#[test]
+fn a_canvas_step_is_a_token_denoising_call_without_input_tokens() {
+    let valid = canvas_step_batch().calls().next().unwrap().clone();
+    assert!(valid.validate().is_ok());
+
+    let mut misplaced = call_for(CallKind::Forward(ForwardMode::Prefill), valid.call_id);
+    misplaced.canvas = valid.canvas;
+    let mut both = valid.clone();
+    both.readout = Some(readout());
+    both.input_token_ids = vec![4, 9, 4, 1];
+    let mut with_tokens = valid.clone();
+    with_tokens.input_token_ids = vec![1; 256];
+    let mut empty = valid.clone();
+    empty.bounds.max_tokens = 0;
+    for call in [misplaced, both, with_tokens, empty] {
+        assert!(call.validate().is_err(), "{:?}", call.canvas);
+    }
+}
+
 /// Only a successful token-denoising completion reports candidate
 /// log-probabilities.
 #[test]
@@ -643,6 +727,7 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             kv_output: None,
             input_token_ids: Vec::new(),
             readout: None,
+            canvas: None,
             sampling_state: None,
             request_key: request_key(),
             call_id: CallId::new(56 + index as u64, 0),
@@ -1528,6 +1613,7 @@ fn comprehensive_batches() -> Vec<Batch> {
             negative_token_ids: vec![100, 101],
             finish_token_ids: vec![2, 7],
             initial_position: 128,
+            canvas: None,
         }),
         None,
         0,
@@ -1580,6 +1666,7 @@ fn comprehensive_batches() -> Vec<Batch> {
                 Vec::new()
             },
             readout: (kind == CallKind::Forward(ForwardMode::TokenDenoising)).then(readout),
+            canvas: None,
             sampling_state: None,
             request_key: key,
             call_id,

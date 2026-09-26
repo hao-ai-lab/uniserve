@@ -407,6 +407,9 @@ struct SimRequestState {
     /// admission root: the call a later chained call follows, as a rank
     /// derives it from its own request state.
     state_call_id: uniserve_worker_ipc::CallId,
+    /// The generation canvas step the request's next canvas call must run:
+    /// blocks stopped so far and steps run on the current block.
+    canvas: uniserve_worker_ipc::CanvasStep,
 }
 
 impl SimRequestState {
@@ -433,6 +436,7 @@ impl SimRequestState {
             predicate_values: HashMap::new(),
             penalty_counts: BTreeMap::new(),
             state_call_id: uniserve_worker_ipc::CallId::new(0, 0),
+            canvas: uniserve_worker_ipc::CanvasStep::default(),
         }
     }
 
@@ -523,7 +527,7 @@ impl SimEngine {
         let natural = if index >= text_len {
             fake_eos
         } else {
-            1_000 + ((request_id.0 as u32 * 7 + index as u32) % 5_000)
+            sim_text_token(request_id, index)
         };
         logits[natural as usize] = 10.0;
         let alternate_one = 1_000 + ((request_id.0 as u32 * 13 + index as u32 + 1) % 5_000);
@@ -824,7 +828,49 @@ impl SimEngine {
             }
             CallKind::Forward(ForwardMode::TokenDenoising) => {
                 // A canvas pass reads KV without writing it and reports one
-                // deterministic log-probability per readout candidate.
+                // deterministic log-probability per readout candidate, or runs
+                // one step of the request's generation canvas.
+                if let Some(step) = call.canvas {
+                    anyhow::ensure!(
+                        step == request.canvas,
+                        "canvas call {:?} runs {step:?}, but the request's canvas is at {:?}",
+                        call.call_id,
+                        request.canvas
+                    );
+                    let max_steps = request
+                        .admission
+                        .ar
+                        .as_ref()
+                        .and_then(|branch| branch.canvas.as_ref())
+                        .map(|canvas| canvas.max_steps)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "canvas call for a request admitted without canvas sampling"
+                            )
+                        })?;
+                    let request_id = call.request_key.request_id;
+                    if step.step < sim_canvas_stop_step(request_id, step.block, max_steps) {
+                        request.canvas.step += 1;
+                    } else {
+                        // The stopped block holds the synthetic text from its
+                        // first position on, and EOS past the text's end.
+                        let length = call.bounds.max_tokens as usize;
+                        let first = step.block as usize * length;
+                        record.committed_tokens = (first..first + length)
+                            .map(|index| {
+                                if index < text_len {
+                                    sim_text_token(request_id, index)
+                                } else {
+                                    fake_eos
+                                }
+                            })
+                            .collect();
+                        request.canvas = uniserve_worker_ipc::CanvasStep {
+                            block: step.block + 1,
+                            step: 0,
+                        };
+                    }
+                }
                 if let Some(readout) = &call.readout {
                     record.candidate_logprobs = readout
                         .candidate_ids
@@ -1021,6 +1067,18 @@ impl SimEngine {
     pub fn mut_info_for_test(&mut self) -> &mut WorkerInfo {
         &mut self.info
     }
+}
+
+/// Synthetic text token `index` of request `request_id`: the natural token
+/// the simulator samples at that generated position, in `1_000..6_000`.
+pub fn sim_text_token(request_id: RequestId, index: usize) -> u32 {
+    1_000 + ((request_id.0 as u32 * 7 + index as u32) % 5_000)
+}
+
+/// Zero-based step at which the simulator stops block `block` of request
+/// `request_id`: one of its first three steps, within `max_steps`.
+pub fn sim_canvas_stop_step(request_id: RequestId, block: u32, max_steps: u32) -> u32 {
+    ((request_id.0 as u32).wrapping_add(block) % 3).min(max_steps.saturating_sub(1))
 }
 
 /// Sets every logical KV frontier to the visible token position.
@@ -1263,6 +1321,7 @@ mod tests {
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
                 initial_position: 0,
+                canvas: None,
             }),
             None,
             0,
@@ -1307,6 +1366,7 @@ mod tests {
             kv_output: None,
             input_token_ids: Vec::new(),
             readout: None,
+            canvas: None,
             sampling_state: None,
             request_key,
             call_id: CallId::new(batch_id, request_index),

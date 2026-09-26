@@ -1930,6 +1930,85 @@ mod tests {
         }
     }
 
+    /// Tokens committed together reach the chat stream as one text delta per block, and a
+    /// stop string inside a block ends the output at the match with the tokens through the
+    /// one that completed it.
+    #[tokio::test]
+    async fn chat_output_publishes_each_committed_block_as_one_delta() {
+        let block = |text: &str| EngineCoreOutput::TextTokens {
+            ids: text.bytes().map(u32::from).collect(),
+        };
+        let tokenizer = crate::serving::test_support::configured_tokenizer();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.try_send(EngineCoreOutput::Scheduled {
+            queued_at: 1.0,
+            scheduled_at: 2.0,
+        })
+        .unwrap();
+        tx.try_send(block("first block, ")).unwrap();
+        tx.try_send(block("second one. END and more")).unwrap();
+        tx.try_send(block("never decoded")).unwrap();
+        drop(tx);
+
+        let mut request = crate::serving::chat::ChatRequest::for_test();
+        request.decode_options.stop_strings = Some(vec!["END".to_string()]);
+        let decode_options = request.decode_options.clone();
+        let processor = crate::serving::chat::Qwen3ChatOutputProcessor::new(
+            &mut request,
+            Arc::clone(&tokenizer),
+            true,
+        )
+        .unwrap();
+        let input = StreamInput {
+            request_id: "canvas-blocks".into(),
+            event_context: event_context(),
+            prompt_token_ids: vec![b'p' as u32],
+            tokenizer,
+            prompt_logprobs_requested: false,
+            generated_logprobs_requested: false,
+            emit_token_ids: false,
+            decode_options,
+            stream: EventRx::from_receiver(rx),
+        };
+        let events = Box::pin(assemble_chat_event_stream(input, processor))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(events.iter().all(std::result::Result::is_ok), "{events:?}");
+        let texts: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(RequestOutput::TextDelta { text, .. }) if !text.is_empty() => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        // The decoder holds back two bytes, one less than the stop string,
+        // until the next block rules a match in or out.
+        assert_eq!(texts, vec!["first block", ", second one. "]);
+        let usage = events.iter().find_map(|event| match event {
+            Ok(RequestOutput::Usage {
+                visible_output_tokens,
+                ..
+            }) => Some(*visible_output_tokens),
+            _ => None,
+        });
+        // The first block and the second through the `D` that completes `END`.
+        assert_eq!(usage, Some(13 + 15));
+        assert!(
+            matches!(
+                events.last(),
+                Some(Ok(RequestOutput::Finished {
+                    reason: FinishStatus::Stop { .. },
+                    ..
+                }))
+            ),
+            "{:?}",
+            events.last()
+        );
+    }
+
     /// Committed image events are held back and published immediately before the next text
     /// token (or before a terminal event or the end of the engine stream), so they stay
     /// ordered ahead of that token.

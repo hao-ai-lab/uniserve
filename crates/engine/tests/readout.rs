@@ -85,6 +85,7 @@ fn readout_request(
         include_stop_token: false,
         image_generation: ImageGenerationConfig::default(),
         readout,
+        canvas: None,
     }
 }
 

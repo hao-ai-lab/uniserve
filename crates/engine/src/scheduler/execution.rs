@@ -1013,6 +1013,7 @@ impl Scheduler {
             kv_output: None,
             input_token_ids: Vec::new(),
             readout: None,
+            canvas: None,
             sampling_state: None,
             request_key,
             call_id,
@@ -1584,6 +1585,9 @@ impl Scheduler {
                 CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
                     Phase::Prefill
                 }
+                CallKind::Forward(ForwardMode::TokenDenoising) if call.canvas.is_some() => {
+                    Phase::Canvas
+                }
                 CallKind::Forward(ForwardMode::TokenDenoising) => Phase::Readout,
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
                     if is_feedback_computation(call) {
@@ -1621,8 +1625,10 @@ impl Scheduler {
             None => state.phase,
         };
         Some(match phase {
-            // A readout's complete prompt conditions its canvases; any other
-            // request decodes from it.
+            // A complete prompt conditions a readout's canvases or a
+            // canvas-generating request's blocks; any other request decodes
+            // from it. A block commit also projects here, since it extends
+            // the context the same way, and the next block follows it.
             Phase::Prefill
                 if self.num_scheduled_prompt_tokens(id)?
                     >= state.req.prompt_token_ids.len() as u32
@@ -1630,6 +1636,8 @@ impl Scheduler {
             {
                 if state.req.is_readout() {
                     Phase::Readout
+                } else if state.req.is_canvas_generation() {
+                    Phase::Canvas
                 } else {
                     Phase::DecodeUnd
                 }
@@ -1873,7 +1881,8 @@ impl Scheduler {
             Phase::PrepareGen => CallKind::Media(MediaCall::LatentPreparation),
             Phase::DenoiseGen => CallKind::Media(MediaCall::Denoising),
             Phase::CommitGen => CallKind::Media(MediaCall::ImageDecoding),
-            Phase::Readout => CallKind::Forward(ForwardMode::TokenDenoising),
+            Phase::Readout | Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
+            Phase::CommitCanvas => CallKind::Forward(ForwardMode::Prefill),
             Phase::FeedbackEncode => {
                 let feedback = &state.req.image_generation;
                 feedback.feedback_source.as_ref()?;
@@ -2930,7 +2939,7 @@ impl Scheduler {
                     CallKind::Forward(ForwardMode::Prefill)
                         | CallKind::Forward(ForwardMode::Decode)
                         | CallKind::Forward(ForwardMode::Verify)
-                );
+                ) || call.canvas.is_some();
                 // With stop strings, push a placeholder decoder boundary before
                 // resolving, so a non-error finish reached while resolving
                 // waits for the frontend decoder's stop-string decision on this

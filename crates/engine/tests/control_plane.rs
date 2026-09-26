@@ -241,6 +241,7 @@ fn generation_request(
         cache,
         image_generation: policy,
         readout: Vec::new(),
+        canvas: None,
     };
     request
         .validate_resources(&limits)
