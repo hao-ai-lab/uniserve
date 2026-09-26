@@ -149,7 +149,8 @@ pub struct DenoisingDefaults {
     /// Sampling temperature at the first step (`t_max`).
     pub t_max: f32,
     /// Stopping threshold on the canvas's residual uncertainty
-    /// (`confidence_threshold`).
+    /// (`confidence_threshold`); zero never stops a canvas early, so every
+    /// canvas runs all its steps.
     pub confidence_threshold: f32,
     /// Consecutive unchanged steps that end denoising early
     /// (`stability_threshold`); zero ends it on confidence alone.
@@ -164,9 +165,10 @@ impl DenoisingDefaults {
     /// Returns a message naming the first resulting value outside the
     /// domain the block-diffusion sampler accepts
     /// (`uniserve.diffusion.canvas.CanvasSampling`): a positive step limit,
-    /// a positive entropy bound and confidence threshold, and temperatures
-    /// with `0 <= t_min < t_max`, all finite. A zero stability threshold
-    /// stops a canvas on confidence alone.
+    /// a positive entropy bound, a non-negative confidence threshold, and
+    /// temperatures with `0 <= t_min < t_max`, all finite. A zero stability
+    /// threshold stops a canvas on confidence alone; a zero confidence
+    /// threshold runs every canvas for all its steps.
     pub fn with_overrides(self, overrides: &DenoisingOverrides) -> Result<Self, String> {
         let value = Self {
             max_denoising_steps: overrides
@@ -191,8 +193,8 @@ impl DenoisingDefaults {
             Some("t_min must be finite and non-negative")
         } else if !(value.t_max.is_finite() && value.t_max > value.t_min) {
             Some("t_max must be finite and above t_min")
-        } else if !positive(value.confidence_threshold) {
-            Some("confidence_threshold must be positive and finite")
+        } else if !(value.confidence_threshold.is_finite() && value.confidence_threshold >= 0.0) {
+            Some("confidence_threshold must be finite and non-negative")
         } else {
             None
         };
@@ -426,6 +428,24 @@ mod tests {
         );
     }
 
+    /// Zero thresholds are served: zero confidence runs every canvas for all
+    /// its steps (the fixed-work configuration), zero stability stops on
+    /// confidence alone.
+    #[test]
+    fn zero_stopping_thresholds_are_accepted() {
+        let overrides: DenoisingOverrides =
+            serde_json::from_str(r#"{"confidence_threshold": 0, "stability_threshold": 0}"#)
+                .unwrap();
+        assert_eq!(
+            CHECKPOINT.with_overrides(&overrides),
+            Ok(DenoisingDefaults {
+                confidence_threshold: 0.0,
+                stability_threshold: 0,
+                ..CHECKPOINT
+            })
+        );
+    }
+
     /// Unknown keys and out-of-range values are refused, naming the field.
     #[test]
     fn an_invalid_denoising_override_is_refused() {
@@ -435,7 +455,7 @@ mod tests {
             (r#"{"entropy_bound": 0.0}"#, "entropy_bound"),
             (r#"{"t_min": -0.1}"#, "t_min"),
             (r#"{"t_max": 0.4}"#, "t_max"),
-            (r#"{"confidence_threshold": 0.0}"#, "confidence_threshold"),
+            (r#"{"confidence_threshold": -0.1}"#, "confidence_threshold"),
         ] {
             let overrides: DenoisingOverrides = serde_json::from_str(json).unwrap();
             let message = CHECKPOINT.with_overrides(&overrides).unwrap_err();
