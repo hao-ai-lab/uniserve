@@ -44,6 +44,23 @@ impl Scheduler {
             });
             return;
         }
+        // A canvas pass holds whole rows, so every readout row must fit one
+        // scheduling step's token budget.
+        if let Some(row) = req
+            .readout
+            .iter()
+            .find(|row| row.token_ids.len() > self.config.max_num_batched_tokens)
+        {
+            let _ = event_tx.send(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
+                message: format!(
+                    "a {}-token readout canvas exceeds the {}-token step budget",
+                    row.token_ids.len(),
+                    self.config.max_num_batched_tokens
+                ),
+            });
+            return;
+        }
         if let Some(feature) = self.missing_required_feature(&req) {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
                 kind: RejectionKind::Invalid,
@@ -130,6 +147,8 @@ impl Scheduler {
             replayable: true,
             encoder_cache_pins: Vec::new(),
             transient_encoder_products: Vec::new(),
+            readout_rows: 0,
+            readout_logprobs: Vec::with_capacity(req.readout_candidates()),
             output: RequestOutput::new(event_tx),
             queued_at: now(),
             terminal_intent: super::TerminalIntent::None,
@@ -588,15 +607,9 @@ impl Scheduler {
         &self,
         request: &GenerationRequest,
     ) -> Option<uniserve_core::GenerationFeatures> {
-        let context_steps = request
-            .multimodal_inputs
-            .images
-            .iter()
-            .flat_map(|image| image.encoders.iter().map(|input| input.encoder));
-        let needs = request
-            .image_generation
-            .required_features(request.constraint, context_steps);
-        self.generation_limits.covers(needs).err()
+        self.generation_limits
+            .covers(request.required_features())
+            .err()
     }
 
     /// Returns whether the worker tracks image-latent capacity.

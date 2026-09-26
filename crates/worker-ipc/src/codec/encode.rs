@@ -436,6 +436,7 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
     let kv_input = v.kv_input.as_ref().map(|value| buffer_id(b, value));
     let kv_output = v.kv_output.as_ref().map(|value| buffer_id(b, value));
     let consumer_slots = Some(b.create_vector(&v.consumer_slots));
+    let readout = v.readout.as_ref().map(|value| readout(b, value));
 
     fbs::Call::create(
         b,
@@ -471,6 +472,21 @@ fn call<'a>(b: &mut FlatBufferBuilder<'a>, v: &Call) -> WIPOffset<fbs::Call<'a>>
             kv_input,
             kv_output,
             consumer_slots,
+            readout,
+        },
+    )
+}
+
+fn readout<'a>(b: &mut FlatBufferBuilder<'a>, v: &Readout) -> WIPOffset<fbs::Readout<'a>> {
+    let slot_tokens = Some(b.create_vector(&v.slot_tokens));
+    let candidate_offsets = Some(b.create_vector(&v.candidate_offsets));
+    let candidate_ids = Some(b.create_vector(&v.candidate_ids));
+    fbs::Readout::create(
+        b,
+        &fbs::ReadoutArgs {
+            slot_tokens,
+            candidate_offsets,
+            candidate_ids,
         },
     )
 }
@@ -960,6 +976,7 @@ fn completion<'a>(
     let finish_flags = Some(finish_flags(b, &v.finish_flags));
     let media_output = v.media_output.as_ref().map(|value| media_output(b, value));
     let kv_output = v.kv_output.as_ref().map(|value| kv_transfer(b, value));
+    let candidate_logprobs = Some(b.create_vector(&v.candidate_logprobs));
     fbs::RequestOutput::create(
         b,
         &fbs::RequestOutputArgs {
@@ -981,6 +998,7 @@ fn completion<'a>(
             finish_flags,
             media_output,
             kv_output,
+            candidate_logprobs,
         },
     )
 }

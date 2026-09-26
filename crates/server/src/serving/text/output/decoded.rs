@@ -578,13 +578,15 @@ pub async fn decoded_text_event_stream(
                     message,
                 });
             }
-            // Media lifecycle events cannot be represented by a text-only stream.
+            // Media lifecycle events and readout answers cannot be
+            // represented by a text-only stream.
             EngineCoreOutput::ImageBegin { .. }
             | EngineCoreOutput::ImageStep { .. }
             | EngineCoreOutput::ImageCommit { .. }
             | EngineCoreOutput::ImageDone { .. }
             | EngineCoreOutput::Artifact(_)
-            | EngineCoreOutput::MediaProgress { .. } => {
+            | EngineCoreOutput::MediaProgress { .. }
+            | EngineCoreOutput::Readout { .. } => {
                 return Err(Error::MalformedOutput {
                     request_id: request_id.clone(),
                     message: "text-only request received a non-text lifecycle event".to_string(),

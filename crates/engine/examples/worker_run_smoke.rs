@@ -46,6 +46,7 @@ fn submit_text(handle: &EngineHandle, rxs: &mut Rxs, id: u64) -> anyhow::Result<
         priority: 0,
         cache: Default::default(),
         image_generation: policy,
+        readout: Vec::new(),
     };
     let rx = handle.submit(request).map_err(|e| anyhow::anyhow!(e))?;
     rxs.insert(RequestId(id), rx);

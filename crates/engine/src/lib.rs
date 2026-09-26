@@ -46,7 +46,7 @@ pub use crate::scheduler::{
     SchedulerStats, SchedulerStatsReporter, SchedulingPolicy, TimingStats, WorkerStats,
 };
 #[cfg(feature = "testing")]
-pub use crate::sim::{BatchEvent, SimEngine, SimExecutor};
+pub use crate::sim::{BatchEvent, SimEngine, SimExecutor, sim_candidate_logprob};
 pub use crate::worker::{
     BatchSubmitError, FlashInferBackend, FlashInferBackendParseError, LaneConfig, WorkerExecutor,
     WorkerGroup, WorkerProcessArgs,

@@ -42,7 +42,11 @@ impl RequestKey {
     }
 }
 
-/// The numerical mode of an autoregressive model forward.
+/// The numerical mode of a token model forward.
+///
+/// `Prefill`, `Decode` and `Verify` extend a request's KV cache causally.
+/// `TokenDenoising` runs one denoising pass over rows of a token canvas that
+/// read the request's cached prefix without writing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
@@ -50,6 +54,7 @@ pub enum ForwardMode {
     Prefill,
     Decode,
     Verify,
+    TokenDenoising,
 }
 
 impl ForwardMode {
@@ -58,13 +63,19 @@ impl ForwardMode {
     /// `worker-ipc-py` builds its Python enum table from this array and
     /// indexes it with `mode as usize`, so the order must match the
     /// declaration order.
-    pub const ALL: [Self; 3] = [Self::Prefill, Self::Decode, Self::Verify];
+    pub const ALL: [Self; 4] = [
+        Self::Prefill,
+        Self::Decode,
+        Self::Verify,
+        Self::TokenDenoising,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Prefill => "prefill",
             Self::Decode => "decode",
             Self::Verify => "verify",
+            Self::TokenDenoising => "token_denoising",
         }
     }
 }
@@ -296,10 +307,11 @@ impl CallKind {
     /// Mirrored, in the same order, by `CALL_KINDS` in
     /// `uniserve_worker.protocol.call`; the worker's reports list supported
     /// calls in this order.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::Forward(ForwardMode::Prefill),
         Self::Forward(ForwardMode::Decode),
         Self::Forward(ForwardMode::Verify),
+        Self::Forward(ForwardMode::TokenDenoising),
         Self::Media(MediaCall::VisionEncoding),
         Self::Media(MediaCall::LatentEncoding),
         Self::Media(MediaCall::TextEncoding),
@@ -450,6 +462,62 @@ impl CallCoordinates {
     }
 }
 
+/// Candidate log-probabilities a token-denoising call reads at canvas slots.
+///
+/// The call's `input_token_ids` hold its canvas rows back to back. Slot `i`
+/// is canvas token `slot_tokens[i]` of that sequence and reads the candidate
+/// token ids `candidate_ids[candidate_offsets[i]..candidate_offsets[i + 1]]`.
+/// The worker reports, in `candidate_ids` order, each candidate's natural-log
+/// probability under the log-softmax over the full vocabulary of the model's
+/// logits at its slot (`RequestOutput::candidate_logprobs`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Readout {
+    /// Index of each slot's token in the call's concatenated canvas rows.
+    pub slot_tokens: Vec<u32>,
+    /// Offsets of each slot's candidates in `candidate_ids`: one more entry
+    /// than there are slots, starting at zero and ending at the id count.
+    pub candidate_offsets: Vec<u32>,
+    /// Candidate token ids of every slot, slot after slot.
+    pub candidate_ids: Vec<u32>,
+}
+
+impl Readout {
+    /// Number of candidate log-probabilities the readout reports.
+    pub fn candidate_count(&self) -> usize {
+        self.candidate_ids.len()
+    }
+
+    /// Validates the slot layout against a call of `canvas_tokens` canvas
+    /// tokens.
+    ///
+    /// Every slot addresses a canvas token and reads at least one candidate,
+    /// and the offsets partition `candidate_ids` in slot order.
+    pub fn validate(&self, canvas_tokens: usize) -> ValidationResult<()> {
+        ensure_valid!(!self.slot_tokens.is_empty(), "readout reads no slot");
+        ensure_valid!(
+            self.candidate_offsets.len() == self.slot_tokens.len() + 1,
+            "readout candidate offsets do not bound every slot"
+        );
+        ensure_valid!(
+            self.candidate_offsets.first() == Some(&0)
+                && self.candidate_offsets.last().map(|&end| end as usize)
+                    == Some(self.candidate_ids.len())
+                && self
+                    .candidate_offsets
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1]),
+            "readout candidate offsets do not partition the candidates"
+        );
+        ensure_valid!(
+            self.slot_tokens
+                .iter()
+                .all(|&token| (token as usize) < canvas_tokens),
+            "readout slot lies outside the call's canvas rows"
+        );
+        Ok(())
+    }
+}
+
 /// Component used when a deployment does not partition a model by capability.
 pub const DEFAULT_COMPONENT: &str = "model";
 
@@ -511,9 +579,13 @@ pub struct Call {
     pub rng: Option<Rng>,
     /// Host-side sampler constraints for this computation; absent uses admission defaults.
     pub sampling_state: Option<SamplingState>,
-    /// Host-known prompt, draft, or decode input tokens in model input order.
-    /// Empty when continuation reads its predecessor's device token.
+    /// Host-known prompt, draft, or decode input tokens in model input order,
+    /// or a token-denoising call's canvas rows back to back. Empty when
+    /// continuation reads its predecessor's device token.
     pub input_token_ids: Vec<u32>,
+    /// Candidate slots a token-denoising readout reports; absent for every
+    /// other call.
+    pub readout: Option<Readout>,
     /// Encoded source image in base64, consumed by a vision or latent encoder.
     /// Dispatch and in-flight matching share these immutable bytes.
     pub input_image: Option<std::sync::Arc<str>>,
@@ -654,6 +726,23 @@ impl Call {
                     && self.image_input.is_none(),
                 "encoded image requires an image encoder without another image source"
             );
+        }
+
+        // A token-denoising call reads candidate log-probabilities at slots
+        // of the canvas rows it carries, and produces no sampled token.
+        let denoises = self.code == CallKind::Forward(ForwardMode::TokenDenoising);
+        ensure_valid!(
+            self.readout.is_some() == denoises,
+            "a candidate readout belongs exactly to a token-denoising call"
+        );
+        if let Some(readout) = &self.readout {
+            ensure_valid!(
+                !self.input_token_ids.is_empty()
+                    && self.token_output.is_none()
+                    && self.transition_output.is_none(),
+                "token denoising requires canvas tokens and samples no token"
+            );
+            readout.validate(self.input_token_ids.len())?;
         }
 
         // Every output must be uniquely owned by this producer and fit the
@@ -895,6 +984,9 @@ pub struct RequestOutput {
     pub top_logprobs: Vec<TokenLogprob>,
     /// Ranked candidates for each scored prompt position, in input order.
     pub prompt_logprobs: Vec<Vec<TokenLogprob>>,
+    /// Natural-log probability of every candidate of a token-denoising
+    /// readout, in the call's `Readout::candidate_ids` order.
+    pub candidate_logprobs: Vec<f32>,
     /// Device-observed terminal conditions.
     pub finish_flags: FinishFlags,
     /// Completed artifact and its external storage lifetime, when produced.
@@ -935,6 +1027,12 @@ impl RequestOutput {
                 "a non-error completion must not carry an error code"
             ),
         }
+        ensure_valid!(
+            self.candidate_logprobs.is_empty()
+                || (self.status == CallStatus::Ok
+                    && self.code == CallKind::Forward(ForwardMode::TokenDenoising)),
+            "candidate log-probabilities belong to a successful token-denoising completion"
+        );
         if self.status == CallStatus::Predicated {
             ensure_valid!(
                 self.committed_tokens.as_slice().is_empty() && self.product_generations.is_empty(),

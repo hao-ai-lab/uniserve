@@ -46,7 +46,7 @@ use crate::{
     CallStatus, DType, DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout,
     ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode,
     ForwardStats, KvCacheInfo, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaCall,
-    MediaOutput, NewRequest, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
+    MediaOutput, NewRequest, Readout, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
     SamplingState, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
     TransferHandle, TransferMode, TransferTransport, WorkerEndpoint, WorkerInfo, WorkerRequest,
     WorkerResponse, WorkerResponseError,
@@ -591,6 +591,20 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
             .input_token_ids()
             .map(|ids| ids.iter().collect())
             .unwrap_or_default(),
+        readout: call.readout().map(|readout| Readout {
+            slot_tokens: readout
+                .slot_tokens()
+                .map(|ids| ids.iter().collect())
+                .unwrap_or_default(),
+            candidate_offsets: readout
+                .candidate_offsets()
+                .map(|ids| ids.iter().collect())
+                .unwrap_or_default(),
+            candidate_ids: readout
+                .candidate_ids()
+                .map(|ids| ids.iter().collect())
+                .unwrap_or_default(),
+        }),
         consumer_slots: call
             .consumer_slots()
             .map(|slots| slots.iter().collect())
@@ -883,6 +897,10 @@ fn completion_record_from_table(record: fbs::RequestOutput<'_>) -> CodecResult<R
                     })
                     .collect()
             })
+            .unwrap_or_default(),
+        candidate_logprobs: record
+            .candidate_logprobs()
+            .map(|values| values.iter().collect())
             .unwrap_or_default(),
         request_key: request_key_from_table(record.request_key(), "completion.request_key")?,
         call_id: computation_id_from_fb(record.call_id())?,
@@ -1411,6 +1429,7 @@ fn forward_mode_to_fb(value: ForwardMode) -> fbs::ForwardMode {
         ForwardMode::Prefill => fbs::ForwardMode::Prefill,
         ForwardMode::Decode => fbs::ForwardMode::Decode,
         ForwardMode::Verify => fbs::ForwardMode::Verify,
+        ForwardMode::TokenDenoising => fbs::ForwardMode::TokenDenoising,
     }
 }
 
@@ -1419,6 +1438,7 @@ fn forward_mode_from_fb(value: fbs::ForwardMode) -> CodecResult<ForwardMode> {
         fbs::ForwardMode::Prefill => ForwardMode::Prefill,
         fbs::ForwardMode::Decode => ForwardMode::Decode,
         fbs::ForwardMode::Verify => ForwardMode::Verify,
+        fbs::ForwardMode::TokenDenoising => ForwardMode::TokenDenoising,
         _ => codec_bail!("unknown forward_mode {}", value.0),
     })
 }

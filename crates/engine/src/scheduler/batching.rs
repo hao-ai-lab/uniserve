@@ -193,6 +193,10 @@ impl Scheduler {
         } else {
             0
         };
+        // Canvas rows staged by this pass across its token-denoising calls,
+        // bounded by the worker's per-call row staging.
+        let mut canvas_rows_left =
+            (self.info.max_batch_calls.min(self.info.request_slots) as usize).max(1);
         let mut selected = 0usize;
         for id in ids.iter().copied() {
             if selected >= self.config.max_batch {
@@ -253,7 +257,9 @@ impl Scheduler {
             } else {
                 budget
             };
-            if let Some(mut call) = self.next_generation_computation(id, call_budget) {
+            if let Some(mut call) =
+                self.next_generation_computation(id, call_budget, canvas_rows_left)
+            {
                 let planned_us = uniserve_core::now_monotonic_us();
 
                 // Only a call that obtains its storage is charged to the
@@ -281,6 +287,13 @@ impl Scheduler {
                     mixed_left = mixed_left.saturating_sub(cost);
                 }
                 budget = budget.saturating_sub(cost);
+                if call.readout.is_some() {
+                    let rows = self.running.get(&id).and_then(|state| {
+                        let start = self.scheduled_readout_rows(id)?;
+                        state.readout_rows_covering(start, call.input_token_ids.len())
+                    });
+                    canvas_rows_left = canvas_rows_left.saturating_sub(rows.unwrap_or(0));
+                }
 
                 // Identify the call by its batch and row, and stamp the
                 // coordinates projected through the request's in-flight calls.
@@ -413,13 +426,17 @@ impl Scheduler {
 
     /// Chooses the highest-priority execution lane that has schedulable work.
     ///
-    /// Prefill wins while fewer than `PREFILL_WINDOW_CREDITS` batches carrying
-    /// `BatchKind::Prefill` calls await their results; past that, ready decode
-    /// work takes the pass, and prefill runs only when no decode is ready.
-    /// `BatchKind::Media` readiness never selects a lane: with only such work
-    /// ready this returns `None`, and `assemble_batch` then applies no lane
-    /// filter.
+    /// A ready canvas pass takes the decode lane first: it completes a
+    /// readout, which releases the request's KV, so prefill never holds it
+    /// back. Otherwise prefill wins while fewer than `PREFILL_WINDOW_CREDITS`
+    /// batches carrying `BatchKind::Prefill` calls await their results; past
+    /// that, ready decode work takes the pass, and prefill runs only when no
+    /// decode is ready. Prefill still shares a decode-lane pass within the
+    /// mixed-prefill token budget. `BatchKind::Media` readiness never selects
+    /// a lane: with only such work ready this returns `None`, and
+    /// `assemble_batch` then applies no lane filter.
     pub(super) fn select_batch_kind(&self, ids: &[RequestId]) -> Option<BatchKind> {
+        let mut canvas_ready = false;
         let mut projected_decode_ready = false;
         let mut committed_decode_ready = false;
         let mut prefill_ready = false;
@@ -438,7 +455,9 @@ impl Scheduler {
             match batch_kind(call_type) {
                 BatchKind::Decode => {
                     if self.can_schedule_next(id) {
-                        if self.inflight.has_pending_calls(id) {
+                        if call_type == CallKind::Forward(ForwardMode::TokenDenoising) {
+                            canvas_ready = true;
+                        } else if self.inflight.has_pending_calls(id) {
                             projected_decode_ready = true;
                         } else {
                             committed_decode_ready = true;
@@ -453,7 +472,9 @@ impl Scheduler {
                 BatchKind::Media => {}
             }
         }
-        if prefill_ready
+        if canvas_ready {
+            Some(BatchKind::Decode)
+        } else if prefill_ready
             && self
                 .inflight
                 .pending_batches
@@ -488,10 +509,11 @@ impl Scheduler {
     /// Returns the scheduling priority used during batch assembly; lower
     /// values are assembled first.
     ///
-    /// Context ingestion (encoders and prefill) comes first; then token decode
-    /// and verification, image decoding, and KV installation; then denoising
-    /// and the video and audio media calls; and last latent preparation,
-    /// tensor transfers, KV publication, and requests with no next call.
+    /// Context ingestion (encoders and prefill) comes first; then token decode,
+    /// verification and canvas denoising, image decoding, and KV installation;
+    /// then denoising and the video and audio media calls; and last latent
+    /// preparation, tensor transfers, KV publication, and requests with no
+    /// next call.
     pub(super) fn assembly_priority(&self, id: RequestId) -> u8 {
         match self.peek_next_call_variant(id) {
             Some(
@@ -501,8 +523,9 @@ impl Scheduler {
                 | CallKind::Forward(ForwardMode::Prefill),
             ) => 0,
             Some(
-                CallKind::Forward(ForwardMode::Decode)
-                | CallKind::Forward(ForwardMode::Verify)
+                CallKind::Forward(
+                    ForwardMode::Decode | ForwardMode::Verify | ForwardMode::TokenDenoising,
+                )
                 | CallKind::Media(MediaCall::ImageDecoding)
                 | CallKind::Transfer(TransferMode::KvInstall),
             ) => 1,
@@ -581,6 +604,7 @@ impl Scheduler {
                 }
             }
             Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
+            Phase::Readout => CallKind::Forward(ForwardMode::TokenDenoising),
         })
     }
 
@@ -702,7 +726,8 @@ impl Scheduler {
             CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
                 Some(KvLengths { visible, input: 1 })
             }
-            CallKind::Transfer(TransferMode::KvPublish)
+            CallKind::Forward(ForwardMode::TokenDenoising)
+            | CallKind::Transfer(TransferMode::KvPublish)
             | CallKind::Media(MediaCall::LatentPreparation)
             | CallKind::Media(MediaCall::Denoising) => Some(KvLengths { visible, input: 0 }),
             _ => None,
@@ -741,6 +766,28 @@ impl Scheduler {
             encoder.and_then(|encoder| encoder.num_kv_tokens)
         } else {
             None
+        };
+
+        // A canvas pass covers the readout rows after those already scheduled;
+        // each row's canvas becomes one read-only forward row below.
+        let canvas_lengths = if call.readout.is_some() {
+            let rows = self.scheduled_readout_rows(request_id).and_then(|start| {
+                let state = self.running.get(&request_id)?;
+                let count = state.readout_rows_covering(start, call.input_token_ids.len())?;
+                Some(
+                    state.req.readout[start..start + count]
+                        .iter()
+                        .map(|row| row.token_ids.len() as u32)
+                        .collect::<Vec<_>>(),
+                )
+            });
+            let Some(rows) = rows else {
+                self.invariant_broken("a canvas pass covers whole scheduled readout rows");
+                return None;
+            };
+            rows
+        } else {
+            Vec::new()
         };
 
         let mut call_block_tables = Vec::new();
@@ -810,6 +857,17 @@ impl Scheduler {
                     lengths.visible + lengths.input,
                     lengths.input,
                     true,
+                );
+            }
+            // One read-only row per canvas: it attends to the visible prefix
+            // and its own canvas, and persists nothing.
+            for canvas in &canvas_lengths {
+                call_forward.push(
+                    0,
+                    request_pool_idx,
+                    lengths.visible + canvas,
+                    *canvas,
+                    false,
                 );
             }
         }
@@ -1226,12 +1284,16 @@ impl Scheduler {
     ///
     /// Prompt text and input images still to ingest go through
     /// `next_context_computation`; otherwise the request's next phase decides.
-    /// Returns `None` when nothing can be planned now, including when the KV
-    /// capacity a call needs or the image-branch reservation is unavailable.
+    /// A canvas pass takes the next readout rows that fit both `budget`
+    /// tokens and `canvas_rows` rows. Returns `None` when nothing can be
+    /// planned now, including when the KV capacity a call needs, the
+    /// image-branch reservation, or room for one whole canvas row is
+    /// unavailable.
     pub(super) fn next_generation_computation(
         &mut self,
         id: RequestId,
         budget: usize,
+        canvas_rows: usize,
     ) -> Option<Call> {
         let (logical_position, kv_visible_len) = self.scheduled_token_lengths(id)?;
         let context_pending = self.running.get(&id).is_some_and(|st| {
@@ -1440,6 +1502,27 @@ impl Scheduler {
                 })
             }
             Phase::IngestState => self.next_context_computation(id, budget),
+            Phase::Readout => {
+                // Whole rows join the pass in report order while they fit its
+                // remaining tokens and canvas rows.
+                let start = self.scheduled_readout_rows(id)?;
+                let st = self.running.get(&id)?;
+                let mut end = start;
+                let mut tokens = 0usize;
+                for row in st.req.readout.get(start..)? {
+                    if end - start >= canvas_rows || tokens + row.token_ids.len() > budget {
+                        break;
+                    }
+                    tokens += row.token_ids.len();
+                    end += 1;
+                }
+                if end == start {
+                    return None;
+                }
+                self.plan_computation(id, |_scheduler, request| {
+                    generation::plan_readout(request, start..end)
+                })
+            }
         }
     }
 

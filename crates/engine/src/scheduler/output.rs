@@ -381,7 +381,8 @@ impl Scheduler {
                         }
 
                         // Ingesting the last image of a fully consumed prompt
-                        // starts understanding decode from BOS.
+                        // starts a readout's canvases, or understanding decode
+                        // from BOS.
                         if is_final_step
                             && self.running.get(&id).is_some_and(|st| {
                                 st.num_ingested_images >= st.req.multimodal_inputs.images.len()
@@ -391,9 +392,13 @@ impl Scheduler {
                         {
                             let bos = self.ctrl.bos;
                             if let Some(st) = self.running.get_mut(&id) {
-                                st.next_token = bos;
-                                st.round_token_ids.clear();
-                                st.phase = Phase::DecodeUnd;
+                                if st.req.is_readout() {
+                                    st.phase = Phase::Readout;
+                                } else {
+                                    st.next_token = bos;
+                                    st.round_token_ids.clear();
+                                    st.phase = Phase::DecodeUnd;
+                                }
                             }
                         }
                         return;
@@ -510,6 +515,15 @@ impl Scheduler {
                     return;
                 }
 
+                // A readout's complete prompt samples nothing; its canvases
+                // follow.
+                if let Some(st) = self.running.get_mut(&id)
+                    && st.req.is_readout()
+                {
+                    st.phase = Phase::Readout;
+                    return;
+                }
+
                 let Some(st) = self.running.get_mut(&id) else {
                     return;
                 };
@@ -591,6 +605,27 @@ impl Scheduler {
                 {
                     self.begin_image(id);
                 }
+            }
+            CallKind::Forward(ForwardMode::TokenDenoising) => {
+                // `process_generation_result` accepted the pass's rows and
+                // their log-probabilities. Once every row has reported, the
+                // request answers with all of them, in report order.
+                let Some(st) = self.running.get_mut(&id) else {
+                    return;
+                };
+                if st.readout_rows < st.req.readout.len() {
+                    return;
+                }
+                let candidate_logprobs = std::mem::take(&mut st.readout_logprobs);
+                if candidate_logprobs.len() != st.req.readout_candidates() {
+                    tracing::error!(
+                        request_id = id.0,
+                        "a completed readout lacks candidate log-probabilities"
+                    );
+                    return self.finish(id, FinishReason::Error);
+                }
+                self.emit(id, EngineCoreOutput::Readout { candidate_logprobs });
+                self.finish(id, FinishReason::Completed);
             }
             CallKind::Media(MediaCall::Denoising) => {
                 // Publish every newly committed step exactly once, including steps

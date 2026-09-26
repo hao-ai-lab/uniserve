@@ -240,6 +240,7 @@ fn generation_request(
         priority: 0,
         cache,
         image_generation: policy,
+        readout: Vec::new(),
     };
     request
         .validate_resources(&limits)

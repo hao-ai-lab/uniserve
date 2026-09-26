@@ -47,6 +47,7 @@ SUPPORTED_CALL_GROUPS: dict[str, tuple[CallKind, ...]] = {
     "ar_extend": (ForwardMode.PREFILL,),
     "ar_decode": (ForwardMode.DECODE,),
     "ar_verify": (ForwardMode.VERIFY,),
+    "token_denoising": (ForwardMode.TOKEN_DENOISING,),
     "encoder_vision": (MediaCall.VISION_ENCODING,),
     "encoder_latent": (MediaCall.LATENT_ENCODING,),
     "encoder_text": (MediaCall.TEXT_ENCODING,),

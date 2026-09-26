@@ -161,9 +161,12 @@ def test_execution_lanes_are_typed_and_domain_disjoint(tmp_path) -> None:
         ("decode", 64),
         ("compute", 88),
     )
+    # The decode domain holds the calls that advance admitted requests
+    # without growing their prompt.
     assert config.execution.lanes[0].call_kinds == (
         ForwardMode.DECODE,
         ForwardMode.VERIFY,
+        ForwardMode.TOKEN_DENOISING,
     )
 
 

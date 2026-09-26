@@ -968,6 +968,7 @@ impl InputProcessor {
             priority,
             cache,
             image_generation: ImageGenerationConfig::default(),
+            readout: Vec::new(),
         };
         let mut decode = TextDecodeOptions {
             skip_special_tokens: decode.skip_special_tokens,

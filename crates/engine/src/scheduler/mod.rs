@@ -121,7 +121,8 @@ const MAX_INFLIGHT_TRANSFERS: usize = 256;
 enum BatchKind {
     /// Every forward prefill, and text, vision, and latent encoding.
     Prefill,
-    /// Token decode and speculative verification.
+    /// Calls that advance admitted requests without growing their prompt:
+    /// token decode, speculative verification, and canvas denoising.
     Decode,
     /// Latent preparation, denoising, image, video, and audio decoding, video
     /// and audio encoding, muxing, and transfers.
@@ -420,6 +421,7 @@ impl Scheduler {
             (RuntimeFamily::Ar, RuntimeFamily::Ar)
                 | (RuntimeFamily::Diffusion, RuntimeFamily::Diffusion)
                 | (RuntimeFamily::Umm, RuntimeFamily::Ar | RuntimeFamily::Umm)
+                | (RuntimeFamily::BlockDiffusion, RuntimeFamily::BlockDiffusion)
         )
     }
 }
@@ -498,9 +500,9 @@ fn batch_kind(call_variant: CallKind) -> BatchKind {
         | CallKind::Media(MediaCall::TextEncoding)
         | CallKind::Media(MediaCall::VisionEncoding)
         | CallKind::Media(MediaCall::LatentEncoding) => BatchKind::Prefill,
-        CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
-            BatchKind::Decode
-        }
+        CallKind::Forward(
+            ForwardMode::Decode | ForwardMode::Verify | ForwardMode::TokenDenoising,
+        ) => BatchKind::Decode,
         CallKind::Media(MediaCall::Denoising)
         | CallKind::Media(MediaCall::VideoDecoding)
         | CallKind::Media(MediaCall::LatentPreparation)

@@ -418,14 +418,13 @@ class WorkerInfo:
                 "endpoint rank must satisfy 0 <= rank < world_size"
             )
 
+        # Every token-model forward reads or extends a request's KV cache.
         requires_kv = any(
-            variant
-            in {ForwardMode.PREFILL, ForwardMode.DECODE, ForwardMode.VERIFY}
-            for variant in self.supported_calls
+            isinstance(variant, ForwardMode) for variant in self.supported_calls
         )
         if requires_kv and self.kv_cache is None:
             raise invalid_descriptor(
-                "worker advertises AR work without a KV cache"
+                "worker advertises token work without a KV cache"
             )
 
         for name in (
