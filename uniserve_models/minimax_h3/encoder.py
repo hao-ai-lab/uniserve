@@ -88,6 +88,7 @@ class TextEncoder(BaseTextEncoder):
                 hidden_act="silu",
                 rms_norm_eps=config.rms_norm_eps,
                 rope_theta=config.rope_theta,
+                rope_scaling=None,
                 max_position_embeddings=config.max_position_embeddings,
                 attention_bias=False,
                 tie_word_embeddings=False,
@@ -95,6 +96,8 @@ class TextEncoder(BaseTextEncoder):
                 num_experts_per_tok=1,
                 moe_intermediate_size=config.intermediate_size,
                 norm_topk_prob=False,
+                decoder_sparse_step=1,
+                mlp_only_layers=(),
             )
         )
         # H3 conditions on the retained layer's raw hidden state; the Qwen
