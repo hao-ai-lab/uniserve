@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from uniserve.tensors import BufferConfig
 
+from ..backends import record_kernel_choice
 from . import capturing
 
 
@@ -47,6 +48,7 @@ class VsaBinding:
                 transient=self.transient,
             )
             self.providers[key] = provider.name
+            record_kernel_choice()
 
         return self.operators[key]
 

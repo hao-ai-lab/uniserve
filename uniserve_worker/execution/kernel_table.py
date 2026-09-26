@@ -1,9 +1,13 @@
 """The startup table of the kernel serving every prepared call site.
 
 Startup logs one line, ``uniserve-kernel-table <JSON>``, once warmup and
-graph capture have resolved every selection the served call kinds make. The
-JSON object has these fields:
+graph capture have resolved the selections they exercise. A call site that
+prepares at its first call and a call kind that startup does not exercise
+choose their kernels while serving; the worker then logs the complete table
+again after the call that made the choice. The last line is therefore the
+complete record. The JSON object has these fields:
 
+- ``stage``: ``startup`` or ``serving``;
 - ``rank`` and ``device``: the worker rank and its compute device;
 - ``runners``: one entry per runner (a bound computation and its call
   kinds), with ``runner``, ``device`` and ``call_sites``. Each call site
@@ -12,7 +16,8 @@ JSON object has these fields:
   ``{0-63}``, and the remaining fields are the ``ExecutionContext.kernels``
   record: ``op`` (``attention``, ``vsa``, ``moe`` or ``matmul``), the
   representation, the resolved ``provider`` and, for automatic attention
-  selection, ``inputs``, the provider that served each input class;
+  selection, ``inputs``, the provider that served each input class. An
+  attention call site not called yet has ``dtype`` and ``provider`` None;
 - ``portable``: every call site a CUDA runner serves with the portable torch
   provider, listed again so that no such call site is silent.
 
@@ -90,6 +95,8 @@ def _label(runner: Any) -> str:
 
 def _portable(record: dict[str, Any]) -> list[str]:
     """Return what a record serves with the portable torch provider."""
+    if record["provider"] is None:
+        return []
     if record["provider"] == "torch":
         return ["every input"]
     return [
@@ -99,51 +106,98 @@ def _portable(record: dict[str, Any]) -> list[str]:
     ]
 
 
-def kernel_table(runners: Iterable[Any], *, rank: int, device: str) -> dict:
-    """Group the kernel records of ``runners`` for the startup table.
+class KernelRecords:
+    """Accumulate the kernel records of a worker's runners.
 
-    ``runners`` are the worker's prepared runners, each with ``name``,
-    ``call``, ``device`` and an ``ExecutionContext`` as ``context``. Runners
-    with the same label (one computation prepared at several sizes) merge.
+    A call site's records are those its runners report the last time they
+    are gathered: a record that grows (an automatic selection meeting a new
+    input class, a first call preparing a site) replaces its earlier form.
+    A computation retired while serving keeps the records it last reported.
     """
-    grouped: dict[str, dict[str, Any]] = {}
-    for runner in runners:
-        label = _label(runner)
-        entry = grouped.setdefault(
-            label,
-            {"device": str(runner.device), "sites": {}},
-        )
-        for record in runner.context.kernels():
-            record = dict(record)
-            path = record.pop("path")
-            key = json.dumps(record, sort_keys=True)
-            entry["sites"].setdefault(key, (record, []))[1].append(path)
 
-    table: dict[str, Any] = {
-        "rank": rank,
-        "device": device,
-        "runners": [],
-        "portable": [],
-    }
-    for label, entry in grouped.items():
-        sites = []
-        for record, paths in entry["sites"].values():
-            layers = layer_paths(dict.fromkeys(paths))
-            sites.append({"layers": layers, **record})
-            served = _portable(record)
-            if served and canonical_device(entry["device"]).type == "cuda":
-                table["portable"].append(
-                    {
-                        "runner": label,
-                        "op": record["op"],
-                        "layers": layers,
-                        "inputs": served,
-                    }
+    def __init__(self) -> None:
+        # Runner label -> (device, {path: {record key: record}}).
+        self._runners: dict[str, tuple[str, dict[str, dict[str, dict]]]] = {}
+
+    def add(self, runners: Iterable[Any]) -> bool:
+        """Gather the current records of ``runners``; report any change.
+
+        ``runners`` are the worker's runners, each with ``name``, ``call``,
+        ``device`` and an ``ExecutionContext`` as ``context``. Runners with
+        the same label (one computation prepared at several sizes) merge.
+        """
+        current: dict[str, tuple[str, dict[str, dict[str, dict]]]] = {}
+        for runner in runners:
+            _, paths = current.setdefault(
+                _label(runner), (str(runner.device), {})
+            )
+            for record in runner.context.kernels():
+                record = dict(record)
+                site = paths.setdefault(record.pop("path"), {})
+                site[json.dumps(record, sort_keys=True)] = record
+
+        changed = False
+        for label, (runner_device, paths) in current.items():
+            _, stored = self._runners.setdefault(label, (runner_device, {}))
+            for path, records in paths.items():
+                if stored.get(path) != records:
+                    stored[path] = records
+                    changed = True
+        return changed
+
+    def table(self, *, stage: str, rank: int, device: str) -> dict:
+        """Return the logged table of every gathered record.
+
+        ``stage`` is ``startup`` or ``serving``; ``rank`` and ``device`` name
+        the worker rank and its compute device.
+        """
+        table: dict[str, Any] = {
+            "stage": stage,
+            "rank": rank,
+            "device": device,
+            "runners": [],
+            "portable": [],
+        }
+        for label, (runner_device, paths) in self._runners.items():
+            # Group the paths of identical records into one call site. A
+            # site prepared at several sizes may report a prepared and a
+            # not yet called form; only the prepared one is kept.
+            sites: dict[str, tuple[dict, list[str]]] = {}
+            for path, records in paths.items():
+                prepared = any(
+                    record["op"] == "attention" and record["provider"]
+                    for record in records.values()
                 )
-        table["runners"].append(
-            {"runner": label, "device": entry["device"], "call_sites": sites}
-        )
-    return table
+                for key, record in records.items():
+                    unprepared = (
+                        record["op"] == "attention"
+                        and record["provider"] is None
+                    )
+                    if not (prepared and unprepared):
+                        sites.setdefault(key, (record, []))[1].append(path)
+
+            call_sites = []
+            for record, site_paths in sites.values():
+                layers = layer_paths(site_paths)
+                call_sites.append({"layers": layers, **record})
+                served = _portable(record)
+                if served and canonical_device(runner_device).type == "cuda":
+                    table["portable"].append(
+                        {
+                            "runner": label,
+                            "op": record["op"],
+                            "layers": layers,
+                            "inputs": served,
+                        }
+                    )
+            table["runners"].append(
+                {
+                    "runner": label,
+                    "device": runner_device,
+                    "call_sites": call_sites,
+                }
+            )
+        return table
 
 
 def format_kernel_table(table: dict) -> str:

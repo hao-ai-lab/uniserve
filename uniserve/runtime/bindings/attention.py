@@ -14,6 +14,7 @@ from uniserve.nn.attention.inputs import DenseInput
 from uniserve.quantization import QuantizedTensor
 
 from ..backends import attention as attention_backend
+from ..backends import record_kernel_choice
 from . import capturing
 
 
@@ -149,6 +150,7 @@ class AttentionBinding:
         )
         self.operators[dtype] = operator
         self.providers[dtype] = provider.name
+        record_kernel_choice()
         self._bound.discard(dtype)
         return operator
 
@@ -159,7 +161,9 @@ class AttentionBinding:
         history window and cache storage, the prepared ``provider`` and the
         provider serving each input class the call site has met
         (``inputs``; see ``Operator.selections``). A provider other than
-        automatic selection serves every input itself.
+        automatic selection serves every input itself. A call site that
+        prepares at its first call and has not been called yet reports one
+        record whose ``dtype`` and ``provider`` are None.
         """
         cache = None
         if self.cache is not None:
@@ -169,13 +173,26 @@ class AttentionBinding:
                 else str(self.cache.key.dtype).removeprefix("torch.")
             )
             cache = f"{storage} pages of {self.cache.block_size} tokens"
+        layer = {
+            "op": "attention",
+            "heads": self.module.local_heads,
+            "kv_heads": self.module.local_kv_heads,
+            "head_dim": self.module.head_dim,
+            "window": self.module.window,
+        }
+        if not self.operators:
+            return [
+                {
+                    **layer,
+                    "dtype": None,
+                    "cache": cache,
+                    "provider": None,
+                    "inputs": {},
+                }
+            ]
         return [
             {
-                "op": "attention",
-                "heads": self.module.local_heads,
-                "kv_heads": self.module.local_kv_heads,
-                "head_dim": self.module.head_dim,
-                "window": self.module.window,
+                **layer,
                 "dtype": str(dtype).removeprefix("torch."),
                 "cache": cache,
                 "provider": self.providers[dtype],
