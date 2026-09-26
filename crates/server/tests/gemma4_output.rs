@@ -13,6 +13,20 @@
 //! Transformers' Gemma-4 response parser, except for the continuation whose
 //! thought channel the BF16 template opens in the prompt, where they are the
 //! rendered parts themselves.
+//!
+//! `fixtures/gemma4_tool_replies.json` holds every distinct reply that
+//! Transformers 5.14.1 generated for one tool prompt (the weather in Paris
+//! with a declared `get_weather(city)` tool, thinking off) on the BF16 and
+//! NVFP4 checkpoints over seeds 0..63, with the seeds that produced each.
+//! They include the malformed shapes the model writes: a call without its
+//! opening token, a thought channel whose name lacks its newline or that
+//! never closes, and a call without `call:`. The expected values are SGLang's
+//! non-streaming chat parse (`--reasoning-parser gemma4 --tool-call-parser
+//! gemma4`), except that the `<|channel>` token and channel name SGLang keeps
+//! in the reasoning of a channel whose name lacks its newline are stripped
+//! (the reply's `sglang` entry then records SGLang's own parse). A reply that
+//! follows the chat template's assistant grammar also records Transformers'
+//! `parse_response` of it (`hf`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -90,6 +104,62 @@ enum Block {
 fn fixture() -> Fixture {
     serde_json::from_str(include_str!("fixtures/gemma4_chat_output.json"))
         .expect("fixture is valid JSON")
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolReplyFixture {
+    prompt_token_ids: Vec<u32>,
+    replies: Vec<ToolReply>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolReply {
+    name: String,
+    output: Vec<(u32, String)>,
+    reasoning: String,
+    content: String,
+    tool_calls: Vec<ToolCall>,
+    /// Transformers' parse, present for a reply in the template's grammar.
+    hf: Option<Parse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Parse {
+    reasoning: String,
+    content: String,
+    tool_calls: Vec<ToolCall>,
+}
+
+/// The replies of `fixtures/gemma4_tool_replies.json`, each as a `Sample`
+/// expecting the reference serving parse, with Transformers' parse when the
+/// reply follows the template's grammar.
+fn tool_replies() -> Vec<(Sample, Option<Sample>)> {
+    let fixture: ToolReplyFixture =
+        serde_json::from_str(include_str!("fixtures/gemma4_tool_replies.json"))
+            .expect("fixture is valid JSON");
+    fixture
+        .replies
+        .into_iter()
+        .map(|reply| {
+            let sample = |name: &str, expected: Parse| Sample {
+                name: name.to_string(),
+                prompt_token_ids: fixture.prompt_token_ids.clone(),
+                output: reply.output.clone(),
+                reasoning: expected.reasoning,
+                content: expected.content,
+                tool_calls: expected.tool_calls,
+            };
+            let hf = reply
+                .hf
+                .map(|parse| sample(&format!("{} (Transformers)", reply.name), parse));
+            let serving = Parse {
+                reasoning: reply.reasoning,
+                content: reply.content,
+                tool_calls: reply.tool_calls,
+            };
+            (sample(&reply.name, serving), hf)
+        })
+        .collect()
 }
 
 /// Builds a tokenizer that holds the checkpoint's special tokens at their
@@ -257,6 +327,36 @@ async fn gemma4_processor_parses_replies_token_by_token_and_by_committed_block()
                 "{} with {tokens_per_delta} tokens per delta",
                 sample.name
             );
+        }
+    }
+}
+
+/// Every reply the model wrote to a tool prompt, malformed ones included,
+/// parses as the reference serving system parses it, and as Transformers
+/// does when the reply follows the template's grammar, token by token and by
+/// committed block. No channel markup reaches the reasoning or the content.
+#[tokio::test]
+async fn gemma4_processor_parses_real_tool_replies_as_the_reference_does() {
+    let tokenizer = gemma4_tokenizer();
+
+    for (serving, hf) in tool_replies() {
+        for sample in std::iter::once(&serving).chain(hf.as_ref()) {
+            for tokens_per_delta in [1, COMMITTED_BLOCK_TOKENS] {
+                let mut request = request_with_tools();
+                let processor =
+                    Gemma4ChatOutputProcessor::new(&mut request, Arc::clone(&tokenizer), true)
+                        .expect("build processor");
+
+                let blocks =
+                    assistant_blocks(processor, decoded_events(sample, tokens_per_delta)).await;
+
+                assert_eq!(
+                    blocks,
+                    expected_blocks(sample),
+                    "{} with {tokens_per_delta} tokens per delta",
+                    sample.name
+                );
+            }
         }
     }
 }
