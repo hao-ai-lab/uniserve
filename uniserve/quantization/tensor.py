@@ -31,8 +31,9 @@ class RowOrder(Enum):
     Independent of the represented values, like ``ScaleLayout``. The encoded
     values and the block scales of a stacked ``[E, rows, K]`` tensor store
     each expert matrix's rows in this order; decoding restores the logical
-    order. The orders are the row permutations TensorRT-LLM's grouped GEMMs
-    read (``shuffleMatrixA`` and ``reorderRowsForGatedActGemm``).
+    order. The orders are the row permutations grouped GEMMs read: those of
+    TensorRT-LLM's generated kernels (``shuffleMatrixA`` and
+    ``reorderRowsForGatedActGemm``) and of the CuTeDSL gated GEMM.
     """
 
     LINEAR = "linear"
@@ -44,17 +45,40 @@ class RowOrder(Enum):
     # 32-row block shuffles as in ``SHUFFLED_128``. A gated GEMM so reads
     # the linear and gate rows of one output channel side by side.
     INTERLEAVED_SHUFFLED_128 = "interleaved-shuffled-128"
+    # The two row halves interleave in 64-row blocks: 128-row block ``b``
+    # stores rows ``[64b, 64b + 64)`` of the first half, then the same rows
+    # of the second half. A gated GEMM whose epilogue reads 64-column
+    # subtiles so pairs each linear subtile with its gate subtile.
+    INTERLEAVED_64 = "interleaved-64"
+
+
+def _row_block(order: RowOrder) -> int:
+    """Return the row count every matrix stored in ``order`` divides into.
+
+    A permuted order moves rows only within blocks of this many rows (or
+    pairs such blocks across the two halves), so each expert matrix must
+    consist of whole blocks.
+    """
+    if order is RowOrder.LINEAR:
+        return 1
+    return 128 if order is RowOrder.INTERLEAVED_64 else 32
 
 
 def _logical_rows(order: RowOrder, rows: int) -> torch.Tensor:
     """Return the logical row stored at each physical row of one matrix.
 
-    ``rows`` must be a multiple of 32 for a shuffled order; the result is a
+    ``rows`` must be a multiple of ``_row_block(order)``; the result is a
     CPU ``int64`` permutation of ``range(rows)``.
     """
     positions = torch.arange(rows)
     if order is RowOrder.LINEAR:
         return positions
+
+    if order is RowOrder.INTERLEAVED_64:
+        # Physical row q lies in 128-row block q // 128; its first 64 rows
+        # hold first-half rows and its last 64 the matching second-half rows.
+        block, within = positions // 128, positions % 128
+        return block * 64 + within % 64 + (within // 64) * (rows // 2)
 
     # Physical position q of a 32-row block holds block row (q % 8) * 4 +
     # q // 8, the inverse of the shuffle's r -> (r % 4) * 8 + r // 4.

@@ -239,7 +239,7 @@ def _shuffled(rows):
 
 
 def test_row_orders_permute_each_expert_without_changing_values():
-    experts, rows, width = 2, 64, 32
+    experts, rows, width = 2, 256, 32
     generator = torch.Generator().manual_seed(3)
     values = torch.randint(
         0,
@@ -266,10 +266,14 @@ def test_row_orders_permute_each_expert_without_changing_values():
 
     # The interleaved order first puts row i of each half at 2i or 2i + 1.
     half = torch.arange(rows) % (rows // 2)
-    interleaved = 2 * half + (torch.arange(rows) >= rows // 2).long()
+    second = (torch.arange(rows) >= rows // 2).long()
+    interleaved = 2 * half + second
     positions = {
         RowOrder.SHUFFLED_128: _shuffled(rows),
         RowOrder.INTERLEAVED_SHUFFLED_128: _shuffled(rows)[interleaved],
+        # Row i of either half goes to 128-row block i // 64, at offset
+        # i % 64 in its first (first half) or second (second half) 64 rows.
+        RowOrder.INTERLEAVED_64: 128 * (half // 64) + half % 64 + 64 * second,
     }
     for order, position in positions.items():
         for layout in ScaleLayout:
@@ -298,18 +302,24 @@ def test_row_orders_permute_each_expert_without_changing_values():
 def test_row_orders_describe_only_stacked_block_scaled_rows():
     shuffled = RowOrder.SHUFFLED_128
     nvfp4 = Quantizer("nvfp4")
-    for shape in ((64, 32), (2, 48, 32)):
+    # A rank-2 matrix, a stack of partial 32-row blocks, and a stack of
+    # whole 32-row blocks that are not whole 128-row interleaving blocks.
+    for shape, order in (
+        ((64, 32), shuffled),
+        ((2, 48, 32), shuffled),
+        ((2, 64, 32), RowOrder.INTERLEAVED_64),
+    ):
         rows = shape[-2] * (shape[0] if len(shape) == 3 else 1)
         fields = {
             "values": torch.zeros((*shape[:-1], 16), dtype=torch.uint8),
             "block_scale": torch.zeros((rows, 2), dtype=torch.uint8),
             "tensor_scale": torch.ones(()),
         }
-        with pytest.raises(ValueError, match="row orders"):
+        with pytest.raises(ValueError, match="row order"):
             nvfp4.from_tensors(
-                fields, shape=shape, dtype=torch.float32, row_order=shuffled
+                fields, shape=shape, dtype=torch.float32, row_order=order
             )
-    with pytest.raises(ValueError, match="row orders"):
+    with pytest.raises(ValueError, match="row order"):
         Quantizer("fp8").from_tensors(
             {
                 "values": torch.zeros((2, 32, 4), dtype=torch.float8_e4m3fn),
