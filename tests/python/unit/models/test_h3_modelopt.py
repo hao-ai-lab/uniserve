@@ -34,14 +34,42 @@ MODELOPT_NVFP4 = {
 }
 
 
-@pytest.fixture
-def packed_checkpoint(tmp_path):
+@pytest.fixture(params=("unified", "manifest"))
+def packed_checkpoint(tmp_path, request):
     source = Path(__file__).parents[2] / "fixtures/models/fasth3"
     shutil.copytree(source, tmp_path, dirs_exist_ok=True)
     (tmp_path / "modular_model_index.json").write_text(
         json.dumps({"_class_name": "MiniMaxH3ModularPipeline"}),
         encoding="utf-8",
     )
+    if request.param == "manifest":
+        (tmp_path / "modelopt_manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "numerical_format": {
+                        "activation": "a4",
+                        "block_scale": "fp8_e4m3",
+                        "block_size": 16,
+                        "output": "bf16",
+                        "tensor_scale": "fp32",
+                        "values": "e2m1",
+                        "weight": "w4",
+                    },
+                    "components": {
+                        "denoiser": {
+                            "enabled": True,
+                            "modules": {
+                                "denoiser.transformer.layers.0.mlp.down": {
+                                    "activation_amax": 2688
+                                }
+                            },
+                        }
+                    },
+                }
+            )
+        )
+        return tmp_path
     for component in ("transformer", "vae"):
         path = tmp_path / component / "config.json"
         config = json.loads(path.read_text())
