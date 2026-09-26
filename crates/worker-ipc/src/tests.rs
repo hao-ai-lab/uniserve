@@ -444,6 +444,8 @@ fn a_readout_must_address_the_canvas_of_a_token_denoising_call() {
     empty_slot.readout.as_mut().unwrap().candidate_offsets = vec![0, 3, 3];
     let mut short_offsets = valid.clone();
     short_offsets.readout.as_mut().unwrap().candidate_offsets = vec![0, 2];
+    let mut unordered = valid.clone();
+    unordered.readout.as_mut().unwrap().slot_tokens.reverse();
     let mut sampling = valid.clone();
     sampling.token_output = Some(output_product(call_id));
     for call in [
@@ -452,6 +454,7 @@ fn a_readout_must_address_the_canvas_of_a_token_denoising_call() {
         outside,
         empty_slot,
         short_offsets,
+        unordered,
         sampling,
     ] {
         assert!(call.validate().is_err(), "{:?}", call.readout);

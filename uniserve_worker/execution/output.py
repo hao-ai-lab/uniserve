@@ -3,8 +3,8 @@
 `reserve_outputs` in `uniserve_worker.execution.prepare` calls
 `create_outputs` to create one `PendingOutput` per call of a batch, each bound
 to one row of the batch's pinned `OutputBuffer`. Execution then stages the
-call's domain results into it: sampling captures and speculative
-verification coordinates (`TokenResult`), latent trajectory updates
+call's domain results into it: sampling captures, canvas readouts and
+speculative verification coordinates (`TokenResult`), latent trajectory updates
 (`LatentResult`), host tasks and media (`HostResult`), and the projected
 `RequestProgress`.
 
@@ -18,6 +18,7 @@ calls `abandon` instead. No method here installs request progress itself.
 from __future__ import annotations
 
 import logging
+import struct
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -269,6 +270,10 @@ class TokenResult:
     logprobs: tuple[float, tuple[tuple[int, float, int], ...]] | None = None
     prompt_logprobs: tuple[tuple[tuple[int, float, int], ...], ...] = ()
     sampled: SamplerRow | None = None
+    # A canvas readout's `(offset, count)` span: one word per candidate,
+    # holding its FP32 log-probability's bits sign-extended from int32.
+    candidate_range: tuple[int, int] | None = None
+    candidate_logprobs: tuple[float, ...] = ()
 
     # These borrowed numerical views survive until DecodeState accepts them.
     runtime_logical_position: int | torch.Tensor = 0
@@ -541,6 +546,14 @@ class PendingOutput:
                     self._buffer.logprob_values(span)[1]
                     for span in self.token.prompt_logprob_ranges
                 )
+                if self.token.candidate_range is not None:
+                    words = self._buffer.read_tokens(
+                        *self.token.candidate_range
+                    )
+                    self.token.candidate_logprobs = struct.unpack(
+                        f"<{len(words)}f",
+                        struct.pack(f"<{len(words)}i", *words),
+                    )
             except Exception:
                 logger.exception(
                     "completion materialization failed: request=%s "
@@ -648,6 +661,11 @@ class PendingOutput:
                 ()
                 if suppressed or not self._reports_output
                 else self.token.prompt_logprobs
+            ),
+            candidate_logprobs=(
+                ()
+                if suppressed or not self._reports_output
+                else self.token.candidate_logprobs
             ),
             finish_flags=FinishFlags() if suppressed else self.finish_flags,
             media_output=self.host.media,

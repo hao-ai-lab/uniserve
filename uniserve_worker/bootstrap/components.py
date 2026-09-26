@@ -33,6 +33,7 @@ from uniserve.model import (
     ImageDecoder,
     PatchEncoder,
     TextEncoder,
+    TokenDenoiser,
     VideoDecoder,
     VideoPostprocessor,
 )
@@ -96,6 +97,8 @@ def call_kinds(calls: Iterable[Call]) -> frozenset[CallKind]:
             kinds.update(
                 (ForwardMode.PREFILL, ForwardMode.DECODE, ForwardMode.VERIFY)
             )
+        elif isinstance(module, TokenDenoiser) and method == "forward":
+            kinds.add(ForwardMode.TOKEN_DENOISING)
         elif isinstance(module, Denoiser) and method == "forward":
             kinds.update((MediaCall.LATENT_PREPARATION, MediaCall.DENOISING))
         elif isinstance(module, VideoPostprocessor) and method == "forward":
@@ -156,7 +159,8 @@ def describe_components(
             ancestor with a ``DeviceMesh`` or is one this pipeline stage
             participates in, a method is not callable, or the worker has no
             call kind for a method other than a ``CausalLM``'s
-            ``embed_input_ids`` or ``compute_logits``.
+            ``embed_input_ids`` or ``compute_logits`` or a
+            ``TokenDenoiser``'s ``compute_logits``.
     """
     if entries is None:
         entries = import_module(type(model).__module__).entry_points(
@@ -211,6 +215,8 @@ def describe_components(
             if not call_kinds((call,)) and not (
                 isinstance(module, CausalLM)
                 and method in {"embed_input_ids", "compute_logits"}
+                or isinstance(module, TokenDenoiser)
+                and method == "compute_logits"
             ):
                 raise unsupported_setup(
                     f"worker cannot execute capability {path}.{method}"

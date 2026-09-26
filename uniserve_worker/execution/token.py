@@ -328,6 +328,8 @@ def publish_sample(
         logical_position = start + (
             max(1, 1 if flow is None else int(flow.rope_advance))
             if call.completion_output is not None
+            else _vision_span(task)
+            if call.vision_input is not None
             else 1
         )
         publish_runtime_sample(
@@ -340,6 +342,7 @@ def publish_sample(
         )
         return _finish_visual(
             call,
+            task,
             image_builder=image_builder,
             request_tables=request_tables,
             state=state,
@@ -558,14 +561,29 @@ def _prepare_visual_sampling(
         return sample
     return _finish_visual(
         call,
+        task,
         image_builder=image_builder,
         request_tables=request_tables,
         state=state,
     )
 
 
+def _vision_span(task: TokenRow | DiffusionRow) -> int:
+    """Return the logical positions a vision row's temporal axis occupies.
+
+    Features sharing one temporal position span one; features at
+    consecutive positions span their count.
+    """
+    positions = task.positions
+    if positions is None:
+        raise RuntimeError("a vision row has no positions")
+    temporal = positions if positions.ndim == 1 else positions[0]
+    return int(temporal.max() - temporal.min()) + 1
+
+
 def _finish_visual(
     call: Call,
+    task: TokenRow | DiffusionRow,
     *,
     state: BatchState,
     image_builder: ImageBuilder | None,
@@ -574,8 +592,8 @@ def _finish_visual(
     """Advance the logical position past a visual row and stage its outcome.
 
     A call that closes the image advances by the image builder's RoPE advance
-    (at least one); another vision row advances by one; a latent row keeps
-    its position.
+    (at least one); another vision row advances past the positions it
+    occupies (``_vision_span``); a latent row keeps its position.
     """
     request = state.pending_output(call.request_key.request_id)
     position = int(calls.require_progress(request).logical_position)
@@ -588,7 +606,8 @@ def _finish_visual(
         )
     elif call.vision_input is not None:
         request.progress = replace(
-            calls.require_progress(request), logical_position=position + 1
+            calls.require_progress(request),
+            logical_position=position + _vision_span(task),
         )
     return image.state_outcome(call, request_tables=request_tables, state=state)
 

@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from uniserve.processing import ImageProcessor, PatchBudget, PatchTransform
+from uniserve.processing import (
+    FeatureInjection,
+    FeatureLayout,
+    ImageProcessor,
+    PatchBudget,
+    PatchTransform,
+    PositionLayout,
+)
 
 from .config import Config
 
@@ -28,9 +35,10 @@ def image_processor(config: Config) -> ImageProcessor:
     the BF16 projection. The serving front end counts an image's soft
     tokens with the same budget arithmetic before the image is decoded.
 
-    Image features take the place of the prompt's image placeholder tokens
-    inside the text prefill, so the processor declares no separate feature
-    injection.
+    An image's soft tokens enter the prompt directly between its
+    ``<|image>`` and ``<image|>`` text tokens, which the prompt itself
+    carries, and take consecutive positions as the placeholder tokens they
+    replace would.
     """
     vision = config.vision
     return ImageProcessor(
@@ -41,6 +49,10 @@ def image_processor(config: Config) -> ImageProcessor:
             normalization="unit",
             patch_layout="channels_last",
             resampling="torchvision",
+        ),
+        feature_injection=FeatureInjection(
+            layout=FeatureLayout.DIRECT,
+            positions=PositionLayout.SEQUENTIAL,
         ),
         alpha="drop",
     )

@@ -1,7 +1,8 @@
 """Prepared numerical calls with owned inputs and graph residency.
 
 ``ModelRunner`` is the base of the per-capability runners that
-``runner_type`` selects (text, diffusion, encoder, decoder). The base runner
+``runner_type`` selects (text, canvas, diffusion, encoder, decoder). The base
+runner
 serves two call paths:
 
 - Staged batches: ``prepare_inputs`` stages rows into the runner's
@@ -463,6 +464,7 @@ def runner_type(module):
         Denoiser,
         Encoder,
         ImageDecoder,
+        TokenDenoiser,
         VideoDecoder,
         VideoPostprocessor,
     )
@@ -470,6 +472,7 @@ def runner_type(module):
 
     # The runner modules import ``ModelRunner`` from this module, so they are
     # imported here rather than at module scope.
+    from .canvas_runner import CanvasRunner
     from .decoder_runner import DecoderRunner
     from .diffusion_runner import DiffusionRunner
     from .encoder_runner import EncoderRunner
@@ -479,6 +482,8 @@ def runner_type(module):
         return TextRunner
     if isinstance(module, Denoiser):
         return DiffusionRunner
+    if isinstance(module, TokenDenoiser):
+        return CanvasRunner
     if isinstance(
         module, (AudioDecoder, ImageDecoder, VideoDecoder, VideoPostprocessor)
     ):

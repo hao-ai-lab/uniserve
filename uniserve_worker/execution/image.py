@@ -610,7 +610,9 @@ def _vision_positions(
     """Build position ids for a vision row's marker and feature slots.
 
     Returns ``[query]`` positions for ``PositionLayout.TEMPORAL``, all at
-    ``conditioning_position``. Otherwise returns ``[3, query]`` rows of
+    ``conditioning_position``, and for ``PositionLayout.SEQUENTIAL``,
+    consecutive from ``conditioning_position``. Otherwise returns
+    ``[3, query]`` rows of
     temporal, height and width coordinates: feature slots take their raster
     grid coordinates and marker slots zero spatial coordinates. The raster
     grid is the patch grid of a ``height`` x ``width`` canvas under the
@@ -621,6 +623,9 @@ def _vision_positions(
         return torch.full(
             (query,), int(conditioning_position), dtype=torch.long
         )
+    if layout is PositionLayout.SEQUENTIAL:
+        start = int(conditioning_position)
+        return torch.arange(start, start + query, dtype=torch.long)
 
     transform = model_runner.image_processor().vit
     if not isinstance(transform, PatchTransform):

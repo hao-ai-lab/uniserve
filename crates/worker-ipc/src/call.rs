@@ -490,8 +490,9 @@ impl Readout {
     /// Validates the slot layout against a call of `canvas_tokens` canvas
     /// tokens.
     ///
-    /// Every slot addresses a canvas token and reads at least one candidate,
-    /// and the offsets partition `candidate_ids` in slot order.
+    /// Slots address canvas tokens in increasing order, each reads at least
+    /// one candidate, and the offsets partition `candidate_ids` in slot
+    /// order.
     pub fn validate(&self, canvas_tokens: usize) -> ValidationResult<()> {
         ensure_valid!(!self.slot_tokens.is_empty(), "readout reads no slot");
         ensure_valid!(
@@ -513,6 +514,10 @@ impl Readout {
                 .iter()
                 .all(|&token| (token as usize) < canvas_tokens),
             "readout slot lies outside the call's canvas rows"
+        );
+        ensure_valid!(
+            self.slot_tokens.windows(2).all(|pair| pair[0] < pair[1]),
+            "readout slots are not in canvas order"
         );
         Ok(())
     }

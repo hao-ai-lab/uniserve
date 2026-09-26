@@ -20,10 +20,18 @@ class BranchSource(StrEnum):
 
 
 class PositionLayout(StrEnum):
-    """Choose temporal or temporal/spatial coordinates for inserted features."""
+    """Choose the position coordinates of inserted features.
+
+    ``TEMPORAL`` places every feature at one temporal position and
+    ``TEMPORAL_SPATIAL`` adds each feature's grid row and column to it;
+    both advance the sequence by one position. ``SEQUENTIAL`` gives the
+    features consecutive positions, as text tokens take, and advances the
+    sequence past all of them.
+    """
 
     TEMPORAL = "temporal"
     TEMPORAL_SPATIAL = "temporal_spatial"
+    SEQUENTIAL = "sequential"
 
 
 class FeatureLayout(StrEnum):

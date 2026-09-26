@@ -13,6 +13,7 @@ from typing import Generic, TypeVar
 
 import torch
 
+from uniserve.model import CanvasInput
 from uniserve_worker.protocol.call import ForwardMode, MediaCall
 from uniserve_worker.sampling.metadata import TokenSelection
 
@@ -24,9 +25,11 @@ class InputBatch(Generic[InputT]):
     """One typed numerical input and the worker's aligned output controls.
 
     ``request_pool_indices`` is a nonempty [rows] vector naming the request
-    slot that receives each row's output. Text calls (a ``ForwardMode``)
-    carry one ``TokenSelection`` per row, and ``decode_force_finish``, when
-    present, is a [rows] bool mask; ``__post_init__`` checks both.
+    slot that receives each row's output. Sampled text calls (a
+    ``ForwardMode`` other than ``TOKEN_DENOISING``, whose canvas rows select
+    their slots themselves) carry one ``TokenSelection`` per row, and
+    ``decode_force_finish``, when present, is a [rows] bool mask;
+    ``__post_init__`` checks both.
     """
 
     forward_mode: ForwardMode | MediaCall
@@ -60,6 +63,7 @@ class InputBatch(Generic[InputT]):
             )
         if (
             isinstance(self.forward_mode, ForwardMode)
+            and self.forward_mode is not ForwardMode.TOKEN_DENOISING
             and len(self.token_selections) != self.row_count
         ):
             raise ValueError(
@@ -127,3 +131,78 @@ class TokenRow(AttentionRow):
         if self.token_ids is not None:
             return int(self.token_ids.numel())
         return 0
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasRow(AttentionRow):
+    """One token canvas denoised over its request's cached prefix.
+
+    The canvas attends non-causally to the request's first ``seq_len``
+    cached tokens and to all of its own tokens, and writes no KV, so
+    ``write_kv`` and ``causal`` stay false. ``token_ids`` and ``positions``
+    are host int64 ``[canvas]`` vectors. The row reads the logits of its
+    tokens ``slot_tokens``: slot ``i`` reports the log-probabilities of
+    ``candidate_ids[candidate_offsets[i]:candidate_offsets[i + 1]]`` under
+    the full-vocabulary softmax, so its output is FP32 ``[candidates]`` in
+    slot, then candidate order.
+    """
+
+    token_ids: torch.Tensor | None = None
+    slot_tokens: tuple[int, ...] = ()
+    candidate_offsets: tuple[int, ...] = (0,)
+    candidate_ids: tuple[int, ...] = ()
+
+    def __post_init__(self):
+        tokens = self.query_tokens
+        offsets = self.candidate_offsets
+        if (
+            self.write_kv
+            or self.causal
+            or tokens < 1
+            or self.positions is None
+            or self.positions.shape[-1] != tokens
+        ):
+            raise ValueError(
+                "a canvas row is a read-only noncausal token sequence"
+            )
+        if (
+            not self.slot_tokens
+            or len(offsets) != len(self.slot_tokens) + 1
+            or offsets[0] != 0
+            or offsets[-1] != len(self.candidate_ids)
+            or any(end <= start for start, end in zip(offsets, offsets[1:]))
+            or any(not 0 <= token < tokens for token in self.slot_tokens)
+        ):
+            raise ValueError(
+                "canvas slots must lie in the row and each read candidates"
+            )
+
+    @property
+    def query_tokens(self) -> int:
+        """Return the canvas length."""
+        return 0 if self.token_ids is None else int(self.token_ids.numel())
+
+
+@dataclass(frozen=True, slots=True)
+class ReadoutInput:
+    """Staged canvases of one token-denoising call and their candidate reads.
+
+    ``canvas`` packs every ``CanvasRow`` back to back. ``slot_tokens`` is
+    int64 ``[slots]``: each slot's index into the packed canvas tokens, in
+    row then slot order. ``candidates`` is int64 ``[slots, width]``, each
+    slot's candidate ids with the row padded by its first candidate, and
+    ``selection`` is int64 ``[candidates]``: the flat indices into
+    ``candidates`` of every real candidate, in row, slot and candidate
+    order. ``row_candidates`` holds each row's candidate count on the host.
+    """
+
+    canvas: CanvasInput
+    slot_tokens: torch.Tensor
+    candidates: torch.Tensor
+    selection: torch.Tensor
+    row_candidates: tuple[int, ...]
+
+    @property
+    def attention(self):
+        """The canvas rows' attention input, which execution binds."""
+        return self.canvas.attention

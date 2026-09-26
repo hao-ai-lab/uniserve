@@ -9,7 +9,6 @@ attention shapes of the released checkpoints runs every call through the
 automatic native attention providers and reproduces that CPU path.
 """
 
-import json
 import math
 from dataclasses import replace
 
@@ -17,11 +16,19 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 from transformers import (
-    DiffusionGemmaConfig,
-    DiffusionGemmaForBlockDiffusion,
     DynamicCache,
 )
 
+from tests.python.fixtures.checkpoints import (
+    BEGIN_IMAGE,
+    END_IMAGE,
+    HIDDEN,
+    IMAGE,
+    SOFTCAP,
+    VOCAB,
+    diffusion_gemma_checkpoint,
+    load_diffusion_gemma,
+)
 from uniserve.diffusion.tokens import self_conditioning_embedding
 from uniserve.loading import weights
 from uniserve.model import (
@@ -45,11 +52,6 @@ from uniserve_models import loading as models
 
 pytestmark = pytest.mark.integration
 
-# Transformers' sliding window counts the query: seven history tokens.
-WINDOW = 8
-SOFTCAP = 0.5
-HIDDEN, VOCAB = 32, 64
-IMAGE, BEGIN_IMAGE, END_IMAGE = 60, 58, 59
 # Every cache group's table holds eight pages of the unit pool; the groups'
 # tables name disjoint units.
 BLOCK_SIZE, PAGES = 4, 8
@@ -57,127 +59,6 @@ LAYERS = (
     "text.backbone.layers.0.attention.attention",
     "text.backbone.layers.1.attention.attention",
 )
-
-
-def _checkpoint(root, *, text=None, vision=None, unit_scores=False):
-    """Save a two-layer DiffusionGemma checkpoint; return its reference.
-
-    Layer 0 attends through a sliding window and layer 1 fully, with no
-    value projection and proportional rotation of a quarter of its 16-wide
-    heads. Norm weights, router scales, layer scalars, vision positions and
-    standardization are randomized so each factor is observable, and the
-    head's logits are large enough for the small softcap to bend them. The
-    tokenizer files declare the canvas's special tokens: pad 0, mask 4 and
-    end of turn 6. ``text`` and ``vision`` override entries of the text and
-    vision configurations. ``unit_scores`` scales every query norm by the
-    inverse square root of its head width, so the unscaled attention scores
-    of normalized queries and keys have unit variance, as trained query
-    norms keep them, instead of growing with the head width.
-    """
-    config = DiffusionGemmaConfig(
-        text_config={
-            "vocab_size": VOCAB,
-            "hidden_size": HIDDEN,
-            "intermediate_size": 48,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 8,
-            "global_head_dim": 16,
-            "num_global_key_value_heads": 1,
-            "layer_types": ["sliding_attention", "full_attention"],
-            "sliding_window": WINDOW,
-            "num_experts": 6,
-            "top_k_experts": 2,
-            "moe_intermediate_size": 16,
-            "use_bidirectional_attention": "vision",
-            "max_position_embeddings": 256,
-            "rms_norm_eps": 1e-6,
-            **(text or {}),
-        },
-        vision_config={
-            "model_type": "gemma4_vision",
-            "hidden_size": 24,
-            "intermediate_size": 40,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 2,
-            "head_dim": 12,
-            "patch_size": 4,
-            "pooling_kernel_size": 3,
-            "position_embedding_size": 32,
-            "rope_parameters": {"rope_theta": 100.0, "rope_type": "default"},
-            "standardize": True,
-            "use_clipped_linears": False,
-            **(vision or {}),
-        },
-        canvas_length=16,
-        image_token_id=IMAGE,
-        boi_token_id=BEGIN_IMAGE,
-        eoi_token_id=END_IMAGE,
-    )
-    config._attn_implementation = "eager"
-    torch.manual_seed(313)
-    model = DiffusionGemmaForBlockDiffusion(config).eval()
-    model.final_logit_softcapping = SOFTCAP
-
-    def uniform(value, low, high):
-        value.copy_(torch.rand_like(value) * (high - low) + low)
-
-    with torch.no_grad():
-        for name, value in model.named_parameters():
-            if name.endswith(".weight") and "norm" in name.split(".")[-2]:
-                uniform(value, 0.8, 1.2)
-            if unit_scores and name.endswith("q_norm.weight"):
-                value.mul_(value.numel() ** -0.5)
-        encoder = model.model.encoder
-        for index, layer in enumerate(model.model.decoder.layers):
-            uniform(layer.router.scale, 0.5, 1.5)
-            uniform(layer.router.per_expert_scale, 0.5, 2.0)
-            # Both stored copies of a layer scalar agree, as in the released
-            # checkpoints.
-            uniform(layer.layer_scalar, 0.3, 1.2)
-            encoder.language_model.layers[index].layer_scalar.copy_(
-                layer.layer_scalar
-            )
-        tower = encoder.vision_tower
-        tower.patch_embedder.position_embedding_table.normal_(std=0.02)
-        tower.std_bias.normal_(std=0.1)
-        uniform(tower.std_scale, 0.5, 1.5)
-
-    model.save_pretrained(root)
-    metadata = json.loads((root / "config.json").read_text())
-    metadata["text_config"]["final_logit_softcapping"] = SOFTCAP
-    metadata["vision_soft_tokens_per_image"] = 70
-    (root / "config.json").write_text(json.dumps(metadata))
-    (root / "generation_config.json").write_text(
-        json.dumps({"eos_token_id": [1, 6]})
-    )
-    (root / "tokenizer_config.json").write_text(
-        json.dumps(
-            {"pad_token": "<pad>", "mask_token": "<mask>", "eot_token": "<e>"}
-        )
-    )
-    (root / "tokenizer.json").write_text(
-        json.dumps(
-            {
-                "added_tokens": [
-                    {"id": 0, "content": "<pad>"},
-                    {"id": 4, "content": "<mask>"},
-                    {"id": 6, "content": "<e>"},
-                ]
-            }
-        )
-    )
-    return model
-
-
-def _load(root):
-    return models.load_model(
-        models.read_config(root),
-        device="cpu",
-        weights=weights.Config(dtype=torch.float32),
-    ).model
 
 
 def _capped(logits):
@@ -311,7 +192,7 @@ def test_prompt_cache_and_canvas_match_transformers(tmp_path, prompt_length):
     in sliding layers, the whole prompt in full layers, and every canvas
     token in both.
     """
-    reference = _checkpoint(tmp_path)
+    reference = diffusion_gemma_checkpoint(tmp_path)
     generator = torch.Generator().manual_seed(prompt_length)
     prompt = torch.randint(7, 58, (prompt_length,), generator=generator)
     canvas = torch.randint(0, 58, (9,), generator=generator)
@@ -324,7 +205,7 @@ def test_prompt_cache_and_canvas_match_transformers(tmp_path, prompt_length):
             reference.lm_head(expected.encoder_last_hidden_state[0])
         )
 
-    model = _load(tmp_path)
+    model = load_diffusion_gemma(tmp_path)
     cache, context = _session(model)
     with cache, context:
         context.prepare(TextSize(32, 1))
@@ -370,7 +251,7 @@ def test_self_conditioning_matches_transformers(tmp_path):
     A first pass without soft embeddings equals a pass whose soft
     embeddings are all zero.
     """
-    reference = _checkpoint(tmp_path)
+    reference = diffusion_gemma_checkpoint(tmp_path)
     generator = torch.Generator().manual_seed(5)
     prompt = torch.randint(7, 58, (12,), generator=generator)
     canvas = torch.randint(0, 58, (9,), generator=generator)
@@ -382,7 +263,7 @@ def test_self_conditioning_matches_transformers(tmp_path):
             self_conditioning_logits=previous[None],
         ).logits[0]
 
-    model = _load(tmp_path)
+    model = load_diffusion_gemma(tmp_path)
     soft = self_conditioning_embedding(
         previous,
         model.text.backbone.embedding.weight[:VOCAB],
@@ -411,7 +292,7 @@ def test_image_features_and_blocks_match_transformers(tmp_path):
     Each image block attends to itself in both directions, its prompt
     history through the sliding window, and later text attends causally.
     """
-    reference = _checkpoint(tmp_path)
+    reference = diffusion_gemma_checkpoint(tmp_path)
     generator = torch.Generator().manual_seed(17)
     images = (
         torch.rand(3, 24, 24, generator=generator),
@@ -468,7 +349,7 @@ def test_image_features_and_blocks_match_transformers(tmp_path):
             reference.lm_head(expected.encoder_last_hidden_state[0])
         )
 
-    model = _load(tmp_path)
+    model = load_diffusion_gemma(tmp_path)
     encoder = model.vision_encoder
     grid_tensors = tuple(torch.tensor([grid]) for grid in grids)
     with torch.no_grad():
@@ -514,7 +395,7 @@ def test_stacked_and_per_expert_checkpoints_load_identically(tmp_path):
     """Per-expert matrices load into the same rows as stacked tensors."""
     stacked, split = tmp_path / "stacked", tmp_path / "split"
     stacked.mkdir()
-    _checkpoint(stacked)
+    diffusion_gemma_checkpoint(stacked)
     split.mkdir()
     for path in stacked.iterdir():
         if path.suffix == ".json":
@@ -544,7 +425,7 @@ def test_stacked_and_per_expert_checkpoints_load_identically(tmp_path):
     canvas = torch.randint(0, 58, (9,), generator=generator)
     results = []
     for root in (stacked, split):
-        model = _load(root)
+        model = load_diffusion_gemma(root)
         cache, context = _session(model)
         with cache, context:
             context.prepare(TextSize(32, 1))
@@ -560,12 +441,12 @@ def test_stacked_and_per_expert_checkpoints_load_identically(tmp_path):
 
 def test_disagreeing_layer_scalars_are_rejected(tmp_path):
     """One backbone cannot represent differing encoder and decoder scalars."""
-    _checkpoint(tmp_path)
+    diffusion_gemma_checkpoint(tmp_path)
     state = load_file(tmp_path / "model.safetensors")
     state["model.encoder.language_model.layers.1.layer_scalar"] += 0.25
     save_file(state, tmp_path / "model.safetensors")
     with pytest.raises(ValueError, match="layer_scalar of layer 1 differ"):
-        _load(tmp_path)
+        load_diffusion_gemma(tmp_path)
 
 
 def _pipeline_stage(rank, rendezvous, root):
@@ -638,7 +519,7 @@ def test_pipeline_stages_exchange_the_complete_stream(tmp_path):
     """Two pipeline stages pass one complete stream and match upstream."""
     import torch.multiprocessing as mp
 
-    reference = _checkpoint(tmp_path)
+    reference = diffusion_gemma_checkpoint(tmp_path)
     generator = torch.Generator().manual_seed(11)
     prompt = torch.randint(7, 58, (10,), generator=generator)
     canvas = torch.randint(0, 58, (9,), generator=generator)
@@ -847,7 +728,7 @@ def test_native_cuda_attention_reproduces_the_cpu_torch_path(tmp_path):
     after retired pages. Prompt and canvas logits agree within the BF16
     attention tolerance.
     """
-    _checkpoint(
+    diffusion_gemma_checkpoint(
         tmp_path, text=NATIVE_TEXT, vision=NATIVE_VISION, unit_scores=True
     )
     generator = torch.Generator().manual_seed(23)
