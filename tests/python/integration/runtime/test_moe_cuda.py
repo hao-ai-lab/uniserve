@@ -384,17 +384,14 @@ def test_nvfp4_gating_applies_the_declared_nonlinearity(activation, provider):
 
 @pytest.mark.parametrize("provider", NVFP4_PROVIDERS)
 @torch.inference_mode()
-def test_nvfp4_calls_combining_many_routes_stay_within_the_rounding_bound(
-    provider,
-):
-    """Every call over eight routes per token is correctly combined.
+def test_nvfp4_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
+    """Eight routes per token combine identically on every call.
 
-    A provider may combine a token's routes in a different order on each
-    call, so its output need not repeat bit for bit; each call must still
-    combine every route once. Every expert projection is exact in FP32.
-    Each route's contribution passes at most eight BF16 roundings (its own
-    and seven additions) in any summation order, plus the FP32 route
-    products.
+    Repeated eager calls and replays of a captured call return the first
+    eager output bit for bit, so readouts of the same inputs repeat. Every
+    expert projection is exact in FP32; two BF16 roundings remain, of each
+    route's projection and of the combined output, plus the FP32 route
+    products and sums, however many routes a token combines.
     """
     top_k = EXPERTS
     generator = torch.Generator().manual_seed(61)
@@ -407,7 +404,7 @@ def test_nvfp4_calls_combining_many_routes_stay_within_the_rounding_bound(
         ids,
         weights,
         "gelu_tanh",
-    ).float()
+    )
 
     stream = CUDAStream.external(torch.cuda.Stream(device=DEVICE))
     stream.wait(torch.cuda.current_stream(DEVICE))
@@ -417,22 +414,16 @@ def test_nvfp4_calls_combining_many_routes_stay_within_the_rounding_bound(
     ):
         context.prepare(TextSize(TOKENS, 1))
         with context.activate():
+            first = module(hidden, ids, weights).clone()
+            torch.testing.assert_close(
+                first.double(), expected, rtol=_gamma(3), atol=0
+            )
             for _ in range(16):
-                torch.testing.assert_close(
-                    module(hidden, ids, weights).float(),
-                    expected,
-                    rtol=_gamma(top_k + 1),
-                    atol=0,
-                )
+                assert torch.equal(module(hidden, ids, weights), first)
         with CUDAGraph(context=context) as graph:
             graph.capture(lambda: module(hidden, ids, weights))
             for _ in range(16):
-                torch.testing.assert_close(
-                    graph.replay().float(),
-                    expected,
-                    rtol=_gamma(top_k + 1),
-                    atol=0,
-                )
+                assert torch.equal(graph.replay(), first)
     torch.cuda.synchronize(DEVICE)
 
 
