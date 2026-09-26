@@ -137,27 +137,135 @@ class PixelBounds:
 
 
 @dataclass(frozen=True, slots=True)
+class PatchBudget:
+    """Scale an image to fill a fixed patch budget at its aspect ratio.
+
+    The image scales so that its area reaches ``max_patches`` patches, and
+    each side floors to a multiple of the pooled patch side. A side that
+    floors to zero, which only a very elongated image produces, takes one
+    multiple; the other side then becomes the integer aspect ratio times
+    one multiple, capped at the longest side the budget's pooled tokens
+    allow. Every image therefore scales, up or down, to at most the budget.
+    """
+
+    max_patches: int
+
+    def __post_init__(self) -> None:
+        """Require a positive patch budget."""
+        _positive(self.max_patches, "image patch budget")
+
+    def pixel_bound(
+        self, *, patch_size: int, input_images: int | None = None
+    ) -> int:
+        """Return the pixel area of the budget, the same for every image.
+
+        ``input_images`` does not affect the bound: each image receives the
+        whole budget.
+        """
+        del input_images
+        return self.max_patches * patch_size**2
+
+    def fit(
+        self,
+        height: int,
+        width: int,
+        *,
+        patch_size: int,
+        downsample: int,
+        input_images: int | None = None,
+    ) -> tuple[int, int]:
+        """Return the resized ``(height, width)`` in pixels.
+
+        The float arithmetic follows the Transformers Gemma-4
+        ``get_aspect_ratio_preserving_size`` operation for operation, and
+        the server's soft-token planner performs the same IEEE-754 double
+        operations, so all three agree on every size whose pixel area is
+        exactly representable as a double.
+
+        Raises:
+            ValueError: For a nonpositive side.
+        """
+        del input_images
+        if min(height, width) < 1:
+            raise ValueError("image dimensions must be positive")
+
+        unit = patch_size * downsample
+        budget = self.pixel_bound(patch_size=patch_size)
+        factor = math.sqrt(budget / (height * width))
+        target_height = math.floor(factor * height / unit) * unit
+        target_width = math.floor(factor * width / unit) * unit
+        if target_height == 0 and target_width == 0:
+            raise ValueError(
+                f"a {height}x{width} image cannot hold one {unit}-pixel square"
+            )
+
+        longest = (self.max_patches // downsample**2) * unit
+        if target_height == 0:
+            target_height = unit
+            target_width = min(math.floor(width / height) * unit, longest)
+        elif target_width == 0:
+            target_width = unit
+            target_height = min(math.floor(height / width) * unit, longest)
+
+        # Positive sides never exceed the budget; the reference keeps the
+        # same guard.
+        if target_height * target_width > budget:
+            raise ValueError(
+                f"a {height}x{width} image resizes beyond "
+                f"{self.max_patches} patches"
+            )
+        return target_height, target_width
+
+
+@dataclass(frozen=True, slots=True)
 class PatchTransform:
-    """Resize and normalization for a patch-sequence tower.
+    """Resize, pixel scaling and patch packing for a patch-sequence tower.
 
     The tower cuts an image into ``patch_size`` squares and merges each
     ``downsample x downsample`` block of patches into one output token, so
     resized sides are multiples of ``patch_size * downsample`` pixels;
-    ``resize`` chooses the size. Packed patch rows hold channel, pixel row,
-    pixel column values and follow the patch grid in raster order.
+    ``resize`` chooses the size. ``resampling`` names the implementation of
+    the antialiased bicubic filter applied to decoded 8-bit images:
+    ``"pil"`` is PIL's filter, ``"torchvision"`` is torchvision's on the
+    ``uint8`` CHW tensor, rounded back to 8 bits. The two differ by one
+    level on a fraction of pixels, so a tower names the one its reference
+    processor uses.
+
+    ``normalization`` maps 8-bit values to the tower's input range:
+    ``"imagenet"`` and ``"signed_unit"`` divide by 255 and then standardize
+    or map to ``[-1, 1]``; ``"unit"`` multiplies by the float32 rescale
+    factor ``1/255`` as Transformers image processors do, which differs
+    from dividing by 255 in the last bit for about half of the byte values.
+
+    ``patch_layout`` orders the values within each packed patch row:
+    ``"channels_first"`` is channel, pixel row, pixel column, as a patch
+    convolution reads them, and ``"channels_last"`` is pixel row, pixel
+    column, channel (``uniserve.nn.functional.patchify``), as a patch
+    linear projection reads them. Rows follow the patch grid in raster
+    order either way.
     """
 
     patch_size: int
     downsample: int
-    resize: PixelBounds
-    normalization: Literal["imagenet", "signed_unit"] = "imagenet"
+    resize: PixelBounds | PatchBudget
+    normalization: Literal["imagenet", "signed_unit", "unit"] = "imagenet"
+    patch_layout: Literal["channels_first", "channels_last"] = "channels_first"
+    resampling: Literal["pil", "torchvision"] = "pil"
 
     def __post_init__(self) -> None:
-        """Require positive patch dimensions and a known resize policy."""
+        """Require positive patch dimensions and known policies."""
         _positive(self.patch_size, "patch size")
         _positive(self.downsample, "patch downsample")
-        if not isinstance(self.resize, PixelBounds):
-            raise ValueError("patch towers resize by pixel bounds")
+        if not isinstance(self.resize, (PixelBounds, PatchBudget)):
+            raise ValueError("patch towers resize by pixel bounds or budget")
+        if self.normalization not in ("imagenet", "signed_unit", "unit"):
+            raise ValueError(
+                f"unknown image normalization {self.normalization!r}"
+            )
+        if self.patch_layout not in ("channels_first", "channels_last"):
+            raise ValueError(f"unknown patch layout {self.patch_layout!r}")
+        if self.resampling not in ("pil", "torchvision"):
+            raise ValueError(f"unknown image resampling {self.resampling!r}")
 
     def pixel_bound(self, input_images: int | None = None) -> int:
         """Return the upper bound on one resized image's pixel area.
@@ -235,19 +343,29 @@ class TowerTransform:
 
 @dataclass(frozen=True, slots=True)
 class ImageProcessor:
-    """Defines ViT and VAE transforms, staging dtype, and language-sequence feature injection."""  # noqa: E501
+    """Defines ViT and VAE transforms, staging dtype, and language-sequence feature injection.
+
+    ``alpha`` sets how a decoded image with transparency becomes RGB before
+    either transform: ``"white"`` composites it over an opaque white
+    background, and ``"drop"`` discards the alpha channel and keeps every
+    pixel's stored color, as PIL's ``convert("RGB")`` does. A
+    ``staging_dtype`` of None stages the FP32 transform output.
+    """  # noqa: E501
 
     vit: PatchTransform | TowerTransform | None = None
     vae: TowerTransform | None = None
     staging_dtype: torch.dtype | None = None
     feature_injection: FeatureInjection | None = None
+    alpha: Literal["white", "drop"] = "white"
 
     def __post_init__(self) -> None:
-        """Require at least one image transform for the caller."""
+        """Require at least one image transform and a known alpha policy."""
         if self.vit is None and self.vae is None:
             raise ValueError(
                 "image processor must implement at least one transform"
             )
+        if self.alpha not in ("white", "drop"):
+            raise ValueError(f"unknown image alpha policy {self.alpha!r}")
 
 
 __all__ = [
@@ -258,6 +376,7 @@ __all__ = [
     "FeatureInjection",
     "FeatureLayout",
     "ImageProcessor",
+    "PatchBudget",
     "PatchTransform",
     "PixelBounds",
     "StrideResize",
