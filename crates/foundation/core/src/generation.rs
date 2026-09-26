@@ -127,7 +127,8 @@ pub struct CanvasSampling {
     pub t_min: f32,
     /// Sampling temperature of a block's first step.
     pub t_max: f32,
-    /// Mean canvas entropy, in nats, below which a stable block stops.
+    /// Mean canvas entropy, in nats, below which a stable block stops; zero
+    /// never stops a block early.
     pub confidence_threshold: f32,
     /// Steps the argmax canvas must hold unchanged before a block stops;
     /// zero stops a block on confidence alone.
