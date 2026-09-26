@@ -2,10 +2,11 @@
 
 ``send_request`` is the single entry point the benchmark runner
 (``uniserve_eval.pipeline.run``) uses per request. It routes by endpoint to a
-transport for synchronous video, image generations, streamed chat, or
+transport for native video APIs, image generations, streamed chat, or
 non-streaming chat, and folds everything observable into one
 ``RequestRecord``: HTTP status, success and a stable failure classifier, client
-timing, token usage with its provenance, generated text, and decoded media.
+timing, token usage with its provenance, generated text, and media. Video
+bodies remain encoded until the runner inspects them after measurement.
 
 All timestamps are ``time.perf_counter`` values on the same clock as
 ``RequestRecord.start_time``. Streamed events carry the client receipt time
@@ -14,6 +15,7 @@ that ``SseParser`` stamps into their ``_client_t`` field.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -21,9 +23,9 @@ import httpx
 
 from ..types import IMAGES_GENERATIONS, VIDEOS_SYNC, RequestRecord, TaskRequest
 from .images import ImageOutputError, decode_openai_image_parts
+from .native_video import receive_video
 from .openai import OpenAIChat
 from .sse import aiter_sse_events
-from .video import VideoOutputError, inspect_video_bytes
 
 
 async def send_request(
@@ -36,6 +38,7 @@ async def send_request(
     prompt_len: int = 0,
     output_len_fallback: int = 0,
     scheduled_time: float | None = None,
+    timeout_s: float = 6 * 60 * 60,
 ) -> RequestRecord:
     """Dispatch one task request through its endpoint-specific transport.
 
@@ -48,8 +51,9 @@ async def send_request(
 
     Returns:
         The closed record. HTTP status and response-content failures carry
-        their own classifiers; any raised ``Exception``, including httpx
-        connection errors and timeouts, becomes ``transport_failure``.
+        their own classifiers. Expiration of the overall logical deadline
+        becomes ``request_deadline``; other raised ``Exception`` instances,
+        including httpx connection errors, become ``transport_failure``.
         Exceptions outside ``Exception``, such as ``asyncio.CancelledError``,
         propagate.
     """
@@ -66,8 +70,12 @@ async def send_request(
         requested_output_len=int(output_len_fallback),
     )
     try:
-        if request.endpoint == VIDEOS_SYNC:
-            await _send_video(client, url, payload, record)
+        if request.video_backend is not None or request.endpoint == VIDEOS_SYNC:
+            record.prompt_len = prompt_len
+            record.requested_seconds = float(payload["seconds"])
+            # One deadline covers dispatch, polling and the complete media body.
+            async with asyncio.timeout(timeout_s):
+                await receive_video(client, base_url, request, record)
         elif request.endpoint == IMAGES_GENERATIONS:
             await _send_images(client, url, payload, record)
         elif request.stream:
@@ -78,6 +86,11 @@ async def send_request(
             await _send_chat(
                 client, url, payload, record, prompt_len, output_len_fallback
             )
+    except TimeoutError:
+        record.close_at(record.start_time + timeout_s)
+        record.mark_failure(
+            "request_deadline", f"logical request exceeded {timeout_s}s"
+        )
     except Exception as error:  # noqa: BLE001 - benchmarks emit structured failures.
         record.mark_transport_exception(error)
     return record
@@ -293,37 +306,6 @@ async def _send_chat_stream(
     # Images decode after timing is folded; a decode failure replaces the
     # stream's classification.
     _attach_images(record, image_parts)
-
-
-async def _send_video(
-    client: httpx.AsyncClient,
-    url: str,
-    payload: dict[str, Any],
-    record: RequestRecord,
-) -> None:
-    """Execute a synchronous video request and validate its raw MP4 body.
-
-    Latency closes once the complete body has been read, before the MP4 is
-    inspected.
-    """
-    async with client.stream("POST", url, json=payload) as response:
-        record.note_http(response.status_code)
-        body = await response.aread()
-        record.close_now()
-        if response.status_code >= 400:
-            record.mark_failure(
-                f"transport_status_{response.status_code}",
-                body.decode("utf-8", errors="replace")[:500],
-            )
-            return
-        try:
-            record.decoded_video = inspect_video_bytes(
-                body, declared_mime=response.headers.get("content-type", "")
-            )
-        except VideoOutputError as error:
-            record.mark_failure(error.classifier, str(error))
-            return
-        record.mark_success()
 
 
 def _classify_images(payload: Any) -> tuple[bool, str]:

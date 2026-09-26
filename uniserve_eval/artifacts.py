@@ -22,8 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from .transport.images import inspect_image_bytes
-from .transport.video import inspect_video_bytes
-from .types import DecodedImage, DecodedVideo
+from .types import DecodedImage
 
 
 class ArtifactWriter:
@@ -70,6 +69,32 @@ class ArtifactWriter:
         finally:
             # After a successful rename the temporary name no longer exists
             # and this is a no-op; on failure it removes the partial file.
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        return path
+
+    def write_original_video(self, path: Path, data: bytes) -> Path:
+        """Durably retain bytes, including bodies rejected by inspection.
+
+        Callers supply a request-qualified path. Existing different bytes are
+        never overwritten, so a canonical output cannot silently change.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            if path.read_bytes() != data:
+                raise FileExistsError(f"original media already exists: {path}")
+            return path
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent, delete=False
+            ) as handle:
+                temporary_path = Path(handle.name)
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(temporary_path, path)
+        finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
         return path
@@ -139,44 +164,6 @@ class ArtifactWriter:
             ) as handle:
                 temporary_path = Path(handle.name)
                 handle.write(image.data)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, path)
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
-        return path
-
-    def write_video_sample(self, video: DecodedVideo) -> Path:
-        """Validate and store a content-addressed MP4 sample.
-
-        Validation, reuse, and error behavior follow `write_image_sample`,
-        with `VideoOutputError` raised when `inspect_video_bytes` rejects the
-        bytes or the declared MIME type.
-        """
-        inspected = inspect_video_bytes(video.data, declared_mime=video.mime)
-        if inspected.metadata_dict() != video.metadata_dict():
-            raise ValueError(
-                "generated video metadata does not match its response bytes"
-            )
-
-        path = self.samples_dir / video.sample_filename
-        if path.exists():
-            if path.read_bytes() != video.data:
-                raise ValueError("content-addressed video sample collision")
-            return path
-
-        temporary_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                dir=path.parent,
-                prefix=f".{path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as handle:
-                temporary_path = Path(handle.name)
-                handle.write(video.data)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary_path, path)

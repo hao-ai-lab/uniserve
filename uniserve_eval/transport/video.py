@@ -7,9 +7,8 @@ derived from the bytes and the normalized media type. Model-specific
 expectations such as codecs, raster, frame count, and audio format are
 checked by ``VideoTask.validate_output``, not here.
 
-``ArtifactWriter.write_video_sample`` inspects the sample bytes again before
-storing them and requires metadata equal to the transport's result, so the
-returned metadata must stay a deterministic function of those inputs.
+Inspection runs after transport completion for the entire measured batch.
+Original response bytes are persisted even when inspection rejects them.
 """
 
 from __future__ import annotations
@@ -17,6 +16,8 @@ from __future__ import annotations
 import hashlib
 import io
 from fractions import Fraction
+
+import numpy as np
 
 from ..types import DecodedVideo
 
@@ -91,17 +92,46 @@ def inspect_video_bytes(data: bytes, *, declared_mime: str) -> DecodedVideo:
             audio_samples = 0
             audio_channels: int | None = None
             audio_sample_rate: int | None = None
+            pixel_count = 0
+            pixel_sum = pixel_squares = 0.0
+            pcm_count = 0
+            pcm_squares = 0.0
 
             # Fully decode both streams; container metadata alone cannot prove
             # that frames and PCM samples are readable.
             for frame in container.decode(video=0, audio=0):
                 if isinstance(frame, av.VideoFrame):
                     frame_count += 1
+                    pixels = frame.to_ndarray(format="rgb24").astype(np.float64)
+                    pixel_count += pixels.size
+                    pixel_sum += float(pixels.sum())
+                    pixel_squares += float(np.square(pixels).sum())
+                    if (frame.width, frame.height) != (
+                        video_stream.codec_context.width,
+                        video_stream.codec_context.height,
+                    ):
+                        raise VideoOutputError(
+                            "response_inconsistent_video_shape",
+                            "video raster changes within the response",
+                        )
                     continue
                 if isinstance(frame, av.AudioFrame):
                     # `samples` counts samples per channel, so the total over
                     # sample rate is the audio duration in seconds.
                     audio_samples += int(frame.samples)
+                    pcm = frame.to_ndarray()
+                    # Report RMS in normalized PCM units for integer formats.
+                    scale = (
+                        max(
+                            abs(np.iinfo(pcm.dtype).min),
+                            np.iinfo(pcm.dtype).max,
+                        )
+                        if np.issubdtype(pcm.dtype, np.integer)
+                        else 1.0
+                    )
+                    normalized = pcm.astype(np.float64) / scale
+                    pcm_count += pcm.size
+                    pcm_squares += float(np.square(normalized).sum())
                     channels = len(frame.layout.channels)
                     rate = int(frame.sample_rate)
                     if audio_channels is None:
@@ -159,6 +189,12 @@ def inspect_video_bytes(data: bytes, *, declared_mime: str) -> DecodedVideo:
                 audio_sample_rate=audio_sample_rate,
                 audio_samples=audio_samples,
                 sample_filename=f"{checksum}.mp4",
+                video_variance=max(
+                    0.0,
+                    pixel_squares / pixel_count
+                    - (pixel_sum / pixel_count) ** 2,
+                ),
+                audio_rms=float(np.sqrt(pcm_squares / pcm_count)),
             )
     except VideoOutputError:
         raise

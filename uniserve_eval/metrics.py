@@ -205,7 +205,7 @@ def summarize(
         for record in successful
         if record.decoded_video is not None
     ]
-    if videos:
+    if any(record.task == "video" for record in records):
         summary["completed_videos"] = len(videos)
         summary["videos_per_second"] = len(videos) / duration
         # Only MP4 bytes of returned videos count; images do not contribute.

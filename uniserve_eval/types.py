@@ -81,6 +81,9 @@ class LoadConfig:
     max_concurrency: int | None = None
     warmup_requests: int = 1
     seed: int = 42
+    warmup_manifest: str | None = None
+    priming_manifest: str | None = None
+    request_timeout_s: float = 6 * 60 * 60
 
     def __post_init__(self) -> None:
         """Validate load parameters that govern request scheduling."""
@@ -92,6 +95,13 @@ class LoadConfig:
             raise ValueError("max_concurrency must be positive")
         if self.warmup_requests < 0:
             raise ValueError("warmup_requests must be non-negative")
+        if self.warmup_manifest and self.warmup_requests:
+            raise ValueError("warmup_manifest requires warmup_requests = 0")
+        if (
+            not math.isfinite(self.request_timeout_s)
+            or self.request_timeout_s <= 0
+        ):
+            raise ValueError("request_timeout_s must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -156,14 +166,16 @@ class ImageConfig:
 class VideoConfig:
     """Configures generated duration and synthesized prompt length.
 
-    ``seconds`` is the requested duration of rows without a per-row override
-    and the duration ``VideoTask.validate_output`` checks every output
-    against. ``prompt_tokens`` is the tokenizer length of the prompts that
+    ``seconds`` is the requested duration of rows without a per-row override.
+    ``prompt_tokens`` is the tokenizer length of the prompts that
     the MiniMax H3 dataset synthesizes.
     """
 
     seconds: float = 5.0
     prompt_tokens: int = 1000
+    backend: str = "uniserve"
+    poll_interval_s: float = 0.1
+    media_dir: str | None = None
 
     def __post_init__(self) -> None:
         """Validate finite duration and positive prompt length."""
@@ -171,6 +183,10 @@ class VideoConfig:
             raise ValueError("video seconds must be finite and positive")
         if self.prompt_tokens < 1:
             raise ValueError("video prompt_tokens must be positive")
+        if self.backend not in {"uniserve", "vllm-omni", "sglang", "fastvideo"}:
+            raise ValueError("unknown video backend")
+        if not math.isfinite(self.poll_interval_s) or self.poll_interval_s <= 0:
+            raise ValueError("poll_interval_s must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -198,6 +214,7 @@ class Example:
     seed: int | None = None
     aspect_ratio: str | None = None
     seconds: float | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         """Return populated fields as a JSON-compatible mapping."""
@@ -215,6 +232,8 @@ class TaskRequest:
     endpoint: str
     payload: dict[str, Any]
     stream: bool
+    video_backend: str | None = None
+    poll_interval_s: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -270,6 +289,8 @@ class DecodedVideo:
     audio_sample_rate: int
     audio_samples: int
     sample_filename: str
+    video_variance: float = 0.0
+    audio_rms: float = 0.0
 
     @property
     def fps(self) -> float:
@@ -302,6 +323,8 @@ class DecodedVideo:
             "audio_channels": self.audio_channels,
             "audio_sample_rate": self.audio_sample_rate,
             "audio_samples": self.audio_samples,
+            "video_variance": self.video_variance,
+            "audio_rms": self.audio_rms,
             "video_duration_s": self.video_duration_s,
             "audio_duration_s": self.audio_duration_s,
             "sample_filename": self.sample_filename,
@@ -366,6 +389,12 @@ class RequestRecord:
     image_steps: list[int] = field(default_factory=list)
     decoded_images: list[DecodedImage] = field(default_factory=list, repr=False)
     decoded_video: DecodedVideo | None = field(default=None, repr=False)
+    video_body: bytes | None = field(default=None, repr=False)
+    video_mime: str = ""
+    requested_seconds: float | None = None
+    media_checks: dict[str, bool] = field(default_factory=dict)
+    original_output: dict[str, Any] | None = None
+    example: dict[str, Any] | None = None
     status_code: int | None = None
     finish_reason: str | None = None
     stop_reason: str | None = None
@@ -625,6 +654,15 @@ class RequestRecord:
                 if self.decoded_video is not None
                 else None
             ),
+            "requested_seconds": self.requested_seconds,
+            "media_checks": self.media_checks,
+            "original_output": self.original_output,
+            "example": self.example,
+            "real_time_factor": (
+                self.latency / self.decoded_video.video_duration_s
+                if self.decoded_video is not None
+                else None
+            ),
             # Transport terminal state remains available for validation reports.
             "status_code": self.status_code,
             "finish_reason": self.finish_reason,
@@ -651,6 +689,7 @@ class BenchmarkPoint:
     tokenizer: str | None = None
     endpoint: str = CHAT_COMPLETIONS
     question: str | None = None
+    provenance: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Normalize the task identifier and require protected metrics."""
@@ -682,6 +721,7 @@ class BenchmarkPoint:
             "tokenizer": self.tokenizer,
             "endpoint": self.endpoint,
             "question": self.question,
+            "provenance": self.provenance,
             "load": load,
             "sampling": asdict(self.sampling),
             "image": asdict(self.image),
