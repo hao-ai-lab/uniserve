@@ -9,15 +9,17 @@ and runs ``CuteDslMoEWrapper``: a routing sort groups the (token, route)
 pairs by expert into 128-row tiles; the FC1 GEMM gathers each tile's token
 rows, accumulates in FP32, applies the gating nonlinearity to the
 dequantized FP32 products and encodes the gated product to NVFP4 in its
-epilogue; the FC2 GEMM dequantizes in FP32, scales each row by its FP32
-route weight, rounds the route's contribution to BF16 and adds it into the
-token's BF16 output row with an atomic bulk reduction.
+epilogue; the FC2 GEMM dequantizes in FP32 and stores each (token, route)
+row in BF16; a final pass sums every token's routes in route order in FP32,
+each weighted by its FP32 route weight, and rounds the sum to BF16 once.
 
-The combined output of a token with three or more routes can therefore
-differ between calls of the same inputs: the order in which concurrently
-running tiles add a token's BF16 route contributions varies, and BF16
-addition is not associative. Every order stays within the rounding bound
-of one BF16 rounding per route and per addition.
+The provider uses only this two-stage combination (FlashInfer's
+``use_fused_finalize=False``). FlashInfer's fused alternative adds each
+route into the token's BF16 output row with an atomic reduction from
+whichever tile computed it, so the order of the BF16 additions, and with it
+the output, varies between calls of the same inputs. The two-stage
+combination fixes the order: repeated calls of the same inputs, eager or
+replayed, give bitwise identical outputs.
 
 The kernels read expert weights with ``up_gate`` in
 ``RowOrder.INTERLEAVED_64`` (each 128-row block holds 64 up rows, which the
@@ -30,15 +32,14 @@ are unchanged, so every provider and the portable reference decode them
 identically, and only one copy stays resident.
 
 Every per-call buffer (the encoded hidden states and their scales, routing
-tables, the encoded FC1 output and its scales, and the returned output)
-comes from PyTorch's caching allocator, and from the graph's private pool
-under CUDA graph capture, so ``workspace_buffers`` is empty. The operator
-owns FlashInfer's auxiliary stream and two events, created at preparation:
-the output rows are zeroed on the auxiliary stream while FC1 runs, and the
-caller's stream waits for that before FC2, so the result is ordered on the
-caller's stream. The first eager call compiles the kernels; the tactic is
-FlashInfer's default unless its autotuner has recorded one. Capture must
-follow an eager call, as for every prepared operator.
+tables, the encoded FC1 output and its scales, the ``[T * K, H]`` BF16
+route rows and the returned output) comes from PyTorch's caching
+allocator, and from the graph's private pool under CUDA graph capture, so
+``workspace_buffers`` is empty. Every kernel runs on the caller's current
+stream; the operator owns no stream or event. The first eager call
+compiles the kernels; the tactic is FlashInfer's default unless its
+autotuner has recorded one. Capture must follow an eager call, as for
+every prepared operator.
 """
 
 from __future__ import annotations
@@ -102,15 +103,16 @@ class _CuteDsl(_Operator):
         self._fc2_alpha = fields2["tensor_scale"] * input2
 
         # Default SwiGLU parameters (alpha 1, beta 0, no limit) give
-        # silu(gate) * up. use_cuda_graph gives this operator its own
-        # auxiliary stream and events instead of process-wide ones that
-        # concurrently running operators would share.
+        # silu(gate) * up. The two-stage finalize runs on the caller's
+        # stream alone; use_cuda_graph would only create the auxiliary
+        # stream and events of the fused finalize's overlapped output
+        # zeroing, which this combination never runs.
         self._kernel = CuteDslMoEWrapper(
             num_experts=experts,
             top_k=module.top_k,
             hidden_size=hidden,
             intermediate_size=intermediate,
-            use_cuda_graph=True,
+            use_cuda_graph=False,
             output_dtype=torch.bfloat16,
             device=device,
             activation_type=(
@@ -118,6 +120,7 @@ class _CuteDsl(_Operator):
                 if module.activation == "silu"
                 else ActivationType.GegluTanh
             ).value,
+            use_fused_finalize=False,
             quant_mode="w4a4",
         )
 
@@ -159,9 +162,8 @@ class _CuteDsl(_Operator):
 
     def close(self) -> None:
         super().close()
-        # Release the borrowed weight fields, derived scales and the
-        # kernel's stream resources, so a closed operator never keeps a
-        # replaced encoding resident.
+        # Release the borrowed weight fields and derived scales, so a closed
+        # operator never keeps a replaced encoding resident.
         self._kernel = None
         self._fc1 = self._fc2 = self._fc1_scale = self._fc2_scale = None
         self._input_scale = self._fc1_alpha = None

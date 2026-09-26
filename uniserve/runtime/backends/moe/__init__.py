@@ -24,8 +24,7 @@ from uniserve.tensors import BufferConfig
 
 # Native providers in automatic selection order. Their representations are
 # disjoint: trtllm-gen serves NVFP4 experts, CUTLASS BF16 and FP16 experts.
-# CuTeDSL also serves NVFP4 experts, by explicit selection only: its atomic
-# combine does not repeat bit for bit between calls.
+# CuTeDSL also serves NVFP4 experts, by explicit selection.
 _NATIVE = ("trtllm", "cutlass")
 _PROVIDERS = frozenset((*_NATIVE, "cutedsl", "torch"))
 
