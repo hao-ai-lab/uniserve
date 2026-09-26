@@ -22,6 +22,7 @@ adda64ef4f063ab1389019a02a612e171a1ec4e65786bd7d3784ef1ef474f19a):
 """
 
 import dataclasses
+import json
 import math
 
 import pytest
@@ -476,8 +477,9 @@ def test_rows_without_history_stop_on_the_confidence_threshold(
     assert decision.finished[:, 0].tolist() == [stops, stops, True]
 
 
-def test_product_reports_the_algorithm_it_measured():
-    # A shape no other test multiplies, so its first product happens here.
+def test_product_times_shapes_the_table_does_not_name():
+    # A shape no other test multiplies and no table entry names, so its
+    # first product times the proposals here.
     generator = torch.Generator().manual_seed(41)
     positions, vocab, hidden = 96, 4096, 40
     weights = torch.rand(positions, vocab, generator=generator).bfloat16()
@@ -489,12 +491,51 @@ def test_product_reports_the_algorithm_it_measured():
     assert kernels.product_algorithm(*operands) is None
     kernels.product(*operands)
     chosen = kernels.product_algorithm(*operands)
-    assert chosen is not None and chosen["cublaslt_version"] > 0
+    assert chosen is not None and chosen["source"] == "measured"
 
     expected = weights.double() @ table.double()
     spread = weights.double().abs() @ table.double().abs()
     difference = (output.cpu().double() - expected).abs()
     assert (difference <= 2 * vocab * U * spread).all()
+
+
+def test_product_takes_the_algorithm_the_table_names():
+    # One canvas row of 256 positions, DiffusionGemma's vocabulary and width.
+    positions, vocab, hidden = 256, 262144, 2816
+    scratch_bytes = kernels.product_scratch_bytes(positions, hidden)
+    key = kernels.product_table_key(
+        DEVICE, positions, hidden, vocab, scratch_bytes
+    )
+    shipped = json.loads(kernels.PRODUCT_TABLE.read_text())["entries"]
+    named = [
+        entry["algorithm"]
+        for entry in shipped
+        if (
+            entry["device"],
+            entry["cublaslt_version"],
+            entry["m"],
+            entry["n"],
+            entry["k"],
+            entry["scratch_bytes"],
+        )
+        == key
+    ]
+    if not named:
+        pytest.skip("the table names no algorithm for this device and cuBLASLt")
+    generator = torch.Generator(device=DEVICE).manual_seed(43)
+    weights = torch.rand(
+        positions, vocab, generator=generator, device=DEVICE
+    ).bfloat16()
+    table = torch.randn(
+        vocab, hidden, generator=generator, device=DEVICE
+    ).bfloat16()
+    output = torch.empty(positions, hidden, device=DEVICE)
+    scratch = torch.empty(scratch_bytes, dtype=torch.uint8, device=DEVICE)
+
+    kernels.product(weights, table, output, scratch)
+    chosen = kernels.product_algorithm(weights, table, output, scratch)
+    assert chosen["source"] == "table"
+    assert {field: chosen[field] for field in named[0]} == named[0]
 
 
 @pytest.mark.parametrize(("rows", "hidden"), [(1, 64), (4, 2816)])

@@ -11,8 +11,10 @@ resident (:class:`CanvasState`) and supplies each row's Philox coordinates
 the host, allocates, or knows request identities, so a CUDA graph can
 capture ``start_canvas`` and ``denoise_canvas`` for a fixed row count. On
 CUDA, run one eager step of each row count before capturing it: that step
-configures the kernels and measures the self-conditioning product's
-algorithm, which synchronizes the device.
+configures the kernels and chooses the self-conditioning product's
+algorithm, from the kernels' shipped table or by timing the candidates,
+which synchronizes the device (see
+``uniserve_kernels.diffusion.canvas.product``).
 
 A block runs ``start_canvas`` before its first pass (rows at step 0 draw
 their initial canvas and clear history and self-conditioning), then per
@@ -266,18 +268,12 @@ class CanvasDecision:
         )
 
 
-# The CUDA self-conditioning product's cuBLASLt workspace holds split-K
-# partial sums: room for eight FP32 products of the step's shape, within
-# 32 MiB to 256 MiB.
-_SCRATCH_PARTIALS = 8
-_SCRATCH_BYTES = (32 << 20, 256 << 20)
-
-
 def _scratch_bytes(positions: int, hidden_size: int, device_type: str) -> int:
+    # The CUDA self-conditioning product's cuBLASLt workspace; the kernels
+    # size it and key their shipped algorithm table by that size.
     if device_type != "cuda":
         return 0
-    partials = _SCRATCH_PARTIALS * positions * hidden_size * 4
-    return min(max(partials, _SCRATCH_BYTES[0]), _SCRATCH_BYTES[1])
+    return _kernels().product_scratch_bytes(positions, hidden_size)
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,7 +282,8 @@ class CanvasWorkspace:
 
     ``weights`` ``[R * C, V]`` in the embedding dtype, ``normalizer`` FP32
     ``[R * C]``, ``product`` FP32 ``[R * C, H]`` and ``scratch`` uint8 bytes
-    the CUDA product uses as its cuBLASLt workspace (empty on the CPU).
+    the CUDA product uses as its cuBLASLt workspace (empty on the CPU; see
+    ``uniserve_kernels.diffusion.canvas.product_scratch_bytes``).
     ``score_canvas`` fills the first two in an implementation-defined form
     that ``condition_canvas`` consumes; the contents are otherwise
     unspecified. ``weights`` must not share storage with the logits. Steps
