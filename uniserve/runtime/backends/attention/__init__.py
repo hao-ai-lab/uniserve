@@ -25,7 +25,14 @@ class Operator:
     ``window`` is the layer's history bound in tokens (``None`` reads the
     whole history); its visibility rule is documented on
     :class:`uniserve.nn.attention.Attention`.
+
+    ``reads_retired_tables`` states whether the provider consumes block
+    tables whose rows start after logical page zero
+    (``BlockTable.start_page``). A provider that does not rejects such a
+    table instead of reading its columns from the wrong logical pages.
     """
+
+    reads_retired_tables = False
 
     def __init__(
         self,
@@ -76,11 +83,19 @@ class Operator:
         """
         self._check_batch(batch)
 
-        if self.requires_host_lengths(batch) and any(
-            lengths is not None and lengths.host is None
-            for lengths in (
-                getattr(batch, name, None)
-                for name in ("queries", "keys", "prefixes")
+        table = getattr(batch, "block_table", None)
+        if self.requires_host_lengths(batch) and (
+            any(
+                lengths is not None and lengths.host is None
+                for lengths in (
+                    getattr(batch, name, None)
+                    for name in ("queries", "keys", "prefixes")
+                )
+            )
+            or (
+                table is not None
+                and table.start_page is not None
+                and table.start_page_host is None
             )
         ):
             raise ValueError(
@@ -127,6 +142,17 @@ class Operator:
                 raise ValueError(
                     "attention block table and cache block sizes differ"
                 )
+
+        table = getattr(batch, "block_table", None)
+        if (
+            table is not None
+            and table.start_page is not None
+            and not self.reads_retired_tables
+        ):
+            raise ValueError(
+                "this attention provider reads block tables from logical "
+                "page zero and cannot consume retired window pages"
+            )
 
     def update_cache(
         self,

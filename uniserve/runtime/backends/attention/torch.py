@@ -26,6 +26,28 @@ def _host(lengths: SequenceLengths) -> tuple[int, ...]:
     return lengths.host
 
 
+def _origin(table, row: int) -> int:
+    """Return the absolute token position of a table row's first column.
+
+    Eager evaluation reads the exact host start page; a table without start
+    pages begins every row at token zero.
+    """
+    if table is None or table.start_page is None:
+        return 0
+    if table.start_page_host is None:
+        raise ValueError(
+            "eager paged attention over retired pages requires host start pages"
+        )
+    return table.start_page_host[row] * table.block_size
+
+
+def _device_origin(table, row: int):
+    """Return a row's first-column token position without a host read."""
+    if table is None or table.start_page is None:
+        return 0
+    return table.start_page[row] * table.block_size
+
+
 def _paged(value, table, length):
     """Gather one sequence's live prefix pages.
 
@@ -204,6 +226,7 @@ def _captured(q, k, v, batch, cache, scale, window):
                 batch.keys.values[row]
                 if isinstance(batch, VisibleInput)
                 else batch.prefixes.values[row]
+                - _device_origin(batch.block_table, row)
                 + (query_count if isinstance(batch, PagedInput) else 0)
             )
             table = batch.block_table.indices[row]
@@ -270,6 +293,22 @@ def _captured(q, k, v, batch, cache, scale, window):
 
 
 class _TorchOperator(_Operator):
+    # Keys are gathered from each row's first column and positions counted
+    # from its origin; causal and window visibility depend only on relative
+    # positions, so retired pages that no reader needs never enter a result.
+    reads_retired_tables = True
+
+    def _check_batch(self, batch):
+        super()._check_batch(batch)
+        if (
+            isinstance(batch, VisibleInput)
+            and batch.block_table is not None
+            and batch.block_table.start_page is not None
+        ):
+            raise ValueError(
+                "visible key endpoints are not defined over retired pages"
+            )
+
     def __call__(self, q, k, v, batch, *, scale, out):
         self._validate(q, k, v, batch, out)
 
@@ -335,7 +374,11 @@ class _TorchOperator(_Operator):
                     if self.cache is None
                     else (self.cache.key, self.cache.value)
                 )
-                key_count = _host(batch.prefixes)[row] + count
+                key_count = (
+                    _host(batch.prefixes)[row]
+                    - _origin(batch.block_table, row)
+                    + count
+                )
                 keys = _paged(key, batch.block_table.indices[row], key_count)
                 values = _paged(
                     value, batch.block_table.indices[row], key_count
@@ -380,7 +423,9 @@ class _TorchOperator(_Operator):
                 )
                 kstart += key_count
             elif isinstance(batch, SegmentedInput):
-                prefix = _host(batch.prefixes)[row]
+                prefix = _host(batch.prefixes)[row] - _origin(
+                    batch.block_table, row
+                )
                 keys = _paged(
                     self.cache.key, batch.block_table.indices[row], prefix
                 )

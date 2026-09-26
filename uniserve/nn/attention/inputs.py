@@ -88,14 +88,28 @@ class SequenceLengths:
 
 @dataclass(frozen=True, slots=True)
 class BlockTable:
-    """Map [sequence, logical block] to physical block IDs.
+    """Map [sequence, page column] to physical block IDs.
 
-    Sequence lengths determine the valid portion of each row. Unused trailing
-    entries have no numerical meaning and are never part of an attention read.
+    Column ``j`` of row ``b`` holds absolute logical page
+    ``start_page[b] + j``, so the absolute token position ``p`` of the row
+    lies in column ``p // block_size - start_page[b]`` at page offset
+    ``p % block_size``. Sequence lengths stay absolute: the valid columns of a
+    row end at the page holding its last key. Pages before a row's start page
+    are retired, a representation only history-windowed caches produce; the
+    row's reader must need none of their keys. Unused trailing entries have
+    no numerical meaning and are never part of an attention read.
+
+    ``start_page`` is an int32 ``[B]`` device column, or ``None`` when every
+    row starts at page zero, as every full-history table does.
+    ``start_page_host`` optionally mirrors the column exactly on the host;
+    the caller keeps both consistent while an invocation uses them, and
+    construction never reads the device column.
     """
 
     indices: torch.Tensor
     block_size: int
+    start_page: torch.Tensor | None = None
+    start_page_host: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -107,6 +121,32 @@ class BlockTable:
             raise ValueError(
                 "block tables require a positive block size and an integer "
                 "matrix"
+            )
+        if self.start_page is None:
+            if self.start_page_host is not None:
+                raise ValueError(
+                    "a host start-page mirror requires its device column"
+                )
+            return
+        if (
+            self.start_page.shape != (self.indices.shape[0],)
+            or self.start_page.dtype != torch.int32
+            or self.start_page.device != self.indices.device
+        ):
+            raise ValueError(
+                "table start pages require one int32 page per row on the "
+                "table's device"
+            )
+        if self.start_page_host is not None and (
+            not isinstance(self.start_page_host, tuple)
+            or len(self.start_page_host) != self.indices.shape[0]
+            or any(
+                type(page) is not int or page < 0
+                for page in self.start_page_host
+            )
+        ):
+            raise ValueError(
+                "host start pages must mirror one nonnegative page per row"
             )
 
 
@@ -197,9 +237,15 @@ class PagedInput:
         block_size: int,
         causal: bool | tuple[bool, ...],
         device: torch.device | str,
+        start_pages: tuple[int, ...] | None = None,
     ) -> PagedInput:
         """Build a block table and addresses for appending each query to its
         prefix.
+
+        Each row of ``blocks`` holds the physical blocks of its logical pages
+        from its entry of ``start_pages`` on (page zero when ``None``). The
+        blocks must cover every appended position, which must lie at or
+        after the row's start page.
         """  # noqa: D205
         if (
             not isinstance(blocks, tuple)
@@ -212,6 +258,15 @@ class PagedInput:
                 "block lists and sequence lengths must have matching batch "
                 "sizes"
             )
+        starts = (0,) * len(blocks) if start_pages is None else start_pages
+        if (
+            not isinstance(starts, tuple)
+            or len(starts) != len(blocks)
+            or any(type(page) is not int or page < 0 for page in starts)
+        ):
+            raise ValueError(
+                "start pages must give one nonnegative page per block row"
+            )
         queries = SequenceLengths.from_lengths(query_lengths, device=device)
         prefixes = SequenceLengths.from_lengths(prefix_lengths, device=device)
         flags = (causal,) * len(blocks) if type(causal) is bool else causal
@@ -220,8 +275,8 @@ class PagedInput:
         width = max(map(len, blocks), default=0)
         rows = []
         addresses: list[int] = []
-        for row, query, prefix in zip(
-            blocks, query_lengths, prefix_lengths, strict=True
+        for row, query, prefix, start in zip(
+            blocks, query_lengths, prefix_lengths, starts, strict=True
         ):
             if not isinstance(row, tuple) or any(
                 type(block) is not int
@@ -232,16 +287,20 @@ class PagedInput:
                 raise ValueError(
                     "physical block IDs must be nonnegative int32 integers"
                 )
-            if len(row) * block_size < prefix + query:
+            if (start + len(row)) * block_size < prefix + query or (
+                query and prefix < start * block_size
+            ):
                 raise ValueError(
                     "block table does not cover the prefix and query"
                 )
             # Short rows are zero-padded to the shared table width; padded
             # entries are never read because lengths bound the valid span.
             rows.append((*row, *((0,) * (width - len(row)))))
-            # One physical token address per appended query position.
+            # One physical token address per appended query position, in the
+            # row's columns counted from its start page.
             addresses.extend(
-                row[position // block_size] * block_size + position % block_size
+                row[position // block_size - start] * block_size
+                + position % block_size
                 for position in range(prefix, prefix + query)
             )
 
@@ -251,7 +310,14 @@ class PagedInput:
         return cls(
             queries,
             prefixes,
-            BlockTable(table, block_size),
+            BlockTable(
+                table,
+                block_size,
+                None
+                if start_pages is None
+                else torch.tensor(starts, dtype=torch.int32, device=device),
+                None if start_pages is None else starts,
+            ),
             torch.tensor(addresses, dtype=torch.int64, device=device),
             flags,
         )
