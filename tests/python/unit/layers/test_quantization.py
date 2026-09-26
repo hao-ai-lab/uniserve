@@ -5,7 +5,12 @@ import io
 import pytest
 import torch
 
-from uniserve.quantization import QuantizedTensor, Quantizer, ScaleLayout
+from uniserve.quantization import (
+    QuantizedTensor,
+    Quantizer,
+    RowOrder,
+    ScaleLayout,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -224,6 +229,96 @@ def test_block_decoding_uses_encoded_values_and_both_nvfp4_scales():
     torch.testing.assert_close(
         mxfp8.dequantize(), torch.full((1, 32), 0.5), rtol=0, atol=0
     )
+
+
+def _shuffled(rows):
+    """Physical position of each row under the 32-row block shuffle."""
+    row = torch.arange(rows)
+    within = row % 32
+    return row - within + (within % 4) * 8 + within // 4
+
+
+def test_row_orders_permute_each_expert_without_changing_values():
+    experts, rows, width = 2, 64, 32
+    generator = torch.Generator().manual_seed(3)
+    values = torch.randint(
+        0,
+        256,
+        (experts, rows, width // 2),
+        dtype=torch.uint8,
+        generator=generator,
+    )
+    block_scale = (
+        (torch.rand(experts * rows, width // 16, generator=generator) + 0.5)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+    )
+    encoded = Quantizer("nvfp4").from_tensors(
+        {
+            "values": values,
+            "block_scale": block_scale,
+            "tensor_scale": torch.tensor([0.5, 2.0]),
+        },
+        shape=(experts, rows, width),
+        dtype=torch.float32,
+    )
+    logical = encoded.dequantize()
+
+    # The interleaved order first puts row i of each half at 2i or 2i + 1.
+    half = torch.arange(rows) % (rows // 2)
+    interleaved = 2 * half + (torch.arange(rows) >= rows // 2).long()
+    positions = {
+        RowOrder.SHUFFLED_128: _shuffled(rows),
+        RowOrder.INTERLEAVED_SHUFFLED_128: _shuffled(rows)[interleaved],
+    }
+    for order, position in positions.items():
+        for layout in ScaleLayout:
+            placed = encoded.repack(scale_layout=layout, row_order=order)
+            assert placed.row_order is order
+            assert torch.equal(placed.dequantize(), logical)
+            # Physical row position[r] stores logical row r of every expert.
+            assert torch.equal(placed.buffers()["values"][:, position], values)
+
+            restored = placed.repack(
+                scale_layout=ScaleLayout.LINEAR, row_order=RowOrder.LINEAR
+            )
+            for name in ("values", "block_scale"):
+                assert torch.equal(
+                    restored.buffers()[name], encoded.buffers()[name]
+                )
+
+            checkpoint = io.BytesIO()
+            torch.save(placed, checkpoint)
+            checkpoint.seek(0)
+            loaded = torch.load(checkpoint, weights_only=True)
+            assert loaded.row_order is order
+            assert torch.equal(loaded.dequantize(), logical)
+
+
+def test_row_orders_describe_only_stacked_block_scaled_rows():
+    shuffled = RowOrder.SHUFFLED_128
+    nvfp4 = Quantizer("nvfp4")
+    for shape in ((64, 32), (2, 48, 32)):
+        rows = shape[-2] * (shape[0] if len(shape) == 3 else 1)
+        fields = {
+            "values": torch.zeros((*shape[:-1], 16), dtype=torch.uint8),
+            "block_scale": torch.zeros((rows, 2), dtype=torch.uint8),
+            "tensor_scale": torch.ones(()),
+        }
+        with pytest.raises(ValueError, match="row orders"):
+            nvfp4.from_tensors(
+                fields, shape=shape, dtype=torch.float32, row_order=shuffled
+            )
+    with pytest.raises(ValueError, match="row orders"):
+        Quantizer("fp8").from_tensors(
+            {
+                "values": torch.zeros((2, 32, 4), dtype=torch.float8_e4m3fn),
+                "scale": torch.ones(()),
+            },
+            shape=(2, 32, 4),
+            dtype=torch.float32,
+            row_order=shuffled,
+        )
 
 
 @pytest.mark.parametrize("format", [None, "fp8"])
