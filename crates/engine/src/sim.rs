@@ -966,34 +966,34 @@ impl SimEngine {
             .groups = groups;
     }
 
-    /// Sets the total KV block capacity and its sole group capacity when applicable.
+    /// Sets the simulator's KV unit count, including the unit-zero sentinel.
     ///
     /// # Panics
     ///
     /// Panics when the simulated worker does not expose a KV cache.
-    pub fn set_num_blocks(&mut self, count: u32) {
-        let kv_cache = self
-            .info
-            .kv_cache
-            .as_mut()
-            .expect("sim AR worker has a KV cache");
-        kv_cache.num_blocks = count;
-        if kv_cache.groups.len() == 1 {
-            kv_cache.groups[0].num_blocks = count;
-        }
-    }
-
-    /// Sets the simulator's KV block size in tokens.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the simulated worker does not expose a KV cache.
-    pub fn set_block_size(&mut self, size: u32) {
+    pub fn set_num_units(&mut self, count: u32) {
         self.info
             .kv_cache
             .as_mut()
             .expect("sim AR worker has a KV cache")
-            .block_size = size;
+            .num_units = count;
+    }
+
+    /// Sets every KV group's page size in tokens.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the simulated worker does not expose a KV cache.
+    pub fn set_page_tokens(&mut self, tokens: u32) {
+        for group in &mut self
+            .info
+            .kv_cache
+            .as_mut()
+            .expect("sim AR worker has a KV cache")
+            .groups
+        {
+            group.page_tokens = tokens;
+        }
     }
 
     /// Returns mutable access to the simulator's advertised capabilities.
@@ -1301,7 +1301,7 @@ mod tests {
                     worker: WorkerId("sim".into()),
                     request_pool_idx: None,
                     block_tables: Vec::new(),
-                    new_cache_pages: Vec::new(),
+                    new_cache_units: Vec::new(),
                     forward: ForwardBatch::default(),
                     latent: None,
                     decode: None,

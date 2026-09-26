@@ -590,14 +590,13 @@ impl WorkerExecutor {
         }
         if lost {
             for (buffer, publication) in &mut self.kv_transfers {
-                for tensor in &mut publication.tensors {
+                for tensor in publication.tensors_mut() {
                     tensor
                         .locations
                         .retain(|location| !loss.endpoints.contains(&location.source));
                 }
                 if publication
-                    .tensors
-                    .iter()
+                    .tensors()
                     .any(|tensor| !tensor.has_complete_coverage())
                 {
                     buffers.insert(*buffer);
@@ -1035,7 +1034,7 @@ impl WorkerExecutor {
             .chain(
                 wire.kv_inputs
                     .iter_mut()
-                    .flat_map(|publication| &mut publication.tensors),
+                    .flat_map(|publication| publication.tensors_mut()),
             );
         for tensor in tensors {
             tensor.locations.retain(|location| {

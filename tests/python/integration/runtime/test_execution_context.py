@@ -71,7 +71,7 @@ def test_device_lengths_drive_current_attention_values(
         stream if stream is not None else nullcontext(),
         PrefixCache(
             Config({"attention": mha.Config(2, 64, (0, 1), dtype)}),
-            num_blocks=2,
+            num_units=2,
             block_size=16,
             device=device,
         ) as cache,
@@ -178,10 +178,8 @@ def test_nested_execution_contexts_keep_prefixes_independent():
     module.projection.weight.copy_(torch.eye(64))
     config = Config({"attention": mha.Config(1, 64, (0,), torch.float32)})
     with (
-        PrefixCache(config, num_blocks=1, block_size=16, device="cpu") as first,
-        PrefixCache(
-            config, num_blocks=1, block_size=16, device="cpu"
-        ) as second,
+        PrefixCache(config, num_units=1, block_size=16, device="cpu") as first,
+        PrefixCache(config, num_units=1, block_size=16, device="cpu") as second,
         ExecutionContext(module, cache=first, attention="torch") as a,
     ):
         a.prepare(TextSize(1, 1))
@@ -282,9 +280,7 @@ def test_eager_attention_replans_changed_sequence_boundaries():
         for _ in range(2)
     )
     with (
-        PrefixCache(
-            config, num_blocks=2, block_size=16, device=device
-        ) as cache,
+        PrefixCache(config, num_units=2, block_size=16, device=device) as cache,
         ExecutionContext(layer, cache=cache, attention="flashinfer") as context,
     ):
         context.prepare(TextSize(5, 2))
@@ -372,9 +368,7 @@ def test_bound_metadata_serves_one_call_and_later_changes_are_planned(provider):
         prefixes=replace(initial.prefixes, host=None),
     )
     with (
-        PrefixCache(
-            config, num_blocks=2, block_size=16, device=device
-        ) as cache,
+        PrefixCache(config, num_units=2, block_size=16, device=device) as cache,
         ExecutionContext(layer, cache=cache, attention=provider) as context,
     ):
         context.prepare(TextSize(5, 2))

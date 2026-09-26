@@ -235,14 +235,15 @@ fn controls_and_disconnection_release_requests_during_preprocessing() {
     });
 }
 
-/// A chat prompt that exceeds the total capacity of a two-block KV cache is
+/// A chat prompt that exceeds the total capacity of a two-unit KV cache is
 /// returned as a stream and then rejected by engine admission. Collecting the
 /// completion must report that rejection as HTTP 400 and record the request
 /// as `Rejected`.
 #[tokio::test]
 async fn chat_admission_rejection_remains_a_bad_request() {
     let mut worker = SimEngine::new();
-    worker.set_num_blocks(2);
+    // Unit zero is the sentinel: two allocatable 64-token pages remain.
+    worker.set_num_units(3);
     let runtime = runtime_with_worker(worker);
     let request = serde_json::from_value(serde_json::json!({
         "model": "sim-model",

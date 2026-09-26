@@ -30,14 +30,14 @@ use uniserve_worker_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode}
 
 use anyhow::Context as _;
 use uniserve_core::{
-    BlockId, DiffusionRequest, DiffusionSamplingParams, EngineCoreOutput, Request, RequestId,
-    RuntimeFamily, SamplingParams,
+    DiffusionRequest, DiffusionSamplingParams, EngineCoreOutput, Request, RequestId, RuntimeFamily,
+    SamplingParams, UnitId,
 };
 use uniserve_engine::{
     EngineConfig, EngineCore, Executor, WorkerConfig, WorkerFailure, WorkerGroup, WorkerProcessArgs,
 };
 use uniserve_worker_ipc::{
-    ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, CachePageAllocation, Call, CallId,
+    ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, CacheUnitAllocation, Call, CallId,
     CallKind, CallStatus, DType, DimBound, ErrorCode, ForwardBatch, Locator, NewRequest,
     RequestKey, ShapeBound, TensorPublication, TensorRef, TransferHandle, TransferTransport,
 };
@@ -88,7 +88,7 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
         CallId::new(2, 0),
         CallKind::Forward(ForwardMode::Prefill),
         &[7, 8],
-        BlockId(1),
+        UnitId(1),
         0,
     );
     let second_admission = token_batch(
@@ -99,7 +99,7 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
         CallId::new(3, 0),
         CallKind::Forward(ForwardMode::Prefill),
         &[9, 10],
-        BlockId(2),
+        UnitId(2),
         0,
     );
     // Both requests are admitted by one command-only batch carrying their
@@ -300,7 +300,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                 CallId::new(1, 0),
                 CallKind::Forward(ForwardMode::Prefill),
                 &[7, 8],
-                BlockId(1),
+                UnitId(1),
                 0,
             );
             let request = |mut request: WorkerRequest, message_id| {
@@ -338,7 +338,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                 CallId::new(2, 0),
                 CallKind::Forward(ForwardMode::Prefill),
                 &[9, 10],
-                BlockId(2),
+                UnitId(2),
                 0,
             );
             // No `WorkerGroup` sits in front of this worker, so its own
@@ -465,7 +465,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
                         worker: WorkerId("worker".into()),
                         request_pool_idx: None,
                         block_tables: batch.block_tables,
-                        new_cache_pages: batch.new_cache_pages,
+                        new_cache_units: batch.new_cache_units,
                         forward: batch.forward,
                         latent: batch.latent_params.into_iter().next(),
                         decode: batch.decode_ranges.into_iter().next(),
@@ -485,7 +485,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             CallId::new(1, 0),
             CallKind::Forward(ForwardMode::Prefill),
             &[7],
-            BlockId(1),
+            UnitId(1),
             0,
         );
         let value = source.calls[0].token_output.clone().unwrap();
@@ -644,7 +644,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         first_id,
         CallKind::Forward(ForwardMode::Prefill),
         &[7],
-        BlockId(1),
+        UnitId(1),
         0,
     );
     let mut successor = token_batch(
@@ -655,7 +655,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         second_id,
         CallKind::Forward(ForwardMode::Decode),
         &[0],
-        BlockId(1),
+        UnitId(1),
         1,
     );
     // Reserve the next row's shape, but obtain its token only from the device
@@ -670,7 +670,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         verify_id,
         CallKind::Forward(ForwardMode::Verify),
         &[0, 900, 901],
-        BlockId(1),
+        UnitId(1),
         2,
     );
     verifier.calls[0].input_token_ids = vec![900, 901];
@@ -683,7 +683,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         resumed_id,
         CallKind::Forward(ForwardMode::Decode),
         &[0],
-        BlockId(1),
+        UnitId(1),
         5,
     );
     resumed.calls[0].input_token_ids.clear();
@@ -704,7 +704,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
             worker: WorkerId("worker".into()),
             request_pool_idx: None,
             block_tables: batch.block_tables,
-            new_cache_pages: batch.new_cache_pages,
+            new_cache_units: batch.new_cache_units,
             forward: batch.forward,
             latent: None,
             decode: None,
@@ -806,7 +806,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
                     worker: WorkerId("worker".into()),
                     request_pool_idx: None,
                     block_tables: batch.block_tables,
-                    new_cache_pages: batch.new_cache_pages,
+                    new_cache_units: batch.new_cache_units,
                     forward: batch.forward,
                     latent: batch.latent_params.into_iter().next(),
                     decode: batch.decode_ranges.into_iter().next(),
@@ -933,7 +933,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
             CallId::new(3, 0),
             CallKind::Forward(ForwardMode::Prefill),
             &[9],
-            BlockId(2),
+            UnitId(2),
             0,
         ),
         "model",
@@ -1053,7 +1053,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
                     worker: WorkerId("consumer".into()),
                     request_pool_idx: None,
                     block_tables: batch.block_tables,
-                    new_cache_pages: batch.new_cache_pages,
+                    new_cache_units: batch.new_cache_units,
                     forward: batch.forward,
                     latent: batch.latent_params.into_iter().next(),
                     decode: batch.decode_ranges.into_iter().next(),
@@ -1188,7 +1188,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
         CallId::new(3, 0),
         CallKind::Forward(ForwardMode::Prefill),
         &[9],
-        BlockId(2),
+        UnitId(2),
         0,
     );
     executor.submit(bind(independent, Vec::new()))?;
@@ -1245,7 +1245,7 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
             CallId::new(1, 0),
             CallKind::Forward(ForwardMode::Prefill),
             &[7, 8],
-            BlockId(1),
+            UnitId(1),
             0,
         );
         worker.submit_batch(batch)?;
@@ -1481,7 +1481,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         CallId::new(1, 0),
         CallKind::Forward(ForwardMode::Prefill),
         &[7, 8],
-        BlockId(1),
+        UnitId(1),
         0,
     );
     // The bound the scheduler's `logprob_result_bytes` would derive: the
@@ -1518,7 +1518,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         CallId::new(1, 0),
         CallKind::Forward(ForwardMode::Prefill),
         &[7, 8, 9],
-        BlockId(1),
+        UnitId(1),
         0,
     );
     assert!(executor.submit_batch(conflicting).is_err());
@@ -1548,7 +1548,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         CallId::new(3, 0),
         CallKind::Forward(ForwardMode::Decode),
         &[first_record.committed_tokens.as_slice()[0]],
-        BlockId(1),
+        UnitId(1),
         2,
     );
     continuation.calls[0].bounds.max_completion_bytes = 4 + 2 * 12;
@@ -1577,7 +1577,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         CallId::new(6, 0),
         CallKind::Forward(ForwardMode::Prefill),
         &[9, 10],
-        BlockId(2),
+        UnitId(2),
         0,
     );
     close_batch.commands.push(close.clone());
@@ -1602,7 +1602,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         CallId::new(8, 0),
         CallKind::Forward(ForwardMode::Decode),
         &[first_record.committed_tokens.as_slice()[0]],
-        BlockId(1),
+        UnitId(1),
         2,
     );
     let closed = execute(&mut executor, descendant)?;
@@ -1644,7 +1644,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         CallId::new(9, 0),
         CallKind::Forward(ForwardMode::Prefill),
         &[7, 8],
-        BlockId(3),
+        UnitId(3),
         0,
     );
     initial.calls[0].token_output = None;
@@ -1704,8 +1704,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
         .as_ref()
         .context("KV publication has no physical locations")?;
     assert_eq!(publication.source, buffer);
-    let tensors = &publication.tensors;
-    for tensor in tensors {
+    for tensor in publication.tensors() {
         let ranks = tensor
             .locations
             .iter()
@@ -1762,7 +1761,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
         CallId::new(1, 0),
         CallKind::Forward(ForwardMode::Prefill),
         &[3],
-        BlockId(1),
+        UnitId(1),
         0,
     );
     let finished_admission = text_admission(20, 1, 2)?;
@@ -1775,14 +1774,14 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
         CallId::new(1, 1),
         CallKind::Forward(ForwardMode::Prefill),
         &[2],
-        BlockId(2),
+        UnitId(2),
         0,
     );
     finished.forward.call_indices[0] = 1;
     first.calls.extend(finished.calls);
     first.commands.extend(finished.commands);
     first.block_tables.extend(finished.block_tables);
-    first.new_cache_pages.extend(finished.new_cache_pages);
+    first.new_cache_units.extend(finished.new_cache_units);
     first.forward.append(finished.forward, 0)?;
     first.input_products.extend(finished.input_products);
     execute(&mut executor, first)?;
@@ -1805,7 +1804,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
         CallId::new(3, 0),
         CallKind::Forward(ForwardMode::Prefill),
         &[4],
-        BlockId(2),
+        UnitId(2),
         0,
     ))?;
     paused.terminate()?;
@@ -1847,7 +1846,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
             CallId::new(4, 0),
             CallKind::Forward(ForwardMode::Prefill),
             &[5],
-            BlockId(1),
+            UnitId(1),
             0,
         ),
     )?;
@@ -1932,7 +1931,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         CallId::new(1, 0),
         CallKind::Forward(ForwardMode::Prefill),
         &[6],
-        BlockId(1),
+        UnitId(1),
         0,
     );
     let predicate = TensorRef {
@@ -1961,7 +1960,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         CallId::new(2, 0),
         CallKind::Forward(ForwardMode::Prefill),
         &[9],
-        BlockId(2),
+        UnitId(2),
         0,
     );
 
@@ -2149,7 +2148,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
                     worker: WorkerId(worker.into()),
                     request_pool_idx: None,
                     block_tables: batch.block_tables,
-                    new_cache_pages: batch.new_cache_pages,
+                    new_cache_units: batch.new_cache_units,
                     forward: batch.forward,
                     latent: batch.latent_params.into_iter().next(),
                     decode: batch.decode_ranges.into_iter().next(),
@@ -2169,7 +2168,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
             CallId::new(batch_id, request_index),
             CallKind::Forward(ForwardMode::Prefill),
             &[7],
-            BlockId(page),
+            UnitId(page),
             0,
         )
     };
@@ -2960,7 +2959,7 @@ fn token_batch(
     call_id: CallId,
     mode: CallKind,
     tokens: &[u32],
-    page: BlockId,
+    unit: UnitId,
     prefix_length: u32,
 ) -> Batch {
     let request_pool_idx = admission.as_ref().map_or(1, |value| value.request_pool_idx);
@@ -3006,7 +3005,7 @@ fn token_batch(
         code: mode,
         bounds: Bounds {
             max_tokens: tokens.len().max(1) as u32,
-            max_kv_pages: u32::from(prefix_length == 0),
+            max_kv_units: u32::from(prefix_length == 0),
             ..Bounds::default()
         },
         inputs: Vec::new(),
@@ -3020,14 +3019,15 @@ fn token_batch(
     batch.block_tables = vec![BlockTable {
         request_pool_idx,
         group_id: 0,
-        page_ids: vec![page],
+        start_page: 0,
+        unit_ids: vec![unit],
         allocated_tokens: prefix_length + input_length,
     }];
-    batch.new_cache_pages = if prefix_length == 0 {
-        vec![CachePageAllocation {
+    batch.new_cache_units = if prefix_length == 0 {
+        vec![CacheUnitAllocation {
             request_pool_idx,
             group_id: 0,
-            page_ids: vec![page],
+            unit_ids: vec![unit],
         }]
     } else {
         Vec::new()

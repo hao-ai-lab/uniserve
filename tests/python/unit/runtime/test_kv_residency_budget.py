@@ -47,36 +47,47 @@ def _worker_config(*, token_capacity: int | None):
 
 # Layout planning queries the device properties of its CUDA grant.
 @pytest.mark.gpu
-def test_explicit_kv_capacity_provisions_one_physical_page_pool():
+def test_explicit_kv_capacity_provisions_one_physical_unit_pool():
     info = build_worker_layout(
         _model(), _worker_config(token_capacity=131072)
     ).info
 
+    # The stub's layers share one group whose pages are single units.
     assert info.kv_cache is not None
-    assert info.kv_cache.num_blocks * BLOCK_SIZE == 131072
+    assert info.kv_cache.num_units * BLOCK_SIZE == 131072
+
+
+def test_explicit_kv_capacity_counts_the_units_of_every_group():
+    # A full group of one-unit 64-token pages and a windowed group of
+    # five-unit 128-token pages hold 1024 tokens in 16 + 8 * 5 units.
+    capacity = derive_runtime_kv_capacity(
+        pages=((64, 1), (128, 5)),
+        kv_token_capacity=1024,
+        unit_bytes=4096,
+    )
+    assert (capacity.num_units, capacity.unit_bytes) == (56, 4096)
 
 
 def test_automatic_kv_capacity_reserves_all_storage_within_the_grant():
     capacity = derive_runtime_kv_capacity(
-        block_size=64,
+        pages=((64, 1),),
         kv_token_capacity=None,
-        bytes_per_token=128,
+        unit_bytes=64 * 128,
         device="cuda:0",
         available_bytes=10 * 64 * 128 + 100,
         resident_copies=2,
-        co_resident_blocks=2,
+        co_resident_units=2,
     )
-    assert capacity.num_blocks == 4
-    assert capacity.token_capacity == 256
+    assert capacity.num_units == 4
 
 
 @pytest.mark.parametrize("tokens", [None, 256])
 def test_kv_storage_cannot_exceed_its_grant(tokens):
     with pytest.raises(ValueError, match="grant"):
         derive_runtime_kv_capacity(
-            block_size=64,
+            pages=((64, 1),),
             kv_token_capacity=tokens,
-            bytes_per_token=128,
+            unit_bytes=64 * 128,
             available_bytes=64 * 128 - 1,
         )
 
@@ -84,9 +95,9 @@ def test_kv_storage_cannot_exceed_its_grant(tokens):
 def test_automatic_cuda_kv_capacity_requires_a_host_grant():
     with pytest.raises(ValueError, match="host storage grant"):
         derive_runtime_kv_capacity(
-            block_size=64,
+            pages=((64, 1),),
             kv_token_capacity=None,
-            bytes_per_token=128,
+            unit_bytes=64 * 128,
             device="cuda:0",
         )
 
@@ -112,8 +123,8 @@ def test_automatic_capacity_charges_request_and_input_storage() -> None:
     assert small.kv_cache is not None
     assert larger_requests.kv_cache is not None
     assert larger_input.kv_cache is not None
-    assert larger_requests.kv_cache.num_blocks < small.kv_cache.num_blocks
-    assert larger_input.kv_cache.num_blocks < small.kv_cache.num_blocks
+    assert larger_requests.kv_cache.num_units < small.kv_cache.num_units
+    assert larger_input.kv_cache.num_units < small.kv_cache.num_units
 
 
 # Layout planning queries the device properties of its CUDA grant.

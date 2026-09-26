@@ -121,31 +121,31 @@ table ImageParams {
   retain_images:bool = true;
 }
 
+/// One cache group of a worker's unit pool, decoded into
+/// `uniserve_core::KvCacheGroup`.
 table KvGroup {
-  num_blocks:uint;
   kind:KvGroupKind;
   /// Read only when `kind` is `SlidingWindow`.
   window:uint;
   /// Read only when `kind` is `SlidingWindow`.
   sink:uint;
-}
-
-/// Paged KV geometry of one rank. `num_layers` and `num_kv_heads` are this
-/// rank's share; `total_layers`, `total_kv_heads`, and the two offsets place
-/// that share in the model's logical cache.
-table KVCacheInfo {
-  block_size:uint;
-  num_blocks:uint;
-  num_layers:uint;
-  total_layers:uint;
-  layer_offset:uint;
+  page_tokens:uint;
+  units_per_page:uint;
+  /// Global cache-layer ids of this rank's layers, in column order.
+  layer_ids:[uint];
   num_kv_heads:uint;
   total_kv_heads:uint;
   kv_head_offset:uint;
   head_dim:uint;
-  bytes_per_token:ulong;
-  groups:[KvGroup];
+}
+
+/// Paged KV unit pool of one rank: `num_units` units of `unit_bytes` each,
+/// shared by every group's pages.
+table KVCacheInfo {
+  num_units:uint;
+  unit_bytes:ulong;
   dtype:string;
+  groups:[KvGroup];
 }
 
 table WorkerEndpoint {
@@ -315,9 +315,9 @@ table Call {
   // Scheduler-reserved maxima, decoded into `Bounds`. `max_tokens` and
   // `max_latent_bytes` are checked by `Call::validate` and
   // `max_transfer_bytes` by `Batch::validate`; neither validator checks
-  // `max_kv_pages` or `max_completion_bytes`.
+  // `max_kv_units` or `max_completion_bytes`.
   max_tokens:uint;
-  max_kv_pages:uint;
+  max_kv_units:uint;
   max_latent_bytes:ulong;
   max_completion_bytes:ulong;
   max_transfer_bytes:ulong;
@@ -353,17 +353,20 @@ table Call {
   consumer_slots:[uint];
 }
 
+/// Units of logical pages `start_page..` of one request slot and cache group,
+/// page-major.
 table BlockTable {
   request_pool_idx:uint;
   group_id:uint;
-  page_ids:[uint];
+  start_page:uint;
+  unit_ids:[uint];
   allocated_tokens:uint;
 }
 
-table CachePageAllocation {
+table CacheUnitAllocation {
   request_pool_idx:uint;
   group_id:uint;
-  page_ids:[uint];
+  unit_ids:[uint];
 }
 
 table LatentParams {
@@ -504,7 +507,7 @@ table Batch {
   collective_seq:ulong;
   calls:[Call];
   block_tables:[BlockTable];
-  new_cache_pages:[CachePageAllocation];
+  new_cache_units:[CacheUnitAllocation];
   // Parallel columns of the forward rows, decoded into `ForwardBatch`; entry
   // `i` of each column describes row `i`, and `forward_call_indices` index
   // into `calls`.
@@ -605,20 +608,25 @@ table DeviceProductTransfer {
   tensor:TensorTransfer;
 }
 
-/// An incremental KV cache publication: the destination already holds `base`,
-/// when set, up to `base_extent` tokens, and `tensors` carry only the tokens
-/// in `[base_extent, published_extent)`: keys, values, and, for quantized
-/// storage, scales.
-table KvTransfer {
+/// One cache group's tokens `[start, published_extent)` of a KV publication:
+/// keys, values, and, for quantized storage, scales.
+table KvGroupTransfer {
+  start:uint;
+  page_tokens:uint;
   tensors:[TensorTransfer];
+}
+
+/// An incremental KV cache publication: the destination already holds `base`,
+/// when set, up to `base_extent` tokens, and each group carries only its own
+/// tokens from its `start` on.
+table KvTransfer {
+  groups:[KvGroupTransfer];
   source:BufferId;
   destination:string;
   base:BufferId;
   base_extent:uint;
   published_extent:uint;
-  group_id:uint;
   compute_dtype:string;
-  page_size:uint;
 }
 
 table LatentTransfer {

@@ -1,85 +1,165 @@
-"""Prefix state copying, addressing and fixed-scale partial writes."""
+"""Unit-pool planes, prefix state addressing and fixed-scale writes."""
 
 from contextlib import ExitStack
-from dataclasses import dataclass
-from typing import ClassVar, Literal
 
 import pytest
 import torch
 
-from uniserve.cache import Config, State, StateConfig, mha
+from uniserve.cache import Config, State, mha
 from uniserve.quantization import Quantizer
 from uniserve.runtime import PrefixCache
-from uniserve.tensors import BufferConfig
+from uniserve.runtime.prefix_cache import CacheTable, plan_units
 
 pytestmark = pytest.mark.unit
 
 
-@dataclass(frozen=True)
-class Snapshot(StateConfig):
-    indexing: ClassVar[Literal["states"]] = "states"
+def _layer(head_dim, window=None, heads=2, dtype=torch.float32):
+    return mha.Config(heads, head_dim, tuple(range(heads)), dtype, window)
 
-    def buffers(self, *, num_blocks, block_size, dtype, quantizer):
-        return {
-            "hidden": BufferConfig((num_blocks, 2), torch.float32),
-            "initialized": BufferConfig((num_blocks,), torch.bool),
-        }
 
-    def bind(self, tensors, *, block_size, dtype, quantizer):
-        return State(
-            {"hidden": tensors["hidden"]},
-            {"hidden": tensors["initialized"]},
-            block_size,
+def _hybrid_config():
+    """Five windowed layers per full layer, the full rows twice as wide."""
+    layers = {}
+    for index in range(12):
+        full = index % 6 == 5
+        layers[f"layers.{index}"] = _layer(16) if full else _layer(8, window=16)
+    return Config(layers)
+
+
+def test_homogeneous_pool_keeps_the_per_layer_stack_layout():
+    config = Config({f"layers.{index}": _layer(8) for index in range(3)})
+    with PrefixCache(config, num_units=5, block_size=4, device="cpu") as cache:
+        planes = cache.planes
+        # One group: one unit per page holding every layer as a column, one
+        # table, and pages of exactly ``block_size`` tokens.
+        assert planes.columns == 3
+        assert [
+            (group.page_tokens, group.units_per_page) for group in planes.groups
+        ] == [(4, 1)]
+        assert cache.tables == (CacheTable(0, 0),)
+        stack = cache.planes_of(0, "key")
+        assert stack.shape == (3, 5, 4, 2, 8)
+        for index in range(3):
+            name = f"layers.{index}"
+            state = cache.state(name)
+            assert cache.table(name) == 0
+            assert state.key.shape == (5, 4, 2, 8)
+            # Layer ``k`` of the stack is the layer's own storage.
+            values = torch.full((4, 2, 8), float(index + 1))
+            state.write((3,), start=0, key=values, value=-values)
+            torch.testing.assert_close(stack[index, 3], values, rtol=0, atol=0)
+        # Only the written unit changed.
+        assert torch.count_nonzero(stack[:, (0, 1, 2, 4)]).item() == 0
+
+
+def test_hybrid_groups_read_column_planes_of_one_unit_pool():
+    with PrefixCache(
+        _hybrid_config(), num_units=6, block_size=4, device="cpu"
+    ) as cache:
+        planes = cache.planes
+        windowed, full = planes.groups
+        # gcd(10, 2) columns; the widest rows (full attention) fill a plane
+        # with ``block_size`` tokens, the half-width windowed rows with twice
+        # as many.
+        assert planes.columns == 2
+        assert planes.plane_bytes == 4 * 2 * 16 * 4
+        assert (
+            windowed.window,
+            windowed.page_tokens,
+            windowed.units_per_page,
+        ) == (16, 8, 5)
+        assert (full.window, full.page_tokens, full.units_per_page) == (
+            None,
+            4,
+            1,
+        )
+        # Two fields per column, each with one initialization flag per unit.
+        assert planes.unit_bytes == 2 * 2 * (planes.plane_bytes + 1)
+        assert cache.tables == tuple(CacheTable(0, row) for row in range(5)) + (
+            CacheTable(1, 0),
+        )
+
+        # The windowed group's k-th layer reads column k % 2 of its page's
+        # unit k // 2; the full group's layers read one unit's two columns.
+        windowed_names = [
+            f"layers.{index}" for index in range(12) if index % 6 != 5
+        ]
+        full_names = [f"layers.{index}" for index in (5, 11)]
+        for position, name in enumerate(windowed_names):
+            assert cache.table(name) == position // 2
+            assert cache.state(name).key.shape == (6, 8, 2, 8)
+        for name in full_names:
+            assert cache.table(name) == 5
+            assert cache.state(name).key.shape == (6, 4, 2, 16)
+
+        # A layer's writes land in its own column of the addressed unit.
+        values = torch.arange(8 * 2 * 8, dtype=torch.float32).reshape(8, 2, 8)
+        cache.state(windowed_names[3]).write(
+            (2,), start=0, key=values, value=-values
+        )
+        torch.testing.assert_close(
+            cache.planes_of(0, "key")[1, 2], values, rtol=0, atol=0
+        )
+        assert torch.count_nonzero(cache.planes_of(0, "key")[0]).item() == 0
+
+        # Both groups address the same bytes: the full group reads the unit's
+        # column as its own page shape, which the unit allocator keeps
+        # exclusive between groups.
+        assert torch.equal(
+            cache.planes_of(1, "key")[1, 2].reshape(-1).view(torch.uint8),
+            values.reshape(-1).view(torch.uint8),
+        )
+
+        # Resetting a unit clears every column, field and flag of it alone.
+        ones = torch.ones(4, 2, 16)
+        cache.state(full_names[0]).write((4,), start=0, key=ones, value=ones)
+        cache.zero_units((2,))
+        assert torch.count_nonzero(cache.planes_of(0, "key")[:, 2]).item() == 0
+        assert not cache.state(windowed_names[3]).initialized["key"][2]
+        assert cache.state(full_names[0]).initialized["value"][4]
+        torch.testing.assert_close(
+            cache.state(full_names[0]).read((4,), start=0, length=4)[0], ones
         )
 
 
-def test_heterogeneous_state_preserves_overlapping_block_sources():
-    config = Config(
-        {
-            "recurrent": Snapshot(),
-            "attention": mha.Config(4, 2, (1, 3), torch.float32),
-        }
-    )
-    cache = PrefixCache(
+def test_quantized_units_carry_one_scale_per_column_and_field():
+    config = Config({f"layers.{index}": _layer(8) for index in range(2)})
+    planes = plan_units(
         config,
-        num_blocks={"recurrent": 3, "attention": 2},
-        block_size={"recurrent": 1, "attention": 4},
-        device="cpu",
+        block_size=4,
+        quantization={name: Quantizer("fp8", axis=0) for name in config.layers},
     )
-    state = cache.state("recurrent")
-    state.tensors["hidden"].copy_(
-        torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
-    )
-    cache.mark_initialized("recurrent", (0, 2), fields=("hidden",))
-    state.copy_blocks((0, 1), (1, 0))
-    torch.testing.assert_close(
-        state.tensors["hidden"],
-        torch.tensor([[3.0, 4.0], [1.0, 2.0], [5.0, 6.0]]),
-        rtol=0,
-        atol=0,
-    )
-    assert state.initialized["hidden"].tolist() == [False, True, True]
-    views = state.transfer_views((2, 0))
-    views["hidden.values"][0].fill_(7)
-    assert state.tensors["hidden"][2].tolist() == [7.0, 7.0]
-    assert views["hidden.initialized"][0].item()
-    cache.zero_blocks("recurrent", (1,))
-    assert state.tensors["hidden"][1].tolist() == [0.0, 0.0]
-    assert state.initialized["hidden"].tolist() == [False, False, True]
-    assert cache.state("attention").key.shape == (2, 4, 2, 2)
-    cache.close()
-    # Borrowing alone does not invalidate tensors. Releasing an owner requires
-    # the caller to have retired numerical uses, rather than mutating them.
-    assert state.tensors["hidden"][2].tolist() == [7.0, 7.0]
-    with pytest.raises(KeyError):
-        cache.state("recurrent")
+    # FP8 rows are a quarter of the FP32 rows; each column and field adds
+    # one flag byte and one FP32 scale.
+    assert planes.plane_bytes == 4 * 2 * 8
+    assert planes.unit_bytes == 2 * 2 * (planes.plane_bytes + 1 + 4)
+
+
+@pytest.mark.parametrize(
+    ("layers", "options"),
+    [
+        # A windowed row that does not divide the plane into a power-of-two
+        # page.
+        ({"a": _layer(16), "b": _layer(12, window=8)}, {"block_size": 4}),
+        # A page size that is not a power of two.
+        ({"a": _layer(8)}, {"block_size": 3}),
+        # Layers that do not share one storage quantizer.
+        (
+            {"a": _layer(8), "b": _layer(8)},
+            {"block_size": 4, "quantization": {"a": Quantizer("fp8", axis=0)}},
+        ),
+    ],
+)
+def test_unit_planning_rejects_unrepresentable_layouts(layers, options):
+    with pytest.raises(ValueError):
+        plan_units(Config(layers), **options)
 
 
 def _cache(quantized=False, device="cpu"):
     config = Config({"attention": mha.Config(2, 2, (0, 1), torch.float32)})
     return PrefixCache(
         config,
-        num_blocks=3,
+        num_units=3,
         block_size=4,
         device=device,
         quantization={
@@ -211,56 +291,47 @@ def test_aliases_copy_from_original_block_values():
     "device", ("cpu", pytest.param("cuda", marks=pytest.mark.gpu))
 )
 @pytest.mark.parametrize("quantized", (False, True))
-def test_zero_blocks_preserves_other_pages_and_layer_state(device, quantized):
-    config = Config(
-        {
-            "attention": mha.Config(2, 16, (0, 1), torch.float32),
-            "other": Snapshot(),
-        }
-    )
+def test_zero_units_preserves_other_units_and_layers(device, quantized):
+    config = Config({name: _layer(16) for name in ("attention", "other")})
     with PrefixCache(
         config,
-        num_blocks={"attention": 5, "other": 2},
-        block_size={"attention": 3, "other": 1},
+        num_units=5,
+        block_size=4,
         device=device,
         quantization={
-            "attention": Quantizer("fp8", axis=0) if quantized else None
+            name: Quantizer("fp8", axis=0) if quantized else None
+            for name in config.layers
         },
     ) as cache:
         state, other = cache.state("attention"), cache.state("other")
         key = (
             torch.arange(1, 6, device=device).float() * 448
-        ).repeat_interleave(3)
-        key = key[:, None, None].expand(15, 2, 16).contiguous()
+        ).repeat_interleave(4)
+        key = key[:, None, None].expand(20, 2, 16).contiguous()
         state.write((0, 1, 2, 3, 4), start=0, key=key, value=-key)
-        other.tensors["hidden"].fill_(7)
-        cache.mark_initialized("other", (0, 1), fields=("hidden",))
-        # Caller order and duplicate indices do not change a reset; holes and
-        # independent layer storage must retain their values and initialization.
-        cache.zero_blocks("attention", (4, 0, 2, 2))
-        expected = key.clone().reshape(5, 3, 2, 16)
+        other.write((1, 3), start=0, key=key[:8], value=key[:8])
+        # Caller order and duplicate indices do not change a reset; other
+        # units of every column retain their values and initialization.
+        cache.zero_units((4, 0, 2, 2))
+        expected = key.clone().reshape(5, 4, 2, 16)
         expected[[0, 2, 4]] = 0
-        actual = state.read((0, 1, 2, 3, 4), start=0, length=15)
+        actual = state.read((0, 1, 2, 3, 4), start=0, length=20)
         for value, reference in zip(actual, (expected, -expected), strict=True):
             torch.testing.assert_close(
-                value, reference.reshape(15, 2, 16), rtol=0, atol=0
+                value, reference.reshape(20, 2, 16), rtol=0, atol=0
             )
-        assert state.initialized["key"].tolist() == [
-            False,
-            True,
-            False,
-            True,
-            False,
-        ]
-        assert state.initialized["value"].tolist() == [
-            False,
-            True,
-            False,
-            True,
-            False,
-        ]
-        assert other.tensors["hidden"].tolist() == [[7, 7], [7, 7]]
-        assert other.initialized["hidden"].tolist() == [True, True]
+        for layer in (state, other):
+            for field in ("key", "value"):
+                assert layer.initialized[field].tolist() == [
+                    False,
+                    True,
+                    False,
+                    True,
+                    False,
+                ]
+        torch.testing.assert_close(
+            other.read((1, 3), start=0, length=8)[0], key[:8], rtol=0, atol=0
+        )
         if quantized:
             for tensor in (state.key, state.value):
                 assert tensor.buffers()["scale"].flatten().tolist() == [
@@ -273,9 +344,9 @@ def test_zero_blocks_preserves_other_pages_and_layer_state(device, quantized):
         # A reused encoded page must derive its first scale from new values.
         replacement = torch.full((1, 2, 16), 1792.0, device=device)
         state.write((2,), start=1, key=replacement, value=-replacement)
-        updated = state.read((2,), start=0, length=3)[0]
+        updated = state.read((2,), start=0, length=4)[0]
         torch.testing.assert_close(updated[1:2], replacement, rtol=0, atol=0)
-        assert torch.count_nonzero(updated[[0, 2]]).item() == 0
+        assert torch.count_nonzero(updated[[0, 2, 3]]).item() == 0
         if quantized:
             assert state.key.buffers()["scale"][2].item() == 4
 
@@ -357,7 +428,7 @@ def test_fp8_partial_copy_preserves_uncovered_values_and_transfers_encoding():
     torch.testing.assert_close(
         state.read((0,), start=3, length=1)[0], source[:1], rtol=0, atol=0
     )
-    cache.zero_blocks("attention", (0,))
+    cache.zero_units((0,))
     assert not state.initialized["key"][0]
     assert state.key.buffers()["scale"][0].item() == 1.0
     assert state.read((0,), start=0, length=0)[0].shape == (0, 2, 2)

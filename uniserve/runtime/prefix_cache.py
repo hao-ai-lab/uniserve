@@ -1,155 +1,355 @@
-"""Ownership of storage for heterogeneous prefix state layouts."""
+"""Unit-pool ownership of paged K/V state with column planes.
+
+The pool is ``num_units`` equally sized allocation units. Every unit is
+ordinary memory; a serving owner reserves unit zero as the padding sentinel
+that padding rows may read, and assigns the others. Each unit holds
+``columns`` columns, and each column a key plane and a value plane of
+``plane_bytes`` bytes. Every plane ``(column, field)`` is one contiguous
+``[num_units, plane_bytes]`` tensor, and a field's planes are stacked on a
+leading column axis in one allocation.
+
+Layers that share a history window and a K/V page shape form a group. A
+group's logical page holds ``page_tokens = plane_bytes / row_bytes`` tokens
+of every layer in the group and occupies ``units_per_page = layers /
+columns`` units: the group's ``k``-th layer in configuration order reads
+column ``k % columns`` of the page's ``k // columns``-th unit. A layer's key
+view is therefore ``plane(column, key)`` read as a contiguous ``[num_units,
+page_tokens, heads, dim]`` tensor whose block id is the unit id, and the
+units of one page position ``k // columns`` of every page form one block
+table. Groups read the same bytes differently; the unit allocator guarantees
+that a unit belongs to one group at a time.
+
+A cache whose layers all share one group has one unit per page with one
+column per layer, ``page_tokens`` equal to ``block_size`` and one table, so
+each layer's view and the stacked allocation of each field are the
+``[layers, blocks, block_size, heads, dim]`` layout of a per-layer stack.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
+from math import gcd
 from typing import Self
 
 import torch
 
-from uniserve.cache import Config, State, StateConfig
+from uniserve.cache import Config, State, mha
 from uniserve.cache.state import _blocks
-from uniserve.quantization import QuantizedTensor, Quantizer
+from uniserve.quantization import Quantizer
 from uniserve.tensors import BufferConfig
 
-from ._block_fill import BlockFill
 from .tensor_buffers import TensorBuffers
+
+_FIELDS = ("key", "value")
+
+
+def _ranges(units: tuple[int, ...]) -> list[tuple[int, int]]:
+    """Merge unit ids into sorted half-open intervals of adjacent units."""
+    ranges: list[tuple[int, int]] = []
+    for unit in sorted(set(units)):
+        if ranges and ranges[-1][1] == unit:
+            ranges[-1] = (ranges[-1][0], unit + 1)
+        else:
+            ranges.append((unit, unit + 1))
+    return ranges
+
+
+@dataclass(frozen=True, slots=True)
+class CacheGroup:
+    """Cache layers that share a history window and a K/V page shape.
+
+    Attributes:
+        window: History tokens any reader of the group needs; ``None`` keeps
+            the whole history.
+        page_tokens: Tokens stored per logical page; a power of two.
+        units_per_page: Units one logical page occupies.
+        layers: Cache layer names in column order; layer ``k`` lies in
+            column ``k % columns`` of a page's unit ``k // columns``.
+        num_kv_heads: Local K/V heads stored per layer.
+        head_dim: Elements per head.
+        dtype: Stored element dtype (``float8_e4m3fn`` for FP8 storage).
+    """
+
+    window: int | None
+    page_tokens: int
+    units_per_page: int
+    layers: tuple[str, ...]
+    num_kv_heads: int
+    head_dim: int
+    dtype: torch.dtype
+
+    @property
+    def row_bytes(self) -> int:
+        """Bytes one token of one layer's key (or value) occupies."""
+        return (
+            self.num_kv_heads
+            * self.head_dim
+            * torch.empty((), dtype=self.dtype).element_size()
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CacheTable:
+    """One block table: the units at one position of every page of a group.
+
+    ``row`` indexes a unit within each logical page of group ``group``; every
+    layer whose column lies in that unit reads through this table.
+    """
+
+    group: int
+    row: int
+
+
+@dataclass(frozen=True, slots=True)
+class Planes:
+    """The unit and column-plane organization of one K/V unit pool.
+
+    Attributes:
+        columns: Columns per unit, the greatest common divisor of the
+            groups' layer counts.
+        plane_bytes: Bytes of one ``(column, field)`` plane of one unit.
+        groups: Cache groups in table order.
+        quantized: Whether the planes hold FP8 values with one FP32 scale
+            per unit, column and field.
+    """
+
+    columns: int
+    plane_bytes: int
+    groups: tuple[CacheGroup, ...]
+    quantized: bool
+
+    @property
+    def unit_bytes(self) -> int:
+        """Bytes one unit occupies: its planes, flags and FP8 scales."""
+        metadata = 1 + (4 if self.quantized else 0)
+        return self.columns * len(_FIELDS) * (self.plane_bytes + metadata)
+
+    @property
+    def tables(self) -> tuple[CacheTable, ...]:
+        """Block tables in table-id order: every group's rows, group-major."""
+        return tuple(
+            CacheTable(group, row)
+            for group, value in enumerate(self.groups)
+            for row in range(value.units_per_page)
+        )
+
+    def buffers(self, num_units: int) -> dict[str, BufferConfig]:
+        """Declare every backing field the pool allocates for ``num_units``.
+
+        Values are raw bytes that each group reads in its own element type;
+        initialization flags and FP8 scales hold one entry per unit, column
+        and field.
+        """
+        if type(num_units) is not int or num_units < 1:
+            raise ValueError("a K/V unit pool requires at least one unit")
+        result = {}
+        for field in _FIELDS:
+            result[f"{field}.values"] = BufferConfig(
+                (self.columns, num_units, self.plane_bytes), torch.uint8
+            )
+            if self.quantized:
+                result[f"{field}.scale"] = BufferConfig(
+                    (self.columns, num_units, 1, 1, 1), torch.float32
+                )
+            result[f"{field}.initialized"] = BufferConfig(
+                (self.columns, num_units), torch.bool
+            )
+        return result
+
+
+def plan_units(
+    config: Config,
+    *,
+    block_size: int,
+    dtype: torch.dtype | None = None,
+    quantization: Mapping[str, Quantizer | None] | None = None,
+) -> Planes:
+    """Group cache layers and derive the unit pool's column planes.
+
+    Layers group by history window, logical and local K/V heads, head width
+    and stored element type, in order of first appearance. ``block_size`` is
+    the page size of the group with the widest token rows; its rows fill one
+    plane, and every other group's page holds as many tokens as fit that
+    plane.
+
+    Args:
+        config: MHA cache layers by module path.
+        block_size: Tokens per page of the widest group; a power of two.
+        dtype: Logical storage dtype, or ``None`` for each layer's compute
+            dtype.
+        quantization: Optional per-layer quantizer; every layer must use the
+            same FP8 block quantizer or none.
+
+    Raises:
+        ValueError: A layer is not an MHA layout, quantization is mixed or
+            unsupported, ``block_size`` is not a positive power of two, or a
+            group's rows do not divide the plane into a power-of-two page.
+    """
+    layers = config.layers
+    if not layers or any(
+        not isinstance(layout, mha.Config) for layout in layers.values()
+    ):
+        raise ValueError("a K/V unit pool requires MHA cache layers")
+    if quantization is not None and set(quantization) - set(layers):
+        raise ValueError(
+            "cache quantization names must identify resident state layers"
+        )
+    if (
+        type(block_size) is not int
+        or block_size < 1
+        or block_size & (block_size - 1)
+    ):
+        raise ValueError("the K/V page size must be a power of two")
+
+    quantizers = {
+        name: None if quantization is None else quantization.get(name)
+        for name in layers
+    }
+    if len(set(quantizers.values())) != 1:
+        raise ValueError("every K/V layer must share one storage quantizer")
+    quantizer = next(iter(quantizers.values()))
+
+    # Group layers in configuration order by retention and page shape. The
+    # layout validates each layer's dtype and quantizer through its buffers.
+    members: dict[tuple, list[str]] = {}
+    for name, layout in layers.items():
+        fields = layout.buffers(
+            num_blocks=1, block_size=1, dtype=dtype, quantizer=quantizer
+        )
+        stored = fields["key.values"].dtype
+        key = (
+            layout.window,
+            layout.num_kv_heads,
+            layout.head_indices,
+            layout.head_dim,
+            stored,
+        )
+        members.setdefault(key, []).append(name)
+
+    columns = 0
+    for names in members.values():
+        columns = gcd(columns, len(names))
+    rows = {
+        key: len(key[2]) * key[3] * torch.empty((), dtype=key[4]).element_size()
+        for key in members
+    }
+    plane_bytes = block_size * max(rows.values())
+
+    groups = []
+    for key, names in members.items():
+        window, _, head_indices, head_dim, stored = key
+        heads = len(head_indices)
+        page_tokens, remainder = divmod(plane_bytes, rows[key])
+        if remainder or page_tokens & (page_tokens - 1):
+            raise ValueError(
+                "K/V row sizes must divide the plane into power-of-two pages"
+            )
+        groups.append(
+            CacheGroup(
+                window=window,
+                page_tokens=page_tokens,
+                units_per_page=len(names) // columns,
+                layers=tuple(names),
+                num_kv_heads=heads,
+                head_dim=head_dim,
+                dtype=stored,
+            )
+        )
+    return Planes(columns, plane_bytes, tuple(groups), quantizer is not None)
 
 
 class PrefixCache:
-    """Allocate per-layer state; callers own block assignment and retirement.
+    """Allocate a K/V unit pool; callers own unit assignment and retirement.
 
-    Layers may use different block sizes and budgets. Consecutive layers whose
-    backing requirements agree share one allocation per buffer, stacked on a
-    leading layer axis, so one buffer of a whole run of layers is addressable
-    as a single strided tensor (see `layer_stacks`). No layer, attention
-    method, or numerical input receives this owning object.
+    No layer, attention method, or numerical input receives this owning
+    object: layers borrow their states, and block tables name units by id.
     """
 
     def __init__(
         self,
         config: Config,
         *,
-        num_blocks: int | Mapping[str, int],
-        block_size: int | Mapping[str, int],
+        num_units: int,
+        block_size: int,
         device: torch.device | str,
         dtype: torch.dtype | None = None,
         quantization: Mapping[str, Quantizer | None] | None = None,
     ) -> None:
+        """Allocate and reset the pool's planes and bind every layer's state.
+
+        ``block_size``, ``dtype`` and ``quantization`` are interpreted as by
+        ``plan_units``; ``num_units`` counts every unit, sentinel included.
+        """
         self.config = config
         self.device = torch.device(device)
+        self.planes = plan_units(
+            config,
+            block_size=block_size,
+            dtype=dtype,
+            quantization=quantization,
+        )
+        self.num_units = num_units
+
+        requirements = self.planes.buffers(num_units)
+        self._backing = TensorBuffers.allocate(requirements, device=self.device)
+        self._fields = dict(self._backing.view(requirements))
+        for name, tensor in self._fields.items():
+            # Multiplicative scales restart at one; encoded bytes and flags
+            # restart at zero.
+            tensor.fill_(int(name.endswith(".scale")))
+
         self._states: dict[str, State] = {}
-        self._backing: list[TensorBuffers] = []
-        # Each run of layers sharing an allocation, in configuration order,
-        # with its buffers as [layers in run, *buffer shape] views.
-        self._stacks: list[
-            tuple[tuple[str, ...], Mapping[str, torch.Tensor]]
-        ] = []
-        self._fills: dict[str, BlockFill] = {}
-
-        if quantization is not None and set(quantization) - set(config.layers):
-            raise ValueError(
-                "cache quantization names must identify resident state layers"
-            )
-        for parameter in (num_blocks, block_size):
-            if isinstance(parameter, Mapping) and set(parameter) != set(
-                config.layers
-            ):
-                raise ValueError(
-                    "per-layer block allocation must cover every state layer"
+        self._tables: dict[str, int] = {}
+        columns = self.planes.columns
+        first_table = 0
+        for group_index, group in enumerate(self.planes.groups):
+            for index, name in enumerate(group.layers):
+                row, column = divmod(index, columns)
+                layout = config.layers[name]
+                assert isinstance(layout, mha.Config)
+                quantizer = (
+                    None if quantization is None else quantization.get(name)
                 )
-
-        # Group maximal runs of consecutive layers whose backing requirements
-        # agree. Each member keeps its own layout, block size and quantizer
-        # for binding; only the physical allocation is shared.
-        runs: list[
-            tuple[
-                Mapping[str, BufferConfig],
-                list[tuple[str, StateConfig, int, Quantizer | None]],
-            ]
-        ] = []
-        for name, layout in config.layers.items():
-            count = (
-                num_blocks[name]
-                if isinstance(num_blocks, Mapping)
-                else num_blocks
-            )
-            size = (
-                block_size[name]
-                if isinstance(block_size, Mapping)
-                else block_size
-            )
-            quantizer = None if quantization is None else quantization.get(name)
-
-            requirements = layout.buffers(
-                num_blocks=count,
-                block_size=size,
-                dtype=dtype,
-                quantizer=quantizer,
-            )
-            member = (name, layout, size, quantizer)
-            if runs and runs[-1][0] == requirements:
-                runs[-1][1].append(member)
-            else:
-                runs.append((requirements, [member]))
-
-        for requirements, members in runs:
-            # A run's buffers are [layers in run, *layer shape]: every layer
-            # of one buffer shares an allocation at a uniform layer stride.
-            stacked = {
-                buffer: BufferConfig(
-                    (len(members), *requirement.shape),
-                    requirement.dtype,
-                    None
-                    if requirement.capacity_shape is None
-                    else (len(members), *requirement.capacity_shape),
-                    requirement.host,
-                )
-                for buffer, requirement in requirements.items()
-            }
-            allocation = TensorBuffers.allocate(stacked, device=self.device)
-            self._backing.append(allocation)
-            stacks = allocation.view(stacked)
-            for tensor in stacks.values():
-                tensor.zero_()
-            self._stacks.append(
-                (tuple(name for name, _, _, _ in members), stacks)
-            )
-
-            for index, (name, layout, size, quantizer) in enumerate(members):
-                # A leading-axis slice is a contiguous view of one layer.
-                state = layout.bind(
-                    {buffer: stack[index] for buffer, stack in stacks.items()},
-                    block_size=size,
+                views = {}
+                for field in _FIELDS:
+                    # One plane read as [units, page tokens, heads, dim]; the
+                    # block id of the view is the unit id.
+                    views[f"{field}.values"] = (
+                        self._fields[f"{field}.values"][column]
+                        .view(group.dtype)
+                        .view(
+                            num_units,
+                            group.page_tokens,
+                            group.num_kv_heads,
+                            group.head_dim,
+                        )
+                    )
+                    views[f"{field}.initialized"] = self._fields[
+                        f"{field}.initialized"
+                    ][column]
+                    if self.planes.quantized:
+                        views[f"{field}.scale"] = self._fields[
+                            f"{field}.scale"
+                        ][column]
+                self._states[name] = layout.bind(
+                    views,
+                    block_size=group.page_tokens,
                     dtype=dtype,
                     quantizer=quantizer,
                 )
-                self._states[name] = state
+                self._tables[name] = first_table + row
+            first_table += group.units_per_page
 
-                # Block reset values: multiplicative scales restart at one,
-                # while encoded values, metadata, and initialized flags
-                # restart at zero.
-                fields, values = [], []
-                for field, tensor in state.tensors.items():
-                    buffers = (
-                        tensor.buffers()
-                        if isinstance(tensor, QuantizedTensor)
-                        else {"values": tensor}
-                    )
-                    for key, backing in buffers.items():
-                        value = int(key in {"scale", "tensor_scale"})
-                        if value:
-                            backing.fill_(1)
-                        # Zero bytes cover encoded values and metadata
-                        # without depending on arithmetic support for their
-                        # storage dtype.
-                        fields.append(
-                            backing if value else backing.view(torch.uint8)
-                        )
-                        values.append(value)
-                    fields.append(state.initialized[field])
-                    values.append(0)
-                self._fills[name] = BlockFill(tuple(fields), tuple(values))
+    @property
+    def groups(self) -> tuple[CacheGroup, ...]:
+        """Cache groups in table order."""
+        return self.planes.groups
+
+    @property
+    def tables(self) -> tuple[CacheTable, ...]:
+        """Block tables in table-id order."""
+        return self.planes.tables
 
     def state(self, name: str) -> State:
         """Borrow one layer's state.
@@ -159,77 +359,73 @@ class PrefixCache:
         return self._states[name]
 
     def table(self, name: str) -> int:
-        """Return the ID of the block table addressing one layer's pages.
+        """Return the ID of the block table addressing one layer's units.
 
-        Every layer of this cache shares one page space and therefore one
-        block table, whose ID is 0. ``AttentionBatch`` entries are keyed by
+        The table holds the units at the layer's position within every page
+        of its group (``tables``). ``AttentionBatch`` entries are keyed by
         these IDs.
         """
         self.state(name)
-        return 0
+        return self._tables[name]
 
-    def layer_stacks(
-        self, buffer: str
-    ) -> tuple[tuple[tuple[str, ...], torch.Tensor], ...]:
-        """Borrow one backing buffer of every layer, grouped by allocation.
+    def planes_of(self, group: int, field: str) -> torch.Tensor:
+        """Borrow one field's planes as one group reads them.
 
-        `buffer` names a backing field the layers' state configs declare, such
-        as ``"key.values"``. Returns ``(names, stack)`` pairs that cover every
-        state layer in configuration order: `names` are consecutive layers
-        sharing one allocation, and `stack` is ``[len(names), *buffer shape]``
-        with its leading axis in the order of `names`. Writes through a
-        layer's state are visible in its stack slice and vice versa. The views
-        remain valid until this owner closes; the caller retains the owner
-        through every asynchronous reader.
+        Returns ``[columns, num_units, page_tokens, heads, dim]`` in the
+        group's stored dtype for ``field`` ``"key"`` or ``"value"``: the
+        group's layer ``k`` of a page's unit ``u`` is ``[k % columns, u]``.
+        Writes through a layer's state are visible here and vice versa; the
+        caller retains this owner through every asynchronous reader.
+        """
+        values = self.planes.groups[group]
+        columns = self.planes.columns
+        return (
+            self._fields[f"{field}.values"]
+            .view(values.dtype)
+            .view(
+                columns,
+                self.num_units,
+                values.page_tokens,
+                values.num_kv_heads,
+                values.head_dim,
+            )
+        )
+
+    def scales_of(self, field: str) -> torch.Tensor:
+        """Borrow one field's FP8 scales as ``[columns, num_units, 1, 1, 1]``.
 
         Raises:
-            ValueError: A state layer does not declare `buffer`.
+            ValueError: The pool stores unquantized values.
         """
-        if any(buffer not in stacks for _, stacks in self._stacks):
-            raise ValueError(
-                f"every state layer must declare backing buffer {buffer!r}"
-            )
-        return tuple((names, stacks[buffer]) for names, stacks in self._stacks)
+        if not self.planes.quantized:
+            raise ValueError("unquantized K/V planes carry no scales")
+        return self._fields[f"{field}.scale"]
 
-    def zero_blocks(self, name: str, blocks: tuple[int, ...]) -> None:
-        """Reset caller-selected blocks.
+    def zero_units(self, units: tuple[int, ...]) -> None:
+        """Reset caller-selected units in every column and field.
 
-        Reset caller-selected blocks and their encoding initialization
-        state.
+        Resets the units' bytes, initialization flags and FP8 scales, so a
+        unit leaving one group can join any other. Adjacent units reset as
+        one interval, enqueued on the current stream of the pool's device
+        without a host read.
         """
-        state = self.state(name)
-        _blocks(blocks, next(iter(state.tensors.values())).shape[0])
+        _blocks(units, self.num_units)
+        ranges = _ranges(units)
+        for name, tensor in self._fields.items():
+            value = int(name.endswith(".scale"))
+            for start, stop in ranges:
+                tensor[:, start:stop].fill_(value)
 
-        # Adjacent blocks merge into one fill range per contiguous run.
-        ranges: list[tuple[int, int]] = []
-        for block in sorted(set(blocks)):
-            if ranges and ranges[-1][1] == block:
-                ranges[-1] = (ranges[-1][0], block + 1)
-            else:
-                ranges.append((block, block + 1))
+    def mark_initialized(self, units: tuple[int, ...]) -> None:
+        """Commit externally transferred values and scales of whole units.
 
-        fill = self._fills[name]
-        for start, stop in ranges:
-            fill(start, stop)
-
-    def mark_initialized(
-        self, name: str, blocks: tuple[int, ...], *, fields: tuple[str, ...]
-    ) -> None:
-        """Commit externally transferred fields.
-
-        Commit externally transferred values and scales for specified
-        fields.
+        Every column of a unit holds a layer of the unit's group, so the
+        flags of both fields in every column are set, without a host read.
         """
-        state = self.state(name)
-        _blocks(blocks, next(iter(state.tensors.values())).shape[0])
-        if any(field not in state.initialized for field in fields):
-            raise ValueError(
-                "initialized fields must belong to the selected state"
-            )
-
-        for field in fields:
-            for block in blocks:
-                state.initialized[field][block] = True
+        _blocks(units, self.num_units)
+        for start, stop in _ranges(units):
+            for field in _FIELDS:
+                self._fields[f"{field}.initialized"][:, start:stop].fill_(True)
 
     def close(self) -> None:
         """Release owner references.
@@ -237,11 +433,9 @@ class PrefixCache:
         Release owner references after the caller has retired borrowed uses.
         """
         self._states.clear()
-        self._fills.clear()
-        self._stacks.clear()
-        for allocation in self._backing:
-            allocation.close()
-        self._backing.clear()
+        self._tables.clear()
+        self._fields.clear()
+        self._backing.close()
 
     def __enter__(self) -> Self:
         return self

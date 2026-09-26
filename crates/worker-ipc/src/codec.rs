@@ -37,19 +37,19 @@ use std::collections::BTreeMap;
 use flatbuffers::FlatBufferBuilder;
 
 mod encode;
-use uniserve_core::{BlockId, KvCacheGroup, KvGroupKind, RequestId, SamplingParams, TokenLogprob};
+use uniserve_core::{KvCacheGroup, KvGroupKind, RequestId, SamplingParams, TokenLogprob, UnitId};
 
 use crate::schema::uniserve::ipc as fbs;
 use crate::{
     ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, Bounds,
-    BufferAllocation, BufferId, CachePageAllocation, Call, CallCoordinates, CallId, CallKind,
+    BufferAllocation, BufferId, CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind,
     CallStatus, DType, DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout,
     ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode,
-    ForwardStats, KvCacheInfo, KvTransfer, LatentParams, Locator, MediaCall, MediaOutput,
-    NewRequest, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng, SamplingState,
-    ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters, TransferHandle,
-    TransferMode, TransferTransport, WorkerEndpoint, WorkerInfo, WorkerRequest, WorkerResponse,
-    WorkerResponseError,
+    ForwardStats, KvCacheInfo, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaCall,
+    MediaOutput, NewRequest, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
+    SamplingState, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
+    TransferHandle, TransferMode, TransferTransport, WorkerEndpoint, WorkerInfo, WorkerRequest,
+    WorkerResponse, WorkerResponseError,
 };
 
 /// Result type returned by FlatBuffers codec calls.
@@ -326,16 +326,16 @@ fn batch_from_table(run: fbs::Batch<'_>) -> CodecResult<Batch> {
             .transpose()?
             .unwrap_or_default(),
 
-        // Scheduler-owned KV page tables and the columnar forward rows. The
+        // Scheduler-owned KV unit tables and the columnar forward rows. The
         // `ForwardBatch` columns are parallel arrays; `ForwardBatch::validate`
         // checks that their lengths agree.
         block_tables: run
             .block_tables()
             .map(|items| items.iter().map(block_table_from_table).collect())
             .unwrap_or_default(),
-        new_cache_pages: run
-            .new_cache_pages()
-            .map(|items| items.iter().map(cache_page_allocation_from_table).collect())
+        new_cache_units: run
+            .new_cache_units()
+            .map(|items| items.iter().map(cache_unit_allocation_from_table).collect())
             .unwrap_or_default(),
         forward: ForwardBatch {
             call_indices: run
@@ -486,29 +486,30 @@ fn diffusion_params_from_table(
     })
 }
 
-/// Decodes a logical KV block table while preserving page order.
+/// Decodes a KV unit table while preserving its page-major unit order.
 fn block_table_from_table(table: fbs::BlockTable<'_>) -> BlockTable {
     BlockTable {
         request_pool_idx: table.request_pool_idx(),
         group_id: table.group_id(),
-        page_ids: table
-            .page_ids()
-            .map(|items| items.iter().map(BlockId).collect())
+        start_page: table.start_page(),
+        unit_ids: table
+            .unit_ids()
+            .map(|items| items.iter().map(UnitId).collect())
             .unwrap_or_default(),
         allocated_tokens: table.allocated_tokens(),
     }
 }
 
-/// Decodes newly assigned KV pages for one request and cache group.
-fn cache_page_allocation_from_table(
-    allocation: fbs::CachePageAllocation<'_>,
-) -> CachePageAllocation {
-    CachePageAllocation {
+/// Decodes newly assigned KV units for one request and cache group.
+fn cache_unit_allocation_from_table(
+    allocation: fbs::CacheUnitAllocation<'_>,
+) -> CacheUnitAllocation {
+    CacheUnitAllocation {
         request_pool_idx: allocation.request_pool_idx(),
         group_id: allocation.group_id(),
-        page_ids: allocation
-            .page_ids()
-            .map(|items| items.iter().map(BlockId).collect())
+        unit_ids: allocation
+            .unit_ids()
+            .map(|items| items.iter().map(UnitId).collect())
             .unwrap_or_default(),
     }
 }
@@ -617,7 +618,7 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
         code: computation_from_fb(call.code())?,
         bounds: Bounds {
             max_tokens: call.max_tokens(),
-            max_kv_pages: call.max_kv_pages(),
+            max_kv_units: call.max_kv_units(),
             max_latent_bytes: call.max_latent_bytes(),
             max_completion_bytes: call.max_completion_bytes(),
             max_transfer_bytes: call.max_transfer_bytes(),
@@ -1216,8 +1217,9 @@ fn map_from_table(
         .unwrap_or_default()
 }
 
-/// Decodes one KV cache group: its block count and full-attention or
-/// sliding-window kind. `window` and `sink` are read only for sliding windows.
+/// Decodes one KV cache group: its retention kind, page shape, and this
+/// rank's layers and heads. `window` and `sink` are read only for sliding
+/// windows.
 fn kv_group_from_table(group: fbs::KvGroup<'_>) -> CodecResult<KvCacheGroup> {
     let kind = if group.kind() == fbs::KvGroupKind::Full {
         KvGroupKind::Full
@@ -1230,8 +1232,17 @@ fn kv_group_from_table(group: fbs::KvGroup<'_>) -> CodecResult<KvCacheGroup> {
         codec_bail!("unknown KV group kind {}", group.kind().0)
     };
     Ok(KvCacheGroup {
-        num_blocks: group.num_blocks(),
         kind,
+        page_tokens: group.page_tokens(),
+        units_per_page: group.units_per_page(),
+        layer_ids: group
+            .layer_ids()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default(),
+        num_kv_heads: group.num_kv_heads(),
+        total_kv_heads: group.total_kv_heads(),
+        kv_head_offset: group.kv_head_offset(),
+        head_dim: group.head_dim(),
     })
 }
 
@@ -1320,16 +1331,8 @@ fn token_logprob_from_fb(entry: &fbs::TokenLogprob) -> TokenLogprob {
 /// Decodes worker KV-cache capabilities from a verified table.
 fn kv_cache_from_table(config: fbs::KVCacheInfo<'_>) -> CodecResult<KvCacheInfo> {
     Ok(KvCacheInfo {
-        block_size: config.block_size(),
-        num_blocks: config.num_blocks(),
-        num_layers: config.num_layers(),
-        total_layers: config.total_layers(),
-        layer_offset: config.layer_offset(),
-        num_kv_heads: config.num_kv_heads(),
-        total_kv_heads: config.total_kv_heads(),
-        kv_head_offset: config.kv_head_offset(),
-        head_dim: config.head_dim(),
-        bytes_per_token: config.bytes_per_token(),
+        num_units: config.num_units(),
+        unit_bytes: config.unit_bytes(),
         groups: config
             .groups()
             .map(|items| {
@@ -1831,12 +1834,12 @@ fn response_kind_from_fb(kind: fbs::RespKind) -> CodecResult<ResponseKind> {
 /// completion's `kv_output`.
 fn kv_transfer_from_table(transfer: fbs::KvTransfer<'_>) -> CodecResult<KvTransfer> {
     Ok(KvTransfer {
-        tensors: transfer
-            .tensors()
+        groups: transfer
+            .groups()
             .map(|items| {
                 items
                     .iter()
-                    .map(tensor_transfer_from_table)
+                    .map(kv_group_transfer_from_table)
                     .collect::<CodecResult<Vec<_>>>()
             })
             .transpose()?
@@ -1849,11 +1852,28 @@ fn kv_transfer_from_table(transfer: fbs::KvTransfer<'_>) -> CodecResult<KvTransf
         base: transfer.base().map(buffer_id_from_table).transpose()?,
         base_extent: transfer.base_extent(),
         published_extent: transfer.published_extent(),
-        group_id: transfer.group_id(),
-        page_size: transfer.page_size(),
         compute_dtype: transfer
             .compute_dtype()
             .context("KV transfer compute dtype is missing")?
             .to_owned(),
+    })
+}
+
+/// Decodes one cache group's share of a KV publication, preserving the key,
+/// value, scale tensor order.
+fn kv_group_transfer_from_table(group: fbs::KvGroupTransfer<'_>) -> CodecResult<KvGroupTransfer> {
+    Ok(KvGroupTransfer {
+        start: group.start(),
+        page_tokens: group.page_tokens(),
+        tensors: group
+            .tensors()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(tensor_transfer_from_table)
+                    .collect::<CodecResult<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
     })
 }

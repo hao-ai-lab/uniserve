@@ -263,12 +263,12 @@ impl Scheduler {
                 // the row, which is the one whose steps release it.
                 let Some(reserved_buffers) = self.reserve_generation_resources(&call) else {
                     self.record_domain_backpressure(call.code);
-                    // Planning a forward advanced `num_kv_blocks_sent` past its
-                    // fresh pages; roll it back so the next plan declares them.
+                    // Planning a forward advanced `num_kv_units_sent` past its
+                    // fresh units; roll it back so the next plan declares them.
                     if let Some(state) = self.running.get_mut(&id) {
-                        state.num_kv_blocks_sent = state
-                            .num_kv_blocks_sent
-                            .saturating_sub(call.bounds.max_kv_pages as usize);
+                        state.num_kv_units_sent = state
+                            .num_kv_units_sent
+                            .saturating_sub(u64::from(call.bounds.max_kv_units));
                     }
                     tracing::debug!(
                         request_id = id.0,
@@ -743,72 +743,61 @@ impl Scheduler {
             None
         };
 
-        // `max_kv_pages` counts the pages the first group's table gained since
-        // the previous dispatch (`plan_computation`).
-        let new_page_count = call.bounds.max_kv_pages as usize;
         let mut call_block_tables = Vec::new();
-        let mut call_new_cache_pages = Vec::new();
+        let mut call_new_cache_units = Vec::new();
         let mut call_forward = ForwardBatch::default();
         if let Some(lengths) = kv_lengths {
             // Registration above found the request running, and a running
-            // token request always has the text KV cache.
-            let Some((state, tables, request_pool_idx, cache)) =
-                self.running.get(&request_id).and_then(|state| {
-                    Some((
-                        state,
-                        state.block_tables()?,
-                        state.request_pool_idx()?,
-                        self.storage.cache()?,
-                    ))
-                })
+            // token request always has its KV tables.
+            let Some(state) = self.running.get_mut(&request_id) else {
+                self.invariant_broken("a registered token request is admitted with a KV cache");
+                return None;
+            };
+            let fresh_count = u64::from(call.bounds.max_kv_units);
+            let declared = state.num_kv_units_sent;
+            let (Some(request_pool_idx), Some(allocation)) =
+                (state.request_pool_idx(), state.kv_mut())
             else {
                 self.invariant_broken("a registered token request is admitted with a KV cache");
                 return None;
             };
-            // KV descriptors include complete tables only on admission or
-            // growth; fresh-page lists identify storage the worker must
-            // initialize now. On admission every page is fresh except the
-            // group-0 pages already holding the computed prompt prefix
-            // (`num_computed_prompt_tokens`); on growth each group's last
-            // `new_page_count` pages are.
-            let table_changed = admitted || new_page_count > 0;
-            for group_id in 0..cache.block_pool.num_groups() {
-                let page_ids = tables
-                    .get(group_id)
-                    .map(BlockTable::page_ids)
+
+            // A table is declared when its held page interval changed since
+            // its last declaration (growth, or window retirement in a
+            // sliding-window group) or it holds fresh units, which the worker
+            // must reset before use. A forward's fresh units are those
+            // allocated since the declared watermark (`plan_computation`).
+            // Admission (or re-admission) declares every table again, with
+            // every allocated page fresh; pages acquired from the prefix
+            // cache already hold computed KV and are never fresh.
+            if admitted {
+                allocation.clear_sent();
+            }
+            let fresh_since = if admitted {
+                Some(0)
+            } else {
+                (fresh_count > 0).then(|| declared.saturating_sub(fresh_count))
+            };
+            for table in &mut allocation.tables {
+                let fresh = fresh_since
+                    .map(|serial| table.fresh_units(serial))
                     .unwrap_or_default();
-                if table_changed {
+                if table.changed_since_sent() || !fresh.is_empty() {
                     call_block_tables.push(IpcBlockTable {
                         request_pool_idx,
-                        group_id: group_id as u32,
-                        allocated_tokens: u32::try_from(
-                            page_ids
-                                .len()
-                                .saturating_mul(self.info.kv_block_size() as usize),
-                        )
-                        .unwrap_or(u32::MAX),
-                        page_ids: page_ids.clone(),
+                        group_id: table.group_id() as u32,
+                        start_page: u32::try_from(table.start_page()).unwrap_or(u32::MAX),
+                        unit_ids: table.unit_ids(),
+                        allocated_tokens: u32::try_from(table.capacity_tokens())
+                            .unwrap_or(u32::MAX),
                     });
+                    table.mark_sent();
                 }
-                let fresh_pages = if admitted {
-                    let retained_pages = if group_id == 0 {
-                        (state.num_computed_prompt_tokens as usize)
-                            .div_ceil(self.info.kv_block_size() as usize)
-                            .min(page_ids.len())
-                    } else {
-                        0
-                    };
-                    page_ids[retained_pages..].to_vec()
-                } else if new_page_count > 0 {
-                    page_ids[page_ids.len().saturating_sub(new_page_count)..].to_vec()
-                } else {
-                    Vec::new()
-                };
-                if !fresh_pages.is_empty() {
-                    call_new_cache_pages.push(CachePageAllocation {
+                if !fresh.is_empty() {
+                    call_new_cache_units.push(CacheUnitAllocation {
                         request_pool_idx,
-                        group_id: group_id as u32,
-                        page_ids: fresh_pages,
+                        group_id: table.group_id() as u32,
+                        unit_ids: fresh,
                     });
                 }
             }
@@ -920,27 +909,24 @@ impl Scheduler {
             };
             let mut alternative = None;
             if let Some(prefix) = state.flow_prefix.as_mut() {
-                let allocated_tokens = prefix
-                    .block_tables()
-                    .first()
-                    .map(|table| table.capacity_tokens())
-                    .unwrap_or_default();
-                if !prefix.diffusion_finalized || !prefix.new_pages.is_empty() {
+                if !prefix.diffusion_finalized || !prefix.new_units.is_empty() {
                     for table in prefix.block_tables() {
                         call_block_tables.push(IpcBlockTable {
                             request_pool_idx: prefix.request_pool_idx(),
                             group_id: table.group_id() as u32,
-                            page_ids: table.page_ids(),
-                            allocated_tokens: u32::try_from(allocated_tokens).unwrap_or(u32::MAX),
+                            start_page: u32::try_from(table.start_page()).unwrap_or(u32::MAX),
+                            unit_ids: table.unit_ids(),
+                            allocated_tokens: u32::try_from(table.capacity_tokens())
+                                .unwrap_or(u32::MAX),
                         });
                     }
                 }
-                for (group_id, pages) in std::mem::take(&mut prefix.new_pages) {
-                    if !pages.is_empty() {
-                        call_new_cache_pages.push(CachePageAllocation {
+                for (group_id, units) in std::mem::take(&mut prefix.new_units) {
+                    if !units.is_empty() {
+                        call_new_cache_units.push(CacheUnitAllocation {
                             request_pool_idx: prefix.request_pool_idx(),
                             group_id,
-                            page_ids: pages,
+                            unit_ids: units,
                         });
                     }
                 }
@@ -1049,7 +1035,7 @@ impl Scheduler {
                 worker,
                 request_pool_idx: None,
                 block_tables: call_block_tables,
-                new_cache_pages: call_new_cache_pages,
+                new_cache_units: call_new_cache_units,
                 forward: call_forward,
                 latent,
                 decode: None,
@@ -1092,8 +1078,8 @@ impl Scheduler {
             .store(self.pending_request_count(), Ordering::Relaxed);
         self.stats
             .kv_cache
-            .free_blocks
-            .store(self.storage.free_blocks(), Ordering::Relaxed);
+            .free_units
+            .store(self.storage.free_units(), Ordering::Relaxed);
         self.inflight.register_pending_batch(&batch, submit_at);
         batch
     }
@@ -1142,12 +1128,20 @@ impl Scheduler {
                 .matches_generated(&st.req.prompt_token_ids)
     }
 
-    /// Grows the request's KV tables to hold `total_tokens` tokens.
+    /// Grows the request's KV tables for a call that reads from KV token
+    /// `read_start` and holds `total_tokens` tokens.
     ///
-    /// Returns `false` when the request is not running, the cache cannot grow,
-    /// or (after latching engine-fatal) a running request lacks its
+    /// A sliding-window group needs only the pages the read's window and the
+    /// call's tokens intersect; every group's units come from one pool.
+    /// Returns `false` when the request is not running, the cache cannot
+    /// grow, or (after latching engine-fatal) a running request lacks its
     /// allocations or the KV cache.
-    pub(super) fn ensure_request_capacity(&mut self, id: RequestId, total_tokens: usize) -> bool {
+    pub(super) fn ensure_request_capacity(
+        &mut self,
+        id: RequestId,
+        read_start: usize,
+        total_tokens: usize,
+    ) -> bool {
         let Some(state) = self.running.get_mut(&id) else {
             return false;
         };
@@ -1160,6 +1154,7 @@ impl Scheduler {
         cache
             .grow(
                 &mut allocations.kv,
+                read_start.min(u32::MAX as usize) as u32,
                 total_tokens.min(u32::MAX as usize) as u32,
             )
             .is_ok()
@@ -1178,11 +1173,11 @@ impl Scheduler {
         }
     }
 
-    /// Builds a computation and records the KV pages owned by its next dispatch.
+    /// Builds a computation and records the KV units owned by its next dispatch.
     ///
-    /// For a forward call, sets `bounds.max_kv_pages` to the pages the first
+    /// For a forward call, sets `bounds.max_kv_units` to the units every
     /// group's table gained since the last dispatch and advances
-    /// `num_kv_blocks_sent`; a caller that drops the call must roll that back.
+    /// `num_kv_units_sent`; a caller that drops the call must roll that back.
     ///
     /// Returns `None` when the request is not running, when planning fails
     /// (the request is then finished with `Error`), or, after latching
@@ -1201,22 +1196,21 @@ impl Scheduler {
                         | CallKind::Forward(ForwardMode::Decode)
                         | CallKind::Forward(ForwardMode::Verify)
                 ) {
-                    // The KV owner keeps page identities. The scheduled record
-                    // only needs the number of fresh pages for dispatch and drain.
+                    // The KV owner keeps unit identities. The scheduled record
+                    // only needs the number of fresh units for dispatch and drain.
                     let state = self.running.get_mut(&id)?;
                     let Some(allocated) = state
-                        .block_tables()
-                        .and_then(|tables| tables.first())
-                        .map(BlockTable::len)
+                        .allocations()
+                        .map(|allocations| allocations.kv.allocated_units())
                     else {
                         self.invariant_broken("a request planning a forward holds its KV tables");
                         return None;
                     };
-                    call.bounds.max_kv_pages = allocated
-                        .saturating_sub(state.num_kv_blocks_sent)
-                        .min(u32::MAX as usize)
+                    call.bounds.max_kv_units = allocated
+                        .saturating_sub(state.num_kv_units_sent)
+                        .min(u64::from(u32::MAX))
                         as u32;
-                    state.num_kv_blocks_sent = allocated;
+                    state.num_kv_units_sent = allocated;
                 }
                 Some(call)
             }
@@ -1267,7 +1261,7 @@ impl Scheduler {
                     .min(self.config.long_prefill_threshold)
                     .min(budget.max(1));
                 let end = (cursor + chunk_cap.max(1)).min(n);
-                if !self.ensure_request_capacity(id, end) {
+                if !self.ensure_request_capacity(id, kv_visible_len as usize, end) {
                     return None;
                 }
                 let sampling_state = self.build_token_masks(id, 0, 0);
@@ -1295,7 +1289,7 @@ impl Scheduler {
                 let pos = logical_position;
                 let relay_input = projected_successor || self.can_reuse_resolved_token_product(id);
                 let capacity_target = decode_capacity_target(pos as usize, 0);
-                if !self.ensure_request_capacity(id, capacity_target) {
+                if !self.ensure_request_capacity(id, kv_visible_len as usize, capacity_target) {
                     return None;
                 }
 
@@ -1313,7 +1307,7 @@ impl Scheduler {
             Phase::CloseKv => {
                 let token = self.running.get(&id)?.next_token;
                 let capacity_target = decode_capacity_target(kv_visible_len as usize, 0);
-                if !self.ensure_request_capacity(id, capacity_target) {
+                if !self.ensure_request_capacity(id, kv_visible_len as usize, capacity_target) {
                     return None;
                 }
 
@@ -1327,9 +1321,8 @@ impl Scheduler {
                         .info
                         .kv_cache
                         .as_ref()
-                        .map_or(0, |cache| cache.publication_bytes_per_token()),
+                        .map_or(0, |cache| cache.publication_bytes(kv_visible_len)),
                     request,
-                    kv_visible_len,
                 )
             }),
             Phase::PrepareGen => {
@@ -1490,6 +1483,7 @@ impl Scheduler {
 
                 if !self.ensure_request_capacity(
                     id,
+                    kv_visible_len as usize,
                     kv_visible_len.saturating_add(physical_bound) as usize,
                 ) {
                     return None;
@@ -1569,7 +1563,11 @@ impl Scheduler {
             .min(prompt_len)
             .min(next_image.max(cursor + 1));
 
-        if !self.ensure_request_capacity(id, kv_visible_len as usize + end - cursor) {
+        if !self.ensure_request_capacity(
+            id,
+            kv_visible_len as usize,
+            kv_visible_len as usize + end - cursor,
+        ) {
             return None;
         }
 

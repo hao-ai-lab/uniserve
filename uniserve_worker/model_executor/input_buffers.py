@@ -21,6 +21,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from uniserve.math import bucketed_length
 from uniserve.media import image
 from uniserve.model import EmbeddingReplacement, TextInput, VisionInput
 from uniserve.nn.attention import (
@@ -36,7 +37,11 @@ from uniserve.tensors import BufferConfig, adjacent_view
 from uniserve_worker.model_executor._decode_inputs import (
     gather_request_decode_inputs,
 )
-from uniserve_worker.model_executor.attention import cache_pages, columns
+from uniserve_worker.model_executor.attention import (
+    columns,
+    row_tables,
+    table_pages,
+)
 from uniserve_worker.model_executor.diffusion_inputs import (
     DecodeInput,
     DiffusionRow,
@@ -76,32 +81,43 @@ class AttentionBufferConfig(RowBufferConfig):
     fills only the leading axis for one-axis positions. ``max_tokens`` bounds
     the positions and write-index columns; ``input_buffer_config`` gives
     text and diffusion staging built from one ``TokenBufferConfig`` the
-    same bound.
+    same bound. ``table_widths`` holds the most pages one call stages per
+    row of each numerical block table, in table order.
     """
 
     max_tokens: int
-    max_blocks_per_row: int
+    table_widths: tuple[int, ...]
 
     def __post_init__(self):
         RowBufferConfig.__post_init__(self)
-        if min(self.max_tokens, self.max_blocks_per_row) < 1:
+        if (
+            self.max_tokens < 1
+            or not self.table_widths
+            or min(self.table_widths) < 1
+        ):
             raise ValueError(
                 "attention token and block bounds must be positive"
             )
 
     def buffers(self):
         rows, tokens = self.max_rows, self.max_tokens
+        tables = len(self.table_widths)
         return {
             **RowBufferConfig.buffers(self),
             "positions": BufferConfig((3, tokens), torch.int64),
+            # [table, row, column]: every table shares the widest capacity so
+            # each table's staged view is one strided slice.
             "block_tables": BufferConfig(
-                (rows, self.max_blocks_per_row), torch.int32
+                (tables, rows, max(self.table_widths)), torch.int32
             ),
+            # [table, row]: first staged logical page of windowed tables.
+            "start_pages": BufferConfig((tables, rows), torch.int32),
             "cache_lengths": BufferConfig((rows,), torch.int32),
             "query_lengths": BufferConfig((rows,), torch.int32),
             "cumulative_query_lengths": BufferConfig((rows + 1,), torch.int32),
             "cumulative_prefix_lengths": BufferConfig((rows + 1,), torch.int32),
-            "write_indices": BufferConfig((tokens,), torch.int64),
+            # [table, token]: each table addresses its own units.
+            "write_indices": BufferConfig((tables, tokens), torch.int64),
         }
 
 
@@ -211,7 +227,7 @@ class InputBuffers:
                 mix computations, or subclass staging rejects the rows.
             TypeError: A row is not this staging's ``row_type``, or token or
                 diffusion staging receives unsupported attention.
-            WorkerError: ``cache_pages`` rejects the rows while attention
+            WorkerError: ``row_tables`` rejects the rows while attention
                 is built from ``cache`` and ``tables``.
         """
         if not 0 < len(rows) <= self.max_rows:
@@ -265,6 +281,7 @@ class AttentionBuffers(InputBuffers):
 
     positions: torch.Tensor
     block_tables: torch.Tensor
+    start_pages: torch.Tensor
     cache_lengths: torch.Tensor
     query_lengths: torch.Tensor
     cumulative_query_lengths: torch.Tensor
@@ -274,31 +291,48 @@ class AttentionBuffers(InputBuffers):
     def __init__(self, *, config: AttentionBufferConfig, **options):
         super().__init__(config=config, **options)
         self.max_tokens = config.max_tokens
-        self.max_blocks_per_row = config.max_blocks_per_row
+        self.table_widths = config.table_widths
         # -1 is the attention write-index sentinel for a token that writes no
         # cache slot; unstaged capacity starts inert.
         self.write_indices.fill_(-1)
 
     def stage_attention(self, attention):
-        """Copy paged or segmented attention columns into the fixed buffers.
+        """Copy every table's paged or segmented columns into fixed buffers.
 
-        Returns an attention input of the same type whose device tensors are
-        leading views of this owner's columns; host length metadata is
-        carried over unchanged. A segmented input is accepted only when its
-        current sequences are fully visible, and is rebuilt with each query
-        seeing its whole current sequence.
+        ``attention`` is an ``AttentionBatch`` whose entries share one query
+        domain and one prefix-length column. Returns a batch over the same
+        tables whose device tensors are leading views of this owner's
+        columns; host length metadata and host start pages are carried over
+        unchanged. A segmented entry is accepted only when its current
+        sequences are fully visible, and is rebuilt with each query seeing
+        its whole current sequence.
 
         Raises:
-            TypeError: ``attention`` is neither paged nor segmented.
-            ValueError: A column exceeds capacity, or a segmented input is
-                not fully visible or lacks host query lengths.
+            TypeError: An entry is neither paged nor segmented.
+            ValueError: A table or column exceeds capacity, entries do not
+                share prefix lengths, or a segmented entry is not fully
+                visible or lacks host query lengths.
         """
-        if not isinstance(attention, (PagedInput, SegmentedInput)):
+        entries = attention.entries
+        if not all(
+            isinstance(entry, (PagedInput, SegmentedInput))
+            for entry in entries.values()
+        ):
             raise TypeError(
                 "worker token staging requires paged or prefix/current "
                 "attention"
             )
+        if any(table >= len(self.table_widths) for table in entries):
+            raise ValueError("attention tables exceed input-buffer capacity")
+        first = next(iter(entries.values()))
+        if any(
+            entry.prefixes.values is not first.prefixes.values
+            for entry in entries.values()
+        ):
+            raise ValueError("staged attention tables must share prefixes")
 
+        # The query domain and the prefix lengths are staged once and shared
+        # by every table's entry.
         count = attention.queries.batch_size
         queries = SequenceLengths(
             host=attention.queries.host,
@@ -308,33 +342,45 @@ class AttentionBuffers(InputBuffers):
             ),
         )
         prefixes = SequenceLengths(
-            host=attention.prefixes.host,
-            values=self._vector(self.cache_lengths, attention.prefixes.values),
+            host=first.prefixes.host,
+            values=self._vector(self.cache_lengths, first.prefixes.values),
             offsets=self._vector(
-                self.cumulative_prefix_lengths, attention.prefixes.offsets
+                self.cumulative_prefix_lengths, first.prefixes.offsets
             ),
         )
 
-        source = attention.block_table.indices
-        if source.shape[1] > self.max_blocks_per_row:
+        staged = {
+            number: self._stage_table(number, entry, queries, prefixes, count)
+            for number, entry in entries.items()
+        }
+        return AttentionBatch(staged, queries)
+
+    def _stage_table(self, number, entry, queries, prefixes, count):
+        """Stage one table's pages, start pages and write addresses."""
+        source = entry.block_table
+        if source.indices.shape[1] > self.table_widths[number]:
             raise ValueError("block tables exceed input-buffer capacity")
 
-        table = self.block_tables[:count, : source.shape[1]]
-        table.copy_(source, non_blocking=True)
-        blocks = BlockTable(table, attention.block_table.block_size)
+        table = self.block_tables[number, :count, : source.indices.shape[1]]
+        table.copy_(source.indices, non_blocking=True)
+        start = None
+        if source.start_page is not None:
+            start = self.start_pages[number, :count]
+            start.copy_(source.start_page, non_blocking=True)
+        blocks = BlockTable(
+            table, source.block_size, start, source.start_page_host
+        )
 
         writes = (
             None
-            if attention.write_indices is None
-            else self._vector(self.write_indices, attention.write_indices)
+            if entry.write_indices is None
+            else self._vector(self.write_indices[number], entry.write_indices)
         )
 
-        if isinstance(attention, PagedInput):
-            return PagedInput(
-                queries, prefixes, blocks, writes, attention.causal
-            )
+        if isinstance(entry, PagedInput):
+            return PagedInput(queries, prefixes, blocks, writes, entry.causal)
 
-        if not attention.fully_visible_current:
+        if not entry.fully_visible_current:
             raise ValueError(
                 "image staging requires fully visible current sequences"
             )
@@ -446,20 +492,24 @@ class TokenBuffers(AttentionBuffers):
                     "indexed decode requires valid resident request slots"
                 )
 
-            # A fully indexed call on one CUDA device with its resident page
-            # tables gathers every input on device. ``cache_pages`` validates
-            # the rows' cache extents (including one KV group per call) and
-            # returns the staged table width.
+            # A fully indexed call on one CUDA device with its resident unit
+            # tables gathers every input on device. ``row_tables`` validates
+            # the rows' cache extents; the host selects each table's staged
+            # pages only to bound its width and mirror its start pages.
             if (
                 attention is None
                 and cache is not None
                 and tables is not None
-                and states.device == tables.page_tables.device == self.device
+                and states.device == tables.unit_tables.device == self.device
                 and self.device.type == "cuda"
                 and all(row.request_indexed_decode for row in rows)
             ):
-                _, width = cache_pages(rows, cache=cache, tables=tables)
-                inputs = self._indexed(rows, width, cache, tables, states)
+                pages = table_pages(
+                    row_tables(rows, cache=cache, tables=tables),
+                    prefix_lengths=tuple(row.seq_len for row in rows),
+                    query_lengths=(1,) * len(rows),
+                )
+                inputs = self._indexed(rows, pages, tables, states)
                 return inputs, tuple(row.selection for row in rows), finish
 
             # Otherwise (prepared attention supplied, not every row indexed,
@@ -487,10 +537,7 @@ class TokenBuffers(AttentionBuffers):
             if attention is None
             else attention
         )
-        # Every cache layer of a worker's prefix cache reads table 0.
-        inputs = self._text(
-            rows, AttentionBatch.single(self.stage_attention(attention))
-        )
+        inputs = self._text(rows, self.stage_attention(attention))
         return inputs, tuple(row.selection for row in rows), finish
 
     def _text(self, rows, attention):
@@ -605,21 +652,37 @@ class TokenBuffers(AttentionBuffers):
             else None,
         )
 
-    def _indexed(self, rows, width, cache, tables, states):
+    def _indexed(self, rows, pages, tables, states):
         """Gather resident decode rows on device directly into paged staging.
 
         One kernel reads the rows' request slots from
         ``request_pool_indices`` (already copied by ``prepare_inputs`` on the
-        same stream) and fills token, position, table, length, offset and
-        write-index columns over the whole row capacity. Rows past
-        ``len(rows)`` are initialized as inert padding and their request
-        slots reset to 0, so a padded decode graph replays consistent inputs.
-        Every row decodes one query token.
+        same stream) and fills token, position, length, offset, table, start
+        page and write-index columns of every numerical table over the whole
+        row capacity. Rows past ``len(rows)`` are initialized as inert
+        padding and their request slots reset to 0, so a padded decode graph
+        replays consistent inputs. Every row decodes one query token.
+        ``pages`` holds the host selection of every table's staged pages,
+        which bounds each table's width and mirrors its start pages.
+
+        Raises:
+            ValueError: A table's staged pages exceed its capacity.
         """
         count = len(rows)
+        widths = []
+        for number, table in enumerate(pages):
+            if table.width > self.table_widths[number]:
+                raise ValueError("block tables exceed input-buffer capacity")
+            # Power-of-two widths keep the staged shapes few.
+            widths.append(
+                min(bucketed_length(table.width), self.table_widths[number])
+            )
+
         gather_request_decode_inputs(
             request_pool_indices=self.request_pool_indices,
-            request_page_tables=tables.page_tables,
+            request_unit_tables=tables.unit_tables,
+            request_start_pages=tables.start_pages,
+            table_shapes=tables.table_shapes,
             request_cache_lengths=tables.verified_lengths,
             request_tokens=states.future_input_tokens[:, 0],
             request_positions=states.logical_lengths,
@@ -627,18 +690,17 @@ class TokenBuffers(AttentionBuffers):
             positions=self.positions
             if self.image_builder is not None
             else self.positions[:1],
-            block_tables=self.block_tables[:, :width],
+            block_tables=self.block_tables,
+            start_pages=self.start_pages,
             cache_lengths=self.cache_lengths,
             query_lengths=self.query_lengths,
             query_offsets=self.cumulative_query_lengths,
             prefix_offsets=self.cumulative_prefix_lengths,
             write_indices=self.write_indices,
             rows=count,
-            group_id=rows[0].group_id,
-            page_size=cache.info.block_size,
+            columns=max(widths),
         )
 
-        writes = self.write_indices[:count]
         queries = SequenceLengths(
             host=(1,) * count,
             values=self.query_lengths[:count],
@@ -649,18 +711,26 @@ class TokenBuffers(AttentionBuffers):
             values=self.cache_lengths[:count],
             offsets=self.cumulative_prefix_lengths[: count + 1],
         )
+        causal = tuple(row.causal for row in rows)
 
-        attention = AttentionBatch.single(
-            PagedInput(
+        entries = {}
+        for number, (table, width) in enumerate(
+            zip(pages, widths, strict=True)
+        ):
+            windowed = table.windowed
+            entries[number] = PagedInput(
                 queries,
                 prefixes,
                 BlockTable(
-                    self.block_tables[:count, :width], cache.info.block_size
+                    self.block_tables[number, :count, :width],
+                    table.block_size,
+                    self.start_pages[number, :count] if windowed else None,
+                    table.start_pages if windowed else None,
                 ),
-                writes,
-                tuple(row.causal for row in rows),
+                self.write_indices[number, :count],
+                causal,
             )
-        )
+        attention = AttentionBatch(entries, queries)
 
         if self.image_builder is not None:
             positions = self.positions[:, :count]
@@ -689,13 +759,7 @@ class DiffusionBuffers(AttentionBuffers):
             if attention is None
             else attention
         )
-        return (
-            self._images(
-                rows, AttentionBatch.single(self.stage_attention(attention))
-            ),
-            (),
-            None,
-        )
+        return self._images(rows, self.stage_attention(attention)), (), None
 
     def _images(self, rows, attention):
         """Stage denoising positions and timesteps, then bind image inputs.
@@ -801,7 +865,7 @@ def input_buffer_config(kind, limits: TokenBufferConfig):
         return TokenBuffers, limits
     if kind is MediaCall.DENOISING:
         return DiffusionBuffers, DiffusionBufferConfig(
-            limits.max_rows, limits.max_tokens, limits.max_blocks_per_row
+            limits.max_rows, limits.max_tokens, limits.table_widths
         )
     if kind in {MediaCall.VISION_ENCODING, MediaCall.LATENT_ENCODING}:
         return VisionBuffers, RowBufferConfig(limits.max_rows)
