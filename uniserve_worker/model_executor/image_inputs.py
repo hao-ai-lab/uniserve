@@ -15,7 +15,6 @@ from __future__ import annotations
 import base64
 import binascii
 import io
-import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -69,12 +68,11 @@ def _image_plan(
 
     Vision encoding uses the processor's ``vit`` transform and every other
     call kind its ``vae`` transform. A patch tower keeps the source size as
-    its canvas, and its pixel bound depends on ``input_images`` (see
-    ``PatchTransform.pixel_bound``). For a ``TowerTransform``, whether
-    ``vit`` or ``vae``, the canvas is the source resized by the ``vae``
-    stride policy when the processor declares a ``vae`` transform, and the
-    tower input applies the selected transform's stride policy to that
-    canvas.
+    its canvas, and its input size is ``PatchTransform.resized_size`` for
+    ``input_images``. For a ``TowerTransform``, whether ``vit`` or ``vae``,
+    the canvas is the source resized by the ``vae`` stride policy when the
+    processor declares a ``vae`` transform, and the tower input applies the
+    selected transform's stride policy to that canvas.
 
     Returns:
         The selected transform, the canvas (height, width) and the tower's
@@ -82,8 +80,8 @@ def _image_plan(
 
     Raises:
         WorkerError: An ``invalid_descriptor`` error when the model declares
-            no transform for ``kind``, or, for a patch tower, when
-            ``_bounded_grid_shape`` rejects the dimensions.
+            no transform for ``kind``, or, for a patch tower, when its resize
+            policy rejects the dimensions.
     """
     transform = (
         processor.vit if kind is MediaCall.VISION_ENCODING else processor.vae
@@ -93,11 +91,11 @@ def _image_plan(
             f"model declares no {kind.value} image transform"
         )
     if isinstance(transform, PatchTransform):
-        return (
-            transform,
-            (height, width),
-            _patch_image_shape(transform, height, width, input_images),
-        )
+        try:
+            tower = transform.resized_size(height, width, input_images)
+        except ValueError as error:
+            raise invalid_descriptor(str(error)) from error
+        return transform, (height, width), tower
 
     canvas = (
         (height, width)
@@ -172,7 +170,7 @@ def prepare_tensor_image(
     ``image`` is [3, height, width] or [1, 3, height, width] with values in
     [0, 1], or in [-1, 1] when ``signed_unit``; values are clamped to [0, 1]
     before the transforms. The view is a generated image rather than a
-    request input, so a patch tower bounds it by ``max_pixels`` alone.
+    request input, so a patch tower applies its single-image pixel bound.
     """
     value = image.detach().to(dtype=torch.float32)
     if value.ndim == 4:
@@ -223,7 +221,7 @@ def _decode_rgb(encoded: str) -> Image.Image:
 
 
 def patch_grid_shape(
-    processor: PatchTransform,
+    transform: PatchTransform,
     source_height: int,
     source_width: int,
     input_images: int | None,
@@ -232,75 +230,15 @@ def patch_grid_shape(
 
     ``input_images`` is the number of input images in the request of a
     request input image, or None for a generated image.
-    """
-    height, width = _patch_image_shape(
-        processor, source_height, source_width, input_images
-    )
-    patch = int(processor.patch_size)
-    return height // patch, width // patch
-
-
-def _patch_image_shape(
-    processor: PatchTransform,
-    source_height: int,
-    source_width: int,
-    input_images: int | None,
-) -> tuple[int, int]:
-    """Resolve the resized pixel dimensions for a patch tower.
-
-    Both dimensions become multiples of ``patch_size / downsample_ratio``
-    within the processor's lower pixel bound and the upper bound
-    ``PatchTransform.pixel_bound`` gives for ``input_images``.
-    """
-    factor = int(
-        round(int(processor.patch_size) / float(processor.downsample_ratio))
-    )
-    return _bounded_grid_shape(
-        source_height,
-        source_width,
-        factor=factor,
-        minimum=int(processor.min_pixels),
-        maximum=int(processor.pixel_bound(input_images)),
-    )
-
-
-def _bounded_grid_shape(
-    height: int,
-    width: int,
-    *,
-    factor: int,
-    minimum: int,
-    maximum: int,
-) -> tuple[int, int]:
-    """Fit aspect-preserving pixel dimensions within pixel-area bounds.
-
-    Each dimension is rounded to a multiple of ``factor`` pixels; when the
-    resulting area falls outside [``minimum``, ``maximum``] the image is
-    rescaled, flooring toward ``maximum`` or ceiling toward ``minimum``.
-    Returns (height, width) in pixels.
 
     Raises:
-        WorkerError: An ``invalid_descriptor`` error for a nonpositive
-            dimension or ``factor``, or an aspect ratio above 200.
+        WorkerError: An ``invalid_descriptor`` error when the transform's
+            resize policy rejects the dimensions.
     """
-    if min(height, width, factor) < 1:
-        raise invalid_descriptor("image dimensions must be positive")
-    if max(height, width) / min(height, width) > 200:
-        raise invalid_descriptor("image aspect ratio must be at most 200")
-
-    result_height = max(factor, round(height / factor) * factor)
-    result_width = max(factor, round(width / factor) * factor)
-    if result_height * result_width > maximum:
-        scale = math.sqrt((height * width) / maximum)
-        result_height = max(
-            factor, math.floor(height / scale / factor) * factor
-        )
-        result_width = max(factor, math.floor(width / scale / factor) * factor)
-    elif result_height * result_width < minimum:
-        scale = math.sqrt(minimum / (height * width))
-        result_height = math.ceil(height * scale / factor) * factor
-        result_width = math.ceil(width * scale / factor) * factor
-    return result_height, result_width
+    try:
+        return transform.grid_shape(source_height, source_width, input_images)
+    except ValueError as error:
+        raise invalid_descriptor(str(error)) from error
 
 
 def _stride_image_shape(
