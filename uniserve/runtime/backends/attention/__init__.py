@@ -347,8 +347,11 @@ def resolve(
 ) -> Backend:
     """Resolve a provider, preserving an optional configured FlashInfer factory.
 
-    Automatic selection also uses its workspace grant for TensorRT-LLM, whose
-    native kernels consume the same scratch allocation.
+    ``"auto"`` selects native kernels per call (see ``_auto``) and uses the
+    FlashInfer factory's workspace grant for the TensorRT-LLM kernels that
+    ship with FlashInfer. Any other name selects that provider for every
+    call, including the FlashInfer, FlashAttention-2 and portable torch
+    providers that automatic selection never chooses on CUDA.
     """
     if isinstance(backend, Backend):
         return backend
