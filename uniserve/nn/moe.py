@@ -84,8 +84,10 @@ class FusedMoE(nn.Module):
     """Routed expert FFN over stacked expert weights.
 
     ``up_gate.weight`` is ``[E, 2I, H]`` with each expert's up rows followed
-    by its gate rows (the order grouped expert kernels consume directly);
-    ``down.weight`` is ``[E, H, I]``. ``forward(hidden [T, H],
+    by its gate rows; ``down.weight`` is ``[E, H, I]``. These are logical
+    orders: an encoded weight may store each expert's rows in the physical
+    ``RowOrder`` its prepared kernel reads, which the runtime provider
+    places once and every consumer decodes. ``forward(hidden [T, H],
     topk_ids [T, K] int32, topk_weights [T, K] fp32) -> [T, H]`` computes
 
         sum_k topk_weights[t, k] * down_e(act(gate_e(x_t)) * up_e(x_t)),
