@@ -381,6 +381,7 @@ def _token_worker_layout(
     # Zero leaves prefill calls bounded by the batch call bound alone, as
     # when they run eagerly; captured prefill graphs lower it below.
     max_prefill_calls = 0
+    prefills_on_cuda = False
     unresolved_window = call_window(
         int(queue_depth), int(worker_config.max_batch_calls)
     )
@@ -487,6 +488,10 @@ def _token_worker_layout(
                     if not selected:
                         continue
                     fields = input_config
+                    prefills_on_cuda |= (
+                        ForwardMode.PREFILL in selected
+                        and torch.device(target).type == "cuda"
+                    )
                     if (
                         ForwardMode.PREFILL in selected
                         and torch.device(target).type == "cuda"
@@ -499,13 +504,6 @@ def _token_worker_layout(
                             feature_injection=image_processor is not None
                             and image_processor.feature_injection is not None,
                         )
-                        bound = prefill_rows(captures, max_rows=max_rows)
-                        if bound is not None:
-                            max_prefill_calls = (
-                                bound
-                                if not max_prefill_calls
-                                else min(max_prefill_calls, bound)
-                            )
                         fields = (
                             replace(
                                 fields,
@@ -613,6 +611,28 @@ def _token_worker_layout(
             )
             capacity_group.all_reduce(units, op="min")
             capacity = replace(capacity, num_units=int(units.item()))
+
+        # Prefill calls on a CUDA device replay graphs whose rows' pages fit
+        # the granted pool. The rows the widest graphs hold bound every
+        # prefill call the engine forms. The staging above was sized before
+        # the pool, for the rows of every configured bucket.
+        row_units = sum(group.units_per_page for group in planes.groups)
+        pool_rows = (capacity.num_units - 1) // row_units
+        if prefills_on_cuda:
+            max_prefill_calls = (
+                prefill_rows(
+                    prefill_captures(
+                        worker_config,
+                        max_rows=min(max_rows, pool_rows),
+                        max_tokens=input_config.max_text_tokens,
+                        image_builder=flow is not None,
+                        feature_injection=image_processor is not None
+                        and image_processor.feature_injection is not None,
+                    ),
+                    max_rows=min(max_rows, pool_rows),
+                )
+                or 0
+            )
 
     # ``build_worker_layout`` replaces the supported calls and media routes
     # with the placement's narrowed values.

@@ -1120,11 +1120,13 @@ class ModelExecutor:
         config = self.worker_config
         self._initialize_streams(event_slots=max_inflight + 1)
 
-        # A decode row holds at least one page of every cache group. A
-        # prefill call holds at most the text tokens its staging accepts, the
-        # batch token budget plus one image's feature span, and at most the
-        # tokens the pool's units cover.
+        # A decode or prefill row holds at least one page of every cache
+        # group, so the pool's allocatable units bound the rows of either
+        # call. A prefill call holds at most the text tokens its staging
+        # accepts, the batch token budget plus one image's feature span, and
+        # at most the tokens the pool's units cover.
         max_rows = min(max_calls, request_slots)
+        pool_rows = (kv_cache.info.num_units - 1) // kv_cache.row_units
         decode_sizes = tuple(
             value
             for value in config.decode_graph_batch_sizes
@@ -1210,7 +1212,7 @@ class ModelExecutor:
                 prefill = (
                     prefill_captures(
                         config,
-                        max_rows=rows,
+                        max_rows=min(rows, pool_rows),
                         max_tokens=min(
                             input_config.max_text_tokens,
                             kv_cache.token_capacity,

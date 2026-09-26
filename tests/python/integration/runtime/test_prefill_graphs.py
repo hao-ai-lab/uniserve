@@ -8,7 +8,8 @@ non-causal image-block rows and 256-token commit rows return the outputs and
 write the KV of eager execution of the same calls, and a replayed call copies
 no device value to the host. After startup, a prefill call no captured graph
 holds fails instead of running eagerly, and the worker reports the most rows
-its prefill graphs hold.
+its prefill graphs hold, at most the rows its KV unit pool holds a page of
+each cache group for.
 """
 
 from __future__ import annotations
@@ -393,3 +394,65 @@ def test_sealed_prefill_rejects_calls_no_captured_graph_holds(tmp_path):
             _cache_values(manager), before, strict=True
         ):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_unit_pool_bounds_the_rows_of_prefill_graphs(tmp_path):
+    """A pool of few units bounds prefill rows, and startup still captures.
+
+    Every row of a prefill call holds a page of the model's one cache
+    group, so a 96-token unit pool holds fewer rows than the configured
+    prefill buckets would. Startup captures every prefill graph within the
+    pool, the worker reports the rows its allocatable units hold, and a
+    prefill of that many rows replays a graph.
+    """
+    _qwen_checkpoint(tmp_path)
+    model = models.load_model(
+        models.read_config(tmp_path), device="cuda:0"
+    ).model
+    config = WorkerConfig(
+        device="cuda:0",
+        block_size=16,
+        kv_token_capacity=96,
+        max_sequence_tokens=32,
+        max_batch_calls=16,
+        max_batch_tokens=64,
+        max_request_pool_size=16,
+        prefill_graph_token_sizes=(16,),
+        decode_graph_batch_sizes=(1,),
+    )
+    with Worker(
+        model,
+        worker_config=config,
+        sampling_group=Communicator(device=torch.device("cuda:0")),
+        tokenizer=None,
+        allowed_calls=supported_calls(model),
+        queue_depth=2,
+        completion_payload_bytes=1 << 16,
+    ) as worker:
+        worker.warmup()
+        # Unit zero is the pool's sentinel; each row holds one unit, and the
+        # pool holds fewer rows than the 31 the widest bucket would.
+        allocatable = worker.info.kv_cache.num_units - 1
+        assert allocatable < 31
+        assert worker.info.max_prefill_calls == allocatable
+
+        manager = worker.kv_cache
+        manager.block_tables.install(
+            tuple(
+                (slot, 0, 0, (slot,), 16) for slot in range(1, allocatable + 1)
+            )
+        )
+        output = _call(
+            worker.runner,
+            manager,
+            _rows(
+                tuple(
+                    torch.tensor([slot % 30 + 1]) for slot in range(allocatable)
+                ),
+                prefix=0,
+                selections=(TokenSelection.LAST_LOGITS,) * allocatable,
+            ),
+        )
+        assert output.stats.cuda_graph_replays == 1
+        assert len(output.materialize().values) == allocatable
