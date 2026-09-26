@@ -15,7 +15,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from importlib import import_module
 
-import torch
+# The portable provider is the submodule ``torch``; importing it binds that
+# name on this package, so the library keeps a distinct name here.
+import torch as torch_lib
 from torch import nn
 
 from uniserve.model.inputs import TextSize
@@ -46,10 +48,10 @@ class Operator:
 
     def __call__(
         self,
-        hidden: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-    ) -> torch.Tensor:
+        hidden: torch_lib.Tensor,
+        topk_ids: torch_lib.Tensor,
+        topk_weights: torch_lib.Tensor,
+    ) -> torch_lib.Tensor:
         raise NotImplementedError
 
     def close(self) -> None:
@@ -94,12 +96,12 @@ def _place(linear, order: RowOrder) -> None:
         and weight.scale_layout is ScaleLayout.SWIZZLED_128X4
     ):
         return
-    if torch.cuda.is_current_stream_capturing():
+    if torch_lib.cuda.is_current_stream_capturing():
         raise RuntimeError("expert weights must be placed before capture")
     placed = weight.repack(
         scale_layout=ScaleLayout.SWIZZLED_128X4, row_order=order
     )
-    torch.cuda.current_stream(weight.device).synchronize()
+    torch_lib.cuda.current_stream(weight.device).synchronize()
     linear.weight = nn.Parameter(placed, requires_grad=False)
 
 
@@ -120,7 +122,7 @@ class NVFP4Backend(Backend):
     up_gate_order: RowOrder
     down_order: RowOrder
 
-    def kernels_unsupported(self, device: torch.device) -> str | None:
+    def kernels_unsupported(self, device: torch_lib.device) -> str | None:
         """Return why the kernels cannot run on CUDA ``device``, or ``None``.
 
         Covers the device architecture and the installed kernel library.
@@ -140,7 +142,7 @@ class NVFP4Backend(Backend):
             for weight in (up_gate, down)
         ):
             return "only NVFP4 expert weights are served"
-        if up_gate.dtype != torch.bfloat16:
+        if up_gate.dtype != torch_lib.bfloat16:
             return "NVFP4 experts compute in BF16"
         if any(
             quantizer is None
@@ -189,7 +191,9 @@ class NVFP4Backend(Backend):
         return super().prepare(module=module, size=size, workspace=workspace)
 
 
-def resolve(backend: str | Backend, *, module, device: torch.device) -> Backend:
+def resolve(
+    backend: str | Backend, *, module, device: torch_lib.device
+) -> Backend:
     """Resolve a provider name for ``module`` on ``device``.
 
     ``auto`` selects a native grouped-expert kernel on a GPU and the
