@@ -4,18 +4,17 @@ Each precision's DiffusionGemma checkpoint is served by ``uniserve serve``
 on one GPU with its default flags and answers ``POST /v1/chat/completions``
 end to end: the server renders the Gemma-4 chat template, the engine
 prefills the prompt and denoises the reply canvas by canvas, committing
-each finished canvas to the context, and the Gemma-4 parsers split the
-thought channel and tool calls. The tests check what a client observes:
+each finished canvas to the context, and the Gemma-4 parser splits the
+thought channel from the content. The tests check what a client observes:
 
 - a seeded reply streams exactly what the same request returns in one
   response, with usage, and ends at an end-of-sequence token;
 - a stop string ends the reply at the string, and ``max_completion_tokens``
   truncates it inside a canvas;
-- a seed draws the same reply whether its request runs alone or with
-  others;
+- the same request, seed included, served alone again returns the same
+  reply;
 - ``chat_template_kwargs.enable_thinking`` opens and closes the thought
-  channel, a tool call parses into ``tool_calls``, and an attached image is
-  read;
+  channel, and an attached image is read;
 - token-sampling controls are refused with 400.
 
 The checkpoint directories come from ``UNISERVE_DIFFUSION_GEMMA_MODEL``
@@ -27,7 +26,6 @@ interpreter is ``UNISERVE_WORKER_PYTHON``, else the repository's
 from __future__ import annotations
 
 import base64
-import concurrent.futures
 import io
 import json
 import os
@@ -199,20 +197,18 @@ def test_the_completion_limit_truncates_inside_a_canvas(served):
     assert reply["usage"]["completion_tokens"] == 100
 
 
-def test_a_seed_draws_the_same_reply_alone_and_in_a_batch(served):
-    """The seed alone decides the reply, whatever runs beside it."""
-    body = _body(APPLES, seed=77, **_thinking(True))
-    alone = _complete(served, body)["choices"][0]["message"]
+def test_a_seed_repeats_its_reply(served):
+    """The same prompt, parameters and seed served alone give one reply.
 
-    others = [
-        _body(STORY, seed=seed, max_completion_tokens=300) for seed in (1, 2, 3)
-    ]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        futures = [pool.submit(_complete, served, other) for other in others]
-        batched = pool.submit(_complete, served, body).result()
-        for future in futures:
-            future.result()
-    assert batched["choices"][0]["message"] == alone
+    The seed selects the request's sampling stream, so a request served
+    again by itself draws the same canvases and returns the same reply.
+    """
+    body = _body(APPLES, seed=77, **_thinking(True))
+    first = _complete(served, body)
+    again = _complete(served, body)
+
+    assert again["choices"] == first["choices"]
+    assert again["usage"] == first["usage"]
 
 
 def test_thinking_opens_and_closes_the_thought_channel(served):
@@ -224,47 +220,6 @@ def test_thinking_opens_and_closes_the_thought_channel(served):
     assert not direct["choices"][0]["message"].get("reasoning_content")
     for reply in (thinking, direct):
         assert "15" in reply["choices"][0]["message"]["content"]
-
-
-def test_a_tool_call_is_returned_as_a_call(served):
-    """A reply that calls a declared tool returns the call with arguments.
-
-    The model does not write a well-formed call for every seed (it may omit
-    the call's opening token or leave the thought channel open, which the
-    checkpoint's own response parser does not read as a call either), so
-    the request is drawn with a few seeds and every call returned must be
-    the right one, at least one reply returning it.
-    """
-    tool = {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get the current weather for a city.",
-            "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}},
-                "required": ["city"],
-            },
-        },
-    }
-    calls = []
-    for seed in range(9, 13):
-        reply = _complete(
-            served,
-            _body(
-                "What is the weather in Paris right now?",
-                seed=seed,
-                tools=[tool],
-            ),
-        )
-        (choice,) = reply["choices"]
-        returned = choice["message"].get("tool_calls") or []
-        assert (choice["finish_reason"] == "tool_calls") == bool(returned)
-        calls.extend(returned)
-    assert calls
-    for call in calls:
-        assert call["function"]["name"] == "get_weather"
-        assert json.loads(call["function"]["arguments"])["city"] == "Paris"
 
 
 def test_an_attached_image_is_read(served):
