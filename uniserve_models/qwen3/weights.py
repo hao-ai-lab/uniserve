@@ -78,7 +78,7 @@ def parameter_sources(config: Config) -> Mapping[str, str]:
                 f"{source}.self_attn.{branch}_norm.weight"
             )
 
-        if config.num_experts:
+        if config.sparse(index):
             # Stacked expert parameters receive every expert's projections
             # through ``expert_sources``.
             names[f"{target}.mlp.router.weight"] = f"{source}.mlp.gate.weight"
@@ -99,13 +99,12 @@ def expert_sources(config: Config) -> Mapping[str, str]:
     the Transformers prefix whose ``{expert}.{gate,up,down}_proj.weight``
     tensors hold each expert's matrices.
     """
-    if not config.num_experts:
-        return {}
     return {
         f"backbone.layers.{index}.mlp.experts": (
             f"model.layers.{index}.mlp.experts"
         )
         for index in range(config.num_hidden_layers)
+        if config.sparse(index)
     }
 
 

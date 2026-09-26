@@ -247,6 +247,7 @@ def test_text_worker_reports_exact_cache_capacity(storage):
                 hidden_act="silu",
                 rms_norm_eps=1e-6,
                 rope_theta=10000.0,
+                rope_scaling=None,
                 max_position_embeddings=128,
                 attention_bias=False,
                 tie_word_embeddings=False,
@@ -254,6 +255,8 @@ def test_text_worker_reports_exact_cache_capacity(storage):
                 num_experts_per_tok=1,
                 moe_intermediate_size=48,
                 norm_topk_prob=False,
+                decoder_sparse_step=1,
+                mlp_only_layers=(),
             )
         ).to(dtype=torch.bfloat16)
     config = WorkerConfig(

@@ -29,7 +29,7 @@ from uniserve.nn.moe import FusedMoE, TopK
 from uniserve.nn.norm import RMSNorm
 from uniserve.nn.rope import RotaryEmbedding
 
-from .config import Config
+from .config import Config, expert_activation
 
 
 def _activation(name: str) -> str:
@@ -69,7 +69,12 @@ class Attention(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
         )
-        self.rotary = RotaryEmbedding(config.head_dim, theta=config.rope_theta)
+        self.rotary = RotaryEmbedding(
+            config.head_dim,
+            theta=config.rope_theta,
+            scaling=config.rope_scaling,
+            max_position_embeddings=config.max_position_embeddings,
+        )
 
     def forward(
         self,
@@ -77,8 +82,8 @@ class Attention(nn.Module):
         positions: torch.Tensor,
         attention: AttentionBatch,
     ):
-        # This unscaled recipe depends only on positions, so computing factors
-        # does not require a host mirror of the attention lengths.
+        # Plain and YaRN recipes depend only on positions, so computing
+        # factors does not require a host mirror of the attention lengths.
         cos, sin = self.rotary(
             positions.reshape(-1),
             dtype=torch.float32,
@@ -97,8 +102,11 @@ class MoE(nn.Module):
     """Top-k expert selection with a replicated mathematical router.
 
     Expert weights are the selected top-k softmax probabilities, renormalized
-    to one when ``Config.norm_topk_prob`` is set. Every expert is a SiLU gated
-    MLP, whatever ``Config.hidden_act`` names; only the dense MLP reads it.
+    to one when ``Config.norm_topk_prob`` is set. Experts gate with
+    ``Config.hidden_act``, as the dense MLP does. The weights stay in FP32 and
+    the experts combine in FP32 before one rounding to the hidden dtype; the
+    Transformers eager reference instead rounds the weights and each partial
+    sum to the hidden dtype, a difference within that dtype's rounding.
     """
 
     def __init__(self, config: Config):
@@ -112,7 +120,7 @@ class MoE(nn.Module):
             config.hidden_size,
             config.moe_intermediate_size,
             top_k=config.num_experts_per_tok,
-            activation="silu",
+            activation=expert_activation(config.hidden_act),
         )
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -132,7 +140,7 @@ class TransformerLayer(nn.Module):
         )
         self.mlp = (
             MoE(config)
-            if config.num_experts
+            if config.sparse(layer)
             else GatedMLP(
                 config.hidden_size,
                 config.intermediate_size,

@@ -3,6 +3,8 @@
 Cached decoding agrees with the checkpoint equations as well.
 """
 
+import json
+
 import pytest
 import torch
 
@@ -514,9 +516,48 @@ def _moe_logits(root, tokens, *, mesh=None):
         ).gather()
 
 
-@pytest.mark.parametrize("norm_topk_prob", [True, False])
-def test_mixture_of_experts_matches_transformers(tmp_path, norm_topk_prob):
-    reference = qwen_moe_checkpoint(tmp_path, norm_topk_prob=norm_topk_prob)
+_YARN = {
+    "rope_type": "yarn",
+    "rope_theta": 1_000_000.0,
+    "factor": 4.0,
+    "original_max_position_embeddings": 16,
+}
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"norm_topk_prob": True},
+        {"norm_topk_prob": False},
+        # Layer 0 keeps a dense MLP; only layer 1 routes to experts.
+        {"mlp_only_layers": [0]},
+        {"decoder_sparse_step": 2},
+        # Experts gate with the configured activation, as the dense MLP does.
+        {"hidden_act": "gelu_pytorch_tanh"},
+        {"rope_parameters": _YARN},
+    ],
+    ids=["renormalized", "raw", "mlp-only", "sparse-step", "gelu", "yarn"],
+)
+def test_mixture_of_experts_matches_transformers(tmp_path, fields):
+    reference = qwen_moe_checkpoint(tmp_path, **fields)
+    tokens = torch.tensor([3, 11, 29, 7, 1, 20])
+    with torch.no_grad():
+        expected = reference(tokens[None]).logits[0]
+    torch.testing.assert_close(
+        _moe_logits(tmp_path, tokens), expected, rtol=1e-5, atol=1e-6
+    )
+
+
+def test_legacy_rope_scaling_key_selects_the_same_yarn_positions(tmp_path):
+    reference = qwen_moe_checkpoint(tmp_path, rope_parameters=_YARN)
+    # Checkpoints written before Transformers 5 carry the recipe under
+    # rope_scaling with a top-level rope_theta.
+    path = tmp_path / "config.json"
+    metadata = json.loads(path.read_text())
+    recipe = dict(metadata.pop("rope_parameters"))
+    metadata["rope_theta"] = recipe.pop("rope_theta")
+    metadata["rope_scaling"] = recipe
+    path.write_text(json.dumps(metadata))
     tokens = torch.tensor([3, 11, 29, 7, 1, 20])
     with torch.no_grad():
         expected = reference(tokens[None]).logits[0]

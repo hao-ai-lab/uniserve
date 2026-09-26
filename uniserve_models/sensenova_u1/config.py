@@ -19,16 +19,9 @@ from typing import Any
 from uniserve import loading
 from uniserve.diffusion import NoiseScale
 from uniserve.loading import checkpoint
-from uniserve.nn.rope import (
-    DynamicScaling,
-    LinearScaling,
-    LlamaScaling,
-    LongRoPEScaling,
-    ProportionalScaling,
-    RoPEScaling,
-    YaRNScaling,
-)
+from uniserve.nn.rope import RoPEScaling
 
+from ..rotary import alias, read_rotary
 from . import flow, vision
 
 
@@ -221,29 +214,6 @@ def _required(config: Mapping[str, Any], name: str, label: str) -> Any:
     return config[name]
 
 
-def _alias(
-    primary: Mapping[str, Any],
-    name: str,
-    aliases: tuple[Mapping[str, Any], ...],
-    default: Any,
-) -> Any:
-    """Return one value for a field that checkpoints may duplicate across maps.
-
-    A ``None`` value counts as absent. Present values must all be equal, or
-    this raises ``ValueError``; with none present, ``default`` is returned.
-    """  # noqa: E501
-    values = [
-        source[name]
-        for source in (primary, *aliases)
-        if source.get(name) is not None
-    ]
-    if any(value != values[0] for value in values[1:]):
-        raise ValueError(
-            f"SenseNova checkpoint has conflicting aliases for {name}"
-        )
-    return values[0] if values else default
-
-
 def _normalize(raw: Mapping[str, Any]) -> Config:
     """Resolve checkpoint aliases once, without allocating numerical resources.
 
@@ -277,84 +247,13 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
         )
 
     # Checkpoints may carry rotary metadata under rope_scaling,
-    # rope_parameters, or both; a field present in both must agree. The
-    # recipe name comes from rope_type, falling back to the type key, and
-    # every type key present must name the same recipe.
-    scaling = text.get("rope_scaling") or {}
-    parameters = text.get("rope_parameters") or {}
-    if not isinstance(scaling, Mapping) or not isinstance(parameters, Mapping):
-        raise ValueError("SenseNova rotary metadata must be an object")
-    kind = _alias(
-        parameters,
-        "rope_type",
-        (scaling,),
-        parameters.get("type", scaling.get("type", "default")),
+    # rope_parameters, or both; read_rotary resolves their aliases.
+    rotary = read_rotary(
+        text,
+        owner="SenseNova",
+        default_theta=10000.0,
+        default_original=text.get("max_position_embeddings", 32768),
     )
-    if any(
-        source.get("type", kind) != kind for source in (parameters, scaling)
-    ):
-        raise ValueError(
-            "SenseNova checkpoint has conflicting rotary type aliases"
-        )
-
-    recipe: RoPEScaling | None = None
-    if kind != "default":
-
-        def option(name, default=None):
-            return _alias(parameters, name, (scaling,), default)
-
-        factor = option("factor")
-        original = option(
-            "original_max_position_embeddings",
-            text.get("max_position_embeddings", 32768),
-        )
-        match kind:
-            case "linear":
-                recipe = LinearScaling(factor)
-            case "dynamic":
-                recipe = DynamicScaling(factor)
-            case "proportional":
-                recipe = ProportionalScaling(factor)
-            case "yarn":
-                recipe = YaRNScaling(
-                    factor,
-                    original,
-                    option("attention_factor"),
-                    option("beta_fast", 32.0),
-                    option("beta_slow", 1.0),
-                    option("mscale"),
-                    option("mscale_all_dim"),
-                    option("truncate", True),
-                )
-            case "longrope":
-                short = option("short_factor", ())
-                long = option("long_factor", ())
-                if not all(
-                    isinstance(factors, (list, tuple))
-                    for factors in (short, long)
-                ):
-                    raise ValueError(
-                        "SenseNova LongRoPE short and long factors must be "
-                        "lists"
-                    )
-                recipe = LongRoPEScaling(
-                    factor,
-                    original,
-                    option("attention_factor"),
-                    tuple(short),
-                    tuple(long),
-                )
-            case "llama3":
-                recipe = LlamaScaling(
-                    factor,
-                    original,
-                    option("low_freq_factor", 1.0),
-                    option("high_freq_factor", 4.0),
-                )
-            case _:
-                raise ValueError(
-                    f"unsupported SenseNova rotary recipe {kind!r}"
-                )
 
     layers = _required(text, "num_hidden_layers", "llm_config")
     heads = _required(text, "num_attention_heads", "llm_config")
@@ -430,21 +329,17 @@ def _normalize(raw: Mapping[str, Any]) -> Config:
             max_position_embeddings_hw=text.get(
                 "max_position_embeddings_hw", 10000
             ),
-            rope_theta=_alias(
-                text, "rope_theta", (parameters, scaling), 10000.0
-            ),
+            rope_theta=rotary.theta,
             rope_theta_hw=text.get("rope_theta_hw", 10000.0),
-            rope_scaling=recipe,
-            partial_rotary_factor=_alias(
-                text, "partial_rotary_factor", (parameters, scaling), 1.0
-            ),
+            rope_scaling=rotary.scaling,
+            partial_rotary_factor=rotary.partial_rotary_factor,
             sliding_window=window,
             # The text map's pad_token_id takes precedence over the root's.
             pad_token_id=text.get("pad_token_id")
             if text.get("pad_token_id") is not None
             else raw.get("pad_token_id"),
-            tie_word_embeddings=_alias(
-                text, "tie_word_embeddings", (raw,), False
+            tie_word_embeddings=alias(
+                text, "tie_word_embeddings", (raw,), False, owner="SenseNova"
             ),
         ),
         vision=vision.Config(

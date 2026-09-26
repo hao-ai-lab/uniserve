@@ -24,6 +24,7 @@ def _decoder(*, normalize_output: bool) -> Transformer:
         hidden_act="silu",
         rms_norm_eps=1e-6,
         rope_theta=10_000.0,
+        rope_scaling=None,
         max_position_embeddings=128,
         attention_bias=False,
         tie_word_embeddings=False,
@@ -31,6 +32,8 @@ def _decoder(*, normalize_output: bool) -> Transformer:
         num_experts_per_tok=1,
         moe_intermediate_size=32,
         norm_topk_prob=False,
+        decoder_sparse_step=1,
+        mlp_only_layers=(),
     )
     model = Transformer(config)
     if not normalize_output:

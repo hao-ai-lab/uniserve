@@ -243,9 +243,12 @@ class RotaryEmbedding(nn.Module):
         config.num_attention_heads = 1
         config.max_position_embeddings = self._maximum
         config.rope_parameters = parameters
-        frequencies, scale = ROPE_INIT_FUNCTIONS[parameters["rope_type"]](
-            config, device, seq_len=sequence_length
-        )
+        # Upstream recipes allocate some intermediates on the default device;
+        # pin it so meta model construction still yields real frequencies.
+        with torch.device(device):
+            frequencies, scale = ROPE_INIT_FUNCTIONS[parameters["rope_type"]](
+                config, device, seq_len=sequence_length
+            )
         return frequencies[::2] if self.keep_freq_range else frequencies, scale
 
     @torch.no_grad()
