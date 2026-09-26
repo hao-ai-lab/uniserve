@@ -1,9 +1,11 @@
 """SM100 kernels of one block-diffusion denoising step over token canvases.
 
-The sources in ``csrc/canvas.cu`` build as a PyTorch JIT extension on the
-first :func:`load`; :func:`unsupported` never compiles. The launches run on
-the current CUDA stream with device-resident per-row values, static shapes
-and no host synchronization, so CUDA graphs capture them:
+The sources in ``csrc/`` build as a PyTorch JIT extension on the first
+:func:`load`; :func:`unsupported` never compiles. The launches run on
+the current CUDA stream with device-resident per-row values and static
+shapes. Apart from the first :func:`product` of each shape, which measures
+its algorithm, they never synchronize with the host, so CUDA graphs capture
+them:
 
 - :func:`start` begins a block on the rows whose step is zero.
 - :func:`score` sweeps the FP32 logits of every canvas position. A
@@ -14,6 +16,9 @@ and no host synchronization, so CUDA graphs capture them:
   that can still win the Gumbel race draw Philox bits.
 - :func:`advance` decides every row: entropy-bound acceptance, re-noise,
   the stable-and-confident stop, and end-of-sequence truncation.
+- :func:`product` multiplies the self-conditioning weights by the
+  embedding table through cuBLASLt, with the algorithm measured on the
+  first product of each shape.
 - :func:`condition` turns the self-conditioning product into the next
   step's embedding.
 
@@ -36,6 +41,7 @@ __all__ = [
     "cluster_size",
     "condition",
     "load",
+    "product",
     "score",
     "start",
     "supported",
@@ -131,6 +137,7 @@ _DEVICE_FLAGS = (
     "--expt-relaxed-constexpr",
     "-gencode=arch=compute_100a,code=sm_100a",
 )
+_LINK_FLAGS = ("-lcublasLt",)
 
 
 @lru_cache(maxsize=1)
@@ -142,16 +149,17 @@ def _extension():
     from torch.utils.cpp_extension import load as load_extension
 
     directory = Path(__file__).parent / "csrc"
-    sources = [directory / "canvas.cu"]
+    sources = [directory / "canvas.cu", directory / "product.cpp"]
     digest = hashlib.sha256()
     for source in sources:
         digest.update(source.read_bytes())
-    digest.update(repr((_HOST_FLAGS, _DEVICE_FLAGS)).encode())
+    digest.update(repr((_HOST_FLAGS, _DEVICE_FLAGS, _LINK_FLAGS)).encode())
     return load_extension(
         f"uniserve_canvas_sm100_{digest.hexdigest()[:16]}",
         sources=[str(source) for source in sources],
         extra_cflags=list(_HOST_FLAGS),
         extra_cuda_cflags=list(_DEVICE_FLAGS),
+        extra_ldflags=list(_LINK_FLAGS),
     )
 
 
@@ -245,6 +253,27 @@ def advance(
         [int(token) for token in eos_ids],
         int(pad_id),
     )
+
+
+def product(
+    weights: torch.Tensor,
+    table: torch.Tensor,
+    output: torch.Tensor,
+    scratch: torch.Tensor,
+) -> None:
+    """Write ``weights @ table`` into ``output``, accumulating in FP32.
+
+    ``weights`` is BF16 ``[positions, vocab]``, ``table`` the BF16 ``[vocab,
+    hidden]`` embedding rows and ``output`` FP32 ``[positions, hidden]``, all
+    with unit column stride; ``scratch`` is the contiguous uint8 cuBLASLt
+    workspace, which concurrent products must not share. The first product
+    of each shape and workspace size times the algorithms cuBLASLt proposes
+    on the current stream, which synchronizes the device, and keeps the
+    fastest; later products launch it without synchronizing, and CUDA graphs
+    capture them. Run one product of every shape before capturing a graph.
+    The candidates differ only in FP32 summation order.
+    """
+    _extension().product(weights, table, output, scratch)
 
 
 def condition(
