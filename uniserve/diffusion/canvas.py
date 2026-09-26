@@ -33,8 +33,10 @@ follow the pinned Transformers ``DiffusionGemmaGenerationMixin``:
 - the new canvas takes ``sample`` at the positions ``accept_by_entropy``
   accepts and a RENOISE-stream token elsewhere (lane 0 of word 0);
 - the row stops when its argmax canvas equals the previous ``stability``
-  ones and its mean entropy is below ``confidence``; its block is done when
-  it stops or ``remaining == 1``; history shifts in the new argmax canvas;
+  ones (always true for ``stability = 0``) and its mean entropy is below
+  ``confidence`` (never true for ``confidence = 0``: entropies are
+  non-negative); its block is done when it stops or ``remaining == 1``;
+  history shifts in the new argmax canvas;
 - ``tokens`` is the argmax canvas truncated after the first end-of-sequence
   id; the self-conditioning embedding for the next pass is
   ``softmax(bf16(q)) @ E * bf16(scale)``;
@@ -89,9 +91,10 @@ class CanvasSampling:
 
     ``steps`` bounds the denoising steps of a block, ``entropy_bound`` the
     accepted entropy budget, ``t_min``/``t_max`` the temperature schedule,
-    ``confidence`` the mean-entropy stop threshold and ``stability`` the
-    number of previous argmax canvases a stop must match. ``eos_ids`` end a
-    sequence and ``pad_id`` replaces tokens after the first of them.
+    ``confidence`` the mean-entropy stop threshold (zero never stops a row
+    before its last step) and ``stability`` the number of previous argmax
+    canvases a stop must match (zero: none). ``eos_ids`` end a sequence and
+    ``pad_id`` replaces tokens after the first of them.
     """
 
     steps: int
@@ -110,8 +113,10 @@ class CanvasSampling:
             raise ValueError(
                 "the temperature schedule needs 0 <= t_min < t_max"
             )
-        if self.entropy_bound <= 0 or self.confidence <= 0:
-            raise ValueError("entropy bound and confidence must be positive")
+        if not self.entropy_bound > 0:
+            raise ValueError("the entropy bound must be positive")
+        if not self.confidence >= 0:
+            raise ValueError("the confidence threshold must be non-negative")
         if type(self.stability) is not int or self.stability < 0:
             raise ValueError("stability counts previous canvases (>= 0)")
         if not self.eos_ids or any(

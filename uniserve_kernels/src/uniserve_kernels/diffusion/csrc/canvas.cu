@@ -795,7 +795,12 @@ __global__ void __launch_bounds__(kSweepThreads, 3)
         exchange.maximum = top.value;
         exchange.threshold = gumbel_score(__fdiv_rn(x, temp), lanes[top.index & 3]) - kGumbelReach;
         if (rank == 0) {
-          params.entropy[position] = logf(moments.mass) - moments.moment / moments.mass;
+          // Entropy is non-negative, as the reference computes it. Rebased
+          // moments round without preserving that sign where a near one-hot
+          // position's entropy approaches zero; the clamp keeps every entropy
+          // and mean entropy >= 0, so a confidence of zero stops no row.
+          params.entropy[position] =
+              fmaxf(0.f, logf(moments.mass) - moments.moment / moments.mass);
         }
       }
     }
