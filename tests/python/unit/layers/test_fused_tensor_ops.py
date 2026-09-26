@@ -217,6 +217,21 @@ def test_qkv_bias_fusion_preserves_outputs(
         expected.append(normalized)
     expected_query, expected_key = expected
     expected_value = value + value_bias.view(32, head_dim)
+    if device == "cuda" and layout == "transposed":
+        # The in-place CUDA kernel addresses tokens as rows of one stride;
+        # CUDA token layouts it cannot address raise instead of computing.
+        with pytest.raises(ValueError, match="token axes"):
+            qk_bias_rms_norm_rope_(
+                query,
+                key,
+                cosine,
+                sine,
+                query_bias=query_bias,
+                key_bias=key_bias,
+                value=value,
+                value_bias=value_bias,
+            )
+        return
     actual_query, actual_key = qk_bias_rms_norm_rope_(
         query,
         key,

@@ -221,20 +221,20 @@ if triton is not None:
 
         Q and K are RMS-normalized in fp32 over the full head and their even
         rotary prefix is rotated split-half with compact factors, the formula
-        of ``triton_qk_rms_norm_rope_inplace`` in ``uniserve_kernels.rope``.
-        The squared-row sum here adds two half-width partial sums, a
-        different fp32 order, so a rounded element can differ from that
-        kernel's by one ulp. Each head row is read once as two half-width
-        column sets: ``x`` holds the first rotary half followed by the first
-        half of the unrotated tail, ``y`` the partner column of each ``x``
-        column, so a lane owns a rotation pair and tail columns ride along
-        with unit factors. The packed rows hold the rotated values rounded to
-        the source dtype; the pooled means average those rounded rows over
-        the tile's valid rows in fp32. Queries are packed row-major in
-        owner-interval order, including rows past the valid size, and K/V in
-        packed row order with those rows zeroed, the row-major layout of the
-        packing kernel; the gate rows are copied unmasked in packed row
-        order.
+        ``uniserve_kernels.rope.qk_norm_rope`` evaluates for one full-head
+        domain over one partially rotated axis. The squared-row sum here adds
+        two half-width partial sums, a different fp32 order, so a rounded
+        element can differ from that kernel's by one ulp. Each head row is
+        read once as two half-width column sets: ``x`` holds the first rotary
+        half followed by the first half of the unrotated tail, ``y`` the
+        partner column of each ``x`` column, so a lane owns a rotation pair
+        and tail columns ride along with unit factors. The packed rows hold
+        the rotated values rounded to the source dtype; the pooled means
+        average those rounded rows over the tile's valid rows in fp32.
+        Queries are packed row-major in owner-interval order, including rows
+        past the valid size, and K/V in packed row order with those rows
+        zeroed, the row-major layout of the packing kernel; the gate rows are
+        copied unmasked in packed row order.
         """
         tile = tl.program_id(0)
         head = tl.program_id(1)
