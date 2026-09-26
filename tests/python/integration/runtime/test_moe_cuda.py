@@ -544,3 +544,20 @@ def test_cutlass_does_not_serve_nvfp4_experts():
     with pytest.raises(ValueError, match="does not support"):
         with ExecutionContext(module, moe="cutlass") as context:
             context.prepare(TextSize(TOKENS, 1))
+
+
+@torch.inference_mode()
+def test_native_experts_prepare_after_the_portable_reference_is_loaded():
+    """Loading the portable provider leaves native preparation intact.
+
+    A process may evaluate CPU experts, which loads the portable provider,
+    before it prepares GPU experts.
+    """
+    from uniserve.runtime.backends.moe import resolve
+
+    reference = FusedMoE(4, 16, 16, top_k=2, activation="silu")
+    resolve("auto", module=reference, device=torch.device("cpu"))
+
+    module, _ = _exact_nvfp4("silu", torch.Generator().manual_seed(61))
+    with ExecutionContext(module) as context:
+        context.prepare(TextSize(TOKENS, 1))
