@@ -43,8 +43,8 @@ use crate::schema::uniserve::ipc as fbs;
 use crate::{
     ArRequestParams, ArtifactHandle, Batch, BatchCommand, BatchOutput, BlockTable, Bounds,
     BufferAllocation, BufferId, CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind,
-    CallStatus, DType, DecodeRange, DiffusionSamplingParams, DimBound, DrawLayout,
-    ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode,
+    CallStatus, CanvasSampling, CanvasStep, DType, DecodeRange, DiffusionSamplingParams, DimBound,
+    DrawLayout, ErrorCallIdentity, ErrorCode, FeatureKind, FinishFlags, ForwardBatch, ForwardMode,
     ForwardStats, KvCacheInfo, KvGroupTransfer, KvTransfer, LatentParams, Locator, MediaCall,
     MediaOutput, NewRequest, Readout, RequestKey, RequestKind, RequestOutput, ResponseKind, Rng,
     SamplingState, ShapeBound, TensorPublication, TensorRef, TensorTransfer, TimingCounters,
@@ -470,6 +470,15 @@ fn ar_params_from_table(admission: fbs::ArRequestParams<'_>) -> CodecResult<ArRe
             .map(|items| items.iter().collect())
             .unwrap_or_default(),
         initial_position: admission.initial_position(),
+        canvas: admission.canvas().map(|canvas| CanvasSampling {
+            canvas_length: canvas.canvas_length(),
+            max_steps: canvas.max_steps(),
+            entropy_bound: canvas.entropy_bound(),
+            t_min: canvas.t_min(),
+            t_max: canvas.t_max(),
+            confidence_threshold: canvas.confidence_threshold(),
+            stability_threshold: canvas.stability_threshold(),
+        }),
     })
 }
 
@@ -604,6 +613,10 @@ fn call_from_table(call: fbs::Call<'_>) -> CodecResult<Call> {
                 .candidate_ids()
                 .map(|ids| ids.iter().collect())
                 .unwrap_or_default(),
+        }),
+        canvas: call.canvas().map(|canvas| CanvasStep {
+            block: canvas.block(),
+            step: canvas.step(),
         }),
         consumer_slots: call
             .consumer_slots()

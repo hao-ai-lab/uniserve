@@ -584,6 +584,39 @@ class CallCoordinates:
 
 
 @dataclass(frozen=True, slots=True)
+class CanvasStep:
+    """One denoising step of a block-diffusion request's resident canvas.
+
+    The request's admitted ``GenerationParams.canvas`` fixes the sampling;
+    the worker holds the canvas and its sampler state in the request's slot.
+    ``block`` counts the blocks already committed to the request's context
+    and ``step`` the steps already run on this canvas; step zero starts the
+    canvas from random tokens. The step that stops the canvas reports its
+    argmax tokens as the completion's committed tokens.
+    """
+
+    block: int
+    step: int
+
+    def __post_init__(self) -> None:
+        _nonnegative(self.block, "canvas block")
+        _nonnegative(self.step, "canvas step")
+
+    @classmethod
+    def from_mapping(cls, value: object, where: str = "canvas") -> CanvasStep:
+        """Parse a canvas step's block and step counters."""
+        data = _map(value, where)
+        return cls(
+            block=_uint(data.get("block"), f"{where}.block"),
+            step=_uint(data.get("step"), f"{where}.step"),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        """Serialize a canvas step's counters."""
+        return {"block": self.block, "step": self.step}
+
+
+@dataclass(frozen=True, slots=True)
 class Readout:
     """Candidate log-probabilities a token-denoising call reads at slots.
 
@@ -722,6 +755,8 @@ class Call:
     consumer_slots: tuple[int, ...] = ()
     # Candidate slots of a token-denoising call; None for every other call.
     readout: Readout | None = None
+    # Step a token-denoising call runs on its request's generation canvas.
+    canvas: CanvasStep | None = None
 
     def tensor_inputs(self) -> tuple[tensor.TensorRef, ...]:
         """Return the tensor inputs of the computation, excluding its predicate.
@@ -848,25 +883,30 @@ class Call:
                 "image source"
             )
 
-        # A token-denoising call reads candidates at slots of the canvas rows
-        # it carries and samples no token.
-        if (self.readout is not None) != (
-            self.kind is ForwardMode.TOKEN_DENOISING
+        # A token-denoising call either reads candidates at slots of the
+        # canvas rows it carries or runs one step of its request's resident
+        # generation canvas of ``max_tokens`` tokens; it samples no token.
+        denoises = self.kind is ForwardMode.TOKEN_DENOISING
+        if (self.readout is not None) + (self.canvas is not None) != denoises:
+            raise invalid_descriptor(
+                "a token-denoising call carries exactly one readout or canvas "
+                "step"
+            )
+        if denoises and (
+            self.token_output is not None or self.transition_output is not None
+        ):
+            raise invalid_descriptor("token denoising samples no token output")
+        if self.readout is not None:
+            if not self.input_token_ids:
+                raise invalid_descriptor("a readout requires canvas tokens")
+            self.readout.validate(len(self.input_token_ids))
+        if self.canvas is not None and (
+            self.input_token_ids or self.bounds.max_tokens < 1
         ):
             raise invalid_descriptor(
-                "a candidate readout belongs exactly to a token-denoising call"
+                "a canvas step denoises its resident canvas of max_tokens "
+                "tokens"
             )
-        if self.readout is not None:
-            if (
-                not self.input_token_ids
-                or self.token_output is not None
-                or self.transition_output is not None
-            ):
-                raise invalid_descriptor(
-                    "token denoising requires canvas tokens and samples no "
-                    "token"
-                )
-            self.readout.validate(len(self.input_token_ids))
 
         # KV cache transfer endpoints. A KV output's index shares the output
         # index space with the tensor outputs checked below.
@@ -1142,6 +1182,11 @@ class Call:
                 if get("readout") is None
                 else Readout.from_mapping(get("readout"), f"{where}.readout")
             ),
+            canvas=(
+                None
+                if get("canvas") is None
+                else CanvasStep.from_mapping(get("canvas"), f"{where}.canvas")
+            ),
         )
         call.validate()
         return call
@@ -1211,6 +1256,7 @@ class Call:
             "readout": None
             if self.readout is None
             else self.readout.to_mapping(),
+            "canvas": None if self.canvas is None else self.canvas.to_mapping(),
         }
 
 

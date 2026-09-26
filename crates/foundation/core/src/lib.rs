@@ -38,7 +38,7 @@ pub use events::{
     RuntimeFamily, StopReason, TokenLogprob,
 };
 pub use generation::{
-    CachePolicy, FeedbackNextToken, FeedbackSource, GenerationConstraint,
+    CachePolicy, CanvasSampling, FeedbackNextToken, FeedbackSource, GenerationConstraint,
     GenerationConstraintParseError, GenerationFeatures, GenerationLimits, GenerationRequest,
     GenerationRequestError, GenerationResourceError, ImageEncoderInput, ImageGenerationConfig,
     ImageIngestStep, ImageInput, ImageTrigger, MultimodalInputs, ReadoutRow, ReadoutSlot,

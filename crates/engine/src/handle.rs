@@ -9,8 +9,9 @@
 //! while a request's channel is full hands the events it could not send to
 //! the receiver, which yields them after the channel's buffered events.
 //!
-//! [`EventRx`] also drives output acknowledgement. It counts received
-//! `TextToken` events and reports consumed prefixes as
+//! [`EventRx`] also drives output acknowledgement. It counts the text tokens
+//! of received `TextToken` and `TextTokens` events and reports consumed
+//! prefixes as
 //! [`Command::Acknowledge`]. A token request without stop strings is
 //! acknowledged on receipt; for a request with stop strings the frontend
 //! decoder calls [`EventRx::acknowledge_consumed_prefix`] after checking that
@@ -209,7 +210,7 @@ pub struct EventRx {
 struct EventCancellation {
     handle: EngineHandle,
     request_id: RequestId,
-    /// Acknowledge each `TextToken` as soon as it is received. `submit` sets
+    /// Acknowledge text tokens as soon as they are received. `submit` sets
     /// this only for token requests without stop strings; for token requests
     /// with stop strings the frontend decoder acknowledges explicitly.
     acknowledge_on_receive: bool,
@@ -291,8 +292,12 @@ impl EventRx {
     /// Updates acknowledgement and completion state for a received event.
     fn observe(&mut self, event: &EngineCoreOutput) {
         match event {
-            EngineCoreOutput::TextToken { .. } => {
-                self.text_tokens_received = self.text_tokens_received.saturating_add(1);
+            EngineCoreOutput::TextToken { .. } | EngineCoreOutput::TextTokens { .. } => {
+                let count = match event {
+                    EngineCoreOutput::TextTokens { ids } => ids.len(),
+                    _ => 1,
+                };
+                self.text_tokens_received = self.text_tokens_received.saturating_add(count);
                 if self
                     .cancellation
                     .as_ref()
@@ -588,6 +593,7 @@ mod tests {
             cache: Default::default(),
             image_generation: policy,
             readout: Vec::new(),
+            canvas: None,
         }
     }
 

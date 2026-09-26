@@ -1,8 +1,9 @@
 //! Generation lifecycle state and worker-call planning.
 //!
 //! A request advances through context ingestion, then either understanding
-//! decode, image generation and optional feedback, or, for a readout, canvas
-//! denoising, and finally terminal publication ([`GenerationPhase`]).
+//! decode, image generation and optional feedback, block-diffusion canvases
+//! of text, or, for a readout, canvas denoising, and finally terminal
+//! publication ([`GenerationPhase`]).
 //! [`RequestState`] holds the accepted progress of one admitted token request.
 //!
 //! Each `plan_*` builder returns one call whose identities are placeholders
@@ -27,8 +28,8 @@ use uniserve_worker_ipc::{
 
 use uniserve_core::{GenerationRequest, ImageIngestStep, RequestId, SamplingParams};
 use uniserve_worker_ipc::{
-    Bounds, BufferId, Call, CallId, CallKind, CallStatus, DType, DimBound, DrawLayout, Readout,
-    RequestKey, RequestOutput, Rng, SamplingState, ShapeBound, TensorRef,
+    Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound, DrawLayout,
+    Readout, RequestKey, RequestOutput, Rng, SamplingState, ShapeBound, TensorRef,
 };
 
 use crate::scheduler::image_artifact::png_artifact_dims_b64;
@@ -191,6 +192,13 @@ pub(crate) enum GenerationPhase {
     /// Denoise a readout request's canvas rows over its prompt, a bounded
     /// group of rows per call, until every row has reported its slots.
     Readout,
+    /// Run one denoising step of a canvas-generating request's current block
+    /// over its context. The step that stops the block reports the block's
+    /// tokens.
+    Canvas,
+    /// Write a stopped block's tokens into the request's context as a causal
+    /// prefill row (`RequestState::canvas_commit`); the next block reads them.
+    CommitCanvas,
 }
 
 /// Image extension consumes an encoder feature rather than token inputs.
@@ -214,8 +222,10 @@ pub(super) fn is_feedback_computation(call: &Call) -> bool {
 
 /// Prompt extension writes prompt tokens into KV: a prefill with no
 /// image-feature input and no completion predicate. It samples the next token
-/// unless its request is a readout, whose prompt only conditions its canvases;
-/// the `CloseKv` write is the prefill that declares a completion instead.
+/// unless its request is a readout or generates canvases, whose prompt only
+/// conditions its canvases; the `CloseKv` write is the prefill that declares a
+/// completion instead. A canvas-generating request's block commit is a prompt
+/// extension too, of the tokens of its stopped block.
 pub(super) fn is_prompt_extend(call: &Call) -> bool {
     call.code == CallKind::Forward(ForwardMode::Prefill)
         && !consumes_image_features(call)
@@ -259,6 +269,20 @@ impl RequestState {
         }
 
         match call.code {
+            // A block commit is planned only in `CommitCanvas`, and a prompt
+            // chunk never is; the committed block extends the context and
+            // the next block starts at step zero.
+            CallKind::Forward(ForwardMode::Prefill)
+                if is_prompt_extend(call) && self.phase == GenerationPhase::CommitCanvas =>
+            {
+                let count = call.input_token_ids.len().min(u32::MAX as usize) as u32;
+                self.logical_position = self.logical_position.saturating_add(count);
+                self.kv_visible_len = self.kv_visible_len.saturating_add(count);
+                self.canvas_block = self.canvas_block.saturating_add(1);
+                self.canvas_step = 0;
+                self.canvas_commit.clear();
+                self.phase = GenerationPhase::Canvas;
+            }
             CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => {
                 let count = call.input_token_ids.len().min(u32::MAX as usize) as u32;
                 self.num_computed_prompt_tokens =
@@ -316,6 +340,17 @@ impl RequestState {
                 let count = record.committed_tokens.len().max(1).min(u32::MAX as usize) as u32;
                 self.logical_position = self.logical_position.saturating_add(count);
                 self.kv_visible_len = self.kv_visible_len.saturating_add(count);
+            }
+            // A canvas step that reports no tokens leaves its block running;
+            // one that reports the block's tokens stopped it, and `output`
+            // publishes them before the block is committed.
+            CallKind::Forward(ForwardMode::TokenDenoising) if call.canvas.is_some() => {
+                if record.committed_tokens.is_empty() {
+                    self.canvas_step = self.canvas_step.saturating_add(1);
+                } else {
+                    self.canvas_commit = record.committed_tokens.clone();
+                    self.phase = GenerationPhase::CommitCanvas;
+                }
             }
             CallKind::Forward(ForwardMode::TokenDenoising) => {
                 // The call covers the rows after the accepted ones whose
@@ -447,17 +482,18 @@ fn computation(request: &GenerationRequest, code: CallKind) -> Call {
         kv_output: None,
         input_token_ids: Vec::new(),
         readout: None,
+        canvas: None,
         sampling_state: None,
     }
 }
 
 /// Plans a prefill of prompt tokens `start..end`, with a sampled-token output
-/// unless the request is a readout.
+/// unless the request is a readout or generates canvases.
 ///
-/// The RNG coordinate is `end`, the exclusive prompt end. A readout's prompt
-/// only conditions its canvases, so its prefill samples nothing and declares
-/// no RNG coordinate. Fails with `InvalidPromptRange` for an empty range or
-/// one past the prompt.
+/// The RNG coordinate is `end`, the exclusive prompt end. The prompt of a
+/// readout or of a canvas-generating request only conditions its canvases, so
+/// its prefill samples nothing and declares no RNG coordinate. Fails with
+/// `InvalidPromptRange` for an empty range or one past the prompt.
 pub(super) fn plan_prompt(
     request: &GenerationRequest,
     start: u32,
@@ -474,7 +510,7 @@ pub(super) fn plan_prompt(
     let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = end.saturating_sub(start);
     call.input_token_ids = request.prompt_token_ids[start as usize..end as usize].to_vec();
-    if request.is_readout() {
+    if request.is_readout() || request.is_canvas_generation() {
         return finish_plan(request, call, 0);
     }
     call.token_output = Some(output_tensor(0, DType::I64));
@@ -547,6 +583,50 @@ pub(super) fn plan_readout(
     let mut call = finish_plan(request, call, 0)?;
     call.bounds.max_completion_bytes = completion_bytes;
     Ok(call)
+}
+
+/// Plans denoising step `step` of the canvas-generating `request`'s block
+/// `block`, the number of blocks already committed to its context.
+///
+/// The call carries no tokens: the worker keeps the block's canvas and
+/// sampler state in the request's slot. Its `max_tokens` is the canvas
+/// length, which the step denoises and which a stopping step reports as its
+/// committed tokens; its completion payload bound covers those tokens at
+/// four bytes each. Fails with `NotCanvasGeneration` for a request without
+/// canvas sampling.
+pub(super) fn plan_canvas_step(
+    request: &GenerationRequest,
+    block: u32,
+    step: u32,
+) -> Result<Call, PlanningError> {
+    let canvas = request
+        .canvas
+        .as_ref()
+        .ok_or(PlanningError::NotCanvasGeneration)?;
+    let mut call = computation(request, CallKind::Forward(ForwardMode::TokenDenoising));
+    call.bounds.max_tokens = canvas.canvas_length;
+    call.canvas = Some(CanvasStep { block, step });
+    let mut call = finish_plan(request, call, 0)?;
+    call.bounds.max_completion_bytes = u64::from(canvas.canvas_length).saturating_mul(4);
+    Ok(call)
+}
+
+/// Plans the commit of a stopped block's `tokens` to the context of the
+/// canvas-generating `request`: a prefill that writes them into KV, as causal
+/// prompt, and samples nothing. Fails with `NotCanvasGeneration` for a
+/// request without canvas sampling or an empty block.
+pub(super) fn plan_canvas_commit(
+    request: &GenerationRequest,
+    tokens: &[u32],
+) -> Result<Call, PlanningError> {
+    if !request.is_canvas_generation() || tokens.is_empty() {
+        return Err(PlanningError::NotCanvasGeneration);
+    }
+    let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
+    call.bounds.max_tokens = u32::try_from(tokens.len())
+        .map_err(|_| PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
+    call.input_token_ids = tokens.to_vec();
+    finish_plan(request, call, 0)
 }
 
 /// Plans a sampled continuation; relay inputs leave host token values empty.
@@ -857,6 +937,8 @@ pub(crate) enum PlanningError {
         end: usize,
         rows: usize,
     },
+    #[error("the request does not generate a nonempty canvas")]
+    NotCanvasGeneration,
     #[error("image generation branch is disabled")]
     GenerationBranchDisabled,
     #[error("generated-image feedback is disabled")]
@@ -1060,6 +1142,32 @@ pub(crate) fn validate_generation_result(
                 detail: "image_kv_mismatch",
             });
         }
+    }
+
+    // A canvas step reports no tokens while its block runs and the whole
+    // block once it stops; the step at the block's step limit must stop it.
+    if let Some(step) = call.canvas {
+        let committed = record.committed_tokens.len();
+        if committed != 0 && committed != call.bounds.max_tokens as usize {
+            return Err(GenerationResultError::Token {
+                detail: "canvas_block_length_mismatch",
+            });
+        }
+        let last_step = request
+            .canvas
+            .as_ref()
+            .is_none_or(|canvas| step.step.saturating_add(1) >= canvas.max_steps);
+        if committed == 0 && last_step {
+            return Err(GenerationResultError::Progress {
+                detail: "canvas_step_limit_exceeded",
+            });
+        }
+        if !record.top_logprobs.is_empty() || !record.prompt_logprobs.is_empty() {
+            return Err(GenerationResultError::Logprob {
+                detail: "unexpected_canvas_logprobs",
+            });
+        }
+        return Ok(());
     }
 
     // Sampled tokens: presence, verified-draft prefix, count, and allowed set.
@@ -1361,6 +1469,13 @@ pub(crate) struct RequestState {
     pub(super) readout_rows: usize,
     /// Accepted candidate log-probabilities of those rows, in report order.
     pub(super) readout_logprobs: Vec<f32>,
+    /// Blocks a canvas-generating request has committed to its context.
+    pub(super) canvas_block: u32,
+    /// Accepted denoising steps of the current block.
+    pub(super) canvas_step: u32,
+    /// Tokens of the stopped block awaiting their commit
+    /// (`GenerationPhase::CommitCanvas`); empty otherwise.
+    pub(super) canvas_commit: Vec<u32>,
     /// Unix time, in seconds, at which the request state was created.
     pub queued_at: f64,
     pub(crate) terminal_intent: TerminalIntent,

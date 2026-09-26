@@ -293,6 +293,8 @@ impl Scheduler {
                         state.readout_rows_covering(start, call.input_token_ids.len())
                     });
                     canvas_rows_left = canvas_rows_left.saturating_sub(rows.unwrap_or(0));
+                } else if call.canvas.is_some() {
+                    canvas_rows_left = canvas_rows_left.saturating_sub(1);
                 }
 
                 // Identify the call by its batch and row, and stamp the
@@ -345,6 +347,7 @@ impl Scheduler {
                                     negative_token_ids: st.req.negative_prompt_token_ids.clone(),
                                     finish_token_ids,
                                     initial_position: st.num_computed_prompt_tokens,
+                                    canvas: st.req.canvas,
                                 }),
                                 st.req.generates_images().then(|| st.req.image.clone()),
                                 input_images,
@@ -427,9 +430,10 @@ impl Scheduler {
     /// Chooses the highest-priority execution lane that has schedulable work.
     ///
     /// A ready canvas pass takes the decode lane first: it completes a
-    /// readout, which releases the request's KV, so prefill never holds it
-    /// back. Otherwise prefill wins while fewer than `PREFILL_WINDOW_CREDITS`
-    /// batches carrying `BatchKind::Prefill` calls await their results; past
+    /// readout, which releases the request's KV, or advances a generating
+    /// block, so prefill never holds it back. Otherwise prefill wins while
+    /// fewer than `PREFILL_WINDOW_CREDITS` batches carrying
+    /// `BatchKind::Prefill` calls await their results; past
     /// that, ready decode work takes the pass, and prefill runs only when no
     /// decode is ready. Prefill still shares a decode-lane pass within the
     /// mixed-prefill token budget. `BatchKind::Media` readiness never selects
@@ -604,7 +608,8 @@ impl Scheduler {
                 }
             }
             Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
-            Phase::Readout => CallKind::Forward(ForwardMode::TokenDenoising),
+            Phase::Readout | Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
+            Phase::CommitCanvas => CallKind::Forward(ForwardMode::Prefill),
         })
     }
 
@@ -786,6 +791,10 @@ impl Scheduler {
                 return None;
             };
             rows
+        } else if call.canvas.is_some() {
+            // A generation step denoises the request's resident canvas of
+            // `max_tokens` tokens.
+            vec![call.bounds.max_tokens]
         } else {
             Vec::new()
         };
@@ -1521,6 +1530,37 @@ impl Scheduler {
                 }
                 self.plan_computation(id, |_scheduler, request| {
                     generation::plan_readout(request, start..end)
+                })
+            }
+            Phase::Canvas => {
+                // One step of the request's block is one read-only canvas row
+                // of the pass. A step follows only the accepted result of the
+                // previous one, which decides whether the block stopped.
+                let st = self.running.get(&id)?;
+                let canvas_length = st.req.canvas.as_ref()?.canvas_length as usize;
+                if self.inflight.has_pending_calls(id) || canvas_rows == 0 || canvas_length > budget
+                {
+                    return None;
+                }
+                let (block, step) = (st.canvas_block, st.canvas_step);
+                self.plan_computation(id, |_scheduler, request| {
+                    generation::plan_canvas_step(request, block, step)
+                })
+            }
+            Phase::CommitCanvas => {
+                // The stopped block's tokens extend the context as one causal
+                // prefill row.
+                let st = self.running.get(&id)?;
+                let tokens = st.canvas_commit.clone();
+                if self.inflight.has_pending_calls(id) || tokens.len() > budget {
+                    return None;
+                }
+                let end = (kv_visible_len as usize).saturating_add(tokens.len());
+                if !self.ensure_request_capacity(id, kv_visible_len as usize, end) {
+                    return None;
+                }
+                self.plan_computation(id, |_scheduler, request| {
+                    generation::plan_canvas_commit(request, &tokens)
                 })
             }
         }
