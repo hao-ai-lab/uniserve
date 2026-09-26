@@ -90,13 +90,16 @@ def run(args: argparse.Namespace) -> None:
     empty, and server output goes to `<output root>/server-logs/<first point
     of the deployment>.log`, with a `.replica-<i>` infix per replica.
 
-    Exits with status 2 when a point completes with a failed validation. An
-    exception while preparing, launching, or measuring a point propagates and
-    ends the run; `ManagedDeployment` stops processes already started.
+    Exits with status 2 when a point completes with a failed validation,
+    immediately unless `--keep-going` asks to measure the remaining points
+    first. An exception while preparing, launching, or measuring a point
+    propagates and ends the run; `ManagedDeployment` stops processes already
+    started.
     """
     config = load_config(args.config)
     output_root = args.output_root or config.artifact_root
     points = config.selected_points(args.selection)
+    invalid = 0
 
     # Consecutive points form one deployment group only when reuse is
     # requested and they name the same server.
@@ -167,7 +170,11 @@ def run(args: argparse.Namespace) -> None:
                             f"/{result.summary['request_count']} requests)"
                         )
                         if valid is not True:
-                            raise SystemExit(2)
+                            invalid += 1
+                            if not args.keep_going:
+                                raise SystemExit(2)
+    if invalid:
+        raise SystemExit(2)
 
 
 def _log_path(
@@ -210,6 +217,7 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--launch-timeout-s", type=float, default=1800)
     command.add_argument("--request-timeout-s", type=float)
     command.add_argument("--reuse-deployment", action="store_true")
+    command.add_argument("--keep-going", action="store_true")
     command.set_defaults(function=run)
     return parser
 
