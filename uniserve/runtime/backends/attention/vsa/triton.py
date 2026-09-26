@@ -15,4 +15,5 @@ class _Operator(BaseOperator):
 
 
 class Backend(BaseBackend):
+    name = "triton"
     operator_class = _Operator

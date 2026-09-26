@@ -127,6 +127,17 @@ class Operator:
                 "lengths"
             )
 
+    def selections(self) -> Mapping[str, str]:
+        """Return the provider that served each input class this operator met.
+
+        Keys name an input class by its path and mask semantics, for example
+        ``"paged attention: causal rows"``; values are provider names. Only a
+        dispatching operator, which chooses a provider per input, reports
+        choices; a provider's own operator serves every input itself and
+        returns an empty mapping.
+        """
+        return {}
+
     def requires_host_lengths(self, batch: AttentionInput) -> bool:
         """Whether preparation needs exact CPU sequence lengths.
 

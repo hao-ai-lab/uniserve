@@ -19,10 +19,15 @@ provider remain selectable by name but never stand in for a native kernel.
 The one CUDA call class the portable provider serves is FP32 single-head
 dense attention of head dimension 512, which no native kernel computes
 (``_portable``). Off CUDA the portable provider serves every call.
+
+The dispatching operator records the provider that served each input class
+it met (``Operator.selections``), so startup can report the kernel behind
+every call site.
 """
 
 from dataclasses import replace
 from importlib import import_module
+from types import MappingProxyType
 
 import torch
 
@@ -243,6 +248,9 @@ class _Automatic(_Operator):
         self._requirements = requirements
         self._architecture = architecture
         self._operators = {}
+        # Provider name by input class ("path: mask semantics"), in the
+        # order the classes were first met.
+        self._selections = {}
         self._arguments = kwargs
 
     def _name(self, batch):
@@ -312,6 +320,7 @@ class _Automatic(_Operator):
             raise ValueError(
                 f"no native attention kernel serves {self._describe(batch)}"
             )
+        self._selections.setdefault(": ".join(_input_class(batch)), name)
 
         if name not in self._operators:
             # Workspace buffers are namespaced per provider; the shared
@@ -326,6 +335,10 @@ class _Automatic(_Operator):
             self._operators[name] = self._providers[name].prepare(**arguments)
 
         return self._operators[name]
+
+    def selections(self):
+        # A mixed-causality batch evaluated as runs records each run's class.
+        return MappingProxyType(dict(self._selections))
 
     def bind(self, batch):
         if self._closed:

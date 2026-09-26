@@ -21,6 +21,8 @@ class VsaBinding:
         self.backend, self.transient, self.scratch = backend, transient, scratch
         self._shared_buffers, self.exchange = shared_buffers, exchange
         self.operators, self._buffers = {}, {}
+        # Provider name of each prepared operator key.
+        self.providers = {}
 
     def prepare(self, pattern, q):
         key = (q.device, q.dtype, q.shape[1], q.shape[2], pattern)
@@ -44,8 +46,26 @@ class VsaBinding:
                 workspace=self.scratch(requirements, q.device),
                 transient=self.transient,
             )
+            self.providers[key] = provider.name
 
         return self.operators[key]
+
+    def kernels(self):
+        """Describe the block-sparse kernel of each prepared query shape.
+
+        One record per prepared (device, dtype, heads, head dimension,
+        pattern): the provider name, local heads, head dimension and dtype.
+        """
+        return [
+            {
+                "op": "vsa",
+                "provider": name,
+                "heads": heads,
+                "head_dim": head_dim,
+                "dtype": str(dtype).removeprefix("torch."),
+            }
+            for (_, dtype, heads, head_dim, _), name in self.providers.items()
+        ]
 
     def buffers(self, requirements, device):
         key = (device, tuple(requirements.items()))
@@ -68,4 +88,5 @@ class VsaBinding:
         for operator in self.operators.values():
             operator.close()
         self.operators.clear()
+        self.providers.clear()
         self._buffers.clear()

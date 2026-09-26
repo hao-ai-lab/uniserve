@@ -90,6 +90,7 @@ class Backend(_GroupedBackend):
     those projections retain the grouped kernel that supports small matrices.
     """
 
+    name = "flashinfer"
     operator_class = _FlashInferOperator
 
     def merged_workspace_buffers(
