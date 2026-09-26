@@ -306,6 +306,32 @@ def _tile_rows(
     return rows[0]
 
 
+def _compile(
+    specialization: dict[str, object],
+    arguments: tuple[torch.Tensor | None, ...],
+) -> Callable[..., None]:
+    """Compile one kernel specialization for the ABI of ``arguments``."""
+    return _cute.compile(
+        _kernel_type(**specialization),
+        *(
+            None
+            if tensor is None
+            else _dynamic_tensor(
+                tensor,
+                16 if tensor.dtype == torch.bfloat16 else 4,
+            )
+            for tensor in arguments
+        ),
+        1.0,
+        0,
+        1,
+        1,
+        # The stream is an explicit argument of every launch.
+        _cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        options="--enable-tvm-ffi",
+    )
+
+
 def _sm_count(device: torch.device) -> int:
     index = device.index
     if index is None:
@@ -371,7 +397,10 @@ def prefix_block_attention(
 
     Raises:
         RuntimeError: If the kernel is unavailable, or if an uncompiled
-            specialization is first seen during CUDA graph capture.
+            specialization is first seen during CUDA graph capture. The
+            first call of a specialization (dtypes, head and page shape,
+            window kind, optional inputs) compiles it for every batch size,
+            so one call before capture suffices for all captured batches.
         ValueError: If the call violates the kernel contract.
     """
     if not available(query.device):
@@ -442,15 +471,17 @@ def prefix_block_attention(
     device_index = query.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    cache_key = (
-        device_index,
-        torch.cuda.get_device_capability(query.device),
-        tuple(sorted(specialization.items())),
-        *(_abi(tensor) for tensor in arguments),
-    )
+
+    def cache_key(variant: dict[str, object]) -> tuple[object, ...]:
+        return (
+            device_index,
+            torch.cuda.get_device_capability(query.device),
+            tuple(sorted(variant.items())),
+            *(_abi(tensor) for tensor in arguments),
+        )
 
     with torch.cuda.device(query.device):
-        executor = _EXECUTORS.get(cache_key)
+        executor = _EXECUTORS.get(cache_key(specialization))
         if executor is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
@@ -461,26 +492,18 @@ def prefix_block_attention(
                 raise RuntimeError(
                     "the SM100 prefix-block attention kernel is unavailable"
                 ) from _IMPORT_ERROR
-            executor = _cute.compile(
-                _kernel_type(**specialization),
-                *(
-                    None
-                    if tensor is None
-                    else _dynamic_tensor(
-                        tensor,
-                        16 if tensor.dtype == torch.bfloat16 else 4,
+            # The batch shape selects the tile rows, so every tile this call's
+            # specialization can run with is compiled together; a graph
+            # captured at another batch size then finds its executor.
+            for rows in _TILE_ROWS[specialization["head_dim"]]:
+                if (rows // 2) % group:
+                    continue
+                variant = dict(specialization, tile_rows=rows)
+                if cache_key(variant) not in _EXECUTORS:
+                    _EXECUTORS[cache_key(variant)] = _compile(
+                        variant, arguments
                     )
-                    for tensor in arguments
-                ),
-                1.0,
-                0,
-                1,
-                1,
-                # The stream is an explicit argument of every launch.
-                _cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-                options="--enable-tvm-ffi",
-            )
-            _EXECUTORS[cache_key] = executor
+            executor = _EXECUTORS[cache_key(specialization)]
 
         if _cuda_driver is None:
             raise RuntimeError(
