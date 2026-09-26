@@ -24,6 +24,7 @@ contract, including where the kernels round differently.
 
 from __future__ import annotations
 
+import hashlib
 from functools import lru_cache
 from pathlib import Path
 
@@ -120,24 +121,37 @@ def load() -> None:
     _extension()
 
 
+# Build flags. The sources compile without fast math: the Gumbel scores use
+# the accurate logf, and the divisions and temperature use explicit
+# round-to-nearest intrinsics.
+_HOST_FLAGS = ("-O3", "-std=c++20")
+_DEVICE_FLAGS = (
+    "-O3",
+    "-std=c++20",
+    "--expt-relaxed-constexpr",
+    "-gencode=arch=compute_100a,code=sm_100a",
+)
+
+
 @lru_cache(maxsize=1)
 def _extension():
-    # One build or cache lookup per process. The file is compiled without
-    # fast math: the Gumbel scores use the accurate logf, and the divisions
-    # and temperature use explicit round-to-nearest intrinsics.
+    # One build or cache lookup per process. The build takes its name from a
+    # digest of the sources and flags, so processes running different
+    # revisions share PyTorch's extension cache without one loading
+    # another's build.
     from torch.utils.cpp_extension import load as load_extension
 
-    source = Path(__file__).parent / "csrc" / "canvas.cu"
+    directory = Path(__file__).parent / "csrc"
+    sources = [directory / "canvas.cu"]
+    digest = hashlib.sha256()
+    for source in sources:
+        digest.update(source.read_bytes())
+    digest.update(repr((_HOST_FLAGS, _DEVICE_FLAGS)).encode())
     return load_extension(
-        "uniserve_canvas_sm100",
-        sources=[str(source)],
-        extra_cflags=["-O3", "-std=c++20"],
-        extra_cuda_cflags=[
-            "-O3",
-            "-std=c++20",
-            "--expt-relaxed-constexpr",
-            "-gencode=arch=compute_100a,code=sm_100a",
-        ],
+        f"uniserve_canvas_sm100_{digest.hexdigest()[:16]}",
+        sources=[str(source) for source in sources],
+        extra_cflags=list(_HOST_FLAGS),
+        extra_cuda_cflags=list(_DEVICE_FLAGS),
     )
 
 
