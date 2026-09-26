@@ -1381,10 +1381,14 @@ void condition(torch::Tensor product, torch::Tensor normalizer, double scale,
 // Defined in product.cpp, which the host compiler builds against cuBLASLt.
 void product(torch::Tensor weights, torch::Tensor table, torch::Tensor output,
              torch::Tensor scratch);
+std::vector<int64_t> product_algorithm(torch::Tensor weights, torch::Tensor table,
+                                       torch::Tensor output, torch::Tensor scratch);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, binding) {
   binding.def("score", &score, "Score canvas positions over the vocabulary");
   binding.def("product", &product, "Multiply self-conditioning weights by the embedding table");
+  binding.def("product_algorithm", &product_algorithm,
+              "Configuration of the algorithm chosen for a product shape");
   binding.def("condition", &condition, "Normalize the self-conditioning product");
   binding.def("advance", &advance, "Accept, re-noise and decide canvas rows");
   binding.def("start", &start, "Begin a block on rows at step 0");

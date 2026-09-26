@@ -26,6 +26,7 @@ import math
 
 import pytest
 import torch
+from uniserve_kernels.diffusion import canvas as kernels
 
 from uniserve.diffusion import canvas, tokens
 
@@ -473,3 +474,24 @@ def test_rows_without_history_stop_on_the_confidence_threshold(
     )
     assert (scores.entropy >= 0).all()
     assert decision.finished[:, 0].tolist() == [stops, stops, True]
+
+
+def test_product_reports_the_algorithm_it_measured():
+    # A shape no other test multiplies, so its first product happens here.
+    generator = torch.Generator().manual_seed(41)
+    positions, vocab, hidden = 96, 4096, 40
+    weights = torch.rand(positions, vocab, generator=generator).bfloat16()
+    table = torch.randn(vocab, hidden, generator=generator).bfloat16()
+    output = torch.empty(positions, hidden, device=DEVICE)
+    scratch = torch.empty(1 << 22, dtype=torch.uint8, device=DEVICE)
+    operands = (weights.to(DEVICE), table.to(DEVICE), output, scratch)
+
+    assert kernels.product_algorithm(*operands) is None
+    kernels.product(*operands)
+    chosen = kernels.product_algorithm(*operands)
+    assert chosen is not None and chosen["cublaslt_version"] > 0
+
+    expected = weights.double() @ table.double()
+    spread = weights.double().abs() @ table.double().abs()
+    difference = (output.cpu().double() - expected).abs()
+    assert (difference <= 2 * vocab * U * spread).all()

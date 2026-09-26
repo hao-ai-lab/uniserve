@@ -42,6 +42,7 @@ __all__ = [
     "condition",
     "load",
     "product",
+    "product_algorithm",
     "score",
     "start",
     "supported",
@@ -274,6 +275,37 @@ def product(
     The candidates differ only in FP32 summation order.
     """
     _extension().product(weights, table, output, scratch)
+
+
+_ALGORITHM_FIELDS = (
+    "cublaslt_version",
+    "algorithm",
+    "tile",
+    "stages",
+    "split_k",
+    "reduction",
+    "swizzle",
+    "custom",
+    "inner_shape",
+    "cluster_shape",
+)
+
+
+def product_algorithm(
+    weights: torch.Tensor,
+    table: torch.Tensor,
+    output: torch.Tensor,
+    scratch: torch.Tensor,
+) -> dict[str, int] | None:
+    """Return the cuBLASLt algorithm :func:`product` uses for these operands.
+
+    The configuration (cuBLASLt version, algorithm id, tile, stages, split-K
+    count, reduction scheme, CTA swizzling, custom option, inner and cluster
+    shape) identifies the measured choice for the operands' shape and
+    workspace size; ``None`` before the first product of that shape.
+    """
+    values = _extension().product_algorithm(weights, table, output, scratch)
+    return dict(zip(_ALGORITHM_FIELDS, values, strict=True)) if values else None
 
 
 def condition(
