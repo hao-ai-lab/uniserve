@@ -16,7 +16,7 @@ from uniserve.nn.functional._tensors import result
 
 from ._parallel import ParallelAttention
 from .config import AttentionParallelConfig
-from .inputs import AttentionInput, DenseInput, PagedInput, SegmentedInput
+from .inputs import AttentionBatch, DenseInput, PagedInput, SegmentedInput
 
 
 class Attention(nn.Module):
@@ -84,15 +84,17 @@ class Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        batch: AttentionInput,
+        attention: AttentionBatch,
         *,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply attention to ``[tokens, heads, head_dim]`` projections.
 
-        Returns a tensor shaped like ``q``, written into ``out`` when given.
-        Under Ulysses the token shard is exchanged for this rank's head shard
-        before compute and restored to token layout afterwards.
+        ``attention`` supplies this call's inputs per cache table; the layer
+        reads its own table's entry. Returns a tensor shaped like ``q``,
+        written into ``out`` when given. Under Ulysses the token shard is
+        exchanged for this rank's head shard before compute and restored to
+        token layout afterwards.
         """
         if out is not None and (
             out.shape != q.shape
@@ -105,6 +107,7 @@ class Attention(nn.Module):
 
         group = self.exchange.group
         operator = _binding.attention.get().get(id(self))
+        batch = attention.entry(None if operator is None else operator.table)
         if self.context_parallel is not None:
             if operator is None:
                 raise RuntimeError(
@@ -181,15 +184,21 @@ class Attention(nn.Module):
         return operator(q, k, v, batch, scale=self.scale, out=destination)
 
     def update_cache(
-        self, k: torch.Tensor, v: torch.Tensor, *, indices: torch.Tensor
+        self, k: torch.Tensor, v: torch.Tensor, attention: AttentionBatch
     ) -> None:
-        """Write one global token view without scheduling or committing a
-        request.
+        """Write this call's K/V at its table's addresses, without attending.
 
-        With Ulysses, each rank supplies its local token interval and TP-local
-        heads. The same exchange as forward produces this rank's cache heads.
-        """  # noqa: D205
+        The layer's own table entry supplies the physical write addresses; an
+        entry without write addresses publishes nothing. No request is
+        scheduled or committed. With Ulysses, each rank supplies its local
+        token interval and TP-local heads, and the same exchange as forward
+        produces this rank's cache heads.
+        """
         operator = _binding.attention.get().get(id(self))
+        entry = attention.entry(None if operator is None else operator.table)
+        indices = getattr(entry, "write_indices", None)
+        if indices is None:
+            return
         if operator is None:
             raise RuntimeError(
                 "cache writes require an active ExecutionContext"

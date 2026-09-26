@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from uniserve.media import image
-from uniserve.nn.attention import SequenceLengths, VarlenInput
+from uniserve.nn.attention import AttentionBatch, SequenceLengths, VarlenInput
 from uniserve.tensors import OutputLayout
 
 from .inputs import VisionInput
@@ -305,7 +305,9 @@ class TextEncoder(Encoder[tuple[torch.Tensor, ...]]):
             (values.new_zeros(1), values.cumsum(0, dtype=torch.int32))
         )
         lengths = SequenceLengths(host=counts, values=values, offsets=offsets)
-        attention = VarlenInput(lengths, lengths, (True,) * len(counts))
+        attention = AttentionBatch.single(
+            VarlenInput(lengths, lengths, (True,) * len(counts))
+        )
 
         embeddings = (
             self.network.embed_input_ids(packed)

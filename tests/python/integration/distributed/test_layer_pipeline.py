@@ -11,6 +11,7 @@ from torch import nn
 from uniserve.distributed import DeviceMesh, parallelize_
 from uniserve.model import TransformerDecoder
 from uniserve.nn.attention import (
+    AttentionBatch,
     AttentionParallelConfig,
     SequenceLengths,
     Ulysses,
@@ -75,7 +76,9 @@ def _run(rank, rendezvous, stages):
         )
         pipeline = mesh.get_group("pp")
         lengths = SequenceLengths.from_lengths((16,), device="cpu")
-        attention = VarlenInput(lengths, lengths, (False,))
+        attention = AttentionBatch.single(
+            VarlenInput(lengths, lengths, (False,))
+        )
         positions = torch.arange(16)
         states = initial.clone()
         for step in range(4):

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import accumulate
+from types import MappingProxyType
 
 import torch
 
@@ -309,3 +311,79 @@ def _visibility(value: torch.Tensor, queries: SequenceLengths) -> None:
 AttentionInput = (
     DenseInput | VarlenInput | PagedInput | VisibleInput | SegmentedInput
 )
+
+
+@dataclass(frozen=True, slots=True)
+class AttentionBatch:
+    """One call's numerical attention inputs, one entry per cache table.
+
+    A layer bound to a prefix cache reads the entry of the table that holds
+    its cache; a layer without a cache table reads the batch's only entry.
+    Table IDs come from the prefix cache's layout and are not model
+    configuration. Every packed entry shares ``queries``: the same query
+    order, length and offset tensors. Entries may differ in their prefixes,
+    block tables, write addresses and key visibility. A dense input forms a
+    singleton batch without a packed query domain. The batch borrows its
+    tensors and owns no cache, request or execution state.
+    """
+
+    entries: Mapping[int, AttentionInput]
+    queries: SequenceLengths | None
+
+    def __post_init__(self) -> None:
+        entries = dict(self.entries)
+        if not entries or any(
+            type(table) is not int or table < 0 for table in entries
+        ):
+            raise ValueError(
+                "attention batches map nonnegative table IDs to inputs"
+            )
+        if any(isinstance(entry, DenseInput) for entry in entries.values()):
+            if len(entries) != 1 or self.queries is not None:
+                raise ValueError(
+                    "dense attention forms a singleton batch without packed "
+                    "queries"
+                )
+        elif self.queries is None or any(
+            entry.queries.values is not self.queries.values
+            or entry.queries.offsets is not self.queries.offsets
+            for entry in entries.values()
+        ):
+            raise ValueError(
+                "attention tables must share one packed query domain"
+            )
+        object.__setattr__(self, "entries", MappingProxyType(entries))
+
+    @classmethod
+    def single(cls, value: AttentionInput) -> AttentionBatch:
+        """Wrap one input as the only entry, for layers without cache tables."""
+        return cls(
+            {0: value},
+            None if isinstance(value, DenseInput) else value.queries,
+        )
+
+    @property
+    def batch_size(self) -> int | None:
+        """Packed sequence count, or None for a dense singleton."""
+        return None if self.queries is None else self.queries.batch_size
+
+    def entry(self, table: int | None) -> AttentionInput:
+        """Select one table's input; ``None`` selects the only entry.
+
+        Raises:
+            ValueError: ``table`` is absent, or ``None`` names a batch with
+                several entries.
+        """
+        if table is None:
+            if len(self.entries) != 1:
+                raise ValueError(
+                    "a layer without a cache table requires a single-entry "
+                    "attention batch"
+                )
+            return next(iter(self.entries.values()))
+        try:
+            return self.entries[table]
+        except KeyError:
+            raise ValueError(
+                f"attention batch has no entry for cache table {table}"
+            ) from None

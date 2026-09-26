@@ -21,7 +21,7 @@ from torch import nn
 from uniserve.model import TransformerDecoder
 from uniserve.nn.attention import (
     Attention,
-    AttentionInput,
+    AttentionBatch,
     AxialQKVProjection,
     DenseInput,
     PagedInput,
@@ -136,7 +136,7 @@ class TransformerLayer(nn.Module):
         hidden: RoutedTensor,
         residual: RoutedTensor | None,
         positions: torch.Tensor,
-        attention: AttentionInput,
+        attention: AttentionBatch,
         *,
         routes: tuple[RouteSpan, ...],
     ):
@@ -171,13 +171,13 @@ class TransformerLayer(nn.Module):
         dynamic = isinstance(
             self.temporal_rotary.scaling, (DynamicScaling, LongRoPEScaling)
         )
+        # SenseNova caches form one block table, so the batch's only entry
+        # carries the absolute sequence lengths every layer shares.
+        entry = attention.entry(None)
         if not dynamic:
             length: int | None = positions.shape[1]
-        elif isinstance(attention, (PagedInput, SegmentedInput)):
-            if (
-                attention.queries.host is None
-                or attention.prefixes.host is None
-            ):
+        elif isinstance(entry, (PagedInput, SegmentedInput)):
+            if entry.queries.host is None or entry.prefixes.host is None:
                 raise ValueError(
                     "dynamic rotary scaling requires exact "
                     "host sequence lengths"
@@ -186,8 +186,8 @@ class TransformerLayer(nn.Module):
                 (
                     query + prefix
                     for query, prefix in zip(
-                        attention.queries.host,
-                        attention.prefixes.host,
+                        entry.queries.host,
+                        entry.prefixes.host,
                         strict=True,
                     )
                 ),
@@ -196,8 +196,8 @@ class TransformerLayer(nn.Module):
         else:
             length = (
                 positions.shape[1]
-                if isinstance(attention, DenseInput)
-                else attention.queries.maximum
+                if isinstance(entry, DenseInput)
+                else entry.queries.maximum
             )
         if length is None:
             raise ValueError(
