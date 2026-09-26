@@ -31,8 +31,11 @@ memory, and the probabilities reach the PV MMA through shared memory.
 Key tiles. A work tile streams 128-key tiles: prefix tiles first, then the
 tiles of its own block. Prefix tiles start at the page containing the
 tile's smallest lower bound; each is assembled from ``128 / page_tokens``
-page slots, and each CTA loads its K half (64 keys) and its half of the
-head dimension of every V slot with one TMA box per page. The TMA global
+page slots. Each CTA stages the 64 keys of its K half per 128-wide head-dim
+chunk, and its contiguous head-dim half of V per pair of chunks and 64-key
+half of the tile. Every stage is 64 rows by two 64-dim swizzle atoms,
+filled by TMA boxes of (64 dims, rows, 2 atoms): one box per page slot when
+a page covers the stage's 64 rows, one per atom otherwise. The TMA global
 view of the cache keeps the in-page row and the page as separate
 dimensions, which makes two cases exact without reading unowned memory:
 
@@ -56,8 +59,12 @@ may therefore hold NaN.
 Warp roles (per CTA, 12 warps): softmax (0-3, one thread per tensor-memory
 lane), output correction and epilogue (4-7), MMA issue (8, leader CTA
 only), TMA loads (9), and two idle warps. K and V stages share one ring of
-16 KiB shared-memory stages. These mechanisms follow the FlashAttention-4
-head-dimension-256 SM100 kernel.
+16 KiB shared-memory stages. The load warp looks up the page slots of a
+prefix tile once, one slot per lane and one tile ahead of its copies. The
+softmax raises the row maximum used for the probabilities only when a tile
+exceeds it by more than a threshold, so the correction warps rescale the
+output only for the few tiles that raise it. These mechanisms follow the
+FlashAttention-4 SM100 forward kernels.
 """
 
 import math
@@ -168,15 +175,26 @@ class PrefixBlockAttentionSm100:
         self.pv_block_tiler = (self.cta_rows, self.chunk)
         self.qk_chunks = head_dim // self.chunk
         self.pv_chunks = head_dim // self.chunk
-        # Keys of the QK B operand and head dims of the PV B operand that each
-        # CTA of the pair stages.
+        # Each CTA of the pair stages 64 keys of every K chunk (its half of
+        # the QK B operand) and 64 head dims of every V chunk (its half of the
+        # PV B operand). A K or V stage is 64 rows (keys) by two 64-wide
+        # head-dim atoms, one 128-byte swizzle row per row and atom, so every
+        # stage is filled by TMA boxes of (64 dims, rows, 2 atoms).
+        self.atom_dims = 64
         self.half_keys = self.tile_keys // 2
-        self.half_dims = self.chunk // 2
         self.slots_per_tile = self.tile_keys // page_tokens
         self.slots_per_half = self.half_keys // page_tokens
+        # A CTA's V head dims are the contiguous half [v * D / 2, (v + 1) *
+        # D / 2): PV chunk c's column n is head dim (n // 64) * D / 2 + 64 c
+        # + n % 64. A V stage holds two consecutive chunks of one 64-key
+        # half of a tile, so a tile's V takes 2 * pv_pairs stages.
+        self.pv_pairs = self.pv_chunks // 2
 
+        # A tile streams qk_chunks K stages and 2 * pv_pairs V stages; eight
+        # 16 KiB ring stages keep the loads a full tile ahead at head dim
+        # 512 (SMEM: Q 64 KiB, ring 128 KiB, probabilities 32 KiB).
         self.q_stage = self.qk_chunks
-        self.kv_stage = 8 if head_dim == 256 else 6
+        self.kv_stage = 8
         self.s_stage = 2
 
         self.softmax_warps = (0, 1, 2, 3)
@@ -200,9 +218,14 @@ class PrefixBlockAttentionSm100:
         self.p_columns = self.tile_keys // 2
         self.stats_column = self.p_columns if self.p_in_tmem else 0
 
+        # Registers per thread of each warpgroup after setmaxnreg: softmax,
+        # correction, and the MMA/load/idle group. Their sum times 128 must
+        # stay within the launch allocation (168 per thread for 384 threads,
+        # 64512), or the softmax increase never completes; the load and MMA
+        # warps need the 88 to keep their unrolled issue loops in registers.
         self.regs_softmax = 256
         self.regs_correction = 160
-        self.regs_other = 48
+        self.regs_other = 88
 
     # ------------------------------------------------------------------ host
 
@@ -257,44 +280,82 @@ class PrefixBlockAttentionSm100:
             ),
         )
         # The launcher guarantees 16-byte aligned rows; stating it lets the
-        # epilogue store each thread's row segment with vector stores.
+        # epilogue store each thread's row segment with vector stores. The
+        # head dim is viewed as ((64, 2), chunks) in the PV column order: the
+        # 128 columns of chunk c are head dims 64 c + [0, 64) and D / 2 +
+        # 64 c + [0, 64).
         o_head_stride = cute.assume(output.stride[1], divby=8)
         o_token_stride = cute.assume(output.stride[0], divby=8)
         o_packed = cute.make_tensor(
             output.iterator,
             cute.make_layout(
-                ((group, tokens), head_dim, kv_heads),
+                (
+                    (group, tokens),
+                    ((self.atom_dims, 2), self.pv_chunks),
+                    kv_heads,
+                ),
                 stride=(
                     (o_head_stride, o_token_stride),
-                    1,
+                    ((1, self.head_dim // 2), self.atom_dims),
                     o_head_stride * group,
                 ),
             ),
         )
-        # Current block K as (tokens, D, Hkv) and V as (D, tokens, Hkv); the
-        # caches as (row, D, Hkv, page) and (D, row, Hkv, page) so that the
-        # in-page row and the page are separate TMA dimensions.
+        # K/V as (dim in atom, row, atom, head[, page]): current blocks from
+        # the packed tokens and prefixes from the caches, whose in-page row
+        # and page stay separate TMA dimensions.
+        atoms = self.head_dim // self.atom_dims
         k_current = cute.make_tensor(
             key.iterator,
             cute.make_layout(
-                (tokens, head_dim, kv_heads),
-                stride=(key.stride[0], 1, key.stride[1]),
+                (self.atom_dims, tokens, atoms, kv_heads),
+                stride=(1, key.stride[0], self.atom_dims, key.stride[1]),
             ),
         )
         v_current = cute.make_tensor(
             value.iterator,
             cute.make_layout(
-                (head_dim, tokens, kv_heads),
-                stride=(1, value.stride[0], value.stride[1]),
+                (self.atom_dims, tokens, atoms, kv_heads),
+                stride=(1, value.stride[0], self.atom_dims, value.stride[1]),
             ),
         )
         k_pages = cute.make_tensor(
             key_cache.iterator,
-            cute.select(key_cache.layout, mode=[1, 3, 2, 0]),
+            cute.make_layout(
+                (
+                    self.atom_dims,
+                    self.page_tokens,
+                    atoms,
+                    kv_heads,
+                    key_cache.shape[0],
+                ),
+                stride=(
+                    1,
+                    key_cache.stride[1],
+                    self.atom_dims,
+                    key_cache.stride[2],
+                    key_cache.stride[0],
+                ),
+            ),
         )
         v_pages = cute.make_tensor(
             value_cache.iterator,
-            cute.select(value_cache.layout, mode=[3, 1, 2, 0]),
+            cute.make_layout(
+                (
+                    self.atom_dims,
+                    self.page_tokens,
+                    atoms,
+                    kv_heads,
+                    value_cache.shape[0],
+                ),
+                stride=(
+                    1,
+                    value_cache.stride[1],
+                    self.atom_dims,
+                    value_cache.stride[2],
+                    value_cache.stride[0],
+                ),
+            ),
         )
 
         self.dtype = dtype
@@ -334,31 +395,38 @@ class PrefixBlockAttentionSm100:
         k_smem = sm100_utils.make_smem_layout_b(
             qk_mma, self.qk_mma_tiler, dtype, self.kv_stage
         )
+        # V sub-stages of 64 keys (one head-dim atom each), two per stage.
         v_smem = sm100_utils.make_smem_layout_b(
-            pv_mma, self.pv_mma_tiler, dtype, self.kv_stage
+            pv_mma,
+            (self.tile_rows, self.chunk, self.half_keys),
+            dtype,
+            2 * self.kv_stage,
         )
-        # One probability tile per score stage, as the PV A operand: in
-        # tensor memory (aliasing the stage's first columns) or in SMEM.
+        # One probability tile per score stage as the PV A operand, aliasing
+        # the stage in tensor memory or in SMEM.
         p_layout = sm100_utils.make_smem_layout_a(
             pv_mma, self.pv_mma_tiler, dtype, self.s_stage
         )
         # K and V stages alias one ring: both are 16 KiB per CTA with the
-        # same swizzle, and a stage holds one of them at a time.
+        # same swizzle, and a stage holds one of them at a time. In both, row
+        # (key) n and head dim d of a stage sit at element n * 64 + d % 64 +
+        # (d // 64) * 4096, i.e. the stage is (dim in atom, row, atom) =
+        # (64, 64, 2):(1, 64, 4096), the order of the TMA boxes below.
         assert cute.cosize(k_smem) == cute.cosize(v_smem)
         assert str(k_smem.inner) == str(v_smem.inner)
-        # Plain (rows, cols) views of one K or V stage for the slot TMA
-        # copies. They tile the same swizzle atom in the same order as the
-        # MMA-partitioned stages above, so element offsets coincide.
-        k_plain = sm100_utils.make_smem_layout(
-            OperandMajorMode.K, (self.half_keys, self.chunk), dtype, 1
+        ring = cute.make_composed_layout(
+            k_smem.inner,
+            0,
+            cute.make_layout(
+                (self.atom_dims, self.half_keys, 2),
+                stride=(1, self.atom_dims, self.atom_dims * self.half_keys),
+            ),
         )
-        k_plain = cute.select(k_plain, mode=[0, 1])
-        v_plain = sm100_utils.make_smem_layout(
-            OperandMajorMode.MN, (self.half_dims, self.tile_keys), dtype, 1
-        )
-        v_plain = cute.select(v_plain, mode=[0, 1])
-        k_slot = cute.composition(k_plain, (self.page_tokens, self.chunk))
-        v_slot = cute.composition(v_plain, (self.half_dims, self.page_tokens))
+        # A page slot is page_tokens rows of a stage: one TMA box when the
+        # slot fills the stage, one per atom otherwise.
+        slot = cute.composition(ring, (self.atom_dims, self.page_tokens, 2))
+        slot_tile = (self.atom_dims, self.page_tokens, 2)
+        stage_tile = (self.atom_dims, self.half_keys, 2)
 
         load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
         tma_q, tma_q_tensor = cute.nvgpu.make_tiled_tma_atom_A(
@@ -370,16 +438,16 @@ class PrefixBlockAttentionSm100:
             cluster_layout_vmnk.shape,
         )
         tma_kp, tma_kp_tensor = cpasync.make_tiled_tma_atom(
-            load_op, k_pages, k_slot, (self.page_tokens, self.chunk)
+            load_op, k_pages, slot, slot_tile
         )
         tma_vp, tma_vp_tensor = cpasync.make_tiled_tma_atom(
-            load_op, v_pages, v_slot, (self.half_dims, self.page_tokens)
+            load_op, v_pages, slot, slot_tile
         )
         tma_kc, tma_kc_tensor = cpasync.make_tiled_tma_atom(
-            load_op, k_current, k_plain, (self.half_keys, self.chunk)
+            load_op, k_current, ring, stage_tile
         )
         tma_vc, tma_vc_tensor = cpasync.make_tiled_tma_atom(
-            load_op, v_current, v_plain, (self.half_dims, self.tile_keys)
+            load_op, v_current, ring, stage_tile
         )
         q_bytes = cute.size_in_bytes(dtype, cute.select(q_smem, mode=[0, 1, 2]))
         kv_bytes = cute.size_in_bytes(
@@ -438,8 +506,7 @@ class PrefixBlockAttentionSm100:
             k_smem,
             v_smem,
             p_layout,
-            k_plain,
-            v_plain,
+            ring,
         ).launch(
             grid=[num_clusters * 2, 1, 1],
             block=[self.threads, 1, 1],
@@ -592,8 +659,7 @@ class PrefixBlockAttentionSm100:
         k_smem: cute.ComposedLayout,
         v_smem: cute.ComposedLayout,
         p_layout: cute.ComposedLayout,
-        k_plain: cute.ComposedLayout,
-        v_plain: cute.ComposedLayout,
+        ring: cute.ComposedLayout,
     ):
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp == self.load_warp:
@@ -785,7 +851,7 @@ class PrefixBlockAttentionSm100:
                     tma_vc,
                     tma_vc_tensor,
                 ),
-                (s_q, s_k, k_plain, v_plain),
+                (s_q, s_k, ring),
                 block_table,
                 num_pages,
                 q_producer,
@@ -886,25 +952,21 @@ class PrefixBlockAttentionSm100:
             tma_vc,
             tma_vc_tensor,
         ) = tma
-        s_q, s_k, k_plain, v_plain = smem_tensors
+        s_q, s_k, ring = smem_tensors
 
-        # Plain (row, col, stage) views of the K and V stages of the ring.
-        stages = cute.make_layout(self.kv_stage, stride=cute.cosize(k_plain))
-        s_k_plain = cute.make_tensor(
-            s_k.iterator, cute.append(k_plain.outer, stages)
+        # (dim in atom, row, atom, stage) view of the ring, split into page
+        # slots and into whole stages; both grouped as (box, ...).
+        s_ring = cute.make_tensor(
+            s_k.iterator,
+            cute.append(
+                ring.outer,
+                cute.make_layout(self.kv_stage, stride=cute.cosize(ring.outer)),
+            ),
         )
-        s_v_plain = cute.make_tensor(
-            s_k.iterator, cute.append(v_plain.outer, stages)
-        )
-        # Page slots (page_tokens, chunk, slots, 1, stage) of a K half and
-        # (half_dims, page_tokens, 1, slots, stage) of a V half, and the
-        # whole-stage views used for current-block tiles.
-        views = (
-            cute.flat_divide(s_k_plain, (self.page_tokens, self.chunk)),
-            cute.flat_divide(s_k_plain, (self.half_keys, self.chunk)),
-            cute.flat_divide(s_v_plain, (self.half_dims, self.page_tokens)),
-            cute.flat_divide(s_v_plain, (self.half_dims, self.tile_keys)),
-        )
+        slot_tile = (self.atom_dims, self.page_tokens, 2)
+        stage_tile = (self.atom_dims, self.half_keys, 2)
+        s_slots = cute.group_modes(cute.flat_divide(s_ring, slot_tile), 0, 3)
+        s_whole = cute.group_modes(cute.flat_divide(s_ring, stage_tile), 0, 3)
         q_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
         )
@@ -950,56 +1012,49 @@ class PrefixBlockAttentionSm100:
                         tma_bar_ptr=handle.barrier,
                     )
 
-                # The sequence's current-block K/V start at its first row.
-                k_seq = cute.domain_offset((query_start, 0, 0), tma_kc_tensor)
-                v_seq = cute.domain_offset((0, query_start, 0), tma_vc_tensor)
                 sequence = (
-                    batch,
                     kv_head,
                     cta_v,
+                    query_start,
                     query_len,
-                    prefix_len,
-                    first_page,
-                    prefix_base,
                     prefix_tiles,
                 )
                 sources = (
-                    tma_kp,
-                    tma_kp_tensor,
-                    tma_kc,
-                    k_seq,
-                    tma_vp,
-                    tma_vp_tensor,
-                    tma_vc,
-                    v_seq,
+                    (tma_kp, tma_kp_tensor, tma_kc, tma_kc_tensor),
+                    (tma_vp, tma_vp_tensor, tma_vc, tma_vc_tensor),
+                    (s_slots, s_whole),
                 )
-
                 # Lane s holds (physical page, row shift) of page slot s of
                 # a prefix tile; the lookups run one tile ahead of the copies
                 # that use them.
-                lookup = (sequence, block_table, num_pages)
+                lookup = (
+                    (
+                        batch,
+                        prefix_len,
+                        first_page,
+                        prefix_base,
+                        prefix_tiles,
+                    ),
+                    block_table,
+                    num_pages,
+                )
                 slots = self.lane_slots(Int32(0), lookup)
                 ahead = self.lane_slots(Int32(1), lookup)
                 kv_producer = self.load_k(
-                    Int32(0), slots, sequence, sources, views, kv_producer
+                    Int32(0), slots, sequence, sources, kv_producer
                 )
                 for key_tile in cutlass.range(1, key_tiles, unroll=1):
                     following = self.lane_slots(key_tile + 1, lookup)
                     kv_producer = self.load_k(
-                        key_tile, ahead, sequence, sources, views, kv_producer
+                        key_tile, ahead, sequence, sources, kv_producer
                     )
                     kv_producer = self.load_v(
-                        key_tile - 1,
-                        slots,
-                        sequence,
-                        sources,
-                        views,
-                        kv_producer,
+                        key_tile - 1, slots, sequence, sources, kv_producer
                     )
                     slots = ahead
                     ahead = following
                 kv_producer = self.load_v(
-                    key_tiles - 1, slots, sequence, sources, views, kv_producer
+                    key_tiles - 1, slots, sequence, sources, kv_producer
                 )
             tile += num_clusters
         kv_producer.tail()
@@ -1015,17 +1070,8 @@ class PrefixBlockAttentionSm100:
         issuing lane; other lanes, and tiles that are not prefix tiles,
         return an out-of-range page.
         """
-        sequence, block_table, num_pages = lookup
-        (
-            batch,
-            _kv_head,
-            _cta_v,
-            _query_len,
-            prefix_len,
-            first_page,
-            prefix_base,
-            prefix_tiles,
-        ) = sequence
+        prefix, block_table, num_pages = lookup
+        batch, prefix_len, first_page, prefix_base, prefix_tiles = prefix
         lane = cute.arch.lane_idx()
         physical = num_pages
         shift = Int32(0)
@@ -1076,142 +1122,130 @@ class PrefixBlockAttentionSm100:
 
     @no_type_check
     @cute.jit
-    def load_k(
-        self, key_tile: Int32, slots, sequence, sources, views, kv_producer
+    def copy_slot(
+        self,
+        atom,
+        tensor,
+        s_slots,
+        kv_head,
+        pair,
+        physical,
+        shift,
+        slot,
+        handle,
     ):
-        """Load this CTA's 64-key half of K tile ``key_tile``, per chunk."""
-        (
-            _batch,
-            kv_head,
-            cta_v,
-            query_len,
-            _prefix_len,
-            _first_page,
-            _prefix_base,
-            prefix_tiles,
-        ) = sequence
-        tma_kp, tma_kp_tensor, tma_kc, k_seq = sources[:4]
-        s_k_slots, s_k_whole = views[:2]
-        one = cute.make_layout(1)
+        """Copy one page slot into slot ``slot`` of a ring stage.
 
+        The box is rows ``[-shift, page_tokens - shift)`` of page
+        ``physical`` over head-dim atoms ``2 * pair`` and ``2 * pair + 1``;
+        rows before the page start read as zeros.
+        """
+        g = cute.domain_offset(
+            (0, shift, 0, 0), tensor[None, None, None, kv_head, None]
+        )
+        g = cute.flat_divide(g, (self.atom_dims, self.page_tokens, 2))
+        smem, gmem = cpasync.tma_partition(
+            atom, 0, cute.make_layout(1), s_slots, cute.group_modes(g, 0, 3)
+        )
+        cute.copy(
+            atom,
+            gmem[None, 0, 0, pair, physical],
+            smem[None, 0, slot, 0, handle.index],
+            tma_bar_ptr=handle.barrier,
+        )
+
+    @no_type_check
+    @cute.jit
+    def copy_current(self, atom, tensor, s_whole, rows, pair, handle):
+        """Copy 64 current-block rows starting at packed row ``rows``."""
+        g = cute.domain_offset((0, rows, 0), tensor)
+        g = cute.flat_divide(g, (self.atom_dims, self.half_keys, 2))
+        smem, gmem = cpasync.tma_partition(
+            atom, 0, cute.make_layout(1), s_whole, cute.group_modes(g, 0, 3)
+        )
+        cute.copy(
+            atom,
+            gmem[None, 0, 0, pair],
+            smem[None, 0, 0, 0, handle.index],
+            tma_bar_ptr=handle.barrier,
+        )
+
+    @no_type_check
+    @cute.jit
+    def load_k(self, key_tile: Int32, slots, sequence, sources, kv_producer):
+        """Load this CTA's 64-key half of K tile ``key_tile``, per chunk.
+
+        Chunk ``c`` holds head dims ``[128 c, 128 c + 128)``.
+        """
+        kv_head, cta_v, query_start, query_len, prefix_tiles = sequence
+        (atom, pages, current_atom, current), _, (s_slots, s_whole) = sources
         for chunk in cutlass.range(self.qk_chunks, unroll=1):
             handle = kv_producer.acquire_and_advance()
             if key_tile < prefix_tiles:
                 for slot in cutlass.range(self.slots_per_half, unroll=1):
                     lane = cta_v * self.slots_per_half + slot
-                    physical = cute.arch.shuffle_sync(slots[0], lane)
-                    shift = cute.arch.shuffle_sync(slots[1], lane)
-                    g_k = cute.domain_offset((shift, 0, 0, 0), tma_kp_tensor)
-                    g_k = cute.flat_divide(
-                        g_k[None, None, kv_head, None],
-                        (self.page_tokens, self.chunk),
-                    )
-                    t_dst, t_src = cpasync.tma_partition(
-                        tma_kp,
-                        0,
-                        one,
-                        cute.group_modes(s_k_slots, 0, 2),
-                        cute.group_modes(g_k, 0, 2),
-                    )
-                    cute.copy(
-                        tma_kp,
-                        t_src[None, 0, chunk, physical],
-                        t_dst[None, slot, 0, handle.index],
-                        tma_bar_ptr=handle.barrier,
+                    self.copy_slot(
+                        atom,
+                        pages,
+                        s_slots,
+                        kv_head,
+                        chunk,
+                        cute.arch.shuffle_sync(slots[0], lane),
+                        cute.arch.shuffle_sync(slots[1], lane),
+                        slot,
+                        handle,
                     )
             else:
                 row = self.current_row(key_tile - prefix_tiles, query_len)
-                g_k = cute.domain_offset(
-                    (row + cta_v * self.half_keys, 0, 0), k_seq
-                )
-                g_k = cute.flat_divide(
-                    g_k[None, None, kv_head], (self.half_keys, self.chunk)
-                )
-                t_dst, t_src = cpasync.tma_partition(
-                    tma_kc,
-                    0,
-                    one,
-                    cute.group_modes(s_k_whole, 0, 2),
-                    cute.group_modes(g_k, 0, 2),
-                )
-                cute.copy(
-                    tma_kc,
-                    t_src[None, 0, chunk],
-                    t_dst[None, 0, 0, handle.index],
-                    tma_bar_ptr=handle.barrier,
+                self.copy_current(
+                    current_atom,
+                    current[None, None, None, kv_head],
+                    s_whole,
+                    query_start + row + cta_v * self.half_keys,
+                    chunk,
+                    handle,
                 )
         return kv_producer
 
     @no_type_check
     @cute.jit
-    def load_v(
-        self, key_tile: Int32, slots, sequence, sources, views, kv_producer
-    ):
-        """Load this CTA's head-dim half of every key of V tile ``key_tile``.
+    def load_v(self, key_tile: Int32, slots, sequence, sources, kv_producer):
+        """Load this CTA's head-dim half of V tile ``key_tile``.
 
-        Chunk ``c`` of the PV product covers head dims ``[c * 128, c * 128 +
-        128)``; this CTA supplies the 64 dims starting at ``c * 128 +
-        cta_v * 64``.
+        Stages follow the PV order: for each chunk pair ``pair`` of this
+        CTA's contiguous head-dim half (head-dim atoms ``2 * (v * pairs +
+        pair)`` and the next), the tile's two 64-key halves.
         """
-        (
-            _batch,
-            kv_head,
-            cta_v,
-            query_len,
-            _prefix_len,
-            _first_page,
-            _prefix_base,
-            prefix_tiles,
-        ) = sequence
-        tma_vp, tma_vp_tensor, tma_vc, v_seq = sources[4:]
-        s_v_slots, s_v_whole = views[2:]
-        one = cute.make_layout(1)
-
-        for chunk in cutlass.range(self.pv_chunks, unroll=1):
-            handle = kv_producer.acquire_and_advance()
-            dim_block = chunk * 2 + cta_v
-            if key_tile < prefix_tiles:
-                for slot in cutlass.range(self.slots_per_tile, unroll=1):
-                    physical = cute.arch.shuffle_sync(slots[0], slot)
-                    shift = cute.arch.shuffle_sync(slots[1], slot)
-                    g_v = cute.domain_offset((0, shift, 0, 0), tma_vp_tensor)
-                    g_v = cute.flat_divide(
-                        g_v[None, None, kv_head, None],
-                        (self.half_dims, self.page_tokens),
+        kv_head, cta_v, query_start, query_len, prefix_tiles = sequence
+        _, (atom, pages, current_atom, current), (s_slots, s_whole) = sources
+        for pair in cutlass.range_constexpr(self.pv_pairs):
+            for half in cutlass.range_constexpr(2):
+                handle = kv_producer.acquire_and_advance()
+                atoms = cta_v * self.pv_pairs + pair
+                if key_tile < prefix_tiles:
+                    for slot in cutlass.range(self.slots_per_half, unroll=1):
+                        lane = half * self.slots_per_half + slot
+                        self.copy_slot(
+                            atom,
+                            pages,
+                            s_slots,
+                            kv_head,
+                            atoms,
+                            cute.arch.shuffle_sync(slots[0], lane),
+                            cute.arch.shuffle_sync(slots[1], lane),
+                            slot,
+                            handle,
+                        )
+                else:
+                    row = self.current_row(key_tile - prefix_tiles, query_len)
+                    self.copy_current(
+                        current_atom,
+                        current[None, None, None, kv_head],
+                        s_whole,
+                        query_start + row + half * self.half_keys,
+                        atoms,
+                        handle,
                     )
-                    t_dst, t_src = cpasync.tma_partition(
-                        tma_vp,
-                        0,
-                        one,
-                        cute.group_modes(s_v_slots, 0, 2),
-                        cute.group_modes(g_v, 0, 2),
-                    )
-                    cute.copy(
-                        tma_vp,
-                        t_src[None, dim_block, 0, physical],
-                        t_dst[None, 0, slot, handle.index],
-                        tma_bar_ptr=handle.barrier,
-                    )
-            else:
-                row = self.current_row(key_tile - prefix_tiles, query_len)
-                g_v = cute.domain_offset((0, row, 0), v_seq)
-                g_v = cute.flat_divide(
-                    g_v[None, None, kv_head],
-                    (self.half_dims, self.tile_keys),
-                )
-                t_dst, t_src = cpasync.tma_partition(
-                    tma_vc,
-                    0,
-                    one,
-                    cute.group_modes(s_v_whole, 0, 2),
-                    cute.group_modes(g_v, 0, 2),
-                )
-                cute.copy(
-                    tma_vc,
-                    t_src[None, dim_block, 0],
-                    t_dst[None, 0, 0, handle.index],
-                    tma_bar_ptr=handle.barrier,
-                )
         return kv_producer
 
     @no_type_check
@@ -1347,23 +1381,34 @@ class PrefixBlockAttentionSm100:
             )
         else:
             t_p_stage = t_p[None, None, None, p_handle.index]
-        for chunk in cutlass.range(self.pv_chunks, unroll=1):
-            v_handle = kv_consumer.wait_and_advance()
-            pv_mma.set(tcgen05.Field.ACCUMULATE, accumulate)
-            t_o_chunk = t_o[None, None, None, chunk]
-            t_v_stage = t_v[None, None, None, v_handle.index]
-            for kphase in cutlass.range(
-                cute.size(t_v_stage, mode=[2]), unroll_full=True
-            ):
-                cute.gemm(
-                    pv_mma,
-                    t_o_chunk,
-                    t_p_stage[None, None, kphase],
-                    t_v_stage[None, None, kphase],
-                    t_o_chunk,
-                )
-                pv_mma.set(tcgen05.Field.ACCUMULATE, True)
-            v_handle.release()
+        # V stages arrive per chunk pair and 64-key half (see load_v); each
+        # holds one 64-key sub-stage per chunk of the pair. Both halves of a
+        # pair are held so that each output chunk accumulates its 128 keys
+        # in one uninterrupted run.
+        for pair in cutlass.range_constexpr(self.pv_pairs):
+            halves = (
+                kv_consumer.wait_and_advance(),
+                kv_consumer.wait_and_advance(),
+            )
+            for step in cutlass.range_constexpr(2):
+                t_o_chunk = t_o[None, None, None, pair * 2 + step]
+                pv_mma.set(tcgen05.Field.ACCUMULATE, accumulate)
+                for half in cutlass.range_constexpr(2):
+                    t_v_stage = t_v[
+                        None, None, None, halves[half].index * 2 + step
+                    ]
+                    kphases = cute.size(t_v_stage, mode=[2])
+                    for kphase in cutlass.range_constexpr(kphases):
+                        cute.gemm(
+                            pv_mma,
+                            t_o_chunk,
+                            t_p_stage[None, None, half * kphases + kphase],
+                            t_v_stage[None, None, kphase],
+                            t_o_chunk,
+                        )
+                        pv_mma.set(tcgen05.Field.ACCUMULATE, True)
+            halves[0].release()
+            halves[1].release()
         o_handle.commit()
         p_handle.release()
         # The accumulate flag lives in the MMA atom; returning the atom carries
@@ -1999,12 +2044,7 @@ class PrefixBlockAttentionSm100:
         of head ``kv_head * G + row % G``.
         """
         tidx = cute.arch.thread_idx()[0] % self.lane_threads
-        g_o = cute.flat_divide(o_seq, self.pv_block_tiler)
-        c_o = cute.flat_divide(
-            cute.make_identity_tensor(o_seq.shape), self.pv_block_tiler
-        )
-        g_o = g_o[None, None, cta_block, None, kv_head]
-        c_o = c_o[None, None, cta_block, None, kv_head]
+        c_seq = cute.make_identity_tensor(o_seq.shape)
 
         # This lane's row within the CTA block selects its row sum; every
         # chunk maps lanes to rows alike.
@@ -2029,16 +2069,19 @@ class PrefixBlockAttentionSm100:
             factor = cute.arch.rcp_approx(row_sum)
 
         o_handle = o_consumer.wait_and_advance()
-        for chunk in cutlass.range(self.pv_chunks, unroll=1):
+        for chunk in cutlass.range_constexpr(self.pv_chunks):
+            # This CTA's rows of the chunk's 128 head dims (PV column order).
+            g_o = cute.flat_divide(
+                o_seq[None, (None, chunk), kv_head], self.pv_block_tiler
+            )[None, None, cta_block, 0]
+            c_o = cute.flat_divide(
+                c_seq[None, (None, chunk), kv_head], self.pv_block_tiler
+            )[None, None, cta_block, 0]
             t_o_epi = cute.zipped_divide(
                 t_o[(None, None), 0, 0, chunk], self.pv_block_tiler
             )
-            g_o_epi = cute.zipped_divide(
-                g_o[None, None, chunk], self.pv_block_tiler
-            )
-            c_o_epi = cute.zipped_divide(
-                c_o[None, None, chunk], self.pv_block_tiler
-            )
+            g_o_epi = cute.zipped_divide(g_o, self.pv_block_tiler)
+            c_o_epi = cute.zipped_divide(c_o, self.pv_block_tiler)
             load_o = tcgen05.make_tmem_copy(
                 cute.make_copy_atom(
                     tcgen05.Ld32x32bOp(tcgen05.Repetition(32)), Float32
