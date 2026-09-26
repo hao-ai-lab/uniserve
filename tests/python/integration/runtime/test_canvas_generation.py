@@ -265,7 +265,9 @@ def test_canvas_steps_follow_the_public_model_and_sampler(tmp_path):
     finally:
         reference.close()
 
-    worker = _worker(tmp_path)
+    worker = _worker(
+        tmp_path, canvas_history_depth=ADMITTED.stability_threshold
+    )
     with worker:
         prefill = replace(
             _prefill(1, 0, tokens=prompt),
@@ -306,7 +308,9 @@ def test_canvas_steps_follow_the_public_model_and_sampler(tmp_path):
 def test_a_step_that_skips_its_canvas_is_refused(tmp_path):
     """A slot's canvas starts at step zero and advances one step per call."""
     diffusion_gemma_checkpoint(tmp_path)
-    worker = _worker(tmp_path)
+    worker = _worker(
+        tmp_path, canvas_history_depth=ADMITTED.stability_threshold
+    )
     with worker:
         prefill = replace(
             _prefill(1, 0, tokens=list(range(7, 20))),

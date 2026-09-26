@@ -521,6 +521,7 @@ def _token_worker_layout(
                             denoiser,
                             request_pool_size=worker_config.max_request_pool_size,
                             max_rows=input_config.max_rows,
+                            history_depth=worker_config.canvas_history_depth,
                             cuda=torch.device(target).type == "cuda",
                         ).values()
                     )

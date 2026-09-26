@@ -40,9 +40,6 @@ STEP_BYTES = 2 << 30
 # product uses for split-K partial sums: the most it takes for any step
 # shape. The product runs without one on other devices.
 SCRATCH_BYTES = 256 << 20
-# Argmax canvases each slot keeps: the largest stability a request's canvas
-# sampling may use. The checkpoint default is 1.
-HISTORY_DEPTH = 8
 
 
 def step_rows(*, canvas_length: int, vocab_size: int, max_rows: int) -> int:
@@ -77,7 +74,6 @@ def denoiser_fields(denoiser: TokenDenoiser) -> dict[str, object]:
         "tokens": denoiser.canvas,
         "vocab_size": denoiser.lm_head.vocab.size,
         "hidden_size": embedding.embedding_dim,
-        "history_depth": HISTORY_DEPTH,
         "dtype": embedding.weight.dtype,
     }
 
@@ -107,7 +103,8 @@ class CanvasSlots:
             vocab_size: Vocabulary size of the denoiser's logits.
             hidden_size: Width of one self-conditioning embedding.
             history_depth: Argmax canvases the stopping rule keeps, the
-                largest stability a request may use.
+                largest stability a request may use: the stability of the
+                canvas sampling the deployment serves.
             dtype: Dtype of the self-conditioning embeddings and sampling
                 weights, the model's embedding dtype.
             device: Device of every tensor.
@@ -163,12 +160,18 @@ class CanvasSlots:
         *,
         request_pool_size: int,
         max_rows: int,
+        history_depth: int,
         device: torch.device | str,
     ) -> CanvasSlots:
-        """Allocate the slots of a generating denoiser's canvases."""
+        """Allocate the slots of a generating denoiser's canvases.
+
+        ``history_depth`` is the deployment's canvas stability threshold
+        (``WorkerConfig.canvas_history_depth``).
+        """
         return cls(
             request_pool_size=request_pool_size,
             max_rows=max_rows,
+            history_depth=history_depth,
             device=device,
             **denoiser_fields(denoiser),
         )
@@ -180,6 +183,7 @@ class CanvasSlots:
         *,
         request_pool_size: int,
         max_rows: int,
+        history_depth: int,
         cuda: bool,
     ) -> dict[str, BufferConfig]:
         """``buffers`` of the slots ``for_denoiser`` allocates."""
@@ -189,6 +193,7 @@ class CanvasSlots:
             request_pool_size=request_pool_size,
             max_rows=max_rows,
             canvas_length=tokens.length,
+            history_depth=history_depth,
             cuda=cuda,
             **fields,
         )

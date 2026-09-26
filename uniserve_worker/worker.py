@@ -733,6 +733,7 @@ class Worker:
                     denoiser,
                     request_pool_size=int(info.request_slots),
                     max_rows=canvas_runner.input_buffers.max_rows,
+                    history_depth=worker_config.canvas_history_depth,
                     device=canvas_runner.device,
                 )
                 startup.callback(self.canvas_slots.close)

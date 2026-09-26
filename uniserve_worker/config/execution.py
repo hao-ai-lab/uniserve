@@ -334,6 +334,10 @@ class WorkerConfig:
     # Text capacities, in prompt tokens, of the denoiser's layouts; empty
     # selects ``MediaBuilder``'s default spacing.
     video_text_capacities: tuple[int, ...] = ()
+    # Argmax canvases each generating block-diffusion canvas keeps for its
+    # stopping rule, the stability threshold of the served canvas sampling;
+    # zero keeps none.
+    canvas_history_depth: int = 0
     max_request_pool_size: int = 128
     encoder_cache_entries: int = 256
     generation_device: str | None = None
@@ -404,6 +408,10 @@ class WorkerConfig:
             )
         if any(value < 1 for value in self.video_text_capacities):
             raise invalid_descriptor("video text capacities must be positive")
+        if self.canvas_history_depth < 0:
+            raise invalid_descriptor(
+                "canvas history depth must not be negative"
+            )
         if not 0 < self.kv_storage_fraction <= 1:
             raise invalid_descriptor(
                 "worker configuration KV storage fraction must be in (0, 1]"
@@ -454,6 +462,7 @@ def worker_config_from_namespace(
         video_text_capacities=_parse_positive_int_csv(
             getattr(namespace, "video_text_capacities", None), default=()
         ),
+        canvas_history_depth=int(getattr(namespace, "canvas_history_depth", 0)),
         kv_token_capacity=_positive_optional_int(namespace.kv_token_capacity),
         attention_backend=str(namespace.attention_backend),
         model_dtype=str(namespace.model_dtype),
