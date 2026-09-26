@@ -93,8 +93,12 @@ class VideoTask(BenchmarkTask):
         )
         videos = [output for output in outputs if output is not None]
 
-        # Audio and video stream durations may differ by at most one frame
-        # period.
+        # Both streams are measured against the aligned media length rather
+        # than each other: the video may differ from the aligned frame count
+        # by one frame, and the audio duration from the aligned duration by
+        # one frame period. A one-frame-short video with full-length audio is
+        # therefore valid, while a missing or truncated stream is not.
+        frame_tolerance = 1
         duration_tolerance_s = 1.0 / 24.0
         return ValidationResult(
             checks={
@@ -105,10 +109,14 @@ class VideoTask(BenchmarkTask):
                 and all(
                     video.width == 1344
                     and video.height == 768
-                    and video.frame_count == frames
                     # The container frame rate is a rational; require exactly
                     # 24 fps.
                     and video.fps_numerator == 24 * video.fps_denominator
+                    for video in videos
+                ),
+                "aligned_frame_count": present
+                and all(
+                    abs(video.frame_count - frames) <= frame_tolerance
                     for video, frames in zip(
                         videos, expected_frames, strict=True
                     )
@@ -120,11 +128,13 @@ class VideoTask(BenchmarkTask):
                     and video.audio_sample_rate == 32_000
                     for video in videos
                 ),
-                "audio_spans_video": present
+                "aligned_audio_duration": present
                 and all(
-                    abs(video.audio_duration_s - video.video_duration_s)
+                    abs(video.audio_duration_s - frames / 24.0)
                     <= duration_tolerance_s
-                    for video in videos
+                    for video, frames in zip(
+                        videos, expected_frames, strict=True
+                    )
                 ),
                 "nonzero_video_variance": present
                 and all(
