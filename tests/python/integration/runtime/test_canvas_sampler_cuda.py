@@ -495,3 +495,14 @@ def test_product_reports_the_algorithm_it_measured():
     spread = weights.double().abs() @ table.double().abs()
     difference = (output.cpu().double() - expected).abs()
     assert (difference <= 2 * vocab * U * spread).all()
+
+
+@pytest.mark.parametrize(("rows", "hidden"), [(1, 64), (4, 2816)])
+def test_workspace_size_matches_its_allocation(rows, hidden):
+    workspace = canvas.CanvasWorkspace.empty(
+        rows, 256, 4096, hidden, device=DEVICE
+    )
+    allocated = sum(
+        getattr(workspace, name).nbytes for name in workspace.__slots__
+    )
+    assert allocated == canvas.CanvasWorkspace.nbytes(rows, 256, 4096, hidden)
