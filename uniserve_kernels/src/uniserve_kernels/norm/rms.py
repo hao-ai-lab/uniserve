@@ -20,7 +20,7 @@ MAX_WIDTH = 8192
 #: ``[tokens, heads]`` rows of a merged projection view.
 MAX_ROW_AXES = 4
 # Power-of-two row blocks at least this wide launch with 8 warps, narrower
-# blocks with 4 (see ``_launch``).
+# blocks with 4 (see :func:`row_launch`).
 _WIDE_BLOCK = 2048
 _FLOATING = (torch.float16, torch.bfloat16, torch.float32)
 
@@ -202,7 +202,7 @@ def unsupported_add(
     return None
 
 
-def _launch(width: int) -> tuple[int, int]:
+def row_launch(width: int) -> tuple[int, int]:
     """Return the power-of-two row block covering ``width`` and its warps."""
     block = triton.next_power_of_2(width)
     return block, 8 if block >= _WIDE_BLOCK else 4
@@ -216,7 +216,7 @@ def rms_norm(
     rows = x.numel() // width
     if rows == 0:
         return
-    block, warps = _launch(width)
+    block, warps = row_launch(width)
     x_shape, x_strides = row_axes(x)
     out_shape, out_strides = row_axes(out)
     _rms_norm_kernel[(rows,)](
@@ -250,7 +250,7 @@ def add_rms_norm(
     rows = x.numel() // width
     if rows == 0:
         return
-    block, warps = _launch(width)
+    block, warps = row_launch(width)
     _add_rms_norm_kernel[(rows,)](
         x,
         residual,

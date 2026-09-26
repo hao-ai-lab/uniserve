@@ -117,6 +117,93 @@ def add_rms_norm(
     return result(normalized, out[0]), result(summed.to(x.dtype), out[1])
 
 
+def sandwich_rms_norm(
+    residual: torch.Tensor,
+    updates: tuple[tuple[torch.Tensor, torch.Tensor | None], ...],
+    weight: torch.Tensor,
+    *,
+    eps: float,
+    scale: torch.Tensor | None = None,
+    norms: tuple[tuple, ...] = (),
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    """Add post-normalized sublayer outputs to a residual stream.
+
+    Sandwich normalization, as the Gemma layers apply it around each
+    sublayer. Each ``(update, branch_weight)`` pair contributes
+    ``rms_norm(update, branch_weight)``, or ``update`` itself when the
+    weight is ``None``; the contributions sum left to right. Then::
+
+        stream = residual + rms_norm(summed, weight)
+        stream = stream * scale                      # when scale is given
+
+    Each entry ``(norm_weight, *factors)`` of ``norms`` also returns
+    ``rms_norm(stream, norm_weight)`` multiplied by its factors in order
+    (vectors over the width or numbers); a ``None`` weight normalizes
+    without one. Every step rounds to the residual dtype exactly as that
+    tensor expression does, and each normalization accumulates in FP32; all
+    normalizations share ``eps``. Returns the stream and the tuple of
+    normalizations. Inputs are not modified. On CUDA one launch evaluates
+    the whole expression and its results are bit-identical to the
+    :func:`rms_norm` launches and tensor operations it replaces.
+    """
+    from uniserve_kernels.norm import sandwich
+
+    if not updates or any(
+        update.shape != residual.shape for update, _ in updates
+    ):
+        raise ValueError("sandwich updates must match the residual rows")
+    for vector in (
+        weight,
+        *(branch for _, branch in updates if branch is not None),
+        *(norm[0] for norm in norms if norm[0] is not None),
+    ):
+        if vector.shape != residual.shape[-1:] or vector.device != (
+            residual.device
+        ):
+            raise ValueError(
+                "normalization weights must match the final width and device"
+            )
+
+    if residual.is_cuda:
+        require_kernel(
+            "sandwich_rms_norm",
+            sandwich.unsupported(residual, updates, weight, scale, norms),
+            residual=residual,
+            **{f"update{i}": update for i, (update, _) in enumerate(updates)},
+            scale=scale,
+        )
+        stream = torch.empty_like(residual)
+        outputs = tuple(torch.empty_like(residual) for _ in norms)
+        sandwich.sandwich(
+            residual, updates, weight, scale, norms, eps, stream, outputs
+        )
+        return stream, outputs
+
+    # The composition that defines the kernel's rounding points.
+    summed = None
+    for update, branch_weight in updates:
+        term = (
+            update
+            if branch_weight is None
+            else rms_norm(update, branch_weight, eps)
+        )
+        summed = term if summed is None else summed + term
+    stream = residual + rms_norm(summed, weight, eps)
+    if scale is not None:
+        stream = stream * scale
+    outputs = []
+    for norm_weight, *factors in norms:
+        value = (
+            _rms(stream, eps).to(stream.dtype)
+            if norm_weight is None
+            else rms_norm(stream, norm_weight, eps)
+        )
+        for factor in factors:
+            value = value * factor
+        outputs.append(value)
+    return stream, tuple(outputs)
+
+
 def _autocast_dtype(value: torch.Tensor) -> torch.dtype:
     """Return the dtype CUDA autocast would produce for ``value``."""
     return (

@@ -1,0 +1,285 @@
+"""Sandwich RMS normalization of a residual stream in one launch.
+
+The Triton kernel here backs ``uniserve.nn.functional.sandwich_rms_norm``,
+which defines the numbers with its portable composition, allocates the
+outputs and raises on CUDA with the reason :func:`unsupported` reports. One
+program owns one contiguous row: it normalizes and sums the updates,
+normalizes the sum, adds it to the residual, applies the optional device
+scale, stores the stream and then every requested normalization of that
+stream. Each stored intermediate of the composition rounds to the row dtype
+at the same point.
+
+Every normalization of a row evaluates exactly as
+``uniserve_kernels.norm.rms.rms_norm`` does on that row: the same
+``x * x`` square sum reduced by ``tl.sum`` over the same power-of-two block
+and warp count, the same compile-time width and epsilon, and
+``x * rsqrt(mean + eps) * weight``. The FP32 reduction order is therefore
+the one of the separate normalizations this launch replaces, and the
+results are bit-identical to the composition of those kernels and the
+tensor operations between them. The scale is read from device memory, so the
+launch synchronizes nothing and CUDA graphs capture it.
+"""
+
+from __future__ import annotations
+
+from numbers import Real
+
+import torch
+
+from uniserve_kernels.norm.rms import MAX_WIDTH, row_launch
+from uniserve_kernels.triton import tl, triton, unsupported_operands
+
+#: Rows are 16-bit floating values.
+ROW_DTYPES = (torch.bfloat16, torch.float16)
+#: Updates summed before the normalization, and normalizations of the stream.
+MAX_UPDATES = 2
+MAX_NORMS = 4
+_VECTOR_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
+
+
+if triton is not None:
+
+    @triton.jit
+    def _normalize(
+        values,
+        weight_ptr,
+        columns,
+        mask,
+        WEIGHTED: tl.constexpr,  # noqa: N803
+        WIDTH: tl.constexpr,  # noqa: N803
+        EPS: tl.constexpr,  # noqa: N803
+    ):
+        """``values * rsqrt(mean(values^2) + EPS) * weight`` in FP32, as
+        ``uniserve_kernels.norm.rms`` evaluates it; unweighted without the
+        unit multiplication (exact either way).
+        """  # noqa: D205
+        var = tl.sum(values * values, axis=0) / WIDTH
+        normalized = values * tl.rsqrt(var + EPS)
+        if WEIGHTED:
+            weight = tl.load(weight_ptr + columns, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            normalized = normalized * weight
+        return normalized
+
+    @triton.jit
+    def _sandwich_kernel(
+        residual_ptr,
+        first_ptr,
+        second_ptr,
+        first_weight_ptr,
+        second_weight_ptr,
+        weight_ptr,
+        scale_ptr,
+        stream_ptr,
+        norm_weights,
+        norm_factors,
+        norm_outputs,
+        WIDTH: tl.constexpr,  # noqa: N803
+        EPS: tl.constexpr,  # noqa: N803
+        BLOCK: tl.constexpr,  # noqa: N803
+        HAS_RESIDUAL: tl.constexpr,  # noqa: N803
+        TWO: tl.constexpr,  # noqa: N803
+        FIRST_NORMALIZED: tl.constexpr,  # noqa: N803
+        SECOND_NORMALIZED: tl.constexpr,  # noqa: N803
+        SCALED: tl.constexpr,  # noqa: N803
+        NORM_WEIGHTED: tl.constexpr,  # noqa: N803
+        NORM_FACTORED: tl.constexpr,  # noqa: N803
+        NORM_SCALARS: tl.constexpr,  # noqa: N803
+    ):
+        """Sandwich-normalize one contiguous row.
+
+        ``NORM_SCALARS[i]`` is the trailing number of normalization ``i``,
+        or ``None``. Every ``.to(dtype)`` marks a rounding point of the
+        composition.
+        """
+        dtype = stream_ptr.dtype.element_ty
+        row = tl.program_id(0).to(tl.int64)
+        columns = tl.arange(0, BLOCK)
+        mask = columns < WIDTH
+        base = row * WIDTH
+
+        update = tl.load(first_ptr + base + columns, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        if FIRST_NORMALIZED:
+            update = _normalize(
+                update, first_weight_ptr, columns, mask, True, WIDTH, EPS
+            )
+            update = update.to(dtype).to(tl.float32)
+        if TWO:
+            term = tl.load(
+                second_ptr + base + columns, mask=mask, other=0.0
+            ).to(tl.float32)
+            if SECOND_NORMALIZED:
+                term = _normalize(
+                    term, second_weight_ptr, columns, mask, True, WIDTH, EPS
+                )
+                term = term.to(dtype).to(tl.float32)
+            update = (update + term).to(dtype).to(tl.float32)
+
+        stream = _normalize(update, weight_ptr, columns, mask, True, WIDTH, EPS)
+        if HAS_RESIDUAL:
+            residual = tl.load(
+                residual_ptr + base + columns, mask=mask, other=0.0
+            ).to(tl.float32)
+            stream = residual + stream.to(dtype).to(tl.float32)
+        stream = stream.to(dtype).to(tl.float32)
+        if SCALED:
+            scale = tl.load(scale_ptr).to(tl.float32)
+            stream = (stream * scale).to(dtype).to(tl.float32)
+        tl.store(stream_ptr + base + columns, stream, mask=mask)
+
+        for n in tl.static_range(len(NORM_WEIGHTED)):
+            value = _normalize(
+                stream,
+                norm_weights[n],
+                columns,
+                mask,
+                NORM_WEIGHTED[n],
+                WIDTH,
+                EPS,
+            )
+            value = value.to(dtype).to(tl.float32)
+            if NORM_FACTORED[n]:
+                factor = tl.load(
+                    norm_factors[n] + columns, mask=mask, other=0.0
+                ).to(tl.float32)
+                value = (value * factor).to(dtype).to(tl.float32)
+            if NORM_SCALARS[n] is not None:
+                value = value * NORM_SCALARS[n]
+            tl.store(norm_outputs[n] + base + columns, value, mask=mask)
+
+
+def _unsupported_vector(vector: torch.Tensor, width: int, device) -> str | None:
+    if vector.device != device:
+        return "a weight or factor resides on another device"
+    if vector.dtype not in _VECTOR_DTYPES:
+        return f"weight or factor dtype {vector.dtype} is not floating"
+    if vector.shape != (width,) or not vector.is_contiguous():
+        return "a weight or factor is not one contiguous row-width vector"
+    return None
+
+
+def unsupported(
+    residual: torch.Tensor,
+    updates: tuple[tuple[torch.Tensor, torch.Tensor | None], ...],
+    weight: torch.Tensor,
+    scale: torch.Tensor | None,
+    norms: tuple[tuple, ...],
+) -> str | None:
+    """Return why the kernel cannot take a sandwich call, or ``None``.
+
+    ``residual`` and every update are contiguous CUDA rows of one BF16 or
+    FP16 dtype and shape, at most :data:`MAX_WIDTH` wide. Weights and
+    vector factors are contiguous FP32, BF16 or FP16 ``[width]`` vectors (a
+    normalization weight may be ``None``: unweighted), ``scale`` holds one
+    floating value, and each normalization's factors are at most one vector
+    followed by at most one Python number.
+    """
+    rows = (residual, *(update for update, _ in updates))
+    reason = unsupported_operands(
+        *rows, weight, scale, *(w for _, w in updates)
+    )
+    if reason is not None:
+        return reason
+    if residual.dtype not in ROW_DTYPES:
+        return f"row dtype {residual.dtype} is not bfloat16 or float16"
+    width = int(residual.shape[-1]) if residual.ndim else 0
+    if not 0 < width <= MAX_WIDTH:
+        return f"row width {width} is outside 1..{MAX_WIDTH}"
+    if not 0 < len(updates) <= MAX_UPDATES or len(norms) > MAX_NORMS:
+        return (
+            f"the kernel sums 1..{MAX_UPDATES} updates and stores at most "
+            f"{MAX_NORMS} normalizations"
+        )
+    for row in rows:
+        if row.dtype != residual.dtype or row.shape != residual.shape:
+            return "updates do not match the residual rows"
+        if not row.is_contiguous():
+            return "rows are not contiguous"
+    vectors = [weight, *(w for _, w in updates if w is not None)]
+    for norm in norms:
+        if norm[0] is not None:
+            vectors.append(norm[0])
+        factors = norm[1:]
+        if factors and isinstance(factors[0], torch.Tensor):
+            vectors.append(factors[0])
+            factors = factors[1:]
+        if len(factors) > 1 or any(
+            not isinstance(factor, Real) for factor in factors
+        ):
+            return (
+                "a normalization's factors must be at most one vector "
+                "followed by at most one number"
+            )
+    for vector in vectors:
+        reason = _unsupported_vector(vector, width, residual.device)
+        if reason is not None:
+            return reason
+    if scale is not None and (
+        scale.numel() != 1 or scale.dtype not in _VECTOR_DTYPES
+    ):
+        return "the scale is not one floating value"
+    return None
+
+
+def sandwich(
+    residual: torch.Tensor,
+    updates: tuple[tuple[torch.Tensor, torch.Tensor | None], ...],
+    weight: torch.Tensor,
+    scale: torch.Tensor | None,
+    norms: tuple[tuple, ...],
+    eps: float,
+    stream: torch.Tensor,
+    outputs: tuple[torch.Tensor, ...],
+) -> None:
+    """Store the stream and its normalizations into caller outputs.
+
+    ``stream`` and each of ``outputs`` (one per normalization) are
+    contiguous rows like ``residual``, overlapping no operand. Callers first
+    check :func:`unsupported`.
+    """
+    width = int(residual.shape[-1])
+    rows = residual.numel() // width
+    if rows == 0:
+        return
+    weights, factors, scalars = [], [], []
+    for norm in norms:
+        rest = norm[1:]
+        vector = rest[0] if rest and isinstance(rest[0], torch.Tensor) else None
+        rest = rest[1:] if vector is not None else rest
+        weights.append(norm[0])
+        factors.append(vector)
+        scalars.append(float(rest[0]) if rest else None)
+    # The block and warp count of the rms row kernel give every
+    # normalization its reduction layout, hence its FP32 order.
+    block, warps = row_launch(width)
+    first, first_weight = updates[0]
+    second, second_weight = updates[1] if len(updates) == 2 else (first, None)
+    # Absent pointers stand in as the stream; the kernel never reads them.
+    _sandwich_kernel[(rows,)](
+        residual,
+        first,
+        second,
+        stream if first_weight is None else first_weight,
+        stream if second_weight is None else second_weight,
+        weight,
+        stream if scale is None else scale,
+        stream,
+        tuple(stream if w is None else w for w in weights),
+        tuple(stream if f is None else f for f in factors),
+        tuple(outputs),
+        width,
+        float(eps),
+        block,
+        True,
+        len(updates) == 2,
+        first_weight is not None,
+        second_weight is not None,
+        scale is not None,
+        tuple(w is not None for w in weights),
+        tuple(f is not None for f in factors),
+        tuple(scalars),
+        num_warps=warps,
+    )
