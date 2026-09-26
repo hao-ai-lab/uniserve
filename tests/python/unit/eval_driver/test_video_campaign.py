@@ -133,6 +133,46 @@ def test_each_duration_uses_ties_to_even_and_native_alignment():
 
 
 @pytest.mark.parametrize(
+    "frames,audio_samples,valid",
+    [
+        # One frame short with full-length audio, as FastVideo returns 15 s.
+        (361, 483328, True),
+        (363, 483328, True),
+        (360, 483328, False),
+        # Audio truncated to the short video exceeds one frame period.
+        (361, round(360 / 24 * 32000), False),
+    ],
+)
+def test_media_length_tolerates_one_frame_around_the_aligned_duration(
+    frames, audio_samples, valid
+):
+    video = DecodedVideo(
+        data=b"",
+        sha256="",
+        byte_size=0,
+        mime="video/mp4",
+        width=1344,
+        height=768,
+        frame_count=frames,
+        fps_numerator=24,
+        fps_denominator=1,
+        video_codec="h264",
+        audio_codec="aac",
+        audio_channels=2,
+        audio_sample_rate=32000,
+        audio_samples=audio_samples,
+        sample_filename="sample.mp4",
+        video_variance=1,
+        audio_rms=0.1,
+    )
+    record = RequestRecord(
+        request_id="15", task="video", requested_seconds=15, decoded_video=video
+    )
+
+    assert VideoTask(point()).validate_output([record]).valid is valid
+
+
+@pytest.mark.parametrize(
     "backend,endpoint",
     [
         ("uniserve", VIDEOS_SYNC),
