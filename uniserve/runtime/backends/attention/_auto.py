@@ -1,16 +1,24 @@
 """Select native attention by representation and input.
 
-Select native attention from the actual representation and numerical input.
+On CUDA, automatic selection chooses only native kernels:
 
-History-windowed attention and head dimension 512 have complete native
-coverage on SM100: TensorRT-LLM context kernels evaluate causal paged rows,
-and the prefix-block kernel evaluates non-causal paged blocks and segmented
-prefix reads. On CUDA, FlashInfer, the FlashAttention-2 library and the
-portable torch provider therefore never stand in for these calls: a call no
-native kernel serves raises when its layer is prepared or bound, naming the
-call's path, shape, dtype and mask semantics. The one exception is FP32
-single-head dense attention of head dimension 512, which no native kernel
-computes and the portable provider evaluates (``_portable``).
+- the TensorRT-LLM (trtllm-gen) paged kernels and UniServe's prefix-block
+  kernel on SM100, for causal and non-causal paged rows and for segmented
+  prefix reads whose queries see their whole current block;
+- FlashAttention-4 on SM90 and the SM100 family, for dense, variable-length,
+  visible-endpoint and segmented inputs and for paged rows without a history
+  window. Its SM100 head-dimension-256 kernel accepts neither per-sequence key
+  lengths nor mask functions, so it serves only dense and variable-length
+  inputs of that width;
+- SGLang's FlashAttention-3 build on SM90.
+
+A call no native kernel serves raises when its layer is prepared or bound,
+naming the call's path, shape, dtype and mask semantics. FlashInfer's own
+attention kernels, the FlashAttention-2 library and the portable torch
+provider remain selectable by name but never stand in for a native kernel.
+The one CUDA call class the portable provider serves is FP32 single-head
+dense attention of head dimension 512, which no native kernel computes
+(``_portable``). Off CUDA the portable provider serves every call.
 """
 
 from dataclasses import replace
@@ -35,10 +43,6 @@ from . import CachePages
 from . import Operator as _Operator
 from ._sequences import causal_runs
 
-# Providers that substitute for missing native coverage. They serve only
-# calls outside the natively covered classes (see ``_native_only``).
-_FALLBACKS = frozenset({"flash_attn", "flashinfer", "torch"})
-
 
 def _available(module, names):
     try:
@@ -46,16 +50,6 @@ def _available(module, names):
     except (ImportError, OSError):
         return False
     return all(callable(getattr(library, name, None)) for name in names)
-
-
-def _native_only(device, head_dim, window):
-    """Whether only native kernels may serve a layer's calls on ``device``.
-
-    Windowed history and head dimension 512 are the call classes whose
-    native coverage is complete; the fallbacks remain candidates for the
-    others.
-    """
-    return device.type == "cuda" and (window is not None or head_dim == 512)
 
 
 def _portable(*, num_heads, num_kv_heads, head_dim, dtype, pages, window):
@@ -66,7 +60,8 @@ def _portable(*, num_heads, num_kv_heads, head_dim, dtype, pages, window):
     window, the spatial self-attention of FP32 image autoencoders: the
     TensorRT-LLM and FlashAttention-4 kernels compute in half precision, and
     neither serves head dimension 512 on dense inputs. The portable torch
-    provider evaluates these calls.
+    provider evaluates its non-causal unmasked dense calls; every other call
+    of such a layer is rejected like any call without a native kernel.
     """
     return (
         dtype == torch.float32
@@ -100,6 +95,49 @@ def _layer(*, num_heads, num_kv_heads, head_dim, dtype, cache, window):
     )
 
 
+def _causality(flags):
+    if all(flags):
+        return "causal rows"
+    if not any(flags):
+        return "non-causal rows"
+    return "mixed causal and non-causal rows"
+
+
+def _input_class(batch):
+    """Return an input's ``(path, mask semantics)``.
+
+    Provider choice depends on these properties and the layer, never on
+    lengths, so together they name every call one choice applies to.
+    """
+    if isinstance(batch, DenseInput):
+        path = "dense attention"
+        mask = "causal" if batch.causal else "non-causal"
+        if batch.mask is not None:
+            mask += " with an explicit mask"
+    elif isinstance(batch, PagedInput):
+        path, mask = "paged attention", _causality(batch.causal)
+    elif isinstance(batch, VarlenInput):
+        path, mask = "variable-length attention", _causality(batch.causal)
+    elif isinstance(batch, SegmentedInput):
+        path = "segmented prefix read"
+        mask = (
+            "every current key visible"
+            if batch.fully_visible_current
+            else "per-query current key endpoints"
+        )
+    else:
+        path = "visible-endpoint attention"
+        mask = (
+            "every key visible"
+            if batch.fully_visible
+            else "per-query key endpoints"
+        )
+    table = getattr(batch, "block_table", None)
+    if table is not None and table.start_page is not None:
+        mask += " over block tables starting after retired pages"
+    return path, mask
+
+
 def _paged_calls(page_tokens):
     """Return one-row samples of every paged call a cache layer receives.
 
@@ -123,43 +161,31 @@ def _paged_calls(page_tokens):
     )
 
 
-def _causality(flags):
-    if all(flags):
-        return "causal rows"
-    if not any(flags):
-        return "non-causal rows"
-    return "mixed causal and non-causal rows"
-
-
-def _names(batch, *, head_dim, window, architecture, ndim=None):
+def _names(batch, *, head_dim, window, architecture):
     """Name the providers that may read ``batch``, most preferred first.
 
-    ``head_dim``, ``window`` and ``architecture`` describe the layer and
-    the device; a provider must also be available for the layer to serve
-    the call.
+    ``head_dim``, ``window`` and ``architecture`` (the CUDA major compute
+    capability, or None off CUDA) describe the layer and the device; a
+    provider must also be available for the layer to serve the call. Off
+    CUDA the portable provider serves every call.
     """
-    if isinstance(batch, DenseInput) and batch.mask is not None:
+    if architecture is None:
         return ("torch",)
-    if isinstance(batch, DenseInput) and ndim == 4:
-        # Keep the explicit batch in one native invocation. FlashInfer's
-        # single-prefill path otherwise serializes its individual samples.
-        return (
-            "sgl_kernel",
-            "flash_attn",
-            "flash_attn_4",
-            "flashinfer",
-            "torch",
-        )
+
+    if isinstance(batch, DenseInput):
+        if batch.mask is not None:
+            # No native kernel consumes an arbitrary dense mask.
+            return ()
+        # The portable provider is a candidate only of the FP32
+        # single-head layer class (``_portable``), whose non-causal calls
+        # it evaluates.
+        portable = () if batch.causal else ("torch",)
+        return ("sgl_kernel", "flash_attn_4", *portable)
     if isinstance(batch, VarlenInput):
         # Packed Q/K/V need no cache plan. Native varlen kernels consume
         # offsets directly without reserving paged split-KV intermediates.
-        return (
-            "sgl_kernel",
-            "flash_attn",
-            "flash_attn_4",
-            "flashinfer",
-            "torch",
-        )
+        return ("sgl_kernel", "flash_attn_4")
+
     # The SM100 head-dimension-256 FA4 kernel accepts neither per-sequence
     # key lengths nor mask functions, which paged, visible and segmented
     # inputs require.
@@ -172,43 +198,29 @@ def _names(batch, *, head_dim, window, architecture, ndim=None):
             if isinstance(batch, SegmentedInput) and batch.fully_visible_current
             else ()
         )
-        # Device-visible endpoints are captured directly by FA4. This
-        # retains the packed-attention preference for native mask kernels.
+        # FA4 captures device-visible endpoints directly.
         fa4 = (
             ("flash_attn_4",)
             if architecture in (9, 10, 11) and fa4_indexed
             else ()
         )
-        return (*block, *fa4, "flashinfer", "torch")
+        return (*block, *fa4)
     if isinstance(batch, PagedInput):
-        block_size = batch.block_table.block_size
-        ordinary = ("sgl_kernel", "flash_attn") if block_size % 256 == 0 else ()
-        fa4 = (
-            ("flash_attn_4",)
-            if architecture not in (8, 12) and fa4_indexed
-            else ()
-        )
         # Non-causal blocks read their own keys and a prefix window with
         # the prefix-block kernel. TensorRT-LLM context kernels bound a
         # history window only along the causal diagonal.
         block = ("prefix_block",) if not any(batch.causal) else ()
         trtllm = ("trtllm",) if window is None or all(batch.causal) else ()
-        return (
-            *block,
-            *trtllm,
-            *ordinary[:1],
-            "flashinfer",
-            *ordinary[1:],
-            *fa4,
-            "torch",
+        ordinary = (
+            ("sgl_kernel",) if batch.block_table.block_size % 256 == 0 else ()
         )
-    return (
-        "sgl_kernel",
-        "flashinfer",
-        "flash_attn",
-        "flash_attn_4",
-        "torch",
-    )
+        fa4 = (
+            ("flash_attn_4",)
+            if architecture not in (8, 12) and fa4_indexed
+            else ()
+        )
+        return (*block, *trtllm, *ordinary, *fa4)
+    return ()
 
 
 class _Automatic(_Operator):
@@ -218,6 +230,8 @@ class _Automatic(_Operator):
     input. A paged batch whose causal and non-causal rows prefer different
     providers is evaluated as its contiguous runs of equal causality, each
     by its own provider, after the batch's cache write commits once.
+    ``architecture`` is the CUDA major compute capability, or ``None`` off
+    CUDA, where the portable provider serves every input.
     """
 
     # Retired-page tables reach only providers that read them.
@@ -231,7 +245,7 @@ class _Automatic(_Operator):
         self._operators = {}
         self._arguments = kwargs
 
-    def _name(self, batch, *, ndim=None):
+    def _name(self, batch):
         """Return the first available provider reading ``batch``, or None."""
         # A table with retired window pages is read only by providers that
         # consume its start pages; no other provider may substitute for one.
@@ -245,7 +259,6 @@ class _Automatic(_Operator):
                     head_dim=self.head_dim,
                     window=self.window,
                     architecture=self._architecture,
-                    ndim=ndim,
                 )
                 if name in self._providers
                 and (
@@ -274,40 +287,12 @@ class _Automatic(_Operator):
 
     def _describe(self, batch):
         """Name a call's path, shape, dtype and mask semantics."""
-        if isinstance(batch, DenseInput):
-            path = "dense attention"
-            mask = "causal" if batch.causal else "non-causal"
-            if batch.mask is not None:
-                mask += " with an explicit mask"
-        else:
-            if isinstance(batch, PagedInput):
-                path, mask = "paged attention", _causality(batch.causal)
-            elif isinstance(batch, VarlenInput):
-                path, mask = (
-                    "variable-length attention",
-                    _causality(batch.causal),
-                )
-            elif isinstance(batch, SegmentedInput):
-                path = "segmented prefix read"
-                mask = (
-                    "every current key visible"
-                    if batch.fully_visible_current
-                    else "per-query current key endpoints"
-                )
-            else:
-                path = "visible-endpoint attention"
-                mask = (
-                    "every key visible"
-                    if batch.fully_visible
-                    else "per-query key endpoints"
-                )
+        path, mask = _input_class(batch)
+        if not isinstance(batch, DenseInput):
             tokens = batch.queries.num_tokens
             path += f" of {batch.queries.batch_size} rows" + (
                 "" if tokens is None else f" and {tokens} query tokens"
             )
-        table = getattr(batch, "block_table", None)
-        if table is not None and table.start_page is not None:
-            mask += " over block tables starting after retired pages"
         layer = _layer(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -321,16 +306,16 @@ class _Automatic(_Operator):
             f"available providers: {', '.join(sorted(self._providers))}"
         )
 
-    def _operator(self, batch, *, ndim=None):
-        name = self._name(batch, ndim=ndim)
+    def _operator(self, batch):
+        name = self._name(batch)
         if name is None:
             raise ValueError(
-                f"no available attention kernel serves {self._describe(batch)}"
+                f"no native attention kernel serves {self._describe(batch)}"
             )
 
         if name not in self._operators:
             # Workspace buffers are namespaced per provider; the shared
-            # FlashInfer scratch grant keeps its plain name for TensorRT-LLM.
+            # scratch grant keeps its plain name.
             arguments = dict(self._arguments)
             arguments["workspace"] = {
                 key: self.workspace[
@@ -367,9 +352,7 @@ class _Automatic(_Operator):
 
     def __call__(self, q, k, v, batch, *, scale, out):
         if not self._runs(batch):
-            return self._operator(batch, ndim=q.ndim)(
-                q, k, v, batch, scale=scale, out=out
-            )
+            return self._operator(batch)(q, k, v, batch, scale=scale, out=out)
 
         self._validate(q, k, v, batch, out)
         if q.ndim != 3 or k.ndim != 3:
@@ -402,7 +385,9 @@ class _Automatic(_Operator):
 class Backend(_Backend):
     """Provider factory probing installed native libraries.
 
-    Provider factory probing the native libraries installed for this device.
+    ``flashinfer``, a configured FlashInfer provider, sizes the scratch grant
+    of the TensorRT-LLM kernels that ship with FlashInfer; FlashInfer's own
+    attention kernels are not candidates.
     """
 
     def __init__(self, device, *, flashinfer=None):
@@ -412,69 +397,56 @@ class Backend(_Backend):
             if device.type == "cuda"
             else None
         )
-        self._factories = {
-            "torch": import_module(f"{__package__}.torch").Backend()
-        }
+        # The portable provider serves every call off CUDA and, on CUDA, the
+        # one call class no native kernel computes (``_portable``).
+        self._portable = import_module(f"{__package__}.torch").Backend()
+        self._native = {}
         if device.type != "cuda":
             self.name = f"auto:{device.type}:torch"
             return
 
         # Probe each native library's entry points; uninstalled or incomplete
         # builds never become selection candidates.
-        libraries = {
-            "sgl_kernel": (
-                "sgl_kernel.flash_attn",
-                ("flash_attn_varlen_func", "flash_attn_with_kvcache"),
-            ),
-            "flashinfer": (
-                "flashinfer",
-                (
-                    "BatchPrefillWithPagedKVCacheWrapper",
-                    "BatchDecodeWithPagedKVCacheWrapper",
-                ),
-            ),
-            "flash_attn": (
-                "flash_attn",
-                (
-                    "flash_attn_func",
-                    "flash_attn_varlen_func",
-                    "flash_attn_with_kvcache",
-                ),
-            ),
-        }
-        for name, (module, functions) in libraries.items():
-            if name == "sgl_kernel" and self._architecture != 9:
-                continue
-            if _available(module, functions):
-                self._factories[name] = (
-                    flashinfer
-                    if name == "flashinfer" and flashinfer is not None
-                    else import_module(f"{__package__}.{name}").Backend()
+        if self._architecture == 9 and _available(
+            "sgl_kernel.flash_attn",
+            ("flash_attn_varlen_func", "flash_attn_with_kvcache"),
+        ):
+            self._native["sgl_kernel"] = import_module(
+                f"{__package__}.sgl_kernel"
+            ).Backend()
+        if (
+            self._architecture == 10
+            and _available(
+                "flashinfer.decode", ("trtllm_batch_decode_with_kv_cache",)
+            )
+            and _available(
+                "flashinfer.prefill", ("trtllm_batch_context_with_kv_cache",)
+            )
+        ):
+            trtllm = import_module(f"{__package__}.trtllm")
+            self._native["trtllm"] = (
+                trtllm.Backend()
+                if flashinfer is None
+                else trtllm.Backend(
+                    workspace_size=flashinfer.config.workspace_size
                 )
-        if self._architecture == 10 and "flashinfer" in self._factories:
-            self._factories["trtllm"] = import_module(
-                f"{__package__}.trtllm"
-            ).Backend(
-                workspace_size=self._factories[
-                    "flashinfer"
-                ].config.workspace_size
             )
         from uniserve_kernels.attention import prefix_block
 
         if prefix_block.available(device):
-            self._factories["prefix_block"] = import_module(
+            self._native["prefix_block"] = import_module(
                 f"{__package__}.prefix_block"
             ).Backend()
         from .flash_attn_4 import available
 
         if available():
-            self._factories["flash_attn_4"] = import_module(
+            self._native["flash_attn_4"] = import_module(
                 f"{__package__}.flash_attn_4"
             ).Backend()
 
         # Replacement compatibility includes the resolved provider policy.
         self.name = f"auto:sm{self._architecture}:" + ",".join(
-            sorted(self._factories)
+            sorted(self._native)
         )
 
     def _providers(
@@ -485,36 +457,33 @@ class Backend(_Backend):
         ``pages`` describes the layer's paged prefix cache, or is None for
         a layer without one.
         """
-        from .prefix_block import unsupported
-
-        native_only = _native_only(
-            self.device, head_dim, window
-        ) and not _portable(
+        if self.device.type != "cuda" or _portable(
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             dtype=dtype,
             pages=pages,
             window=window,
-        )
+        ):
+            return {"torch": self._portable}
 
         # Native kernels require half precision and unquantized cache state.
         if dtype not in {torch.float16, torch.bfloat16} or (
             pages is not None and pages.quantized
         ):
-            return {} if native_only else {"torch": self._factories["torch"]}
+            return {}
+
+        from .prefix_block import unsupported
 
         # Restrict candidates to each kernel's head-dimension, cache-block and
         # history-window constraints. The pinned SM100 TensorRT-LLM cubins
         # specialize head dimension 512 context kernels only for causal and
         # dense masks over 16-, 32- and 64-token pages; FlashAttention
-        # providers do not take UniServe's history windows.
+        # kernels do not take UniServe's history windows.
         return {
             name: backend
-            for name, backend in self._factories.items()
-            if not (native_only and name in _FALLBACKS)
-            and (name != "flashinfer" or head_dim in {64, 128, 256, 512})
-            and (
+            for name, backend in self._native.items()
+            if (
                 name != "trtllm"
                 or head_dim in {64, 128, 256}
                 or (
@@ -535,13 +504,14 @@ class Backend(_Backend):
                 )
                 is None
             )
+            and (window is None or name not in {"sgl_kernel", "flash_attn_4"})
             and (
-                window is None
-                or name not in {"sgl_kernel", "flash_attn", "flash_attn_4"}
-            )
-            and (
-                name not in {"sgl_kernel", "flash_attn"}
-                or (head_dim <= 256 and head_dim % 8 == 0)
+                name != "sgl_kernel"
+                or (
+                    head_dim <= 256
+                    and head_dim % 8 == 0
+                    and (pages is None or pages.page_tokens % 256 == 0)
+                )
             )
             and (
                 name != "flash_attn_4"
@@ -553,11 +523,6 @@ class Backend(_Backend):
                         or (self._architecture == 9 and head_dim <= 256)
                     )
                 )
-            )
-            and (
-                name not in {"sgl_kernel", "flash_attn"}
-                or pages is None
-                or pages.page_tokens % 256 == 0
             )
         }
 

@@ -149,7 +149,7 @@ curl -s http://127.0.0.1:8000/v1/systemone \
 | `--max-running-requests` | `128` | Scheduler active-request bound |
 | `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget |
 | `--chunked-prefill-size` | `8192` | Per-request prefill bound |
-| `--attention-backend` | `auto` | Worker attention provider selection |
+| `--attention-backend` | `auto` | Worker attention provider: `auto` selects a native kernel for each attention call on the GPU and rejects, with an error naming its shape, dtype and mask, any call no native kernel serves; a provider name (`trtllm`, `flash_attn_4`, `flashinfer`, `torch`, ...) serves every call with that provider |
 | `--api-key` | Unset | Bearer token for public routes |
 | `--request-timeout` | Unset | Seconds until a response head is sent; streamed bodies (chat SSE and video downloads) are not bounded |
 | `--max-concurrent-requests` | Unset | In-flight bound for chat completion, image generation, and System One requests (503 above it); video requests share the video job slots instead |
