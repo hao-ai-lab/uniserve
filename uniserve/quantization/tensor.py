@@ -312,10 +312,13 @@ class _NVFP4Tensor(QuantizedTensor):
         scales = _linear_scales(
             self._buffers["block_scale"], rows, width // 16, self.scale_layout
         )
-        scales = (
-            scales.view(torch.float8_e4m3fn).float()
-            * self._buffers["tensor_scale"]
-        )
+        # One tensor scale, or one per leading expert of a stacked tensor.
+        tensor_scale = self._buffers["tensor_scale"]
+        if tensor_scale.ndim:
+            tensor_scale = tensor_scale.repeat_interleave(
+                rows // tensor_scale.numel()
+            ).unsqueeze(-1)
+        scales = scales.view(torch.float8_e4m3fn).float() * tensor_scale
         return (
             values.reshape(rows, width // 16, 16) * scales.unsqueeze(-1)
         ).reshape(self.shape)

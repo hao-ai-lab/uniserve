@@ -28,6 +28,7 @@ from uniserve.nn.linear import (
     Linear,
     MergedColumnParallelLinear,
 )
+from uniserve.nn.moe import FusedMoE
 from uniserve.runtime._collectives import GatherPool
 from uniserve.runtime.communication import stream_collective_scope
 from uniserve.tensors import BufferConfig
@@ -35,6 +36,7 @@ from uniserve.tensors import BufferConfig
 from .bindings import capturing
 from .bindings.attention import AttentionBinding, ExchangeBuffers
 from .bindings.matmul import MatmulBinding
+from .bindings.moe import MoEBinding
 from .bindings.vsa import VsaBinding
 from .resources import streams_idle
 from .stream import CUDAStream
@@ -152,6 +154,7 @@ class ExecutionContext(Generic[SizeT]):
         attention="auto",
         vsa="auto",
         matmul="auto",
+        moe="auto",
         groups=None,
         scratch: Scratch | None = None,
     ):
@@ -166,6 +169,7 @@ class ExecutionContext(Generic[SizeT]):
             vsa,
             matmul,
         )
+        self._moe_backend = moe
 
         reference: torch.Tensor | None = next(
             (value for value in module.parameters() if not value.is_meta), None
@@ -205,6 +209,7 @@ class ExecutionContext(Generic[SizeT]):
         self._merged: dict[int | _binding.MergedKey, MatmulBinding] = {}
         self._attention: dict[int, AttentionBinding] = {}
         self._vsa: dict[int, VsaBinding] = {}
+        self._moe: dict[int, MoEBinding] = {}
         self._vsa_output: dict[ParallelAttention, OutputBuffers] = {}
         self._vsa_context: dict[ParallelAttention, AttentionBuffers] = {}
         self._context_backing: dict[tuple[object, ...], AttentionBuffers] = {}
@@ -269,6 +274,12 @@ class ExecutionContext(Generic[SizeT]):
                 "attention", {"scratch": shared}, device
             )["scratch"]
         return views
+
+    def _moe_workspace(self, requirements, device):
+        # Grouped-expert kernels consume their work areas within one call and
+        # write the combined output before returning, so every expert layer
+        # on this serialized context shares one backing.
+        return self.scratch("moe", requirements, device)
 
     def _vsa_buffers(self, slot, requirements, device):
         # Two projection slots permit one layer's output consumption to overlap
@@ -520,6 +531,18 @@ class ExecutionContext(Generic[SizeT]):
                             with pool.borrow(amount, device):
                                 pass
 
+                if isinstance(child, FusedMoE):
+                    moe_binding = MoEBinding(
+                        child,
+                        self._moe_backend,
+                        size if isinstance(size, TextSize) else None,
+                        device,
+                        self._moe_workspace,
+                    )
+                    self._moe[id(child)] = moe_binding
+                    if isinstance(size, TextSize):
+                        moe_binding.prepare(size)
+
                 if isinstance(child, BlockAttention):
                     self._vsa[id(child)] = VsaBinding(
                         self._vsa_backend,
@@ -680,6 +703,7 @@ class ExecutionContext(Generic[SizeT]):
             _install(scope, _binding.merged_matmul, self._merged)
             _install(scope, _binding.attention, self._attention)
             _install(scope, _binding.vsa, self._vsa)
+            _install(scope, _binding.moe, self._moe)
             _install(scope, _binding.attention_storage, self._exchange)
             _install(scope, _binding.linear_chunks, self._chunks)
             yield
@@ -695,6 +719,7 @@ class ExecutionContext(Generic[SizeT]):
             close_resources(
                 *(binding.close for binding in self._attention.values()),
                 *(binding.close for binding in self._vsa.values()),
+                *(binding.close for binding in self._moe.values()),
                 *(
                     allocation.close
                     for allocation in reversed(self._allocations)
@@ -712,6 +737,7 @@ class ExecutionContext(Generic[SizeT]):
                 self._merged,
                 self._attention,
                 self._vsa,
+                self._moe,
                 self._vsa_output,
                 self._vsa_context,
                 self._context_backing,

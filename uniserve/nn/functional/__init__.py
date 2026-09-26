@@ -18,6 +18,7 @@ from ._activation import (
 )
 from ._attention import attention
 from ._linear import linear, merged_linear
+from ._moe import fused_moe
 from ._norm import (
     add_rms_norm,
     gated_residual,
@@ -43,6 +44,7 @@ __all__ = [
     "gated_residual",
     "gated_residual_rms_norm",
     "gated_residual_rms_norm_fp8",
+    "fused_moe",
     "gelu_and_mul",
     "linear",
     "merged_linear",

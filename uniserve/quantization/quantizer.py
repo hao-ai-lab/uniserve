@@ -437,6 +437,45 @@ class Quantizer:
             "tensor_scale": tensor_scale,
         }
 
+    def round_trip(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode ``x`` with this quantizer's static scale and decode it again.
+
+        The portable reference for kernels that consume calibrated NVFP4
+        activations: each K16 block takes an E4M3 scale of its amax over
+        ``6 * calibrated_scale``, and each value rounds to the nearest E2M1
+        code, ties to even. Runs on any device and returns ``x``'s dtype.
+
+        Raises:
+            ValueError: This quantizer is not calibrated NVFP4.
+        """
+        if self.format != "nvfp4" or self.calibrated_scale is None:
+            raise ValueError("round trips require calibrated NVFP4 encoding")
+        self._shape(tuple(x.shape), x.dtype)
+        tensor_scale = self.calibrated_scale
+        blocks = x.float().reshape(*x.shape[:-1], -1, 16)
+        block_scale = (
+            (blocks.abs().amax(dim=-1) / (6.0 * tensor_scale))
+            .clamp(max=448.0)
+            .to(torch.float8_e4m3fn)
+            .float()
+        )
+        scale = block_scale.unsqueeze(-1) * tensor_scale
+        normalized = blocks / torch.where(scale == 0, 1.0, scale)
+        # Midpoints between adjacent E2M1 magnitudes 0, .5, 1, 1.5, 2, 3, 4, 6.
+        boundaries = torch.tensor(
+            (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0), device=x.device
+        )
+        magnitude = normalized.abs().contiguous()
+        code = torch.bucketize(magnitude, boundaries)
+        # A value exactly on a midpoint rounds to the even (lower) code.
+        boundary = boundaries[code.clamp(max=6)]
+        code += ((magnitude == boundary) & (code.remainder(2) == 1)).long()
+        table = torch.tensor(
+            (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0), device=x.device
+        )
+        decoded = table[code] * normalized.sign() * scale
+        return decoded.reshape(x.shape).to(x.dtype)
+
     def empty(
         self,
         shape: tuple[int, ...],
@@ -554,11 +593,17 @@ class Quantizer:
                     "block scale shape, dtype or strides disagree with its "
                     "physical layout"
                 )
+            # A stacked expert tensor [E, rows, K] may carry one tensor
+            # scale per expert, the leading axis; others carry one scalar.
             if block == 16 and (
                 tensors["tensor_scale"].dtype != torch.float32
-                or tensors["tensor_scale"].shape != ()
+                or tensors["tensor_scale"].shape
+                not in {(), *(((shape[0],),) if len(shape) == 3 else ())}
             ):
-                raise ValueError("NVFP4 tensor scale must be an FP32 scalar")
+                raise ValueError(
+                    "NVFP4 tensor scale must be an FP32 scalar or one value "
+                    "per leading expert of a stacked tensor"
+                )
             cls = _MXFP8Tensor if block == 32 else _NVFP4Tensor
 
         return cls(

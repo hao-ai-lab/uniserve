@@ -52,6 +52,8 @@ class Config:
     num_experts: int
     num_experts_per_tok: int
     moe_intermediate_size: int
+    # Whether the selected experts' softmax weights renormalize to one.
+    norm_topk_prob: bool
 
     def __post_init__(self) -> None:
         for name in (
@@ -102,7 +104,7 @@ class Config:
             ):
                 raise ValueError(f"Qwen3 {name} must be finite and positive")
 
-        for name in ("attention_bias", "tie_word_embeddings"):
+        for name in ("attention_bias", "tie_word_embeddings", "norm_topk_prob"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"Qwen3 {name} must be boolean")
 
@@ -239,7 +241,27 @@ def read_config(
         hidden_size // num_attention_heads,
         minimum=1,
     )
+    # Transformers 5 serializes the expert count as num_local_experts;
+    # released Qwen3-MoE checkpoints name it num_experts.
+    if "num_local_experts" in config:
+        if (
+            "num_experts" in config
+            and config["num_experts"] != config["num_local_experts"]
+        ):
+            raise ValueError(
+                "Qwen3 checkpoint has conflicting expert-count aliases"
+            )
+        config["num_experts"] = config["num_local_experts"]
     num_experts = _optional_int(config, "num_experts", 0, minimum=0)
+    # Every layer holds experts; interleaved dense layers are not modeled.
+    if num_experts and (
+        config.get("mlp_only_layers", [])
+        or config.get("decoder_sparse_step", 1) != 1
+    ):
+        raise ValueError(
+            "Qwen3 MoE requires experts in every layer "
+            "(decoder_sparse_step 1, no mlp_only_layers)"
+        )
     num_experts_per_tok = _optional_int(
         config, "num_experts_per_tok", 1, minimum=1
     )
@@ -269,6 +291,8 @@ def read_config(
             intermediate_size,
             minimum=1,
         ),
+        # Transformers' Qwen3-MoE default keeps the raw top-k probabilities.
+        norm_topk_prob=_boolean(config, "norm_topk_prob", False),
     )
     return cfg
 
