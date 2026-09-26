@@ -26,6 +26,7 @@ mod assembly;
 /// Chat request rendering and structured output processing.
 pub mod chat;
 mod diffusion_gemma;
+pub(crate) use self::diffusion_gemma::canvas_sampling;
 mod input;
 /// Image reference resolution shared by every request path that accepts images.
 pub mod media;

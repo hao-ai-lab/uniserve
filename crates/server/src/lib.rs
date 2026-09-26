@@ -146,11 +146,13 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         max_video_seconds: config.engine.max_video_seconds,
         // Video workers provision only the frame counts the API admits.
         min_video_seconds: Some(crate::serving::MIN_VIDEO_SECONDS),
-        // Every generated canvas uses the served sampling, so the worker
-        // keeps exactly the argmax canvases its stability threshold compares.
-        canvas_history_depth: match &model_config.parameters {
-            ModelParameters::DiffusionGemma(profile) => profile.denoising.stability_threshold,
-            _ => 0,
+        // Every generated canvas uses the served sampling, which the worker
+        // sizes its canvas state for and prepares its canvas steps with.
+        canvas_sampling: match &model_config.parameters {
+            ModelParameters::DiffusionGemma(profile) => {
+                Some(crate::serving::canvas_sampling(profile))
+            }
+            _ => None,
         },
         ..config.engine.worker_process.clone()
     };

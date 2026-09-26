@@ -11,8 +11,11 @@ that numerical flow in chunks of at most ``step_rows`` canvases, whose
 sampler scratch (``CanvasWorkspace``) this owner also holds. Slot ``0`` is
 the padding sentinel, as in ``DecodeState``.
 
-The host records the step each slot ran last, so a call that skips or
-repeats a step of its canvas is refused before any device work
+Every canvas uses the one block-diffusion sampling the deployment serves
+(``WorkerConfig.canvas_sampling``): its stability threshold sizes the
+argmax history, and a request that carries other sampling is refused
+(``sampling``). The host records the step each slot ran last, so a call that
+skips or repeats a step of its canvas is refused before any device work
 (``advance``); ``reset`` forgets a slot's canvas when a request is admitted
 to it or released from it.
 """
@@ -28,6 +31,7 @@ from uniserve.model import CanvasTokens, TokenDenoiser
 from uniserve.runtime.tensor_buffers import TensorBuffers
 from uniserve.tensors import BufferConfig
 from uniserve_worker.errors import invalid_descriptor
+from uniserve_worker.protocol.batch import CanvasSampling
 
 # Sampler state fields kept per slot, each a bank with one row per slot and
 # a staging area with one row per canvas of a pass.
@@ -85,7 +89,7 @@ class CanvasSlots:
         tokens: CanvasTokens,
         vocab_size: int,
         hidden_size: int,
-        history_depth: int,
+        sampling: CanvasSampling,
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> None:
@@ -98,23 +102,27 @@ class CanvasSlots:
                 generates.
             vocab_size: Vocabulary size of the denoiser's logits.
             hidden_size: Width of one self-conditioning embedding.
-            history_depth: Argmax canvases the stopping rule keeps, the
-                largest stability a request may use: the stability of the
-                canvas sampling the deployment serves.
+            sampling: The block-diffusion sampling the deployment serves;
+                its stability threshold is the argmax history kept.
             dtype: Dtype of the self-conditioning embeddings and sampling
                 weights, the model's embedding dtype.
             device: Device of every tensor.
 
         Raises:
-            ValueError: When a dimension is not positive or the history depth
-                is negative.
+            ValueError: When a dimension is not positive, the sampling's
+                canvas length is not the model's, or the sampler refuses
+                the sampling's values.
         """
+        if sampling.canvas_length != tokens.length:
+            raise ValueError(
+                "the served canvas length is not the model's canvas length"
+            )
         fields = self.buffers(
             request_pool_size=request_pool_size,
             max_rows=max_rows,
             canvas_length=tokens.length,
             hidden_size=hidden_size,
-            history_depth=history_depth,
+            history_depth=sampling.stability_threshold,
             dtype=dtype,
         )
         self.request_pool_size = int(request_pool_size)
@@ -123,7 +131,20 @@ class CanvasSlots:
         self.canvas_length = tokens.length
         self.vocab_size = int(vocab_size)
         self.hidden_size = int(hidden_size)
-        self.history_depth = int(history_depth)
+        self.served = sampling
+        self.history_depth = sampling.stability_threshold
+        # The sampler's constants for the served sampling, with the model's
+        # end-of-sequence and padding tokens; the sampler checks their domain.
+        self.constants = sampler.CanvasSampling(
+            steps=sampling.max_steps,
+            entropy_bound=sampling.entropy_bound,
+            t_min=sampling.t_min,
+            t_max=sampling.t_max,
+            confidence=sampling.confidence_threshold,
+            stability=sampling.stability_threshold,
+            eos_ids=tokens.eos_token_ids,
+            pad_id=tokens.pad_token_id,
+        )
         self.step_rows = step_rows(
             canvas_length=tokens.length,
             vocab_size=vocab_size,
@@ -158,18 +179,18 @@ class CanvasSlots:
         *,
         request_pool_size: int,
         max_rows: int,
-        history_depth: int,
+        sampling: CanvasSampling,
         device: torch.device | str,
     ) -> CanvasSlots:
         """Allocate the slots of a generating denoiser's canvases.
 
-        ``history_depth`` is the deployment's canvas stability threshold
-        (``WorkerConfig.canvas_history_depth``).
+        ``sampling`` is the deployment's served canvas sampling
+        (``WorkerConfig.canvas_sampling``).
         """
         return cls(
             request_pool_size=request_pool_size,
             max_rows=max_rows,
-            history_depth=history_depth,
+            sampling=sampling,
             device=device,
             **denoiser_fields(denoiser),
         )
@@ -265,38 +286,22 @@ class CanvasSlots:
         self.workspace = None
         self._backing.close()
 
-    def sampling(self, admitted) -> sampler.CanvasSampling:
+    def sampling(self, admitted: CanvasSampling) -> sampler.CanvasSampling:
         """The sampler constants of a request's admitted canvas sampling.
 
-        ``admitted`` is the request's protocol ``CanvasSampling``; the
-        end-of-sequence and padding tokens are the model's.
+        Every request carries the sampling the deployment serves, so these
+        are ``constants``.
 
         Raises:
-            WorkerError: ``invalid_descriptor`` when the admitted sampling
-                has another canvas length, a stability beyond the kept
-                history, or values the sampler refuses.
+            WorkerError: ``invalid_descriptor`` when ``admitted`` is not the
+                served sampling.
         """
-        if admitted.canvas_length != self.canvas_length:
+        if admitted != self.served:
             raise invalid_descriptor(
-                "the admitted canvas length is not the model's canvas length"
+                "the admitted canvas sampling is not the sampling this "
+                "worker serves"
             )
-        if admitted.stability_threshold > self.history_depth:
-            raise invalid_descriptor(
-                "the canvas stability threshold exceeds the kept history"
-            )
-        try:
-            return sampler.CanvasSampling(
-                steps=admitted.max_steps,
-                entropy_bound=admitted.entropy_bound,
-                t_min=admitted.t_min,
-                t_max=admitted.t_max,
-                confidence=admitted.confidence_threshold,
-                stability=admitted.stability_threshold,
-                eos_ids=self.tokens.eos_token_ids,
-                pad_id=self.tokens.pad_token_id,
-            )
-        except ValueError as error:
-            raise invalid_descriptor(str(error)) from error
+        return self.constants
 
     def advance(self, slot: int, block: int, step: int) -> None:
         """Record that ``slot`` runs step ``step`` of its block ``block``.

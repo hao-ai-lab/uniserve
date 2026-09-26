@@ -229,7 +229,7 @@ impl Default for WorkerProcessArgs {
             flow_graph_batch_sizes: None,
             flow_graph_shapes: None,
             video_text_capacities: None,
-            canvas_history_depth: 0,
+            canvas_sampling: None,
             flashinfer_workspace_size: 512 * 1024 * 1024,
             flashinfer_use_tensor_core: None,
             flashinfer_decode_backend: FlashInferBackend::Fa2,
@@ -467,8 +467,8 @@ impl WorkerProcessArgs {
             json!(self.video_text_capacities),
         );
         fields.insert(
-            "canvas_history_depth".into(),
-            json!(self.canvas_history_depth),
+            "canvas_sampling".into(),
+            serde_json::to_value(self.canvas_sampling)?,
         );
         fields.insert(
             "flashinfer_workspace_size".into(),

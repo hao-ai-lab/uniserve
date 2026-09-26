@@ -24,6 +24,7 @@ from uniserve.runtime.backends.attention.flashinfer import (
     Config as FlashInferConfig,
 )
 from uniserve_worker.errors import invalid_descriptor
+from uniserve_worker.protocol.batch import CanvasSampling
 from uniserve_worker.protocol.call import (
     CALL_KINDS,
     CallKind,
@@ -346,10 +347,10 @@ class WorkerConfig:
     # Text capacities, in prompt tokens, of the denoiser's layouts; empty
     # selects ``MediaBuilder``'s default spacing.
     video_text_capacities: tuple[int, ...] = ()
-    # Argmax canvases each generating block-diffusion canvas keeps for its
-    # stopping rule, the stability threshold of the served canvas sampling;
-    # zero keeps none.
-    canvas_history_depth: int = 0
+    # Block-diffusion sampling of every canvas the deployment generates; None
+    # when it generates none. Generating canvases keep the argmax history
+    # its stability threshold needs and run their steps with exactly it.
+    canvas_sampling: CanvasSampling | None = None
     max_request_pool_size: int = 128
     encoder_cache_entries: int = 256
     generation_device: str | None = None
@@ -421,10 +422,6 @@ class WorkerConfig:
             )
         if any(value < 1 for value in self.video_text_capacities):
             raise invalid_descriptor("video text capacities must be positive")
-        if self.canvas_history_depth < 0:
-            raise invalid_descriptor(
-                "canvas history depth must not be negative"
-            )
         if not 0 < self.kv_storage_fraction <= 1:
             raise invalid_descriptor(
                 "worker configuration KV storage fraction must be in (0, 1]"
@@ -475,7 +472,9 @@ def worker_config_from_namespace(
         video_text_capacities=_parse_positive_int_csv(
             getattr(namespace, "video_text_capacities", None), default=()
         ),
-        canvas_history_depth=int(getattr(namespace, "canvas_history_depth", 0)),
+        canvas_sampling=_canvas_sampling(
+            getattr(namespace, "canvas_sampling", None)
+        ),
         kv_token_capacity=_positive_optional_int(namespace.kv_token_capacity),
         attention_backend=str(namespace.attention_backend),
         model_dtype=str(namespace.model_dtype),
@@ -533,6 +532,15 @@ def _none_if_empty(value: object | None) -> str | None:
             "an explicitly provided string setting must not be empty"
         )
     return text
+
+
+def _canvas_sampling(value: object | None) -> CanvasSampling | None:
+    """Parse the served block-diffusion sampling, keeping ``None`` as none."""
+    return (
+        None
+        if value is None
+        else CanvasSampling.from_mapping(value, "canvas_sampling")
+    )
 
 
 def _optional_float(value: object | None) -> float | None:
