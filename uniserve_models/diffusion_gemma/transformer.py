@@ -146,9 +146,7 @@ class Router(nn.Module):
         self, hidden: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         scaled = self.norm(hidden) * self.scale * self.root_size
-        ids, weights = self.topk(self.projection(scaled))
-        scales = self.per_expert_scale.index_select(0, ids.reshape(-1))
-        return ids, weights * scales.reshape(ids.shape)
+        return self.topk(self.projection(scaled), scale=self.per_expert_scale)
 
 
 class MoE(nn.Module):

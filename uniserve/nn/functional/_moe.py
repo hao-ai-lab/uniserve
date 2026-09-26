@@ -21,6 +21,59 @@ def _encoded(value: torch.Tensor, quantizer) -> torch.Tensor:
     return value if quantizer is None else quantizer.round_trip(value)
 
 
+def topk_softmax(
+    scores: torch.Tensor,
+    k: int,
+    *,
+    renormalize: bool,
+    scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Route tokens to their ``k`` most probable experts.
+
+    ``scores`` is ``[tokens, experts]``. Returns int32 ``ids`` and FP32
+    ``weights``, both ``[tokens, k]`` in descending probability: the full
+    FP32 softmax of the scores, its top-k, divided by their sum (clamped
+    below by the FP32 epsilon) when ``renormalize`` is set, then multiplied
+    by ``scale[id]`` (an ``[experts]`` vector) when given.
+    """
+    from uniserve_kernels.triton import require_kernel
+
+    if scores.ndim != 2 or not 0 < k <= scores.shape[-1]:
+        raise ValueError("routing requires [tokens, experts] scores and k")
+    if scale is not None and scale.shape != scores.shape[-1:]:
+        raise ValueError("the expert scale must hold one value per expert")
+
+    if scores.is_cuda:
+        from uniserve_kernels import routing
+
+        require_kernel(
+            "topk_softmax",
+            routing.unsupported(scores, k, scale),
+            scores=scores,
+            scale=scale,
+        )
+        ids = torch.empty(
+            (scores.shape[0], k), dtype=torch.int32, device=scores.device
+        )
+        weights = torch.empty(
+            (scores.shape[0], k), dtype=torch.float32, device=scores.device
+        )
+        routing.topk_softmax(scores, k, renormalize, scale, ids, weights)
+        return ids, weights
+
+    probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32)
+    weights, ids = torch.topk(probabilities, k, dim=-1)
+    if renormalize:
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(
+            torch.finfo(weights.dtype).eps
+        )
+    if scale is not None:
+        weights = weights * scale.index_select(0, ids.reshape(-1)).reshape(
+            ids.shape
+        )
+    return ids.to(torch.int32), weights
+
+
 def fused_moe(
     hidden: torch.Tensor,
     up_gate: torch.Tensor,

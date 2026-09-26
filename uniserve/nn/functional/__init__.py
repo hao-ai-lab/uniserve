@@ -18,7 +18,7 @@ from ._activation import (
 )
 from ._attention import attention
 from ._linear import linear, merged_linear
-from ._moe import fused_moe
+from ._moe import fused_moe, topk_softmax
 from ._norm import (
     add_rms_norm,
     gated_residual,
@@ -61,6 +61,7 @@ __all__ = [
     "silu_and_mul",
     "swiglu",
     "swiglu_absmax",
+    "topk_softmax",
     "unpatchify",
     "unpatchify_video_tokens",
     "value_first_swiglu",
