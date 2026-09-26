@@ -22,13 +22,13 @@ ROWS, LENGTH, VOCAB, HIDDEN = 3, 16, 64, 8
 EOS, PAD = (1, 6, 5), 0
 
 
-def _sampling(steps, stability=1):
+def _sampling(steps, stability=1, confidence=0.2):
     return canvas.CanvasSampling(
         steps=steps,
         entropy_bound=0.5,
         t_min=0.4,
         t_max=0.8,
-        confidence=0.2,
+        confidence=confidence,
         stability=stability,
         eos_ids=EOS,
         pad_id=PAD,
@@ -205,3 +205,20 @@ def test_rows_without_stability_history_stop_on_confidence_alone():
         scores, state, sampling, decision=decision, vocab_size=VOCAB
     )
     assert decision.finished[:, 0].tolist() == [True, False, True]
+
+
+def test_zero_confidence_runs_every_step_of_a_block():
+    # Converged rows (zero entropy, no stability history) are never
+    # confident below a threshold of zero; only the last step ends a block.
+    sampling = _sampling(steps=48, stability=0, confidence=0.0)
+    state = _state(
+        seed=[1, 2, 3], block=[0, 0, 0], step=[5, 46, 47], stability=0
+    )
+    scores, decision, _ = _buffers()
+    scores.entropy.zero_()
+    scores.argmax.fill_(9)
+    scores.sample.fill_(9)
+    canvas.advance_canvas(
+        scores, state, sampling, decision=decision, vocab_size=VOCAB
+    )
+    assert decision.finished[:, 0].tolist() == [False, False, True]

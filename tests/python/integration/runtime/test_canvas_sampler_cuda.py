@@ -21,6 +21,7 @@ adda64ef4f063ab1389019a02a612e171a1ec4e65786bd7d3784ef1ef474f19a):
 - R9: a row's results do not depend on the rows beside it.
 """
 
+import dataclasses
 import math
 
 import pytest
@@ -429,3 +430,46 @@ def test_row_results_do_not_depend_on_the_batch():
         + 2.0**-120
     ).all()
     assert math.isfinite(float(reference.abs().max()))
+
+
+@pytest.mark.parametrize(("confidence", "stops"), [(0.0, False), (100.0, True)])
+def test_rows_without_history_stop_on_the_confidence_threshold(
+    confidence, stops
+):
+    # Without stability history every row is stable, so the confidence
+    # threshold alone decides: 100 nats exceeds every mean entropy, and no
+    # mean entropy lies below zero. The positions are near one-hot, with a
+    # runner-up 6 to 16 raw units below the winner, before or after it.
+    generator = torch.Generator().manual_seed(29)
+    rows, length, vocab = 3, 64, 262144
+    sampling = dataclasses.replace(
+        _sampling(), stability=0, confidence=confidence
+    )
+    embedding = (
+        torch.randn(vocab, HIDDEN, generator=generator).bfloat16().to(DEVICE)
+    )
+    logits = torch.full((rows, length, vocab), -30.0)
+    first = torch.randint(
+        0, vocab - 4096, (rows, length, 1), generator=generator
+    )
+    gap = 6 + 10 * torch.rand(rows, length, 1, generator=generator)
+    winner_first = torch.rand(rows, length, 1, generator=generator) < 0.5
+    logits.scatter_(-1, first, torch.where(winner_first, 20.0, 20.0 - gap))
+    logits.scatter_(
+        -1, first + 4096, torch.where(winner_first, 20.0 - gap, 20.0)
+    )
+    state = _state(rows, length, [4, 5, 6], [0, 0, 0], [5, 30, 47], stability=0)
+    scores, decision, workspace = _buffers(rows, length, vocab, DEVICE)
+
+    canvas.denoise_canvas(
+        logits.to(DEVICE),
+        embedding,
+        53.0,
+        state,
+        sampling,
+        scores=scores,
+        decision=decision,
+        workspace=workspace,
+    )
+    assert (scores.entropy >= 0).all()
+    assert decision.finished[:, 0].tolist() == [stops, stops, True]
