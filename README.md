@@ -96,7 +96,7 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-Models with image input (SenseNova and Bagel) accept `image_url` content parts whose URL is either a `data:image/<subtype>;base64,...` URL or an `http(s)` URL. The server fetches `http(s)` URLs itself before tokenization: it follows at most three redirects, requires an `image/*` `Content-Type` or a recognizable PNG, JPEG, GIF, WebP, or BMP file, and enforces `--image-fetch-timeout` and `--image-fetch-max-bytes`. Every hop must resolve to a public address unless `--allow-private-image-urls` is set, and environment proxy settings are not used for these fetches. An image that cannot be fetched or decoded fails the request with 400.
+Models with image input (SenseNova, Bagel, and DiffusionGemma) accept `image_url` content parts whose URL is either a `data:image/<subtype>;base64,...` URL or an `http(s)` URL. The server fetches `http(s)` URLs itself before tokenization: it follows at most three redirects, requires an `image/*` `Content-Type` or a recognizable PNG, JPEG, GIF, WebP, or BMP file, and enforces `--image-fetch-timeout` and `--image-fetch-max-bytes`. Every hop must resolve to a public address unless `--allow-private-image-urls` is set, and environment proxy settings are not used for these fetches. An image that cannot be fetched or decoded fails the request with 400.
 
 Generate one image from a SenseNova server:
 
@@ -114,6 +114,8 @@ curl -s http://127.0.0.1:8000/v1/images/generations \
 ```
 
 Each image response entry carries `b64_json`, pixel `height` and `width`, and the encoded PNG byte count `bytes`; `revised_prompt` is included when available. Request timing starts before preprocessing and includes queueing and generation.
+
+A DiffusionGemma server generates chat replies by block diffusion: the reply is denoised in canvases of the checkpoint's canvas length (256 tokens), each committed to the context before the next begins, and a streamed reply publishes one chunk per committed canvas. Sampling follows the checkpoint's `generation_config.json` (48 steps, entropy bound 0.1, temperature falling from 0.8 to 0.4, confidence 0.005, stability 1), which `--diffusion-generation-config` overrides for the whole server; `seed` selects each request's random stream. `max_completion_tokens` truncates the reply inside the canvas that reaches it, and `stop` strings and the checkpoint's end-of-sequence tokens end it. `chat_template_kwargs` passes template variables such as `enable_thinking`, and Gemma-4 thought channels and tool calls are returned as `reasoning_content` and `tool_calls`. Token-sampling controls have no meaning for a denoised canvas, so `temperature`, `top_p`, `top_k`, `min_p`, the penalties, `logit_bias`, `allowed_token_ids`, `bad_words`, `logprobs`, `prompt_logprobs`, `min_tokens`, and `ignore_eos` are refused with 400, as are grammar constraints such as `response_format`, which the chat API does not accept for any model.
 
 A DiffusionGemma server answers System One 0.2.0 requests: a `state` and named `noul`, `choice`, or `score` questions. It renders the questions into readout prompts, denoises each answer canvas once over its prompt, and reads every answer from the full-vocabulary probabilities of its answer tokens; nothing is generated, so `usage.output_tokens` is 0. Every answer also carries `x_candidate_mass`, the unnormalized probability of all its answer tokens; a value near 0 means the model did not answer within them. The optional `x_images` field attaches 1 to 8 images, as `data:image/...;base64` or `http(s)` URLs fetched under the same rules as chat images, which the prompt names Image 1 to Image n. Validation failures are 422 with FastAPI's `{"detail": [...]}` body, another model name is 404, and inference failures are 500 with `{"detail": ...}`.
 
@@ -159,6 +161,7 @@ curl -s http://127.0.0.1:8000/v1/systemone \
 | `--allow-private-image-urls` | Off | Allow image URLs that resolve to loopback, private, link-local, unique-local, or cloud metadata addresses |
 | `--readout-layout` | `joint` | System One question grouping: `joint` packs questions in request order into shared canvases; `independent` gives each question its own prompt and canvas |
 | `--readout-canvas` | `full` | System One canvas length: `full` is the checkpoint's canvas length; `compact` the smallest multiple of 16 tokens holding the answer scaffold |
+| `--diffusion-generation-config` | Checkpoint `generation_config.json` | DiffusionGemma block-diffusion sampling for every reply, as a JSON object that replaces any of `max_denoising_steps`, `entropy_bound`, `t_min`, `t_max`, `confidence_threshold`, and `stability_threshold` |
 
 For tensor-parallel execution, select one rank per participating GPU:
 

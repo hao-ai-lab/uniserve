@@ -25,6 +25,7 @@
 mod assembly;
 /// Chat request rendering and structured output processing.
 pub mod chat;
+mod diffusion_gemma;
 mod input;
 /// Image reference resolution shared by every request path that accepts images.
 pub mod media;
@@ -69,7 +70,7 @@ pub use model::{
 };
 pub use preprocessing::chat_image_urls;
 
-use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, Qwen3ChatOutputProcessor};
+use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock};
 use crate::serving::omni::{SenseNovaOutputProcessor, SenseNovaTextDelta};
 use crate::serving::text::output::stop_string_holdback_bytes;
 use crate::serving::text::{
@@ -244,6 +245,17 @@ pub enum ServeError {
         request_id: ServeRequestId,
         /// Stable feature name.
         feature: &'static str,
+    },
+    /// A request sets a sampling control the model's generation does not
+    /// define.
+    #[error("request `{request_id}` sets `{control}`, but {reason}")]
+    UnsupportedSamplingControl {
+        /// Identifier of the rejected request.
+        request_id: ServeRequestId,
+        /// Wire name of the control.
+        control: &'static str,
+        /// Why the model's generation has no such control.
+        reason: &'static str,
     },
     /// The prompt exceeds the profile context limit.
     #[error(
@@ -691,7 +703,7 @@ impl ServingRuntime {
                             stream,
                         };
                         let output: RequestOutputStream = match output_processor {
-                            OutputProcessorPolicy::Qwen3(processor) => {
+                            OutputProcessorPolicy::Chat(processor) => {
                                 Box::pin(assemble_chat_event_stream(assembly, processor))
                             }
                             // `assemble_event_stream` applies the remaining policies as its
@@ -1903,9 +1915,12 @@ mod tests {
                     .unwrap();
                     // Boxed like the runtime boxes it, since the chat pipeline
                     // is a large future.
-                    Box::pin(assemble_chat_event_stream(input, processor))
-                        .collect::<Vec<_>>()
-                        .await
+                    Box::pin(assemble_chat_event_stream(
+                        input,
+                        crate::serving::chat::ChatOutputProcessor::Qwen3(processor),
+                    ))
+                    .collect::<Vec<_>>()
+                    .await
                 } else {
                     assemble_event_stream(input, OutputProcessorPolicy::None)
                         .collect::<Vec<_>>()
@@ -1970,9 +1985,12 @@ mod tests {
             decode_options,
             stream: EventRx::from_receiver(rx),
         };
-        let events = Box::pin(assemble_chat_event_stream(input, processor))
-            .collect::<Vec<_>>()
-            .await;
+        let events = Box::pin(assemble_chat_event_stream(
+            input,
+            crate::serving::chat::ChatOutputProcessor::Qwen3(processor),
+        ))
+        .collect::<Vec<_>>()
+        .await;
 
         assert!(events.iter().all(std::result::Result::is_ok), "{events:?}");
         let texts: Vec<_> = events

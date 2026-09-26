@@ -6,8 +6,11 @@
 //! normalizes the checkpoint metadata the server needs once at startup: the
 //! canvas length and its control tokens, the Gemma-4 image patch budget that
 //! sizes image placeholders, and the block-diffusion sampler defaults of
-//! `generation_config.json`. The text context limit lives under the root
+//! `generation_config.json`, which a server may override
+//! ([`DenoisingOverrides`]). The text context limit lives under the root
 //! configuration's `text_config` and is read by `assets::ModelConfig`.
+//! [`ControlTokens::expand_images`] expands a rendered prompt's image tokens
+//! as the Gemma-4 processor does.
 //!
 //! Both published precisions (BF16 and the ModelOpt NVFP4 variant) share this
 //! metadata; the NVFP4 checkpoint differs only by a `quantization_config`,
@@ -130,6 +133,10 @@ impl PatchBudget {
 }
 
 /// Block-diffusion sampler defaults of a DiffusionGemma checkpoint.
+///
+/// The sampling temperature falls linearly from `t_max` at a canvas's first
+/// step to `t_min` at its last (Transformers'
+/// `LinearTemperatureScheduleLogitsProcessor`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DenoisingDefaults {
     /// Maximum denoising steps per canvas (`max_denoising_steps`).
@@ -137,16 +144,166 @@ pub struct DenoisingDefaults {
     /// Entropy budget of the tokens accepted in one step
     /// (`sampler_config.entropy_bound`), in nats.
     pub entropy_bound: f32,
-    /// Sampling temperature at the first step (`t_min`).
+    /// Sampling temperature at the last step (`t_min`).
     pub t_min: f32,
-    /// Sampling temperature at the last step (`t_max`).
+    /// Sampling temperature at the first step (`t_max`).
     pub t_max: f32,
     /// Stopping threshold on the canvas's residual uncertainty
     /// (`confidence_threshold`).
     pub confidence_threshold: f32,
     /// Consecutive unchanged steps that end denoising early
-    /// (`stability_threshold`).
+    /// (`stability_threshold`); zero ends it on confidence alone.
     pub stability_threshold: u32,
+}
+
+impl DenoisingDefaults {
+    /// Returns these defaults with every value `overrides` names replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the first resulting value outside the
+    /// domain the block-diffusion sampler accepts
+    /// (`uniserve.diffusion.canvas.CanvasSampling`): a positive step limit,
+    /// a positive entropy bound and confidence threshold, and temperatures
+    /// with `0 <= t_min < t_max`, all finite. A zero stability threshold
+    /// stops a canvas on confidence alone.
+    pub fn with_overrides(self, overrides: &DenoisingOverrides) -> Result<Self, String> {
+        let value = Self {
+            max_denoising_steps: overrides
+                .max_denoising_steps
+                .unwrap_or(self.max_denoising_steps),
+            entropy_bound: overrides.entropy_bound.unwrap_or(self.entropy_bound),
+            t_min: overrides.t_min.unwrap_or(self.t_min),
+            t_max: overrides.t_max.unwrap_or(self.t_max),
+            confidence_threshold: overrides
+                .confidence_threshold
+                .unwrap_or(self.confidence_threshold),
+            stability_threshold: overrides
+                .stability_threshold
+                .unwrap_or(self.stability_threshold),
+        };
+        let positive = |number: f32| number.is_finite() && number > 0.0;
+        let invalid = if value.max_denoising_steps == 0 {
+            Some("max_denoising_steps must be positive")
+        } else if !positive(value.entropy_bound) {
+            Some("entropy_bound must be positive and finite")
+        } else if !(value.t_min.is_finite() && value.t_min >= 0.0) {
+            Some("t_min must be finite and non-negative")
+        } else if !(value.t_max.is_finite() && value.t_max > value.t_min) {
+            Some("t_max must be finite and above t_min")
+        } else if !positive(value.confidence_threshold) {
+            Some("confidence_threshold must be positive and finite")
+        } else {
+            None
+        };
+        match invalid {
+            Some(message) => Err(message.to_owned()),
+            None => Ok(value),
+        }
+    }
+}
+
+/// Server-level replacements for the checkpoint's block-diffusion sampler
+/// defaults, read from a JSON object whose keys name `generation_config.json`
+/// fields. Requests carry no such fields, so these settings apply to every
+/// request the server generates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DenoisingOverrides {
+    /// Replaces `max_denoising_steps`.
+    pub max_denoising_steps: Option<u32>,
+    /// Replaces `sampler_config.entropy_bound`.
+    pub entropy_bound: Option<f32>,
+    /// Replaces `t_min`.
+    pub t_min: Option<f32>,
+    /// Replaces `t_max`.
+    pub t_max: Option<f32>,
+    /// Replaces `confidence_threshold`.
+    pub confidence_threshold: Option<f32>,
+    /// Replaces `stability_threshold`.
+    pub stability_threshold: Option<u32>,
+}
+
+/// Where one image's soft tokens sit in a prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImagePlacement {
+    /// Index of the image among the request's input images.
+    pub source: usize,
+    /// Prompt position of the first soft token, just after `<|image>`.
+    pub offset: u32,
+    /// Number of consecutive soft-token placeholders.
+    pub soft_tokens: u32,
+}
+
+/// A rendered prompt whose image tokens do not match its input images.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ImageTokenMismatch {
+    /// The request's text encodes image tokens of its own.
+    #[error("the request text encodes {0} image placeholder token(s) beyond its images")]
+    Extra(usize),
+    /// The template rendered fewer image tokens than the request has images.
+    #[error("the prompt renders {rendered} image token(s) for {images} image(s)")]
+    Missing {
+        /// Image tokens in the rendered prompt.
+        rendered: usize,
+        /// Input images of the request.
+        images: usize,
+    },
+}
+
+impl ControlTokens {
+    /// Expands a rendered prompt's image tokens as the Gemma-4 processor
+    /// does, and reports where each image's soft tokens stand.
+    ///
+    /// The chat template writes one `<|image|>` per image, in input order;
+    /// each becomes `<|image>`, `soft_tokens[i]` copies of `<|image|>`, and
+    /// `<image|>`. All other tokens are kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImageTokenMismatch`] unless `rendered` holds exactly one
+    /// image token per entry of `soft_tokens`.
+    pub fn expand_images(
+        &self,
+        rendered: &[u32],
+        soft_tokens: &[u32],
+    ) -> Result<(Vec<u32>, Vec<ImagePlacement>), ImageTokenMismatch> {
+        let placeholders = rendered
+            .iter()
+            .filter(|token| **token == self.image)
+            .count();
+        if placeholders > soft_tokens.len() {
+            return Err(ImageTokenMismatch::Extra(placeholders - soft_tokens.len()));
+        }
+        if placeholders < soft_tokens.len() {
+            return Err(ImageTokenMismatch::Missing {
+                rendered: placeholders,
+                images: soft_tokens.len(),
+            });
+        }
+
+        let expanded: usize = soft_tokens.iter().map(|tokens| *tokens as usize + 1).sum();
+        let mut token_ids = Vec::with_capacity(rendered.len() + expanded);
+        let mut placements = Vec::with_capacity(soft_tokens.len());
+        for &token in rendered {
+            if token != self.image {
+                token_ids.push(token);
+                continue;
+            }
+            let source = placements.len();
+            let count = soft_tokens[source];
+            token_ids.push(self.image_start);
+            let offset = u32::try_from(token_ids.len()).unwrap_or(u32::MAX);
+            token_ids.extend(std::iter::repeat_n(self.image, count as usize));
+            token_ids.push(self.image_end);
+            placements.push(ImagePlacement {
+                source,
+                offset,
+                soft_tokens: count,
+            });
+        }
+        Ok((token_ids, placements))
+    }
 }
 
 /// The root `config.json` fields a DiffusionGemma profile reads.
@@ -238,7 +395,53 @@ fn required<T>(value: Option<T>, field: &'static str) -> assets::Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::PatchBudget;
+    use super::{DenoisingDefaults, DenoisingOverrides, PatchBudget};
+
+    const CHECKPOINT: DenoisingDefaults = DenoisingDefaults {
+        max_denoising_steps: 48,
+        entropy_bound: 0.1,
+        t_min: 0.4,
+        t_max: 0.8,
+        confidence_threshold: 0.005,
+        stability_threshold: 1,
+    };
+
+    /// A server override replaces exactly the values it names, read from a
+    /// JSON object keyed by the `generation_config.json` field names.
+    #[test]
+    fn a_denoising_override_replaces_the_values_it_names() {
+        let overrides: DenoisingOverrides =
+            serde_json::from_str(r#"{"max_denoising_steps": 32, "t_max": 1.0}"#).unwrap();
+        assert_eq!(
+            CHECKPOINT.with_overrides(&overrides),
+            Ok(DenoisingDefaults {
+                max_denoising_steps: 32,
+                t_max: 1.0,
+                ..CHECKPOINT
+            })
+        );
+        assert_eq!(
+            CHECKPOINT.with_overrides(&DenoisingOverrides::default()),
+            Ok(CHECKPOINT)
+        );
+    }
+
+    /// Unknown keys and out-of-range values are refused, naming the field.
+    #[test]
+    fn an_invalid_denoising_override_is_refused() {
+        assert!(serde_json::from_str::<DenoisingOverrides>(r#"{"temperature": 0.5}"#).is_err());
+        for (json, field) in [
+            (r#"{"max_denoising_steps": 0}"#, "max_denoising_steps"),
+            (r#"{"entropy_bound": 0.0}"#, "entropy_bound"),
+            (r#"{"t_min": -0.1}"#, "t_min"),
+            (r#"{"t_max": 0.4}"#, "t_max"),
+            (r#"{"confidence_threshold": 0.0}"#, "confidence_threshold"),
+        ] {
+            let overrides: DenoisingOverrides = serde_json::from_str(json).unwrap();
+            let message = CHECKPOINT.with_overrides(&overrides).unwrap_err();
+            assert!(message.starts_with(field), "{message}");
+        }
+    }
 
     /// Soft-token counts match the Hugging Face Gemma-4 processor for square,
     /// landscape, portrait, tiny, and extremely elongated images. The cases

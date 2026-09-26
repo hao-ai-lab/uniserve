@@ -186,6 +186,12 @@ pub fn serve_error_to_api(error: ServeError) -> ApiError {
             format!("Only one output is supported, got {requested}."),
             Some("n"),
         ),
+        ServeError::UnsupportedSamplingControl {
+            control, reason, ..
+        } => ApiError::invalid_request(
+            format!("`{control}` is not supported by this model: {reason}."),
+            Some(control),
+        ),
         error @ (ServeError::UnsupportedFeature { .. }
         | ServeError::ContextLengthExceeded { .. }
         | ServeError::ContextCapacityExceeded { .. }

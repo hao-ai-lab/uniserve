@@ -50,9 +50,10 @@ pub use self::format::ChatTemplateContentFormatOption;
 ///
 /// Without this value, rendering fails with
 /// `Error::UnsupportedMultimodalContent` on any `image_url` part. Production
-/// loading passes `None`: the omni preprocessors replace each chat image with
-/// a text placeholder (`replace_chat_images`) before rendering, so image parts
-/// never reach the renderer there.
+/// loading passes DiffusionGemma's image token, which its template writes for
+/// each image part, and `None` for every other model: the omni preprocessors
+/// replace each chat image with a text placeholder (`replace_chat_images`)
+/// before rendering, so image parts never reach the renderer there.
 pub struct MultimodalRenderInfo {
     /// Text substituted for each image part when content is flattened to a
     /// string. With list-shaped content, image parts become `{"type": "image"}`
@@ -212,6 +213,20 @@ impl HfChatRenderer {
             "applying chat template"
         );
 
+        // The request's template kwargs replace defaults of the same name.
+        let request_kwargs = &request.chat_options.template_kwargs;
+        let merged_kwargs;
+        let template_kwargs = if request_kwargs.is_empty() {
+            &self.default_template_kwargs
+        } else {
+            merged_kwargs = self
+                .default_template_kwargs
+                .iter()
+                .chain(request_kwargs)
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect::<HashMap<_, _>>();
+            &merged_kwargs
+        };
         let prompt = effective_template
             .apply(TemplateContext {
                 messages: &messages,
@@ -219,7 +234,7 @@ impl HfChatRenderer {
                 continue_final_message: request.chat_options.continue_final_message(),
                 tools: tools.as_deref(),
                 documents: None,
-                template_kwargs: Some(&self.default_template_kwargs),
+                template_kwargs: Some(template_kwargs),
                 special_tokens: self.special_tokens.as_ref(),
                 reasoning_effort: request.chat_options.reasoning_effort,
             })
@@ -821,6 +836,30 @@ mod tests {
         let rendered = renderer.render(&request).unwrap();
 
         assert_eq!(rendered, "True|x");
+    }
+
+    /// A request's template kwargs replace defaults of the same name and add
+    /// their own; the others keep their default values.
+    #[test]
+    fn request_template_kwargs_override_default_template_kwargs() {
+        let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
+        request.chat_options.template_kwargs = HashMap::from([
+            ("enable_thinking".to_string(), Value::Bool(true)),
+            ("request_only".to_string(), Value::String("y".to_string())),
+        ]);
+        let renderer = HfChatRenderer::new(
+            Some("{{ enable_thinking }}|{{ default_only }}|{{ request_only }}".to_string()),
+            HashMap::from([
+                ("enable_thinking".to_string(), Value::Bool(false)),
+                ("default_only".to_string(), Value::String("x".to_string())),
+            ]),
+            ChatTemplateContentFormatOption::Auto,
+        )
+        .unwrap();
+
+        let rendered = renderer.render(&request).unwrap();
+
+        assert_eq!(rendered, "True|x|y");
     }
 
     #[test]

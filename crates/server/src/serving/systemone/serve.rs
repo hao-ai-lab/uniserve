@@ -13,13 +13,13 @@
 //! images share no cached pages, since page identities cover token ids only,
 //! and all of their readouts run concurrently.
 
-use base64::Engine as _;
 use uniserve_core::{
     CachePolicy, EngineCoreOutput, FinishReason, GenerationConstraint, GenerationRequest,
-    ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageInput, ImageParams,
-    MultimodalInputs, ReadoutRow, ReadoutSlot, RejectionKind, RequestId, SamplingParams,
+    ImageGenerationConfig, ImageParams, MultimodalInputs, ReadoutRow, ReadoutSlot, RejectionKind,
+    RequestId, SamplingParams,
 };
 
+use crate::serving::diffusion_gemma::engine_images;
 use crate::serving::media;
 use crate::serving::systemone::error::{LocItem, SystemOneError, ValidationIssue};
 use crate::serving::systemone::plan::{ImageSize, ReadoutPrompt};
@@ -194,30 +194,10 @@ impl ServingRuntime {
 /// leave the prompt and each image enters at the count of text tokens before
 /// it. An image's soft tokens take one position each, and the vision encoder
 /// writes exactly that many KV entries. `images` are the request's decoded
-/// `x_images`, indexed by [`ImagePlacement::source`](super::ImagePlacement).
+/// `x_images`, indexed by
+/// [`ImagePlacement::source`](crate::profile::diffusion_gemma::ImagePlacement).
 fn readout_request(prompt: &ReadoutPrompt, images: &[media::ImageInput]) -> GenerationRequest {
-    let mut token_ids = Vec::with_capacity(prompt.token_ids.len());
-    let mut inputs = Vec::with_capacity(prompt.images.len());
-    let mut next = 0;
-    for placement in &prompt.images {
-        let offset = placement.offset as usize;
-        token_ids.extend_from_slice(&prompt.token_ids[next..offset]);
-        next = offset + placement.soft_tokens as usize;
-
-        let image = &images[placement.source];
-        inputs.push(ImageInput {
-            hash: image.hash(),
-            b64: base64::engine::general_purpose::STANDARD.encode(image.bytes()),
-            position: u32::try_from(token_ids.len()).unwrap_or(u32::MAX),
-            num_positions: placement.soft_tokens,
-            encoders: vec![ImageEncoderInput {
-                encoder: ImageIngestStep::VitEncode,
-                num_kv_tokens: Some(placement.soft_tokens),
-                max_kv_tokens: None,
-            }],
-        });
-    }
-    token_ids.extend_from_slice(&prompt.token_ids[next..]);
+    let (token_ids, inputs) = engine_images(&prompt.token_ids, &prompt.images, images);
 
     GenerationRequest {
         // `ServingRuntime::readout` replaces it with the registered id.

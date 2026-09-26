@@ -42,7 +42,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::profile::assets::ResolvedModelFiles;
-use crate::profile::diffusion_gemma::{ControlTokens, DiffusionGemmaProfile, PatchBudget};
+use crate::profile::diffusion_gemma::{
+    ControlTokens, DiffusionGemmaProfile, ImagePlacement, ImageTokenMismatch, PatchBudget,
+};
 use crate::profile::tokenizer::{DynTokenizer, TokenizerError};
 use crate::serving::chat::template::renderer::hf::MultimodalRenderInfo;
 use crate::serving::chat::{
@@ -473,49 +475,23 @@ impl ReadoutEncoder {
             .render(text, sources)
             .map_err(|error| SystemOneError::Server(error.to_string()))?;
 
-        let image = self.tokens.image;
-        let placeholders = rendered.iter().filter(|token| **token == image).count();
-        if placeholders > soft_tokens.len() {
-            return Err(invalid(
-                vec!["body".into()],
-                &format!(
-                    "the request text encodes {} image placeholder token(s); images are \
-                     attached only through x_images",
-                    placeholders - soft_tokens.len()
-                ),
-            ));
-        }
-        if placeholders < soft_tokens.len() {
-            return Err(SystemOneError::Server(format!(
-                "the readout prompt renders {placeholders} of {} images",
-                soft_tokens.len()
-            )));
-        }
-
         // The template writes one image token per image, before the text;
-        // the processor replaces each with `<|image>`, the image's soft-token
-        // placeholders, and `<image|>`.
-        let expanded: usize = soft_tokens.iter().map(|tokens| *tokens as usize + 1).sum();
-        let mut token_ids =
-            Vec::with_capacity(rendered.len() + expanded + self.vocabulary.thought_prefix.len());
-        let mut placements = Vec::with_capacity(soft_tokens.len());
-        for token in rendered {
-            if token != image {
-                token_ids.push(token);
-                continue;
-            }
-            let source = placements.len();
-            let count = soft_tokens[source];
-            token_ids.push(self.tokens.image_start);
-            let offset = to_u32(token_ids.len());
-            token_ids.extend(std::iter::repeat_n(image, count as usize));
-            token_ids.push(self.tokens.image_end);
-            placements.push(ImagePlacement {
-                source,
-                offset,
-                soft_tokens: count,
-            });
-        }
+        // each expands into the image's soft-token run.
+        let (mut token_ids, placements) = self
+            .tokens
+            .expand_images(&rendered, soft_tokens)
+            .map_err(|mismatch| match mismatch {
+                ImageTokenMismatch::Extra(extra) => invalid(
+                    vec!["body".into()],
+                    &format!(
+                        "the request text encodes {extra} image placeholder token(s); images \
+                         are attached only through x_images"
+                    ),
+                ),
+                ImageTokenMismatch::Missing { .. } => {
+                    SystemOneError::Server(format!("the readout prompt: {mismatch}"))
+                }
+            })?;
         token_ids.extend(&self.vocabulary.thought_prefix);
         Ok((token_ids, placements))
     }
@@ -731,17 +707,6 @@ pub struct ReadoutPrompt {
     /// every answer slot masked; any further rows condition a two-letter
     /// label's second slot on its first letter.
     pub rows: Vec<CanvasRow>,
-}
-
-/// Where one image's soft tokens sit in a prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ImagePlacement {
-    /// Index of the image in the request's `x_images`.
-    pub source: usize,
-    /// Prompt position of the first soft token, just after `<|image>`.
-    pub offset: u32,
-    /// Number of consecutive soft-token placeholders.
-    pub soft_tokens: u32,
 }
 
 /// One canvas denoised in a single pass.

@@ -7,7 +7,8 @@
 //! [`HfChatRenderer`]. During generation, `assemble_chat_event_stream` feeds
 //! decoded text through that processor and assembles the resulting assistant
 //! events into public serving events. [`Gemma4ChatOutputProcessor`] composes
-//! the same output stages for Gemma-4's chat format. The omni models render
+//! the same output stages for Gemma-4's chat format, which DiffusionGemma
+//! chat requests use; [`ChatOutputProcessor`] carries either. The omni models render
 //! chat requests with the same renderer, but their output bypasses this
 //! module's output processors.
 //!
@@ -22,7 +23,7 @@ pub use crate::profile::tools::ToolParserError;
 pub use crate::serving::text::{FinishReason, StopReason};
 pub use error::{Error, Result};
 pub use event::{AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantToolCall};
-pub use output::{Gemma4ChatOutputProcessor, Qwen3ChatOutputProcessor};
+pub use output::{ChatOutputProcessor, Gemma4ChatOutputProcessor, Qwen3ChatOutputProcessor};
 pub use request::{
     ChatContent, ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatToolChoice,
     GenerationPromptMode, ReasoningEffort, Tool,

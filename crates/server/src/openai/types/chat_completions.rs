@@ -88,6 +88,9 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<ToolChoice>,
     /// Requested reasoning budget.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Extra chat-template variables, such as `enable_thinking`, which
+    /// replace the server's default template kwargs of the same name.
+    pub chat_template_kwargs: Option<HashMap<String, Value>>,
     /// Token identifiers that terminate generation.
     pub stop_token_ids: Option<Vec<u32>>,
     /// Whether matched stop strings remain in returned text.

@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::profile::diffusion_gemma::DenoisingOverrides;
 use crate::serving::chat::ChatTemplateContentFormatOption;
 use crate::serving::media::ImageFetchPolicy;
 use crate::serving::systemone::ReadoutOptions;
@@ -166,6 +167,9 @@ pub struct Config {
     /// How a DiffusionGemma server divides System One questions among
     /// readout prompts and canvases; other models ignore it.
     pub readout: ReadoutOptions,
+    /// Replacements for a DiffusionGemma checkpoint's block-diffusion sampler
+    /// defaults, applied to every generated reply; other models ignore it.
+    pub diffusion_generation: DenoisingOverrides,
 }
 
 impl Default for Config {
@@ -193,6 +197,7 @@ impl Default for Config {
             reasoning_parsing: true,
             image_fetch: ImageFetchPolicy::default(),
             readout: ReadoutOptions::default(),
+            diffusion_generation: DenoisingOverrides::default(),
         }
     }
 }
