@@ -8,10 +8,11 @@ those columns. Because the addresses never change, text graph buckets capture
 the staging columns themselves, and ``graph_inputs.pad_text`` can widen the
 staged slices in place to a bucket's capacity.
 
-Token staging copies its inputs into owned columns; diffusion staging does the
-same for attention metadata, positions and timesteps but borrows the rows'
-latents. Vision and latent-encoding staging and image-decode staging own only
-the request-slot column and borrow the rows' tensors. Borrowed tensors must
+Token staging copies its inputs into owned columns, as canvas staging does for
+token canvases and their answer slots; diffusion staging does the same for
+attention metadata, positions and timesteps but borrows the rows' latents.
+Vision and latent-encoding staging and image-decode staging own only the
+request-slot column and borrow the rows' tensors. Borrowed tensors must
 already reside on the entry's device.
 """
 
@@ -23,7 +24,12 @@ import torch
 
 from uniserve.math import bucketed_length
 from uniserve.media import image
-from uniserve.model import EmbeddingReplacement, TextInput, VisionInput
+from uniserve.model import (
+    CanvasInput,
+    EmbeddingReplacement,
+    TextInput,
+    VisionInput,
+)
 from uniserve.nn.attention import (
     AttentionBatch,
     BlockTable,
@@ -49,8 +55,10 @@ from uniserve_worker.model_executor.diffusion_inputs import (
 )
 from uniserve_worker.model_executor.image_inputs import DecodeRow, VisionRow
 from uniserve_worker.model_executor.input_batch import (
+    CanvasRow,
     InputBatch,
     InputRow,
+    ReadoutInput,
     TokenRow,
 )
 from uniserve_worker.protocol.call import ForwardMode, MediaCall
@@ -163,6 +171,22 @@ class TokenBufferConfig(AttentionBufferConfig):
                 (self.max_text_tokens, self.hidden_size), self.embedding_dtype
             )
         return fields
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasBufferConfig(AttentionBufferConfig):
+    """Canvas token and slot columns of a token-denoising call.
+
+    ``max_rows`` bounds the canvas rows of one call and ``max_tokens`` their
+    tokens, which also bounds the slots they read.
+    """
+
+    def buffers(self):
+        return {
+            **AttentionBufferConfig.buffers(self),
+            "input_ids": BufferConfig((self.max_tokens,), torch.int64),
+            "slot_tokens": BufferConfig((self.max_tokens,), torch.int64),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -740,6 +764,109 @@ class TokenBuffers(AttentionBuffers):
         return TextInput(self.input_ids[:count], positions, attention)
 
 
+class CanvasBuffers(AttentionBuffers):
+    """Stage token canvases, their slots and candidate reads on their lane.
+
+    Canvas tokens, positions, attention metadata and slot indices use fixed
+    columns bounded by the configured rows and tokens. The candidate ids a
+    call reads have no configured bound, so their backing grows to the
+    largest call staged so far and keeps its address until a larger call
+    arrives; the readout head that consumes them runs outside any graph.
+    """
+
+    row_type = CanvasRow
+
+    input_ids: torch.Tensor
+    slot_tokens: torch.Tensor
+
+    def __init__(self, *, config: CanvasBufferConfig, **options):
+        super().__init__(config=config, **options)
+        # Candidate matrix and selection indices share one int64 backing.
+        self._candidates = torch.empty(0, dtype=torch.int64, device=self.device)
+
+    def _prepare_inputs(
+        self, rows, *, attention=None, cache=None, tables=None, states=None
+    ):
+        attention = (
+            columns(rows, cache=cache, tables=tables)
+            if attention is None
+            else attention
+        )
+        staged = self.stage_attention(attention)
+
+        lengths = tuple(row.query_tokens for row in rows)
+        total = sum(lengths)
+        if total > self.max_tokens:
+            raise ValueError("canvas tokens exceed input-buffer capacity")
+
+        # Rows pack back to back; each row's slots shift by the tokens of the
+        # rows before it.
+        slots, groups, offset = [], [], 0
+        for row, length in zip(rows, lengths, strict=True):
+            self.input_ids[offset : offset + length].copy_(
+                row.token_ids.reshape(-1), non_blocking=True
+            )
+            self._positions(row.positions, offset, length)
+            offsets = row.candidate_offsets
+            for index, token in enumerate(row.slot_tokens):
+                slots.append(offset + token)
+                groups.append(
+                    row.candidate_ids[offsets[index] : offsets[index + 1]]
+                )
+            offset += length
+
+        count = len(slots)
+        slot_tokens = self.slot_tokens[:count]
+        slot_tokens.copy_(
+            torch.tensor(slots, dtype=torch.int64), non_blocking=True
+        )
+
+        # A [slots, width] matrix holds every slot's candidates, padded with
+        # its first one; the selection names the real entries in order.
+        width = max(map(len, groups))
+        matrix = torch.tensor(
+            [group + (group[0],) * (width - len(group)) for group in groups],
+            dtype=torch.int64,
+        )
+        selection = torch.tensor(
+            [
+                slot * width + index
+                for slot, group in enumerate(groups)
+                for index in range(len(group))
+            ],
+            dtype=torch.int64,
+        )
+        backing = self._candidate_backing(matrix.numel() + selection.numel())
+        candidates = backing[: matrix.numel()].view(count, width)
+        candidates.copy_(matrix, non_blocking=True)
+        selected = backing[matrix.numel() : matrix.numel() + selection.numel()]
+        selected.copy_(selection, non_blocking=True)
+
+        canvas = CanvasInput(
+            self.input_ids[:total], self.positions[0, :total], staged
+        )
+        inputs = ReadoutInput(
+            canvas,
+            slot_tokens,
+            candidates,
+            selected,
+            tuple(len(row.candidate_ids) for row in rows),
+        )
+        return inputs, (), None
+
+    def _candidate_backing(self, size):
+        """Return candidate storage of at least ``size`` int64 elements.
+
+        Replacing the backing is ordered after earlier readers by the
+        caching allocator, since every reader runs on this staging stream.
+        """
+        if self._candidates.numel() < size:
+            self._candidates = torch.empty(
+                size, dtype=torch.int64, device=self.device
+            )
+        return self._candidates
+
+
 class DiffusionBuffers(AttentionBuffers):
     """Stage spatial attention and solver times without text storage."""
 
@@ -861,6 +988,10 @@ def input_buffer_config(kind, limits: TokenBufferConfig):
     Raises:
         ValueError: ``kind`` has no fixed row staging.
     """
+    if kind is ForwardMode.TOKEN_DENOISING:
+        return CanvasBuffers, CanvasBufferConfig(
+            limits.max_rows, limits.max_tokens, limits.table_widths
+        )
     if isinstance(kind, ForwardMode):
         return TokenBuffers, limits
     if kind is MediaCall.DENOISING:

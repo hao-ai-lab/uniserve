@@ -88,7 +88,7 @@ pub struct ReadoutRow {
     /// Canvas token ids.
     pub token_ids: Vec<u32>,
     /// Positions whose candidate log-probabilities the row reports, in
-    /// report order.
+    /// increasing position order, which is also report order.
     pub slots: Vec<ReadoutSlot>,
 }
 
@@ -1022,6 +1022,13 @@ fn validate_readout(request: &GenerationRequest) -> Result<(), GenerationRequest
         if row.token_ids.is_empty() || row.slots.is_empty() {
             return Err(GenerationRequestError::EmptyReadoutRow);
         }
+        if row
+            .slots
+            .windows(2)
+            .any(|pair| pair[0].position >= pair[1].position)
+        {
+            return Err(GenerationRequestError::UnorderedReadoutSlots);
+        }
         for slot in &row.slots {
             if slot.position as usize >= row.token_ids.len() {
                 return Err(GenerationRequestError::ReadoutSlotOutsideRow {
@@ -1129,6 +1136,9 @@ pub enum GenerationRequestError {
     /// A readout slot names no candidate token.
     #[error("every readout slot must read at least one candidate")]
     EmptyReadoutSlot,
+    /// A readout row's slot positions do not strictly increase.
+    #[error("readout slots must be listed in increasing position order")]
+    UnorderedReadoutSlots,
     /// Text sampling parameters are invalid.
     #[error("invalid sampling parameters: {0}")]
     InvalidSampling(#[source] SamplingParamsError),
@@ -1607,6 +1617,13 @@ mod tests {
         assert_eq!(
             unread.validate(),
             Err(GenerationRequestError::EmptyReadoutSlot)
+        );
+
+        let mut unordered = readout_request();
+        unordered.readout[0].slots.swap(0, 1);
+        assert_eq!(
+            unordered.validate(),
+            Err(GenerationRequestError::UnorderedReadoutSlots)
         );
     }
 }

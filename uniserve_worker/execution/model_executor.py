@@ -50,6 +50,7 @@ from uniserve.model import (
     TextConditioner,
     TextEncoder,
     TextSize,
+    TokenDenoiser,
     VideoDecoder,
     VideoPostprocessor,
 )
@@ -1229,13 +1230,15 @@ class ModelExecutor:
                                 else {}
                             ),
                         )
+                        # Token passes and image denoising read the paged
+                        # KV cache; canvas passes read it without writing.
+                        reads_cache = isinstance(
+                            call.module,
+                            (CausalLM, ImageDenoiser, TokenDenoiser),
+                        )
                         context = ExecutionContext(
                             call.module,
-                            cache=kv_cache.cache
-                            if isinstance(
-                                call.module, (CausalLM, ImageDenoiser)
-                            )
-                            else None,
+                            cache=kv_cache.cache if reads_cache else None,
                             attention=self.attention,
                             stream=stream,
                             groups=call.groups,
@@ -1246,9 +1249,7 @@ class ModelExecutor:
                         # shapes encountered during preparation/eager execution.
                         size = (
                             TextSize(fields.max_tokens, fields.max_rows)
-                            if isinstance(
-                                call.module, (CausalLM, ImageDenoiser)
-                            )
+                            if reads_cache
                             else None
                         )
                         entry = self._runner_types[id(call)](

@@ -1588,7 +1588,8 @@ fn merge_completion_record(
         rank_completion.media.as_ref().is_ok_and(Option::is_none)
             && rank_completion.output.sampled_logprob.is_none()
             && rank_completion.output.top_logprobs.is_empty()
-            && rank_completion.output.prompt_logprobs.is_empty(),
+            && rank_completion.output.prompt_logprobs.is_empty()
+            && rank_completion.output.candidate_logprobs.is_empty(),
         "non-designated rank returned public output"
     );
     anyhow::ensure!(

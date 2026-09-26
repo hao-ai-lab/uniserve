@@ -588,7 +588,8 @@ class Readout:
     """Candidate log-probabilities a token-denoising call reads at slots.
 
     The call's ``input_token_ids`` hold its canvas rows back to back. Slot
-    ``i`` is canvas token ``slot_tokens[i]`` of that sequence and reads the
+    ``i`` is canvas token ``slot_tokens[i]`` of that sequence, slots
+    increase along it, and slot ``i`` reads the
     candidate ids ``candidate_ids[candidate_offsets[i]:candidate_offsets[i +
     1]]``. The call reports each candidate's natural-log probability under
     the log-softmax over the full vocabulary of the logits at its slot, in
@@ -604,8 +605,9 @@ class Readout:
 
         Raises:
             WorkerError: A slot lies outside the call's ``canvas_tokens``
-                canvas tokens, reads no candidate, or the offsets do not
-                partition ``candidate_ids`` in slot order.
+                canvas tokens, slots do not increase, a slot reads no
+                candidate, or the offsets do not partition ``candidate_ids``
+                in slot order.
         """
         offsets = self.candidate_offsets
         if not self.slot_tokens or len(offsets) != len(self.slot_tokens) + 1:
@@ -627,6 +629,13 @@ class Readout:
             raise invalid_descriptor(
                 "readout slot lies outside the call's canvas rows"
             )
+        if any(
+            left >= right
+            for left, right in zip(
+                self.slot_tokens, self.slot_tokens[1:], strict=False
+            )
+        ):
+            raise invalid_descriptor("readout slots are not in canvas order")
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "readout") -> Readout:

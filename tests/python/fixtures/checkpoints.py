@@ -6,9 +6,13 @@ dimensions are small enough for CPU equation references.
 
 from __future__ import annotations
 
+import json
+
 import torch
 from safetensors.torch import save_file
 from transformers import (
+    DiffusionGemmaConfig,
+    DiffusionGemmaForBlockDiffusion,
     Qwen3Config,
     Qwen3ForCausalLM,
     Qwen3MoeConfig,
@@ -19,6 +23,7 @@ from uniserve import loading
 from uniserve.diffusion import NoiseScale
 from uniserve.loading import checkpoint, weights
 from uniserve_models import bagel, siglip
+from uniserve_models import loading as models
 from uniserve_models import sensenova_u1 as u1
 from uniserve_models.bagel import vae
 from uniserve_models.sensenova_u1 import flow, vision
@@ -246,3 +251,134 @@ def sensenova_checkpoint(root, dtype):
         device="cpu",
     ).model
     return model, state
+
+
+# Transformers' sliding window counts the query: seven history tokens.
+WINDOW = 8
+SOFTCAP = 0.5
+HIDDEN, VOCAB = 32, 64
+IMAGE, BEGIN_IMAGE, END_IMAGE = 60, 58, 59
+
+
+def diffusion_gemma_checkpoint(
+    root, *, text=None, vision=None, unit_scores=False
+):
+    """Save a two-layer DiffusionGemma checkpoint; return its reference.
+
+    Layer 0 attends through a sliding window and layer 1 fully, with no
+    value projection and proportional rotation of a quarter of its 16-wide
+    heads. Norm weights, router scales, layer scalars, vision positions and
+    standardization are randomized so each factor is observable, and the
+    head's logits are large enough for the small softcap to bend them. The
+    tokenizer files declare the canvas's special tokens: pad 0, mask 4 and
+    end of turn 6. ``text`` and ``vision`` override entries of the text and
+    vision configurations. ``unit_scores`` scales every query norm by the
+    inverse square root of its head width, so the unscaled attention scores
+    of normalized queries and keys have unit variance, as trained query
+    norms keep them, instead of growing with the head width.
+    """
+    config = DiffusionGemmaConfig(
+        text_config={
+            "vocab_size": VOCAB,
+            "hidden_size": HIDDEN,
+            "intermediate_size": 48,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "global_head_dim": 16,
+            "num_global_key_value_heads": 1,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": WINDOW,
+            "num_experts": 6,
+            "top_k_experts": 2,
+            "moe_intermediate_size": 16,
+            "use_bidirectional_attention": "vision",
+            "max_position_embeddings": 256,
+            "rms_norm_eps": 1e-6,
+            **(text or {}),
+        },
+        vision_config={
+            "model_type": "gemma4_vision",
+            "hidden_size": 24,
+            "intermediate_size": 40,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "head_dim": 12,
+            "patch_size": 4,
+            "pooling_kernel_size": 3,
+            "position_embedding_size": 32,
+            "rope_parameters": {"rope_theta": 100.0, "rope_type": "default"},
+            "standardize": True,
+            "use_clipped_linears": False,
+            **(vision or {}),
+        },
+        canvas_length=16,
+        image_token_id=IMAGE,
+        boi_token_id=BEGIN_IMAGE,
+        eoi_token_id=END_IMAGE,
+    )
+    config._attn_implementation = "eager"
+    torch.manual_seed(313)
+    model = DiffusionGemmaForBlockDiffusion(config).eval()
+    model.final_logit_softcapping = SOFTCAP
+
+    def uniform(value, low, high):
+        value.copy_(torch.rand_like(value) * (high - low) + low)
+
+    with torch.no_grad():
+        for name, value in model.named_parameters():
+            if name.endswith(".weight") and "norm" in name.split(".")[-2]:
+                uniform(value, 0.8, 1.2)
+            if unit_scores and name.endswith("q_norm.weight"):
+                value.mul_(value.numel() ** -0.5)
+        encoder = model.model.encoder
+        for index, layer in enumerate(model.model.decoder.layers):
+            uniform(layer.router.scale, 0.5, 1.5)
+            uniform(layer.router.per_expert_scale, 0.5, 2.0)
+            # Both stored copies of a layer scalar agree, as in the released
+            # checkpoints.
+            uniform(layer.layer_scalar, 0.3, 1.2)
+            encoder.language_model.layers[index].layer_scalar.copy_(
+                layer.layer_scalar
+            )
+        tower = encoder.vision_tower
+        tower.patch_embedder.position_embedding_table.normal_(std=0.02)
+        tower.std_bias.normal_(std=0.1)
+        uniform(tower.std_scale, 0.5, 1.5)
+
+    model.save_pretrained(root)
+    metadata = json.loads((root / "config.json").read_text())
+    metadata["text_config"]["final_logit_softcapping"] = SOFTCAP
+    metadata["vision_soft_tokens_per_image"] = 70
+    (root / "config.json").write_text(json.dumps(metadata))
+    (root / "generation_config.json").write_text(
+        json.dumps({"eos_token_id": [1, 6]})
+    )
+    (root / "tokenizer_config.json").write_text(
+        json.dumps(
+            {"pad_token": "<pad>", "mask_token": "<mask>", "eot_token": "<e>"}
+        )
+    )
+    (root / "tokenizer.json").write_text(
+        json.dumps(
+            {
+                "added_tokens": [
+                    {"id": 0, "content": "<pad>"},
+                    {"id": 4, "content": "<mask>"},
+                    {"id": 6, "content": "<e>"},
+                ]
+            }
+        )
+    )
+    return model
+
+
+def load_diffusion_gemma(root):
+    """Load the checkpoint's public DiffusionGemma model in FP32 on the CPU."""
+    return models.load_model(
+        models.read_config(root),
+        device="cpu",
+        weights=weights.Config(dtype=torch.float32),
+    ).model
