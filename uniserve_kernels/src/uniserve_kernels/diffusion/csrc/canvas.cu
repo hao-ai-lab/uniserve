@@ -929,12 +929,14 @@ struct AdvanceParams {
   EosIds eos;
 };
 
-// One CTA per canvas row, one thread per canvas position.
+// One CTA per canvas row, one thread per canvas position. The kernel is
+// latency-bound: every global read issues up front, work that does not
+// depend on the acceptance prefix runs before it, and the one sequential
+// part, the FP64 prefix chain, reads pre-widened values.
 __global__ void advance_kernel(const AdvanceParams params) {
   extern __shared__ __align__(16) float row_smem[];
-  float* entropies = row_smem;
-  float* ordered = entropies + params.canvas;
-  float* prefix = ordered + params.canvas;
+  float* entropies = row_smem;                                          // [canvas]
+  double* prefixes = reinterpret_cast<double*>(entropies + params.canvas);  // [canvas]
   __shared__ double partial[kWarp];
   __shared__ double total;
   __shared__ int first_eos;
@@ -945,41 +947,14 @@ __global__ void advance_kernel(const AdvanceParams params) {
   const int64_t offset = static_cast<int64_t>(row) * canvas + c;
   const float h = params.entropy[offset];
   const int64_t argmax = params.argmax[offset];
+  const int64_t sample = params.sample[offset];
+  const int64_t seed = params.seed[row];
+  const int64_t block = params.block[row];
+  const int64_t step = params.step[row];
   entropies[c] = h;
   if (c == 0) {
     first_eos = canvas;
   }
-  __syncthreads();
-
-  // Stable ascending rank: smaller entropies first, equal ones by position.
-  int rank = 0;
-  for (int j = 0; j < canvas; ++j) {
-    const float other = entropies[j];
-    rank += (other < h) || (other == h && j < c);
-  }
-  ordered[rank] = h;
-  __syncthreads();
-
-  // Prefix sums accumulate sequentially in FP64 in sorted order and round
-  // each prefix to FP32, which is how the CPU cumsum of the portable
-  // formula evaluates FP32 input.
-  if (c == 0) {
-    double running = 0.0;
-    for (int k = 0; k < canvas; ++k) {
-      running += static_cast<double>(ordered[k]);
-      prefix[k] = static_cast<float>(running);
-    }
-  }
-  __syncthreads();
-  const bool accepted = __fsub_rn(prefix[rank], h) <= params.bound;
-
-  const int64_t seed = params.seed[row];
-  const int64_t block = params.block[row];
-  const int64_t step = params.step[row];
-  const uint4 noise = philox(static_cast<uint64_t>(seed), 0u, static_cast<uint32_t>(c),
-                             static_cast<uint32_t>(step), block_word(block, kStreamRenoise));
-  params.canvas_tokens[offset] =
-      accepted ? params.sample[offset] : random_token(noise.x, params.vocab);
 
   // Stable: the argmax canvas equals each of the previous `stability` ones.
   // Each thread owns its history column, oldest entry first.
@@ -994,9 +969,16 @@ __global__ void advance_kernel(const AdvanceParams params) {
   if (params.stability) {
     column[static_cast<int64_t>(params.stability - 1) * canvas] = argmax;
   }
-  const bool stable = __syncthreads_and(same);
+
+  bool eos = false;
+  for (int e = 0; e < params.eos.count; ++e) {
+    eos |= argmax == params.eos.ids[e];
+  }
+  const uint4 noise = philox(static_cast<uint64_t>(seed), 0u, static_cast<uint32_t>(c),
+                             static_cast<uint32_t>(step), block_word(block, kStreamRenoise));
 
   // Confident: the FP64 mean entropy, rounded to FP32, is below the bound.
+  // Lanes reduce here; one thread adds the warps' partials in order below.
   double value = static_cast<double>(h);
   for (int shift = kWarp / 2; shift; shift >>= 1) {
     value += __shfl_down_sync(0xffffffffu, value, shift);
@@ -1004,15 +986,51 @@ __global__ void advance_kernel(const AdvanceParams params) {
   if (c % kWarp == 0) {
     partial[c / kWarp] = value;
   }
-  bool eos = false;
-  for (int e = 0; e < params.eos.count; ++e) {
-    eos |= argmax == params.eos.ids[e];
-  }
+  __syncthreads();
   if (eos) {
     atomicMin(&first_eos, c);
   }
-  __syncthreads();
+
+  // Stable ascending rank: smaller entropies first, equal ones by position.
+  // Four entries per shared-memory read and two counts keep the scan
+  // throughput-bound.
+  const float4* entropies4 = reinterpret_cast<const float4*>(entropies);
+  int rank_even = 0;
+  int rank_odd = 0;
+#pragma unroll 8
+  for (int j = 0; j < canvas / 4; ++j) {
+    const float4 other = entropies4[j];
+    const int k = 4 * j;
+    rank_even += (other.x < h) || (other.x == h && k < c);
+    rank_odd += (other.y < h) || (other.y == h && k + 1 < c);
+    rank_even += (other.z < h) || (other.z == h && k + 2 < c);
+    rank_odd += (other.w < h) || (other.w == h && k + 3 < c);
+  }
+  const int rank = rank_even + rank_odd;
+  prefixes[rank] = static_cast<double>(h);
+  const bool stable = __syncthreads_and(same);
+
+  // Prefix sums accumulate sequentially in FP64 in sorted order, which is
+  // how the CPU cumsum of the portable formula evaluates FP32 input; each
+  // prefix rounds to FP32 below. The mean's partials sum on another thread
+  // meanwhile.
   if (c == 0) {
+    // Eight values load ahead of their additions, off the FP64 chain.
+    double running = 0.0;
+    for (int k = 0; k < canvas; k += 8) {
+      double terms[8];
+#pragma unroll
+      for (int u = 0; u < 8; ++u) {
+        terms[u] = prefixes[k + u];
+      }
+#pragma unroll
+      for (int u = 0; u < 8; ++u) {
+        running += terms[u];
+        prefixes[k + u] = running;
+      }
+    }
+  }
+  if (c == canvas - 1) {
     double sum = 0.0;
     for (int w = 0; w < canvas / kWarp; ++w) {
       sum += partial[w];
@@ -1020,6 +1038,11 @@ __global__ void advance_kernel(const AdvanceParams params) {
     total = sum;
   }
   __syncthreads();
+
+  const bool accepted =
+      __fsub_rn(static_cast<float>(prefixes[rank]), h) <= params.bound;
+  params.canvas_tokens[offset] = accepted ? sample : random_token(noise.x, params.vocab);
+
   const float mean = static_cast<float>(total / canvas);
   const bool stop = stable && mean < params.confidence;
   const bool done = stop || step == params.steps - 1;
@@ -1276,7 +1299,7 @@ void advance(torch::Tensor entropy, torch::Tensor argmax, torch::Tensor sample,
   for (int e = 0; e < kMaxEos; ++e) {
     params.eos.ids[e] = e < params.eos.count ? eos[e] : -1;
   }
-  const size_t smem = 3 * static_cast<size_t>(canvas) * sizeof(float);
+  const size_t smem = static_cast<size_t>(canvas) * (sizeof(float) + sizeof(double));
   advance_kernel<<<static_cast<unsigned>(rows), static_cast<unsigned>(canvas), smem,
                    at::cuda::getCurrentCUDAStream()>>>(params);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
