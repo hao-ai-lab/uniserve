@@ -4,6 +4,8 @@ It also preserves cache state.
 """
 
 from dataclasses import replace
+from importlib import import_module
+from types import MappingProxyType
 
 import pytest
 import torch
@@ -43,6 +45,36 @@ from uniserve_worker.storage.kv_cache import KVCacheManager
 from uniserve_worker.storage.latent_pool import LatentPool
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
+
+
+def _placed_entries(model, devices):
+    """Declare the model's methods whose modules sit on ``devices``.
+
+    These tests load a model's text and denoising modules, and for SenseNova
+    its vision tower, onto the worker devices; the other modules stay
+    unloaded, so the worker binds, warms and serves only the placed ones.
+    """
+    declared = import_module(type(model).__module__).entry_points(model.config)
+    placed = {torch.device(device) for device in devices}
+
+    def on_devices(point):
+        module = model.get_submodule(point.method.rpartition(".")[0])
+        return all(
+            value.device in placed
+            for value in (*module.parameters(), *module.buffers())
+        )
+
+    return MappingProxyType(
+        {
+            name: replace(
+                entry,
+                points=tuple(
+                    point for point in entry.points if on_devices(point)
+                ),
+            )
+            for name, entry in declared.items()
+        }
+    )
 
 
 @torch.inference_mode()
@@ -122,7 +154,14 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
         flow_graph_shapes=((16, 16),),
         flow_graph_batch_sizes=(1,),
     )
-    runner = ModelExecutor(model, config, bindings=bindings)
+    runner = ModelExecutor(
+        model,
+        config,
+        bindings=bindings,
+        entry_points=_placed_entries(
+            model, ("cuda:0", generation_device or "cuda:0")
+        ),
+    )
     size = image.Config(16, 16)
     factory = runner.image_builder
     shape = factory.denoiser.latent_shape("image", size)
@@ -402,6 +441,7 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         sampling_group=group,
         tokenizer=None,
         allowed_calls=supported_calls(model),
+        entry_points=_placed_entries(model, ("cuda:0",)),
         queue_depth=2,
         completion_payload_bytes=1 << 16,
         components=(("model", placement),),

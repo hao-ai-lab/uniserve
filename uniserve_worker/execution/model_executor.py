@@ -1389,12 +1389,17 @@ class ModelExecutor:
 
     @torch.inference_mode()
     def capture(self, *, tokenizer, latents):
-        """Capture every entry's configured prefill, decode, and flow graphs.
+        """Prepare every staged entry before serving.
 
-        An entry that captures no graph of a kind runs one eager call of it.
+        Captures each entry's configured prefill, decode and flow graphs,
+        running one eager call of each kind that captures none, then runs
+        one synthetic image through every image encoding and decoding entry
+        (see ``startup.prepare_images``), so every staged call kind has
+        prepared its call sites and chosen its kernels.
         """
         from uniserve_worker.model_executor.startup import (
             prepare_decode,
+            prepare_images,
             prepare_prefill,
         )
 
@@ -1425,6 +1430,7 @@ class ModelExecutor:
                     )
 
                     prepare_flow(self, entry, latents, tokenizer)
+        prepare_images(self, latents)
         self.synchronize()
 
     def complete_startup(self):

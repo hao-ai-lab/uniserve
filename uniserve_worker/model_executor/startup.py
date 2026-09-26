@@ -7,6 +7,9 @@ prefixes resolved through the model's ``FlowPrompt``) through the same
 ``TokenBuffers`` and ``DiffusionBuffers`` serving uses, on scratch KV units and
 latent values leased from the idle pools, and capture each configured bucket;
 when graphs are disabled, representative calls run eagerly as warmup instead.
+Image encoders and decoders, which run eagerly, evaluate one synthetic image
+each (``prepare_images``), so every staged call kind has prepared its call
+sites and chosen its kernels before serving.
 """
 
 from __future__ import annotations
@@ -25,11 +28,16 @@ from uniserve_worker.model_executor.diffusion_inputs import (
     DiffusionRow,
     resolve_prefix,
 )
+from uniserve_worker.model_executor.image_inputs import (
+    DecodeRow,
+    VisionRow,
+    prepare_tensor_image,
+)
 from uniserve_worker.model_executor.input_batch import InputBatch, TokenRow
 from uniserve_worker.model_executor.input_buffers import TokenBuffers
 from uniserve_worker.model_executor.model_runner import ModelRunner
 from uniserve_worker.model_executor.output import ExecutionOutput
-from uniserve_worker.protocol.call import ForwardMode, ImageParams
+from uniserve_worker.protocol.call import ForwardMode, ImageParams, MediaCall
 from uniserve_worker.sampling.metadata import TokenSelection
 from uniserve_worker.storage.block_tables import GroupTable
 from uniserve_worker.storage.kv_cache import KVCacheManager
@@ -476,3 +484,136 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
 
     if stream is not None:
         torch.cuda.current_stream(entry.device).wait_stream(stream.stream)
+
+
+@torch.inference_mode()
+def prepare_images(runner: ModelExecutor, latents) -> None:
+    """Evaluate one synthetic image in every image input and output call.
+
+    Vision and latent encoding stage a black square through the model's
+    image processor, as a request image is staged; image decoding decodes a
+    zero latent of an image that square's size; and a model that writes an
+    input image's latent into its prompt (framed latent features, as
+    ``execution.image.latent_state_row`` builds them) writes one on scratch
+    KV units through its denoising entry. Latents come from the latent pool
+    ``latents``. These calls run eagerly, so this prepares their call sites
+    and resolves their kernels, and a call without a native kernel fails
+    here rather than at the first request. Kernel selection depends on each
+    call's representation, not its extent, so the square is small: two
+    latent patches of the image denoiser on a side, which any latent pool
+    holds, or 64 pixels without a denoiser. Each transform resizes it to its
+    tower's bounds, as it would a request image.
+    """
+    builder = runner.image_builder
+    side = 64 if builder is None else 2 * builder.denoiser.downsample
+    size = media_image.Config(side, side)
+    # Only a model whose input images reach the prompt as framed latents
+    # (and not only as vision features) writes latent features.
+    latent_features = (
+        builder is not None
+        and builder.framing == 2
+        and latents is not None
+        and any(
+            MediaCall.LATENT_ENCODING in entry.call_kinds
+            for entry in runner.entries.values()
+        )
+    )
+    for entry in runner.entries.values():
+        stream = entry.context.stream
+        if stream is not None:
+            stream.wait(torch.cuda.current_stream(entry.device))
+        for kind in (MediaCall.VISION_ENCODING, MediaCall.LATENT_ENCODING):
+            if kind not in entry.call_kinds or runner.processor is None:
+                continue
+            prepared = prepare_tensor_image(
+                runner.processor,
+                kind,
+                torch.zeros((3, side, side)),
+                device=entry.device,
+                signed_unit=False,
+            )
+            row = VisionRow(
+                forward_mode=kind,
+                encode_pixels=prepared.pixels,
+                encode_grid=prepared.grid,
+                encode_grid_shape=prepared.grid_shape,
+            )
+            with entry.context.activate():
+                batch = entry.prepare_inputs((row,), forward_mode=kind)
+            entry.eager_batch(batch, entry.batch_forward)
+        if (
+            MediaCall.IMAGE_DECODING in entry.call_kinds
+            and builder is not None
+            and latents is not None
+        ):
+            units = builder.denoiser.latent_shape("image", size)[0]
+            with latents.startup_values(1, units) as (latent,):
+                latent.zero_()
+                with entry.context.activate():
+                    batch = entry.prepare_inputs(
+                        (
+                            DecodeRow(
+                                forward_mode=MediaCall.IMAGE_DECODING,
+                                latent=latent.to(entry.device),
+                                image_height=side,
+                                image_width=side,
+                            ),
+                        ),
+                        forward_mode=MediaCall.IMAGE_DECODING,
+                    )
+                entry.eager_batch(batch, entry.batch_forward)
+        if latent_features and MediaCall.DENOISING in entry.call_kinds:
+            _write_latent_feature(runner, entry, latents, size)
+        # Activation has restored the caller's stream.
+        if stream is not None:
+            torch.cuda.current_stream(entry.device).wait_stream(stream.stream)
+
+
+def _write_latent_feature(runner, entry, latents, size):
+    """Write one zero image latent, framed, into scratch KV non-causally.
+
+    The row is the one ``execution.image.latent_state_row`` builds for an
+    input image at the start of an empty prompt: the latent at timestep
+    zero between the builder's two framing tokens, attending to itself in
+    both directions and writing its KV.
+    """
+    builder, cache = runner.image_builder, runner.kv_cache
+    query = builder.sequence_length(size)
+    units = builder.denoiser.latent_shape("image", size)[0]
+    with (
+        cache.startup_units(cache.page_units(query)) as scratch,
+        latents.startup_values(1, units) as (latent,),
+    ):
+        latent.zero_()
+        positions = builder.positions(size, 1, device=entry.device)
+        positions[0, 0] = 0
+        positions[0, -1] = builder.rope_advance
+        attention = from_tables(
+            table_pages(
+                scratch_tables(cache, scratch, (query,)),
+                prefix_lengths=(0,),
+                query_lengths=(query,),
+            ),
+            query_lengths=(query,),
+            prefix_lengths=(0,),
+            causal=(False,),
+            write=(True,),
+        )
+        row = DiffusionRow(
+            forward_mode=MediaCall.DENOISING,
+            positions=positions,
+            timestep=latent.new_zeros(1),
+            latent=latent.to(entry.device),
+            image_tokens=query,
+            image_height=size.height,
+            image_width=size.width,
+            request_pool_idx=1,
+            seq_len=0,
+            write_kv=True,
+            causal=False,
+        )
+        with entry.context.activate():
+            batch = entry.prepare_inputs(
+                (row,), forward_mode=MediaCall.DENOISING, attention=attention
+            )
+        entry.eager_batch(batch, entry.batch_forward)
