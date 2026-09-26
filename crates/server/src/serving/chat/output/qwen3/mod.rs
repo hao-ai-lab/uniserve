@@ -5,11 +5,8 @@
 //! Qwen3 XML tool calls from the remaining visible text. A stage without a
 //! parser forwards text unchanged.
 
-mod reasoning;
-mod tool;
-
-use self::reasoning::reasoning_event_stream;
-use self::tool::tool_event_stream;
+use super::reasoning::reasoning_event_stream;
+use super::tool::tool_event_stream;
 use crate::profile::reasoning::Qwen3ReasoningParser;
 use crate::profile::tools::Qwen3XmlToolParser;
 use crate::serving::chat::{ChatRequest, ChatToolChoice};

@@ -3,7 +3,8 @@
 //! A parser splits a stream of decoded text deltas into reasoning text and
 //! visible content by matching delimiter text such as `<think>` and
 //! `</think>`. [`DelimitedReasoningParser`] implements the state machine;
-//! [`Qwen3ReasoningParser`] configures it for Qwen3 chat output, and the
+//! [`Qwen3ReasoningParser`] configures it for Qwen3 chat output behind the
+//! [`ReasoningParser`] interface that the chat output stage consumes, and the
 //! multimodal output filter in `serving::omni::output` configures it from a
 //! profile's `OutputFilterPolicy`.
 
@@ -16,6 +17,25 @@ use thiserror::Error;
 
 pub use self::delimited::DelimitedReasoningParser;
 pub use self::qwen3::Qwen3ReasoningParser;
+
+/// Incremental split of one generation's decoded text into reasoning and
+/// visible content.
+///
+/// One instance serves one generation stream: call `initialize` with the
+/// prompt, `push` for each decoded delta, then `finish` once at end of stream.
+pub trait ReasoningParser: Send {
+    /// Chooses the region generation starts in from the prompt token IDs.
+    fn initialize(&mut self, prompt_token_ids: &[u32]);
+
+    /// Parses one decoded text delta into its reasoning and content parts.
+    ///
+    /// Text that could begin a delimiter stays buffered until a later delta
+    /// completes or rules it out, so the returned delta may be empty.
+    fn push(&mut self, delta: &str) -> ReasoningDelta;
+
+    /// Flushes buffered text at end of stream as text of the current region.
+    fn finish(&mut self) -> ReasoningDelta;
+}
 
 /// Result alias for reasoning parser calls.
 pub type Result<T> = std::result::Result<T, ReasoningError>;

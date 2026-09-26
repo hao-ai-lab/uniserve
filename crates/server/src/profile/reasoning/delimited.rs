@@ -8,14 +8,13 @@
 
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 
-use super::{ReasoningDelta, ReasoningError, Result};
+use super::{ReasoningDelta, ReasoningError, ReasoningParser, Result};
 
 /// Shared incremental state machine for configured tag-delimited reasoning.
 ///
-/// One instance serves one generation stream: optionally call
-/// [`DelimitedReasoningParser::initialize`] with the prompt, then
-/// [`DelimitedReasoningParser::push`] for each decoded delta, then
-/// [`DelimitedReasoningParser::finish`] once at end of stream.
+/// One instance serves one generation stream through its [`ReasoningParser`]
+/// implementation: optionally call `initialize` with the prompt, then `push`
+/// for each decoded delta, then `finish` once at end of stream.
 pub struct DelimitedReasoningParser {
     tokenizer: DynTokenizer,
     current_in_reasoning: bool,
@@ -79,49 +78,6 @@ impl DelimitedReasoningParser {
         })
     }
 
-    /// Initializes parser state from the prompt token IDs.
-    ///
-    /// The last delimiter token in the prompt decides where generation starts
-    /// when no other special token follows it: with `<think>` delimiters, a
-    /// prompt ending in `<think>` starts inside reasoning and one ending in
-    /// `</think>` starts in visible content. Otherwise the parser starts in the
-    /// `default_in_reasoning` region.
-    pub fn initialize(&mut self, prompt_token_ids: &[u32]) {
-        self.current_in_reasoning = last_reasoning_boundary(
-            prompt_token_ids,
-            self.start_token_id,
-            self.end_token_id,
-            self.tokenizer.as_ref(),
-        )
-        .unwrap_or(self.default_in_reasoning);
-    }
-
-    /// Parses one decoded text delta and returns its reasoning/content split.
-    ///
-    /// Text that could begin a delimiter stays buffered, so the returned
-    /// delta may be empty.
-    pub fn push(&mut self, delta: &str) -> ReasoningDelta {
-        self.buffer.push_str(delta);
-
-        // Keep only the possible partial delimiter in the buffer and parse
-        // everything before it.
-        let partial_suffix_len = self.partial_suffix_len(&self.buffer);
-        let stable_len = self.buffer.len() - partial_suffix_len;
-        let pending_suffix = self.buffer.split_off(stable_len);
-        let stable_text = std::mem::replace(&mut self.buffer, pending_suffix);
-
-        self.parse_stable_text(&stable_text)
-    }
-
-    /// Flushes any buffered partial delimiter suffix at end of stream.
-    ///
-    /// The unfinished delimiter text is emitted as ordinary text of the
-    /// current region.
-    pub fn finish(&mut self) -> ReasoningDelta {
-        let stable_text = std::mem::take(&mut self.buffer);
-        self.parse_stable_text(&stable_text)
-    }
-
     /// Parses text that is known not to end with a partial delimiter suffix.
     fn parse_stable_text(&mut self, mut stable: &str) -> ReasoningDelta {
         let mut delta = ReasoningDelta::default();
@@ -180,6 +136,51 @@ impl DelimitedReasoningParser {
         }
 
         best
+    }
+}
+
+impl ReasoningParser for DelimitedReasoningParser {
+    /// Initializes parser state from the prompt token IDs.
+    ///
+    /// The last delimiter token in the prompt decides where generation starts
+    /// when no other special token follows it: with `<think>` delimiters, a
+    /// prompt ending in `<think>` starts inside reasoning and one ending in
+    /// `</think>` starts in visible content. Otherwise the parser starts in the
+    /// `default_in_reasoning` region.
+    fn initialize(&mut self, prompt_token_ids: &[u32]) {
+        self.current_in_reasoning = last_reasoning_boundary(
+            prompt_token_ids,
+            self.start_token_id,
+            self.end_token_id,
+            self.tokenizer.as_ref(),
+        )
+        .unwrap_or(self.default_in_reasoning);
+    }
+
+    /// Parses one decoded text delta and returns its reasoning/content split.
+    ///
+    /// Text that could begin a delimiter stays buffered, so the returned
+    /// delta may be empty.
+    fn push(&mut self, delta: &str) -> ReasoningDelta {
+        self.buffer.push_str(delta);
+
+        // Keep only the possible partial delimiter in the buffer and parse
+        // everything before it.
+        let partial_suffix_len = self.partial_suffix_len(&self.buffer);
+        let stable_len = self.buffer.len() - partial_suffix_len;
+        let pending_suffix = self.buffer.split_off(stable_len);
+        let stable_text = std::mem::replace(&mut self.buffer, pending_suffix);
+
+        self.parse_stable_text(&stable_text)
+    }
+
+    /// Flushes any buffered partial delimiter suffix at end of stream.
+    ///
+    /// The unfinished delimiter text is emitted as ordinary text of the
+    /// current region.
+    fn finish(&mut self) -> ReasoningDelta {
+        let stable_text = std::mem::take(&mut self.buffer);
+        self.parse_stable_text(&stable_text)
     }
 }
 

@@ -8,7 +8,7 @@ use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 
-use super::{DelimitedReasoningParser, Qwen3ReasoningParser};
+use super::{DelimitedReasoningParser, Qwen3ReasoningParser, ReasoningParser};
 
 /// Builds a tokenizer whose only special tokens are the reasoning delimiters
 /// and `<|im_end|>`, which stands in for a chat-turn boundary.
