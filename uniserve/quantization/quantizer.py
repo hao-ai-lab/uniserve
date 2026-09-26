@@ -140,7 +140,9 @@ class Quantizer:
 
         Over the logical statistical domain. Sharded reduction axes are
         all-reduced across the owning mesh group. ``out`` borrows caller
-        storage with the statistical shape.
+        storage with the statistical shape. CUDA inputs reduce with the
+        magnitude kernels and raise ``ValueError`` when no kernel reads their
+        layout.
         """
         self._shape(tuple(x.shape), x.dtype)
         self._distribution(tuple(x.shape), distribution)
@@ -157,7 +159,9 @@ class Quantizer:
         if isinstance(x, QuantizedTensor):
             x = x.dequantize(dtype=torch.float32)
 
-        if self.format == "mxfp8":
+        if x.is_cuda:
+            maximum = self._device_amax(x, shape)
+        elif self.format == "mxfp8":
             maximum = (
                 x.float()
                 .reshape(*x.shape[:-1], x.shape[-1] // 32, 32)
@@ -226,7 +230,9 @@ class Quantizer:
         Into this quantizer's representation. An input already encoded with
         the same quantizer is returned or repacked without recomputing
         scales. ``amax`` borrows caller-computed statistics;
-        ``out`` borrows caller-owned encoding storage.
+        ``out`` borrows caller-owned encoding storage. CUDA FP8 encoding runs
+        the row kernels and raises ``ValueError`` when no kernel reads the
+        input's layout.
         """
         self._shape(tuple(x.shape), x.dtype)
         self._distribution(tuple(x.shape), distribution)
@@ -259,47 +265,8 @@ class Quantizer:
                 "and device"
             )
 
-        # Row-wise FP8 with computed scales takes the fused single-kernel path.
-        if (
-            self.format == "fp8"
-            and self.axis == 0
-            and amax is None
-            and x.ndim == 2
-        ):
-            reduced_axes = (
-                ()
-                if distribution is None
-                else tuple(
-                    axis
-                    for axis, placement in zip(
-                        distribution.mesh.axes,
-                        distribution.placements,
-                        strict=True,
-                    )
-                    if isinstance(placement, Shard)
-                    and placement.dim % x.ndim == 1
-                )
-            )
-            if (
-                not reduced_axes
-                and x.is_cuda
-                and x.dtype in {torch.float16, torch.bfloat16}
-            ):
-                from uniserve_kernels import quantization
-
-                if quantization.can_run_rowwise_fp8(x):
-                    target = (
-                        self.empty(
-                            tuple(x.shape), dtype=x.dtype, device=x.device
-                        )
-                        if out is None
-                        else out
-                    )
-                    fields = target.buffers()
-                    quantization.rowwise_fp8(
-                        x, fields["values"], fields["scale"]
-                    )
-                    return target
+        if self.format == "fp8" and x.is_cuda:
+            return self._device_fp8(x, distribution, amax, out)
 
         # A calibrated activation tensor scale is a checkpoint fact. Runtime
         # callers may still supply scratch statistics used by the dynamic
@@ -318,8 +285,8 @@ class Quantizer:
 
         layout = ScaleLayout.LINEAR if out is None else out.scale_layout
         if self.format == "fp8":
-            # FP8 never carries a calibrated scale, so amax was supplied or
-            # computed above.
+            # FP8 off CUDA: it never carries a calibrated scale, so amax was
+            # supplied or computed above.
             assert amax is not None
             scale = amax.clamp_min(1e-12) / 448.0
             values = (
@@ -337,6 +304,111 @@ class Quantizer:
         for name, value in result.buffers().items():
             out.buffers()[name].copy_(value.reshape_as(out.buffers()[name]))
         return out
+
+    def _kernel_rows(self, x: torch.Tensor) -> tuple[torch.Tensor | None, str]:
+        """Return ``x`` as the ``[rows, width]`` matrix the FP8 kernels read.
+
+        Row scales retain axis zero of a rank-2 matrix. MXFP8 statistics
+        reduce each K32 block, so the blocks become the rows. A tensor-wide
+        statistic spans every element, so any rank whose leading axes
+        flatten to rows without a copy qualifies. The second element names
+        the unmet condition when the matrix is ``None``.
+        """
+        if self.format == "mxfp8":
+            try:
+                return x.view(-1, 32), ""
+            except RuntimeError:
+                return None, "K32 blocks do not flatten to rows without a copy"
+        if self.axis == 0:
+            if x.ndim == 2:
+                return x, ""
+            return None, (
+                "row statistics keep one value per leading index, which only "
+                "a rank-2 matrix has a kernel for"
+            )
+        try:
+            if x.ndim == 2:
+                return x, ""
+            return x.view(-1, x.shape[-1]) if x.ndim else x.view(1, 1), ""
+        except RuntimeError:
+            return None, "leading axes do not flatten to rows without a copy"
+
+    def _device_amax(
+        self, x: torch.Tensor, shape: tuple[int, ...]
+    ) -> torch.Tensor:
+        """Reduce CUDA magnitude statistics with the kernels, or raise."""
+        from uniserve_kernels.triton import require_kernel
+
+        from uniserve_kernels import quantization
+
+        maximum = torch.empty(shape, dtype=torch.float32, device=x.device)
+        if not x.numel():
+            return maximum.zero_()
+        matrix, reason = self._kernel_rows(x)
+        require_kernel(
+            "Quantizer.amax",
+            reason
+            if matrix is None
+            else quantization.unsupported_rowwise_fp8(matrix),
+            x=x,
+        )
+        if self.axis == 0 or self.format == "mxfp8":
+            quantization.row_absmax(matrix, maximum.view(-1))
+        else:
+            quantization.tensor_absmax(matrix, maximum)
+        return maximum
+
+    def _reduces_rows(self, x: torch.Tensor, distribution) -> bool:
+        """Return whether row statistics span columns held by other ranks.
+
+        Columns sharded over a mesh axis of one rank are complete locally.
+        """
+        return distribution is not None and any(
+            isinstance(placement, Shard)
+            and placement.dim % x.ndim == 1
+            and distribution.mesh.size((axis,)) > 1
+            for axis, placement in zip(
+                distribution.mesh.axes, distribution.placements, strict=True
+            )
+        )
+
+    def _device_fp8(self, x, distribution, amax, out) -> QuantizedTensor:
+        """Encode CUDA FP8 through the row kernels, or raise.
+
+        Row scales computed from complete local rows fuse the statistic into
+        the encoding launch. Supplied, tensor-wide or cross-rank statistics
+        are reduced first (``amax``), then the encoding reads them.
+        """
+        from uniserve_kernels.triton import require_kernel
+
+        from uniserve_kernels import quantization
+
+        matrix, reason = self._kernel_rows(x)
+        require_kernel(
+            "Quantizer.quantize(fp8)",
+            reason
+            if matrix is None
+            else quantization.unsupported_rowwise_fp8(matrix),
+            x=x,
+        )
+        if amax is None and (
+            self.axis is None or self._reduces_rows(x, distribution)
+        ):
+            amax = self.amax(x, distribution=distribution)
+
+        target = (
+            self.empty(tuple(x.shape), dtype=x.dtype, device=x.device)
+            if out is None
+            else out
+        )
+        fields = target.buffers()
+        quantization.rowwise_fp8(
+            matrix,
+            fields["values"].view(matrix.shape),
+            fields["scale"].view(-1),
+            amax=None if amax is None else amax.reshape(-1),
+        )
+        return target
 
     def _encode_blocks(self, x, maximum, layout, tensor_scale=None):
         """Encode K-blocks; NVFP4 derives its tensor scale from `maximum`
