@@ -515,15 +515,14 @@ def _token_worker_layout(
                     else None
                 )
                 if denoiser is not None:
-                    fixed_bytes[target] = fixed_bytes.get(target, 0) + sum(
-                        field.nbytes
-                        for field in CanvasSlots.denoiser_buffers(
-                            denoiser,
-                            request_pool_size=worker_config.max_request_pool_size,
-                            max_rows=input_config.max_rows,
-                            history_depth=worker_config.canvas_history_depth,
-                            cuda=torch.device(target).type == "cuda",
-                        ).values()
+                    fixed_bytes[target] = fixed_bytes.get(
+                        target, 0
+                    ) + CanvasSlots.denoiser_bytes(
+                        denoiser,
+                        request_pool_size=worker_config.max_request_pool_size,
+                        max_rows=input_config.max_rows,
+                        history_depth=worker_config.canvas_history_depth,
+                        device_type=torch.device(target).type,
                     )
 
         # Block tables, decode state and the KV import workspaces are charged

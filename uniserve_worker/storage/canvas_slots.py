@@ -36,10 +36,6 @@ FIELDS = ("canvas", "history", "self_conditioning")
 # vocabulary-wide tensors of a step. A pass steps as many whole canvases at
 # a time as fit, so its transient logits and its workspace stay bounded.
 STEP_BYTES = 2 << 30
-# Bytes of the cuBLASLt workspace the sampler's CUDA self-conditioning
-# product uses for split-K partial sums: the most it takes for any step
-# shape. The product runs without one on other devices.
-SCRATCH_BYTES = 256 << 20
 
 
 def step_rows(*, canvas_length: int, vocab_size: int, max_rows: int) -> int:
@@ -117,11 +113,9 @@ class CanvasSlots:
             request_pool_size=request_pool_size,
             max_rows=max_rows,
             canvas_length=tokens.length,
-            vocab_size=vocab_size,
             hidden_size=hidden_size,
             history_depth=history_depth,
             dtype=dtype,
-            cuda=torch.device(device).type == "cuda",
         )
         self.request_pool_size = int(request_pool_size)
         self.max_rows = int(max_rows)
@@ -143,11 +137,15 @@ class CanvasSlots:
         for tensor in tensors.values():
             tensor.zero_()
         self.banks = {name: tensors[name] for name in FIELDS}
-        self.workspace = sampler.CanvasWorkspace(
-            tensors["workspace_weights"],
-            tensors["workspace_normalizer"],
-            tensors["workspace_product"],
-            tensors["workspace_scratch"],
+        # One step chunk's sampler scratch, which every chunk of every pass
+        # reuses in stream order.
+        self.workspace = sampler.CanvasWorkspace.empty(
+            self.step_rows,
+            tokens.length,
+            vocab_size,
+            hidden_size,
+            dtype=dtype,
+            device=self.device,
         )
         # Per slot, the (block, step) it ran last; absent for a slot whose
         # canvas has not started since its request was admitted.
@@ -177,25 +175,45 @@ class CanvasSlots:
         )
 
     @classmethod
-    def denoiser_buffers(
+    def denoiser_bytes(
         cls,
         denoiser: TokenDenoiser,
         *,
         request_pool_size: int,
         max_rows: int,
         history_depth: int,
-        cuda: bool,
-    ) -> dict[str, BufferConfig]:
-        """``buffers`` of the slots ``for_denoiser`` allocates."""
+        device_type: str,
+    ) -> int:
+        """Device bytes of the slots ``for_denoiser`` allocates.
+
+        The banks and their staging (``buffers``) and one step chunk's
+        ``CanvasWorkspace`` on a device of type ``device_type``. Startup
+        sizing (``bootstrap.report``) charges them without an instance.
+        """
         fields = denoiser_fields(denoiser)
         tokens = fields.pop("tokens")
-        return cls.buffers(
+        vocab_size = fields.pop("vocab_size")
+        buffers = cls.buffers(
             request_pool_size=request_pool_size,
             max_rows=max_rows,
             canvas_length=tokens.length,
             history_depth=history_depth,
-            cuda=cuda,
             **fields,
+        )
+        rows = step_rows(
+            canvas_length=tokens.length,
+            vocab_size=vocab_size,
+            max_rows=max_rows,
+        )
+        return sum(
+            config.nbytes for config in buffers.values()
+        ) + sampler.CanvasWorkspace.nbytes(
+            rows,
+            tokens.length,
+            vocab_size,
+            fields["hidden_size"],
+            dtype=fields["dtype"],
+            device_type=device_type,
         )
 
     @staticmethod
@@ -204,37 +222,30 @@ class CanvasSlots:
         request_pool_size: int,
         max_rows: int,
         canvas_length: int,
-        vocab_size: int,
         hidden_size: int,
         history_depth: int,
         dtype: torch.dtype,
-        cuda: bool,
     ) -> dict[str, BufferConfig]:
-        """Describe the banks, their staging and the workspace, by name.
+        """Describe the banks and their staging, by name.
 
         Each field's bank has one row per slot and the sentinel, and its
         staging (``staged_<field>``) one row per canvas of a pass. A row of
         ``canvas`` holds int64 tokens ``[canvas]``, of ``history`` the int64
         argmax canvases ``[history_depth, canvas]``, and of
-        ``self_conditioning`` the embeddings ``[canvas, hidden]``. The
-        ``workspace_*`` fields are one step chunk's ``CanvasWorkspace``,
-        whose ``scratch`` holds ``SCRATCH_BYTES`` when the slots are on a
-        ``cuda`` device and nothing otherwise.
-        Startup sizing (``bootstrap.report``) charges them without an
-        instance.
+        ``self_conditioning`` the embeddings ``[canvas, hidden]``.
 
         Raises:
             ValueError: When a dimension is not positive or the history depth
                 is negative.
         """
         if (
-            min(request_pool_size, max_rows, canvas_length, vocab_size) < 1
+            min(request_pool_size, max_rows, canvas_length) < 1
             or hidden_size < 1
             or history_depth < 0
         ):
             raise ValueError("canvas state dimensions must be positive")
         counts = {"": int(request_pool_size) + 1, "staged_": int(max_rows)}
-        fields = {
+        return {
             f"{prefix}{name}": config
             for prefix, count in counts.items()
             for name, config in {
@@ -247,29 +258,11 @@ class CanvasSlots:
                 ),
             }.items()
         }
-        positions = (
-            step_rows(
-                canvas_length=canvas_length,
-                vocab_size=vocab_size,
-                max_rows=max_rows,
-            )
-            * canvas_length
-        )
-        return {
-            **fields,
-            "workspace_weights": BufferConfig((positions, vocab_size), dtype),
-            "workspace_normalizer": BufferConfig((positions,), torch.float32),
-            "workspace_product": BufferConfig(
-                (positions, hidden_size), torch.float32
-            ),
-            "workspace_scratch": BufferConfig(
-                (SCRATCH_BYTES if cuda else 0,), torch.uint8
-            ),
-        }
 
     def close(self) -> None:
-        """Release the banks once every reader has retired."""
+        """Release the banks and the workspace once every reader has retired."""
         self.banks = {}
+        self.workspace = None
         self._backing.close()
 
     def sampling(self, admitted) -> sampler.CanvasSampling:
