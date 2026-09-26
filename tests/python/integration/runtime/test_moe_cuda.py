@@ -1,7 +1,8 @@
 """Native grouped-expert kernels evaluate the routed expert equation.
 
-Every value is positive, so each rounding step bounds the relative error of
-every output independently of cancellation.
+Every value is positive where a test bounds relative error, so each rounding
+step bounds the relative error of every output independently of
+cancellation.
 """
 
 import pytest
@@ -9,6 +10,7 @@ import torch
 from torch.nn import functional as F
 
 from uniserve.model import TextSize
+from uniserve.nn import functional
 from uniserve.nn.moe import FusedMoE
 from uniserve.quantization import Quantizer, ScaleLayout
 from uniserve.runtime import CUDAStream, ExecutionContext
@@ -130,16 +132,17 @@ def test_bf16_experts_match_the_routed_equation(activation):
 
 
 def _nvfp4(codes, block_scale, tensor_scale):
-    """Encode positive E2M1 ``codes [E, rows, K]`` with per-expert scales.
+    """Encode E2M1 ``codes [E, rows, K]`` with per-expert scales.
 
-    ``block_scale`` holds one E4M3 byte per expert for all its blocks.
+    ``block_scale`` holds one E4M3 byte per expert for all its blocks, or
+    one byte per ``[E, rows, K / 16]`` block.
     """
     experts, rows, width = codes.shape
     codes, block_scale = codes.to(DEVICE), block_scale.to(DEVICE)
     values = (codes[..., 0::2] | (codes[..., 1::2] << 4)).to(torch.uint8)
-    scales = block_scale.to(torch.uint8)[:, None, None].expand(
-        experts, rows, width // 16
-    )
+    if block_scale.ndim == 1:
+        block_scale = block_scale[:, None, None]
+    scales = block_scale.to(torch.uint8).expand(experts, rows, width // 16)
     return (
         Quantizer("nvfp4")
         .from_tensors(
@@ -157,12 +160,8 @@ def _nvfp4(codes, block_scale, tensor_scale):
     )
 
 
-@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
-@torch.inference_mode()
-def test_nvfp4_experts_apply_per_expert_scales_and_static_activations(
-    activation,
-):
-    """Operands are exact in every encoding the kernel applies.
+def _exact_nvfp4(activation, generator):
+    """Return NVFP4 experts and hidden states every encoding keeps exact.
 
     Hidden blocks contain E2M1 magnitudes with a maximum of six, so the unit
     activation scale encodes them exactly. Each up row selects one hidden
@@ -172,7 +171,6 @@ def test_nvfp4_experts_apply_per_expert_scales_and_static_activations(
     Per-expert power-of-two tensor scales are compensated by block scales,
     so a kernel reading another expert's scale changes the result.
     """
-    generator = torch.Generator().manual_seed(43)
     module = FusedMoE(
         EXPERTS,
         HIDDEN,
@@ -222,6 +220,17 @@ def test_nvfp4_experts_apply_per_expert_scales_and_static_activations(
     )
     module.up_gate.input_quantizer = Quantizer("nvfp4", calibrated_scale=1.0)
     module.down.input_quantizer = Quantizer("nvfp4", calibrated_scale=1.0)
+    return module, hidden
+
+
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+@torch.inference_mode()
+def test_nvfp4_experts_apply_per_expert_scales_and_static_activations(
+    activation,
+):
+    """Operands are exact in every encoding the kernel applies."""
+    generator = torch.Generator().manual_seed(43)
+    module, hidden = _exact_nvfp4(activation, generator)
     ids, weights = _routes(generator)
 
     up_gate = module.up_gate.weight.dequantize(dtype=torch.float32)
@@ -234,6 +243,121 @@ def test_nvfp4_experts_apply_per_expert_scales_and_static_activations(
     # expert's projection and of the combined output, and the FP32 route
     # products and sums, remain.
     _replay_matches(module, hidden, ids, weights, expected, rtol=_gamma(3))
+
+
+@torch.inference_mode()
+def test_preparing_nvfp4_experts_keeps_one_copy_of_the_logical_weights():
+    """A kernel's physical placement changes neither values nor footprint."""
+    module, _ = _exact_nvfp4("gelu_tanh", torch.Generator().manual_seed(53))
+    logical = {
+        name: getattr(module, name).weight.dequantize()
+        for name in ("up_gate", "down")
+    }
+    # The smaller projection's encoded bytes: a retained second copy of
+    # either projection would exceed it.
+    smallest = min(
+        sum(
+            field.nbytes
+            for field in getattr(module, name).weight.buffers().values()
+        )
+        for name in ("up_gate", "down")
+    )
+    torch.cuda.synchronize(DEVICE)
+    resident = torch.cuda.memory_allocated(DEVICE)
+
+    with ExecutionContext(module) as context:
+        context.prepare(TextSize(TOKENS, 1))
+        torch.cuda.synchronize(DEVICE)
+        assert torch.cuda.memory_allocated(DEVICE) - resident < smallest
+        for name, value in logical.items():
+            assert torch.equal(getattr(module, name).weight.dequantize(), value)
+
+        # A second preparation borrows the placed weights as they are.
+        placed = module.up_gate.weight
+        context.prepare(TextSize(2 * TOKENS, 1))
+        assert module.up_gate.weight is placed
+
+
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+@torch.inference_mode()
+def test_nvfp4_gating_applies_the_declared_nonlinearity(activation):
+    """Each probe channel is the only nonzero input of its FC2 block.
+
+    Token t routes only to expert t, whose channel 16m has up value 6 and
+    gate ``g_m``; the other channels are zero. The FC2 input encoding then
+    stores ``act(g_m) * 6`` as six times its E4M3 block scale, and the
+    diagonal down projection copies it to output column 16m. The gates
+    include -3.75 and -3.375, where erf GELU departs from the tanh
+    approximation by more than a quarter, and span SiLU's and GELU's
+    curvature elsewhere.
+    """
+    gates = torch.tensor((-3.75, -3.375, -1.5, -0.75, 0.375, 0.75, 1.5, 3.0))
+    experts = tokens = 8
+    module = FusedMoE(
+        experts,
+        HIDDEN,
+        INTERMEDIATE,
+        top_k=1,
+        activation=activation,
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+
+    probes = torch.arange(0, INTERMEDIATE, 16)
+    codes = torch.zeros(experts, 2 * INTERMEDIATE, HIDDEN, dtype=torch.long)
+    block_scale = torch.full(
+        (experts, 2 * INTERMEDIATE, HIDDEN // 16), E4M3_ONE, dtype=torch.long
+    )
+    # Up rows read hidden column 0, which holds 6, with weight one. Gate
+    # rows read it with weight +-0.5 and the block scale |g| / 3, which
+    # E4M3 represents exactly for these gates.
+    codes[:, probes, 0] = 2
+    codes[:, INTERMEDIATE + probes, 0] = torch.where(gates > 0, 1, 9)
+    block_scale[:, INTERMEDIATE + probes, 0] = (
+        (gates.abs() / 3).to(torch.float8_e4m3fn).view(torch.uint8).long()
+    )
+    module.up_gate.weight = torch.nn.Parameter(
+        _nvfp4(codes, block_scale, torch.ones(experts)), requires_grad=False
+    )
+    diagonal = torch.zeros(experts, HIDDEN, INTERMEDIATE, dtype=torch.long)
+    diagonal[:, torch.arange(INTERMEDIATE), torch.arange(INTERMEDIATE)] = 2
+    module.down.weight = torch.nn.Parameter(
+        _nvfp4(diagonal, torch.full((experts,), E4M3_ONE), torch.ones(experts)),
+        requires_grad=False,
+    )
+    # The FC2 input scale keeps every probe's block scale a normal E4M3.
+    module.up_gate.input_quantizer = Quantizer("nvfp4", calibrated_scale=1.0)
+    module.down.input_quantizer = Quantizer("nvfp4", calibrated_scale=2.0**-7)
+
+    hidden = torch.zeros(tokens, HIDDEN, device=DEVICE, dtype=torch.bfloat16)
+    hidden[:, 0] = 6.0
+    ids = torch.arange(tokens, dtype=torch.int32, device=DEVICE)[:, None]
+    weights = torch.ones(tokens, 1, device=DEVICE)
+    # The portable reference encodes the FC2 input with exact FP32 division
+    # and the exact nonlinearity.
+    expected = functional.fused_moe(
+        hidden.float(),
+        module.up_gate.weight,
+        module.down.weight,
+        ids,
+        weights,
+        activation=activation,
+        input_quantizers=(
+            module.up_gate.input_quantizer,
+            module.down.input_quantizer,
+        ),
+    )
+
+    with ExecutionContext(module) as context:
+        context.prepare(TextSize(tokens, 1))
+        with context.activate():
+            actual = module(hidden, ids, weights)
+    # The kernel's approximate nonlinearity and reciprocal may round a
+    # block scale near an E4M3 midpoint to the neighboring value: one E4M3
+    # step, at most 2**-3 of the value, plus the BF16 output rounding.
+    torch.testing.assert_close(
+        actual.float(), expected, rtol=2**-3 + _gamma(1), atol=0
+    )
 
 
 def _uncalibrated_nvfp4():
@@ -264,6 +388,35 @@ def _uncalibrated_nvfp4():
     return module
 
 
+def _unaligned_nvfp4():
+    """Calibrated NVFP4 experts whose intermediate width is 96."""
+    intermediate = 96
+    module = FusedMoE(
+        EXPERTS,
+        HIDDEN,
+        intermediate,
+        top_k=TOP_K,
+        activation="gelu_tanh",
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+    for linear, rows, width in (
+        (module.up_gate, 2 * intermediate, HIDDEN),
+        (module.down, HIDDEN, intermediate),
+    ):
+        codes = torch.ones(EXPERTS, rows, width, dtype=torch.long)
+        linear.weight = torch.nn.Parameter(
+            _nvfp4(
+                codes,
+                torch.full((EXPERTS,), E4M3_ONE),
+                torch.ones(EXPERTS),
+            ),
+            requires_grad=False,
+        )
+        linear.input_quantizer = Quantizer("nvfp4", calibrated_scale=1.0)
+    return module
+
+
 @pytest.mark.parametrize(
     "build",
     [
@@ -277,12 +430,21 @@ def _uncalibrated_nvfp4():
             dtype=torch.float32,
         ),
         _uncalibrated_nvfp4,
+        _unaligned_nvfp4,
     ],
-    ids=["fp32", "uncalibrated-nvfp4"],
+    ids=["fp32", "uncalibrated-nvfp4", "unaligned-nvfp4"],
 )
 @torch.inference_mode()
 def test_representations_without_a_native_kernel_fail_at_preparation(build):
     module = build()
     with pytest.raises(ValueError, match="no native expert kernel covers"):
         with ExecutionContext(module) as context:
+            context.prepare(TextSize(TOKENS, 1))
+
+
+@torch.inference_mode()
+def test_cutlass_does_not_serve_nvfp4_experts():
+    module, _ = _exact_nvfp4("silu", torch.Generator().manual_seed(59))
+    with pytest.raises(ValueError, match="does not support"):
+        with ExecutionContext(module, moe="cutlass") as context:
             context.prepare(TextSize(TOKENS, 1))

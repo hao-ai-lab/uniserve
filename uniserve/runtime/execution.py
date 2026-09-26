@@ -135,7 +135,9 @@ class ExecutionContext(Generic[SizeT]):
     every combination used by a graph must be exercised before capture.
     Callers retire graphs and asynchronous readers before preparing again or
     closing this owner. A new preparation replaces the previous capacity.
-    Weights and externally supplied buffers remain caller-owned.
+    Weights and externally supplied buffers remain caller-owned; preparing
+    a kernel may replace an encoded weight parameter with the same logical
+    tensor stored in the physical row order that kernel reads.
 
     ``stream`` is a borrowed :class:`CUDAStream`. Its communication owner
     holds the communicators, registered windows and window storage every

@@ -4,7 +4,9 @@ A provider evaluates one ``FusedMoE`` call site: routed tokens of up to the
 prepared ``TextSize`` capacity through that module's resident expert
 weights. Operators borrow the module's parameters and context-owned
 workspace; host planning happens only in ``prepare`` so calls can be
-captured in CUDA graphs.
+captured in CUDA graphs. A provider whose kernel reads expert weights in
+another physical row order places them in that order when it is prepared;
+the logical weights stay unchanged and only one copy stays resident.
 """
 
 from __future__ import annotations
@@ -17,8 +19,10 @@ import torch
 from uniserve.model.inputs import TextSize
 from uniserve.tensors import BufferConfig
 
-# Native providers in automatic selection order.
-_NATIVE = ("cutlass",)
+# Native providers in automatic selection order. Their representations are
+# disjoint: trtllm-gen serves NVFP4 experts, CUTLASS BF16 and FP16 experts.
+_NATIVE = ("trtllm", "cutlass")
+_PROVIDERS = frozenset((*_NATIVE, "torch"))
 
 
 class Operator:
@@ -56,9 +60,9 @@ class Backend:
     name: str
     operator_class: type[Operator]
 
-    def supports(self, module) -> bool:
-        """Report whether this provider evaluates ``module``'s weights."""
-        return True
+    def unsupported(self, module) -> str | None:
+        """Return why this provider cannot evaluate ``module``, or ``None``."""
+        return None
 
     def workspace_buffers(
         self, *, module, size: TextSize
@@ -76,8 +80,8 @@ def resolve(backend: str | Backend, *, module, device: torch.device) -> Backend:
 
     ``auto`` selects a native grouped-expert kernel on a GPU and the
     portable implementation on the CPU. A GPU representation that no native
-    kernel covers raises here, at preparation: the portable loop is a
-    reference, not a GPU serving path.
+    kernel covers raises here, at preparation, naming each native provider's
+    reason: the portable loop is a reference, not a GPU serving path.
     """
     if isinstance(backend, Backend):
         return backend
@@ -85,20 +89,25 @@ def resolve(backend: str | Backend, *, module, device: torch.device) -> Backend:
         if device.type != "cuda":
             backend = "torch"
         else:
+            reasons = []
             for name in _NATIVE:
                 provider = import_module(f"{__name__}.{name}").Backend()
-                if provider.supports(module):
+                reason = provider.unsupported(module)
+                if reason is None:
                     return provider
+                reasons.append(f"{name}: {reason}")
             raise ValueError(
                 "no native expert kernel covers this FusedMoE representation "
-                f"on {device}"
+                f"on {device} ({'; '.join(reasons)})"
             )
-    if backend not in {"torch", "cutlass"}:
+    if backend not in _PROVIDERS:
         raise ValueError(f"unknown expert backend {backend!r}")
     provider = import_module(f"{__name__}.{backend}").Backend()
-    if not provider.supports(module):
+    reason = provider.unsupported(module)
+    if reason is not None:
         raise ValueError(
-            f"expert backend {backend!r} does not support this representation"
+            f"expert backend {backend!r} does not support this "
+            f"representation: {reason}"
         )
     return provider
 
