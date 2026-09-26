@@ -546,6 +546,41 @@ def test_graph_replay_reads_updated_lengths_and_tables():
         )
 
 
+@torch.inference_mode()
+def test_capture_at_another_batch_size_after_one_call():
+    # One eager call of a configuration (here 64-token pages, used by no
+    # other head-dim-256 test) prepares it for every batch size: a graph
+    # captured at a much smaller batch compiles nothing during capture.
+    prefixes = (1025,) * 8
+    large = _batch(
+        (256,) * 8,
+        prefixes,
+        page_tokens=64,
+        start_pages=_history_start_pages(prefixes, 64),
+        seed=51,
+    )
+    small = _batch(
+        (256, 17),
+        (1025, 3001),
+        page_tokens=64,
+        start_pages=_history_start_pages((1025, 3001), 64),
+        seed=52,
+    )
+    options = {"window": 1023, "query_window": False, "scale": 1 / 16}
+
+    out, lse = _outputs(large)
+    _launch(large, out=out, lse=lse, max_query_len=256, **options)
+    torch.cuda.synchronize()
+
+    out, lse = _outputs(small)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _launch(small, out=out, lse=lse, max_query_len=256, **options)
+    graph.replay()
+
+    _assert_matches(small, out, lse, base2=False, **options)
+
+
 def test_eligibility_reports_unsupported_page_size():
     batch = _batch((256,), (100,), page_tokens=16)
     arguments = [
