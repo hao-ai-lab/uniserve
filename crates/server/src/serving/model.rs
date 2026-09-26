@@ -1507,7 +1507,7 @@ mod tests {
         }))
         .unwrap();
         let error = processor
-            .preprocess_chat_request(ServeRequestId::new("chat"), request)
+            .preprocess_chat_request(ServeRequestId::new("chat"), request, Vec::new())
             .err()
             .unwrap();
         assert_eq!(error.status_code().as_u16(), 400);
