@@ -28,11 +28,13 @@ mod video_jobs;
 use std::sync::Arc;
 
 use crate::engine_client::EngineClient;
-use crate::profile::ModelConfig;
 pub use crate::profile::ModelDescription;
+use crate::profile::assets::ResolvedModelFiles;
+use crate::profile::{ModelConfig, ModelParameters};
 pub use crate::serving::chat::ChatTemplateContentFormatOption;
 pub use crate::serving::media::ImageFetchPolicy;
 use crate::serving::media::ImageFetcher;
+use crate::serving::systemone::ReadoutEncoder;
 use crate::serving::{InputProcessor, ServingRuntime};
 use anyhow::{Context as _, Result};
 pub use config::{Config, EngineSettings, HttpListenerMode};
@@ -89,9 +91,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let (model_config, tokenizer, renderer) = ModelConfig::load(config)
         .await
         .with_context(|| format!("failed to resolve model assets for `{}`", config.model))?;
-    let runtime_family = model_config
-        .runtime_family()
-        .context("the configured model cannot be served by the engine")?;
+    let runtime_family = model_config.runtime_family();
     let effective_max_model_len = model_config.max_model_tokens();
     let channel_payload_capacity = model_config.channel_payload_capacity();
     let control_tokens = special_token_ids(&model_config);
@@ -162,6 +162,32 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     // The served context limit never exceeds the length the engine reports,
     // which is the `max_model_len` passed in `engine_config`.
     let route_max_model_len = effective_max_model_len.min(engine.max_model_len());
+
+    // A DiffusionGemma checkpoint serves the System One readout, whose
+    // encoder renders prompts with the checkpoint's own chat template.
+    let readout = match &model_config.parameters {
+        ModelParameters::DiffusionGemma(profile) => {
+            let files = ResolvedModelFiles::new(&config.model)
+                .await
+                .context("failed to resolve the readout chat template")?;
+            let encoder = ReadoutEncoder::load(
+                &files,
+                Arc::clone(&tokenizer),
+                profile,
+                config.readout,
+                route_max_model_len,
+            )
+            .context("failed to prepare the System One readout")?;
+            info!(
+                layout = ?config.readout.layout,
+                canvas = ?config.readout.canvas,
+                "serving the System One readout"
+            );
+            Some(encoder)
+        }
+        _ => None,
+    };
+
     let model = InputProcessor::new(
         model_config,
         tokenizer,
@@ -177,7 +203,10 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     .context("failed to bind the configured model description")?;
     let images = ImageFetcher::new(config.image_fetch)
         .context("failed to initialize the image URL fetcher")?;
-    let runtime = ServingRuntime::new(model, Arc::clone(&engine), images, config.log_stats);
+    let mut runtime = ServingRuntime::new(model, Arc::clone(&engine), images, config.log_stats);
+    if let Some(encoder) = readout {
+        runtime = runtime.with_readout(encoder);
+    }
 
     Ok(Arc::new(
         AppState::new(runtime)

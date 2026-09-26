@@ -4,6 +4,7 @@
 mod health;
 mod metrics;
 pub(crate) mod openai;
+mod systemone;
 mod version;
 
 use std::sync::Arc;
@@ -140,6 +141,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/images/generations", post(openai::images_generations))
         .route("/v1/videos/sync", post(openai::videos_sync))
         .route("/v1/capabilities", get(openai::capabilities))
+        .route("/v1/systemone", post(systemone::systemone))
         .route(
             "/v1/videos",
             get(openai::videos_list).post(openai::videos_create),

@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use crate::serving::chat::ChatTemplateContentFormatOption;
 use crate::serving::media::ImageFetchPolicy;
+use crate::serving::systemone::ReadoutOptions;
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
@@ -162,6 +163,9 @@ pub struct Config {
     /// Time, size, and destination limits for request image references
     /// (`image_url` data and http(s) URLs).
     pub image_fetch: ImageFetchPolicy,
+    /// How a DiffusionGemma server divides System One questions among
+    /// readout prompts and canvases; other models ignore it.
+    pub readout: ReadoutOptions,
 }
 
 impl Default for Config {
@@ -188,6 +192,7 @@ impl Default for Config {
             shutdown_timeout: Duration::from_secs(0),
             reasoning_parsing: true,
             image_fetch: ImageFetchPolicy::default(),
+            readout: ReadoutOptions::default(),
         }
     }
 }

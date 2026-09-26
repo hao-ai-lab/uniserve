@@ -14,7 +14,7 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use tower::ServiceExt as _;
-use uniserve_core::RuntimeFamily;
+use uniserve_core::{ModelDtype, RuntimeFamily};
 use uniserve_engine::{EngineConfig, SimEngine, SimExecutor};
 
 use crate::AppState;
@@ -29,16 +29,37 @@ use crate::serving::{InputProcessor, ServedSamplingControl, ServingRuntime, Work
 pub(crate) const SERVED_MODEL: &str = "sim-model";
 
 /// Builds application state for a model with `parameters` over a default
+/// `SimEngine`; see [`sim_runtime`].
+pub(crate) fn sim_state(parameters: ModelParameters) -> AppState {
+    AppState::new(sim_runtime(parameters))
+}
+
+/// Builds a serving runtime for a model with `parameters` over a default
 /// `SimEngine`.
 ///
 /// The tokenizer is `serving::test_support::configured_tokenizer`, whose
 /// `<|im_end|>` (ID 2) is the end-of-sequence token, and the chat template
 /// renders only the first message's content. A MiniMax H3 model runs four
-/// denoising steps on a diffusion runtime, as a video deployment does.
-pub(crate) fn sim_state(parameters: ModelParameters) -> AppState {
+/// denoising steps on a diffusion runtime, as a video deployment does, and a
+/// DiffusionGemma model runs readouts on its own runtime family and generation
+/// limits, as `build_state` starts it.
+pub(crate) fn sim_runtime(parameters: ModelParameters) -> ServingRuntime {
+    let model = ModelConfig {
+        served_name: SERVED_MODEL.to_string(),
+        parameters,
+        sampling_defaults: SamplingDefaults::default(),
+        max_model_tokens: Some(4096),
+        primary_eos_token_id: Some(2),
+        eos_token_ids: BTreeSet::from([2]),
+    };
     let mut config = EngineConfig::sim(SERVED_MODEL);
-    if matches!(parameters, ModelParameters::MiniMaxH3 { .. }) {
-        config.runtime_family = RuntimeFamily::Diffusion;
+    match model.parameters {
+        ModelParameters::MiniMaxH3 { .. } => config.runtime_family = RuntimeFamily::Diffusion,
+        ModelParameters::DiffusionGemma(_) => {
+            config.runtime_family = model.runtime_family();
+            config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
+        }
+        _ => {}
     }
     let client = Arc::new(
         EngineClient::connect_with_executor(config, Box::new(SimExecutor::new(SimEngine::new())))
@@ -51,14 +72,7 @@ pub(crate) fn sim_state(parameters: ModelParameters) -> AppState {
     )
     .unwrap();
     let processor = InputProcessor::new(
-        ModelConfig {
-            served_name: SERVED_MODEL.to_string(),
-            parameters,
-            sampling_defaults: SamplingDefaults::default(),
-            max_model_tokens: Some(4096),
-            primary_eos_token_id: Some(2),
-            eos_token_ids: BTreeSet::from([2]),
-        },
+        model,
         configured_tokenizer(),
         Some(renderer),
         WorkerCapabilities {
@@ -72,7 +86,7 @@ pub(crate) fn sim_state(parameters: ModelParameters) -> AppState {
     .unwrap();
 
     let images = ImageFetcher::new(ImageFetchPolicy::default()).unwrap();
-    AppState::new(ServingRuntime::new(processor, client, images, false))
+    ServingRuntime::new(processor, client, images, false)
 }
 
 /// Sends `request` through `router` and returns the status, the headers, and

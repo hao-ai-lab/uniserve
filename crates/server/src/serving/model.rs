@@ -219,16 +219,6 @@ pub enum ModelResolutionError {
         #[source]
         source: std::io::Error,
     },
-    /// The engine has no runtime family that executes the selected profile.
-    #[error(
-        "model description `{description}` has no engine runtime: {computation} is not implemented"
-    )]
-    UnsupportedRuntime {
-        /// Stable model-profile identifier.
-        description: &'static str,
-        /// The computation the missing runtime family would execute.
-        computation: &'static str,
-    },
     /// The running worker lacks a feature required by the selected profile.
     #[error("configured model description `{description}` requires worker feature `{feature}`")]
     MissingFeature {
@@ -369,25 +359,14 @@ impl ModelConfig {
     }
 
     /// Execution family selected by the loaded model settings.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ModelResolutionError::UnsupportedRuntime`] for DiffusionGemma,
-    /// whose block-diffusion readout and generation have no engine runtime
-    /// family yet.
-    pub(crate) fn runtime_family(
-        &self,
-    ) -> std::result::Result<uniserve_core::RuntimeFamily, ModelResolutionError> {
+    pub(crate) fn runtime_family(&self) -> uniserve_core::RuntimeFamily {
         match self.parameters {
-            ModelParameters::Qwen3 => Ok(uniserve_core::RuntimeFamily::Ar),
+            ModelParameters::Qwen3 => uniserve_core::RuntimeFamily::Ar,
             ModelParameters::SenseNova(_) | ModelParameters::Bagel(_) => {
-                Ok(uniserve_core::RuntimeFamily::Umm)
+                uniserve_core::RuntimeFamily::Umm
             }
-            ModelParameters::MiniMaxH3 { .. } => Ok(uniserve_core::RuntimeFamily::Diffusion),
-            ModelParameters::DiffusionGemma(_) => Err(ModelResolutionError::UnsupportedRuntime {
-                description: self.description().id(),
-                computation: "block-diffusion readout and generation",
-            }),
+            ModelParameters::MiniMaxH3 { .. } => uniserve_core::RuntimeFamily::Diffusion,
+            ModelParameters::DiffusionGemma(_) => uniserve_core::RuntimeFamily::BlockDiffusion,
         }
     }
 
@@ -410,13 +389,19 @@ impl ModelConfig {
             },
             ModelParameters::SenseNova(_) => SenseNovaProfile::runtime_limits(model_dtype),
             ModelParameters::Bagel(_) => BagelProfile::runtime_limits(model_dtype),
-            // The encoder prefill understands text and encoded images; the
-            // denoising canvas has no generation feature of its own yet.
-            ModelParameters::DiffusionGemma(_) => uniserve_core::GenerationLimits {
-                features: uniserve_core::GenerationFeatures::UNDERSTANDING
+            // A readout prefills text and encoded images and denoises its
+            // canvases once over them. An image writes one KV entry per soft
+            // token; the worker's encoder entries bound the feature bytes and
+            // the number of cached encodings, so the model states no bound of
+            // its own for either.
+            ModelParameters::DiffusionGemma(profile) => uniserve_core::GenerationLimits {
+                features: uniserve_core::GenerationFeatures::TOKEN_DENOISING
                     | uniserve_core::GenerationFeatures::VISION_ENCODE,
                 latent_downsample: 1,
+                max_vit_grid_tokens: profile.images.max_soft_tokens,
+                max_vision_feature_bytes: u64::MAX,
                 max_cfg_branches: 1,
+                encoder_cache_entries: u32::MAX,
                 ..Default::default()
             },
         }
@@ -468,9 +453,9 @@ impl InputProcessor {
         } = worker;
 
         let needs = match &config.parameters {
-            ModelParameters::Qwen3 | ModelParameters::DiffusionGemma(_) => {
-                GenerationFeatures::UNDERSTANDING
-            }
+            ModelParameters::Qwen3 => GenerationFeatures::UNDERSTANDING,
+            // The System One readout denoises canvases over its prompt.
+            ModelParameters::DiffusionGemma(_) => GenerationFeatures::TOKEN_DENOISING,
             ModelParameters::SenseNova(profile) => {
                 configured_omni_needs(&profile.image_generation, &profile.image_encoders)
             }
@@ -1321,7 +1306,6 @@ mod tests {
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
     use uniserve_core::{GenerationFeatures, GenerationLimits};
 
-    use super::ModelResolutionError;
     use crate::Config;
     use crate::profile::tokenizer::HuggingFaceTokenizer;
     use crate::profile::{ModelConfig, ModelDescription, ModelParameters};
@@ -1445,11 +1429,10 @@ mod tests {
         );
         assert_eq!(profile.denoising.max_denoising_steps, 48);
         assert!(!profile.quantized);
-        // Block-diffusion execution has no engine runtime yet.
-        assert!(matches!(
+        assert_eq!(
             model.runtime_family(),
-            Err(ModelResolutionError::UnsupportedRuntime { .. })
-        ));
+            uniserve_core::RuntimeFamily::BlockDiffusion
+        );
     }
 
     #[tokio::test]
@@ -1477,7 +1460,8 @@ mod tests {
             renderer,
             WorkerCapabilities {
                 limits: GenerationLimits {
-                    features: GenerationFeatures::UNDERSTANDING | GenerationFeatures::VISION_ENCODE,
+                    features: GenerationFeatures::TOKEN_DENOISING
+                        | GenerationFeatures::VISION_ENCODE,
                     latent_downsample: 1,
                     max_cfg_branches: 1,
                     ..Default::default()
