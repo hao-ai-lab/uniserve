@@ -1135,12 +1135,20 @@ fn hybrid_groups_share_one_unit_pool() {
         "reused {reused} tokens"
     );
 
+    // A finished request's units retire until its workers acknowledge the
+    // queued finish, so the pool drains while the engine keeps running, not
+    // at the moment `Finished` is observed; shutdown would abort that ack.
+    let num_units = stats.kv_cache.num_units.load(Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut free_units = stats.kv_cache.free_units.load(Ordering::Relaxed);
+    while free_units != num_units && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+        free_units = stats.kv_cache.free_units.load(Ordering::Relaxed);
+    }
+    assert_eq!(free_units, num_units, "units did not return to the pool");
+
     handle.shutdown();
     let _ = jh.join();
-    assert_eq!(
-        stats.kv_cache.free_units.load(Ordering::Relaxed),
-        stats.kv_cache.num_units.load(Ordering::Relaxed)
-    );
 
     // Every declared table covers whole pages of its group from its start
     // page; the sliding group's tables move their start and never hold more
