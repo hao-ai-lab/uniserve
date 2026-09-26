@@ -8,9 +8,12 @@ from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from uniserve import loading
 from uniserve.loading import weights
+from uniserve.model import CausalLM
 from uniserve.runtime import PrefixCache
 from uniserve_models import loading as models
+from uniserve_models.stub import image_processor as stub_image_processor
 from uniserve_worker.bootstrap.cache import cache_info
+from uniserve_worker.bootstrap.inputs import capability
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.execution.model_executor import ModelExecutor
 from uniserve_worker.model_executor.input_batch import TokenRow
@@ -58,7 +61,13 @@ def _snapshot(cache):
 
 
 @contextmanager
-def _text_runner(model, provider, decode_capacity=2):
+def _text_runner(model, provider, decode_capacity=2, image_processor=None):
+    """Capture a text worker's graphs and yield a call executor.
+
+    With an ``image_processor`` declaring feature injection, the worker also
+    captures prefill graphs for non-causal rows that replace their
+    embeddings, as image feature rows do.
+    """
     config = WorkerConfig(
         device="cuda:0",
         model_dtype="bfloat16",
@@ -81,7 +90,7 @@ def _text_runner(model, provider, decode_capacity=2):
         request_pool_size=4,
         table_width=4,
     )
-    runner = ModelExecutor(model, config)
+    runner = ModelExecutor(model, config, image_processor=image_processor)
     predicates = torch.tensor([False, True, True, True, True], device="cuda:0")
     try:
         runner.configure_inputs(
@@ -97,7 +106,6 @@ def _text_runner(model, provider, decode_capacity=2):
             decode_predicates=predicates,
             max_calls=4,
             request_slots=4,
-            max_tokens=64,
             latent_capacity_units=0,
             table_widths=(2,),
             max_inflight=1,
@@ -116,6 +124,7 @@ def _text_runner(model, provider, decode_capacity=2):
             selection=TokenSelection.LAST_LOGITS,
             causal=True,
             finish=False,
+            embeddings=False,
         ):
             mode = ForwardMode.DECODE if decode else ForwardMode.PREFILL
             prefixes = (0,) * len(tokens) if prefixes is None else prefixes
@@ -135,6 +144,13 @@ def _text_runner(model, provider, decode_capacity=2):
                 TokenRow(
                     forward_mode=mode,
                     token_ids=torch.tensor(sequence, dtype=torch.int64),
+                    # Supplied embeddings equal the token embeddings, as an
+                    # image row's features stand in for its placeholders.
+                    token_embeddings=capability(
+                        model, CausalLM
+                    ).embed_input_ids(torch.tensor(sequence, device="cuda:0"))
+                    if embeddings
+                    else None,
                     positions=torch.arange(prefix, prefix + len(sequence)),
                     selection=selection,
                     request_pool_idx=index + 1,
@@ -288,7 +304,9 @@ def test_noncausal_prefill_graph_preserves_live_prefixes_and_sequence_outputs(
         weights=weights.Config(dtype=torch.bfloat16),
     ).model
     retained = None
-    with _text_runner(model, provider) as execute:
+    with _text_runner(
+        model, provider, image_processor=stub_image_processor()
+    ) as execute:
         for lengths, prefix in (((2, 5), 3), ((6, 1, 4), 17), ((16,), 0)):
             sequences = tuple(
                 tuple(
@@ -308,6 +326,7 @@ def test_noncausal_prefill_graph_preserves_live_prefixes_and_sequence_outputs(
                 prefixes=(prefix,) * len(lengths),
                 selection=selection,
                 causal=False,
+                embeddings=True,
             )
             for actual, sequence in zip(output.values, sequences, strict=True):
                 # Prefix queries retain causal visibility. Appended image
@@ -392,7 +411,6 @@ def test_worker_runner_prepares_and_executes_declared_text_calls(tmp_path):
             decode_predicates=predicates,
             max_calls=2,
             request_slots=2,
-            max_tokens=32,
             latent_capacity_units=0,
             table_widths=(2,),
             max_inflight=1,

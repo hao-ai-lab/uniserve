@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from uniserve.diffusion import Renorm
+from uniserve.math import ceil_div
 from uniserve.media import image as media_image
 from uniserve_worker.model_executor.attention import from_tables, table_pages
 from uniserve_worker.model_executor.diffusion_inputs import (
@@ -76,13 +77,16 @@ def stage_text(
     selection: TokenSelection = TokenSelection.LAST_LOGITS,
     causal: bool = True,
     slots: tuple[int, ...] | None = None,
+    embeddings: bool = False,
 ) -> InputBatch:
     """Stage synthetic token rows through serving's staging path.
 
     ``tokens`` holds each row's token IDs and ``tables`` its scratch tables
     of every cache group. Rows default to empty prefixes and to request
     slots ``1..rows``; slot 0 is the inactive sentinel. Every row writes KV.
-    A decode batch also carries the staging's cleared force-finish column.
+    With ``embeddings``, every token replaces its embedding with zeros, as an
+    image feature row replaces its placeholders. A decode batch also carries
+    the staging's cleared force-finish column.
     """
     rows = len(tokens)
     lengths = tuple(len(value) for value in tokens)
@@ -102,11 +106,19 @@ def stage_text(
 
     slots = slots or tuple(range(1, rows + 1))
     mode = ForwardMode.DECODE if decode else ForwardMode.PREFILL
+    # Replaced embeddings take the staging column's dtype; staging rejects
+    # them on a lane without one.
+    replaced = buffers.input_embeddings if embeddings else None
+    if embeddings and replaced is None:
+        raise ValueError("embedding replacement requires an embedding column")
     batch = buffers.prepare_inputs(
         tuple(
             TokenRow(
                 forward_mode=mode,
                 token_ids=torch.tensor(value, dtype=torch.int64),
+                token_embeddings=None
+                if replaced is None
+                else replaced.new_zeros((len(value), buffers.hidden_size)),
                 positions=position,
                 selection=selection,
                 request_pool_idx=slot,
@@ -129,6 +141,28 @@ def stage_text(
     return batch
 
 
+def capture_lengths(shape: PrefillShape, row_tokens: int) -> tuple[int, ...]:
+    """Return the row lengths of the startup batch that captures ``shape``.
+
+    The rows total the bucket's tokens and number at least its
+    ``live_rows``: one long row and single-token rows, as in the batches the
+    bucket serves. A row holds at most ``row_tokens``, the most one request
+    appends in a call, so a bucket above that stages more long rows, up to
+    one less than its row count; tokens those rows cannot hold become the
+    bucket's padding sequence.
+    """
+    rows = max(shape.live_rows, ceil_div(shape.token_bucket, row_tokens))
+    rows = max(1, min(rows, shape.row_bucket - 1))
+    remaining = min(shape.token_bucket, rows * row_tokens)
+    lengths = []
+    for index in range(rows):
+        # Leave one token for each later row.
+        length = min(row_tokens, remaining - (rows - index - 1))
+        lengths.append(length)
+        remaining -= length
+    return tuple(lengths)
+
+
 def prepare_prefill(
     runner: ModelExecutor,
     entry: ModelRunner,
@@ -138,13 +172,21 @@ def prepare_prefill(
 ) -> None:
     """Capture each selected physical token/row bucket, largest first.
 
-    Buckets are ordered by token-times-row footprint. Each capture stages
-    ``live_rows`` rows totaling the bucket's token count on zeroed scratch
-    KV units; the runner's ``select_graph_shape`` pads them to the bucket.
+    Buckets are ordered by token-times-row footprint, so the first capture
+    sizes the runner's shared prefill output. Each capture stages the
+    ``capture_lengths`` rows of its bucket on zeroed scratch KV units, with
+    the bucket's causality and embedding replacement, through serving's
+    staging with its real paged attention input: per-table block tables,
+    device start pages for windowed tables and their host mirrors; the
+    runner's ``select_graph_shape`` pads them to the bucket.
 
     Raises:
         ValueError: A bucket is prepared on a worker without a KV cache.
     """
+    config = runner.worker_config
+    row_tokens = max(
+        1, min(config.max_sequence_tokens, config.max_batch_tokens)
+    )
     for shape in sorted(
         shapes,
         key=lambda item: (
@@ -153,11 +195,7 @@ def prepare_prefill(
         ),
         reverse=True,
     ):
-        # One row holds the long prompt; the remaining live rows hold one token.
-        lengths = (
-            shape.token_bucket - shape.live_rows + 1,
-            *(1,) * (shape.live_rows - 1),
-        )
+        lengths = capture_lengths(shape, row_tokens)
         cache = runner.kv_cache
         if cache is None:
             raise ValueError("prefill capture requires the worker KV cache")
@@ -168,7 +206,7 @@ def prepare_prefill(
                 tuple((0,) * length for length in lengths),
                 scratch_tables(cache, scratch, lengths),
                 causal=shape.causal,
-                selection=shape.selection,
+                embeddings=shape.embeddings,
             )
             entry.capture_batch(batch, forward)
 
@@ -251,7 +289,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
     For each shape, the prefix entry first prefills every nonempty branch
     prompt prefix eagerly into scratch KV units, then the denoising entry
     stages rows that read those prefixes and captures them, or runs them
-    eagerly when graph capture or prefill graphs are disabled. Rows are
+    eagerly when graph capture or flow graphs are disabled. Rows are
     ordered by request with guidance branches varying fastest, and the
     branches of one request share its slot and latent.
     """
@@ -263,7 +301,7 @@ def prepare_flow(runner, entry, latent_pool, tokenizer):
     builder, cache = runner.image_builder, runner.kv_cache
     capture = (
         runner.worker_config.graph_policy != "off"
-        and runner.worker_config.prefill_cuda_graph
+        and runner.worker_config.flow_cuda_graph
     )
     capacity = min(builder.max_tokens, latent_pool.capacity_units)
     side = max(1, math.isqrt(capacity)) * builder.denoiser.downsample

@@ -710,7 +710,6 @@ class Worker:
                     decode_predicates=self.decode_state.predicates,
                     max_calls=int(info.max_batch_calls),
                     request_slots=int(info.request_slots),
-                    max_tokens=int(info.max_batch_tokens),
                     latent_capacity_units=int(info.latent_capacity_units),
                     table_widths=graph_table_widths(
                         model, worker_config, self.kv_cache

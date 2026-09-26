@@ -108,8 +108,8 @@ from uniserve_worker.model_executor.diffusion_runner import DiffusionRunner
 from uniserve_worker.model_executor.graph_inputs import (
     DiffusionShape,
     PrefillShape,
+    prefill_captures,
     select_flow_captures,
-    select_prefill_captures,
 )
 from uniserve_worker.model_executor.graph_storage import GraphStorage
 from uniserve_worker.model_executor.image_inputs import DecodeRow, VisionRow
@@ -291,7 +291,6 @@ class ModelExecutor:
         self.graph_storage = GraphStorage()
         self.decode_shapes: dict[ModelRunner, tuple[int, ...]] = {}
         self.prefill_shapes: dict[ModelRunner, tuple[PrefillShape, ...]] = {}
-        self.prefill_row_sizes: tuple[int, ...] = ()
         self.flow_captures: tuple[DiffusionShape, ...] = ()
         self.flow_cfg_branches: tuple[int, ...] = ()
         self.table_widths: tuple[int, ...] = ()
@@ -1098,7 +1097,6 @@ class ModelExecutor:
         decode_predicates,
         max_calls,
         request_slots,
-        max_tokens,
         latent_capacity_units,
         table_widths,
         max_inflight,
@@ -1107,27 +1105,25 @@ class ModelExecutor:
 
         Creates one capability runner per (entry, path, lane) covering a
         computation kind, with its input buffers, execution context, decode /
-        prefill capture shapes, and private CUDA graph storage pools. Callable
+        prefill capture shapes, and private CUDA graph storage pools. Prefill
+        buckets reach the text tokens ``input_config`` stages per call, and
+        ``max_calls`` and ``request_slots`` bound their live rows. Callable
         once: a second call raises ``RuntimeError`` when the first bound any
         entry. Raises ``ValueError`` when two staged entries of one component
         cover the same computation kind, and as ``_initialize_streams`` does.
         """
-        from uniserve_worker.config.execution import (
-            DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
-        )
-
         if self.entries:
             raise RuntimeError("input execution resources are already bound")
 
         self.kv_cache, self.decode_predicates = kv_cache, decode_predicates
         self.table_widths = tuple(table_widths)
-        self.prefill_row_sizes = DEFAULT_PREFILL_GRAPH_ROW_BUCKETS
         config = self.worker_config
         self._initialize_streams(event_slots=max_inflight + 1)
 
-        # A decode row holds at least one page of every cache group, and one
-        # prefill row at most the tokens the pool's units cover in every
-        # group.
+        # A decode row holds at least one page of every cache group. A
+        # prefill call holds at most the text tokens its staging accepts, the
+        # batch token budget plus one image's feature span, and at most the
+        # tokens the pool's units cover.
         max_rows = min(max_calls, request_slots)
         decode_sizes = tuple(
             value
@@ -1135,15 +1131,9 @@ class ModelExecutor:
             if 0 < value <= max_rows
             and value * kv_cache.row_units < kv_cache.info.num_units
         )
-        prefill_capacity = min(
-            max_tokens,
-            config.max_sequence_tokens,
-            kv_cache.token_capacity,
-        )
-        prefill_sizes = tuple(
-            value
-            for value in config.prefill_graph_token_sizes
-            if 0 < value <= prefill_capacity
+        feature_injection = (
+            self.processor is not None
+            and self.processor.feature_injection is not None
         )
         if self.image_builder is not None:
             from uniserve.media import image
@@ -1210,28 +1200,25 @@ class ModelExecutor:
                     if lane is None
                     else min(max_rows, lane.max_batch_calls or max_rows)
                 )
-                tokens = (
-                    input_config.max_tokens
-                    if lane is None
-                    else min(
-                        input_config.max_tokens,
-                        lane.max_batch_tokens or input_config.max_tokens,
-                    )
-                )
                 decode = (
                     tuple(value for value in decode_sizes if value <= rows)
                     if ForwardMode.DECODE in kinds
                     else ()
                 )
+                # Graph pools exist only on CUDA, where every prefill call
+                # replays a captured bucket.
                 prefill = (
-                    select_prefill_captures(
-                        prefill_sizes,
-                        self.prefill_row_sizes,
+                    prefill_captures(
+                        config,
                         max_rows=rows,
-                        max_tokens=tokens,
-                        visual=self.image_builder is not None,
+                        max_tokens=min(
+                            input_config.max_text_tokens,
+                            kv_cache.token_capacity,
+                        ),
+                        image_builder=self.image_builder is not None,
+                        feature_injection=feature_injection,
                     )
-                    if ForwardMode.PREFILL in kinds
+                    if ForwardMode.PREFILL in kinds and target.type == "cuda"
                     else ()
                 )
                 # A prefill bucket includes a padding sequence beyond admitted
@@ -1306,6 +1293,7 @@ class ModelExecutor:
                             inputs,
                             storage=self.graph_storage,
                             prefill_graph=config.prefill_cuda_graph,
+                            exact_graphs=config.flow_cuda_graph,
                             cache=kv_cache.cache,
                             predicates=decode_predicates,
                             rank=config.rank,
@@ -1401,7 +1389,10 @@ class ModelExecutor:
 
     @torch.inference_mode()
     def capture(self, *, tokenizer, latents):
-        """Capture every entry's configured prefill, decode, and flow graphs."""
+        """Capture every entry's configured prefill, decode, and flow graphs.
+
+        An entry that captures no graph of a kind runs one eager call of it.
+        """
         from uniserve_worker.model_executor.startup import (
             prepare_decode,
             prepare_prefill,
@@ -1414,11 +1405,10 @@ class ModelExecutor:
                     phase == "prefill"
                     and ForwardMode.PREFILL in entry.call_kinds
                 ):
-                    shapes = (
-                        self.prefill_shapes[entry]
-                        if self.worker_config.graph_policy != "off"
-                        and self.worker_config.prefill_cuda_graph
-                        else (PrefillShape(1, 1, 1),)
+                    # Without captured buckets, one causal token warms the
+                    # entry eagerly.
+                    shapes = self.prefill_shapes[entry] or (
+                        PrefillShape(1, 1, 1),
                     )
                     prepare_prefill(
                         self, entry, entry.input_buffers, forward, shapes
@@ -1744,9 +1734,12 @@ class ModelExecutor:
         Fatal failures propagate immediately because later device work is
         unsafe.
         """
-        # Rows sharing an entry, forward mode, device, row type, and media
-        # shape form one homogeneous numerical call; a canvas readout and a
-        # canvas step of one pass are separate calls.
+        # Rows sharing an entry, forward mode, device, row type, media shape
+        # and attention causality form one homogeneous numerical call: a
+        # canvas readout and a canvas step of one pass are separate calls.
+        # The engine plans at most one call per request in a batch, so rows
+        # of different causality belong to independent sequences, and each
+        # causality's graph serves its own call.
         grouped: dict[tuple[object, ...], list[int]] = defaultdict(list)
         bindings: dict[int, ModelRunner] = {}
         for index, (task, call) in enumerate(tasks):
@@ -1768,8 +1761,16 @@ class ModelExecutor:
                 shape = tuple(int(value) for value in task.encode_pixels.shape)
             elif isinstance(task, (DiffusionRow, DecodeRow)):
                 shape = (task.image_height, task.image_width)
+            causal = isinstance(task, TokenRow) and task.causal
             grouped[
-                (entry, task.forward_mode, str(target), type(task), shape)
+                (
+                    entry,
+                    task.forward_mode,
+                    str(target),
+                    type(task),
+                    shape,
+                    causal,
+                )
             ].append(index)
 
         groups = list(grouped.values())

@@ -118,6 +118,7 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
         prefill_cuda_graph=True,
         prefill_graph_token_sizes=(16,),
         decode_graph_batch_sizes=(1,),
+        flow_cuda_graph=True,
         flow_graph_shapes=((16, 16),),
         flow_graph_batch_sizes=(1,),
     )
@@ -153,7 +154,6 @@ def test_guided_image_calls_reuse_graphs_without_writing_conditioning(
             ),
             max_calls=3,
             request_slots=3,
-            max_tokens=64,
             latent_capacity_units=16,
             table_widths=(2,),
             max_inflight=1,
@@ -372,18 +372,27 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
         prefill_cuda_graph=True,
         prefill_graph_token_sizes=(16,),
         decode_graph_batch_sizes=(1,),
+        flow_cuda_graph=True,
         flow_graph_shapes=((16, 16),),
         flow_graph_batch_sizes=(1,),
     )
-    from uniserve.processing import ImageProcessor, PatchTransform, PixelBounds
+    from uniserve.processing import (
+        FeatureInjection,
+        FeatureLayout,
+        ImageProcessor,
+        PatchTransform,
+        PixelBounds,
+        PositionLayout,
+    )
 
-    processor = (
-        ImageProcessor(
-            vit=PatchTransform(2, 2, PixelBounds(16, 256)),
-            staging_dtype=torch.bfloat16,
-        )
-        if name == "sensenova_u1"
-        else None
+    # The worker appends image features to prompts, so its processor
+    # declares their injection and startup captures the feature rows.
+    processor = ImageProcessor(
+        vit=PatchTransform(2, 2, PixelBounds(16, 256)),
+        staging_dtype=torch.bfloat16,
+        feature_injection=FeatureInjection(
+            FeatureLayout.DIRECT, PositionLayout.SEQUENTIAL
+        ),
     )
     with Worker(
         model,
@@ -557,7 +566,8 @@ def test_loaded_image_worker_completes_request_warmup(tmp_path, name):
                     actual.values[0], expected, rtol=2e-2, atol=2e-2
                 )
 
-        if processor is not None:
+        # Only the SenseNova worker holds its vision tower.
+        if name == "sensenova_u1":
             import base64
             import io
 

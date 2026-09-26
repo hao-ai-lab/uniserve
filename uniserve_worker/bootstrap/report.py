@@ -291,6 +291,9 @@ def build_worker_layout(
         fabric_handles=_exports_fabric_handles(worker_config.device),
         max_batch_calls=max_calls,
         max_batch_tokens=max_tokens,
+        max_prefill_calls=min(layout.info.max_prefill_calls, max_calls)
+        if layout.info.max_prefill_calls
+        else 0,
         components=tuple(
             ComponentInfo(name, entry, outputs.get(name, ()))
             for name, entry in components
@@ -375,6 +378,9 @@ def _token_worker_layout(
     )
 
     capacity = None
+    # Zero leaves prefill calls bounded by the batch call bound alone, as
+    # when they run eagerly; captured prefill graphs lower it below.
+    max_prefill_calls = 0
     unresolved_window = call_window(
         int(queue_depth), int(worker_config.max_batch_calls)
     )
@@ -440,11 +446,9 @@ def _token_worker_layout(
             and planes is not None
             and input_config is not None
         )
-        from uniserve_worker.config.execution import (
-            DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
-        )
         from uniserve_worker.model_executor.graph_inputs import (
-            select_prefill_captures,
+            prefill_captures,
+            prefill_rows,
         )
         from uniserve_worker.protocol.call import ForwardMode, MediaCall
 
@@ -452,6 +456,11 @@ def _token_worker_layout(
         # this rank owns and each lane serving it, including the prefill row
         # widening for captured graphs. The worker-wide row and token bounds
         # are used here, so the reservation covers lanes with narrower bounds.
+        # The rows those prefill graphs hold bound every prefill call the
+        # engine forms.
+        max_rows = min(
+            worker_config.max_batch_calls, worker_config.max_request_pool_size
+        )
         staged = buffered_kinds(diffusion=flow is not None)
         for name, calls in describe_components(model).items():
             placement = None if bindings is None else bindings.get(name)
@@ -478,17 +487,25 @@ def _token_worker_layout(
                     if not selected:
                         continue
                     fields = input_config
-                    if ForwardMode.PREFILL in selected:
-                        captures = select_prefill_captures(
-                            worker_config.prefill_graph_token_sizes,
-                            DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
-                            max_rows=min(
-                                worker_config.max_batch_calls,
-                                worker_config.max_request_pool_size,
-                            ),
-                            max_tokens=input_config.max_tokens,
-                            visual=flow is not None,
+                    if (
+                        ForwardMode.PREFILL in selected
+                        and torch.device(target).type == "cuda"
+                    ):
+                        captures = prefill_captures(
+                            worker_config,
+                            max_rows=max_rows,
+                            max_tokens=input_config.max_text_tokens,
+                            image_builder=flow is not None,
+                            feature_injection=image_processor is not None
+                            and image_processor.feature_injection is not None,
                         )
+                        bound = prefill_rows(captures, max_rows=max_rows)
+                        if bound is not None:
+                            max_prefill_calls = (
+                                bound
+                                if not max_prefill_calls
+                                else min(max_prefill_calls, bound)
+                            )
                         fields = (
                             replace(
                                 fields,
@@ -611,6 +628,7 @@ def _token_worker_layout(
         supported_calls=supported,
         queue_depth=int(queue_depth),
         max_batch_calls=int(worker_config.max_batch_calls),
+        max_prefill_calls=max_prefill_calls,
         max_batch_tokens=int(worker_config.max_batch_tokens),
         request_slots=int(worker_config.max_request_pool_size),
         kv_cache=(
