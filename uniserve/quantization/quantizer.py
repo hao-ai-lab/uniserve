@@ -13,6 +13,7 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 
 from .tensor import (
     QuantizedTensor,
+    RowOrder,
     ScaleLayout,
     _FP8Tensor,
     _MXFP8Tensor,
@@ -241,7 +242,11 @@ class Quantizer:
             if x.quantizer == self and amax is None:
                 if out is None:
                     return x
-                return x.repack(scale_layout=out.scale_layout, out=out)
+                return x.repack(
+                    scale_layout=out.scale_layout,
+                    row_order=out.row_order,
+                    out=out,
+                )
             x = x.dequantize()
 
         if out is not None and (
@@ -301,6 +306,9 @@ class Quantizer:
         )
         if out is None:
             return result
+        if out.row_order is not result.row_order:
+            # Encoding follows logical rows; ``out`` may store them permuted.
+            result = result.repack(row_order=out.row_order)
         for name, value in result.buffers().items():
             out.buffers()[name].copy_(value.reshape_as(out.buffers()[name]))
         return out
@@ -595,13 +603,26 @@ class Quantizer:
         shape: tuple[int, ...],
         dtype: torch.dtype,
         scale_layout: ScaleLayout = ScaleLayout.LINEAR,
+        row_order: RowOrder = RowOrder.LINEAR,
     ) -> QuantizedTensor:
         """Wrap existing encoding buffers without recomputing statistics.
 
-        Every buffer is validated against the logical shape, format dtype and
-        physical scale layout; borrowed buffers keep their storage owner.
+        Every buffer is validated against the logical shape, format dtype,
+        physical scale layout and row order; borrowed buffers keep their
+        storage owner. A non-linear row order describes a stacked block-
+        scaled ``[E, rows, K]`` tensor whose values and block scales store
+        every expert's rows permuted; it requires whole 32-row blocks.
         """
         self._shape(shape, dtype)
+        if not isinstance(row_order, RowOrder):
+            raise ValueError("unknown row order")
+        if row_order is not RowOrder.LINEAR and (
+            self.format == "fp8" or len(shape) != 3 or shape[1] % 32
+        ):
+            raise ValueError(
+                "row orders apply only to stacked block-scaled tensors "
+                "of whole 32-row blocks"
+            )
         keys = (
             {"values", "block_scale", "tensor_scale"}
             if self.format == "nvfp4"
@@ -684,6 +705,7 @@ class Quantizer:
             dtype=dtype,
             quantizer=self,
             scale_layout=scale_layout,
+            row_order=row_order,
         )
 
 
