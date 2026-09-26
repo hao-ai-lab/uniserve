@@ -67,19 +67,36 @@ class _Automatic(_Operator):
                 "flashinfer",
                 "torch",
             )
+        # The SM100 head-dimension-256 FA4 kernel accepts neither per-sequence
+        # key lengths nor mask functions, which paged, visible and segmented
+        # inputs require.
+        fa4_indexed = self.head_dim != 256
         if isinstance(batch, (VisibleInput, SegmentedInput)):
             # Device-visible endpoints are captured directly by FA4. This
             # retains the packed-attention preference for native mask kernels.
-            fa4 = ("flash_attn_4",) if self._architecture in (9, 10, 11) else ()
+            fa4 = (
+                ("flash_attn_4",)
+                if self._architecture in (9, 10, 11) and fa4_indexed
+                else ()
+            )
             return (*fa4, "flashinfer", "torch")
         if isinstance(batch, PagedInput):
             block_size = batch.block_table.block_size
             ordinary = (
                 ("sgl_kernel", "flash_attn") if block_size % 256 == 0 else ()
             )
-            fa4 = ("flash_attn_4",) if self._architecture not in (8, 12) else ()
+            fa4 = (
+                ("flash_attn_4",)
+                if self._architecture not in (8, 12) and fa4_indexed
+                else ()
+            )
+            # TensorRT-LLM context kernels bound a history window only along
+            # the causal diagonal.
+            trtllm = (
+                ("trtllm",) if self.window is None or all(batch.causal) else ()
+            )
             return (
-                "trtllm",
+                *trtllm,
                 *ordinary[:1],
                 "flashinfer",
                 *ordinary[1:],
@@ -210,20 +227,36 @@ class Backend(_Backend):
             sorted(self._factories)
         )
 
-    def _providers(self, dtype, head_dim, cache):
+    def _providers(self, dtype, head_dim, cache, window):
         # Native kernels require half precision and unquantized cache state.
         if dtype not in {torch.float16, torch.bfloat16} or (
             cache is not None and isinstance(cache.key, QuantizedTensor)
         ):
             return {"torch": self._factories["torch"]}
 
-        # Restrict candidates to each kernel's head-dimension and cache-block
-        # constraints.
+        # Restrict candidates to each kernel's head-dimension, cache-block and
+        # history-window constraints. The pinned SM100 TensorRT-LLM cubins
+        # specialize head dimension 512 context kernels only for causal and
+        # dense masks over 16-, 32- and 64-token pages; FlashAttention
+        # providers do not take UniServe's history windows.
         return {
             name: backend
             for name, backend in self._factories.items()
             if (name != "flashinfer" or head_dim in {64, 128, 256, 512})
-            and (name != "trtllm" or head_dim in {64, 128, 256})
+            and (
+                name != "trtllm"
+                or head_dim in {64, 128, 256}
+                or (
+                    head_dim == 512
+                    and window is None
+                    and cache is not None
+                    and cache.block_size in {16, 32, 64}
+                )
+            )
+            and (
+                window is None
+                or name not in {"sgl_kernel", "flash_attn", "flash_attn_4"}
+            )
             and (
                 name not in {"sgl_kernel", "flash_attn"}
                 or (head_dim <= 256 and head_dim % 8 == 0)
@@ -248,7 +281,10 @@ class Backend(_Backend):
 
     def _requirements(self, arguments):
         providers = self._providers(
-            arguments["dtype"], arguments["head_dim"], arguments["cache"]
+            arguments["dtype"],
+            arguments["head_dim"],
+            arguments["cache"],
+            arguments.get("window"),
         )
         requirements = {
             name: backend.workspace_buffers(**arguments)

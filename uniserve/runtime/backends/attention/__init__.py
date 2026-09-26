@@ -14,12 +14,18 @@ from uniserve.nn.attention.inputs import (
     DenseInput,
     PagedInput,
     SegmentedInput,
+    VisibleInput,
 )
 from uniserve.tensors import BufferConfig
 
 
 class Operator:
-    """One layer invocation's backend state and borrowed numerical resources."""
+    """One layer invocation's backend state and borrowed numerical resources.
+
+    ``window`` is the layer's history bound in tokens (``None`` reads the
+    whole history); its visibility rule is documented on
+    :class:`uniserve.nn.attention.Attention`.
+    """
 
     def __init__(
         self,
@@ -31,6 +37,7 @@ class Operator:
         size,
         cache,
         workspace,
+        window=None,
     ):
         if (
             min(num_heads, num_kv_heads, head_dim) < 1
@@ -39,6 +46,11 @@ class Operator:
             raise ValueError(
                 "attention requires compatible positive query and KV heads"
             )
+        if window is not None and (type(window) is not int or window < 0):
+            raise ValueError(
+                "attention windows must be nonnegative token counts"
+            )
+        self.window = window
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -87,6 +99,14 @@ class Operator:
     def _check_batch(self, batch):
         if self._closed:
             raise RuntimeError("attention operator is closed")
+
+        if self.window is not None and isinstance(batch, VisibleInput):
+            # Visible inputs carry key endpoints but no query positions, so a
+            # history bound relative to each query is not defined for them.
+            raise ValueError(
+                "windowed attention requires paged, segmented, variable-length "
+                "or dense inputs"
+            )
 
         if not isinstance(batch, DenseInput) and (
             (
@@ -225,6 +245,7 @@ class Backend:
         dtype: torch_lib.dtype,
         size: TextSize,
         cache: mha.State | None,
+        window: int | None = None,
     ) -> Mapping[str, BufferConfig]:
         return {}
 
@@ -238,6 +259,7 @@ class Backend:
         size: TextSize,
         cache: mha.State | None,
         workspace: Mapping[str, torch_lib.Tensor],
+        window: int | None = None,
     ) -> Operator:
         return self.operator_class(
             num_heads=num_heads,
@@ -247,6 +269,7 @@ class Backend:
             size=size,
             cache=cache,
             workspace=workspace,
+            window=window,
         )
 
 
