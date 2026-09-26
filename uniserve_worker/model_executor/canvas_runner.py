@@ -139,12 +139,7 @@ class CanvasRunner(ModelRunner):
                     count, length, device=hidden.device
                 ),
                 decision=decision,
-                workspace=sampler.CanvasWorkspace(
-                    slots.workspace.weights[:positions],
-                    slots.workspace.normalizer[:positions],
-                    slots.workspace.product[:positions],
-                    slots.workspace.scratch,
-                ),
+                workspace=_chunk_workspace(slots.workspace, positions),
             )
             results[start:stop, 0] = decision.finished[:, 0]
             results[start:stop, 1:] = decision.tokens
@@ -155,6 +150,26 @@ class CanvasRunner(ModelRunner):
     def select_graph_shape(self, batch, *, eligible):
         """Run every canvas pass eagerly; see the class description."""
         return None
+
+
+def _chunk_workspace(
+    workspace: sampler.CanvasWorkspace, positions: int
+) -> sampler.CanvasWorkspace:
+    """The leading ``positions`` rows of a step workspace, for one chunk.
+
+    The scratch keeps the size the CUDA product expects for the chunk's own
+    shape, which keys its reproducible algorithm table, rather than the
+    size of the largest chunk the workspace holds.
+    """
+    from uniserve_kernels.diffusion.canvas import product_scratch_bytes
+
+    hidden = workspace.product.shape[1]
+    return sampler.CanvasWorkspace(
+        workspace.weights[:positions],
+        workspace.normalizer[:positions],
+        workspace.product[:positions],
+        workspace.scratch[: product_scratch_bytes(positions, hidden)],
+    )
 
 
 def _rows(state: sampler.CanvasState, start: int, stop: int):
