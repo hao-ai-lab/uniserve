@@ -120,3 +120,38 @@ def test_dense_attention_preserves_heads_masks_and_graph_inputs(
             torch.testing.assert_close(
                 actual, reference(), rtol=tolerance, atol=tolerance
             )
+
+
+@torch.inference_mode()
+def test_fp32_single_head_autoencoder_attention_is_evaluated():
+    """Automatic selection evaluates FP32 image-autoencoder attention.
+
+    The spatial self-attention of an FP32 image autoencoder is one head of
+    dimension 512 over every latent position, called with query chunks
+    against the full keys. No native CUDA kernel computes it in FP32, and
+    the layer still evaluates the attention equation.
+    """
+    device = torch.device("cuda", 0)
+    torch.manual_seed(311)
+    q = torch.randn((1, 1, 96, 512), device=device)
+    k = torch.randn((1, 1, 256, 512), device=device)
+    v = torch.randn_like(k)
+    attention = Attention(1, 1, 512)
+    inputs = AttentionBatch.single(DenseInput(causal=False, mask=None))
+
+    stream = CUDAStream.external(torch.cuda.Stream(device=device))
+    stream.wait(torch.cuda.current_stream(device))
+    with (
+        stream,
+        ExecutionContext(attention, attention="auto", stream=stream) as context,
+    ):
+        context.prepare(None)
+        actual = attention(q, k, v, inputs)
+
+    expected = F.scaled_dot_product_attention(
+        q.double(), k.double(), v.double()
+    ).float()
+    # CUDA FP32 products may round their inputs to TF32 (2^-11 unit
+    # roundoff); the repository's half-precision tolerance, 2e-2 at BF16's
+    # 2^-8, scales to 2.5e-3 at that unit.
+    torch.testing.assert_close(actual, expected, rtol=2.5e-3, atol=2.5e-3)
