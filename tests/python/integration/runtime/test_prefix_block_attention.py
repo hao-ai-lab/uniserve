@@ -201,7 +201,17 @@ def _reference(batch, *, window, query_window, scale):
     return output, lse
 
 
-def _launch(batch, *, window, query_window, scale, out, lse, lse_base2=False):
+def _launch(
+    batch,
+    *,
+    window,
+    query_window,
+    scale,
+    out,
+    lse,
+    lse_base2=False,
+    max_query_len=280,
+):
     prefix_block.prefix_block_attention(
         batch.query,
         batch.key,
@@ -211,7 +221,7 @@ def _launch(batch, *, window, query_window, scale, out, lse, lse_base2=False):
         batch.block_table,
         batch.query_offsets,
         batch.prefix_lengths,
-        max_query_len=280,
+        max_query_len=max_query_len,
         window=window,
         query_window=query_window,
         start_page=batch.start_page,
@@ -304,6 +314,45 @@ def test_image_block_window_follows_each_query(page_tokens):
         lse,
         window=1023,
         query_window=True,
+        scale=1 / 16,
+        base2=False,
+    )
+
+
+@pytest.mark.parametrize("page_tokens", [16, 32])
+@pytest.mark.parametrize("query_window", [False, True])
+@torch.inference_mode()
+def test_small_batch_reads_history_window(page_tokens, query_window):
+    # A batch too small to occupy the GPU with the widest work tiles (two
+    # sequences of at most 256 queries): a full block over a prefix just past
+    # the window and a short block over a prefix that is not a page multiple.
+    lengths = (256, 17)
+    prefixes = (1025, 3001)
+    batch = _batch(
+        lengths,
+        prefixes,
+        page_tokens=page_tokens,
+        start_pages=_history_start_pages(prefixes, page_tokens),
+        seed=41 + page_tokens,
+    )
+    out, lse = _outputs(batch)
+
+    _launch(
+        batch,
+        window=1023,
+        query_window=query_window,
+        scale=1 / 16,
+        out=out,
+        lse=lse,
+        max_query_len=max(lengths),
+    )
+
+    _assert_matches(
+        batch,
+        out,
+        lse,
+        window=1023,
+        query_window=query_window,
         scale=1 / 16,
         base2=False,
     )

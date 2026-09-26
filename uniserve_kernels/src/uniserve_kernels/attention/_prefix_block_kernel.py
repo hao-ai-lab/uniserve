@@ -26,7 +26,10 @@ half of the columns in lanes 0-63 and the second half in lanes 64-127, which
 keeps every data path busy while halving the columns (256 for the output,
 64 per score stage). Each row's scores are then split between two threads
 (lanes ``r`` and ``r + 64``), which exchange row maxima through shared
-memory, and the probabilities reach the PV MMA through shared memory.
+memory, and the probabilities reach the PV MMA through shared memory. Head
+dimension 256 also runs 128-row tiles in this layout (the ``tile_rows``
+specialization), which the launcher selects when a batch is too small to
+occupy the GPU with 256-row tiles.
 
 Key tiles. A work tile streams 128-key tiles: prefix tiles first, then the
 tiles of its own block. Prefix tiles start at the page containing the
@@ -93,6 +96,10 @@ _TMEM_COLUMNS = 512
 _TMEM_BARRIER = 1
 _PAIR_BARRIER = 2
 _OUTPUT_BARRIER = 4
+# Dynamic SMEM bytes that Q, the ring, the probability tiles and the output
+# staging buffer may use together: the 227 KiB per-CTA limit less 3 KiB for
+# the barriers, row statistics and alignment.
+_STAGING_SMEM_LIMIT = 224 * 1024
 # Tensor-memory addresses carry the lane above bit 16 and the column below.
 _TMEM_LANE = 1 << 16
 # The running row maximum used for the probabilities is only raised when a
@@ -155,8 +162,10 @@ class PrefixBlockAttentionSm100:
 
     Args:
         head_dim: Q/K/V head dimension; 256 or 512.
+        tile_rows: Packed rows per cluster tile: 256 or 128 at head dim 256,
+            128 at head dim 512.
         group_size: Query heads per KV head ``G``; must divide the CTA rows
-            (128 at head dim 256, 64 at head dim 512).
+            (``tile_rows / 2``).
         page_tokens: Tokens per cache page; 16, 32 or 64.
         query_window: If true, row ``i`` of a block reads prefix keys from
             ``P + i - window`` (an image block whose history window follows
@@ -176,6 +185,7 @@ class PrefixBlockAttentionSm100:
         self,
         *,
         head_dim: int,
+        tile_rows: int,
         group_size: int,
         page_tokens: int,
         query_window: bool,
@@ -187,6 +197,11 @@ class PrefixBlockAttentionSm100:
     ) -> None:
         if head_dim not in (256, 512):
             raise ValueError("head_dim must be 256 or 512")
+        if tile_rows not in ((256, 128) if head_dim == 256 else (128,)):
+            raise ValueError(
+                "tile_rows must be 256 or 128 at head_dim 256 and 128 at "
+                "head_dim 512"
+            )
         if page_tokens not in (16, 32, 64):
             raise ValueError("page_tokens must be 16, 32 or 64")
 
@@ -201,7 +216,7 @@ class PrefixBlockAttentionSm100:
         self.lse_base2 = lse_base2
 
         # Rows per cluster tile and per CTA; see the module docstring.
-        self.tile_rows = 256 if head_dim == 256 else 128
+        self.tile_rows = tile_rows
         self.cta_rows = self.tile_rows // 2
         if group_size < 1 or self.cta_rows % group_size:
             raise ValueError("query heads per KV head must divide CTA rows")
@@ -238,17 +253,25 @@ class PrefixBlockAttentionSm100:
 
         # A tile streams qk_chunks K stages and 2 * pv_pairs V stages; eight
         # 16 KiB ring stages keep the loads a full tile ahead at head dim
-        # 512 (SMEM: Q 64 KiB, ring 128 KiB, probabilities 32 KiB).
+        # 512.
         self.q_stage = self.qk_chunks
         self.kv_stage = 8
         self.s_stage = 2
-        # A tensor-memory lane holds one output row, so storing rows straight
-        # from registers writes 16 bytes to a different row per thread. At
-        # head dim 256 the output chunk goes through a 32 KiB SMEM buffer
-        # (free next to Q and the ring) and leaves in whole row segments; at
-        # head dim 512 the probabilities take that space and the output is
+        # A tensor-memory lane holds (part of) one output row, so storing
+        # rows straight from registers writes 16 bytes to a different row
+        # per thread. When SMEM has room next to Q, the ring and the
+        # probability tiles, each output chunk goes through a staging buffer
+        # and leaves in whole row segments; otherwise (head dim 512) it is
         # stored from registers.
-        self.stage_output = head_dim == 256
+        row_bytes = self.cta_rows * 2
+        smem_bytes = (
+            row_bytes * head_dim
+            + self.kv_stage * 16 * 1024
+            + (0 if self.p_in_tmem else self.s_stage * row_bytes * 128)
+        )
+        self.stage_output = (
+            smem_bytes + row_bytes * self.chunk <= _STAGING_SMEM_LIMIT
+        )
 
         self.softmax_warps = (0, 1, 2, 3)
         self.correction_warps = (4, 5, 6, 7)
@@ -753,6 +776,19 @@ class PrefixBlockAttentionSm100:
             prefix_start,
             window,
         )
+        # The load warp reads its first work tile's metadata and page lookups
+        # before the barrier and tensor-memory setup, which the other warps
+        # carry out meanwhile; the other warps keep placeholder values.
+        zero = Int32(0)
+        first_lookups = (
+            (Boolean(False),) + (zero,) * 12,
+            (zero, zero),
+            (zero, zero),
+        )
+        if warp == self.load_warp:
+            first_lookups = self.tile_lookups(
+                cluster_id, schedule, block_table, num_pages
+            )
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -922,6 +958,7 @@ class PrefixBlockAttentionSm100:
                 (s_q, s_k, ring),
                 block_table,
                 num_pages,
+                first_lookups,
                 q_producer,
                 kv_producer,
             )
@@ -976,7 +1013,10 @@ class PrefixBlockAttentionSm100:
             cute.arch.setmaxregister_decrease(self.regs_other)
 
         # Both CTAs must finish every TMEM access before the pair frees it.
-        cute.arch.cluster_arrive()
+        # Every tensor-memory access has completed through its pipeline by
+        # now, so the arrival needs no release ordering; a releasing arrival
+        # would wait for the epilogue's global stores to complete.
+        cute.arch.cluster_arrive_relaxed()
         cute.arch.cluster_wait()
         tmem.relinquish_alloc_permit()
         tmem.free(tmem_ptr)
@@ -1000,13 +1040,16 @@ class PrefixBlockAttentionSm100:
         smem_tensors,
         block_table: cute.Tensor,
         num_pages: Int32,
+        first_lookups,
         q_producer,
         kv_producer,
     ):
         """Issue the TMA loads of Q and of every K/V stage of each tile.
 
         K tile ``j`` is loaded before V tile ``j - 1``, the order in which
-        the MMA warp consumes the stages.
+        the MMA warp consumes the stages. Each tile's metadata and first
+        page lookups (:meth:`tile_lookups`) are read at the end of the
+        previous tile, or before the kernel setup for the first one.
         """
         cluster_id, num_clusters, total_tiles = schedule[:3]
         (
@@ -1041,6 +1084,7 @@ class PrefixBlockAttentionSm100:
         )
 
         tile = cluster_id
+        info, slots, ahead = first_lookups
         while tile < total_tiles:
             (
                 valid,
@@ -1056,7 +1100,7 @@ class PrefixBlockAttentionSm100:
                 key_tiles,
                 _lower_first,
                 _lower_last,
-            ) = self.work_tile(tile, schedule)
+            ) = info
             if valid:
                 # Q: this CTA's rows of the tile's packed rows, per chunk.
                 q_seq = cute.domain_offset(
@@ -1107,8 +1151,6 @@ class PrefixBlockAttentionSm100:
                     block_table,
                     num_pages,
                 )
-                slots = self.lane_slots(Int32(0), lookup)
-                ahead = self.lane_slots(Int32(1), lookup)
                 kv_producer = self.load_k(
                     Int32(0), slots, sequence, sources, kv_producer
                 )
@@ -1126,8 +1168,54 @@ class PrefixBlockAttentionSm100:
                     key_tiles - 1, slots, sequence, sources, kv_producer
                 )
             tile += num_clusters
+            info, slots, ahead = self.tile_lookups(
+                tile, schedule, block_table, num_pages
+            )
         kv_producer.tail()
         q_producer.tail()
+
+    @no_type_check
+    @cute.jit
+    def tile_lookups(
+        self,
+        tile: Int32,
+        schedule,
+        block_table: cute.Tensor,
+        num_pages: Int32,
+    ):
+        """Metadata of work tile ``tile`` and its first two prefix lookups.
+
+        Returns ``(work_tile(tile), lane_slots(0), lane_slots(1))``. A tile
+        past the last one is clamped to it, so the lookups ahead of the end
+        of the loop stay inside the metadata tensors.
+        """
+        total_tiles = schedule[2]
+        info = self.work_tile(cutlass.min(tile, total_tiles - 1), schedule)
+        (
+            _valid,
+            batch,
+            _kv_head,
+            _m_block,
+            _query_start,
+            _query_len,
+            prefix_len,
+            first_page,
+            prefix_base,
+            prefix_tiles,
+            _key_tiles,
+            _lower_first,
+            _lower_last,
+        ) = info
+        lookup = (
+            (batch, prefix_len, first_page, prefix_base, prefix_tiles),
+            block_table,
+            num_pages,
+        )
+        return (
+            info,
+            self.lane_slots(Int32(0), lookup),
+            self.lane_slots(Int32(1), lookup),
+        )
 
     @no_type_check
     @cute.jit
