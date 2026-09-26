@@ -21,7 +21,9 @@ class TopK(nn.Module):
 
     Returns ``(topk_ids int32 [T, K], topk_weights fp32 [T, K])``: a full
     softmax over the router scores followed by top-k, with the selected
-    weights renormalized to sum to one when ``renormalize`` is set.
+    weights renormalized to sum to one when ``renormalize`` is set and
+    multiplied by ``scale[id]`` when a per-expert scale is given (see
+    :func:`uniserve.nn.functional.topk_softmax`).
     """
 
     def __init__(self, k: int, *, renormalize: bool = True) -> None:
@@ -32,15 +34,11 @@ class TopK(nn.Module):
         self.renormalize = renormalize
 
     def forward(
-        self, scores: torch.Tensor
+        self, scores: torch.Tensor, *, scale: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32)
-        weights, ids = torch.topk(probabilities, self.k, dim=-1)
-        if self.renormalize:
-            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(
-                torch.finfo(weights.dtype).eps
-            )
-        return ids.to(torch.int32), weights
+        return functional.topk_softmax(
+            scores, self.k, renormalize=self.renormalize, scale=scale
+        )
 
 
 class ExpertLinear(nn.Module):
