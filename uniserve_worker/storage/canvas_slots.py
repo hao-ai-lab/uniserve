@@ -38,8 +38,10 @@ from uniserve_worker.protocol.batch import CanvasSampling
 FIELDS = ("canvas", "history", "self_conditioning")
 # Bytes of one step chunk's FP32 logits and BF16 sampling weights, the two
 # vocabulary-wide tensors of a step. A pass steps as many whole canvases at
-# a time as fit, so its transient logits and its workspace stay bounded.
-STEP_BYTES = 2 << 30
+# a time as fit (at least one), so its transient logits and its workspace
+# stay bounded; a captured step keeps the head's transients of one chunk in
+# its graph pool.
+STEP_BYTES = 512 << 20
 
 
 def step_rows(*, canvas_length: int, vocab_size: int, max_rows: int) -> int:

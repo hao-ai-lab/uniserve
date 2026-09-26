@@ -960,11 +960,15 @@ class CanvasBuffers(AttentionBuffers):
 
         Replacing the backing is ordered after earlier readers by the
         caching allocator, since every reader runs on this staging stream.
+        Serving stages outside inference mode, so the backing is allocated
+        as an ordinary tensor even when startup staging, which runs in
+        inference mode, grows it first.
         """
         if self._candidates.numel() < size:
-            self._candidates = torch.empty(
-                size, dtype=torch.int64, device=self.device
-            )
+            with torch.inference_mode(False):
+                self._candidates = torch.empty(
+                    size, dtype=torch.int64, device=self.device
+                )
         return self._candidates
 
 

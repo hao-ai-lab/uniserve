@@ -1106,13 +1106,21 @@ class ModelExecutor:
 
         Creates one capability runner per (entry, path, lane) covering a
         computation kind, with its input buffers, execution context, decode /
-        prefill capture shapes, and private CUDA graph storage pools. Prefill
-        buckets reach the text tokens ``input_config`` stages per call, and
-        ``max_calls`` and ``request_slots`` bound their live rows. Callable
-        once: a second call raises ``RuntimeError`` when the first bound any
-        entry. Raises ``ValueError`` when two staged entries of one component
-        cover the same computation kind, and as ``_initialize_streams`` does.
+        prefill capture shapes, and CUDA graph storage pools: private ones,
+        except that the text and canvas runners of one lane stream share
+        theirs. Prefill buckets reach the text tokens ``input_config`` stages
+        per call, and ``max_calls`` and ``request_slots`` bound their live
+        rows. Callable once: a second call raises ``RuntimeError`` when the
+        first bound any entry. Raises ``ValueError`` when two staged entries
+        of one component cover the same computation kind, and as
+        ``_initialize_streams`` does.
         """
+        from uniserve_worker.model_executor.canvas_runner import (
+            CanvasRunner,
+            canvas_staging_rows,
+        )
+        from uniserve_worker.model_executor.text_runner import TextRunner
+
         if self.entries:
             raise RuntimeError("input execution resources are already bound")
 
@@ -1163,6 +1171,13 @@ class ModelExecutor:
             )
 
         staged = buffered_kinds(diffusion=self.image_builder is not None)
+        # The first text or canvas runner with graph pools on each (device,
+        # lane stream). A lane stream runs one call at a time and every such
+        # runner allocates its persistent graph storage before the first
+        # capture, so their graphs share one pool: each capture reuses the
+        # blocks the others' intermediates free, and the pool holds the
+        # largest call's intermediates rather than one copy per runner.
+        token_pools: dict[tuple[str, int], ModelRunner] = {}
 
         for (name, path, method), (
             placement,
@@ -1239,7 +1254,9 @@ class ModelExecutor:
                     else ()
                 )
                 # A prefill bucket includes a padding sequence beyond admitted
-                # requests. It consumes staging, but no scheduler request slot.
+                # requests, and a canvas readout bucket padding sequences
+                # (``canvas_runner.canvas_staging_rows``). They consume
+                # staging, but no scheduler request slot.
                 fields = (
                     replace(
                         input_config,
@@ -1249,6 +1266,13 @@ class ModelExecutor:
                         ),
                     )
                     if prefill
+                    else replace(
+                        input_config,
+                        max_rows=canvas_staging_rows(input_config.max_rows),
+                    )
+                    if ForwardMode.TOKEN_DENOISING in kinds
+                    and target.type == "cuda"
+                    and config.graph_policy != "off"
                     else input_config
                 )
                 inputs = context = entry = None
@@ -1300,7 +1324,12 @@ class ModelExecutor:
                             if reads_cache
                             else None
                         )
-                        entry = self._runner_types[id(call)](
+                        runner_class = self._runner_types[id(call)]
+                        token_runner = issubclass(
+                            runner_class, (TextRunner, CanvasRunner)
+                        )
+                        pool_key = (str(target), id(stream))
+                        entry = runner_class(
                             name,
                             call,
                             target,
@@ -1318,7 +1347,12 @@ class ModelExecutor:
                             if config.graph_policy != "off"
                             and target.type == "cuda"
                             else (),
+                            share=token_pools.get(pool_key)
+                            if token_runner
+                            else None,
                         )
+                        if token_runner and entry.pools:
+                            token_pools.setdefault(pool_key, entry)
                         with self.graph_storage.allocate(entry):
                             context.prepare(size)
                         self.graph_storage.check()
@@ -1408,19 +1442,20 @@ class ModelExecutor:
     def capture(self, *, tokenizer, latents):
         """Prepare every staged entry before serving.
 
-        Captures each entry's configured prefill, decode and flow graphs,
-        running one eager call of each kind that captures none, then runs
-        one synthetic image through every image encoding and decoding entry
-        (see ``startup.prepare_images``), so every staged call kind has
+        Captures each entry's configured prefill, decode, canvas and flow
+        graphs, running one eager call of each kind that captures none, then
+        runs one synthetic image through every image encoding and decoding
+        entry (see ``startup.prepare_images``), so every staged call kind has
         prepared its call sites and chosen its kernels.
         """
         from uniserve_worker.model_executor.startup import (
+            prepare_canvas,
             prepare_decode,
             prepare_images,
             prepare_prefill,
         )
 
-        for phase in ("prefill", "decode", "flow"):
+        for phase in ("prefill", "decode", "canvas", "flow"):
             for entry in self.entries.values():
                 forward = entry.batch_forward
                 if (
@@ -1439,6 +1474,11 @@ class ModelExecutor:
                     phase == "decode" and ForwardMode.DECODE in entry.call_kinds
                 ):
                     prepare_decode(self, entry, entry.input_buffers, forward)
+                elif (
+                    phase == "canvas"
+                    and ForwardMode.TOKEN_DENOISING in entry.call_kinds
+                ):
+                    prepare_canvas(self, entry)
                 elif (
                     phase == "flow" and MediaCall.DENOISING in entry.call_kinds
                 ):

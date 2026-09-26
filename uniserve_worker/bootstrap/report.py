@@ -70,6 +70,7 @@ from uniserve_worker.config.execution import (
     graph_storage_budget_bytes,
 )
 from uniserve_worker.errors import unsupported_setup
+from uniserve_worker.model_executor.canvas_runner import canvas_staging_rows
 from uniserve_worker.model_executor.component_binding import ComponentBinding
 from uniserve_worker.model_executor.input_buffers import (
     TokenBufferConfig,
@@ -522,6 +523,17 @@ def _token_worker_layout(
                             )
                             if captures
                             else fields
+                        )
+                    elif (
+                        ForwardMode.TOKEN_DENOISING in selected
+                        and torch.device(target).type == "cuda"
+                        and worker_config.graph_policy != "off"
+                    ):
+                        # Canvas readout graphs stage padding sequences
+                        # beyond their canvases.
+                        fields = replace(
+                            fields,
+                            max_rows=canvas_staging_rows(fields.max_rows),
                         )
                     _, allocation = call_buffer_config(
                         next(iter(selected)), fields

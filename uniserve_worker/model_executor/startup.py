@@ -4,9 +4,10 @@
 before ``ModelExecutor.complete_startup`` seals graph capture. They stage
 startup rows (token ID zero for text; for image denoising, guidance-branch
 prefixes resolved through the model's ``FlowPrompt``) through the same
-``TokenBuffers`` and ``DiffusionBuffers`` serving uses, on scratch KV units and
-latent values leased from the idle pools, and capture each configured bucket;
-when graphs are disabled, representative calls run eagerly as warmup instead.
+``TokenBuffers``, ``CanvasBuffers`` and ``DiffusionBuffers`` serving uses, on
+scratch KV units and latent values leased from the idle pools, and capture
+each configured bucket; when graphs are disabled, representative calls run
+eagerly as warmup instead.
 Image encoders and decoders, which run eagerly, evaluate one synthetic image
 each (``prepare_images``), so every staged call kind has prepared its call
 sites and chosen its kernels before serving.
@@ -33,8 +34,16 @@ from uniserve_worker.model_executor.image_inputs import (
     VisionRow,
     prepare_tensor_image,
 )
-from uniserve_worker.model_executor.input_batch import InputBatch, TokenRow
-from uniserve_worker.model_executor.input_buffers import TokenBuffers
+from uniserve_worker.model_executor.input_batch import (
+    CanvasRow,
+    CanvasStepRow,
+    InputBatch,
+    TokenRow,
+)
+from uniserve_worker.model_executor.input_buffers import (
+    CanvasBuffers,
+    TokenBuffers,
+)
 from uniserve_worker.model_executor.model_runner import ModelRunner
 from uniserve_worker.model_executor.output import ExecutionOutput
 from uniserve_worker.protocol.call import ForwardMode, ImageParams, MediaCall
@@ -43,7 +52,9 @@ from uniserve_worker.storage.block_tables import GroupTable
 from uniserve_worker.storage.kv_cache import KVCacheManager
 
 if TYPE_CHECKING:
+    from uniserve.diffusion.canvas import CanvasSampling
     from uniserve_worker.execution.model_executor import ModelExecutor
+    from uniserve_worker.model_executor.canvas_runner import CanvasRunner
     from uniserve_worker.model_executor.graph_inputs import PrefillShape
 
 
@@ -283,6 +294,99 @@ def prepare_decode(
             finally:
                 if saved is not None and predicates is not None:
                     predicates.copy_(saved)
+
+
+def stage_canvas(
+    buffers: CanvasBuffers,
+    tables: Sequence[Sequence[GroupTable]],
+    *,
+    length: int,
+    sampling: CanvasSampling | None = None,
+) -> InputBatch:
+    """Stage synthetic canvas rows through serving's staging path.
+
+    Row ``i`` is a canvas of ``length`` tokens in request slot ``i + 1``
+    over a one-token prefix on its scratch ``tables``, read-only and
+    non-causal as every canvas is. Without ``sampling`` the rows are
+    readout canvases of token zero reading one slot; with it they are step
+    zero of block zero of the slots' resident canvases under that sampling.
+    """
+    rows = len(tables)
+    prefix = 1
+    attention = from_tables(
+        table_pages(
+            tables,
+            prefix_lengths=(prefix,) * rows,
+            query_lengths=(length,) * rows,
+        ),
+        query_lengths=(length,) * rows,
+        prefix_lengths=(prefix,) * rows,
+        causal=(False,) * rows,
+        write=(False,) * rows,
+    )
+    positions = torch.arange(prefix, prefix + length, dtype=torch.int64)
+    common = {
+        "forward_mode": ForwardMode.TOKEN_DENOISING,
+        "positions": positions,
+        "seq_len": prefix,
+        "write_kv": False,
+        "causal": False,
+    }
+    staged = tuple(
+        CanvasRow(
+            request_pool_idx=slot,
+            token_ids=torch.zeros(length, dtype=torch.int64),
+            slot_tokens=(0,),
+            candidate_offsets=(0, 1),
+            candidate_ids=(0,),
+            **common,
+        )
+        if sampling is None
+        else CanvasStepRow(
+            request_pool_idx=slot,
+            canvas_length=length,
+            seed=slot,
+            sampling=sampling,
+            **common,
+        )
+        for slot in range(1, rows + 1)
+    )
+    return buffers.prepare_inputs(
+        staged, forward_mode=ForwardMode.TOKEN_DENOISING, attention=attention
+    )
+
+
+def prepare_canvas(runner: ModelExecutor, entry: CanvasRunner) -> None:
+    """Capture every canvas row bucket of a token denoiser, largest first.
+
+    Each bucket captures a readout pass and, when the entry generates
+    canvases, a canvas step of the served sampling over request slots one
+    upward, whose resident state stays scratch until a request starts its
+    canvas there. The rows are staged through serving's staging with the
+    real read-only attention input over one-token prefixes on scratch KV
+    units, and the runner pads them to their bucket. The largest readout
+    bucket, captured first, sizes the runner's shared readout output. A
+    step's warm call runs the sampler's chunk shapes before their capture.
+    Without graph pools, one readout row and one step row run eagerly.
+
+    Raises:
+        ValueError: A bucket is prepared on a worker without a KV cache.
+    """
+    cache = runner.kv_cache
+    if cache is None:
+        raise ValueError("canvas capture requires the worker KV cache")
+    slots = entry.canvas_slots
+    kinds = (None,) if slots is None else (None, slots.constants)
+    for rows in reversed(entry.canvas_rows if entry.pools else (1,)):
+        for sampling in kinds:
+            with cache.startup_units(rows * cache.page_units(1)) as scratch:
+                batch = stage_canvas(
+                    entry.input_buffers,
+                    scratch_tables(cache, scratch, (1,) * rows),
+                    length=entry.canvas_length,
+                    sampling=sampling,
+                )
+                entry.capture_batch(batch, entry.batch_forward)
 
 
 def capture_image_parameters(cfg_branches, *, steps, height, width):
