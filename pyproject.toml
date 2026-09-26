@@ -28,6 +28,8 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
+    # Extension build tests drive torch's C++ extension build.
+    "ninja>=1.13",
     "pytest>=8.1",
     "pytest-timeout>=2.3",
 ]

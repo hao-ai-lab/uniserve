@@ -177,7 +177,7 @@ docker run --rm \
     --max-running-requests 2
 ```
 
-The first startup compiles the native GPU providers. Those artifacts land in `~/.cache/torch_extensions`; mount that path, or point `TORCH_EXTENSIONS_DIR` at a mounted directory, if container restarts must reuse them.
+The first startup compiles the native GPU providers; later startups import the finished builds without compiling. Those artifacts land in `~/.cache/torch_extensions/uniserve_kernels`; mount that path, or point `TORCH_EXTENSIONS_DIR` at a mounted directory, if container restarts must reuse them. The directory's file system must support `flock` locks, which serialize concurrent builds and are released when a stopped or killed startup exits.
 
 ## Generate a video
 
@@ -260,7 +260,7 @@ uniserve serve skx618/FastVideo-FastH3-8-Step-V2-NVFP4 \
 | Error | Action |
 | --- | --- |
 | `_uniserve_ipc` import or protocol error | Run `uv sync --locked --python /usr/bin/python3.12 --extra gpu` again and use the resulting `uniserve` executable. |
-| CUDA or sparse-attention compile error | Check CUDA 13 `nvcc`, `CUDA_HOME`, SM100 hardware, C++ build tools, and a writable `TORCH_EXTENSIONS_DIR`. |
+| CUDA or sparse-attention compile error | Check CUDA 13 `nvcc`, `CUDA_HOME`, SM100 hardware, C++ build tools, and a writable `TORCH_EXTENSIONS_DIR` whose file system supports `flock`. |
 | Missing audio VAE or codec | Restore the locked environment with `uv sync`; do not mix in older Diffusers or PyAV packages. |
 | `unsupported FastH3 checkpoint` | Use a complete checkpoint from the table above; the message names the model ID and revision it expects. |
 | `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `--quantization-config`: a packed NVFP4 checkpoint carries its own precision contract. |

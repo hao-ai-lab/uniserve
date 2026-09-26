@@ -1,7 +1,9 @@
 """SM100a CUDA block-64 attention with independent query and key extents.
 
-The kernel sources live in ``csrc/`` and build as a PyTorch JIT extension.
-The extension compiles on first :func:`load`; support queries never compile.
+The kernel sources live in ``csrc/`` and build through
+:mod:`uniserve_kernels.extension`: the first :func:`load` with a given source
+and toolchain compiles them, later processes import the finished module, and
+support queries never compile.
 ``uniserve.runtime.backends.attention.vsa.sm100`` calls :func:`load` while
 preparing its operator and routes complete calls here when
 ``vsa_cute.should_use`` declines a shape.
@@ -11,6 +13,8 @@ from functools import lru_cache
 from pathlib import Path
 
 import torch
+
+from uniserve_kernels import extension
 
 
 def supported(device: torch.device | None = None) -> bool:
@@ -35,12 +39,10 @@ def _extension():
     # the sm_100a target; torch adds no TORCH_CUDA_ARCH_LIST targets when the
     # CUDA flags already name an architecture. -lcuda links the driver API
     # that the launcher uses to encode TMA tensor maps.
-    from torch.utils.cpp_extension import load as load_extension
-
-    source = Path(__file__).parent / "csrc" / "attention.cu"
-    return load_extension(
+    return extension.load(
         "uniserve_sparse_attention_sm100",
-        sources=[str(source)],
+        Path(__file__).parent / "csrc",
+        ["attention.cu"],
         extra_cflags=["-O3", "-std=c++20"],
         extra_cuda_cflags=[
             "-O3",
