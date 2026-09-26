@@ -16,7 +16,8 @@ without a graph over a copy of each request, prefilled in the same call:
   is the only difference.
 
 After startup, a call of more canvases than every bucket fails instead of
-running eagerly.
+running eagerly. A worker whose KV unit pool holds fewer requests than its
+call bound starts, and replays calls of as many canvases as the pool holds.
 """
 
 from __future__ import annotations
@@ -70,6 +71,10 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 # tokens over a vocabulary of a multiple of 4096.
 CANVAS, VOCAB = 32, 4096
 PROMPT, SEQUENCE, UNITS, SLOTS = 40, 256, 2048, 12
+# A pool of 16 units, whose sentinel leaves 15 allocatable: seven requests
+# of one page of every cache group, fewer than ``SLOTS``. Its prompts take
+# one page of every group.
+SMALL_UNITS, PAGE = 16, 16
 # Five canvases replay the six-canvas bucket, so every call carries padding.
 ROWS = 5
 # Requests 1..ROWS replay graphs; their copies ROWS + 1..2 * ROWS, with the
@@ -87,10 +92,11 @@ SAMPLING = CanvasSampling(
 
 
 @contextmanager
-def _worker(root):
+def _worker(root, units=UNITS):
     """Bind a DiffusionGemma worker with graphs generating ``SAMPLING``.
 
-    Yields the executor, the unit pool's manager and the canvas state.
+    The KV pool holds ``units`` units. Yields the executor, the unit pool's
+    manager and the canvas state.
     """
     source = models.read_config(root)
     model = models.load_model(
@@ -113,13 +119,13 @@ def _worker(root):
     processor = source.image_processor
     cache = PrefixCache(
         model.text.cache_config,
-        num_units=UNITS,
+        num_units=units,
         block_size=16,
         device="cuda:0",
     )
     manager = KVCacheManager(
         cache,
-        info=cache_info(model.text, config, num_units=UNITS),
+        info=cache_info(model.text, config, num_units=units),
         request_pool_size=SLOTS,
         table_width=64,
     )
@@ -160,12 +166,12 @@ def _worker(root):
         manager.close()
 
 
-def _install(manager, count):
-    """Install tables of every group covering ``SEQUENCE`` tokens per slot."""
+def _install(manager, count, tokens=SEQUENCE):
+    """Install tables of every group covering ``tokens`` per slot."""
     entries, unit = [], 1
     for slot in range(1, count + 1):
         for group, shape in enumerate(manager.shapes):
-            pages = ceil_div(SEQUENCE, shape.page_tokens)
+            pages = ceil_div(tokens, shape.page_tokens)
             units = tuple(range(unit, unit + pages * shape.units_per_page))
             unit += len(units)
             entries.append((slot, group, 0, units, pages * shape.page_tokens))
@@ -210,12 +216,13 @@ def _request(slot):
     return slot - COPY if COPY < slot <= 2 * COPY else slot
 
 
-def _scenario(slots):
+def _scenario(slots, prompt_tokens=PROMPT):
     """Prompt rows and, per request slot, its readout row and step rows.
 
-    Slots ``1..EXTRA`` hold requests; a copy's prompt, canvas and seed are
-    its request's. Readout canvases read differing numbers of slots and
-    candidates; one is half a canvas long, as a compact readout canvas is.
+    Slots ``1..EXTRA`` hold requests of ``prompt_tokens`` prompts; a copy's
+    prompt, canvas and seed are its request's. Readout canvases read
+    differing numbers of slots and candidates; one is half a canvas long,
+    as a compact readout canvas is.
     """
     generator = torch.Generator().manual_seed(911)
     requests = {}
@@ -223,7 +230,7 @@ def _scenario(slots):
         length = CANVAS // 2 if request == 2 else CANVAS
         reads = 1 + request % 3
         requests[request] = (
-            torch.randint(7, VOCAB, (PROMPT,), generator=generator),
+            torch.randint(7, VOCAB, (prompt_tokens,), generator=generator),
             torch.randint(7, VOCAB, (length,), generator=generator),
             tuple(range(reads)),
             tuple(
@@ -240,7 +247,7 @@ def _scenario(slots):
             TokenRow(
                 forward_mode=ForwardMode.PREFILL,
                 token_ids=tokens,
-                positions=torch.arange(PROMPT),
+                positions=torch.arange(prompt_tokens),
                 selection=TokenSelection.LAST_LOGITS,
                 request_pool_idx=slot,
                 seq_len=0,
@@ -251,9 +258,11 @@ def _scenario(slots):
         readout[slot] = CanvasRow(
             forward_mode=ForwardMode.TOKEN_DENOISING,
             token_ids=canvas,
-            positions=torch.arange(PROMPT, PROMPT + canvas.numel()),
+            positions=torch.arange(
+                prompt_tokens, prompt_tokens + canvas.numel()
+            ),
             request_pool_idx=slot,
-            seq_len=PROMPT,
+            seq_len=prompt_tokens,
             write_kv=False,
             causal=False,
             slot_tokens=reads,
@@ -263,9 +272,9 @@ def _scenario(slots):
         steps[slot] = tuple(
             CanvasStepRow(
                 forward_mode=ForwardMode.TOKEN_DENOISING,
-                positions=torch.arange(PROMPT, PROMPT + CANVAS),
+                positions=torch.arange(prompt_tokens, prompt_tokens + CANVAS),
                 request_pool_idx=slot,
-                seq_len=PROMPT,
+                seq_len=prompt_tokens,
                 write_kv=False,
                 causal=False,
                 canvas_length=CANVAS,
@@ -359,3 +368,33 @@ def test_a_call_of_more_canvases_than_every_bucket_fails(tmp_path):
         rows = (readout[1],) * (largest + 1)
         with pytest.raises(ResourceError, match="no canvas graph"):
             _run(runner, manager, rows, ForwardMode.TOKEN_DENOISING)
+
+
+@SM100
+@torch.inference_mode()
+def test_a_small_pool_replays_calls_of_every_canvas_it_holds(tmp_path):
+    """A pool of fewer requests than the call bound starts and replays.
+
+    Every live request holds a page of every cache group of its own, so the
+    pool's allocatable units bound the canvases one call reads. A worker on
+    such a pool starts, and a readout and a canvas step of that many
+    canvases, each over a one-page prompt, replay a graph.
+    """
+    _checkpoint(tmp_path)
+    with _worker(tmp_path, units=SMALL_UNITS) as (runner, manager, slots):
+        rows = (manager.info.num_units - 1) // manager.row_units
+        # The pool, not the call or request slot bound, bounds the rows.
+        assert rows < SLOTS
+        _install(manager, rows, tokens=PAGE)
+        prompt, readout, steps = _scenario(slots, prompt_tokens=PAGE)
+        for row in prompt[:rows]:
+            _run(runner, manager, (row,), ForwardMode.PREFILL)
+
+        for canvases in (
+            tuple(readout[slot] for slot in range(1, rows + 1)),
+            tuple(steps[slot][0] for slot in range(1, rows + 1)),
+        ):
+            output = _run(
+                runner, manager, canvases, ForwardMode.TOKEN_DENOISING
+            )
+            assert output.stats.cuda_graph_replays == 1
