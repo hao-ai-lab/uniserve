@@ -21,8 +21,14 @@ def prepare(state, key, value, batch, *, lengths, offsets):
                 "attention cache update requires bound prefix state"
             )
         state._validate_update(key, value, indices)
-        fused = cache.can_run_paged_kv_write(
-            state.key, state.value, indices.reshape(-1), key, value
+        # The fused launch writes plain same-dtype rows; conversions and
+        # encoded representations take the state's own write call.
+        fused = (
+            indices.numel() > 0
+            and cache.unsupported_paged_kv_write(
+                state.key, state.value, indices.reshape(-1), key, value
+            )
+            is None
         )
         if not fused:
             state.update(key, value, indices=indices)

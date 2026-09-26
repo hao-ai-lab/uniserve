@@ -24,8 +24,11 @@ def paged_kv_write(
     heads, dim]``. With ``cast`` the sources convert to the cache dtype;
     otherwise the dtypes must match. ``initialized`` flags receive ``True``
     for every written block. Callers authorize the write intervals;
-    out-of-range slots are index errors.
+    out-of-range slots are index errors. CUDA writes run the scatter kernel
+    and raise ``ValueError`` when it cannot take the operands.
     """
+    from uniserve_kernels.triton import require_kernel
+
     from uniserve_kernels import cache
 
     blocks, block_size, heads, head_dim = (int(dim) for dim in k_cache.shape)
@@ -41,9 +44,22 @@ def paged_kv_write(
         raise ValueError(
             "cache initialization flags must match block count and device"
         )
-    if cache.can_run_paged_kv_write(
-        k_cache, v_cache, slots, k_source, v_source
+    if not cast and (
+        k_source.dtype != k_cache.dtype or v_source.dtype != v_cache.dtype
     ):
+        raise ValueError("K/V sources must match the cache dtype unless cast")
+    if k_cache.is_cuda:
+        require_kernel(
+            "paged_kv_write",
+            cache.unsupported_paged_kv_write(
+                k_cache, v_cache, slots, k_source, v_source, cast=cast
+            ),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            slots=slots,
+            k_source=k_source,
+            v_source=v_source,
+        )
         cache.paged_kv_write(
             k_cache, v_cache, slots, k_source, v_source, initialized
         )

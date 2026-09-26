@@ -3,9 +3,9 @@
 The TensorRT-LLM attention provider needs each sequence's complete key
 length (prefix plus current queries) and its cumulative offsets as device
 columns. One launch derives both from the live query and prefix columns and,
-when :func:`uniserve_kernels.cache.can_run_paged_kv_write` accepts the call's
-K/V write, also scatters those rows into the paged cache. The caller is
-``uniserve.runtime.backends.attention._paged_inputs``.
+when :func:`uniserve_kernels.cache.unsupported_paged_kv_write` accepts the
+call's K/V write, also scatters those rows into the paged cache. The caller
+is ``uniserve.runtime.backends.attention._paged_inputs``.
 """
 
 from __future__ import annotations
@@ -122,7 +122,7 @@ def prepare(
         write: ``None``, or ``(key_cache, value_cache, slots, key, value,
             key_initialized, value_initialized, block_size)`` for a fused
             cache write that
-            :func:`uniserve_kernels.cache.can_run_paged_kv_write` accepts:
+            :func:`uniserve_kernels.cache.unsupported_paged_kv_write` accepts:
             contiguous ``[pages, block_size, heads, head_dim]`` caches, one
             slot per ``[heads, head_dim]`` source row (``-1`` skips a row),
             and the per-block initialized flags that written blocks set.

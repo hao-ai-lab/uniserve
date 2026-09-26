@@ -857,13 +857,27 @@ def test_merged_attention_states_equal_attention_over_the_union(base2):
         lse = torch.logsumexp(scores, dim=-1)
         output = torch.einsum("qhk,khd->qhd", scores.softmax(-1), values)
         lse = lse / math.log(2) if base2 else lse
-        return output.float(), lse.float()
+        # The fused merge reads contiguous [rows, head_dim] states, the
+        # layout attention providers return.
+        return output.float().contiguous(), lse.float().contiguous()
 
     first, second = state(k[:4], v[:4]), state(k[4:], v[4:])
     merged, lse = merge_attention_states(*first, *second, base2=base2)
     expected, expected_lse = state(k, v)
     torch.testing.assert_close(merged, expected, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(lse, expected_lse, rtol=1e-5, atol=1e-5)
+
+
+def test_cuda_attention_states_without_a_merge_kernel_raise():
+    device = torch.device("cuda", 0)
+    output = torch.randn(6, 4, 64, device=device)
+    lse = torch.randn(6, 4, device=device)
+    strided = torch.randn(6, 4, 128, device=device)[..., :64]
+
+    with pytest.raises(ValueError, match="merge_attention_states.*contiguous"):
+        merge_attention_states(strided, lse, output, lse)
+    with pytest.raises(ValueError, match="merge_attention_states.*dtypes"):
+        merge_attention_states(output.double(), lse, output.double(), lse)
 
 
 def test_windowed_head_dimension_512_is_rejected_by_tensorrt_llm():
