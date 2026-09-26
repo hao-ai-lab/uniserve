@@ -29,7 +29,6 @@ contract, including where the kernels round differently.
 
 from __future__ import annotations
 
-import hashlib
 import json
 from functools import cache, lru_cache
 from pathlib import Path
@@ -148,24 +147,17 @@ _LINK_FLAGS = ("-lcublasLt",)
 
 @lru_cache(maxsize=1)
 def _extension():
-    # One build or cache lookup per process. The build takes its name from a
-    # digest of the sources and flags, so processes running different
-    # revisions share PyTorch's extension cache without one loading
-    # another's build.
-    from torch.utils.cpp_extension import load as load_extension
+    # One build or cache lookup per process, content-addressed by
+    # uniserve_kernels.jit.load.
+    from uniserve_kernels import jit
 
     directory = Path(__file__).parent / "csrc"
-    sources = [directory / "canvas.cu", directory / "product.cpp"]
-    digest = hashlib.sha256()
-    for source in sources:
-        digest.update(source.read_bytes())
-    digest.update(repr((_HOST_FLAGS, _DEVICE_FLAGS, _LINK_FLAGS)).encode())
-    return load_extension(
-        f"uniserve_canvas_sm100_{digest.hexdigest()[:16]}",
-        sources=[str(source) for source in sources],
-        extra_cflags=list(_HOST_FLAGS),
-        extra_cuda_cflags=list(_DEVICE_FLAGS),
-        extra_ldflags=list(_LINK_FLAGS),
+    return jit.load(
+        "uniserve_canvas_sm100",
+        [directory / "canvas.cu", directory / "product.cpp"],
+        cxx_flags=_HOST_FLAGS,
+        cuda_flags=_DEVICE_FLAGS,
+        ldflags=_LINK_FLAGS,
     )
 
 
