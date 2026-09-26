@@ -2349,17 +2349,19 @@ mod tests {
         let expected = result_response();
 
         Python::attach(|py| {
-            // Import `uniserve_worker` from this repository's source tree.
+            // Import `uniserve_worker` and the `uniserve_kernels` package it
+            // loads from this repository's source tree; the kernels package
+            // keeps its modules under `uniserve_kernels/src`.
             let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
                 .canonicalize()
                 .unwrap();
-            py.import("sys")
-                .unwrap()
-                .getattr("path")
-                .unwrap()
-                .call_method1("insert", (0, repo_root.to_str().unwrap()))
-                .unwrap();
+            let sys_path = py.import("sys").unwrap().getattr("path").unwrap();
+            for source in [repo_root.join("uniserve_kernels/src"), repo_root] {
+                sys_path
+                    .call_method1("insert", (0, source.to_str().unwrap()))
+                    .unwrap();
+            }
             let canonical = py
                 .import("uniserve_worker.protocol.batch")
                 .unwrap()
