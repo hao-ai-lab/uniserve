@@ -2,7 +2,9 @@
 
 Factors are compact: one ``[..., rotated / 2]`` table per rotary axis over the
 tensor's token axes, broadcast over heads. Arithmetic accumulates in FP32 and
-rounds once to the input dtype.
+rounds once to the input dtype. CUDA calls run UniServe's kernels and raise
+``ValueError`` when no kernel accepts their operands; other devices evaluate
+the same formulas with tensor operations.
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ from __future__ import annotations
 from typing import Literal
 
 import torch
+from uniserve_kernels.triton import require_kernel
 
 from ._tensors import check_output, result
 
@@ -68,6 +71,8 @@ def apply_rotary(
     use FP32 and the result is rounded once to ``x.dtype``.
 
     ``out`` must match ``x`` in shape, dtype and device and may alias it.
+    On CUDA, ``x`` and ``out`` may be strided views whose token axes merge
+    into one strided axis with unit-strided features.
     """  # noqa: D205
     if (
         rotation not in {"interleaved", "split"}
@@ -78,25 +83,27 @@ def apply_rotary(
         raise ValueError(
             "rotary factors must match tokens and a prefix of the head width"
         )
+    if out is not None:
+        check_output(x, out)
 
-    if rotation == "split" and cos.shape[-1] * 2 == x.shape[-1]:
-        from uniserve_kernels.rope import can_run_triton_rope, triton_rope
+    if x.is_cuda:
+        from uniserve_kernels import rope
 
-        # The packed kernel writes directly into a contiguous output that does
-        # not share storage with ``x``; other outputs receive its result.
         target = (
             torch.empty_like(x, memory_format=torch.contiguous_format)
             if out is None
             else out
         )
-        check_output(x, target)
-        if can_run_triton_rope(x, cos, sin, target):
-            triton_rope(x, cos, sin, target)
-            return target
-        staged = torch.empty_like(x, memory_format=torch.contiguous_format)
-        if out is not None and can_run_triton_rope(x, cos, sin, staged):
-            triton_rope(x, cos, sin, staged)
-            return out.copy_(staged)
+        require_kernel(
+            "apply_rotary",
+            rope.unsupported_rotary(x, cos, sin, target),
+            x=x,
+            cos=cos,
+            sin=sin,
+            out=target,
+        )
+        rope.rotary(x, cos, sin, target, interleaved=rotation == "interleaved")
+        return target
 
     return result(_rotate(x.float(), cos, sin, rotation).to(x.dtype), out)
 
@@ -182,9 +189,31 @@ def qk_norm_rope(
         check_output(q, query)
         check_output(k, key)
 
-    if q.ndim == 3 and _fused_qk_norm_rope(
-        q, k, q_weights, k_weights, cos, sin, eps, axis_dims, counts, query, key
-    ):
+    if q.is_cuda:
+        from uniserve_kernels import rope
+
+        require_kernel(
+            "qk_norm_rope",
+            rope.unsupported_qk_norm_rope(
+                q, k, q_weights, k_weights, cos, sin, query, key
+            ),
+            q=q,
+            k=k,
+            q_out=query,
+            k_out=key,
+        )
+        rope.qk_norm_rope(
+            q,
+            k,
+            q_weights,
+            k_weights,
+            cos,
+            sin,
+            eps,
+            query,
+            key,
+            axis_dims=axis_dims,
+        )
         return query, key
 
     # General composition keeps every domain and axis in FP32 and rounds once
@@ -216,96 +245,6 @@ def qk_norm_rope(
             )
         )
     return query, key
-
-
-def _fused_qk_norm_rope(
-    q, k, q_weights, k_weights, cos, sin, eps, axis_dims, counts, query, key
-) -> bool:
-    """Launch the Triton kernel matching the call's domains and axes.
-
-    Selection follows the declared layout: one domain with one axis, or a
-    rotated leading domain followed by one shared tail domain that is either
-    unrotated or holds two rotated axes. Returns ``False`` when no kernel
-    accepts the tensors.
-    """
-    from uniserve_kernels import rope as kernels
-
-    rotated = tuple(cosine.shape[-1] * 2 for cosine in cos)
-    cos = tuple(cosine.contiguous() for cosine in cos)
-    sin = tuple(sine.contiguous() for sine in sin)
-
-    if counts == (1,) and rotated[0] == axis_dims[0]:
-        if kernels.can_run_triton_qk_rms_norm_rope(
-            q, k, q_weights[0], k_weights[0], cos[0], sin[0], query, key
-        ):
-            kernels.triton_qk_rms_norm_rope(
-                q,
-                k,
-                q_weights[0],
-                k_weights[0],
-                cos[0],
-                sin[0],
-                eps,
-                query,
-                key,
-            )
-            return True
-        return False
-
-    if counts == (1,) and rotated[0]:
-        # The partial kernel updates its operands in place. Both the sources
-        # and the destinations must satisfy it before the sources are copied.
-        if all(
-            kernels.can_run_triton_qk_rms_norm_rope_inplace(
-                query_value,
-                key_value,
-                q_weights[0],
-                k_weights[0],
-                cos[0],
-                sin[0],
-            )
-            for query_value, key_value in ((q, k), (query, key))
-        ):
-            if query is not q:
-                query.copy_(q)
-            if key is not k:
-                key.copy_(k)
-            kernels.triton_qk_rms_norm_rope_inplace(
-                query, key, q_weights[0], k_weights[0], cos[0], sin[0], eps
-            )
-            return True
-        return False
-
-    if (
-        len(counts) != 2
-        or counts[0] != 1
-        or rotated[0] != axis_dims[0]
-        or len(q_weights) != 2
-    ):
-        return False
-
-    if not any(rotated[1:]):
-        if kernels.can_run_triton_qk_split_rms_norm_rope(
-            q, k, q_weights, k_weights, cos[0], sin[0], query, key
-        ):
-            kernels.triton_qk_split_rms_norm_rope(
-                q, k, q_weights, k_weights, cos[0], sin[0], eps, query, key
-            )
-            return True
-        return False
-
-    if (
-        len(axis_dims) == 3
-        and rotated[1:] == axis_dims[1:]
-        and kernels.can_run_triton_qk_multi_axis_rms_norm_rope(
-            q, k, q_weights, k_weights, cos, sin, query, key
-        )
-    ):
-        kernels.triton_qk_multi_axis_rms_norm_rope(
-            q, k, q_weights, k_weights, cos, sin, eps, query, key
-        )
-        return True
-    return False
 
 
 def qk_bias_rms_norm_rope_(
@@ -363,9 +302,18 @@ def qk_bias_rms_norm_rope_(
     ):
         raise ValueError("value projection must match Q/K shape and device")
 
-    if rope.can_run_qk_bias_rms_norm_rope(
-        query, key, value, cos, sin, query_bias, key_bias, value_bias
-    ):
+    if query.is_cuda:
+        require_kernel(
+            "qk_bias_rms_norm_rope_",
+            rope.unsupported_qk_bias_rms_norm_rope(
+                query, key, value, cos, sin, query_bias, key_bias, value_bias
+            ),
+            query=query,
+            key=key,
+            value=value,
+            cos=cos,
+            sin=sin,
+        )
         rope.qk_bias_rms_norm_rope_(
             query, key, cos, sin, query_bias, key_bias, value, value_bias, eps
         )

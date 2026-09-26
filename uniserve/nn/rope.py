@@ -278,9 +278,17 @@ class RotaryEmbedding(nn.Module):
             frequencies = self.inv_freq.to(device=positions.device)
             scale = self._frequency_scale
 
+        from uniserve_kernels.triton import require_kernel
+
         from uniserve_kernels import rope
 
-        if rope.can_run_rotary_factors(positions, frequencies, dtype):
+        if positions.is_cuda:
+            require_kernel(
+                "RotaryEmbedding",
+                rope.unsupported_rotary_factors(positions, frequencies, dtype),
+                positions=positions,
+                frequencies=frequencies,
+            )
             shape = (*positions.shape, frequencies.numel())
             cosine = torch.empty(shape, device=positions.device, dtype=dtype)
             sine = torch.empty_like(cosine)
