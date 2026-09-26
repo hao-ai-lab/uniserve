@@ -325,19 +325,18 @@ class TextRunner(ModelRunner):
     def select_graph_shape(self, batch, *, eligible):
         """Choose a captured text graph bucket and pad the batch to it.
 
-        Only buckets that startup captures are candidates. Single-token
-        decode batches use decode buckets, or a prefill bucket when no decode
-        size fits, and run eagerly when neither does. With prefill graphs
-        enabled, every other batch must fit a prefill bucket of its
+        Only buckets that startup captures are candidates. A decode batch
+        (one query token per row) must fit a decode bucket. With prefill
+        graphs enabled, every other batch must fit a prefill bucket of its
         causality and embedding replacement. Returns ``None`` for eager
-        execution (graphs disabled, the batch ineligible, or a decode batch
-        no bucket fits), otherwise ``(key, padded_batch, True)``; a decode
-        key starts with ``"text"`` and a prefill key with ``"prefill"``,
-        and both carry the ``text_shape`` tuple second.
+        execution (graphs disabled, the batch ineligible, or prefill graphs
+        disabled for a non-decode batch), otherwise ``(key, padded_batch,
+        True)``; a decode key starts with ``"text"`` and a prefill key with
+        ``"prefill"``, and both carry the ``text_shape`` tuple second.
 
         Raises:
-            CUDAGraphError: Prefill graphs are enabled and no prefill bucket
-                holds a non-decode batch.
+            CUDAGraphError: No decode bucket holds a decode batch, or prefill
+                graphs are enabled and no prefill bucket holds another batch.
         """
         if not eligible or not self.pools:
             return None
@@ -357,9 +356,7 @@ class TextRunner(ModelRunner):
             table_widths=self.table_widths,
         )
         if shape is None:
-            if decode:
-                return None
-            raise CUDAGraphError(self._unserved(batch))
+            raise CUDAGraphError(self._unserved(batch, decode=decode))
 
         if shape[-1]:
             if batch.decode_force_finish is None:
@@ -399,9 +396,20 @@ class TextRunner(ModelRunner):
         )
         return key, padded, True
 
-    def _unserved(self, batch):
-        """Describe a batch no prefill bucket holds and the captured range."""
+    def _unserved(self, batch, *, decode):
+        """Describe a batch no captured bucket holds and the captured range."""
         inputs = batch.inputs
+        if decode:
+            captured = (
+                f"its captured decode graphs hold up to "
+                f"{max(self.decode_shapes)} rows"
+                if self.decode_shapes
+                else "no decode graph is captured"
+            )
+            return (
+                f"{self.name} has no decode graph for a call of "
+                f"{batch.row_count} rows; {captured}"
+            )
         causality = {
             flag
             for entry in inputs.attention.entries.values()

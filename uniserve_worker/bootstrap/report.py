@@ -294,6 +294,9 @@ def build_worker_layout(
         max_prefill_calls=min(layout.info.max_prefill_calls, max_calls)
         if layout.info.max_prefill_calls
         else 0,
+        max_decode_calls=min(layout.info.max_decode_calls, max_calls)
+        if layout.info.max_decode_calls
+        else 0,
         components=tuple(
             ComponentInfo(name, entry, outputs.get(name, ()))
             for name, entry in components
@@ -378,10 +381,10 @@ def _token_worker_layout(
     )
 
     capacity = None
-    # Zero leaves prefill calls bounded by the batch call bound alone, as
-    # when they run eagerly; captured prefill graphs lower it below.
-    max_prefill_calls = 0
-    prefills_on_cuda = False
+    # Zero leaves prefill and decode calls bounded by the batch call bound
+    # alone, as when they run eagerly; captured graphs lower them below.
+    max_prefill_calls = max_decode_calls = 0
+    prefills_on_cuda = decodes_on_cuda = False
     unresolved_window = call_window(
         int(queue_depth), int(worker_config.max_batch_calls)
     )
@@ -448,6 +451,7 @@ def _token_worker_layout(
             and input_config is not None
         )
         from uniserve_worker.model_executor.graph_inputs import (
+            decode_captures,
             prefill_captures,
             prefill_rows,
         )
@@ -488,6 +492,10 @@ def _token_worker_layout(
                     if not selected:
                         continue
                     fields = input_config
+                    decodes_on_cuda |= (
+                        ForwardMode.DECODE in selected
+                        and torch.device(target).type == "cuda"
+                    )
                     prefills_on_cuda |= (
                         ForwardMode.PREFILL in selected
                         and torch.device(target).type == "cuda"
@@ -612,10 +620,10 @@ def _token_worker_layout(
             capacity_group.all_reduce(units, op="min")
             capacity = replace(capacity, num_units=int(units.item()))
 
-        # Prefill calls on a CUDA device replay graphs whose rows' pages fit
-        # the granted pool. The rows the widest graphs hold bound every
-        # prefill call the engine forms. The staging above was sized before
-        # the pool, for the rows of every configured bucket.
+        # Prefill and decode calls on a CUDA device replay graphs whose rows'
+        # pages fit the granted pool. The rows the widest graphs hold bound
+        # every prefill and decode call the engine forms. The staging above
+        # was sized before the pool, for the rows of every configured bucket.
         row_units = sum(group.units_per_page for group in planes.groups)
         pool_rows = (capacity.num_units - 1) // row_units
         if prefills_on_cuda:
@@ -633,6 +641,14 @@ def _token_worker_layout(
                 )
                 or 0
             )
+        if decodes_on_cuda:
+            sizes = decode_captures(
+                worker_config,
+                max_rows=max_rows,
+                row_units=row_units,
+                num_units=capacity.num_units,
+            )
+            max_decode_calls = max(sizes, default=0)
 
     # ``build_worker_layout`` replaces the supported calls and media routes
     # with the placement's narrowed values.
@@ -649,6 +665,7 @@ def _token_worker_layout(
         queue_depth=int(queue_depth),
         max_batch_calls=int(worker_config.max_batch_calls),
         max_prefill_calls=max_prefill_calls,
+        max_decode_calls=max_decode_calls,
         max_batch_tokens=int(worker_config.max_batch_tokens),
         request_slots=int(worker_config.max_request_pool_size),
         kv_cache=(

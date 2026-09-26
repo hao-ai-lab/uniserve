@@ -314,13 +314,14 @@ class WorkerConfig:
     kernels (``bootstrap.cache.resolve_page_size``) before the unit pool is
     planned.
 
-    Graphs: ``graph_policy`` ``"off"`` disables every graph. Otherwise decode
-    calls replay graphs of ``decode_graph_batch_sizes`` rows, and with
-    ``prefill_cuda_graph`` every prefill call on a CUDA device replays a
-    graph captured at startup over ``prefill_graph_token_sizes`` token
-    buckets; a prefill call no bucket holds then fails, and the worker
-    reports the rows its buckets hold so the engine never forms one. Turning
-    ``prefill_cuda_graph`` off runs prefill eagerly, for debugging.
+    Graphs: ``graph_policy`` ``"off"`` disables every graph. Otherwise every
+    decode call on a CUDA device replays a graph captured at startup for one
+    of the ``decode_graph_batch_sizes`` whose rows' pages fit the KV pool,
+    and with ``prefill_cuda_graph`` every prefill call replays a graph
+    captured over ``prefill_graph_token_sizes`` token buckets. A call no
+    captured graph holds fails, and the worker reports the rows its graphs
+    hold so the engine never forms one. Turning ``prefill_cuda_graph`` off
+    runs prefill eagerly, for debugging.
     ``flow_cuda_graph`` captures image denoising calls at the
     ``flow_graph_shapes`` and ``flow_graph_batch_sizes`` combinations and
     replays those whose exact input signature was captured.

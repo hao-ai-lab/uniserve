@@ -108,6 +108,7 @@ from uniserve_worker.model_executor.diffusion_runner import DiffusionRunner
 from uniserve_worker.model_executor.graph_inputs import (
     DiffusionShape,
     PrefillShape,
+    decode_captures,
     prefill_captures,
     select_flow_captures,
 )
@@ -1127,11 +1128,11 @@ class ModelExecutor:
         # at most the tokens the pool's units cover.
         max_rows = min(max_calls, request_slots)
         pool_rows = (kv_cache.info.num_units - 1) // kv_cache.row_units
-        decode_sizes = tuple(
-            value
-            for value in config.decode_graph_batch_sizes
-            if 0 < value <= max_rows
-            and value * kv_cache.row_units < kv_cache.info.num_units
+        decode_sizes = decode_captures(
+            config,
+            max_rows=max_rows,
+            row_units=kv_cache.row_units,
+            num_units=kv_cache.info.num_units,
         )
         feature_injection = (
             self.processor is not None
@@ -1202,11 +1203,25 @@ class ModelExecutor:
                     if lane is None
                     else min(max_rows, lane.max_batch_calls or max_rows)
                 )
+                # Graph pools exist only on CUDA, where every decode call
+                # replays a captured bucket; a lane with none can serve no
+                # decode call there.
                 decode = (
                     tuple(value for value in decode_sizes if value <= rows)
-                    if ForwardMode.DECODE in kinds
+                    if ForwardMode.DECODE in kinds and target.type == "cuda"
                     else ()
                 )
+                if (
+                    ForwardMode.DECODE in kinds
+                    and target.type == "cuda"
+                    and config.graph_policy != "off"
+                    and not decode
+                ):
+                    raise ValueError(
+                        f"no configured decode graph size fits {rows} rows "
+                        f"and a KV pool of {kv_cache.info.num_units} units, "
+                        f"whose rows hold {kv_cache.row_units} units each"
+                    )
                 # Graph pools exist only on CUDA, where every prefill call
                 # replays a captured bucket.
                 prefill = (

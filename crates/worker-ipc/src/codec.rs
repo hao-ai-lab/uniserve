@@ -1066,6 +1066,7 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
         max_batch_calls: info.max_batch_calls(),
         max_batch_tokens: info.max_batch_tokens(),
         max_prefill_calls: info.max_prefill_calls(),
+        max_decode_calls: info.max_decode_calls(),
         request_slots: info.request_slots(),
         kv_cache: info.kv_cache().map(kv_cache_from_table).transpose()?,
         latent_page_units: info.latent_page_units(),

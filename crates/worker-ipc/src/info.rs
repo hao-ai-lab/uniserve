@@ -314,6 +314,13 @@ pub struct WorkerInfo {
     /// `max_batch_calls` alone, as when they run eagerly.
     #[serde(default)]
     pub max_prefill_calls: u32,
+    /// Maximum calls in one decode run: the rows the rank's largest captured
+    /// decode graph holds, fewer when its KV pool cannot hold a page of
+    /// every cache group for more rows. A decode run no captured graph
+    /// holds fails, so the scheduler never forms one. Zero leaves decode
+    /// runs bounded by `max_batch_calls` alone, as when they run eagerly.
+    #[serde(default)]
+    pub max_decode_calls: u32,
     /// Number of resident request slots.
     pub request_slots: u32,
     /// Paged KV geometry when autoregressive work is supported.
@@ -472,6 +479,10 @@ impl WorkerInfo {
             self.max_prefill_calls <= self.max_batch_calls,
             "worker prefill call bound exceeds its batch call bound"
         );
+        ensure_valid!(
+            self.max_decode_calls <= self.max_batch_calls,
+            "worker decode call bound exceeds its batch call bound"
+        );
 
         // Advertised call families require their corresponding pools; every
         // token-model forward reads or extends a request's KV cache.
@@ -548,6 +559,7 @@ impl Default for WorkerInfo {
             max_batch_calls: 1,
             max_batch_tokens: 8192,
             max_prefill_calls: 0,
+            max_decode_calls: 0,
             request_slots: 128,
             // One full-attention group of 28 layers with 8 BF16 heads of 128:
             // each 64-token page is one unit of 28 columns of 128 KiB K and V

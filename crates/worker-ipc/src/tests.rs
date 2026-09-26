@@ -1775,6 +1775,7 @@ fn full_caps() -> WorkerInfo {
         max_batch_calls: 64,
         max_batch_tokens: 4096,
         max_prefill_calls: 31,
+        max_decode_calls: 48,
         request_slots: 96,
         max_unresolved_calls: 3,
         latent_page_units: 64,

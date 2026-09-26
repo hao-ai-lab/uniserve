@@ -1,4 +1,4 @@
-"""Prefill calls replay CUDA graphs captured at worker startup.
+"""Prefill and decode calls replay CUDA graphs captured at worker startup.
 
 A worker with prefill graphs, the default on CUDA, captures its prefill
 buckets at startup and replays one for every prefill call. On a
@@ -6,10 +6,10 @@ DiffusionGemma model with the released checkpoints' attention shapes, whose
 sliding tables start after retired pages, replays of causal text chunks,
 non-causal image-block rows and 256-token commit rows return the outputs and
 write the KV of eager execution of the same calls, and a replayed call copies
-no device value to the host. After startup, a prefill call no captured graph
-holds fails instead of running eagerly, and the worker reports the most rows
-its prefill graphs hold, at most the rows its KV unit pool holds a page of
-each cache group for.
+no device value to the host. After startup, a prefill or decode call no
+captured graph holds fails instead of running eagerly, and the worker
+reports the most rows its prefill and decode graphs hold, at most the rows
+its KV unit pool holds a page of each cache group for.
 """
 
 from __future__ import annotations
@@ -170,7 +170,7 @@ def _call(runner, manager, rows):
             request_key=RequestKey(1, row.request_pool_idx, 0),
             call_id=CallId(1, index),
             coordinates=CallCoordinates(),
-            kind=ForwardMode.PREFILL,
+            kind=row.forward_mode,
             bounds=Bounds(),
         )
         for index, row in enumerate(rows)
@@ -184,11 +184,19 @@ def _call(runner, manager, rows):
     )
 
 
-def _rows(tokens, *, prefix, selections, causal=True, embeddings=None):
-    """Build prefill rows over slots ``1..`` that append after ``prefix``."""
+def _rows(
+    tokens,
+    *,
+    prefix,
+    selections,
+    causal=True,
+    embeddings=None,
+    mode=ForwardMode.PREFILL,
+):
+    """Build ``mode`` rows over slots ``1..`` appending after ``prefix``."""
     return tuple(
         TokenRow(
-            forward_mode=ForwardMode.PREFILL,
+            forward_mode=mode,
             token_ids=value,
             token_embeddings=None if embeddings is None else embeddings[index],
             positions=torch.arange(prefix, prefix + value.numel()),
@@ -456,3 +464,77 @@ def test_unit_pool_bounds_the_rows_of_prefill_graphs(tmp_path):
         )
         assert output.stats.cuda_graph_replays == 1
         assert len(output.materialize().values) == allocatable
+
+
+@torch.inference_mode()
+def test_sealed_decode_rejects_calls_no_captured_graph_holds(tmp_path):
+    """Decode capacity follows the unit pool; wider decode calls fail.
+
+    Decode graphs of up to 16 rows are configured, and capturing one stages
+    a page of the model's one cache group per row on the unit pool, whose
+    96 tokens hold fewer. The worker reports the largest configured size its
+    allocatable units hold, replays a graph for a decode call of that many
+    rows, and rejects one more row without running it.
+    """
+    _qwen_checkpoint(tmp_path)
+    model = models.load_model(
+        models.read_config(tmp_path), device="cuda:0"
+    ).model
+    sizes = (1, 2, 4, 8, 16)
+    config = WorkerConfig(
+        device="cuda:0",
+        block_size=16,
+        kv_token_capacity=96,
+        max_sequence_tokens=32,
+        max_batch_calls=16,
+        max_batch_tokens=64,
+        max_request_pool_size=16,
+        prefill_graph_token_sizes=(16,),
+        decode_graph_batch_sizes=sizes,
+    )
+    with Worker(
+        model,
+        worker_config=config,
+        sampling_group=Communicator(device=torch.device("cuda:0")),
+        tokenizer=None,
+        allowed_calls=supported_calls(model),
+        queue_depth=2,
+        completion_payload_bytes=1 << 16,
+    ) as worker:
+        worker.warmup()
+        # Unit zero is the pool's sentinel; each row stages one unit.
+        allocatable = worker.info.kv_cache.num_units - 1
+        capacity = worker.info.max_decode_calls
+        assert capacity == max(size for size in sizes if size <= allocatable)
+        assert capacity < max(sizes)
+
+        # Each row owns one unit; the row beyond the capacity shares one,
+        # which its rejected call never reaches.
+        manager = worker.kv_cache
+        manager.block_tables.install(
+            tuple(
+                (slot, 0, 0, ((slot - 1) % allocatable + 1,), 16)
+                for slot in range(1, capacity + 2)
+            )
+        )
+
+        def rows(count):
+            return _rows(
+                tuple(torch.tensor([slot % 30 + 1]) for slot in range(count)),
+                prefix=0,
+                selections=(TokenSelection.LAST_LOGITS,) * count,
+                mode=ForwardMode.DECODE,
+            )
+
+        output = _call(worker.runner, manager, rows(capacity))
+        assert output.stats.cuda_graph_replays == 1
+        assert len(output.materialize().values) == capacity
+
+        before = _cache_values(manager)
+        with pytest.raises(ResourceError, match="no decode graph"):
+            _call(worker.runner, manager, rows(capacity + 1))
+        torch.cuda.synchronize()
+        for actual, expected in zip(
+            _cache_values(manager), before, strict=True
+        ):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)

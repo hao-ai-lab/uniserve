@@ -157,6 +157,26 @@ def select_prefill_captures(
     return tuple(buckets)
 
 
+def decode_captures(config, *, max_rows, row_units, num_units):
+    """Select the decode batch sizes a CUDA text entry captures at startup.
+
+    ``config`` is the ``WorkerConfig``. A configured size is kept when it is
+    positive, at most ``max_rows``, and its rows fit the KV pool's
+    allocatable units: capturing ``rows`` decode rows stages one page of
+    every cache group per row (``row_units`` units) on the ``num_units``
+    pool, whose unit zero is the sentinel. The sizes keep their configured
+    order. Empty when the graph policy is off, which leaves decode calls
+    eager.
+    """
+    if config.graph_policy == "off":
+        return ()
+    return tuple(
+        value
+        for value in config.decode_graph_batch_sizes
+        if 0 < value <= max_rows and value * row_units < num_units
+    )
+
+
 def prefill_captures(
     config, *, max_rows, max_tokens, image_builder, feature_injection
 ):
@@ -235,15 +255,16 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, table_widths):
     Returns:
         ``(rows, tokens, widths, decode)`` for ``pad_text``, where
         ``widths[t]`` is the width to stage for numerical table ``t``: at
-        least its staged width and its ``table_widths`` floor. A
-        single-token causal decode batch whose rows all select last logits
-        uses the first configured decode size at least its row count, with
-        ``tokens == rows``. Any other batch, or a decode batch no decode size
-        fits, uses the smallest prefill shape, by rows then tokens, with the
+        least its staged width and its ``table_widths`` floor. A decode
+        batch (``ForwardMode.DECODE`` with one query token per row) uses the
+        first configured decode size at least its row count, with ``tokens ==
+        rows``, when its rows are causal and all select last logits. Any other
+        batch uses the smallest prefill shape, by rows then tokens, with the
         batch's causality and embedding replacement, more rows than the
         batch and at least its token count; its rows may select any outputs.
         None when the input is not paged text over tables ``0..n-1``, rows
-        mix causality, a row has no query token, or no configured shape fits.
+        mix causality, a row has no query token, or no configured shape of
+        the batch's kind fits; a decode batch never uses a prefill shape.
 
     Raises:
         ValueError: If the attention input has no host query lengths.
@@ -282,20 +303,18 @@ def text_shape(batch, *, decode_sizes, prefill_shapes, table_widths):
         )
         for table, entry in enumerate(entries)
     )
-    if (
-        batch.forward_mode is ForwardMode.DECODE
-        and all(
-            selection is TokenSelection.LAST_LOGITS
-            for selection in batch.token_selections
-        )
-        and causal
-        and all(length == 1 for length in queries)
+    if batch.forward_mode is ForwardMode.DECODE and all(
+        length == 1 for length in queries
     ):
+        if not causal or any(
+            selection is not TokenSelection.LAST_LOGITS
+            for selection in batch.token_selections
+        ):
+            return None
         rows = next(
             (value for value in decode_sizes if value >= batch.row_count), None
         )
-        if rows is not None:
-            return rows, rows, widths, True
+        return None if rows is None else (rows, rows, widths, True)
 
     embeddings = inputs.embeddings is not None
     shapes = tuple(
