@@ -287,3 +287,81 @@ def test_merged_projections_preserve_independent_branch_scale_domains(
             rtol=0,
             atol=0,
         )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("axis", "shape"),
+    ((0, (33, 5120)), (0, (3, 0)), (None, (33, 5120)), (None, (4, 9, 64))),
+)
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
+@pytest.mark.parametrize("supplied", (False, True))
+def test_cuda_fp8_encoding_matches_the_portable_encoding(
+    axis, shape, dtype, supplied
+):
+    generator = torch.Generator().manual_seed(59)
+    source = (torch.randn(shape, generator=generator) * 5).to(dtype)
+    quantizer = Quantizer("fp8", axis=axis)
+    expected = quantizer.quantize(source).buffers()
+
+    device = source.cuda()
+    maximum = quantizer.amax(device)
+    actual = quantizer.quantize(
+        device, amax=maximum if supplied else None
+    ).buffers()
+
+    # Statistics and scales are exact on both devices.
+    torch.testing.assert_close(
+        maximum.cpu(), quantizer.amax(source), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        actual["scale"].cpu(), expected["scale"], rtol=0, atol=0
+    )
+    # An FP32 quotient divided with at most 2 ulp of error can cross at most
+    # one E4M3 rounding midpoint, so each code equals the portable code or
+    # its same-sign neighbour, whose byte differs by one.
+    actual_codes = actual["values"].cpu().view(torch.uint8).int()
+    expected_codes = expected["values"].view(torch.uint8).int()
+    assert ((actual_codes - expected_codes).abs() <= 1).all()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_row_fp8_of_single_rank_column_shards_matches_unsharded():
+    from torch.distributed.tensor import Shard
+
+    from uniserve.distributed import DeviceMesh, Distribution
+
+    mesh = DeviceMesh(ranks=(0,), shape=(1,), axes=("tp",), rank=0)
+    source = torch.randn((16, 4096), device="cuda").to(torch.bfloat16)
+    quantizer = Quantizer("fp8", axis=0)
+
+    sharded = quantizer.quantize(
+        source, distribution=Distribution(mesh, (Shard(1),))
+    ).buffers()
+    unsharded = quantizer.quantize(source).buffers()
+
+    for name in ("values", "scale"):
+        assert torch.equal(
+            sharded[name].view(torch.uint8), unsharded[name].view(torch.uint8)
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("axis", "shape", "reason"),
+    (
+        (0, (2, 3, 64), "rank-2"),
+        (0, (2, 32769), "exceeds"),
+        (None, (2, 32769), "exceeds"),
+    ),
+)
+def test_cuda_fp8_encoding_without_a_kernel_raises(axis, shape, reason):
+    source = torch.zeros(shape, device="cuda")
+    with pytest.raises(ValueError, match=f"Quantizer.quantize.*{reason}"):
+        Quantizer("fp8", axis=axis).quantize(source)
+    strided = torch.zeros((4, 64, 2), device="cuda")[..., 0]
+    with pytest.raises(ValueError, match="unit-strided"):
+        Quantizer("fp8", axis=0).quantize(strided)
