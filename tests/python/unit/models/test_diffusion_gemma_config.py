@@ -1,113 +1,39 @@
-"""DiffusionGemma metadata normalization and Gemma-4 image preprocessing.
+"""DiffusionGemma metadata normalization and its image token budget.
 
-Unsupported mathematical options fail at the loading boundary, and image
-sizes, patches and positions follow the pinned Transformers processor.
+Unsupported mathematical options fail at the loading boundary, and the
+declared image transform sizes images and counts their soft tokens as the
+pinned Transformers processor and the server's prompt planner do.
 """
 
-import copy
 import json
+from pathlib import Path
 
 import pytest
-import torch
 from transformers.models.gemma4.image_processing_gemma4 import (
-    Gemma4ImageProcessor,
+    get_aspect_ratio_preserving_size,
 )
 
-from uniserve import loading
+from tests.python.fixtures.model_metadata import (
+    diffusion_gemma_metadata,
+    read_diffusion_gemma,
+)
 from uniserve_models import diffusion_gemma
-from uniserve_models.diffusion_gemma import processing
 
 pytestmark = pytest.mark.unit
 
-_METADATA = {
-    "architectures": ["DiffusionGemmaForBlockDiffusion"],
-    "model_type": "diffusion_gemma",
-    "canvas_length": 256,
-    "image_token_id": 258880,
-    "boi_token_id": 255999,
-    "eoi_token_id": 258882,
-    "eos_token_id": [1, 106],
-    "tie_word_embeddings": True,
-    "vision_soft_tokens_per_image": 280,
-    "text_config": {
-        "vocab_size": 262144,
-        "hidden_size": 2816,
-        "intermediate_size": 2112,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 16,
-        "num_key_value_heads": 8,
-        "head_dim": 256,
-        "global_head_dim": 512,
-        "num_global_key_value_heads": 2,
-        "layer_types": ["sliding_attention", "full_attention"],
-        "sliding_window": 1024,
-        "num_experts": 128,
-        "top_k_experts": 8,
-        "moe_intermediate_size": 704,
-        "hidden_activation": "gelu_pytorch_tanh",
-        "attention_bias": False,
-        "use_bidirectional_attention": "vision",
-        "final_logit_softcapping": 30.0,
-        "max_position_embeddings": 262144,
-        "rms_norm_eps": 1e-6,
-        "rope_parameters": {
-            "full_attention": {
-                "partial_rotary_factor": 0.25,
-                "rope_theta": 1000000.0,
-                "rope_type": "proportional",
-            },
-            "sliding_attention": {
-                "rope_theta": 10000.0,
-                "rope_type": "default",
-            },
-        },
-    },
-    "vision_config": {
-        "hidden_size": 1152,
-        "intermediate_size": 4304,
-        "num_hidden_layers": 27,
-        "num_attention_heads": 16,
-        "num_key_value_heads": 16,
-        "head_dim": 72,
-        "hidden_activation": "gelu_pytorch_tanh",
-        "patch_size": 16,
-        "pooling_kernel_size": 3,
-        "position_embedding_size": 10240,
-        "rms_norm_eps": 1e-6,
-        "rope_parameters": {"rope_theta": 100.0, "rope_type": "default"},
-        "standardize": True,
-        "use_clipped_linears": False,
-    },
-}
-
-
-def _read(root, metadata):
-    (root / "config.json").write_text(json.dumps(metadata))
-    (root / "tokenizer_config.json").write_text(
-        json.dumps(
-            {
-                "pad_token": "<pad>",
-                "mask_token": "<mask>",
-                "eot_token": "<turn|>",
-            }
-        )
-    )
-    (root / "tokenizer.json").write_text(
-        json.dumps(
-            {
-                "added_tokens": [
-                    {"id": 0, "content": "<pad>"},
-                    {"id": 4, "content": "<mask>"},
-                    {"id": 106, "content": "<turn|>"},
-                ]
-            }
-        )
-    )
-    return diffusion_gemma.read_config(root, loading.Config(), sources={})
+# Image sizes and soft-token counts; the server's prompt planner test reads
+# the same table.
+_IMAGE_TOKENS = json.loads(
+    (
+        Path(__file__).parents[2]
+        / "fixtures"
+        / "diffusion_gemma_image_tokens.json"
+    ).read_text()
+)
 
 
 def test_metadata_normalizes_layers_windows_and_canvas_tokens(tmp_path):
-    config = _read(tmp_path, _METADATA)
+    config = read_diffusion_gemma(tmp_path, diffusion_gemma_metadata())
     sliding, full = config.text.layers
     # The checkpoint's window counts the query itself.
     assert (sliding.kind, sliding.window, sliding.head_dim) == (
@@ -165,42 +91,39 @@ def test_metadata_normalizes_layers_windows_and_canvas_tokens(tmp_path):
 def test_unsupported_mathematics_is_rejected(
     tmp_path, section, field, value, message
 ):
-    metadata = copy.deepcopy(_METADATA)
+    metadata = diffusion_gemma_metadata()
     metadata[section][field] = value
     with pytest.raises(ValueError, match=message):
-        _read(tmp_path, metadata)
+        read_diffusion_gemma(tmp_path, metadata)
 
 
 @pytest.mark.parametrize(
-    "height,width",
-    [(480, 640), (224, 224), (1080, 1920), (1600, 90), (10, 8000), (8000, 10)],
+    "case",
+    _IMAGE_TOKENS["cases"],
+    ids=lambda case: f"{case['width']}x{case['height']}",
 )
-def test_image_sizes_patches_and_positions_follow_the_processor(
-    tmp_path, height, width
-):
-    config = _read(tmp_path, _METADATA).vision
-    reference = Gemma4ImageProcessor(
-        patch_size=16, max_soft_tokens=280, pooling_kernel_size=3
+def test_image_soft_tokens_match_the_server_planner_table(tmp_path, case):
+    config = read_diffusion_gemma(tmp_path, diffusion_gemma_metadata())
+    transform = diffusion_gemma.image_processor(config).vit
+    pooling = _IMAGE_TOKENS["pooling_kernel_size"]
+    assert (
+        transform.patch_size,
+        transform.downsample,
+        transform.resize.max_patches,
+    ) == (
+        _IMAGE_TOKENS["patch_size"],
+        pooling,
+        _IMAGE_TOKENS["max_soft_tokens"] * pooling**2,
     )
-    generator = torch.Generator().manual_seed(height * 7 + width)
-    image = torch.randint(
-        0, 256, (3, height, width), dtype=torch.uint8, generator=generator
-    )
-    expected = reference(images=[image], return_tensors="pt")
 
-    processed = processing.preprocess(image, config)
-    rows, positions = processing.patches(processed, config)
-    count = rows.shape[0]
-    assert processing.soft_tokens(height, width, config) == int(
-        expected["num_soft_tokens_per_image"][0]
+    height, width = case["height"], case["width"]
+    assert transform.tokens(height, width) == case["soft_tokens"]
+    assert transform.resized_size(
+        height, width
+    ) == get_aspect_ratio_preserving_size(
+        height,
+        width,
+        patch_size=transform.patch_size,
+        max_patches=transform.resize.max_patches,
+        pooling_kernel_size=pooling,
     )
-    assert tuple(processed.shape[1:]) == processing.resized_size(
-        height, width, config
-    )
-    assert count * 256 == processed.shape[1] * processed.shape[2]
-    torch.testing.assert_close(
-        rows, expected["pixel_values"][0, :count], rtol=0, atol=0
-    )
-    assert torch.equal(positions, expected["image_position_ids"][0, :count])
-    # Every patch beyond the image is padding.
-    assert (expected["image_position_ids"][0, count:] == -1).all()

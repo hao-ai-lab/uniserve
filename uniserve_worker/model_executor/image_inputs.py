@@ -4,10 +4,10 @@ The model declares its image policy as a ``uniserve.processing``
 ``ImageProcessor``; this module applies it for the worker. An inline base64
 payload (``prepare_image``) or an already decoded RGB tensor
 (``prepare_tensor_image``) is resized to the model's canvas (a patch tower
-keeps the source size) and then to the selected tower's input size,
-normalized, packed into patches for a ``PatchTransform`` tower, and staged
-on the target device. The input rows for vision encoding and image decoding
-live here as well.
+keeps the source size) and then to the selected tower's input size with the
+declared resampling, normalized, packed into patches in the declared layout
+for a ``PatchTransform`` tower, and staged on the target device. The input
+rows for vision encoding and image decoding live here as well.
 """
 
 from __future__ import annotations
@@ -23,7 +23,9 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as vision
+from torchvision.transforms.v2 import functional as tensor_vision
 
+from uniserve.nn.functional import patchify
 from uniserve.processing import (
     ImageProcessor,
     PatchTransform,
@@ -37,17 +39,22 @@ from uniserve_worker.protocol.call import MediaCall
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 
+# The Transformers image processors' rescale factor, 0.00392156862745098;
+# ``"unit"`` normalization multiplies 8-bit values by it in float32.
+_UNIT_SCALE = 1 / 255
+
 
 @dataclass(frozen=True, slots=True)
 class PreparedImage:
     """Normalized pixels, patch coordinates, and model canvas dimensions.
 
     For a ``PatchTransform`` tower, ``pixels`` is
-    [patches, channels * patch * patch] with patches in raster order, and
-    ``grid`` is a [1, 2] int64 tensor holding ``grid_shape`` (rows, columns
-    of patches). For a ``TowerTransform`` tower, ``pixels`` is
-    [channels, height, width] and both grid fields are None. ``height`` and
-    ``width`` are the canvas dimensions, not the tower's input size.
+    [patches, channels * patch * patch] with patches in raster order and
+    each row in the transform's ``patch_layout``, and ``grid`` is a [1, 2]
+    int64 tensor holding ``grid_shape`` (rows, columns of patches). For a
+    ``TowerTransform`` tower, ``pixels`` is [channels, height, width] and
+    both grid fields are None. ``height`` and ``width`` are the canvas
+    dimensions, not the tower's input size.
     """
 
     pixels: torch.Tensor
@@ -109,16 +116,24 @@ def _prepared_pixels(processor, transform, pixels, canvas, device):
     """Pack the numerical tower input and attach its canvas coordinates."""
     grid = grid_shape = None
     if isinstance(transform, PatchTransform):
-        # [C, H, W] -> [gh, gw, C, patch, patch] -> one flattened row per
-        # patch, in raster order over the patch grid.
-        patch = int(transform.patch_size)
+        # [C, H, W] -> one flattened row per patch, in raster order over the
+        # patch grid; the declared layout orders the values within a row.
+        patch = transform.patch_size
         channels, height, width = pixels.shape
         grid_shape = (height // patch, width // patch)
-        pixels = (
-            pixels.reshape(channels, grid_shape[0], patch, grid_shape[1], patch)
-            .permute(1, 3, 0, 2, 4)
-            .reshape(grid_shape[0] * grid_shape[1], channels * patch * patch)
-        )
+        if transform.patch_layout == "channels_last":
+            pixels = patchify(pixels, patch_size=patch)
+        else:
+            # [C, H, W] -> [gh, gw, C, patch, patch] -> rows.
+            pixels = (
+                pixels.reshape(
+                    channels, grid_shape[0], patch, grid_shape[1], patch
+                )
+                .permute(1, 3, 0, 2, 4)
+                .reshape(
+                    grid_shape[0] * grid_shape[1], channels * patch * patch
+                )
+            )
         grid = torch.tensor([grid_shape], dtype=torch.long, device=device)
     return PreparedImage(
         _stage(pixels, processor, device), grid, grid_shape, *canvas
@@ -139,10 +154,19 @@ def prepare_image(
     a patch tower whose images share a pixel budget bounds each by its share
     (see ``PatchTransform.pixel_bound``).
     """
-    image = _decode_rgb(encoded)
+    image = _decode_rgb(encoded, processor.alpha)
     transform, canvas, tower = _image_plan(
         processor, kind, image.height, image.width, input_images
     )
+    if (
+        isinstance(transform, PatchTransform)
+        and transform.resampling == "torchvision"
+    ):
+        pixels = _normalize(
+            _resample_bytes(image, tower).numpy(), transform.normalization
+        )
+        return _prepared_pixels(processor, transform, pixels, canvas, device)
+
     if not isinstance(transform, PatchTransform):
         image = vision.resize(
             image,
@@ -153,8 +177,32 @@ def prepare_image(
     image = vision.resize(
         image, tower, interpolation=InterpolationMode.BICUBIC, antialias=True
     )
-    pixels = _normalize(image, transform.normalization)
+    pixels = _normalize(
+        np.asarray(image).transpose(2, 0, 1), transform.normalization
+    )
     return _prepared_pixels(processor, transform, pixels, canvas, device)
+
+
+def _resample_bytes(image: Image.Image, size: tuple[int, int]) -> torch.Tensor:
+    """Resize an RGB image as a ``uint8`` CHW tensor with torchvision.
+
+    Returns the ``[3, height, width]`` ``uint8`` image at ``size``, following
+    the Transformers torchvision image-processor path call for call:
+    ``pil_to_tensor`` yields a channels-last view of the decoded bytes, and
+    the antialiased bicubic filter runs on it only when the size changes,
+    rounding back to 8 bits. torchvision picks its interpolation kernel by
+    host architecture and memory format, so the same calls on the host
+    reproduce the reference pixels independently of the staging device.
+    """
+    pixels = tensor_vision.pil_to_tensor(image)
+    if tuple(pixels.shape[1:]) == size:
+        return pixels
+    return tensor_vision.resize(
+        pixels,
+        list(size),
+        interpolation=tensor_vision.InterpolationMode.BICUBIC,
+        antialias=True,
+    )
 
 
 def prepare_tensor_image(
@@ -171,6 +219,8 @@ def prepare_tensor_image(
     [0, 1], or in [-1, 1] when ``signed_unit``; values are clamped to [0, 1]
     before the transforms. The view is a generated image rather than a
     request input, so a patch tower applies its single-image pixel bound.
+    Continuous values resize with torch's antialiased bicubic filter
+    whatever resampling the transform declares for 8-bit images.
     """
     value = image.detach().to(dtype=torch.float32)
     if value.ndim == 4:
@@ -196,8 +246,12 @@ def prepare_tensor_image(
     return _prepared_pixels(processor, transform, pixels, canvas, device)
 
 
-def _decode_rgb(encoded: str) -> Image.Image:
-    """Decode a base64 image payload and normalize it to RGB."""
+def _decode_rgb(encoded: str, alpha: str) -> Image.Image:
+    """Decode a base64 image payload and convert it to RGB.
+
+    ``alpha`` is the processor's ``ImageProcessor.alpha`` policy for images
+    with transparency.
+    """
     if not isinstance(encoded, str) or not encoded:
         raise invalid_descriptor(
             "inline image payload must be non-empty base64"
@@ -211,8 +265,10 @@ def _decode_rgb(encoded: str) -> Image.Image:
             "inline image payload is not a valid encoded image"
         ) from error
 
-    # Composite transparency onto white so alpha never reaches the towers.
-    if image.mode == "RGBA" or image.info.get("transparency") is not None:
+    transparent = (
+        image.mode == "RGBA" or image.info.get("transparency") is not None
+    )
+    if alpha == "white" and transparent:
         rgba = image.convert("RGBA")
         rgb = Image.new("RGB", rgba.size, (255, 255, 255))
         rgb.paste(rgba, mask=rgba.getchannel("A"))
@@ -279,12 +335,18 @@ def _stride_shape(
     return align(width * scale), align(height * scale)
 
 
-def _normalize(image: Image.Image, name: str) -> torch.Tensor:
-    """Normalize decoded RGB bytes into contiguous FP32 CHW model inputs."""
+def _normalize(values: np.ndarray, name: str) -> torch.Tensor:
+    """Normalize ``uint8`` CHW RGB bytes into contiguous FP32 model inputs."""
     # PIL decoding and resizing produce host bytes. Keep the pointwise FP32
     # transform in one owned CHW array instead of dispatching each pass through
     # the process-wide tensor thread pool on the serving thread.
-    pixels = np.asarray(image).transpose(2, 0, 1).astype(np.float32, order="C")
+    pixels = values.astype(np.float32, order="C")
+    if name == "unit":
+        # One float32 multiplication by the float32 factor, bit for bit the
+        # Transformers ``rescale`` of a uint8 tensor.
+        pixels *= np.float32(_UNIT_SCALE)
+        return torch.from_numpy(pixels)
+
     pixels /= np.float32(255.0)
     if name == "signed_unit":
         pixels -= np.float32(0.5)
@@ -298,7 +360,9 @@ def _normalize(image: Image.Image, name: str) -> torch.Tensor:
 
 
 def _normalize_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:
-    """Apply the named channel normalization policy to an image tensor."""
+    """Apply the named normalization policy to an image tensor in [0, 1]."""
+    if name == "unit":
+        return tensor
     if name == "signed_unit":
         return (tensor - 0.5) / 0.5
     if name == "imagenet":
