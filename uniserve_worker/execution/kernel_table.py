@@ -87,7 +87,9 @@ def _label(runner: Any) -> str:
     entry = getattr(runner.call, "entry_point", None)
     if entry is not None:
         label += f".{entry.method}"
-    kinds = tuple(str(kind) for kind in getattr(runner, "call_kinds", ()))
+    # Call kinds form a set; sorting keeps one runner's label identical
+    # across processes and runs.
+    kinds = sorted(str(kind) for kind in getattr(runner, "call_kinds", ()))
     if kinds:
         label += f"[{','.join(kinds)}]"
     return label
