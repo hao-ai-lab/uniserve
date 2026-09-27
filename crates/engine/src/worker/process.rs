@@ -638,15 +638,27 @@ enum OutstandingKind {
 /// Caching-allocator variables PyTorch reads, the first taking precedence.
 const ALLOCATOR_VARIABLES: [&str; 2] = ["PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"];
 
-/// Returns the caching-allocator variables every rank is launched with,
-/// given a lookup into the head's environment.
+/// The transparent-huge-page option of mimalloc, which PyTorch builds in as
+/// its CPU allocator on aarch64 Linux.
+const HOST_ALLOCATOR_THP_VARIABLE: &str = "MIMALLOC_ALLOW_THP";
+
+/// Returns the allocator variables every rank is launched with, given a
+/// lookup into the head's environment.
 ///
-/// Every rank serves varying shapes from expandable allocator segments,
-/// unless the head's environment already configures the allocator under
-/// either name, in which case each rank receives exactly the head's
-/// variables. Publication never depends on the caching allocator: a device
-/// product is exported from the rank's own VMM arena or copied into its
-/// bounded VMM pool, both reserved outside the allocator.
+/// Every rank serves varying shapes from expandable caching-allocator
+/// segments, unless the head's environment already configures the caching
+/// allocator under either name, in which case each rank receives exactly
+/// the head's variables. Publication never depends on the caching
+/// allocator: a device product is exported from the rank's own VMM arena or
+/// copied into its bounded VMM pool, both reserved outside the allocator.
+///
+/// Every rank also keeps its host heap out of transparent huge pages unless
+/// the head sets `MIMALLOC_ALLOW_THP` itself. mimalloc otherwise advises its
+/// 1 GiB arenas for huge pages. On a kernel with 64 KiB base pages a huge
+/// page is 512 MiB, and each time khugepaged collapses one it holds the
+/// rank's memory map for about 90 ms, which stalls the rank's service
+/// thread. With the option off, mimalloc disables transparent huge pages
+/// for the rank process.
 ///
 /// The variables are set explicitly on each rank's command, even where a
 /// local child would inherit them, because a launcher on another host
@@ -655,15 +667,18 @@ const ALLOCATOR_VARIABLES: [&str; 2] = ["PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLO
 fn allocator_environment(
     head: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Vec<(&'static str, std::ffi::OsString)> {
-    let configured: Vec<_> = ALLOCATOR_VARIABLES
+    let mut configured: Vec<_> = ALLOCATOR_VARIABLES
         .into_iter()
         .filter_map(|name| head(name).map(|value| (name, value)))
         .collect();
     if configured.is_empty() {
-        vec![("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True".into())]
-    } else {
-        configured
+        configured.push(("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True".into()));
     }
+    configured.push((
+        HOST_ALLOCATOR_THP_VARIABLE,
+        head(HOST_ALLOCATOR_THP_VARIABLE).unwrap_or_else(|| "0".into()),
+    ));
+    configured
 }
 
 /// Bound listening sockets a rank inherits and serves collective stores on.
@@ -732,8 +747,8 @@ impl PendingRank {
             .env("LOCAL_RANK", local_rank.to_string())
             .env("LOCAL_WORLD_SIZE", local_world_size.to_string());
 
-        // The allocator setting is stated even for a local child, which would
-        // inherit it, so that a remote launch carries it as well.
+        // The allocator settings are stated even for a local child, which
+        // would inherit them, so that a remote launch carries them as well.
         cmd.envs(allocator_environment(|name| std::env::var_os(name)));
 
         // The engine's working directory leads the worker's import path.
@@ -1434,10 +1449,12 @@ mod tests {
         }
     }
 
-    /// Every rank runs with the head's allocator configuration, under
-    /// whichever names the head sets, or with expandable segments when the
-    /// head configures none. The result names each variable, since a remote
-    /// launch carries only the variables its command sets.
+    /// Every rank runs with the head's caching-allocator configuration,
+    /// under whichever names the head sets, or with expandable segments when
+    /// the head configures none, and with its host heap out of transparent
+    /// huge pages unless the head decides otherwise. The result names each
+    /// variable, since a remote launch carries only the variables its
+    /// command sets.
     #[test]
     fn ranks_run_with_the_heads_allocator_configuration() {
         let resolve = |head: &[(&'static str, &str)]| {
@@ -1455,7 +1472,10 @@ mod tests {
 
         assert_eq!(
             resolve(&[]),
-            expected(&[("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")])
+            expected(&[
+                ("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
+                ("MIMALLOC_ALLOW_THP", "0"),
+            ])
         );
         for head in [
             vec![(
@@ -1468,7 +1488,16 @@ mod tests {
                 ("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False"),
             ],
         ] {
-            assert_eq!(resolve(&head), expected(&head));
+            let mut ranks = head.clone();
+            ranks.push(("MIMALLOC_ALLOW_THP", "0"));
+            assert_eq!(resolve(&head), expected(&ranks));
         }
+        assert_eq!(
+            resolve(&[("MIMALLOC_ALLOW_THP", "1")]),
+            expected(&[
+                ("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
+                ("MIMALLOC_ALLOW_THP", "1"),
+            ])
+        );
     }
 }
