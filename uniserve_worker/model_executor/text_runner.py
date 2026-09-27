@@ -1,9 +1,11 @@
 """Worker output selection around the public causal language-model capability.
 
 ``TextRunner`` evaluates a ``CausalLM`` backbone once per staged call and
-returns, per row, final-token logits, all-token logits or hidden states. With
-pipeline parallelism, only the last stage projects vocabulary columns, and
-it broadcasts the selected results so every stage returns the same rows.
+returns, per row, final-token logits, all-token logits or hidden states, or
+an empty value for a row that selects ``TokenSelection.CACHE``. A call whose
+rows all select ``CACHE`` only writes the K/V cache (``CausalLM.fill_cache``).
+With pipeline parallelism, only the last stage projects vocabulary columns,
+and it broadcasts the selected results so every stage returns the same rows.
 
 Graphs serve two kinds of text calls. A decode bucket captures the
 final-position logits of every row together with greedy decoding. A prefill
@@ -11,7 +13,8 @@ bucket captures the backbone's hidden states alone, copied into one output
 backing that every prefill bucket of the runner shares; after the replay,
 ``select_outputs`` projects the rows' logits and slices their hidden states
 from that backing with the live lengths, so one bucket serves any mix of
-output selections.
+output selections. A cache-only prefill bucket (``PrefillShape.outputs``)
+captures ``fill_cache`` and serves calls whose rows all select ``CACHE``.
 """
 
 from __future__ import annotations
@@ -135,11 +138,23 @@ class TextRunner(ModelRunner):
     ) -> ExecutionOutput:
         """Run one backbone pass and return the per-row selection it requests.
 
-        Each row independently selects final-token logits, all-token logits, or
-        raw hidden states. Logit and hidden columns are computed once on the
-        last pipeline stage and broadcast so every stage returns the same rows.
+        Each row independently selects final-token logits, all-token logits,
+        raw hidden states, or nothing (``CACHE``). Logit and hidden columns
+        are computed once on the last pipeline stage and broadcast so every
+        stage returns the same rows. A call whose rows all select ``CACHE``
+        only writes the K/V cache.
         """
+        if all(selection is TokenSelection.CACHE for selection in selections):
+            self.model.fill_cache(inputs)
+            return self._cache_rows(len(selections))
         return self.select_outputs(self.model(inputs), inputs, selections)
+
+    def _cache_rows(self, rows: int) -> ExecutionOutput:
+        """Empty ``[0, hidden]`` values of ``rows`` cache-only rows."""
+        empty = torch.empty(
+            (0, self.model.backbone.hidden_size), device=self.device
+        )
+        return ExecutionOutput((empty,) * rows, (None,) * rows)
 
     def hidden_states(self, inputs: TextInput) -> torch.Tensor:
         """Evaluate the backbone into the runner's prefill output backing.
@@ -196,7 +211,8 @@ class TextRunner(ModelRunner):
         gather and one head call: its final token for ``LAST_LOGITS``, every
         token for ``ALL_LOGITS``. Hidden rows are views of ``hidden``, or
         copies with ``copy_hidden``, which a caller whose ``hidden`` is
-        reused storage requests. On other pipeline stages the last stage's
+        reused storage requests. A ``CACHE`` row receives an empty
+        ``[0, hidden]`` value. On other pipeline stages the last stage's
         results are received by broadcast.
 
         Raises:
@@ -229,12 +245,13 @@ class TextRunner(ModelRunner):
 
         # Logit rows: the final token of a final-token row (none for an empty
         # row) and every token of an all-token row.
+        projected = (TokenSelection.LAST_LOGITS, TokenSelection.ALL_LOGITS)
         logit_counts = tuple(
             stop - start
             if selection is TokenSelection.ALL_LOGITS
             else min(1, stop - start)
             for start, stop, selection in rows
-            if selection is not TokenSelection.HIDDEN
+            if selection in projected
         )
         logits = hidden.new_empty((0, width))
         if sum(logit_counts):
@@ -251,7 +268,7 @@ class TextRunner(ModelRunner):
                         if selection is TokenSelection.ALL_LOGITS
                         else range(stop - min(1, stop - start), stop)
                         for start, stop, selection in rows
-                        if selection is not TokenSelection.HIDDEN
+                        if selection in projected
                     ),
                     device,
                 )
@@ -296,16 +313,24 @@ class TextRunner(ModelRunner):
             if selected.numel():
                 self.pipeline.broadcast(selected, src=self.pipeline.size - 1)
 
-        # Interleave both runs back into row order.
+        # Interleave both runs back into row order; cache-only rows receive
+        # an empty value.
         logit_rows = iter(logits.split(logit_counts))
         hidden_rows = iter(
             () if selected is None else selected.split(hidden_lengths)
         )
+        empty = hidden.new_empty((0, hidden.shape[1]))
         outputs, vocabularies = [], []
         for selection in selections:
-            projected = selection is not TokenSelection.HIDDEN
-            outputs.append(next(logit_rows if projected else hidden_rows))
-            vocabularies.append(self.vocab if projected else None)
+            if selection in projected:
+                outputs.append(next(logit_rows))
+                vocabularies.append(self.vocab)
+            elif selection is TokenSelection.HIDDEN:
+                outputs.append(next(hidden_rows))
+                vocabularies.append(None)
+            else:
+                outputs.append(empty)
+                vocabularies.append(None)
         return ExecutionOutput(tuple(outputs), tuple(vocabularies))
 
     def batch_forward(self, batch, *, padded=False):
@@ -328,7 +353,9 @@ class TextRunner(ModelRunner):
         Only buckets that startup captures are candidates. A decode batch
         (one query token per row) must fit a decode bucket. With prefill
         graphs enabled, every other batch must fit a prefill bucket of its
-        causality and embedding replacement. Returns ``None`` for eager
+        causality and embedding replacement that evaluates hidden states,
+        or, when every row selects ``CACHE``, a cache-only bucket if the
+        runner has any. Returns ``None`` for eager
         execution (graphs disabled, the batch ineligible, or prefill graphs
         disabled for a non-decode batch), otherwise ``(key, padded_batch,
         True)``; a decode key starts with ``"text"`` and a prefill key with
@@ -345,7 +372,7 @@ class TextRunner(ModelRunner):
             batch.forward_mode is ForwardMode.DECODE
             and batch.inputs.attention.queries.host == (1,) * batch.row_count
         )
-        prefill_shapes = self.prefill_shapes if self.prefill_graph else ()
+        prefill_shapes = self._prefill_family(batch)
         if not decode and not prefill_shapes:
             return None
 
@@ -382,8 +409,8 @@ class TextRunner(ModelRunner):
             )
             return key, padded, True
 
-        # A prefill graph computes hidden states only; the force-finish
-        # column and the rows' selections stay outside it.
+        # A prefill graph computes hidden states, or only the K/V cache;
+        # the force-finish column and the rows' selections stay outside it.
         padded = pad_text(batch, *shape)
         inputs = padded.inputs
         key = (
@@ -393,8 +420,31 @@ class TextRunner(ModelRunner):
             inputs.positions.ndim,
             inputs.embeddings is not None,
             next(iter(inputs.attention.entries.values())).causal[0],
+            prefill_shapes[0].outputs,
         )
         return key, padded, True
+
+    def _prefill_family(self, batch):
+        """The prefill buckets a batch may replay: one outputs kind.
+
+        A batch whose rows all select ``CACHE`` replays a cache-only bucket
+        when the runner has any; every other batch, one that evaluates
+        hidden states.
+        """
+        if not self.prefill_graph:
+            return ()
+        cache_only = all(
+            selection is TokenSelection.CACHE
+            for selection in batch.token_selections
+        )
+        family = tuple(
+            shape for shape in self.prefill_shapes if not shape.outputs
+        )
+        if not (cache_only and family):
+            family = tuple(
+                shape for shape in self.prefill_shapes if shape.outputs
+            )
+        return family
 
     def _unserved(self, batch, *, decode):
         """Describe a batch no captured bucket holds and the captured range."""
@@ -425,7 +475,7 @@ class TextRunner(ModelRunner):
         embeddings = inputs.embeddings is not None
         shapes = tuple(
             shape
-            for shape in self.prefill_shapes
+            for shape in self._prefill_family(batch)
             if causality == {shape.causal} and shape.embeddings == embeddings
         )
         captured = (
@@ -444,13 +494,23 @@ class TextRunner(ModelRunner):
         )
 
     def capture_graph(self, key, execution, forward):
-        """Capture a prefill bucket's hidden states, or defer to the base."""
+        """Capture a prefill bucket's hidden states or its K/V cache writes.
+
+        Other buckets defer to the base.
+        """
         if key[0] != "prefill":
             return super().capture_graph(key, execution, forward)
+        outputs = key[-1]
         return capture_hidden(
             self.context,
             execution,
-            lambda static: self.hidden_states(static.inputs),
+            (
+                lambda static: (
+                    self.hidden_states(static.inputs)
+                    if outputs
+                    else self.model.fill_cache(static.inputs)
+                )
+            ),
             pools=self.pools,
             cache=self.cache,
         )
@@ -460,11 +520,14 @@ class TextRunner(ModelRunner):
 
         The selection projects logits into new tensors and copies hidden
         rows out of the shared backing, so the result owns its values
-        whether or not ``borrow`` is set.
+        whether or not ``borrow`` is set. A cache-only bucket's rows receive
+        empty values.
         """
         if key[0] != "prefill":
             return super().replay_graph(key, execution, batch, borrow=borrow)
         hidden = replay_hidden(self.buckets[key].graphs[None], execution)
+        if not key[-1]:
+            return self._cache_rows(batch.row_count)
         with self.context.activate():
             return self.select_outputs(
                 hidden,

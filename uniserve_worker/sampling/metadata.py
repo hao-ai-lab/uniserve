@@ -17,11 +17,17 @@ from uniserve.sampling import SamplingParams
 
 
 class TokenSelection(StrEnum):
-    """Select final-token logits, all-token logits, or hidden states."""
+    """Select final-token logits, all-token logits, hidden states, or none.
+
+    A ``CACHE`` row consumes only the K/V cache its call writes: its call
+    returns an empty value for it, and a call of such rows alone evaluates
+    no output at all.
+    """
 
     LAST_LOGITS = "last_logits"
     ALL_LOGITS = "all_logits"
     HIDDEN = "hidden"
+    CACHE = "cache"
 
 
 @dataclass(frozen=True, slots=True)

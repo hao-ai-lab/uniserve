@@ -154,6 +154,9 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             }
             _ => None,
         },
+        // A DiffusionGemma prompt, image block or committed block only
+        // conditions canvases: its prefill writes the K/V cache alone.
+        prefill_outputs: !matches!(model_config.parameters, ModelParameters::DiffusionGemma(_)),
         ..config.engine.worker_process.clone()
     };
     let engine_config = EngineConfig {

@@ -322,7 +322,10 @@ class WorkerConfig:
     captured over ``prefill_graph_token_sizes`` token buckets. A call no
     captured graph holds fails, and the worker reports the rows its graphs
     hold so the engine never forms one. Turning ``prefill_cuda_graph`` off
-    runs prefill eagerly, for debugging.
+    runs prefill eagerly, for debugging. Without ``prefill_outputs`` the
+    deployment's prefill calls select no output (``TokenSelection.CACHE``):
+    their graphs only write the K/V cache, and a prefill call that selects
+    logits or hidden states has no graph.
     ``flow_cuda_graph`` (on by default) captures image denoising calls at
     the ``flow_graph_shapes`` and ``flow_graph_batch_sizes`` combinations
     and replays those whose exact input signature was captured; turning it
@@ -364,6 +367,10 @@ class WorkerConfig:
     graph_policy: str = "auto"
     decode_graph_batch_sizes: tuple[int, ...] = DEFAULT_DECODE_GRAPH_BATCH_SIZES
     prefill_cuda_graph: bool = True
+    # Whether any prefill call of the deployment selects logits or hidden
+    # states. A deployment whose prompts only condition token-denoising
+    # canvases writes the K/V cache alone.
+    prefill_outputs: bool = True
     prefill_graph_token_sizes: tuple[int, ...] = (
         DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
     )
@@ -491,6 +498,7 @@ def worker_config_from_namespace(
             default=DEFAULT_DECODE_GRAPH_BATCH_SIZES,
         ),
         prefill_cuda_graph=bool(namespace.prefill_cuda_graph),
+        prefill_outputs=bool(getattr(namespace, "prefill_outputs", True)),
         flow_cuda_graph=bool(getattr(namespace, "flow_cuda_graph", True)),
         prefill_graph_token_sizes=_parse_positive_int_csv(
             namespace.prefill_graph_token_sizes,

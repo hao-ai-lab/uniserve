@@ -135,6 +135,10 @@ pub struct WorkerProcessArgs {
     /// Whether every prefill call replays a CUDA graph captured at
     /// startup; without it prefill runs eagerly, for debugging.
     pub prefill_cuda_graph: bool,
+    /// Whether any prefill call of the deployment samples a token or scores
+    /// its prompt. Without it every prefill only writes the K/V cache, and
+    /// the worker's prefill graphs stop at the final layer's cache write.
+    pub prefill_outputs: bool,
     /// Optional prefill token counts selected for CUDA graph capture.
     pub prefill_graph_token_sizes: Option<String>,
     /// Whether image denoising calls capture and replay CUDA graphs at the

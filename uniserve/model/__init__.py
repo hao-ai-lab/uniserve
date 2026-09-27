@@ -25,7 +25,11 @@ from .token_denoiser import (
     SelfConditioning,
     TokenDenoiser,
 )
-from .transformer import TransformerDecoder, TransformerEncoder
+from .transformer import (
+    PhasedLayer,
+    TransformerDecoder,
+    TransformerEncoder,
+)
 from .video import AudioDecoder, VideoDecoder, VideoPostprocessor
 
 __all__ = [
@@ -45,6 +49,7 @@ __all__ = [
     "CanvasTokens",
     "SelfConditioning",
     "TokenDenoiser",
+    "PhasedLayer",
     "TransformerDecoder",
     "TransformerEncoder",
     "Denoiser",

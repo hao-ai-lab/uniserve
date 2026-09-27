@@ -224,6 +224,7 @@ impl Default for WorkerProcessArgs {
             graph_policy: "auto".into(),
             decode_graph_batch_sizes: None,
             prefill_cuda_graph: true,
+            prefill_outputs: true,
             prefill_graph_token_sizes: None,
             flow_cuda_graph: true,
             flow_graph_batch_sizes: None,
@@ -452,6 +453,7 @@ impl WorkerProcessArgs {
             json!(self.decode_graph_batch_sizes),
         );
         fields.insert("prefill_cuda_graph".into(), json!(self.prefill_cuda_graph));
+        fields.insert("prefill_outputs".into(), json!(self.prefill_outputs));
         fields.insert(
             "prefill_graph_token_sizes".into(),
             json!(self.prefill_graph_token_sizes),
