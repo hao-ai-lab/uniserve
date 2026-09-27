@@ -129,9 +129,13 @@ class TokenDenoiser(nn.Module):
     The denoiser shares the causal model's backbone and vocabulary head.
     ``forward(inputs)`` returns the final-normalized canvas rows
     ``[rows * canvas, hidden]`` on the last pipeline stage (earlier stages
-    return the activations they forward). ``compute_logits`` projects
-    caller-selected rows through the head. ``canvas`` declares the canvases
-    the denoiser generates text in.
+    return the activations they forward). A pass that reads only some rows
+    splits instead: ``attend(inputs)`` evaluates every canvas token up to the
+    final layer's attention output, and ``finish`` completes the rest for
+    the selected rows alone (``TransformerDecoder.attend``). Its rows equal
+    ``forward``'s up to the rounding that fewer rows allow.
+    ``compute_logits`` projects caller-selected rows through the head.
+    ``canvas`` declares the canvases the denoiser generates text in.
     Concrete models supply only the ``SelfConditioning`` modules, the head's
     mathematics and the canvas tokens.
     """
@@ -156,13 +160,39 @@ class TokenDenoiser(nn.Module):
         return self.backbone.cache_config
 
     def forward(self, inputs: CanvasInput) -> torch.Tensor:
-        embeddings = None
-        if self.backbone._pipeline.rank == 0:
-            embeddings = self.self_conditioning(
-                self.backbone.embed_input_ids(inputs.input_ids),
-                inputs.self_conditioning,
-            )
-        return self.backbone(embeddings, inputs.positions, inputs.attention)
+        return self.backbone(
+            self._embeddings(inputs), inputs.positions, inputs.attention
+        )
+
+    def attend(self, inputs: CanvasInput) -> tuple[torch.Tensor, ...]:
+        """Evaluate every canvas token up to the final layer's attention.
+
+        Returns the backbone's per-token state of every canvas token on the
+        last pipeline stage, for ``finish``; earlier stages return the
+        activations they forward.
+        """
+        return self.backbone.attend(
+            self._embeddings(inputs), inputs.positions, inputs.attention
+        )
+
+    def finish(
+        self, state: tuple[torch.Tensor, ...], rows: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the final-normalized ``[rows, hidden]`` outputs of ``rows``.
+
+        ``state`` is ``attend``'s per-token state and ``rows`` the int64
+        packed canvas token rows to complete, on the last pipeline stage.
+        """
+        return self.backbone.finish(state, rows)
+
+    def _embeddings(self, inputs: CanvasInput) -> torch.Tensor | None:
+        """Self-conditioned canvas embeddings, on the first stage."""
+        if self.backbone._pipeline.rank != 0:
+            return None
+        return self.self_conditioning(
+            self.backbone.embed_input_ids(inputs.input_ids),
+            inputs.self_conditioning,
+        )
 
     def compute_logits(
         self, hidden: torch.Tensor, *, token_indices: torch.Tensor

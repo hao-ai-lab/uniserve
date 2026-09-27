@@ -79,10 +79,12 @@ class TransformerDecoder(nn.Module):
     the token shards. Placement binding selects resident modules before
     loading.
 
-    Besides the complete pass (``forward``), ``fill_cache`` evaluates the
-    model's final layer only up to its K/V cache write
-    (``PhasedLayer.write_cache``), for prompts whose only product is the
-    cache. Every other layer, and every layer of an earlier pipeline stage,
+    Besides the complete pass (``forward``), two partial passes evaluate the
+    model's final layer in its ``PhasedLayer`` phases: ``fill_cache`` stops
+    at the final layer's K/V cache write, for prompts whose only product is
+    the cache, and ``attend`` stops after the final layer's attention, so
+    ``finish`` completes the layer and the output norm for selected rows
+    alone. Every other layer, and every layer of an earlier pipeline stage,
     runs whole.
     """
 
@@ -226,6 +228,56 @@ class TransformerDecoder(nn.Module):
                 traversal.positions,
                 attention,
             )
+
+    def attend(
+        self,
+        embeddings: torch.Tensor | None,
+        positions: torch.Tensor,
+        attention: AttentionBatch,
+    ) -> tuple[torch.Tensor, ...]:
+        """Evaluate every layer up to the final layer's attention output.
+
+        Returns the final stage's per-token state of every token for
+        ``finish``: the final layer's ``PhasedLayer.attend`` state, or, when
+        that layer does not split, its ``(hidden, residual)`` streams
+        (``residual`` omitted for complete-stream layers). An earlier stage
+        returns the activations it forwards. Routed passes are not split.
+        """
+        if self._default_route is not None:
+            raise ValueError("routed decoders evaluate their layers whole")
+        traversal = self._traverse(
+            embeddings, positions, attention, (), split=True
+        )
+        hidden, residual = traversal.hidden, traversal.residual
+        if self._pipeline.rank != self._pipeline.size - 1:
+            return (self._forward_stage(hidden, residual, ()),)
+        if traversal.final is not None:
+            state = traversal.final.attend(
+                hidden, residual, traversal.positions, attention
+            )
+        else:
+            state = (hidden,) if residual is None else (hidden, residual)
+        return tuple(traversal.partition.gather(value) for value in state)
+
+    def finish(
+        self, state: tuple[torch.Tensor, ...], rows: torch.Tensor
+    ) -> torch.Tensor:
+        """Complete the final layer and the output norm for ``rows`` alone.
+
+        ``state`` is ``attend``'s per-token state on the final stage and
+        ``rows`` the int64 token rows to evaluate. Returns their normalized
+        ``[rows, hidden]`` outputs, which equal the same rows of ``forward``
+        up to the rounding that fewer rows allow.
+        """
+        if self._pipeline.rank != self._pipeline.size - 1:
+            raise ValueError("the output norm belongs to the final stage")
+        selected = tuple(value.index_select(0, rows) for value in state)
+        layer = next(reversed(self.layers.values()))
+        if isinstance(layer, PhasedLayer):
+            hidden, residual = layer.feed_forward(*selected)
+        else:
+            hidden, residual = selected[0], (selected[1:] or (None,))[0]
+        return self._normalize(hidden, residual, ())
 
     def _traverse(self, embeddings, positions, attention, routes, *, split):
         """Evaluate the resident layers, all but a split final layer.

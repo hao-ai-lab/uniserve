@@ -20,10 +20,12 @@ and call kind, and every call replays the smallest bucket that holds its
 canvases; after startup a call no captured bucket holds fails. A canvas
 step graph holds the whole step: the pass, the head and the sampler of
 every chunk, and the commit of the stepped state, for the one sampling the
-deployment serves. A readout graph holds the pass alone, over the bucket's
-canvases' worth of tokens in up to twice as many sequences, so it serves
-canvases of any length up to the model's; the slot head runs after the
-replay on the live slots, whose number and candidates vary from call to
+deployment serves. A readout graph holds the pass up to the final layer's
+attention output (``TokenDenoiser.attend``), over the bucket's canvases'
+worth of tokens in up to twice as many sequences, so it serves canvases of
+any length up to the model's; the rest of the final layer, the output norm
+and the head run after the replay on the live slot rows alone
+(``TokenDenoiser.finish``), whose number and candidates vary from call to
 call. Every sequence of a canvas graph, padding included, is at most one
 canvas long, which bounds its attention launch. Padding sequences read no
 prefix, and a padding step row starts a canvas in the sentinel slot zero.
@@ -136,19 +138,24 @@ class CanvasRunner(ModelRunner):
         inputs = batch.inputs
         if isinstance(inputs, CanvasStepInput):
             return ExecutionOutput(self.step(inputs))
-        return self.readout(self.model(inputs.canvas), inputs)
+        return self.readout(self.model.attend(inputs.canvas), inputs)
 
-    def readout(self, hidden: torch.Tensor, inputs: ReadoutInput):
-        """Read the slots of ``inputs`` from the pass's ``hidden`` states.
+    def readout(self, state: tuple[torch.Tensor, ...], inputs: ReadoutInput):
+        """Read the slots of ``inputs`` from the pass's ``attend`` state.
 
-        ``hidden`` holds at least the staged canvas tokens' rows, in the
-        packed order ``inputs.slot_tokens`` indexes. The head projects the
-        slot rows alone, gathered once for every slot of the call.
+        ``state`` holds ``TokenDenoiser.attend``'s per-token state of at
+        least the staged canvas tokens, in the packed order
+        ``inputs.slot_tokens`` indexes. The final layer's remainder, the
+        output norm and the head evaluate the slot rows alone, gathered once
+        for every slot of the call.
         """
         count = int(inputs.selection.numel())
+        device = state[0].device
         if self.pipeline.rank == self.pipeline.size - 1:
+            slots = self.model.finish(state, inputs.slot_tokens)
             logits = self.model.compute_logits(
-                hidden, token_indices=inputs.slot_tokens
+                slots,
+                token_indices=torch.arange(slots.shape[0], device=slots.device),
             )
             # The softmax normalizes over the whole vocabulary, so tensor
             # shards gather their columns for the slot rows alone.
@@ -158,9 +165,7 @@ class CanvasRunner(ModelRunner):
                 .index_select(0, inputs.selection)
             )
         else:
-            values = torch.empty(
-                (count,), dtype=torch.float32, device=hidden.device
-            )
+            values = torch.empty((count,), dtype=torch.float32, device=device)
         self.pipeline.broadcast(values, src=self.pipeline.size - 1)
         return ExecutionOutput(tuple(values.split(inputs.row_candidates)))
 
@@ -313,15 +318,15 @@ class CanvasRunner(ModelRunner):
     def capture_graph(self, key, execution, forward):
         """Capture a readout bucket's pass, or a whole canvas step.
 
-        A readout graph's output is its bucket's ``[canvas tokens, hidden]``
-        pass states, which the graph retains.
+        A readout graph's output is ``TokenDenoiser.attend``'s state of its
+        bucket's canvas tokens, which the graph retains.
         """
         if key[0] != "canvas":
             return super().capture_graph(key, execution, forward)
         return capture_hidden(
             self.context,
             execution,
-            lambda static: self.model(static.inputs),
+            lambda static: self.model.attend(static.inputs),
             pools=self.pools,
             cache=self.cache,
         )
@@ -334,9 +339,9 @@ class CanvasRunner(ModelRunner):
         """
         if key[0] != "canvas":
             return super().replay_graph(key, execution, batch, borrow=borrow)
-        hidden = replay_hidden(self.buckets[key].graphs[None], execution)
+        state = replay_hidden(self.buckets[key].graphs[None], execution)
         with self.context.activate():
-            return self.readout(hidden, batch.inputs)
+            return self.readout(state, batch.inputs)
 
 
 def _pad_attention(
