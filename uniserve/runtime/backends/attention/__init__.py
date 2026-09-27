@@ -54,9 +54,16 @@ class Operator:
     tables whose rows start after logical page zero
     (``BlockTable.start_page``). A provider that does not rejects such a
     table instead of reading its columns from the wrong logical pages.
+
+    ``builds_launch_plan`` states whether ``bind`` builds a launch plan from
+    the batch, metadata that the provider's launches read and that a
+    captured launch therefore needs rebuilt before every replay. A provider
+    whose kernels read every length, offset and table on the device only
+    checks its inputs in ``bind``.
     """
 
     reads_retired_tables = False
+    builds_launch_plan = True
 
     def __init__(
         self,

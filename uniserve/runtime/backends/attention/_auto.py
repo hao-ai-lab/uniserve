@@ -261,6 +261,14 @@ class _Automatic(_Operator):
         self._selections = {}
         self._arguments = kwargs
 
+    @property
+    def builds_launch_plan(self):
+        """Whether any provider this operator may select builds one."""
+        return any(
+            provider.operator_class.builds_launch_plan
+            for provider in self._providers.values()
+        )
+
     def _name(self, batch):
         """Return the first available provider reading ``batch``, or None."""
         # A table with retired window pages is read only by providers that

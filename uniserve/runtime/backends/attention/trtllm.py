@@ -44,6 +44,9 @@ class _TRTLLM(_Operator):
     # and the history window keep their relative meaning while retired
     # pages, which no query of the row may read, are never addressed.
     reads_retired_tables = True
+    # The kernels read every length, offset and table origin on the
+    # device; ``bind`` only checks the batch.
+    builds_launch_plan = False
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
