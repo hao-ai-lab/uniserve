@@ -73,11 +73,15 @@ include = ["uniserve", "uniserve.*", "uniserve_models*", "uniserve_worker*"]
 target = "uniserve_worker._uniserve_ipc"
 path = "crates/worker-ipc-py/Cargo.toml"
 binding = "PyO3"
+# Always release, including editable installs: the worker refuses a debug
+# build of this extension.
+debug = false
 
 # Server/scheduler binary, installed onto PATH as `uniserve`.
 [[tool.setuptools-rust.bins]]
 target = "uniserve"
 path = "crates/bin/uniserve/Cargo.toml"
+debug = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
