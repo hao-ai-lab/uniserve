@@ -172,6 +172,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         workers: config.engine.workers.clone(),
         transfer: config.engine.transfer.clone(),
         data_parallel_size: config.engine.data_parallel_size,
+        expert_parallel: config.engine.expert_parallel,
         worker_process,
         bos: control_tokens.bos,
         eos: control_tokens.eos,

@@ -297,6 +297,11 @@ class ModelExecutor:
         self.table_widths: tuple[int, ...] = ()
         self.decode_predicates = None
         self.kv_cache = None
+        # The all-to-all exchange of expert-parallel layers, which
+        # ``configure_inputs`` builds; ``None`` without such layers. The
+        # runners stepping through it are registered at capture.
+        self.experts = None
+        self._expert_runners: list[ModelRunner] = []
         # A standalone denoiser's component, binding and call, the request
         # bank and latent pool its ladders gather through, and the one
         # runner that serves every layout the media builder admits.
@@ -1128,6 +1133,7 @@ class ModelExecutor:
         self.table_widths = tuple(table_widths)
         config = self.worker_config
         self._initialize_streams(event_slots=max_inflight + 1)
+        self.experts = self._expert_exchange(input_config.max_tokens)
 
         # A decode or prefill row, and the request of every canvas a call
         # reads, holds at least one page of every cache group, so the pool's
@@ -1322,6 +1328,7 @@ class ModelExecutor:
                             stream=stream,
                             groups=call.groups,
                             derive_host_lengths=False,
+                            experts=self.experts,
                         )
                         # Text staging counts canonical tokens. Spatial codecs
                         # and vision towers expand those into different query
@@ -1404,6 +1411,134 @@ class ModelExecutor:
                         )
                     self._forward_calls[key] = entry
 
+    def _expert_exchange(self, max_tokens):
+        """Build the worker's all-to-all exchange for expert-parallel layers.
+
+        Every expert-parallel ``FusedMoE`` of the model shares the exchange
+        of its group, sized for ``max_tokens`` tokens per rank, the most one
+        staged call holds; ``None`` when no layer is expert-parallel.
+        Construction maps peer memory collectively, so every rank of the
+        group builds it at this same point of its startup. The exchange
+        serializes its layers on one stream, so an expert-parallel worker
+        runs its forwards on one execution lane.
+
+        Raises:
+            ValueError: The layers span several expert groups or shapes, or
+                the worker has several execution lanes.
+        """
+        from uniserve.nn.moe import FusedMoE
+        from uniserve.runtime.expert_exchange import ExpertExchange
+
+        layers = [
+            module
+            for module in self.model.modules()
+            if isinstance(module, FusedMoE) and module.expert_group.size > 1
+        ]
+        if not layers:
+            return None
+        first = layers[0]
+        shape = (
+            first.expert_group,
+            first.num_experts,
+            first.top_k,
+            first.hidden_size,
+        )
+        if any(
+            (
+                layer.expert_group,
+                layer.num_experts,
+                layer.top_k,
+                layer.hidden_size,
+            )
+            != shape
+            for layer in layers
+        ):
+            raise ValueError(
+                "expert-parallel layers share one group, expert count, top-k "
+                "and hidden size"
+            )
+        if len(self._lane_streams) > 1:
+            raise ValueError(
+                "an expert-parallel worker runs its forwards on one lane"
+            )
+        return ExpertExchange(
+            first.expert_group,
+            max_tokens=max_tokens,
+            top_k=first.top_k,
+            num_experts=first.num_experts,
+            hidden_size=first.hidden_size,
+            device=first.up_gate.weight.device,
+        )
+
+    def _register_expert_steps(self):
+        """Give each runner whose forwards reach expert layers a step kind.
+
+        Prefill and canvas runners step through the expert exchange at the
+        capacities their graphs serve. Every rank of the expert group must
+        register the same kinds with the same capacities, or its steps would
+        pad to graphs the others lack; the plans are compared once here and
+        a mismatch fails startup on every rank.
+
+        Raises:
+            RuntimeError: The ranks' step plans differ.
+        """
+        exchange = self.experts
+        if exchange is None:
+            return
+        self._expert_runners = []
+        for entry in self.entries.values():
+            if entry.context.experts is not exchange or not (
+                {ForwardMode.PREFILL, ForwardMode.TOKEN_DENOISING}
+                & set(entry.call_kinds)
+            ):
+                continue
+            entry.expert_kind = exchange.register(entry.expert_capacities())
+            self._expert_runners.append(entry)
+
+        plan = [sorted(kind) for kind in exchange.kinds]
+        plans = [None] * exchange.group.size
+        torch.distributed.all_gather_object(
+            plans, plan, group=exchange.group._require()
+        )
+        if any(other != plan for other in plans):
+            raise RuntimeError(
+                "expert-parallel ranks capture different step capacities: "
+                f"{plans}"
+            )
+
+    def join_expert_step(self, *, leaving: bool = False) -> bool:
+        """Take part in the next expert step when this rank has no forward.
+
+        Agrees with the expert group with no tokens; when another rank takes
+        a step, joins every expert layer at the agreed capacity so that
+        rank's exchanges complete. Returns whether a step ran. A rank
+        shutting down passes ``leaving`` until ``experts.released``. Without
+        an exchange nothing happens.
+        """
+        exchange = self.experts
+        if exchange is None or not self._expert_runners:
+            return False
+        capacity = exchange.agree(None, 0, leaving=leaving)
+        if not capacity:
+            return False
+        runner = self._expert_runners[0]
+        context, stream = runner.context, runner.context.stream
+        if stream is not None:
+            stream.wait(torch.cuda.current_stream(runner.device))
+        try:
+            with torch.inference_mode(), context.activate():
+                exchange.begin(capacity)
+                try:
+                    context.join_expert_layers()
+                finally:
+                    exchange.end()
+        finally:
+            if stream is not None:
+                torch.cuda.current_stream(runner.device).wait_stream(
+                    stream.stream
+                )
+        return True
+
     def call_devices(self, call):
         """Return ``(compute, staged, output)`` devices for one call.
 
@@ -1465,6 +1600,7 @@ class ModelExecutor:
             prepare_prefill,
         )
 
+        self._register_expert_steps()
         for phase in ("prefill", "decode", "canvas", "flow"):
             for entry in self.entries.values():
                 forward = entry.batch_forward

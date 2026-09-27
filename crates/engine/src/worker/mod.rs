@@ -184,6 +184,27 @@ pub struct WorkerProcessArgs {
     /// bounds the frame counts a video worker provisions from below; `None`
     /// provisions every frame count the model generates.
     pub min_video_seconds: Option<f64>,
+    /// This group's place in the expert-parallel world its data-parallel
+    /// replica joins, when the deployment shards routed experts across the
+    /// replicas; `None` keeps every expert on the group's own ranks.
+    pub expert_parallel: Option<ExpertParallelPlacement>,
+}
+
+/// One single-rank replica's place in an expert-parallel world.
+///
+/// The world's ranks are the data-parallel replicas in order: replica `rank`
+/// of `size` keeps routed experts `[rank * E / size, (rank + 1) * E / size)`
+/// and exchanges tokens with the other replicas at every expert layer.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ExpertParallelPlacement {
+    /// The replica's rank in the expert-parallel world.
+    pub rank: u32,
+    /// Number of replicas sharing the experts.
+    pub size: u32,
+    /// TCP address of the world's rendezvous store. `WorkerGroup::spawn_all`
+    /// reserves it once the deployment's hosts are known; world rank 0 serves
+    /// it on a socket the head binds.
+    pub address: Option<String>,
 }
 
 /// Parks until one descriptor becomes readable or `timeout` expires.

@@ -347,7 +347,15 @@ class TextRunner(ModelRunner):
             else self(batch.inputs, batch.token_selections)
         )
 
-    def select_graph_shape(self, batch, *, eligible):
+    def expert_capacities(self) -> frozenset[int]:
+        """The prefill buckets' token counts: an expert step pads to one."""
+        return frozenset(shape.token_bucket for shape in self.prefill_shapes)
+
+    def graph_capacity(self, key) -> int:
+        """A text bucket's token count; its graph exchanges at that many."""
+        return key[1][1]
+
+    def select_graph_shape(self, batch, *, eligible, capacity=None):
         """Choose a captured text graph bucket and pad the batch to it.
 
         Only buckets that startup captures are candidates. A decode batch
@@ -359,7 +367,9 @@ class TextRunner(ModelRunner):
         execution (graphs disabled, the batch ineligible, or prefill graphs
         disabled for a non-decode batch), otherwise ``(key, padded_batch,
         True)``; a decode key starts with ``"text"`` and a prefill key with
-        ``"prefill"``, and both carry the ``text_shape`` tuple second.
+        ``"prefill"``, and both carry the ``text_shape`` tuple second. In an
+        expert step of per-rank ``capacity`` tokens, a prefill batch pads to
+        a bucket of exactly that many tokens, whose graph exchanges at it.
 
         Raises:
             CUDAGraphError: No decode bucket holds a decode batch, or prefill
@@ -373,6 +383,12 @@ class TextRunner(ModelRunner):
             and batch.inputs.attention.queries.host == (1,) * batch.row_count
         )
         prefill_shapes = self._prefill_family(batch)
+        if capacity is not None:
+            prefill_shapes = tuple(
+                shape
+                for shape in prefill_shapes
+                if shape.token_bucket == capacity
+            )
         if not decode and not prefill_shapes:
             return None
 

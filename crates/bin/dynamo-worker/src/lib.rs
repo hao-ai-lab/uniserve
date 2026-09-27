@@ -243,6 +243,7 @@ impl DynamoFastH3Engine {
                 workers: self.args.workers.to_vec(),
                 transfer: Default::default(),
                 data_parallel_size: 1,
+                expert_parallel: false,
                 worker_process,
             },
             model: self.args.model_path.clone(),

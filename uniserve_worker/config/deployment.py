@@ -432,6 +432,21 @@ class DataPlaneConfig:
 
 
 @dataclass(frozen=True)
+class ExpertParallelLaunch:
+    """This replica's place in its deployment's expert-parallel world.
+
+    The world's ranks are the data-parallel replicas of one rank each, in
+    order: rank ``rank`` of ``size`` keeps its share of every routed-expert
+    layer and exchanges tokens with the others there. The world forms at
+    ``rendezvous``, whose store rank 0 serves on the socket it inherits.
+    """
+
+    rank: int
+    size: int
+    rendezvous: Rendezvous
+
+
+@dataclass(frozen=True)
 class WorkerProcessArgs:
     """Aggregates the validated launch configuration for one worker rank."""
 
@@ -448,6 +463,7 @@ class WorkerProcessArgs:
     load: IOConfig
     use_stub_model: bool
     components: tuple[tuple[str, ComponentConfig], ...] = ()
+    expert_parallel: ExpertParallelLaunch | None = None
 
     @classmethod
     def from_namespace(cls, namespace: argparse.Namespace) -> WorkerProcessArgs:
@@ -540,6 +556,7 @@ class WorkerProcessArgs:
             components=parse_components(
                 namespace.components, int(namespace.world_size)
             ),
+            expert_parallel=_expert_parallel(namespace),
         )
 
 
@@ -845,6 +862,63 @@ def _rendezvous(namespace: argparse.Namespace) -> Rendezvous | None:
         host=host,
         port=int(port),
         listen_fd=None if listen_fd is None else int(listen_fd),
+    )
+
+
+def _expert_parallel(
+    namespace: argparse.Namespace,
+) -> ExpertParallelLaunch | None:
+    """Resolve the replica's expert-parallel world, when the launch names one.
+
+    The descriptor's optional ``expert_parallel`` object carries ``rank``,
+    ``size``, the store ``address`` and, for rank 0 only, the ``listen_fd``
+    of the socket that rank serves the store on. A replica joins with its
+    only rank, so the group's own process world must be that one rank.
+
+    Raises:
+        ValueError: The object is malformed, the rank lies outside a world of
+            at least two replicas, the group has more than one rank, or the
+            store socket is missing on rank 0 or present on another rank.
+    """
+    value = getattr(namespace, "expert_parallel", None)
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {
+        "rank",
+        "size",
+        "address",
+        "listen_fd",
+    }:
+        raise ValueError(
+            "expert_parallel must carry rank, size, address and listen_fd"
+        )
+
+    rank, size = value["rank"], value["size"]
+    if type(rank) is not int or type(size) is not int or size < 2:
+        raise ValueError("an expert-parallel world spans at least two ranks")
+    if not 0 <= rank < size:
+        raise ValueError("expert-parallel rank must satisfy 0 <= rank < size")
+    if int(namespace.world_size) != 1:
+        raise ValueError(
+            "an expert-parallel replica joins its world with its only rank"
+        )
+
+    address, listen_fd = value["address"], value["listen_fd"]
+    if not isinstance(address, str) or ":" not in address:
+        raise ValueError("expert-parallel store address must be host:port")
+    if (rank == 0) != (listen_fd is not None):
+        raise ValueError(
+            "exactly the expert-parallel world's rank 0 serves its store"
+        )
+    host, _, port = address.rpartition(":")
+    return ExpertParallelLaunch(
+        rank=rank,
+        size=size,
+        rendezvous=Rendezvous(
+            host=host,
+            port=int(port),
+            listen_fd=None if listen_fd is None else int(listen_fd),
+        ),
     )
 
 

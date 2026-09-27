@@ -167,6 +167,12 @@ pub(crate) struct SharedRuntimeArgs {
     /// consecutive blocks of groups.
     #[arg(long = "data-parallel-size", default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub data_parallel_size: usize,
+    /// Shard the model's routed experts across the data-parallel replicas:
+    /// each one-rank replica keeps its share of every expert layer and
+    /// exchanges tokens with the others there, while attention and every
+    /// other layer stay data-parallel.
+    #[arg(long = "expert-parallel", default_value_t = false)]
+    pub expert_parallel: bool,
     /// Path to a JSON deployment configuration: the Worker instances to serve,
     /// each one's node/device ranks, and the components placed on them.
     #[arg(long, value_name = "FILE", value_parser = read_workers)]
@@ -414,6 +420,7 @@ impl SharedRuntimeArgs {
             }),
             transfer: self.transfer.clone().unwrap_or_default(),
             data_parallel_size: self.data_parallel_size,
+            expert_parallel: self.expert_parallel,
             worker_process,
         }
     }
