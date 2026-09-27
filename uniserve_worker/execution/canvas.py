@@ -26,7 +26,11 @@ from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution import calls
 from uniserve_worker.execution.batch import BatchState
 from uniserve_worker.execution.output import PendingOutput
-from uniserve_worker.model_executor.input_batch import CanvasRow, CanvasStepRow
+from uniserve_worker.model_executor.input_batch import (
+    CanvasRow,
+    CanvasStepRow,
+    int64_bits,
+)
 from uniserve_worker.protocol.call import Call, CallStatus, ForwardMode
 from uniserve_worker.protocol.output import FinishFlags
 
@@ -236,7 +240,7 @@ def prepare_step(
         write_kv=False,
         causal=False,
         canvas_length=length,
-        seed=int(seed),
+        seed=int64_bits(int(seed)),
         block=step.block,
         step=step.step,
         sampling=constants,

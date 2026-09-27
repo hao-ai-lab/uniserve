@@ -21,6 +21,23 @@ from uniserve_worker.sampling.metadata import TokenSelection
 InputT = TypeVar("InputT")
 
 
+def int64_bits(value: int) -> int:
+    """Return the int64 whose two's-complement bits equal unsigned ``value``.
+
+    Request seeds are unsigned 64-bit values, while device columns and
+    ``torch.tensor(..., dtype=torch.int64)`` hold signed int64. Seeds of
+    2**63 and above map to the negative int64 with the same bits; the
+    sampler kernels read the column back as unsigned, so every seed keeps
+    its Philox key.
+
+    Raises:
+        ValueError: ``value`` is not an unsigned 64-bit integer.
+    """
+    if not 0 <= value < 1 << 64:
+        raise ValueError(f"seed {value} is not an unsigned 64-bit integer")
+    return value - (1 << 64) if value >= 1 << 63 else value
+
+
 @dataclass(frozen=True, slots=True)
 class InputBatch(Generic[InputT]):
     """One typed numerical input and the worker's aligned output controls.
@@ -219,7 +236,10 @@ class CanvasStepRow(AttentionRow):
     ``positions``, and writes no KV. ``block`` counts the blocks the request
     has committed and ``step`` the steps already run on this canvas; step
     zero starts the canvas. ``seed`` and ``sampling`` are the request's
-    admitted seed and the sampler constants of its canvas sampling.
+    admitted seed and the sampler constants of its canvas sampling. The
+    admitted seed is an unsigned 64-bit value; ``seed`` holds the int64 with
+    the same two's-complement bits, which the device columns store and the
+    sampler reinterprets as unsigned (see ``int64_bits``).
     """
 
     canvas_length: int = 0
