@@ -394,9 +394,10 @@ class BlockTables:
         if rows or start_values or allocated:
             # Every index set of one installation shares one pinned
             # generation, so a batch does not consume several ring slots.
+            # The device reads only each index row's leading entries, so the
+            # rest of a generation keeps whatever it held.
             index_slot, index_host = self._index_host.acquire()
             value_slot, value_host = self._value_host.acquire()
-            index_host.zero_()
             fill_cpu_ints(index_host[0, : len(rows)], row_tables)
             fill_cpu_ints(index_host[1, : len(rows)], row_slots)
             fill_cpu_ints(index_host[2, : len(start_values)], start_groups)
@@ -414,9 +415,14 @@ class BlockTables:
         if rows:
             row_slot, row_host = self._row_host.acquire()
             staged = row_host[: len(rows)]
-            staged.zero_()
+            # Rows are written through a NumPy view of the pinned staging. A
+            # large torch fill would run in torch's intra-op OpenMP pool,
+            # whose barrier stalls this thread when the host is contended;
+            # NumPy fills stay on the calling thread.
+            view = staged.numpy()
+            view.fill(0)
             for index, units in enumerate(rows):
-                fill_cpu_ints(staged[index, : len(units)], units)
+                view[index, : len(units)] = units
             self._row_staging[: len(rows)].copy_(
                 staged, non_blocking=non_blocking
             )
