@@ -8,6 +8,11 @@ keeps the source size) and then to the selected tower's input size with the
 declared resampling, normalized, packed into patches in the declared layout
 for a ``PatchTransform`` tower, and staged on the target device. The input
 rows for vision encoding and image decoding live here as well.
+
+An inline payload's host work (``prepare_host_image``: decoding, resizing,
+normalization, patch packing) touches no device, so it can run on a host
+thread, and ``stage_image`` then issues the asynchronous copies to the
+device. ``prepare_image`` runs both steps in the caller's thread.
 """
 
 from __future__ import annotations
@@ -55,6 +60,24 @@ class PreparedImage:
     ``TowerTransform`` tower, ``pixels`` is [channels, height, width] and
     both grid fields are None. ``height`` and ``width`` are the canvas
     dimensions, not the tower's input size.
+    """
+
+    pixels: torch.Tensor
+    grid: torch.Tensor | None
+    grid_shape: tuple[int, int] | None
+    height: int
+    width: int
+
+
+@dataclass(frozen=True, slots=True)
+class HostImage:
+    """A request input image prepared on the host, before device staging.
+
+    ``pixels`` and ``grid`` hold exactly the values ``PreparedImage.pixels``
+    and ``PreparedImage.grid`` receive, the pixels already in the
+    processor's staging dtype, both in page-locked memory when the image is
+    prepared for a CUDA device (see ``prepare_host_image``). ``grid_shape``,
+    ``height`` and ``width`` are as on ``PreparedImage``.
     """
 
     pixels: torch.Tensor
@@ -112,47 +135,82 @@ def _image_plan(
     return transform, canvas, _stride_image_shape(*canvas, transform.resize)
 
 
+def _packed_pixels(
+    transform: PatchTransform | TowerTransform, pixels: torch.Tensor
+) -> tuple[torch.Tensor, tuple[int, int] | None]:
+    """Pack a patch tower's [C, H, W] input into patch rows.
+
+    Returns the rows and the (rows, columns) patch grid for a
+    ``PatchTransform``, and the unchanged pixels with no grid otherwise.
+    The packing is a pure layout change on the pixels' own device.
+    """
+    if not isinstance(transform, PatchTransform):
+        return pixels, None
+
+    # [C, H, W] -> one flattened row per patch, in raster order over the
+    # patch grid; the declared layout orders the values within a row.
+    patch = transform.patch_size
+    channels, height, width = pixels.shape
+    grid_shape = (height // patch, width // patch)
+    if transform.patch_layout == "channels_last":
+        return patchify(pixels, patch_size=patch), grid_shape
+
+    # [C, H, W] -> [gh, gw, C, patch, patch] -> rows.
+    rows = (
+        pixels.reshape(channels, grid_shape[0], patch, grid_shape[1], patch)
+        .permute(1, 3, 0, 2, 4)
+        .reshape(grid_shape[0] * grid_shape[1], channels * patch * patch)
+    )
+    return rows, grid_shape
+
+
+def _grid_tensor(grid_shape: tuple[int, int], *, pin: bool) -> torch.Tensor:
+    """Build the [1, 2] int64 host grid, page-locked when ``pin`` is set.
+
+    A page-locked source lets the device copy run asynchronously; building
+    the tensor directly on a CUDA device would synchronize the current
+    stream with the host.
+    """
+    grid = torch.tensor([grid_shape], dtype=torch.long)
+    return grid.pin_memory() if pin else grid
+
+
 def _prepared_pixels(processor, transform, pixels, canvas, device):
-    """Pack the numerical tower input and attach its canvas coordinates."""
-    grid = grid_shape = None
-    if isinstance(transform, PatchTransform):
-        # [C, H, W] -> one flattened row per patch, in raster order over the
-        # patch grid; the declared layout orders the values within a row.
-        patch = transform.patch_size
-        channels, height, width = pixels.shape
-        grid_shape = (height // patch, width // patch)
-        if transform.patch_layout == "channels_last":
-            pixels = patchify(pixels, patch_size=patch)
-        else:
-            # [C, H, W] -> [gh, gw, C, patch, patch] -> rows.
-            pixels = (
-                pixels.reshape(
-                    channels, grid_shape[0], patch, grid_shape[1], patch
-                )
-                .permute(1, 3, 0, 2, 4)
-                .reshape(
-                    grid_shape[0] * grid_shape[1], channels * patch * patch
-                )
-            )
-        grid = torch.tensor([grid_shape], dtype=torch.long, device=device)
+    """Pack a device-resident tower input and stage it on ``device``."""
+    pixels, grid_shape = _packed_pixels(transform, pixels)
+    grid = None
+    if grid_shape is not None:
+        grid = _grid_tensor(grid_shape, pin=device.type == "cuda").to(
+            device, non_blocking=True
+        )
     return PreparedImage(
         _stage(pixels, processor, device), grid, grid_shape, *canvas
     )
 
 
-def prepare_image(
+def prepare_host_image(
     processor: ImageProcessor,
     kind: MediaCall,
     encoded: str,
     *,
-    device: torch.device,
     input_images: int,
-) -> PreparedImage:
-    """Decode a request input image and apply the model's transforms.
+    pin: bool,
+) -> HostImage:
+    """Decode a request input image and apply the model's transforms on host.
 
     ``input_images`` is the number of input images in the image's request;
     a patch tower whose images share a pixel budget bounds each by its share
-    (see ``PatchTransform.pixel_bound``).
+    (see ``PatchTransform.pixel_bound``). With ``pin`` the pixels are copied
+    into page-locked memory, so ``stage_image`` can copy them to a CUDA
+    device without synchronizing the host with the device.
+
+    Touches no device and holds no worker state, so any host thread may run
+    it; decoding, torchvision resizing and NumPy normalization release the
+    GIL for most of their work.
+
+    Raises:
+        WorkerError: An ``invalid_descriptor`` error when the payload is not
+            a decodable image, or when the model's transforms reject it.
     """
     image = _decode_rgb(encoded, processor.alpha)
     transform, canvas, tower = _image_plan(
@@ -165,22 +223,78 @@ def prepare_image(
         pixels = _normalize(
             _resample_bytes(image, tower).numpy(), transform.normalization
         )
-        return _prepared_pixels(processor, transform, pixels, canvas, device)
-
-    if not isinstance(transform, PatchTransform):
+    else:
+        if not isinstance(transform, PatchTransform):
+            image = vision.resize(
+                image,
+                canvas,
+                interpolation=InterpolationMode.BICUBIC,
+                antialias=True,
+            )
         image = vision.resize(
             image,
-            canvas,
+            tower,
             interpolation=InterpolationMode.BICUBIC,
             antialias=True,
         )
-    image = vision.resize(
-        image, tower, interpolation=InterpolationMode.BICUBIC, antialias=True
+        pixels = _normalize(
+            np.asarray(image).transpose(2, 0, 1), transform.normalization
+        )
+
+    pixels, grid_shape = _packed_pixels(transform, pixels)
+
+    # The staging dtype conversion runs on the host, where a host-to-device
+    # copy with a dtype change performs it as well, so the rounding matches.
+    dtype = _staging_dtype(processor)
+    if dtype is not None:
+        pixels = pixels.to(dtype)
+    pixels = pixels.contiguous()
+    if pin:
+        pixels = pixels.pin_memory()
+    grid = None if grid_shape is None else _grid_tensor(grid_shape, pin=pin)
+    return HostImage(pixels, grid, grid_shape, *canvas)
+
+
+def stage_image(host: HostImage, device: torch.device) -> PreparedImage:
+    """Copy a host-prepared image to ``device`` on the current stream.
+
+    The copies are asynchronous when the host tensors are page-locked. The
+    caching host allocator keeps a page-locked block from reuse until the
+    copies reading it complete, so the caller may drop ``host`` at once.
+    """
+    grid = (
+        None if host.grid is None else host.grid.to(device, non_blocking=True)
     )
-    pixels = _normalize(
-        np.asarray(image).transpose(2, 0, 1), transform.normalization
+    return PreparedImage(
+        host.pixels.to(device, non_blocking=True),
+        grid,
+        host.grid_shape,
+        host.height,
+        host.width,
     )
-    return _prepared_pixels(processor, transform, pixels, canvas, device)
+
+
+def prepare_image(
+    processor: ImageProcessor,
+    kind: MediaCall,
+    encoded: str,
+    *,
+    device: torch.device,
+    input_images: int,
+) -> PreparedImage:
+    """Decode a request input image, apply the model's transforms and stage it.
+
+    Runs ``prepare_host_image`` and ``stage_image`` in the caller's thread;
+    see ``prepare_host_image`` for ``input_images`` and the errors raised.
+    """
+    host = prepare_host_image(
+        processor,
+        kind,
+        encoded,
+        input_images=input_images,
+        pin=device.type == "cuda",
+    )
+    return stage_image(host, device)
 
 
 def _resample_bytes(image: Image.Image, size: tuple[int, int]) -> torch.Tensor:
@@ -385,25 +499,36 @@ def _resize_tensor(
     )[0]
 
 
+def _staging_dtype(processor: ImageProcessor) -> torch.dtype | None:
+    """Return the declared staging dtype, or None to keep FP32.
+
+    Raises:
+        WorkerError: An ``invalid_descriptor`` error for a declaration that
+            is not a ``torch.dtype``.
+    """
+    dtype = processor.staging_dtype
+    if dtype is not None and not isinstance(dtype, torch.dtype):
+        raise invalid_descriptor(f"unknown image staging dtype {dtype!r}")
+    return dtype
+
+
 def _stage(
     value: torch.Tensor, processor: ImageProcessor, device: torch.device
 ) -> torch.Tensor:
     """Convert preprocessing output to the staging dtype and device."""
-    dtype = processor.staging_dtype
-    if processor.staging_dtype is not None and not isinstance(
-        dtype, torch.dtype
-    ):
-        raise invalid_descriptor(
-            f"unknown image staging dtype {processor.staging_dtype!r}"
-        )
-    return value.to(device=device, dtype=dtype, non_blocking=True)
+    return value.to(
+        device=device, dtype=_staging_dtype(processor), non_blocking=True
+    )
 
 
 __all__ = [
+    "HostImage",
     "PreparedImage",
     "patch_grid_shape",
+    "prepare_host_image",
     "prepare_image",
     "prepare_tensor_image",
+    "stage_image",
 ]
 
 

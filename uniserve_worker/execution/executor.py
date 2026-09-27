@@ -47,6 +47,7 @@ from uniserve_worker.errors import (
     resource_error,
 )
 from uniserve_worker.execution.batch import BatchState
+from uniserve_worker.execution.image import reserve_images
 from uniserve_worker.execution.media import begin_noise
 from uniserve_worker.execution.output import PendingOutput
 from uniserve_worker.execution.prepare import (
@@ -655,6 +656,14 @@ class Executor:
             latent_pool=self.worker.latent_pool,
             request_tables=self.worker.block_tables,
             request_pool=self.worker.requests,
+        )
+        # Inline input images are prepared on the host lane while this thread
+        # launches other batches; `inputs_ready` waits for them.
+        reserve_images(
+            state,
+            host_tasks=self.worker.host_tasks,
+            request_pool=self.worker.requests,
+            model_runner=self.worker.runner,
         )
         self.advance_inputs(state)
 

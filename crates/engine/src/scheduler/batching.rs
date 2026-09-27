@@ -235,6 +235,10 @@ impl Scheduler {
                         .is_some_and(|batch| batch.requests.len() >= *limit)
             })
         };
+        // Host-lane occupancy, built when the pass meets its first encoder
+        // call carrying inline image bytes and charged with each one it
+        // selects.
+        let mut image_lanes: Option<super::execution::LaneLedger> = None;
         let mut selected = 0usize;
         for id in ids.iter().copied() {
             if selected >= self.config.max_batch {
@@ -312,6 +316,33 @@ impl Scheduler {
                     }
                     continue;
                 }
+                // An encoder call carrying inline image bytes holds a host
+                // task on each rank of its component while the worker
+                // prepares the image, so it waits here, as a media call
+                // does, until those host lanes have room.
+                let image_lane =
+                    match call.code {
+                        CallKind::Media(media_call) if call.input_image.is_some() => {
+                            let Some(request_key) = self.running.get(&id).map(|state| {
+                                RequestKey::new(self.engine_id, id, state.request_epoch)
+                            }) else {
+                                continue;
+                            };
+                            let demand = self.image_lane_demand(request_key, media_call);
+                            let ledger = image_lanes.get_or_insert_with(|| self.lane_occupancy());
+                            if !ledger.admits(&demand, id, self) {
+                                self.record_domain_backpressure(call.code);
+                                if let Some(state) = self.running.get_mut(&id) {
+                                    state.num_kv_units_sent = state
+                                        .num_kv_units_sent
+                                        .saturating_sub(u64::from(call.bounds.max_kv_units));
+                                }
+                                continue;
+                            }
+                            Some(demand)
+                        }
+                        _ => None,
+                    };
                 let planned_us = uniserve_core::now_monotonic_us();
 
                 // Only a call that obtains its storage is charged to the
@@ -428,6 +459,9 @@ impl Scheduler {
                 if prepared.is_none() {
                     // Most preparation failures latch engine-fatal first.
                     return Vec::new();
+                }
+                if let (Some(demand), Some(ledger)) = (&image_lane, image_lanes.as_mut()) {
+                    ledger.occupy(demand, id);
                 }
                 selected += 1;
             }
