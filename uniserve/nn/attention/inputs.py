@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from itertools import accumulate
+from itertools import accumulate, chain
 from types import MappingProxyType
 
+import numpy as np
 import torch
 
 
@@ -272,53 +273,70 @@ class PagedInput:
         flags = (causal,) * len(blocks) if type(causal) is bool else causal
         _causal(flags, len(blocks))
 
-        width = max(map(len, blocks), default=0)
-        rows = []
-        addresses: list[int] = []
+        if any(not isinstance(row, tuple) for row in blocks) or not set(
+            map(type, chain.from_iterable(blocks))
+        ) <= {int}:
+            raise ValueError(
+                "physical block IDs must be nonnegative int32 integers"
+            )
         for row, query, prefix, start in zip(
             blocks, query_lengths, prefix_lengths, starts, strict=True
         ):
-            if not isinstance(row, tuple) or any(
-                type(block) is not int
-                or block < 0
-                or block > torch.iinfo(torch.int32).max
-                for block in row
-            ):
-                raise ValueError(
-                    "physical block IDs must be nonnegative int32 integers"
-                )
             if (start + len(row)) * block_size < prefix + query or (
                 query and prefix < start * block_size
             ):
                 raise ValueError(
                     "block table does not cover the prefix and query"
                 )
-            # Short rows are zero-padded to the shared table width; padded
-            # entries are never read because lengths bound the valid span.
-            rows.append((*row, *((0,) * (width - len(row)))))
-            # One physical token address per appended query position, in the
-            # row's columns counted from its start page.
-            addresses.extend(
-                row[position // block_size - start] * block_size
-                + position % block_size
-                for position in range(prefix, prefix + query)
+
+        # Short rows are zero-padded to the shared table width; padded
+        # entries are never read because lengths bound the valid span.
+        count = len(blocks)
+        width = max(map(len, blocks), default=0)
+        table = np.zeros((count, width), dtype=np.int64)
+        try:
+            for index, row in enumerate(blocks):
+                table[index, : len(row)] = row
+        except OverflowError:
+            raise ValueError(
+                "physical block IDs must be nonnegative int32 integers"
+            ) from None
+        if table.size and (
+            table.min() < 0 or table.max() > np.iinfo(np.int32).max
+        ):
+            raise ValueError(
+                "physical block IDs must be nonnegative int32 integers"
             )
 
-        table = torch.tensor(rows, dtype=torch.int32, device=device).reshape(
-            len(blocks), width
+        # One physical token address per appended query position, in the
+        # row's columns counted from its start page, gathered for every
+        # position at once: token t of row r is position prefix[r] + t
+        # - first[r], where first[r] is the row's first token.
+        lengths = np.asarray(query_lengths, dtype=np.int64)
+        owners = np.repeat(np.arange(count), lengths)
+        first = np.cumsum(lengths) - lengths
+        positions = (
+            np.asarray(prefix_lengths, dtype=np.int64)[owners]
+            + np.arange(owners.size)
+            - first[owners]
         )
+        columns = (
+            positions // block_size - np.asarray(starts, dtype=np.int64)[owners]
+        )
+        addresses = table[owners, columns] * block_size + positions % block_size
+
         return cls(
             queries,
             prefixes,
             BlockTable(
-                table,
+                torch.from_numpy(table.astype(np.int32)).to(device),
                 block_size,
                 None
                 if start_pages is None
                 else torch.tensor(starts, dtype=torch.int32, device=device),
                 None if start_pages is None else starts,
             ),
-            torch.tensor(addresses, dtype=torch.int64, device=device),
+            torch.from_numpy(addresses).to(device),
             flags,
         )
 

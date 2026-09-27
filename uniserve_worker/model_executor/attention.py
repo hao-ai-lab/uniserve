@@ -23,6 +23,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from uniserve.math import ceil_div
@@ -285,9 +286,12 @@ def _host_table(pages: TablePages) -> BlockTable:
     The table is ``[rows, width]`` int32; short rows are zero-padded and
     their prefix lengths bound the valid span.
     """
-    table = torch.zeros((len(pages.rows), pages.width), dtype=torch.int32)
+    # Rows fill a NumPy array, one slice assignment per row, rather than one
+    # tensor construction per row.
+    host = np.zeros((len(pages.rows), pages.width), dtype=np.int32)
     for index, row in enumerate(pages.rows):
-        table[index, : len(row)] = torch.tensor(row, dtype=torch.int32)
+        host[index, : len(row)] = row
+    table = torch.from_numpy(host)
     if not pages.windowed:
         return BlockTable(table, pages.block_size)
     return BlockTable(
