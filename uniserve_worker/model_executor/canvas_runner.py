@@ -36,8 +36,10 @@ log-softmax over the vocabulary evaluate the slot rows alone
 the slot rows of the attend state are gathered into the tail's fixed rows,
 a call with more slots than the largest bucket replays it in chunks, and
 one gather after each replay reads the call's candidates, whose number
-varies from call to call. Every sequence of a canvas graph, padding
-included, is at most one canvas long, which bounds its attention launch.
+varies from call to call. A tail that exchanges tokens with other ranks,
+an expert-parallel final layer, runs eagerly instead, once over every slot
+(``tail_exchanges``). Every sequence of a canvas graph, padding included,
+is at most one canvas long, which bounds its attention launch.
 Padding sequences read no prefix, and a padding step row starts a canvas in
 the sentinel slot zero.
 """
@@ -57,6 +59,7 @@ from uniserve.nn.attention import (
     SegmentedInput,
     SequenceLengths,
 )
+from uniserve.nn.moe import FusedMoE
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve_worker.storage.canvas_slots import STEP_CONTINUED, STEP_SKIPPED
 
@@ -98,6 +101,13 @@ class CanvasRunner(ModelRunner):
         # Rows of one page of every cache group the KV unit pool holds, set
         # by ``ModelExecutor.bind``; None leaves canvases unbounded by it.
         self.pool_rows: int | None = None
+        # Whether the readout tail computes on this rank alone. A tail that
+        # exchanges tokens (``tail_exchanges``) runs eagerly after the attend
+        # graph, once over every slot of the call, so each rank joins its
+        # expert exchange once per step at the step's agreed capacity; a
+        # rank-local tail replays graphs per slot bucket. Experts are
+        # partitioned at loading, before the runner is built.
+        self.local_tail = not tail_exchanges(self.model)
 
     @property
     def canvas_length(self) -> int:
@@ -300,6 +310,27 @@ class CanvasRunner(ModelRunner):
         candidates, then the cuBLASLt version and the configuration).
         """
         records = super().kernels()
+
+        # With graphs, the last pipeline stage's readout tails replay graphs
+        # per slot bucket, or run eagerly when the tail exchanges tokens
+        # with other ranks (``local_tail``).
+        if self.pools and self.pipeline.rank == self.pipeline.size - 1:
+            records.append(
+                {
+                    "path": "readout_tail",
+                    "op": "graph",
+                    "provider": "cuda_graph",
+                    "slot_buckets": list(SLOT_BUCKETS),
+                }
+                if self.local_tail
+                else {
+                    "path": "readout_tail",
+                    "op": "graph",
+                    "provider": "eager",
+                    "reason": "expert exchange in the final layer",
+                }
+            )
+
         slots = self.canvas_slots
         if slots is None or slots.workspace is None:
             return records
@@ -414,8 +445,13 @@ class CanvasRunner(ModelRunner):
         )
         # The tails read attend states of every readout bucket alike, so the
         # first readout bucket captured supplies their state layout.
-        if self.pipeline.rank == self.pipeline.size - 1 and any(
-            ("canvas_tail", slots) not in self.buckets for slots in SLOT_BUCKETS
+        if (
+            self.pipeline.rank == self.pipeline.size - 1
+            and self.local_tail
+            and any(
+                ("canvas_tail", slots) not in self.buckets
+                for slots in SLOT_BUCKETS
+            )
         ):
             try:
                 self._capture_tails(replay_hidden(graph, execution))
@@ -476,7 +512,9 @@ class CanvasRunner(ModelRunner):
             return super().replay_graph(key, execution, batch, borrow=borrow)
         state = replay_hidden(self.buckets[key].graphs[None], execution)
         with self.context.activate():
-            return self._replay_tails(state, batch.inputs)
+            if self.local_tail:
+                return self._replay_tails(state, batch.inputs)
+            return self.readout(state, batch.inputs)
 
     def _replay_tails(self, state, inputs: ReadoutInput) -> ExecutionOutput:
         """Read the slots of ``inputs`` through the readout tail graphs.
@@ -515,6 +553,25 @@ class CanvasRunner(ModelRunner):
             )
         values = parts[0] if len(parts) == 1 else torch.cat(parts)
         return self._broadcast_readout(values, state, inputs)
+
+
+def tail_exchanges(model) -> bool:
+    """Whether a token denoiser's readout tail exchanges tokens across ranks.
+
+    The tail completes the final layer, the output norm and the head for a
+    readout's slot rows (``TokenDenoiser.finish``). An expert-parallel
+    ``FusedMoE`` in the final layer exchanges tokens with its expert group,
+    whose ranks read different calls and must join each exchange once per
+    expert step at the step's agreed capacity; a captured tail would carry
+    its capture capacity, and chunked replays would add exchanges the other
+    ranks never join. Tensor-parallel collectives in the tail are joined
+    alike by ranks that read the same slots, so they keep the tail local.
+    """
+    final = next(reversed(model.backbone.layers.values()))
+    return any(
+        isinstance(module, FusedMoE) and module.expert_group.size > 1
+        for module in final.modules()
+    )
 
 
 def _pad_attention(
