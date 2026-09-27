@@ -25,7 +25,8 @@ class MoEBinding:
     the tokens it receives, ``P * C`` rows for a group of ``P`` ranks and the
     open step's capacity ``C``, and combines the partial sums back. Its
     local operator is prepared once for ``P`` times the exchange's largest
-    capacity.
+    capacity. Hidden states of NVFP4 experts travel in the experts' input
+    encoding, dense hidden states otherwise.
     """
 
     def __init__(self, module, backend, size, device, allocate, exchange=None):
@@ -93,8 +94,9 @@ class MoEBinding:
         The record names the prepared provider, the expert count, and each
         projection's weight representation and resident row order (the
         physical order the provider placed; ``linear`` is logical order).
-        An expert-parallel call site also names its expert group size and
-        its all-to-all exchange. Empty until the call site is prepared.
+        An expert-parallel call site also names its expert group size, its
+        all-to-all exchange and the representation its hidden states travel
+        in. Empty until the call site is prepared.
         """
         if self.operator is None:
             return []
@@ -116,6 +118,10 @@ class MoEBinding:
             else {
                 "expert_parallel": self.module.expert_group.size,
                 "exchange": "flashinfer_mnnvl_alltoall",
+                # The representation hidden states travel in.
+                "payload": "nvfp4"
+                if isinstance(self.operator, moe_backend.NVFP4Operator)
+                else "dense",
             }
         )
         return [
@@ -136,6 +142,14 @@ class MoEBinding:
             return operator(hidden, topk_ids, topk_weights, combine=combine)
 
         operator = self.prepare(TextSize(hidden.shape[0], 1))
+        if isinstance(operator, moe_backend.NVFP4Operator):
+            # NVFP4 experts read their input encoding, so the hidden states
+            # travel in it: rows already stored in it as they are, BF16
+            # rows (a join's empty rows included) encoded here to the bytes
+            # the operator would encode after the exchange. The
+            # representation is thus a property of the layer, the same on
+            # every rank of the step, including ranks that only join it.
+            hidden = operator.encode(hidden)
         received = exchange.dispatch(
             id(self.module),
             hidden,
