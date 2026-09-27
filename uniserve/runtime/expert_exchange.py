@@ -9,6 +9,8 @@ received; the partial outputs travel back and sum on the token's rank. This
 is the dispatch/combine of FlashInfer's MNNVL ``MoeAlltoAll``, the transport
 SGLang (``layers/moe/token_dispatcher/flashinfer.py:235-555``) and vLLM
 (``prepare_finalize/flashinfer_nvlink_one_sided.py:75-168``) use on GB200.
+Hidden states of NVFP4 experts travel in the experts' calibrated input
+encoding rather than BF16, as SGLang's NVFP4 dispatch sends them.
 
 ``ExpertExchange`` owns one ``MoeAlltoAll`` workspace for one worker and
 expert group, shared by every expert layer and execution context of the
@@ -38,6 +40,7 @@ import torch
 import torch.distributed as dist
 
 from uniserve.distributed import Communicator
+from uniserve.quantization import QuantizedTensor, ScaleLayout
 
 __all__ = ["ExpertExchange"]
 
@@ -204,20 +207,72 @@ class ExpertExchange:
         here. Ids of experts this rank does not hold, and of unused rows,
         read ``invalid_expert``, which the local expert kernel skips. The
         views are workspace-backed and valid until ``combine``.
+
+        ``hidden`` is a dense ``[T, H]`` tensor or, as the NVFP4 expert
+        kernels read it, a calibrated NVFP4 ``QuantizedTensor`` with linear
+        block scales. An encoded row travels as its packed E2M1 values
+        (``H / 2`` bytes) and E4M3 block scales (``H / 16`` bytes), 9/32 of
+        its BF16 bytes, and arrives as a ``QuantizedTensor`` of the same
+        quantizer and layout; its tensor scale is the static calibration
+        every rank shares, so it stays local. Every rank of a step must send
+        a layer's rows in one representation, since the all-to-all pairs
+        the ranks' payload lists.
+
+        Raises:
+            ValueError: ``hidden`` exceeds the step capacity or is encoded
+                otherwise.
         """
         if not self.capacity:
             raise RuntimeError("an expert exchange runs inside an open step")
         if hidden.shape[0] > self.capacity:
             raise ValueError("a rank's tokens exceed the step capacity")
+        encoded = isinstance(hidden, QuantizedTensor)
+        if encoded:
+            quantizer = hidden.quantizer
+            if (
+                quantizer.format != "nvfp4"
+                or quantizer.calibrated_scale is None
+                or hidden.scale_layout is not ScaleLayout.LINEAR
+            ):
+                raise ValueError(
+                    "encoded hidden states are exchanged as calibrated NVFP4 "
+                    "with linear block scales"
+                )
+            fields = hidden.buffers()
+            states = [fields["values"], fields["block_scale"]]
+        else:
+            states = [hidden]
+
         self.invoked.add(module)
-        received = self._alltoall.dispatch(
-            topk_ids,
-            [hidden, topk_ids, topk_weights],
-            self.capacity,
-            invalid_token_expert_id=invalid_expert,
-            expert_id_payload_index=1,
+        # The states, then the ids the all-to-all routes by, then the
+        # weights, as SGLang's NVFP4 dispatch orders them
+        # (layers/moe/token_dispatcher/flashinfer.py:369-407).
+        received = [
+            value.flatten(0, 1)
+            for value in self._alltoall.dispatch(
+                topk_ids,
+                [*states, topk_ids, topk_weights],
+                self.capacity,
+                invalid_token_expert_id=invalid_expert,
+                expert_id_payload_index=len(states),
+            )
+        ]
+        ids, weights = received[-2:]
+        if not encoded:
+            return received[0], ids, weights
+        return (
+            quantizer.from_tensors(
+                {
+                    "values": received[0],
+                    "block_scale": received[1],
+                    "tensor_scale": fields["tensor_scale"],
+                },
+                shape=(ids.shape[0], hidden.shape[1]),
+                dtype=hidden.dtype,
+            ),
+            ids,
+            weights,
         )
-        return tuple(value.flatten(0, 1) for value in received)
 
     def combine(self, partial: torch.Tensor, tokens: int) -> torch.Tensor:
         """Return the summed expert outputs of this rank's ``tokens`` tokens.

@@ -135,12 +135,55 @@ class NVFP4Operator(Operator):
         from flashinfer import fp4_quantize
 
         self._quantize = fp4_quantize
-        # The encoder's global scale is 1 / s for the static scale s.
+        device = self.module.up_gate.weight.device
+        scale = self.module.up_gate.input_quantizer.calibrated_scale
+        # The static scale s as the encoding's FP32 tensor scale, and the
+        # encoder's global scale 1 / s.
+        self._tensor_scale: torch_lib.Tensor | None = torch_lib.tensor(
+            scale, dtype=torch_lib.float32, device=device
+        )
         self._input_scale: torch_lib.Tensor | None = torch_lib.tensor(
-            [self.module.up_gate.input_quantizer.calibrated_scale],
-            dtype=torch_lib.float32,
-            device=self.module.up_gate.weight.device,
+            [scale], dtype=torch_lib.float32, device=device
         ).reciprocal()
+
+    def _encode_rows(self, hidden):
+        """Encode BF16 ``hidden [T, H]`` to uint8 values and block scales."""
+        tokens, width = hidden.shape
+        if not tokens:
+            # Zero rows (a rank joining an expert exchange) launch nothing;
+            # the empty fields keep their shapes and dtypes.
+            return (
+                hidden.new_empty((0, width // 2), dtype=torch_lib.uint8),
+                hidden.new_empty((0, width // 16), dtype=torch_lib.uint8),
+            )
+        values, scales = self._quantize(
+            hidden.contiguous(),
+            global_scale=self._input_scale,
+            is_sf_swizzled_layout=False,
+        )
+        return values, scales.view(torch_lib.uint8).reshape(tokens, width // 16)
+
+    def encode(self, hidden) -> QuantizedTensor:
+        """Return ``hidden [T, H]`` in the experts' input encoding.
+
+        Hidden states already in that encoding return as they are; BF16
+        states encode to the values and linear block scales this operator
+        would read for them, so a call on ``encode(hidden)`` returns the
+        output of ``hidden`` bit for bit. An expert exchange sends this
+        encoding in place of BF16 rows.
+        """
+        if isinstance(hidden, QuantizedTensor):
+            return hidden
+        values, scales = self._encode_rows(hidden)
+        return self.module.up_gate.input_quantizer.from_tensors(
+            {
+                "values": values,
+                "block_scale": scales,
+                "tensor_scale": self._tensor_scale,
+            },
+            shape=tuple(hidden.shape),
+            dtype=hidden.dtype,
+        )
 
     def _encoded(self, hidden):
         """Return the E2M1 values and E4M3 block scales of ``hidden``."""
@@ -149,18 +192,14 @@ class NVFP4Operator(Operator):
             fields = hidden.buffers()
             values, scales = fields["values"], fields["block_scale"]
         else:
-            values, scales = self._quantize(
-                hidden.contiguous(),
-                global_scale=self._input_scale,
-                is_sf_swizzled_layout=False,
-            )
+            values, scales = self._encode_rows(hidden)
         return values, scales.view(torch_lib.float8_e4m3fn).reshape(
             tokens, width // 16
         )
 
     def close(self) -> None:
         super().close()
-        self._input_scale = None
+        self._input_scale = self._tensor_scale = None
 
 
 class Backend:
