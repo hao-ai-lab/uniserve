@@ -28,6 +28,22 @@ enum TokenOutcome {
     Finish(FinishReason),
 }
 
+/// Builds the terminal `Finished` event of a token request with its final
+/// usage.
+fn terminal_event(
+    state: &RequestState,
+    reason: FinishReason,
+    stop_reason: Option<uniserve_core::StopReason>,
+) -> EngineCoreOutput {
+    EngineCoreOutput::Finished {
+        reason,
+        stop_reason,
+        prompt_tokens: state.req.prompt_token_ids.len(),
+        completion_tokens: state.num_generated_tokens,
+        images: state.num_generated_images,
+    }
+}
+
 /// Flushes journaled public events into the output channel in order.
 ///
 /// Returns `true` only when the receiver has closed, in which case the journal
@@ -1072,6 +1088,15 @@ impl Scheduler {
     /// Returns `false` for a request that is not running. A closed receiver
     /// also returns `false` and marks the request for cancellation.
     pub(super) fn emit(&mut self, id: RequestId, event: EngineCoreOutput) -> bool {
+        // A request whose terminal event is published publishes nothing more.
+        if self
+            .inflight
+            .pending_finishes
+            .get(&id)
+            .is_some_and(|finish| finish.terminal_published)
+        {
+            return false;
+        }
         let Some(state) = self.running.get_mut(&id) else {
             return false;
         };
@@ -1300,6 +1325,16 @@ impl Scheduler {
     /// not wait for stop-string decoder decisions. Otherwise records a
     /// `PendingFinish` that `finish_pending_if_idle` applies later. The first
     /// recorded reason is kept, except that an error replaces it.
+    ///
+    /// A non-error finish that waits only for calls in flight publishes its
+    /// terminal event at once. Those calls were queued speculatively behind
+    /// the call whose output finished the request, such as the no-op step
+    /// behind the step that stopped a block, and a request with a pending
+    /// finish resolves none of their results, so its output is already
+    /// final. Only retirement, which releases the request's resources and
+    /// sends the worker's `Finish`, waits for them to drain. A finish that
+    /// waits for a stop-string decision is published at retirement, since
+    /// that decision may still end the request earlier.
     pub(super) fn finish_after_inflight(
         &mut self,
         id: RequestId,
@@ -1315,17 +1350,28 @@ impl Scheduler {
             self.finish_with(id, reason, stop_reason);
             return;
         }
-        if !self.inflight.pending_finishes.contains_key(&id)
-            || matches!(reason, FinishReason::Error)
-        {
-            self.inflight.pending_finishes.insert(
-                id,
-                PendingFinish {
-                    reason,
-                    stop_reason,
-                },
-            );
+        let recorded = self.inflight.pending_finishes.get(&id);
+        if recorded.is_some() && !matches!(reason, FinishReason::Error) {
+            return;
         }
+        let mut terminal_published = recorded.is_some_and(|finish| finish.terminal_published);
+        if !terminal_published && !decoder_pending && !matches!(reason, FinishReason::Error) {
+            // A closed receiver drops the event; nothing is published later
+            // either way.
+            if let Some(state) = self.running.get_mut(&id) {
+                let terminal = terminal_event(state, reason.clone(), stop_reason.clone());
+                state.output.events.enqueue(terminal);
+                terminal_published = true;
+            }
+        }
+        self.inflight.pending_finishes.insert(
+            id,
+            PendingFinish {
+                reason,
+                stop_reason,
+                terminal_published,
+            },
+        );
     }
 
     /// Fails a running token request whose worker result was rejected.
@@ -1356,7 +1402,9 @@ impl Scheduler {
         {
             return;
         }
-        if let Some(pending) = self.inflight.pending_finishes.remove(&id) {
+        // `finish_with` consumes the pending finish, including whether its
+        // terminal event is already published.
+        if let Some(pending) = self.inflight.pending_finishes.get(&id).cloned() {
             self.finish_with(id, pending.reason, pending.stop_reason);
         }
     }
@@ -1374,7 +1422,11 @@ impl Scheduler {
         reason: FinishReason,
         stop_reason: Option<uniserve_core::StopReason>,
     ) {
-        self.inflight.pending_finishes.remove(&id);
+        let terminal_published = self
+            .inflight
+            .pending_finishes
+            .remove(&id)
+            .is_some_and(|finish| finish.terminal_published);
 
         // Report accepted request progress before error teardown removes it.
         if reason == FinishReason::Error
@@ -1470,15 +1522,14 @@ impl Scheduler {
             // A full event channel transfers ownership to the retired-output
             // queue, which drains the terminal event under normal backpressure
             // or hands it to the receiver when the control loop stops. A
-            // closed receiver drops the terminal event with the journal.
-            let terminal = EngineCoreOutput::Finished {
-                reason,
-                stop_reason,
-                prompt_tokens: st.req.prompt_token_ids.len(),
-                completion_tokens: st.num_generated_tokens,
-                images: st.num_generated_images,
-            };
-            let accepted = st.output.events.enqueue(terminal);
+            // closed receiver drops the terminal event with the journal. A
+            // terminal event published by `finish_after_inflight` may still
+            // be journaled, and it is the only one the request publishes.
+            let accepted = terminal_published
+                || st
+                    .output
+                    .events
+                    .enqueue(terminal_event(&st, reason, stop_reason));
             if accepted {
                 self.output.retire(id, st.output.events);
             }

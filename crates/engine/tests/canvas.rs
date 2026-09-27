@@ -130,9 +130,15 @@ impl Running {
 }
 
 /// Collects one request's events through its terminal event.
-fn events(mut receiver: EventRx) -> Vec<EngineCoreOutput> {
+fn events(receiver: EventRx) -> Vec<EngineCoreOutput> {
+    events_within(receiver, Duration::from_secs(20))
+}
+
+/// Collects one request's events through its terminal event, which must
+/// arrive within `timeout`.
+fn events_within(mut receiver: EventRx, timeout: Duration) -> Vec<EngineCoreOutput> {
     let mut events = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         match receiver.try_recv() {
             Ok(event) => {
@@ -289,7 +295,7 @@ fn blocks_are_denoised_published_and_committed_until_eos() {
 /// With room for two batches in flight, each step of a block is queued
 /// before the step it follows resolves, predicated on that step's
 /// completion. The step behind the one that stops the block is a no-op, and
-/// the commit follows once it resolves; the published text is unchanged.
+/// the commit is queued behind it; the published text is unchanged.
 #[test]
 fn a_blocks_steps_are_queued_behind_the_step_in_flight() {
     let mut sim = worker(40);
@@ -406,6 +412,115 @@ fn a_blocks_first_step_is_queued_behind_the_prefill_before_it() {
         first_steps += 1;
     }
     assert_eq!(first_steps, 3);
+}
+
+/// With room for two batches in flight, a stopped block's commit is queued
+/// as soon as the step that stopped the block resolves: behind the no-op
+/// step still in flight, which the commit does not wait for, so it carries
+/// no predicate. The next block starts from step zero behind the commit, and
+/// the published text is unchanged.
+#[test]
+fn a_blocks_commit_is_queued_behind_its_no_op_step() {
+    let mut sim = worker(40);
+    sim.set_queue_depth(2);
+    sim.set_results_on_wait(true);
+    let running = Running::start(sim, SchedulerConfig::default());
+    let answer = events(running.submit(canvas_request(7, 24, 1_000)));
+    let history = running.stop_events();
+
+    assert_eq!(
+        published_blocks(&answer),
+        vec![text(7, 0..16), text(7, 16..32), text(7, 32..40)]
+    );
+    assert_eq!(finish_of(&answer), (FinishReason::Eos, 41));
+
+    // Each call with its batch, in submission order, and the index of each
+    // batch's submission and resolution.
+    let mut calls = Vec::new();
+    let mut submitted = std::collections::HashMap::new();
+    let mut resolved = std::collections::HashMap::new();
+    for (index, event) in history.iter().enumerate() {
+        match event {
+            BatchEvent::Submitted(batch) => {
+                submitted.insert(batch.id, index);
+                calls.extend(
+                    batch
+                        .requests
+                        .iter()
+                        .map(|(call, _)| (batch.id, call.clone())),
+                );
+            }
+            BatchEvent::Resolved { batch_id } => {
+                resolved.insert(*batch_id, index);
+            }
+        }
+    }
+    let step_batch = |block: u32, step: u32| {
+        calls
+            .iter()
+            .find(|(_, call)| {
+                call.canvas
+                    .is_some_and(|at| (at.block, at.step) == (block, step))
+            })
+            .map(|(batch, _)| *batch)
+            .unwrap_or_else(|| panic!("block {block} ran no step {step}"))
+    };
+    let commits: Vec<_> = calls
+        .iter()
+        .filter(|(_, call)| {
+            call.code == CallKind::Forward(ForwardMode::Prefill)
+                && call.coordinates.kv_visible_len >= 24
+        })
+        .collect();
+    assert_eq!(commits.len(), 2);
+    for (block, (commit_batch, commit)) in (0u32..).zip(commits) {
+        let stop = sim_canvas_stop_step(RequestId(7), block, MAX_STEPS);
+        assert!(stop + 1 < MAX_STEPS, "block {block} queues a no-op step");
+        let no_op_batch = step_batch(block, stop + 1);
+        assert!(
+            submitted[commit_batch] < resolved[&no_op_batch],
+            "the commit of block {block} waited for the no-op step behind step {stop}"
+        );
+        assert!(
+            commit.predicate.is_none(),
+            "the commit of block {block} runs whatever the no-op step reports"
+        );
+        assert!(
+            submitted[&step_batch(block + 1, 0)] > submitted[commit_batch],
+            "block {} starts behind the commit of block {block}",
+            block + 1
+        );
+    }
+}
+
+/// A request whose last block stops before its step limit publishes its
+/// terminal event once that step resolves, while the no-op step queued
+/// behind it is still running; only the request's retirement waits for it.
+#[test]
+fn the_terminal_event_does_not_wait_for_the_no_op_step() {
+    let mut sim = worker(1_000);
+    sim.set_queue_depth(2);
+    sim.set_results_on_wait(true);
+    let release = sim.hold_predicated_batches();
+    let running = Running::start(sim, SchedulerConfig::default());
+    // One block: the completion limit ends the request at the block's end.
+    let receiver = running.submit(canvas_request(8, 24, CANVAS as usize));
+    let answer = events_within(receiver, Duration::from_secs(5));
+    drop(release);
+    let batches = running.stop();
+
+    assert_eq!(published_blocks(&answer), vec![text(8, 0..16)]);
+    assert_eq!(finish_of(&answer), (FinishReason::MaxTokens, 16));
+    let stop = sim_canvas_stop_step(RequestId(8), 0, MAX_STEPS);
+    let steps: Vec<_> = calls_of(&batches, 8)
+        .iter()
+        .filter_map(|(call, _)| call.canvas.map(|step| step.step))
+        .collect();
+    assert_eq!(
+        steps,
+        (0..=stop + 1).collect::<Vec<_>>(),
+        "a no-op step was queued behind the step that stopped the block"
+    );
 }
 
 /// The completion limit truncates the block that reaches it, and no block
