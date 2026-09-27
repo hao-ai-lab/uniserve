@@ -253,6 +253,17 @@ def test_server_sampling_resolves_to_a_request_without_controls(
     assert "server_sampling" not in sampling
 
 
+def test_server_sampling_keeps_a_request_seed(tmp_path: Path) -> None:
+    config = load_config(
+        _text_profile(tmp_path, "server_sampling = true\nsampling_seed = 42")
+    )
+
+    sampling = config.benchmarks["point"].workload_dict()["sampling"]
+
+    assert sampling["sampling_seed"] == 42
+    assert sampling["temperature"] is None
+
+
 def test_server_sampling_rejects_a_token_control(tmp_path: Path) -> None:
     profile = _text_profile(
         tmp_path, "server_sampling = true\ntemperature = 0.0"

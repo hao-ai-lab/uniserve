@@ -72,7 +72,9 @@ _IMAGE_FIELDS = set(ImageConfig.__dataclass_fields__)
 _VIDEO_FIELDS = set(VideoConfig.__dataclass_fields__)
 
 # Request-level sampling controls a point with server-owned sampling may not
-# set: every token-sampling parameter, the request seed, and ignore_eos.
+# set: every token-sampling parameter and ignore_eos. A request seed only
+# selects the random stream the server's schedule draws from, so it stays
+# available to servers that accept one.
 _TOKEN_SAMPLING_CONTROLS = {
     "temperature",
     "top_p",
@@ -81,7 +83,6 @@ _TOKEN_SAMPLING_CONTROLS = {
     "repetition_penalty",
     "frequency_penalty",
     "presence_penalty",
-    "sampling_seed",
     "ignore_eos",
 }
 
@@ -480,8 +481,10 @@ def _sampling_config(
     refuses token-sampling controls. TOML has no null, so this key stands
     for setting `temperature`, `top_p`, and `ignore_eos` to `None`; the
     requests then carry no token-sampling control at all, and the table may
-    not name any of them. The key itself is not a `SamplingConfig` field:
-    the resolved workload shows the omitted controls as nulls.
+    not name any of them. `sampling_seed` stays allowed: a seed selects the
+    random stream of the server's own schedule. The key itself is not a
+    `SamplingConfig` field: the resolved workload shows the omitted controls
+    as nulls.
     """
     value = dict(_mapping(raw, context)) if raw is not None else {}
     server_sampling = value.pop("server_sampling", False)
