@@ -84,6 +84,7 @@ class Model(nn.Module):
             downsample=config.vision.pooling_kernel_size,
             output_size=text.hidden_size,
             output_dtype=torch.bfloat16,
+            max_patches=config.vision.max_patches,
         )
 
 
