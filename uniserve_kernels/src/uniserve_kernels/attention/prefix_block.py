@@ -4,8 +4,10 @@ A batch holds ``B`` sequences. Sequence ``b`` contributes the query block
 ``query[query_offsets[b]:query_offsets[b + 1]]`` of ``L_b`` rows, its own
 current keys and values at the same rows of ``key``/``value``, and a
 read-only prefix of ``P_b = prefix_lengths[b]`` tokens stored in paged
-caches. Query row ``i`` of the block attends without causal ordering to all
-``L_b`` current keys and to prefix tokens ``[lower_b(i), P_b)``, where
+caches. Query row ``i`` of the block attends to prefix tokens
+``[lower_b(i), P_b)`` and to current keys: without causal ordering to all
+``L_b`` of them, with it (``causal``: a chunk continuing its history, whose
+row ``i`` is absolute position ``P_b + i``) to current keys ``[0, i]``.
 ``lower_b(i)`` is the largest of:
 
 * ``prefix_start[b]`` when that column is given, otherwise 0;
@@ -35,9 +37,20 @@ otherwise, matching the ``base2`` flag of
 Supported configuration: CUDA compute capability 10.x, BF16 Q/K/V, caches
 and output, head dimension 256 or 512, query heads a multiple of KV heads
 with the query heads per KV head dividing 128 (head dimension 256) or 64
-(head dimension 512), and 16, 32 or 64 tokens per page.
+(head dimension 512), and 16, 32 or 64 tokens per page. Causal ordering
+requires head dimension 512 and no history window.
 :func:`unsupported_configuration` checks these dimensions before any tensor
 exists; :func:`can_run` checks a call without launching it.
+
+Non-causal blocks run the kernel of :mod:`._prefix_block_kernel`, whose
+persistent clusters stride statically over the work tiles. Causal chunks
+run the kernel of :mod:`._causal_block_kernel`, whose clusters take a
+static first wave and then claim tickets from a counter in ``workspace``
+(see :func:`new_workspace`), sized for the batch's sequences. The counter
+must be zero when a causal launch starts, and the launch leaves it
+nonzero: the launch that precedes it on the stream resets it, such as
+:func:`uniserve_kernels.attention.paged.prepare` with its ``semaphore``.
+Launches that may run concurrently need distinct workspaces.
 
 Each distinct specialization (the executor cache key) compiles once per
 process on first use; :func:`prefix_block_attention` refuses to compile
@@ -57,11 +70,13 @@ _cute: Any | None
 _from_dlpack: Any | None
 _cuda_driver: Any | None
 _kernel_type: Any | None
+_causal_kernel_type: Any | None
 try:  # pragma: no cover - CUDA-only provider.
     import cuda.bindings.driver as _cuda_driver_module
     import cutlass.cute as _cute_module
     from cutlass.cute.runtime import from_dlpack as _dlpack_converter
 
+    from ._causal_block_kernel import CausalBlockAttentionSm100
     from ._prefix_block_kernel import PrefixBlockAttentionSm100
 except BaseException as error:  # pragma: no cover
     _IMPORT_ERROR = error
@@ -69,11 +84,13 @@ except BaseException as error:  # pragma: no cover
     _from_dlpack = None
     _cuda_driver = None
     _kernel_type = None
+    _causal_kernel_type = None
 else:  # pragma: no cover
     _cute = _cute_module
     _from_dlpack = _dlpack_converter
     _cuda_driver = _cuda_driver_module
     _kernel_type = PrefixBlockAttentionSm100
+    _causal_kernel_type = CausalBlockAttentionSm100
 
 _EXECUTORS: dict[tuple[object, ...], Callable[..., None]] = {}
 _SM_COUNTS: dict[int, int] = {}
@@ -85,6 +102,10 @@ PAGE_TOKENS = (16, 32, 64)
 # at head dim 256 the 128-row tile serves batches too small to occupy the
 # GPU with 256-row tiles.
 _TILE_ROWS = {256: (256, 128), 512: (128,)}
+# int32 words of a causal launch workspace besides two per sequence: the
+# ticket counter. The per-sequence words hold each sequence's first dynamic
+# ticket and tile count.
+_COUNTER_WORDS = 1
 
 
 def available(device: torch.device | None = None) -> bool:
@@ -104,6 +125,23 @@ def import_error() -> BaseException | None:
     return _IMPORT_ERROR
 
 
+def workspace_words(sequences: int) -> int:
+    """int32 words of a causal launch workspace for up to ``sequences``."""
+    return _COUNTER_WORDS + 2 * sequences
+
+
+def new_workspace(device: torch.device, sequences: int) -> torch.Tensor:
+    """Return a zeroed causal launch workspace for up to ``sequences``.
+
+    Its first word is the ticket counter, which a causal launch leaves
+    nonzero; the launch that precedes the next one on the stream resets it
+    (see the module docstring).
+    """
+    return torch.zeros(
+        workspace_words(sequences), dtype=torch.int32, device=device
+    )
+
+
 def unsupported_configuration(
     *,
     query_heads: int,
@@ -111,13 +149,16 @@ def unsupported_configuration(
     head_dim: int,
     page_tokens: int,
     dtype: torch.dtype,
+    causal: bool = False,
+    window: int | None = None,
 ) -> str | None:
     """Return why the kernel cannot serve these dimensions, or None.
 
-    ``dtype`` is the element type of Q/K/V, the caches and the output. The
-    check needs no tensor or device, so a caller can decide which kernel
-    serves a layer before its inputs exist; :func:`can_run` additionally
-    checks a concrete call's layouts and device.
+    ``dtype`` is the element type of Q/K/V, the caches and the output;
+    ``causal`` and ``window`` are the call's block ordering and history
+    window. The check needs no tensor or device, so a caller can decide
+    which kernel serves a layer before its inputs exist; :func:`can_run`
+    additionally checks a concrete call's layouts and device.
     """
     if dtype != torch.bfloat16:
         return "query, key, value and caches must be BF16"
@@ -133,6 +174,11 @@ def unsupported_configuration(
         )
     if page_tokens not in PAGE_TOKENS:
         return f"page_tokens {page_tokens} is not one of {PAGE_TOKENS}"
+    if causal and (head_dim != 512 or window is not None):
+        # A causal chunk longer than a window would need a lower bound
+        # within the block, and only full-attention head dimension 512
+        # layers are served causally.
+        return "causal block attention requires head_dim 512 and no window"
     return None
 
 
@@ -150,6 +196,8 @@ def _check(
     out: torch.Tensor | None,
     lse: torch.Tensor | None,
     window: int | None,
+    causal: bool = False,
+    workspace: torch.Tensor | None = None,
 ) -> str | None:
     """Return why the call violates the kernel contract, or None."""
     tensors = (query, key, value, key_cache, value_cache)
@@ -169,6 +217,8 @@ def _check(
         head_dim=head_dim,
         page_tokens=page_tokens,
         dtype=query.dtype,
+        causal=causal,
+        window=window,
     )
     if problem is not None:
         return problem
@@ -245,6 +295,17 @@ def _check(
         return "lse must be FP32 [tokens, query_heads] with unit head stride"
     if window is not None and (type(window) is not int or window < 0):
         return "window must be a nonnegative history token count"
+    if workspace is not None and (
+        workspace.ndim != 1
+        or workspace.shape[0] < workspace_words(batch)
+        or workspace.dtype != torch.int32
+        or workspace.device != device
+        or workspace.stride(0) != 1
+    ):
+        return (
+            "workspace must be a contiguous int32 tensor of at least "
+            "workspace_words(sequences) words on the query device"
+        )
     return None
 
 
@@ -261,13 +322,16 @@ def can_run(
     start_page: torch.Tensor | None = None,
     prefix_start: torch.Tensor | None = None,
     window: int | None = None,
+    causal: bool = False,
     out: torch.Tensor | None = None,
     lse: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> bool:
     """Return whether :func:`prefix_block_attention` accepts the call.
 
     Checks the device, the optional dependencies and every tensor's shape,
-    dtype, device and layout; device values are not inspected.
+    dtype, device and layout; device values are not inspected. A missing
+    ``workspace`` is not checked.
     """
     return available(query.device) and (
         _check(
@@ -284,6 +348,8 @@ def can_run(
             out,
             lse,
             window,
+            causal,
+            workspace,
         )
         is None
     )
@@ -386,6 +452,8 @@ def prefix_block_attention(
     max_query_len: int,
     window: int | None = None,
     query_window: bool = False,
+    causal: bool = False,
+    workspace: torch.Tensor | None = None,
     start_page: torch.Tensor | None = None,
     prefix_start: torch.Tensor | None = None,
     scale: float = 1.0,
@@ -412,6 +480,11 @@ def prefix_block_attention(
         window: History tokens visible before a query, or None for the
             whole prefix.
         query_window: Whether the window follows each query position.
+        causal: Whether block row ``i`` sees only current keys ``[0, i]``.
+        workspace: The int32 workspace of a causal launch for at least
+            ``batch`` sequences (:func:`new_workspace`), whose ticket counter
+            a preceding launch on the stream has zeroed; not shared with a
+            concurrently running launch. Non-causal launches take none.
         start_page: Optional int32 ``[batch]`` logical page of column 0.
         prefix_start: Optional int32 ``[batch]`` lower bound of the prefix.
         scale: Softmax scale applied to the scores.
@@ -451,7 +524,11 @@ def prefix_block_attention(
         out,
         lse,
         window,
+        causal,
+        workspace,
     )
+    if problem is None and causal and workspace is None:
+        problem = "causal launches need a workspace"
     if problem is not None:
         raise ValueError(problem)
     if type(max_query_len) is not int or max_query_len < 0:
@@ -463,6 +540,26 @@ def prefix_block_attention(
     kv_heads = key.shape[1]
     group = query.shape[1] // kv_heads
     if batch == 0 or max_query_len == 0:
+        return out
+    if causal:
+        _causal_attention(
+            query,
+            key,
+            value,
+            key_cache,
+            value_cache,
+            block_table,
+            query_offsets,
+            prefix_lengths,
+            start_page,
+            prefix_start,
+            out,
+            lse,
+            workspace,
+            max_query_len=max_query_len,
+            scale=scale,
+            lse_base2=lse_base2,
+        )
         return out
     clusters = _sm_count(query.device) // 2
     tile_rows = _tile_rows(
@@ -555,12 +652,118 @@ def prefix_block_attention(
     return out
 
 
+def _causal_attention(
+    *arguments: torch.Tensor | None,
+    max_query_len: int,
+    scale: float,
+    lse_base2: bool,
+) -> None:
+    """Launch the causal kernel on validated arguments.
+
+    ``arguments`` are the kernel's tensors in :func:`prefix_block_attention`
+    order followed by ``out``, ``lse`` and ``workspace``. Its clusters take
+    a static first wave of the grid bounded by ``max_query_len`` and claim
+    the remaining tiles dynamically; see :mod:`._causal_block_kernel`.
+    """
+    query, key, _value, key_cache = arguments[:4]
+    start_page, prefix_start = arguments[8:10]
+    lse = arguments[11]
+    batch = arguments[7].shape[0]
+    kv_heads = key.shape[1]
+    group = query.shape[1] // kv_heads
+    clusters = _sm_count(query.device) // 2
+    tile_rows = _tile_rows(
+        query.shape[2], group, batch * kv_heads, max_query_len * group, clusters
+    )
+    # The grid of (sequence, row block up to the bound, KV head) tiles; no
+    # launch runs more clusters than it has tiles. When every tile has its
+    # own cluster, the kernel exchanges no work item.
+    row_blocks = max(1, -(-max_query_len * group // tile_rows))
+    grid_tiles = batch * kv_heads * row_blocks
+    num_clusters = max(1, min(grid_tiles, clusters))
+
+    specialization = {
+        "head_dim": query.shape[2],
+        "tile_rows": tile_rows,
+        "group_size": group,
+        "page_tokens": key_cache.shape[1],
+        "has_prefix_start": prefix_start is not None,
+        "has_start_page": start_page is not None,
+        "has_lse": lse is not None,
+        "lse_base2": bool(lse_base2),
+    }
+    device_index = query.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+
+    def cache_key(variant: dict[str, object]) -> tuple[object, ...]:
+        return (
+            "causal",
+            device_index,
+            torch.cuda.get_device_capability(query.device),
+            tuple(sorted(variant.items())),
+            *(_abi(tensor) for tensor in arguments),
+        )
+
+    with torch.cuda.device(query.device):
+        executor = _EXECUTORS.get(cache_key(specialization))
+        if executor is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "prefix-block attention was not compiled before graph "
+                    "capture"
+                )
+            if _cute is None or _causal_kernel_type is None:
+                raise RuntimeError(
+                    "the SM100 prefix-block attention kernel is unavailable"
+                ) from _IMPORT_ERROR
+            executor = _cute.compile(
+                _causal_kernel_type(**specialization),
+                *(
+                    None
+                    if tensor is None
+                    else _dynamic_tensor(
+                        tensor,
+                        16 if tensor.dtype == torch.bfloat16 else 4,
+                    )
+                    for tensor in arguments
+                ),
+                1.0,
+                1,
+                1,
+                1,
+                _cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+                options="--enable-tvm-ffi",
+            )
+            _EXECUTORS[cache_key(specialization)] = executor
+
+        if _cuda_driver is None:
+            raise RuntimeError(
+                "CUDA driver bindings are unavailable"
+            ) from _IMPORT_ERROR
+        executor(
+            *(
+                None if tensor is None else tensor.detach()
+                for tensor in arguments
+            ),
+            float(scale),
+            num_clusters,
+            row_blocks,
+            int(grid_tiles <= clusters),
+            # Launch on torch's current stream so the call orders with the
+            # surrounding work and records into an active capture.
+            _cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
+        )
+
+
 __all__ = [
     "HEAD_DIMS",
     "PAGE_TOKENS",
     "available",
     "can_run",
     "import_error",
+    "new_workspace",
     "prefix_block_attention",
     "unsupported_configuration",
+    "workspace_words",
 ]

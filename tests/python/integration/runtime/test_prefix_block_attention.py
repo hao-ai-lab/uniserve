@@ -1,10 +1,11 @@
 """SM100 prefix-block attention reads exactly each row's visible keys.
 
-Every query row of a block attends to its whole block and to a window of
-the sequence's paged prefix. Expected values come from an FP32 softmax over
-keys gathered explicitly through the block table. Cache contents that no
-row may see, the sentinel page, and packed rows after the last sequence
-hold NaN, so any read of them reaches the output.
+Every query row of a block attends to its block (all of it, or with causal
+ordering the rows up to its own) and to a window of the sequence's paged
+prefix. Expected values come from an FP32 softmax over keys gathered
+explicitly through the block table. Cache contents that no row may see, the
+sentinel page, and packed rows after the last sequence hold NaN, so any read
+of them reaches the output.
 """
 
 from __future__ import annotations
@@ -34,6 +35,24 @@ _FULL = (16, 2, 512)
 _PADDING_ROWS = 9
 _UNWRITTEN = 7.0
 _TOLERANCE = {"rtol": 2e-2, "atol": 2e-2}
+# Causal launches run one after another on one stream, so they share a
+# workspace sized for the largest batch below.
+_MAX_SEQUENCES = 16
+_WORKSPACE = {}
+
+
+def _workspace():
+    if "counters" not in _WORKSPACE:
+        _WORKSPACE["counters"] = prefix_block.new_workspace(
+            torch.device("cuda"), _MAX_SEQUENCES
+        )
+    return _WORKSPACE["counters"]
+
+
+def _reset(workspace):
+    # The launch that precedes a causal launch on its stream zeroes the
+    # ticket counter.
+    workspace[:1].zero_()
 
 
 @dataclass(frozen=True)
@@ -142,7 +161,7 @@ def _batch(
     )
 
 
-def _reference(batch, *, window, query_window, scale):
+def _reference(batch, *, window, query_window, scale, causal=False):
     """FP32 attention over explicitly gathered visible keys.
 
     Returns the output ``[tokens, Hq, D]`` and the natural-log LSE
@@ -178,15 +197,12 @@ def _reference(batch, *, window, query_window, scale):
         values = torch.cat(
             (batch.value_cache[pages, slots], batch.value[begin:end])
         ).float()
-        visible = torch.cat(
-            (
-                tokens[None, :] >= lower[:, None],
-                torch.ones(
-                    (end - begin, end - begin), dtype=torch.bool, device="cuda"
-                ),
-            ),
-            dim=1,
+        block = torch.ones(
+            (end - begin, end - begin), dtype=torch.bool, device="cuda"
         )
+        if causal:
+            block = block.tril()
+        visible = torch.cat((tokens[None, :] >= lower[:, None], block), dim=1)
         scores = torch.einsum(
             "qhd,khd->hqk",
             batch.query[begin:end].float(),
@@ -211,7 +227,12 @@ def _launch(
     lse,
     lse_base2=False,
     max_query_len=280,
+    causal=False,
 ):
+    workspace = None
+    if causal:
+        workspace = _workspace()
+        _reset(workspace)
     prefix_block.prefix_block_attention(
         batch.query,
         batch.key,
@@ -222,8 +243,10 @@ def _launch(
         batch.query_offsets,
         batch.prefix_lengths,
         max_query_len=max_query_len,
+        workspace=workspace,
         window=window,
         query_window=query_window,
+        causal=causal,
         start_page=batch.start_page,
         prefix_start=batch.prefix_start,
         scale=scale,
@@ -239,9 +262,15 @@ def _outputs(batch):
     return out, lse
 
 
-def _assert_matches(batch, out, lse, *, window, query_window, scale, base2):
+def _assert_matches(
+    batch, out, lse, *, window, query_window, scale, base2, causal=False
+):
     expected, expected_lse = _reference(
-        batch, window=window, query_window=query_window, scale=scale
+        batch,
+        window=window,
+        query_window=query_window,
+        scale=scale,
+        causal=causal,
     )
     tokens = expected.shape[0]
     if base2:
@@ -423,6 +452,156 @@ def test_full_layer_reads_whole_prefix(page_tokens):
     )
 
 
+@pytest.mark.parametrize("page_tokens", [32, 64])
+@torch.inference_mode()
+def test_causal_chunks_continue_their_history(page_tokens):
+    # Head dimension 512 prefill chunks: a prompt without history, chunks
+    # after long prefixes that are not page multiples, and a short final
+    # chunk. Block lengths are not key-tile multiples, so the diagonal cuts
+    # key tiles at every offset of the 16-query work tiles.
+    lengths = (2048, 1023, 300, 17, 130)
+    prefixes = (0, 300, 14336, 4097, 64)
+    batch = _batch(
+        lengths, prefixes, page_tokens=page_tokens, heads=_FULL, seed=61
+    )
+    out, lse = _outputs(batch)
+
+    _launch(
+        batch,
+        window=None,
+        query_window=False,
+        scale=512**-0.5,
+        out=out,
+        lse=lse,
+        max_query_len=max(lengths),
+        causal=True,
+    )
+
+    _assert_matches(
+        batch,
+        out,
+        lse,
+        window=None,
+        query_window=False,
+        scale=512**-0.5,
+        base2=False,
+        causal=True,
+    )
+
+
+@pytest.mark.parametrize("lse_base2", [False, True])
+@torch.inference_mode()
+def test_causal_diagonal_is_exact(lse_base2):
+    # Early rows of a chunk without history see one or two keys, so a key
+    # admitted past a row's own position or dropped at it moves the output
+    # well past the tolerance. Short chunks after prefixes that cut pages.
+    lengths = (5, 3, 9, 200)
+    prefixes = (20, 37, 3, 0)
+    batch = _batch(lengths, prefixes, page_tokens=16, heads=_FULL, seed=67)
+    out, lse = _outputs(batch)
+
+    _launch(
+        batch,
+        window=None,
+        query_window=False,
+        scale=512**-0.5,
+        out=out,
+        lse=lse,
+        lse_base2=lse_base2,
+        causal=True,
+    )
+
+    _assert_matches(
+        batch,
+        out,
+        lse,
+        window=None,
+        query_window=False,
+        scale=512**-0.5,
+        base2=lse_base2,
+        causal=True,
+    )
+
+
+@torch.inference_mode()
+def test_causal_graph_replay_reads_updated_lengths():
+    # One capture of the counter reset and a causal launch whose bound
+    # grid has more tiles than clusters, replayed with changed lengths and
+    # prefixes: short chunks leave many first-wave grid tiles empty, so
+    # their clusters go straight to the dynamically claimed tiles.
+    pages, width = 800, 200
+    batches = [
+        _batch(
+            (1024, 17, 600, 1, 300),
+            (4097, 0, 1500, 64, 12000),
+            page_tokens=64,
+            heads=_FULL,
+            seed=83,
+            pages=pages,
+            table_width=width,
+        ),
+        _batch(
+            (5, 1024, 130, 700, 1024),
+            (300, 9000, 0, 2049, 64),
+            page_tokens=64,
+            heads=_FULL,
+            seed=89,
+            pages=pages,
+            table_width=width,
+        ),
+    ]
+    rows = max(batch.query.shape[0] for batch in batches)
+
+    def resized(tensor):
+        grown = torch.full(
+            (rows, *tensor.shape[1:]),
+            float("nan"),
+            dtype=tensor.dtype,
+            device="cuda",
+        )
+        grown[: tensor.shape[0]] = tensor
+        return grown
+
+    live = replace(
+        batches[0],
+        query=resized(batches[0].query),
+        key=resized(batches[0].key),
+        value=resized(batches[0].value),
+    )
+    out, lse = _outputs(live)
+    options = {"window": None, "query_window": False, "scale": 512**-0.5}
+
+    def launch():
+        _launch(
+            live, out=out, lse=lse, max_query_len=1024, causal=True, **options
+        )
+
+    # Compile outside the capture, then record the reset and the launch.
+    launch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+
+    for batch in batches:
+        for name in ("query", "key", "value"):
+            getattr(live, name).copy_(resized(getattr(batch, name)))
+        for name in (
+            "key_cache",
+            "value_cache",
+            "block_table",
+            "query_offsets",
+            "prefix_lengths",
+        ):
+            getattr(live, name).copy_(getattr(batch, name))
+        out.fill_(_UNWRITTEN)
+        lse.fill_(_UNWRITTEN)
+
+        graph.replay()
+
+        _assert_matches(live, out, lse, base2=False, causal=True, **options)
+
+
 @pytest.mark.parametrize("lse_base2", [False, True])
 @torch.inference_mode()
 def test_whole_prefix_from_explicit_start(lse_base2):
@@ -600,3 +779,33 @@ def test_eligibility_reports_unsupported_page_size():
     assert not prefix_block.can_run(*arguments, window=1023)
     with pytest.raises(ValueError, match="page_tokens"):
         prefix_block.prefix_block_attention(*arguments, max_query_len=256)
+
+
+def test_eligibility_reports_unsupported_causal_configuration():
+    # Causal ordering serves full-attention layers only: head dimension 512
+    # without a history window.
+    sliding = _batch((256,), (100,), page_tokens=16)
+    full = _batch((256,), (100,), page_tokens=16, heads=_FULL)
+
+    def arguments(batch):
+        return (
+            batch.query,
+            batch.key,
+            batch.value,
+            batch.key_cache,
+            batch.value_cache,
+            batch.block_table,
+            batch.query_offsets,
+            batch.prefix_lengths,
+        )
+
+    assert prefix_block.can_run(*arguments(full), causal=True)
+    assert not prefix_block.can_run(*arguments(sliding), causal=True)
+    assert not prefix_block.can_run(*arguments(full), causal=True, window=1023)
+    with pytest.raises(ValueError, match="causal"):
+        prefix_block.prefix_block_attention(
+            *arguments(sliding),
+            max_query_len=256,
+            workspace=_workspace(),
+            causal=True,
+        )
