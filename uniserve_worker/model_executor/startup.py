@@ -29,6 +29,7 @@ from uniserve_worker.model_executor.diffusion_inputs import (
     DiffusionRow,
     resolve_prefix,
 )
+from uniserve_worker.model_executor.encoder_runner import EncoderRunner
 from uniserve_worker.model_executor.image_inputs import (
     DecodeRow,
     VisionRow,
@@ -721,6 +722,17 @@ def prepare_images(runner: ModelExecutor, latents) -> None:
             with entry.context.activate():
                 batch = entry.prepare_inputs((row,), forward_mode=kind)
             entry.eager_batch(batch, entry.batch_forward)
+            # A patch encoder that packs image slots serves vision calls
+            # only through graphs of every slot count a batch can need.
+            if (
+                kind is MediaCall.VISION_ENCODING
+                and isinstance(entry, EncoderRunner)
+                and entry.packs_images
+            ):
+                entry.capture_packed(
+                    max_images=runner.worker_config.max_batch_calls,
+                    dtype=prepared.pixels.dtype,
+                )
         if (
             MediaCall.IMAGE_DECODING in entry.call_kinds
             and builder is not None

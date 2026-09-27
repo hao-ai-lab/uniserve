@@ -189,7 +189,10 @@ class Pooler(nn.Module):
     the averages then multiply by ``sqrt(hidden_size)`` and, when the
     checkpoint standardizes, become ``(value - std_bias) * std_scale``, all
     in FP32 before a final rounding. Soft tokens follow row-major order of
-    the pooled grid.
+    the pooled grid, images in packing order.
+
+    The squares are found from the device grids alone, so the computation
+    has one shape for every packing of the same number of patch rows.
     """
 
     def __init__(self, config: VisionConfig):
@@ -207,26 +210,45 @@ class Pooler(nn.Module):
             )
 
     def forward(
-        self,
-        features: torch.Tensor,
-        grid_shapes: tuple[tuple[int, int], ...],
+        self, features: torch.Tensor, grids: torch.Tensor
     ) -> torch.Tensor:
-        kernel = self.kernel_size
-        pooled = []
-        for rows, (height, width) in zip(
-            features.split(tuple(h * w for h, w in grid_shapes)),
-            grid_shapes,
-            strict=True,
-        ):
-            # [height / k, k, width / k, k, hidden] squares of patches.
-            squares = rows.float().reshape(
-                height // kernel, kernel, width // kernel, kernel, -1
-            )
-            pooled.append(
-                squares.mean(dim=(1, 3)).flatten(0, 1).to(features.dtype)
-            )
+        """Pool ``[patches, hidden]`` features of the ``[images, 2]`` grids.
 
-        values = torch.cat(pooled).float() * self.root_size
+        Every grid side is a multiple of ``k``, and the grids cover the
+        patch rows in order; a ``(0, 0)`` grid is an empty segment.
+        """
+        kernel = self.kernel_size
+        device = features.device
+        tokens = features.shape[0] // kernel**2
+
+        # Soft token t of the packing belongs to image image[t] and is its
+        # local[t]-th token in row-major order of that image's pooled grid.
+        heights, widths = grids[:, 0], grids[:, 1]
+        patch_counts = heights * widths
+        token_counts = patch_counts // kernel**2
+        image = torch.repeat_interleave(
+            torch.arange(grids.shape[0], device=device),
+            token_counts,
+            output_size=tokens,
+        )
+        first_token = torch.cumsum(token_counts, 0) - token_counts
+        first_patch = torch.cumsum(patch_counts, 0) - patch_counts
+        local = torch.arange(tokens, device=device) - first_token[image]
+        width = widths[image]
+        row, column = local // (width // kernel), local % (width // kernel)
+
+        # The patch rows of each token's k x k square in row-major order:
+        # [tokens, k * k] indices into the packed rows.
+        corner = first_patch[image] + (row * width + column) * kernel
+        offsets = torch.arange(kernel, device=device)
+        square = (
+            corner[:, None, None]
+            + offsets[None, :, None] * width[:, None, None]
+            + offsets[None, None, :]
+        ).flatten(1)
+        pooled = features.float()[square].mean(dim=1).to(features.dtype)
+
+        values = pooled.float() * self.root_size
         if self.std_bias is not None and self.std_scale is not None:
             values = (values - self.std_bias.float()) * self.std_scale.float()
         return values.to(features.dtype)
@@ -246,22 +268,30 @@ class Encoder(nn.Module):
         self,
         pixels: torch.Tensor,
         grids: torch.Tensor,
-        grid_shapes: tuple[tuple[int, int], ...],
+        grid_shapes: tuple[tuple[int, int], ...] | None,
     ) -> torch.Tensor:
         """Encode packed patch rows or same-sized CHW images.
+
+        The computation reads the grids only as device values, so its shapes
+        depend only on the number of patch rows and grids, and a padded
+        packing (``PatchEncoder.encode_packed``) replays one captured call.
 
         Args:
             pixels: ``[total_patches, 3 * patch_size**2]`` patch rows with
                 images concatenated in order, or ``[images, 3, height,
                 width]`` pixels, which are patchified here.
             grids: ``[images, 2]`` integer ``(height, width)`` of each
-                image in patches, on the encoder's device.
-            grid_shapes: The same pairs as host integers, so patch counts
-                and shapes are known without reading device values.
+                image in patches, on the encoder's device. Every side is a
+                multiple of the pooling kernel, image sides lie within the
+                position table (a padding segment of a packed batch may run
+                past it), and a ``(0, 0)`` grid is an empty segment.
+            grid_shapes: The same pairs as host integers, checked against
+                the patch rows, or None when the caller has checked the
+                packing.
 
         Returns:
-            ``[sum of (height * width) / k**2, hidden_size]`` standardized
-            soft tokens, images in input order.
+            ``[total_patches / k**2, hidden_size]`` standardized soft tokens,
+            images in input order.
 
         Raises:
             ValueError: If the patch rows do not cover the declared grids, a
@@ -274,16 +304,28 @@ class Encoder(nn.Module):
                 0, 1
             )
 
-        counts = tuple(height * width for height, width in grid_shapes)
+        counts = (
+            None
+            if grid_shapes is None
+            else tuple(height * width for height, width in grid_shapes)
+        )
         if (
             pixels.ndim != 2
-            or pixels.shape != (sum(counts), 3 * config.patch_size**2)
-            or grids.shape != (len(counts), 2)
-            or any(
-                side % config.pooling_kernel_size
-                or not 0 < side <= config.position_embedding_size
-                for shape in grid_shapes
-                for side in shape
+            or pixels.shape[1] != 3 * config.patch_size**2
+            or pixels.shape[0] % config.pooling_kernel_size**2
+            or grids.ndim != 2
+            or grids.shape[1] != 2
+        ) or (
+            grid_shapes is not None
+            and (
+                pixels.shape[0] != sum(counts)
+                or grids.shape[0] != len(counts)
+                or any(
+                    side % config.pooling_kernel_size
+                    or not 0 < side <= config.position_embedding_size
+                    for shape in grid_shapes
+                    for side in shape
+                )
             )
         ):
             raise ValueError(
@@ -291,7 +333,15 @@ class Encoder(nn.Module):
                 "table"
             )
 
-        x, y = build_abs_positions_from_grid_hw(grids, total=sum(counts))
+        # Image rows lie within the position table (checked above, or by the
+        # caller of a packed batch). A padding segment of a packed batch may
+        # run past it, and its rows read the last entry instead.
+        x, y = (
+            axis.clamp(max=config.position_embedding_size - 1)
+            for axis in build_abs_positions_from_grid_hw(
+                grids, total=pixels.shape[0]
+            )
+        )
         features = self.patch_embedder(pixels, x, y)
 
         # Each image attends only to its own patches, in both directions.
@@ -301,10 +351,10 @@ class Encoder(nn.Module):
         )
         lengths = SequenceLengths(host=counts, values=values, offsets=offsets)
         attention = AttentionBatch.single(
-            VarlenInput(lengths, lengths, (False,) * len(counts))
+            VarlenInput(lengths, lengths, (False,) * grids.shape[0])
         )
         features = self.transformer(features, x, y, attention)
-        return self.pooler(features, grid_shapes)
+        return self.pooler(features, grids)
 
 
 class Embedder(nn.Module):
