@@ -83,6 +83,16 @@ class Backend:
         """Return why this provider cannot evaluate ``module``, or ``None``."""
         return None
 
+    def invalid_expert(self, module) -> int:
+        """The routed expert id this provider's kernels skip.
+
+        An expert-parallel exchange rewrites the ids of experts another rank
+        holds, and of unused receive rows, to it. The grouped kernels here
+        skip global ids outside the module's resident experts, so the
+        global expert count serves.
+        """
+        return module.num_experts
+
     def workspace_buffers(
         self, *, module, size: TextSize
     ) -> Mapping[str, BufferConfig]:
@@ -168,7 +178,7 @@ class NVFP4Backend(Backend):
         ):
             return "W4A4 activations require static calibrated NVFP4 scales"
         if any(
-            weight.buffers()["tensor_scale"].shape != (module.num_experts,)
+            weight.buffers()["tensor_scale"].shape != (up_gate.shape[0],)
             for weight in (up_gate, down)
         ):
             return "each expert requires its own tensor scale"

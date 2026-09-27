@@ -30,6 +30,7 @@ from tests.python.fixtures.checkpoints import (
     load_diffusion_gemma,
 )
 from uniserve.diffusion.tokens import self_conditioning_embedding
+from uniserve.distributed import Communicator
 from uniserve.loading import weights
 from uniserve.model import (
     CanvasInput,
@@ -46,6 +47,7 @@ from uniserve.nn.attention import (
     SequenceLengths,
 )
 from uniserve.nn.functional import patchify
+from uniserve.nn.moe import FusedMoE
 from uniserve.runtime import ExecutionContext, PrefixCache
 from uniserve.runtime.prefix_cache import plan_units
 from uniserve_models import loading as models
@@ -437,6 +439,67 @@ def test_stacked_and_per_expert_checkpoints_load_identically(tmp_path):
             )
     for actual, wanted in zip(*results, strict=True):
         assert torch.equal(actual, wanted)
+
+
+@pytest.mark.parametrize("layout", ["stacked", "per_expert"])
+def test_expert_parallel_ranks_load_their_share_of_every_layer(
+    tmp_path, layout
+):
+    """Each rank of a two-rank expert group keeps its half of the experts.
+
+    Rank ``r`` holds global experts ``[r * E / 2, (r + 1) * E / 2)`` of
+    every layer, equal to those rows of a single-rank load, from a stacked
+    checkpoint and from per-expert matrices alike.
+    """
+    root = tmp_path / layout
+    root.mkdir()
+    diffusion_gemma_checkpoint(root)
+    if layout == "per_expert":
+        state = load_file(root / "model.safetensors")
+        intermediate = 16
+        for name in tuple(state):
+            prefix = name.removesuffix(".gate_up_proj")
+            if prefix == name:
+                continue
+            gate_up = state.pop(name)
+            down = state.pop(f"{prefix}.down_proj")
+            for expert in range(gate_up.shape[0]):
+                state[f"{prefix}.{expert}.gate_proj.weight"] = gate_up[
+                    expert, :intermediate
+                ].clone()
+                state[f"{prefix}.{expert}.up_proj.weight"] = gate_up[
+                    expert, intermediate:
+                ].clone()
+                state[f"{prefix}.{expert}.down_proj.weight"] = down[
+                    expert
+                ].clone()
+        save_file(state, root / "model.safetensors")
+
+    config = models.read_config(root)
+    full = models.load_model(
+        config, device="cpu", weights=weights.Config(dtype=torch.float32)
+    ).model
+    for rank in range(2):
+        local = models.load_model(
+            config,
+            device="cpu",
+            weights=weights.Config(dtype=torch.float32),
+            experts=Communicator((0, 1), rank),
+        ).model
+        for (path, whole), (_, part) in zip(
+            full.named_modules(), local.named_modules(), strict=True
+        ):
+            if not isinstance(whole, FusedMoE):
+                continue
+            count = whole.num_experts // 2
+            share = slice(rank * count, (rank + 1) * count)
+            assert part.expert_slice == share, path
+            assert part.num_experts == whole.num_experts
+            for name in ("up_gate", "down"):
+                assert torch.equal(
+                    getattr(part, name).weight,
+                    getattr(whole, name).weight[share],
+                ), (path, name)
 
 
 def test_disagreeing_layer_scalars_are_rejected(tmp_path):

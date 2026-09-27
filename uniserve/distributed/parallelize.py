@@ -27,7 +27,7 @@ from uniserve.nn.moe import FusedMoE
 from uniserve.quantization import QuantizedTensor
 
 from .distribution import Distribution
-from .mesh import DeviceMesh
+from .mesh import Communicator, DeviceMesh
 from .tokens import HeadExchange, kv_head_partition
 
 
@@ -173,6 +173,49 @@ def _partition_experts(module, mesh, group, attention) -> None:
     module.group = group
     module._parallel_mesh = mesh
     module._attention_parallel = attention
+
+
+def partition_experts(model: nn.Module, group: Communicator) -> None:
+    """Shard every ``FusedMoE`` of ``model`` over the expert group ``group``.
+
+    Rank ``r`` of ``P`` keeps the contiguous global experts
+    ``[r * E / P, (r + 1) * E / P)`` of every layer, the placement the
+    FlashInfer and TensorRT-LLM all-to-all kernels route tokens by. Each
+    stacked weight keeps those experts only; routing still names global
+    experts. Binding happens on the meta skeleton, before weights load, so a
+    rank reads only its own experts' tensors.
+
+    Raises:
+        ValueError: A layer's expert count does not divide the group, the
+            layer is already tensor-parallel or expert-parallel, or its
+            weights are already quantized.
+    """
+    if group.size == 1:
+        return
+    for module in model.modules():
+        if not isinstance(module, FusedMoE):
+            continue
+        if module.expert_group.size > 1 or module.group.size > 1:
+            raise ValueError(
+                "an expert layer is partitioned over one group at a time"
+            )
+        if module.num_experts % group.size:
+            raise ValueError(
+                f"{module.num_experts} experts do not divide an expert group "
+                f"of {group.size} ranks"
+            )
+        if isinstance(module.up_gate.weight, QuantizedTensor):
+            raise ValueError("expert binding must precede weight quantization")
+
+        count = module.num_experts // group.size
+        local = slice(group.rank * count, (group.rank + 1) * count)
+        for linear in (module.up_gate, module.down):
+            linear.weight = nn.Parameter(
+                linear.weight[local].contiguous(), requires_grad=False
+            )
+            linear.num_experts = count
+        module.expert_slice = local
+        module.expert_group = group
 
 
 def _replicated_heads(mesh: DeviceMesh, heads: int) -> Distribution:

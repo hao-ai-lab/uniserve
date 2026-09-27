@@ -45,6 +45,9 @@ class ProcessGroups:
     world_size: int
     device: torch.device
     backend: str
+    # The expert-parallel group of a one-rank process joining other
+    # replicas' ranks (see ``initialize_process_groups``); size one otherwise.
+    experts: Communicator = field(default_factory=Communicator)
     _groups: list[Any] = field(default_factory=list, repr=False)
 
     def __enter__(self) -> Self:
@@ -184,6 +187,7 @@ def initialize_process_groups(
     backend: str | None = None,
     init_method: str | None = None,
     rendezvous: Rendezvous | None = None,
+    experts: tuple[int, int, Rendezvous] | None = None,
 ) -> ProcessGroups:
     """Select the rank's device and join or create its physical process world.
 
@@ -192,6 +196,12 @@ def initialize_process_groups(
     ``MASTER_PORT`` name a TCP init method. Both are ignored when the process
     already has a world, which is borrowed.
 
+    ``experts`` is ``(rank, size, rendezvous)`` of the expert-parallel world
+    a one-rank process joins with other data-parallel replicas' ranks. That
+    world becomes the process's torch world, with Gloo for host tensors,
+    which the per-step expert synchronization exchanges, and NCCL for device
+    tensors; ``ProcessGroups.experts`` is its communicator.
+
     The returned ProcessGroups owns any group created here. The caller closes it
     after all dependent execution resources retire, or transfers that obligation
     to the constructed Worker. Its context manager closes on every scope exit.
@@ -199,6 +209,10 @@ def initialize_process_groups(
     if world_size < 1 or not 0 <= rank < world_size or local_rank < 0:
         raise ValueError(
             "launch rank must satisfy 0 <= rank < positive world_size"
+        )
+    if experts is not None and (world_size != 1 or dist.is_initialized()):
+        raise ValueError(
+            "only a one-rank process without a world joins an expert world"
         )
     if init_method is not None and rendezvous is not None:
         raise ValueError("init_method and rendezvous are exclusive")
@@ -259,6 +273,26 @@ def initialize_process_groups(
             device_id=local_device if backend == "nccl" else None,
         )
         environment._groups.append(dist.group.WORLD)
+
+    if experts is not None:
+        expert_rank, expert_size, expert_rendezvous = experts
+        world = "cpu:gloo,cuda:nccl"
+        dist.init_process_group(
+            backend=world,
+            store=_rendezvous_store(
+                expert_rendezvous, expert_rank, expert_size, "nccl"
+            ),
+            rank=expert_rank,
+            world_size=expert_size,
+        )
+        environment._groups.append(dist.group.WORLD)
+        environment.experts = Communicator(
+            tuple(range(expert_size)),
+            expert_rank,
+            "experts",
+            local_device,
+            dist.group.WORLD,
+        )
 
     return environment
 
