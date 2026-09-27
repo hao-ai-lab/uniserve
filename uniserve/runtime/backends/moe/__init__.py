@@ -25,14 +25,21 @@ from uniserve.nn.functional import Routes
 from uniserve.quantization import QuantizedTensor, RowOrder, ScaleLayout
 from uniserve.tensors import BufferConfig
 
-# Native providers in automatic selection order. Their representations are
-# disjoint: CuTeDSL serves NVFP4 experts, CUTLASS BF16 and FP16 experts.
-# trtllm-gen also serves NVFP4 experts, by explicit selection. CuTeDSL leads
-# for NVFP4 because routed-expert layers of 256 tokens or more, the calls
-# that prefill chunks and 256-token canvases make, take 0.78-0.93 of
-# trtllm-gen's median time on SM100 (trtllm-gen is anomalously slow at 4096
-# tokens), while 1 to 64 tokens take 1.17-1.51 of it
-# (artifacts/diffusion_gemma/stage0/moe/measurements-cutedsl-separate/).
+# Native providers in automatic selection order: preparation takes the first
+# whose declared capability covers the representation, and never switches at
+# run time. CuTeDSL serves NVFP4 experts on SM100 and SM103 and BF16 experts
+# on SM100 with hidden and intermediate widths that are multiples of 64;
+# CUTLASS serves the remaining BF16 and FP16 experts. trtllm-gen (NVFP4) and
+# CUTLASS (BF16) also serve CuTeDSL's representations by explicit selection.
+# CuTeDSL leads for NVFP4 because routed-expert layers of 256 tokens or
+# more, the calls that prefill chunks and 256-token canvases make, take
+# 0.78-0.93 of trtllm-gen's median time on SM100 (trtllm-gen is anomalously
+# slow at 4096 tokens), while 1 to 64 tokens take 1.17-1.51 of it
+# (artifacts/diffusion_gemma/stage0/moe/measurements-cutedsl-separate/). It
+# leads for BF16 because a DiffusionGemma expert layer with its routes
+# summed in the following sandwich normalization takes 0.56-0.98 of the
+# tuned CUTLASS layer on SM100 at 1-8 and 128-8192 tokens and ties it at
+# 16-64 tokens (artifacts/diffusion_gemma/stage5/moe/bf16/).
 _NATIVE = ("cutedsl", "cutlass")
 _PROVIDERS = frozenset((*_NATIVE, "trtllm", "torch"))
 
