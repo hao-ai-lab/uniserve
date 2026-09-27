@@ -225,7 +225,7 @@ impl Default for WorkerProcessArgs {
             decode_graph_batch_sizes: None,
             prefill_cuda_graph: true,
             prefill_graph_token_sizes: None,
-            flow_cuda_graph: false,
+            flow_cuda_graph: true,
             flow_graph_batch_sizes: None,
             flow_graph_shapes: None,
             video_text_capacities: None,

@@ -504,8 +504,9 @@ pub(crate) struct WorkerProcessOptions {
     #[arg(long, hide = true)]
     pub prefill_graph_token_sizes: Option<String>,
     /// Capture image denoising calls at the configured flow shapes and
-    /// replay those whose exact input signature was captured.
-    #[arg(long, action = ArgAction::Set, default_value_t = false, hide = true)]
+    /// replay those whose exact input signature was captured (default).
+    /// `false` runs image denoising eagerly, for debugging only.
+    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
     pub flow_cuda_graph: bool,
     #[arg(long, hide = true)]
     pub flow_graph_batch_sizes: Option<String>,
