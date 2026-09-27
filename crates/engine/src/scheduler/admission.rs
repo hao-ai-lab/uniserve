@@ -171,6 +171,7 @@ impl Scheduler {
             output: RequestOutput::new(event_tx),
             queued_at: now(),
             terminal_intent: super::TerminalIntent::None,
+            failure: None,
             req,
         };
         self.next_request_epoch = self.next_request_epoch.saturating_add(1);

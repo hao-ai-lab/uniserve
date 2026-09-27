@@ -1328,6 +1328,24 @@ impl Scheduler {
         }
     }
 
+    /// Fails a running token request whose worker result was rejected.
+    ///
+    /// The first cause recorded for the request becomes its terminal `Error`
+    /// event, sent at once so the client's failure carries it, and appears
+    /// in the log line of its error finish, which `finish_after_inflight`
+    /// applies once the request's in-flight calls drain. A later cause for
+    /// the same request changes neither.
+    pub(super) fn fail_after_inflight(&mut self, id: RequestId, cause: String) {
+        let Some(state) = self.running.get_mut(&id) else {
+            return;
+        };
+        if state.failure.is_none() {
+            state.failure = Some(cause.clone());
+            self.emit(id, EngineCoreOutput::Error { message: cause });
+        }
+        self.finish_after_inflight(id, FinishReason::Error, None);
+    }
+
     /// Applies a deferred finish once no in-flight work or decoder decision remains.
     pub(super) fn finish_pending_if_idle(&mut self, id: RequestId) {
         if self.inflight.has_pending_calls(id)
@@ -1364,6 +1382,7 @@ impl Scheduler {
         {
             tracing::error!(
                 request_id = id.0,
+                cause = state.failure.as_deref().unwrap_or("unrecorded"),
                 phase = ?state.phase,
                 generated_tokens = state.num_generated_tokens,
                 images_done = state.num_generated_images,
