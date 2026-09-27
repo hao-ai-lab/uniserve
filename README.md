@@ -143,8 +143,9 @@ curl -s http://127.0.0.1:8000/v1/systemone \
 | `--host`, `--port` | `127.0.0.1`, `8000` | TCP listener |
 | `--uds` | Unset | Unix-domain listener instead of TCP; a stale socket file is replaced and the socket file is removed at shutdown |
 | `--device` | `cuda` | Worker device |
-| `--worker-ranks` | `1` | Ranks in the default Worker instance when `--workers` is omitted |
-| `--workers` | One `model` entry over every rank | Path to a JSON deployment configuration: Worker instances, node/device ranks, and the components placed on them |
+| `--worker-ranks` | `1` | Ranks, forming one tensor-parallel group, in each replica's default Worker instance when `--workers` is omitted |
+| `--data-parallel-size` | `1` | Independent model replicas, each with its own scheduler, KV cache and ranks; every request goes to the replica with the fewest requests in flight. With `--workers`, the file lists the replicas as equal consecutive blocks of Worker instances |
+| `--workers` | One `model` entry over every rank of each replica | Path to a JSON deployment configuration: Worker instances, node/device ranks, and the components placed on them |
 | `--max-model-len` | Model configuration | Context-length ceiling |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |
 | `--page-size` | Chosen by the worker | Tokens per KV page of the cache group with the widest rows; unset, the worker takes the largest power of two up to 64 whose pages its attention kernels read in every cache group (32 for DiffusionGemma, whose full-attention pages then hold 64 tokens) |
@@ -171,6 +172,14 @@ For tensor-parallel execution, select one rank per participating GPU:
 uniserve serve /models/Qwen3-32B \
   --served-model-name Qwen3-32B \
   --worker-ranks 4
+```
+
+For data-parallel serving, run one full replica per GPU; a model that tensor parallelism cannot split, such as DiffusionGemma, serves four GPUs this way:
+
+```bash
+uniserve serve /models/diffusiongemma-26B-A4B-it \
+  --served-model-name diffusiongemma \
+  --data-parallel-size 4
 ```
 
 For text-to-video-and-audio generation with the FastH3 checkpoints, including the packed NVFP4 releases, use the [FastH3 cheat sheet](docs/fast_h3/fast_h3.md).

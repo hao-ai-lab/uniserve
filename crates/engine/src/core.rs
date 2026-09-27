@@ -273,9 +273,50 @@ impl WorkerConfig {
             storage_fraction: None,
         }
     }
+
+    /// Expands the data-parallel CLI shorthand into `replicas` groups of
+    /// `ranks_per_replica` ranks, each carrying `components`.
+    ///
+    /// All `replicas * ranks_per_replica` ranks are placed at once as
+    /// [`WorkerConfig::placed`] places them, in blocks over `hosts`, and
+    /// consecutive runs of `ranks_per_replica` form the replicas, so
+    /// replicas fill the head's host first. One replica is the group
+    /// `model`; replica `i` of several is `model-<i>`.
+    pub fn replicated(
+        hosts: &[String],
+        device: &str,
+        replicas: usize,
+        ranks_per_replica: usize,
+        queue_depth: usize,
+        components: BTreeMap<String, ComponentConfig>,
+    ) -> Vec<Self> {
+        let placed = Self::placed(
+            hosts,
+            device,
+            replicas * ranks_per_replica,
+            queue_depth,
+            components,
+        );
+        if replicas <= 1 {
+            return vec![placed];
+        }
+        placed
+            .ranks
+            .chunks(ranks_per_replica.max(1))
+            .enumerate()
+            .map(|(index, ranks)| Self {
+                id: WorkerId(format!("model-{index}")),
+                ranks: ranks.to_vec(),
+                components: placed.components.clone(),
+                queue_depth,
+                storage_fraction: None,
+            })
+            .collect()
+    }
 }
 
-/// Configuration for one in-process engine core.
+/// Configuration for the in-process engine cores of one deployment: one core,
+/// or one per data-parallel replica.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Request runtime selected for this configuration.
@@ -306,6 +347,10 @@ pub struct EngineConfig {
     /// and across WorkerGroups, that no configured edge covers, derived from
     /// rank node/device coordinates.
     pub transfer: TransferConfig,
+    /// Number of independent replicas `workers` forms, as equal consecutive
+    /// blocks of groups; each replica is served by its own engine core
+    /// ([`EngineCore::replicas`]). One means the workers form one engine.
+    pub data_parallel_size: usize,
     /// Rank launch defaults refined by each WorkerGroup configuration.
     ///
     /// Every constructor also reads the model identifier (`model`) and
@@ -360,6 +405,7 @@ impl EngineConfig {
                 WorkerConfig::single_component(DEFAULT_COMPONENT, 1),
             )],
             transfer: TransferConfig::default(),
+            data_parallel_size: 1,
             worker_process,
             bos: 0,
             // `SimEngine` fabricates this fake EOS id after `text_len` tokens; the
@@ -402,66 +448,156 @@ impl EngineCore {
     /// the scheduler owner thread.
     ///
     /// Blocks until every rank has loaded the model and reported its
-    /// capabilities. Fails when `WorkerConfig::validate_all` rejects the
+    /// capabilities. Fails when `config.data_parallel_size` is not one (see
+    /// [`EngineCore::replicas`]), `WorkerConfig::validate_all` rejects the
     /// workers, a configured transfer edge names an unconfigured worker,
     /// `WorkerGroup::spawn_all` fails to launch a group,
     /// `WorkerExecutor::try_new` refuses the launched groups, or the scheduler
     /// or its thread cannot be created.
-    pub fn new(mut config: EngineConfig) -> anyhow::Result<Self> {
-        // Validates the workers and fills default edges; the edges it adds
-        // only name configured workers, so the check below covers the
-        // explicitly configured ones.
-        config.transfer = config.transfer.with_worker_defaults(&config.workers)?;
-        let instances = config
-            .workers
-            .iter()
-            .map(|worker| worker.id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        for edge in &config.transfer.edges {
-            anyhow::ensure!(
-                instances.contains(&edge.source_worker)
-                    && instances.contains(&edge.destination_worker),
-                "transfer edge names an unconfigured worker"
+    pub fn new(config: EngineConfig) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            config.data_parallel_size == 1,
+            "one engine core serves one replica; EngineCore::replicas launches \
+             data-parallel replicas"
+        );
+        let mut cores = Self::replicas(config)?;
+        Ok(cores.remove(0))
+    }
+
+    /// Launches `config.data_parallel_size` independent replicas of the
+    /// deployment and returns one engine core per replica.
+    ///
+    /// `config.workers` lists the replicas as equal consecutive blocks of
+    /// WorkerGroups. Each replica gets its own scheduler thread, executor, KV
+    /// pool, prefix cache and request rows over its own groups, the way
+    /// SGLang runs one scheduler per data-parallel rank behind its
+    /// `DataParallelController` and vLLM one engine core per data-parallel
+    /// rank. Every group of every replica launches through one
+    /// `WorkerGroup::spawn_all`, so the replicas load their models at the same
+    /// time and one launcher per remote host serves all of them.
+    ///
+    /// Replicas exchange no products: every configured transfer edge must stay
+    /// inside one replica, and each replica binds its default edges over its
+    /// own groups only.
+    ///
+    /// Fails when the size is zero or does not divide the groups, when the
+    /// replicas are not the same deployment on different ranks (group count,
+    /// rank counts, components, queue depth and storage fraction must match
+    /// position by position), when a configured edge crosses replicas or
+    /// names an unconfigured worker, or for any reason `EngineCore::new`
+    /// names.
+    pub fn replicas(config: EngineConfig) -> anyhow::Result<Vec<Self>> {
+        let size = config.data_parallel_size;
+        anyhow::ensure!(
+            size > 0 && !config.workers.is_empty() && config.workers.len().is_multiple_of(size),
+            "{} worker groups do not form {size} equal data-parallel replicas",
+            config.workers.len()
+        );
+        WorkerConfig::validate_all(&config.workers)?;
+        let replicas: Vec<&[WorkerConfig]> =
+            config.workers.chunks(config.workers.len() / size).collect();
+        for replica in &replicas[1..] {
+            for (group, first) in replica.iter().zip(replicas[0]) {
+                anyhow::ensure!(
+                    group.ranks.len() == first.ranks.len()
+                        && group.components == first.components
+                        && group.queue_depth == first.queue_depth
+                        && group.storage_fraction == first.storage_fraction,
+                    "data-parallel replicas must place the same groups: worker {} \
+                     differs from worker {}",
+                    group.id,
+                    first.id
+                );
+            }
+        }
+
+        // Each replica resolves its transfer edges over its own groups. The
+        // edges `with_worker_defaults` adds only name the replica's groups, so
+        // checking the configured ones covers every edge.
+        let mut transfers = Vec::with_capacity(size);
+        let mut assigned = 0;
+        for replica in &replicas {
+            let members = replica
+                .iter()
+                .map(|worker| worker.id.clone())
+                .collect::<BTreeSet<_>>();
+            let edges = config
+                .transfer
+                .edges
+                .iter()
+                .filter(|edge| members.contains(&edge.source_worker))
+                .cloned()
+                .collect::<Vec<_>>();
+            for edge in &edges {
+                anyhow::ensure!(
+                    members.contains(&edge.destination_worker),
+                    "transfer edge {} -> {} leaves its source's data-parallel replica",
+                    edge.source_worker,
+                    edge.destination_worker
+                );
+            }
+            assigned += edges.len();
+            transfers.push(
+                TransferConfig {
+                    edges,
+                    ..config.transfer.clone()
+                }
+                .with_worker_defaults(replica)?,
             );
         }
-        let peers = config
-            .workers
-            .iter()
-            .map(|worker| (worker.id.to_string(), worker.components.clone()))
-            .collect::<std::collections::BTreeMap<_, _>>();
+        anyhow::ensure!(
+            assigned == config.transfer.edges.len(),
+            "transfer edge names an unconfigured worker"
+        );
 
         // Each group launches from the shared defaults with its own identity,
-        // placement, components, queue depth, and storage fraction, plus the
-        // resolved transfer edges and every group's components (`peers`),
-        // from which the group resolves the ranks, possibly in other groups,
-        // that read its products.
-        let mut bindings = Vec::new();
-        let mut arguments = Vec::new();
-        for worker in &config.workers {
-            arguments.push(WorkerProcessArgs {
-                worker_id: worker.id.to_string(),
-                ranks: worker.ranks.clone(),
-                components: worker.components.clone(),
-                peers: peers.clone(),
-                queue_depth: worker.queue_depth,
-                kv_storage_fraction: worker
-                    .storage_fraction
-                    .unwrap_or(config.worker_process.kv_storage_fraction),
-                transfer: config.transfer.clone(),
-                ..config.worker_process.clone()
-            });
-            bindings.push(worker.id.clone());
+        // placement, components, queue depth, and storage fraction, plus its
+        // replica's resolved transfer edges and the components of every group
+        // of its replica (`peers`), from which the group resolves the ranks,
+        // possibly in other groups, that read its products.
+        let mut arguments = Vec::with_capacity(config.workers.len());
+        for (replica, transfer) in replicas.iter().zip(&transfers) {
+            let peers = replica
+                .iter()
+                .map(|worker| (worker.id.to_string(), worker.components.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for worker in *replica {
+                arguments.push(WorkerProcessArgs {
+                    worker_id: worker.id.to_string(),
+                    ranks: worker.ranks.clone(),
+                    components: worker.components.clone(),
+                    peers: peers.clone(),
+                    queue_depth: worker.queue_depth,
+                    kv_storage_fraction: worker
+                        .storage_fraction
+                        .unwrap_or(config.worker_process.kv_storage_fraction),
+                    transfer: transfer.clone(),
+                    ..config.worker_process.clone()
+                });
+            }
         }
 
         // `spawn_all` returns groups in argument order, which pairs each group
-        // with its identity.
-        let workers = bindings
-            .into_iter()
-            .zip(WorkerGroup::spawn_all(arguments)?)
-            .collect();
-        let executor = WorkerExecutor::try_new(workers, config.transfer.clone())?;
-        let waker = executor.command_waker();
-        Self::assemble(config, Box::new(executor), waker)
+        // with its identity and, block by block, with its replica.
+        let mut groups = config
+            .workers
+            .iter()
+            .map(|worker| worker.id.clone())
+            .zip(WorkerGroup::spawn_all(arguments)?);
+        let mut cores = Vec::with_capacity(size);
+        for (replica, transfer) in replicas.iter().zip(transfers) {
+            let workers = groups.by_ref().take(replica.len()).collect();
+            let executor = WorkerExecutor::try_new(workers, transfer.clone())?;
+            let waker = executor.command_waker();
+            let replica_config = EngineConfig {
+                workers: replica.to_vec(),
+                transfer,
+                data_parallel_size: 1,
+                ..config.clone()
+            };
+            cores.push(Self::assemble(replica_config, Box::new(executor), waker)?);
+        }
+        Ok(cores)
     }
 
     /// Builds the engine core from an executor supplied by a higher composition layer.
@@ -750,6 +886,96 @@ mod tests {
             );
         }
         assert_eq!(worker.components["alone"].ranks, vec![0]);
+    }
+
+    /// Four two-rank replicas over two four-device hosts fill the head's host
+    /// first, and each replica keeps its ranks on one host.
+    #[test]
+    fn the_data_parallel_shorthand_places_replicas_in_host_blocks() {
+        let hosts = ["rank-0".to_owned(), "rank-1".to_owned()];
+        let replicas = WorkerConfig::replicated(
+            &hosts,
+            "cuda",
+            4,
+            2,
+            2,
+            WorkerConfig::single_component("model", 2),
+        );
+
+        let placement: Vec<_> = replicas
+            .iter()
+            .map(|worker| {
+                (
+                    worker.id.to_string(),
+                    worker
+                        .ranks
+                        .iter()
+                        .map(|rank| format!("{}/{}", rank.node, rank.device))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            placement,
+            vec![
+                (
+                    "model-0".into(),
+                    vec!["rank-0/cuda:0".into(), "rank-0/cuda:1".into()]
+                ),
+                (
+                    "model-1".into(),
+                    vec!["rank-0/cuda:2".into(), "rank-0/cuda:3".into()]
+                ),
+                (
+                    "model-2".into(),
+                    vec!["rank-1/cuda:0".into(), "rank-1/cuda:1".into()]
+                ),
+                (
+                    "model-3".into(),
+                    vec!["rank-1/cuda:2".into(), "rank-1/cuda:3".into()]
+                ),
+            ]
+        );
+        assert!(WorkerConfig::validate_all(&replicas).is_ok());
+
+        // One replica keeps the single-group identity.
+        let single = WorkerConfig::replicated(
+            &hosts,
+            "cuda",
+            1,
+            2,
+            2,
+            WorkerConfig::single_component("model", 2),
+        );
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].id.to_string(), "model");
+    }
+
+    /// Replicas must be the same deployment on different ranks, and the size
+    /// must divide the groups; both are refused before any rank launches.
+    #[test]
+    fn data_parallel_replicas_refuse_unequal_deployments() {
+        let hosts = ["localhost".to_owned()];
+        let mut config = EngineConfig {
+            workers: WorkerConfig::replicated(
+                &hosts,
+                "cpu",
+                2,
+                1,
+                2,
+                WorkerConfig::single_component("model", 1),
+            ),
+            data_parallel_size: 3,
+            ..EngineConfig::sim("sim-model")
+        };
+        assert!(EngineCore::replicas(config.clone()).is_err());
+
+        config.data_parallel_size = 2;
+        config.workers[1].queue_depth = 3;
+        let error = EngineCore::replicas(config)
+            .err()
+            .expect("unequal replicas are refused");
+        assert!(error.to_string().contains("data-parallel replicas"));
     }
 
     #[test]

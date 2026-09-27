@@ -242,6 +242,7 @@ impl DynamoFastH3Engine {
                 max_video_seconds: self.args.max_video_seconds,
                 workers: self.args.workers.to_vec(),
                 transfer: Default::default(),
+                data_parallel_size: 1,
                 worker_process,
             },
             model: self.args.model_path.clone(),
