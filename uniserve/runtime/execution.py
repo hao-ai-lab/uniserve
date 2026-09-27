@@ -152,6 +152,11 @@ class ExecutionContext(Generic[SizeT]):
     whose inputs always carry those host mirrors, such as the serving
     worker, passes False, and a call missing one then raises instead of
     copying. Planning never reads device values during graph capture.
+
+    ``experts`` is a borrowed ``ExpertExchange`` the expert-parallel
+    ``FusedMoE`` layers of ``module`` exchange tokens through; its owner
+    opens a step around every forward that reaches them (see
+    ``uniserve.runtime.expert_exchange``) and retires it after this context.
     """
 
     def __init__(
@@ -167,6 +172,7 @@ class ExecutionContext(Generic[SizeT]):
         groups=None,
         scratch: Scratch | None = None,
         derive_host_lengths: bool = True,
+        experts=None,
     ):
         # Close releases the module; a closed context never executes again.
         self.module: nn.Module | None = module
@@ -181,6 +187,7 @@ class ExecutionContext(Generic[SizeT]):
         )
         self._moe_backend = moe
         self._derive_host_lengths = derive_host_lengths
+        self.experts = experts
 
         reference: torch.Tensor | None = next(
             (value for value in module.parameters() if not value.is_meta), None
@@ -549,6 +556,7 @@ class ExecutionContext(Generic[SizeT]):
                         size if isinstance(size, TextSize) else None,
                         device,
                         self._moe_workspace,
+                        self.experts,
                     )
                     self._moe[id(child)] = moe_binding
                     if isinstance(size, TextSize):
@@ -663,6 +671,42 @@ class ExecutionContext(Generic[SizeT]):
         buffers = self._context_backing[key]
         self._vsa_context[parallel] = buffers
         return buffers
+
+    def join_expert_layers(self) -> None:
+        """Join the open step at every expert layer its forward skipped.
+
+        Every rank of an expert group exchanges at every expert-parallel
+        layer of every step, in layer order, whether or not its forward
+        reached that layer: a prefill that stops after the final layer's
+        cache write skips the final expert layer, and a rank without work
+        reaches none. The skipped layers are the forward's tail, so joining
+        them afterwards keeps the layer order. A rank then exchanges with no
+        tokens of its own and still runs its experts over what it receives.
+        The caller runs this inside ``activate``.
+        """
+        exchange = self.experts
+        if exchange is None or not exchange.capacity:
+            return
+        invoked = exchange.invoked
+        pending = [
+            binding
+            for binding in self._moe.values()
+            if binding.exchange is exchange
+            and id(binding.module) not in invoked
+        ]
+        if not pending:
+            return
+        # The reached layers precede the skipped ones in module order.
+        order = list(self._moe.values())
+        if any(
+            id(binding.module) in invoked
+            for binding in order[order.index(pending[0]) :]
+        ):
+            raise RuntimeError(
+                "a forward skipped an expert layer before one it reached"
+            )
+        for binding in pending:
+            binding.join(binding.module.hidden_size, self._dtype)
 
     def bind_attention(self, batch, *, replay=False):
         """Plan one call's attention metadata on the layers that read it.

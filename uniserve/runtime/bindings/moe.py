@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import torch
+
 from uniserve.model.inputs import TextSize
 from uniserve.quantization import QuantizedTensor, RowOrder
 
@@ -15,17 +17,36 @@ class MoEBinding:
 
     The operator is prepared for the largest token count seen, never during
     CUDA capture; a smaller call reuses it.
+
+    An expert-parallel call site (``module.expert_group`` spans several
+    ranks) borrows the worker's ``ExpertExchange``: each call sends its
+    tokens to the ranks holding their experts, runs this rank's experts over
+    the tokens it receives, ``P * C`` rows for a group of ``P`` ranks and the
+    open step's capacity ``C``, and combines the partial sums back. Its
+    local operator is prepared once for ``P`` times the exchange's largest
+    capacity.
     """
 
-    def __init__(self, module, backend, size, device, allocate):
+    def __init__(self, module, backend, size, device, allocate, exchange=None):
         self.module, self.backend, self.device = module, backend, device
         self.allocate = allocate
         self.size = size
         self.operator = None
         self.provider = None
+        self.exchange = exchange if module.expert_group.size > 1 else None
+        if module.expert_group.size > 1 and exchange is None:
+            raise ValueError(
+                "an expert-parallel call site needs the worker's expert "
+                "exchange"
+            )
 
     def prepare(self, size: TextSize):
         previous = self.operator
+        if self.exchange is not None:
+            # Received rows, not local tokens, reach the local experts.
+            size = TextSize(
+                self.module.expert_group.size * self.exchange.max_tokens, 1
+            )
         if previous is not None and previous.size.num_tokens >= size.num_tokens:
             return previous
         if capturing(self.device):
@@ -50,6 +71,7 @@ class MoEBinding:
             previous.close()
         self.operator = operator
         self.provider = provider.name
+        self._invalid_expert = provider.invalid_expert(self.module)
         record_kernel_choice()
         return operator
 
@@ -59,7 +81,8 @@ class MoEBinding:
         The record names the prepared provider, the expert count, and each
         projection's weight representation and resident row order (the
         physical order the provider placed; ``linear`` is logical order).
-        Empty until the call site is prepared.
+        An expert-parallel call site also names its expert group size and
+        its all-to-all exchange. Empty until the call site is prepared.
         """
         if self.operator is None:
             return []
@@ -75,6 +98,14 @@ class MoEBinding:
                 if quantized
                 else RowOrder.LINEAR.value,
             }
+        parallel = (
+            {}
+            if self.exchange is None
+            else {
+                "expert_parallel": self.module.expert_group.size,
+                "exchange": "flashinfer_mnnvl_alltoall",
+            }
+        )
         return [
             {
                 "op": "moe",
@@ -82,12 +113,41 @@ class MoEBinding:
                 "experts": self.module.num_experts,
                 "activation": self.module.activation,
                 **projections,
+                **parallel,
             }
         ]
 
     def __call__(self, hidden, topk_ids, topk_weights):
+        exchange = self.exchange
+        if exchange is None:
+            operator = self.prepare(TextSize(hidden.shape[0], 1))
+            return operator(hidden, topk_ids, topk_weights)
+
         operator = self.prepare(TextSize(hidden.shape[0], 1))
-        return operator(hidden, topk_ids, topk_weights)
+        received = exchange.dispatch(
+            id(self.module),
+            hidden,
+            topk_ids,
+            topk_weights,
+            invalid_expert=self._invalid_expert,
+        )
+        partial = operator(*received)
+        return exchange.combine(partial, hidden.shape[0])
+
+    def join(self, hidden_size: int, dtype: torch.dtype) -> None:
+        """Exchange at this layer with no tokens of this rank's own.
+
+        The other ranks' tokens routed to this rank's experts still arrive,
+        run through them, and return; this rank contributes and receives
+        nothing for itself. A rank joins the expert layers a step's forward
+        did not reach, so every rank exchanges at every layer of every step.
+        """
+        top_k = self.module.top_k
+        self(
+            torch.empty((0, hidden_size), dtype=dtype, device=self.device),
+            torch.empty((0, top_k), dtype=torch.int32, device=self.device),
+            torch.empty((0, top_k), dtype=torch.float32, device=self.device),
+        )
 
     def close(self):
         if self.operator is not None:

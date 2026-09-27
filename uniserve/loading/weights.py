@@ -255,19 +255,26 @@ def expert_assignments(
     layout). ``down`` is the ``[H, I]`` projection. With ``expert=None`` the
     tensors are stacked ``[E, ...]`` over all experts; otherwise they are one
     expert's matrices. The module's tensor-parallel interval of ``I`` selects
-    the resident rows: local up rows first, then local gate rows.
+    the resident rows: local up rows first, then local gate rows. Its
+    expert-parallel ``expert_slice`` selects the resident experts: a stacked
+    tensor contributes those experts only, and one expert outside the slice
+    assigns nothing.
     """
     local = module.intermediate_slice
     width = local.stop - local.start
     hidden = module.hidden_size
+    resident = module.expert_slice
     if expert is None:
-        experts: tuple[slice, ...] = (slice(0, module.num_experts),)
-        targets: tuple[slice, ...] = experts
+        experts: tuple[slice, ...] = (resident,)
+        targets: tuple[slice, ...] = (slice(0, resident.stop - resident.start),)
     else:
         if not 0 <= expert < module.num_experts:
             raise ValueError("expert index is outside the stacked experts")
+        if not resident.start <= expert < resident.stop:
+            return ()
         experts = ()
-        targets = (slice(expert, expert + 1),)
+        offset = expert - resident.start
+        targets = (slice(offset, offset + 1),)
 
     result = []
     for (weight, offset), rows in (

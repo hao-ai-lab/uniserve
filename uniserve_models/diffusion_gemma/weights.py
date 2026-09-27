@@ -154,24 +154,22 @@ def expert_sources(config: Config) -> Mapping[str, str]:
 
 
 def _expert_names(prefix: str, count: int) -> frozenset[str]:
-    """Every checkpoint name either expert layout may use under ``prefix``.
+    """Every checkpoint name either expert layout may use under ``prefix``."""
+    return frozenset({f"{prefix}.gate_up_proj", f"{prefix}.down_proj"}).union(
+        *(_single_expert_names(prefix, expert) for expert in range(count))
+    )
+
+
+def _single_expert_names(prefix: str, expert: int) -> frozenset[str]:
+    """The checkpoint names of one expert's matrices under ``prefix``.
 
     Per-expert matrices of a ModelOpt export carry their NVFP4 block, tensor
     and input scales beside each weight.
     """
     return frozenset(
-        {f"{prefix}.gate_up_proj", f"{prefix}.down_proj"}
-        | {
-            f"{prefix}.{expert}.{projection}_proj.{field}"
-            for expert in range(count)
-            for projection in ("gate", "up", "down")
-            for field in (
-                "weight",
-                "weight_scale",
-                "weight_scale_2",
-                "input_scale",
-            )
-        }
+        f"{prefix}.{expert}.{projection}_proj.{field}"
+        for projection in ("gate", "up", "down")
+        for field in ("weight", "weight_scale", "weight_scale_2", "input_scale")
     )
 
 
@@ -223,6 +221,19 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
         for path, prefix in experts.items()
         if path not in modules
         for name in _expert_names(prefix, config.text.num_experts)
+    )
+    # An expert-parallel layer keeps only the experts of its slice; the
+    # per-expert tensors of the others load on the ranks that keep them.
+    off_stage |= frozenset(
+        name
+        for path, prefix in experts.items()
+        if path in modules
+        for expert in range(config.text.num_experts)
+        if expert
+        not in range(
+            modules[path].expert_slice.start, modules[path].expert_slice.stop
+        )
+        for name in _single_expert_names(prefix, expert)
     )
     # A tensor still read by a resident parameter is never nonresident.
     off_stage -= {names[target] for target in parameters if target in names}

@@ -94,10 +94,17 @@ class FusedMoE(nn.Module):
     where ``act`` is SiLU or tanh-approximated GELU. Routing belongs to the
     model; this module consumes its result. Tensor-parallel binding splits
     ``I`` across the tensor-parallel group and sums the partial outputs once
-    after combining the experts. An active ``ExecutionContext`` supplies a
-    prepared expert kernel. A standalone call prepares a native kernel for
-    itself on a GPU and evaluates the portable reference on the CPU; a GPU
-    representation no native kernel covers is an error, not a slower path.
+    after combining the experts. Expert-parallel binding
+    (``uniserve.distributed.partition_experts``) keeps the global experts
+    ``expert_slice`` resident, ``[E / P, ...]`` of each stacked weight for an
+    expert group of ``P`` ranks, while ``topk_ids`` keep naming global
+    experts; its bound operator exchanges every routed token with the rank
+    holding its experts and returns the complete sum to the token's rank.
+    An active ``ExecutionContext`` supplies a prepared expert kernel. A
+    standalone call prepares a native kernel for itself on a GPU and
+    evaluates the portable reference on the CPU; a GPU representation no
+    native kernel covers is an error, not a slower path, and an
+    expert-parallel call needs the operator an execution context binds.
     """
 
     def __init__(
@@ -144,6 +151,11 @@ class FusedMoE(nn.Module):
         self.intermediate_slice = slice(0, intermediate_size)
         self.group = Communicator()
         self.communication_groups = (self.group,)
+        # Expert-parallel binding records the global experts this rank keeps
+        # and the group holding the rest. The group's exchange is bound by
+        # the runtime, so it is not a communication group of this module.
+        self.expert_slice = slice(0, num_experts)
+        self.expert_group = Communicator()
 
     def forward(
         self,
@@ -166,6 +178,11 @@ class FusedMoE(nn.Module):
         operator = _binding.moe.get().get(id(self))
         if operator is not None:
             result = operator(hidden, topk_ids, topk_weights)
+        elif self.expert_group.size > 1:
+            raise RuntimeError(
+                "expert-parallel experts exchange tokens through the operator "
+                "an execution context binds"
+            )
         elif hidden.device.type == "cpu":
             result = functional.fused_moe(
                 hidden,

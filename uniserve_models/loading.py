@@ -35,7 +35,7 @@ import torch
 from torch import nn
 
 from uniserve import loading
-from uniserve.distributed import DeviceMesh
+from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.loading import checkpoint
 from uniserve.loading import weights as weight_options
 from uniserve.model import ComponentEntry
@@ -1127,6 +1127,7 @@ def load_model(
     attention: Mapping[str, AttentionParallelConfig] | None = None,
     devices: Mapping[str, torch.device | str] | None = None,
     modules: frozenset[str] | None = None,
+    experts: Communicator | None = None,
 ) -> loading.Result[ModelT]:
     """Materialize the selected capability modules through the common loader.
 
@@ -1176,4 +1177,5 @@ def load_model(
         attention=attention,
         devices=devices,
         modules=selected,
+        experts=experts,
     )

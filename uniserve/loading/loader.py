@@ -9,7 +9,12 @@ from typing import Generic, TypeVar
 import torch
 from torch import nn
 
-from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.distributed import (
+    Communicator,
+    DeviceMesh,
+    parallelize_,
+    partition_experts,
+)
 from uniserve.nn.attention import AttentionParallelConfig
 
 from . import checkpoint as checkpoint_module
@@ -106,13 +111,16 @@ def load_model(
     attention: Mapping[str, AttentionParallelConfig] | None = None,
     devices: Mapping[str, torch.device | str] | None = None,
     modules: frozenset[str] | None = None,
+    experts: Communicator | None = None,
 ) -> Result[ModelT]:
     """Construct on meta, bind partitions, then materialize selected modules.
 
     The bound partitions are mathematical. Module paths choose resources and
     numerical settings. Unselected modules remain on meta so architecture
     dimensions and layout queries stay available. Neither constructors nor
-    the resulting model retain loading state.
+    the resulting model retain loading state. ``experts`` names the
+    expert-parallel group every ``FusedMoE`` shards its experts over
+    (``partition_experts``), so this rank reads only its own experts.
     """
     with torch.device("meta"):
         model = model_class(config)
@@ -163,6 +171,8 @@ def load_model(
                 mesh,
                 attention=attention.get(path, AttentionParallelConfig()),
             )
+    if experts is not None:
+        partition_experts(model, experts)
 
     declared = mapping(model)
     parameters = {

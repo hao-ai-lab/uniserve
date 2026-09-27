@@ -117,8 +117,13 @@ class _CuteDsl(_Operator):
         # stream alone; use_cuda_graph would only create the auxiliary
         # stream and events of the fused finalize's overlapped output
         # zeroing, which this combination never runs.
+        # ``experts`` counts the resident experts; an expert-parallel rank
+        # holds the global experts ``expert_slice`` and routing names global
+        # ids, which the kernels skip outside that range.
         self._kernel = CuteDslMoEWrapper(
-            num_experts=experts,
+            num_experts=module.num_experts,
+            num_local_experts=experts,
+            local_expert_offset=module.expert_slice.start,
             top_k=module.top_k,
             hidden_size=hidden,
             intermediate_size=intermediate,

@@ -151,12 +151,12 @@ class _TrtllmGen(_Operator):
             output1_scale_scalar=self._linear_scale,
             output1_scale_gate_scalar=self._gate_scale,
             output2_scale_scalar=self._down_scale,
-            num_experts=self._experts,
+            num_experts=self.module.num_experts,
             top_k=topk_ids.shape[1],
             n_group=None,
             topk_group=None,
             intermediate_size=self._intermediate,
-            local_expert_offset=0,
+            local_expert_offset=self.module.expert_slice.start,
             local_num_experts=self._experts,
             routed_scaling_factor=None,
             routing_method_type=self._routing,
@@ -185,3 +185,7 @@ class Backend(NVFP4Backend):
         if torch.cuda.get_device_capability(device)[0] != 10:
             return "the kernels are built for SM100-class devices"
         return None
+
+    def invalid_expert(self, module) -> int:
+        # The routed kernels mark an absent route with -1.
+        return -1

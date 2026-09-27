@@ -81,6 +81,10 @@ class _Cutlass(_Operator):
             tune_max_num_tokens=self.size.num_tokens,
             profile_ids=tactic,
             workspace_buffer=self.workspace["scratch"],
+            # Expert-parallel ranks hold the contiguous global experts of
+            # their group rank; ids of other ranks' experts are skipped.
+            ep_size=module.expert_group.size,
+            ep_rank=module.expert_group.rank,
         )
         return output
 
@@ -160,6 +164,8 @@ class Backend(_Backend):
             weight_dtype=weight.dtype,
             output_dtype=weight.dtype,
             activation_type=_activation(module.activation),
+            ep_size=module.expert_group.size,
+            ep_rank=module.expert_group.rank,
             device=weight.device,
         )
         return {"scratch": BufferConfig((nbytes,), torch.uint8)}
