@@ -39,6 +39,7 @@ from uniserve.cache.state import _blocks
 from uniserve.quantization import Quantizer
 from uniserve.tensors import BufferConfig
 
+from .device import async_tensor_h2d
 from .tensor_buffers import TensorBuffers
 
 _FIELDS = ("key", "value")
@@ -395,19 +396,6 @@ class PrefixCache:
             raise ValueError("unquantized K/V planes carry no scales")
         return self._fields[f"{field}.scale"]
 
-    def _unit_index(self, units: tuple[int, ...]) -> torch.Tensor:
-        """Stage unit ids as an index on the pool's device.
-
-        On CUDA the ids are copied from pinned host memory without blocking,
-        on the current stream: PyTorch's caching host allocator keeps the
-        pinned source until that copy completes, so the host never waits on
-        queued device work and the index is ordered before every later
-        operation on the stream.
-        """
-        pinned = self.device.type == "cuda"
-        index = torch.tensor(units, dtype=torch.long, pin_memory=pinned)
-        return index.to(self.device, non_blocking=pinned)
-
     def zero_units(self, units: tuple[int, ...]) -> None:
         """Reset caller-selected units in every column and field.
 
@@ -421,7 +409,7 @@ class PrefixCache:
         if not units:
             return
 
-        index = self._unit_index(units)
+        index = async_tensor_h2d(units, dtype=torch.long, device=self.device)
         for name, tensor in self._fields.items():
             # Every field is laid out [columns, num_units, ...].
             tensor.index_fill_(1, index, int(name.endswith(".scale")))
@@ -452,7 +440,7 @@ class PrefixCache:
         if not self.planes.quantized:
             return
 
-        index = self._unit_index(units)
+        index = async_tensor_h2d(units, dtype=torch.long, device=self.device)
         for field in _FIELDS:
             self._fields[f"{field}.initialized"].index_fill_(1, index, False)
             self._fields[f"{field}.scale"].index_fill_(1, index, 1)
@@ -468,7 +456,7 @@ class PrefixCache:
         if not units:
             return
 
-        index = self._unit_index(units)
+        index = async_tensor_h2d(units, dtype=torch.long, device=self.device)
         for field in _FIELDS:
             self._fields[f"{field}.initialized"].index_fill_(1, index, True)
 

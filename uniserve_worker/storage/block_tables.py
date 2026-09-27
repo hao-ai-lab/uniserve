@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 import torch
 
-from uniserve.runtime.device import fill_cpu_ints
+from uniserve.runtime.device import async_tensor_h2d, fill_cpu_ints
 from uniserve.runtime.resources import close_resources
 from uniserve.runtime.tensor_buffers import TensorBuffers
 from uniserve.tensors import BufferConfig
@@ -562,14 +562,13 @@ class BlockTables:
                 "released request slot is outside capacity"
             )
 
-        count = len(values)
-        slot, host = self._index_host.acquire()
-        fill_cpu_ints(host[1, :count], values)
-        indices = self._index_staging[1, :count]
-        indices.copy_(
-            host[1, :count], non_blocking=self.unit_tables.device.type == "cuda"
+        # Requests finish in bursts while later batches are already queued.
+        # A fresh pinned source per release never waits for them, where a
+        # reused staging generation would wait for its copy queued behind
+        # those batches.
+        indices = async_tensor_h2d(
+            values, dtype=torch.int64, device=self.unit_tables.device
         )
-        self._index_host.record_copy(slot)
 
         self.unit_tables.index_fill_(1, indices, 0)
         self.start_pages.index_fill_(1, indices, 0)

@@ -115,6 +115,42 @@ def test_table_updates_and_release_preserve_all_queued_snapshots(device, depth):
         tables.close()
 
 
+@pytest.mark.gpu
+def test_release_bursts_do_not_wait_for_queued_device_work():
+    tables = BlockTables(
+        groups=GROUPS,
+        request_pool_size=3,
+        width=3,
+        device="cuda:0",
+        staging_depth=1,
+    )
+    try:
+        tables.install(
+            (
+                (1, 0, 0, (2, 3), 8),
+                (2, 0, 0, (4, 5), 8),
+                (3, 0, 0, (6, 7), 8),
+            )
+        )
+        stream = torch.cuda.current_stream()
+        stream.synchronize()
+
+        # Requests finish in bursts while earlier batches still run: each
+        # release must be enqueued behind that work, never wait for it.
+        torch.cuda._sleep(1_000_000_000)
+        queued = torch.cuda.Event()
+        queued.record(stream)
+        for slot in (1, 2, 3):
+            tables.release((slot,))
+        assert not queued.query(), "a release waited for queued device work"
+
+        stream.synchronize()
+        assert torch.count_nonzero(tables.unit_tables[:, 1:]).item() == 0
+        assert tables.alloced_lens.tolist() == [0, 0, 0, 0]
+    finally:
+        tables.close()
+
+
 @pytest.mark.parametrize(
     "entry",
     (
