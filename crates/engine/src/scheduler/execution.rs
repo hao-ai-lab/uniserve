@@ -289,6 +289,15 @@ impl Scheduler {
     }
 }
 
+/// Describes a rejected worker result for the request's terminal error and
+/// its error finish's log line: the rejection, then the call it answered.
+fn rejection_cause(call: &Call, error: &generation::GenerationResultError) -> String {
+    format!(
+        "{error} (call {}.{}, {:?})",
+        call.call_id.batch_id, call.call_id.request_index, call.code
+    )
+}
+
 /// The calls that read a video call's products, or `None` for a call
 /// outside the video call graph.
 ///
@@ -2776,19 +2785,15 @@ impl Scheduler {
                     // outputs still being produced when cancellation arrived.
                     continue;
                 };
-                if generation::validate_generation_result(
+                if let Err(error) = generation::validate_generation_result(
                     &call,
                     image_kv,
                     latent.as_ref(),
                     state,
                     &record,
                     media.as_deref(),
-                )
-                .is_err()
-                {
-                    if self.running.contains_key(&id) {
-                        self.finish_after_inflight(id, FinishReason::Error, None);
-                    }
+                ) {
+                    self.fail_after_inflight(id, rejection_cause(&call, &error));
                     continue;
                 }
 
@@ -2846,10 +2851,8 @@ impl Scheduler {
                 } else {
                     None
                 };
-                if let Some(Err(_)) = progress_result {
-                    if self.running.contains_key(&id) {
-                        self.finish_after_inflight(id, FinishReason::Error, None);
-                    }
+                if let Some(Err(error)) = progress_result {
+                    self.fail_after_inflight(id, rejection_cause(&call, &error));
                     continue;
                 }
                 // An accepted forward extends the request's KV: publish the

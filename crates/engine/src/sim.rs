@@ -477,6 +477,9 @@ pub struct SimEngine {
     /// every configured control token, and never shrinks.
     vocab: usize,
     results_on_wait: bool,
+    /// Readout candidate whose log-probability is reported as NaN, as a
+    /// worker with a numerical defect reports it.
+    non_finite_candidate: Option<u32>,
     /// Admitted requests by id, removed when a `Finish` for the same request
     /// key executes.
     requests: HashMap<RequestId, SimRequestState>,
@@ -506,6 +509,7 @@ impl SimEngine {
             fake_eos: FAKE_EOS_TOKEN,
             vocab: SYNTH_VOCAB_SIZE,
             results_on_wait: false,
+            non_finite_candidate: None,
             requests: HashMap::new(),
         }
     }
@@ -643,6 +647,7 @@ impl SimEngine {
         vocab: usize,
         text_len: usize,
         fake_eos: u32,
+        non_finite_candidate: Option<u32>,
         call: &Call,
         request: &mut SimRequestState,
     ) -> anyhow::Result<RequestOutput> {
@@ -883,7 +888,13 @@ impl SimEngine {
                     record.candidate_logprobs = readout
                         .candidate_ids
                         .iter()
-                        .map(|&token| sim_candidate_logprob(call.request_key.request_id, token))
+                        .map(|&token| {
+                            if non_finite_candidate == Some(token) {
+                                f32::NAN
+                            } else {
+                                sim_candidate_logprob(call.request_key.request_id, token)
+                            }
+                        })
                         .collect();
                 }
             }
@@ -1071,6 +1082,12 @@ impl SimEngine {
         }
     }
 
+    /// Reports NaN as the log-probability of readout candidate `token`,
+    /// wherever a readout reads it.
+    pub fn set_non_finite_candidate(&mut self, token: u32) {
+        self.non_finite_candidate = Some(token);
+    }
+
     /// Returns mutable access to the simulator's advertised capabilities.
     pub fn mut_info_for_test(&mut self) -> &mut WorkerInfo {
         &mut self.info
@@ -1218,6 +1235,7 @@ impl SimEngine {
         let vocab = self.vocab;
         let text_len = self.text_len;
         let fake_eos = self.fake_eos;
+        let non_finite_candidate = self.non_finite_candidate;
         let mut completions = Vec::with_capacity(batch.requests.len());
         for (call, _) in batch.requests {
             let request = self
@@ -1273,7 +1291,14 @@ impl SimEngine {
                 continue;
             }
 
-            let completion = Self::execute_call(vocab, text_len, fake_eos, &call, request)?;
+            let completion = Self::execute_call(
+                vocab,
+                text_len,
+                fake_eos,
+                non_finite_candidate,
+                &call,
+                request,
+            )?;
             if completion.status == CallStatus::Ok && call.advances_state() {
                 request.state_call_id = call.call_id;
             }

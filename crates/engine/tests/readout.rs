@@ -278,6 +278,47 @@ fn a_readout_prefills_without_sampling_and_answers_every_candidate_once() {
     assert_eq!(readout.candidate_ids, vec![7, 8, 9, 10, 11, 12]);
 }
 
+/// A worker reporting a non-finite candidate log-probability fails the
+/// readout without an answer, and the request's terminal error names the
+/// field, the readout row and slot the value belongs to, and why it was
+/// rejected.
+#[test]
+fn a_non_finite_readout_logprob_fails_the_request_with_its_cause() {
+    let mut worker = readout_worker();
+    worker.set_non_finite_candidate(11);
+    let running = Running::start(worker, SchedulerConfig::default());
+    let request = readout_request(
+        1,
+        prompt(40, 1000),
+        vec![
+            row(32, &[(3, &[7, 8]), (9, &[9])]),
+            row(32, &[(4, &[10, 11, 12])]),
+        ],
+    );
+    let answer = events(running.submit(request));
+    running.stop();
+
+    assert!(
+        !answer
+            .iter()
+            .any(|event| matches!(event, EngineCoreOutput::Readout { .. })),
+        "a rejected readout gives no answer: {answer:?}"
+    );
+    let Some(EngineCoreOutput::Error { message }) = answer.last() else {
+        panic!("the readout did not fail with an error: {answer:?}");
+    };
+    // Candidate 11 is the second of the three read by the only slot of
+    // the second row, the fifth of the six candidates the pass reports.
+    for part in [
+        "candidate_logprobs[4]",
+        "not finite",
+        "readout row 1, slot 0",
+        "1 of 6",
+    ] {
+        assert!(message.contains(part), "{part:?} missing from {message:?}");
+    }
+}
+
 /// Rows join a pass whole while they fit the step's token budget, so a
 /// readout whose rows exceed one budget answers after several passes, still
 /// in report order.

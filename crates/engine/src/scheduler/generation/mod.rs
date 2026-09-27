@@ -1109,24 +1109,14 @@ pub(crate) fn validate_generation_result(
     // A readout reports one finite log-probability per declared candidate,
     // and no other call reports any.
     if let Some(readout) = &call.readout {
-        if record.candidate_logprobs.len() != readout.candidate_count() {
-            return Err(GenerationResultError::Product {
-                detail: "readout_candidate_count_mismatch",
-            });
-        }
-        if record
-            .candidate_logprobs
-            .iter()
-            .any(|logprob| !logprob.is_finite())
-        {
-            return Err(GenerationResultError::Product {
-                detail: "readout_logprob_not_finite",
-            });
-        }
+        validate_readout_logprobs(readout, state, &record.candidate_logprobs)
+            .map_err(GenerationResultError::Readout)?;
     } else if !record.candidate_logprobs.is_empty() {
-        return Err(GenerationResultError::Product {
-            detail: "unexpected_candidate_logprobs",
-        });
+        return Err(GenerationResultError::Readout(
+            ReadoutRejection::Unexpected {
+                reported: record.candidate_logprobs.len(),
+            },
+        ));
     }
 
     // A feature write must reach exactly `start + tokens` when the encoder
@@ -1341,7 +1331,96 @@ pub(crate) fn validate_generation_result(
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Checks a readout call's reported log-probabilities against its declared
+/// candidates.
+///
+/// The call covers the request's readout rows from `state.readout_rows`, the
+/// rows accepted before it, since results apply in submission order. A
+/// rejection names the request-level readout row and the slot within that
+/// row of the first non-finite value, so a failure points at the answer it
+/// would have corrupted.
+fn validate_readout_logprobs(
+    readout: &Readout,
+    state: &RequestState,
+    logprobs: &[f32],
+) -> Result<(), ReadoutRejection> {
+    let declared = readout.candidate_count();
+    if logprobs.len() != declared {
+        return Err(ReadoutRejection::CandidateCount {
+            reported: logprobs.len(),
+            declared,
+        });
+    }
+
+    let mut non_finite = logprobs
+        .iter()
+        .enumerate()
+        .filter(|(_, logprob)| !logprob.is_finite());
+    let Some((candidate, &value)) = non_finite.next() else {
+        return Ok(());
+    };
+
+    // `candidate_offsets` partitions the candidates by the call's slots, so
+    // the slot is the last one starting at or before the candidate. Rows
+    // contribute their slots to the call in order.
+    let call_slot = readout
+        .candidate_offsets
+        .partition_point(|&offset| offset as usize <= candidate)
+        .saturating_sub(1);
+    let rows = state
+        .req
+        .readout
+        .get(state.readout_rows..)
+        .unwrap_or_default();
+    let mut row = state.readout_rows;
+    let mut slot = call_slot;
+    for readout_row in rows {
+        if slot < readout_row.slots.len() {
+            break;
+        }
+        slot -= readout_row.slots.len();
+        row += 1;
+    }
+
+    Err(ReadoutRejection::NonFinite {
+        candidate,
+        value,
+        row,
+        slot,
+        count: 1 + non_finite.count(),
+        total: declared,
+    })
+}
+
+/// Why a readout call's reported log-probabilities were rejected.
+///
+/// Rows are the request's readout rows and slots the answer slots of one
+/// row, both counted from zero; `candidate` indexes the call's reported
+/// `candidate_logprobs`.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub(crate) enum ReadoutRejection {
+    /// The result's value count differs from the call's declared candidates.
+    #[error("candidate_logprobs has {reported} values for {declared} declared candidates")]
+    CandidateCount { reported: usize, declared: usize },
+    /// A value is NaN or infinite; `count` of the `total` values are.
+    #[error(
+        "candidate_logprobs[{candidate}] = {value} is not finite (readout row {row}, slot \
+         {slot}); {count} of {total} values are not finite"
+    )]
+    NonFinite {
+        candidate: usize,
+        value: f32,
+        row: usize,
+        slot: usize,
+        count: usize,
+        total: usize,
+    },
+    /// A call without a readout reports candidate log-probabilities.
+    #[error("candidate_logprobs has {reported} values for a call without a readout")]
+    Unexpected { reported: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 /// Invalid execution identity, numerical result, or produced value.
 pub(crate) enum GenerationResultError {
     #[error("call has no registered identity")]
@@ -1360,6 +1439,8 @@ pub(crate) enum GenerationResultError {
     Token { detail: &'static str },
     #[error("worker logprob result invalid: {detail}")]
     Logprob { detail: &'static str },
+    #[error("worker readout result invalid: {0}")]
+    Readout(ReadoutRejection),
 }
 
 /// Engine-owned state for one admitted request.
@@ -1482,6 +1563,10 @@ pub(crate) struct RequestState {
     /// Unix time, in seconds, at which the request state was created.
     pub queued_at: f64,
     pub(crate) terminal_intent: TerminalIntent,
+    /// Cause of the first rejected worker result, which
+    /// `Scheduler::fail_after_inflight` reports as the request's terminal
+    /// error and its error finish logs.
+    pub(super) failure: Option<String>,
 }
 
 impl RequestState {
