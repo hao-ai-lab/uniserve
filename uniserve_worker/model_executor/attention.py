@@ -10,11 +10,12 @@ page size, write addresses and, for a history-windowed group, the first page
 each row stages.
 
 This module validates one homogeneous group of ``AttentionRow`` values
-against the installed tables, selects the pages each numerical table stages,
-and builds the host-side attention batch (``PagedInput`` entries for rows
-that append to the cache, ``SegmentedInput`` entries for read-only
-prefix/current calls) that ``uniserve_worker.model_executor.input_buffers``
-then stages into its fixed device backing.
+against the installed tables (``row_tables``) and selects the pages each
+numerical table stages (``table_pages``); ``input_buffers.AttentionBuffers.
+stage_rows`` stages those pages from the resident tables on the device. For
+callers that pass a prepared batch it also builds the host-side attention
+batch (``from_tables``: ``PagedInput`` entries for rows that append to the
+cache, ``SegmentedInput`` entries for read-only prefix/current calls).
 """
 
 from __future__ import annotations
@@ -123,7 +124,7 @@ def row_tables(
             window = table.shape.window
             if (
                 window is not None
-                and _first_page(table, prefix) < table.start_page
+                and first_page(table, prefix) < table.start_page
             ):
                 raise invalid_descriptor(
                     "attention row reads retired window pages"
@@ -134,7 +135,7 @@ def row_tables(
     return tuple(result)
 
 
-def _first_page(table: GroupTable, prefix: int) -> int:
+def first_page(table: GroupTable, prefix: int) -> int:
     """Return the first page a row's queries after ``prefix`` read.
 
     A query at position ``p`` reads keys at positions ``p - window`` through
@@ -178,7 +179,7 @@ def table_pages(
             ):
                 table = row[group]
                 units = table.row(position)
-                start = _first_page(table, int(prefix))
+                start = first_page(table, int(prefix))
                 if shape.window is not None:
                     end = min(
                         table.end_page,
@@ -311,21 +312,4 @@ def _host_table(pages: TablePages) -> BlockTable:
         pages.block_size,
         torch.tensor(pages.start_pages, dtype=torch.int32),
         pages.start_pages,
-    )
-
-
-def columns(tasks, *, tables, cache):
-    """Build the attention batch for one homogeneous group of forward rows."""
-    query_lengths = tuple(task.query_tokens for task in tasks)
-    prefix_lengths = tuple(task.seq_len for task in tasks)
-    return from_tables(
-        table_pages(
-            row_tables(tasks, tables=tables, cache=cache),
-            prefix_lengths=prefix_lengths,
-            query_lengths=query_lengths,
-        ),
-        query_lengths=query_lengths,
-        prefix_lengths=prefix_lengths,
-        causal=tuple(task.causal for task in tasks),
-        write=tuple(task.write_kv for task in tasks),
     )
