@@ -10,19 +10,21 @@ into the batch's output buffer and stages the call's outcome.
 
 A generating call (``Call.canvas``) runs one denoising step of the canvas
 its request keeps in its slot; ``prepare_step`` turns it into one
-``CanvasStepRow``, and ``publish_step`` captures the row's stop flag and
-tokens, which the completion reports as its committed tokens once the step
-stops the canvas. A canvas pass writes no KV, so the request's coordinates
-stay where the call found them.
+``CanvasStepRow``, and ``publish_steps`` captures every stepped row's stop
+flag and tokens of a batch together, which each completion reports as its
+committed tokens once its step stops the canvas. A canvas pass writes no
+KV, so the request's coordinates stay where the call found them.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
+from uniserve.tensors import adjacent_view
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.execution import calls
 from uniserve_worker.execution.batch import BatchState
@@ -257,47 +259,82 @@ def prepare_step(
     )
 
 
-def publish_step(
-    call: Call,
-    value: torch.Tensor,
+def publish_steps(
+    steps: Sequence[tuple[Call, torch.Tensor]],
     *,
     state: BatchState,
     request_tables: BlockTables | None,
     tensor_store: TensorStore,
-) -> PendingOutput:
-    """Capture a canvas step's outcome and tokens and stage its outcome.
+) -> tuple[PendingOutput, ...]:
+    """Capture a batch's canvas step outcomes and tokens and stage them.
 
-    ``value`` is the row's int64 ``[1 + canvas]`` vector (``CanvasRunner``):
-    its outcome and its truncated argmax canvas. Both are captured into the
-    batch's output buffer, which reaches the host with the batch's one
-    completion copy; ``PendingOutput.materialize`` reports the tokens as the
-    call's committed tokens when the step stopped the block, and a skipped
-    step as predicated. The call's completion output receives, on the
-    device, whether the block continues after the step: the predicate of a
-    step queued behind it. The outcome reports the request's coordinates
-    unchanged, since the step wrote no KV.
+    ``steps`` pairs each canvas step call of the batch with its row's int64
+    ``[1 + canvas]`` vector (``CanvasRunner.step``): its outcome and its
+    truncated argmax canvas, in the forward's row order. The rows are
+    adjacent views of one ``[rows, 1 + canvas]`` block. ``CanvasRunner.step``
+    unbinds one result tensor, and a replayed graph's output clone keeps
+    same-dtype rows in one allocation. So the batch captures every row with
+    one copy into its output buffer, which reaches the host with the batch's
+    one completion copy, and each row's span follows the last.
+    ``PendingOutput.materialize`` reports a row's tokens as its call's
+    committed tokens when the step stopped the block, and a skipped step as
+    predicated.
+
+    Each call's completion output receives, on the device, whether its block
+    continues after the step: the predicate of a step queued behind it. One
+    publication covers every row, so each row's completion becomes visible
+    together with its values, after the same producer point on the stream.
+    The outcomes report the requests' coordinates unchanged, since a step
+    writes no KV.
+
+    Returns the staged outcome of each call, in ``steps`` order.
 
     Raises:
-        WorkerError: ``invalid_descriptor`` when the value does not hold the
-            call's canvas.
+        WorkerError: ``invalid_descriptor`` when a value does not hold its
+            call's canvas, or the rows are not adjacent rows of one block.
     """
-    request = state.pending_output(call.request_key.request_id)
-    if value.dtype != torch.int64 or value.shape != (
-        1 + call.bounds.max_tokens,
+    if not steps:
+        return ()
+    width = 1 + steps[0][0].bounds.max_tokens
+    if any(
+        value.dtype != torch.int64
+        or value.shape != (1 + call.bounds.max_tokens,)
+        or value.shape != (width,)
+        for call, value in steps
     ):
         raise invalid_descriptor("a canvas step does not cover its canvas")
-    request.token.canvas_range = state.output_buffer.capture(value)
-    write = request.completion_write
-    if write is not None:
-        (view,) = tensor_store.producer_write_views((write,))
-        tensor_store.publish_writes(
-            (write,), (value[:1] == STEP_CONTINUED).to(view.dtype)
+    block = adjacent_view(tuple(value for _call, value in steps))
+    if block is None:
+        raise invalid_descriptor(
+            "the canvas steps of a batch are not adjacent rows of one result"
         )
 
-    cache = calls.cache_coordinates(request, tables=request_tables)
-    request.status = CallStatus.OK
-    request.progress = calls.execution_runtime(request, cache)
-    request.finish_flags = FinishFlags()
-    request.product_generations = calls.output_generations(call)
-    request.token.committed_tokens = ()
-    return request
+    offset, _count = state.output_buffer.capture(block)
+    outcomes = []
+    writes = []
+    written_rows = []
+    for row, (call, _value) in enumerate(steps):
+        request = state.pending_output(call.request_key.request_id)
+        request.token.canvas_range = (offset + row * width, width)
+        if request.completion_write is not None:
+            writes.append(request.completion_write)
+            written_rows.append(row)
+
+        cache = calls.cache_coordinates(request, tables=request_tables)
+        request.status = CallStatus.OK
+        request.progress = calls.execution_runtime(request, cache)
+        request.finish_flags = FinishFlags()
+        request.product_generations = calls.output_generations(call)
+        request.token.committed_tokens = ()
+        outcomes.append(request)
+
+    if writes:
+        outcome_column = block.view(len(steps), width)[:, 0]
+        if len(written_rows) != len(steps):
+            outcome_column = outcome_column[written_rows]
+        (view, *_views) = tensor_store.producer_write_views(tuple(writes))
+        tensor_store.publish_writes(
+            tuple(writes),
+            (outcome_column == STEP_CONTINUED).to(view.dtype),
+        )
+    return tuple(outcomes)

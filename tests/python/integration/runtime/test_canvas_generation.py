@@ -68,7 +68,7 @@ from uniserve_worker.protocol.call import (
     CanvasStep,
     ForwardMode,
 )
-from uniserve_worker.protocol.identity import CallId
+from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.protocol.tensor import DType, ShapeBound, TensorRef
 
 pytestmark = pytest.mark.integration
@@ -453,3 +453,179 @@ def test_a_canvas_with_other_sampling_is_refused(tmp_path):
     other = replace(ADMITTED, max_steps=ADMITTED.max_steps + 1)
     assert _first_step_status(tmp_path, other, 0) is CallStatus.ERROR
     assert _first_step_status(tmp_path, ADMITTED, 0) is CallStatus.OK
+
+
+# A second request, in its own slot and cache units.
+SECOND = RequestKey(0, 8, 1)
+SECOND_SLOT = 2
+
+
+def _second_tables(tokens):
+    """Each group's table of the second request's slot, covering ``tokens``.
+
+    Group ``g`` holds units ``33 + 64 * g ...``, clear of the first
+    request's units.
+    """
+    return tuple(
+        replace(
+            table,
+            request_pool_idx=SECOND_SLOT,
+            unit_ids=tuple(unit + 32 for unit in table.unit_ids),
+        )
+        for table in _tables(tokens)
+    )
+
+
+def _row_step(batch, row, request, context, block, step, predicate=None):
+    """Row ``row`` of batch ``batch``: request ``request``'s canvas step."""
+    return replace(
+        _step(batch, context, block, step, predicate).calls[0],
+        request_key=request,
+        call_id=CallId(batch, row),
+        completion_output=TensorRef(
+            request_key=request,
+            producer_call_id=CallId(batch, row),
+            output_index=0,
+            generation=batch,
+            dtype=DType.U8,
+            shape_bound=ShapeBound(),
+        ),
+    )
+
+
+def _steps_batch(batch, rows):
+    """One batch of canvas steps, one row per entry of ``rows``.
+
+    Each entry holds a row's call, request slot, block tables and cached
+    context length, in row order.
+    """
+    return Batch(
+        batch_id=batch,
+        collective_seq=batch,
+        calls=tuple(call for call, _slot, _tables, _context in rows),
+        block_tables=tuple(
+            table for _call, _slot, tables, _context in rows for table in tables
+        ),
+        forward_call_indices=tuple(range(len(rows))),
+        request_pool_indices=tuple(slot for _call, slot, _tables, _c in rows),
+        seq_lens=tuple(context + CANVAS for _call, _s, _t, context in rows),
+        query_lens=(CANVAS,) * len(rows),
+        write_kv=(False,) * len(rows),
+    )
+
+
+def test_a_batch_of_canvas_steps_reports_each_rows_outcome(tmp_path):
+    """Rows stepped in one batch each report their own outcome.
+
+    The first request's block stops at its last step in the same batch as
+    the second request's block takes its first step. The stopped row, the
+    batch's second, reports its block as the reference does; the other row
+    reports no tokens. Each row's completion carries its own outcome: a
+    call predicated on the stopped row's completion is skipped, and the
+    continuing request's next step, predicated on its row's completion,
+    runs.
+    """
+    diffusion_gemma_checkpoint(tmp_path)
+    generator = torch.Generator().manual_seed(37)
+    first_prompt = torch.randint(7, 58, (13,), generator=generator).tolist()
+    second_prompt = torch.randint(7, 58, (13,), generator=generator).tolist()
+    expected = _expected_blocks(tmp_path, first_prompt)
+    stop = ADMITTED.max_steps - 1
+    assert [bool(tokens) for tokens in expected[: stop + 1]] == [
+        False
+    ] * stop + [True]
+
+    worker = _worker(tmp_path, canvas_sampling=ADMITTED)
+    with worker:
+        _admitted_prompt(worker, first_prompt)
+        second = _prefill(2, 0, tokens=second_prompt)
+        admitted = replace(
+            second,
+            calls=(replace(second.calls[0], request_key=SECOND),),
+            commands=(
+                Start(
+                    NewRequest(
+                        SECOND,
+                        SECOND_SLOT,
+                        generation=GenerationParams(
+                            sampling=SamplingParams(seed=SEED), canvas=ADMITTED
+                        ),
+                    )
+                ),
+            ),
+            block_tables=_second_tables(13 + CANVAS),
+            new_cache_units=tuple(
+                CacheUnitAllocation(SECOND_SLOT, table.group_id, table.unit_ids)
+                for table in _second_tables(13 + CANVAS)
+            ),
+            request_pool_indices=(SECOND_SLOT,),
+        )
+        assert _run(worker, admitted).completions[0].status is CallStatus.OK
+
+        # The first request steps alone up to its block's last step.
+        for step in range(stop):
+            (record,) = _run(worker, _step(3 + step, 13, 0, step)).completions
+            assert record.status is CallStatus.OK
+            assert not record.committed_tokens
+
+        batch = 3 + stop
+        continuing = _row_step(batch, 0, SECOND, 13, 0, 0)
+        stopping = _row_step(batch, 1, REQUEST, 13, 0, stop)
+        report = _run(
+            worker,
+            _steps_batch(
+                batch,
+                (
+                    (continuing, SECOND_SLOT, _second_tables(13 + CANVAS), 13),
+                    (stopping, SLOT, _tables(13 + CANVAS), 13),
+                ),
+            ),
+        )
+        records = {record.request_key: record for record in report.completions}
+        assert records[SECOND].status is CallStatus.OK
+        assert not records[SECOND].committed_tokens
+        assert records[REQUEST].status is CallStatus.OK
+        assert tuple(records[REQUEST].committed_tokens) == expected[stop]
+
+        # A commit gated on the stopped row's completion is skipped; the
+        # continuing request's next step, gated on its row's, runs.
+        gated_commit = _prefill(batch + 1, 13, tokens=list(expected[stop]))
+        (record,) = _run(
+            worker,
+            replace(
+                gated_commit,
+                calls=(
+                    replace(
+                        gated_commit.calls[0],
+                        predicate=stopping.completion_output,
+                    ),
+                ),
+                block_tables=_tables(13 + CANVAS),
+            ),
+        ).completions
+        assert record.status is CallStatus.PREDICATED
+        next_step = _row_step(
+            batch + 2,
+            0,
+            SECOND,
+            13,
+            0,
+            1,
+            predicate=continuing.completion_output,
+        )
+        (record,) = _run(
+            worker,
+            _steps_batch(
+                batch + 2,
+                ((next_step, SECOND_SLOT, _second_tables(13 + CANVAS), 13),),
+            ),
+        ).completions
+        assert record.status is CallStatus.OK
+        assert not record.committed_tokens
+        _run(
+            worker,
+            Batch(
+                batch_id=batch + 3,
+                commands=(Finish(REQUEST), Finish(SECOND)),
+            ),
+        )

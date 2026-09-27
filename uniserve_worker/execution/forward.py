@@ -593,8 +593,8 @@ def publish_forward_values(
     Dispatches each forward value by its call: denoiser predictions are
     collected per trajectory index and returned for
     ``integrate_predictions``; canvas readouts are collected per call and
-    published by ``canvas.publish``, and canvas steps by
-    ``canvas.publish_step``; sequence rows become sampling
+    published by ``canvas.publish``, and a batch's canvas steps together
+    by ``canvas.publish_steps``; sequence rows become sampling
     candidates (or finish directly when ``token.prepare_sampling`` returns an
     outcome);
     encoder values publish features; image-decoder values publish images.
@@ -608,6 +608,8 @@ def publish_forward_values(
 
     predictions: dict[int, list[torch.Tensor]] = defaultdict(list)
     readouts: dict[int, list[torch.Tensor]] = defaultdict(list)
+    # Canvas steps publish together, in row order, as one block.
+    steps: list[tuple[int, torch.Tensor]] = []
     samples: list[SampleCandidate] = []
 
     for (index, task), numerical_result in zip(forward, values, strict=True):
@@ -621,13 +623,7 @@ def publish_forward_values(
         elif (
             call.kind is ForwardMode.TOKEN_DENOISING and call.canvas is not None
         ):
-            outcomes[index] = canvas.publish_step(
-                call,
-                value,
-                request_tables=request_tables,
-                state=state,
-                tensor_store=tensor_store,
-            )
+            steps.append((index, value))
         elif call.kind is ForwardMode.TOKEN_DENOISING:
             # Canvas rows of one call arrive in row order.
             readouts[index].append(value)
@@ -687,6 +683,15 @@ def publish_forward_values(
                 tensor_store=tensor_store,
                 state=state,
             )
+
+    stepped = canvas.publish_steps(
+        tuple((scheduled[index], value) for index, value in steps),
+        request_tables=request_tables,
+        state=state,
+        tensor_store=tensor_store,
+    )
+    for (index, _value), outcome in zip(steps, stepped, strict=True):
+        outcomes[index] = outcome
 
     for index, rows in readouts.items():
         outcomes[index] = canvas.publish(
