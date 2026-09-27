@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from uniserve.math import ceil_div
 from uniserve.model import EmbeddingReplacement, TextInput
 from uniserve.nn.attention import (
     AttentionBatch,
@@ -120,8 +121,23 @@ def select_flow_captures(
     )
 
 
+def prefill_units(pages, rows, tokens):
+    """Return the fewest pool units a prefill of ``rows`` rows holds.
+
+    ``pages`` holds ``(page_tokens, units_per_page)`` of every cache group.
+    A prefill row writes its query tokens into pages of its own in every
+    group, so a call of ``rows`` rows and ``tokens`` query tokens holds at
+    least ``max(rows, ceil(tokens / page_tokens))`` pages of each group,
+    whatever its row lengths and prefixes. ``capture_lengths`` in
+    ``startup`` stages rows that hold exactly this many.
+    """
+    return sum(
+        units * max(rows, ceil_div(tokens, page)) for page, units in pages
+    )
+
+
 def select_prefill_captures(
-    token_sizes, row_sizes, *, max_rows, max_tokens, variants
+    token_sizes, row_sizes, *, max_rows, max_tokens, variants, pool=None
 ):
     """Build prefill capture buckets from configured token and row sizes.
 
@@ -136,6 +152,16 @@ def select_prefill_captures(
     exceed ``max_rows``, since a full batch still needs a strictly larger
     bucket. Every shape is captured once per ``(causal, embeddings)`` pair
     of ``variants``.
+
+    ``pool`` is ``(pages, units)``: the ``prefill_units`` pages of every
+    cache group and the unit pool's allocatable units, or None before the
+    pool is sized. A bucket serves batches of at least its ``live_rows``
+    rows and more tokens than the next smaller token bucket of its row
+    count; a bucket for which even the smallest such batch holds more units
+    than the pool is left out, since the engine never forms a batch it
+    serves. A row count's first token bucket serves batches of one token
+    per row, whose pages fit whenever ``live_rows`` rows fit, so the row
+    buckets, and the prefill row bound they report, are unchanged.
     """
     buckets: list[PrefillShape] = []
     sizes = {int(value) for value in token_sizes if value <= max_tokens}
@@ -146,13 +172,20 @@ def select_prefill_captures(
         if minimum_rows > max_rows:
             break
         minimum_tokens = minimum_rows if minimum_rows == 1 else minimum_rows + 1
+        # The fewest tokens of a batch the next bucket serves.
+        least = minimum_rows
         for tokens in sorted(
             value for value in sizes if value >= minimum_tokens
         ):
+            if pool is not None:
+                pages, units = pool
+                if prefill_units(pages, minimum_rows, least) > units:
+                    break
             buckets.extend(
                 PrefillShape(tokens, rows, minimum_rows, causal, embeddings)
                 for causal, embeddings in variants
             )
+            least = tokens + 1
         minimum_rows = rows
     return tuple(buckets)
 
@@ -178,19 +211,27 @@ def decode_captures(config, *, max_rows, row_units, num_units):
 
 
 def prefill_captures(
-    config, *, max_rows, max_tokens, image_builder, feature_injection
+    config,
+    *,
+    max_rows,
+    max_tokens,
+    image_builder,
+    feature_injection,
+    pool=None,
 ):
     """Select the prefill buckets a CUDA text entry captures at startup.
 
     ``config`` is the ``WorkerConfig``: its ``prefill_graph_token_sizes``
     and the fixed ``DEFAULT_PREFILL_GRAPH_ROW_BUCKETS`` size the buckets up to
     ``max_rows`` rows and ``max_tokens`` tokens, the most one staged call
-    holds. Causal text is always captured, with embedding replacement when
-    the lane has an ``image_builder`` (every prefill of such a lane replaces
-    embeddings); a model whose image processor declares
-    ``feature_injection`` also appends non-causal image feature rows, which
-    always replace embeddings. Empty when the graph policy is off or prefill
-    graphs are disabled, which leaves prefill calls eager.
+    holds, keeping those whose batches fit the unit ``pool`` (see
+    ``select_prefill_captures``). Causal text is always captured, with
+    embedding replacement when the lane has an ``image_builder`` (every
+    prefill of such a lane replaces embeddings); a model whose image
+    processor declares ``feature_injection`` also appends non-causal image
+    feature rows, which always replace embeddings. Empty when the graph
+    policy is off or prefill graphs are disabled, which leaves prefill calls
+    eager.
     """
     from uniserve_worker.config.execution import (
         DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
@@ -207,6 +248,7 @@ def prefill_captures(
         max_rows=max_rows,
         max_tokens=max_tokens,
         variants=variants,
+        pool=pool,
     )
 
 

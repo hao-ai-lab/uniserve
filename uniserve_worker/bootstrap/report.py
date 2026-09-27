@@ -650,6 +650,7 @@ def _token_worker_layout(
                         image_builder=flow is not None,
                         feature_injection=image_processor is not None
                         and image_processor.feature_injection is not None,
+                        pool=(page_shapes, capacity.num_units - 1),
                     ),
                     max_rows=min(max_rows, pool_rows),
                 )

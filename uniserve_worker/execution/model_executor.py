@@ -1250,6 +1250,13 @@ class ModelExecutor:
                         ),
                         image_builder=self.image_builder is not None,
                         feature_injection=feature_injection,
+                        pool=(
+                            tuple(
+                                (group.page_tokens, group.units_per_page)
+                                for group in kv_cache.shapes
+                            ),
+                            kv_cache.info.num_units - 1,
+                        ),
                     )
                     if ForwardMode.PREFILL in kinds and target.type == "cuda"
                     else ()
