@@ -1713,6 +1713,7 @@ def _bind_cache_tables(
         )
     page_tables.install(tuple(tables))
 
+    recycled: list[int] = []
     for allocation in inputs.new_cache_units:
         if allocation.request_pool_idx not in slots:
             continue
@@ -1726,18 +1727,20 @@ def _bind_cache_tables(
                 "new cache units are outside the installed block table"
             )
 
-        # A KV import zeroes the new units it covers before copying into them
-        # (`CacheImport.initialized_units`); every other new unit is zeroed
-        # here so stale cache content is never read.
+        # A KV import resets the new units it covers before copying into
+        # them (`CacheImport.initialized_units`); every other new unit is
+        # recycled for its new owner below.
         initialized = {
             unit
             for write in state.cache_imports.values()
             if write.request_pool_idx == allocation.request_pool_idx
             for unit in write.initialized_units
         }
-        cache.zero_units(
-            tuple(unit for unit in units if unit not in initialized)
-        )
+        recycled.extend(unit for unit in units if unit not in initialized)
+
+    # One recycle covers every allocation of the batch, so any device reset
+    # it needs is one launch per field rather than one per allocation.
+    cache.recycle_units(tuple(recycled))
 
     # Forward rows index `inputs.calls`, the full batch including predicated
     # calls, so rows are mapped by call identity rather than by position in
