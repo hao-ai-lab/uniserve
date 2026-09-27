@@ -2,7 +2,8 @@
 
 Every value is positive where a test bounds relative error, so each rounding
 step bounds the relative error of every output independently of
-cancellation. NVFP4 cases run on every native NVFP4 provider.
+cancellation. BF16 cases run on every native BF16 provider, NVFP4 cases on
+every native NVFP4 provider.
 """
 
 import pytest
@@ -21,6 +22,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 EXPERTS, HIDDEN, INTERMEDIATE, TOP_K, TOKENS = 8, 256, 128, 2, 40
 DEVICE = torch.device("cuda:0")
 E4M3_ONE = 0x38  # the E4M3 byte encoding 1.0
+BF16_PROVIDERS = ("cutedsl", "cutlass")
 NVFP4_PROVIDERS = ("cutedsl", "trtllm")
 
 
@@ -97,20 +99,20 @@ def _replay_matches(
     torch.cuda.synchronize(DEVICE)
 
 
-@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
-@torch.inference_mode()
-def test_bf16_experts_match_the_routed_equation(activation):
-    generator = torch.Generator().manual_seed(41)
+def _positive_bf16(activation, generator, top_k=TOP_K):
+    """BF16 experts and hidden states of positive values.
+
+    The operands are scaled so each projection stays near unit size.
+    """
     module = FusedMoE(
         EXPERTS,
         HIDDEN,
         INTERMEDIATE,
-        top_k=TOP_K,
+        top_k=top_k,
         activation=activation,
         device=DEVICE,
         dtype=torch.bfloat16,
     )
-    # Positive operands scaled so each projection stays near unit size.
     for parameter, fan_in in (
         (module.up_gate.weight, HIDDEN),
         (module.down.weight, INTERMEDIATE),
@@ -121,6 +123,15 @@ def test_bf16_experts_match_the_routed_equation(activation):
     hidden = (torch.rand(TOKENS, HIDDEN, generator=generator) + 0.125).to(
         DEVICE, torch.bfloat16
     )
+    return module, hidden
+
+
+@pytest.mark.parametrize("provider", BF16_PROVIDERS)
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+@torch.inference_mode()
+def test_bf16_experts_match_the_routed_equation(activation, provider):
+    generator = torch.Generator().manual_seed(41)
+    module, hidden = _positive_bf16(activation, generator)
     ids, weights = _routes(generator)
 
     def expected(hidden, ids, weights):
@@ -136,7 +147,84 @@ def test_bf16_experts_match_the_routed_equation(activation):
     # BF16 roundings of the activated intermediate, each expert's projection
     # and the combined output, plus the kernel's approximate activation,
     # whose relative error is below one BF16 unit on positive inputs.
-    _replay_matches(module, hidden, ids, weights, expected, rtol=_gamma(4))
+    _replay_matches(
+        module,
+        hidden,
+        ids,
+        weights,
+        expected,
+        rtol=_gamma(4),
+        provider=provider,
+    )
+
+
+@pytest.mark.parametrize("provider", BF16_PROVIDERS)
+@torch.inference_mode()
+def test_bf16_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
+    """Repeated eager calls and replays return the first output bit for bit.
+
+    Eight routes per token combine in a fixed order on every call.
+    """
+    top_k = EXPERTS
+    generator = torch.Generator().manual_seed(43)
+    module, hidden = _positive_bf16("gelu_tanh", generator, top_k=top_k)
+    ids, weights = _routes(generator, top_k=top_k)
+
+    stream = CUDAStream.external(torch.cuda.Stream(device=DEVICE))
+    stream.wait(torch.cuda.current_stream(DEVICE))
+    with (
+        stream,
+        ExecutionContext(module, stream=stream, moe=provider) as context,
+    ):
+        context.prepare(TextSize(TOKENS, 1))
+        with context.activate():
+            first = module(hidden, ids, weights).clone()
+            for _ in range(16):
+                assert torch.equal(module(hidden, ids, weights), first)
+        with CUDAGraph(context=context) as graph:
+            graph.capture(lambda: module(hidden, ids, weights))
+            for _ in range(16):
+                assert torch.equal(graph.replay(), first)
+    torch.cuda.synchronize(DEVICE)
+
+
+@torch.inference_mode()
+def test_an_expert_parallel_rank_sums_the_routes_to_its_resident_experts():
+    """A rank holding a slice of the experts combines only their routes.
+
+    Routing keeps naming global experts. Routes to experts other ranks hold,
+    and to ``num_experts``, the id an exchange gives unused rows, add
+    nothing, so an exchange can sum the ranks' partial outputs.
+    """
+    generator = torch.Generator().manual_seed(73)
+    module, hidden = _positive_bf16("gelu_tanh", generator)
+    up_gate, down = module.up_gate.weight.clone(), module.down.weight.clone()
+    resident = slice(EXPERTS // 2, EXPERTS)
+    for linear, weight in ((module.up_gate, up_gate), (module.down, down)):
+        linear.weight = torch.nn.Parameter(
+            weight[resident].clone(), requires_grad=False
+        )
+    module.expert_slice = resident
+    ids, weights = _routes(generator)
+    ids[: TOKENS // 4, 0] = EXPERTS
+
+    kept = (ids >= resident.start) & (ids < resident.stop)
+    expected = _reference(
+        hidden,
+        up_gate,
+        down,
+        ids.clamp(max=EXPERTS - 1),
+        torch.where(kept, weights, 0.0),
+        "gelu_tanh",
+    )
+    with ExecutionContext(module, moe="cutedsl") as context:
+        context.prepare(TextSize(TOKENS, 1))
+        with context.activate():
+            actual = module(hidden, ids, weights)
+    # As for all experts resident; tokens with no resident route are zero.
+    torch.testing.assert_close(
+        actual.double(), expected, rtol=_gamma(4), atol=0
+    )
 
 
 def _nvfp4(codes, block_scale, tensor_scale):

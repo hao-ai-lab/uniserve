@@ -1677,6 +1677,804 @@
    "mismatched": 0,
    "measured_utc": "2026-09-27T03:15:00+00:00",
    "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 1,
+   "tactic": [
+    null
+   ],
+   "median_ms": {
+    "uniform": 0.03324000090360642,
+    "shared": 0.03217599987983703
+   },
+   "default_median_ms": {
+    "uniform": 0.03324000090360642,
+    "shared": 0.03217599987983703
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 2,
+   "tactic": [
+    [
+     [
+      [
+       128,
+       128
+      ],
+      [
+       1,
+       1
+      ]
+     ],
+     [
+      [
+       128,
+       128
+      ],
+      [
+       1,
+       2
+      ]
+     ]
+    ]
+   ],
+   "median_ms": {
+    "uniform": 0.056185600161552426,
+    "shared": 0.043875199556350705
+   },
+   "default_median_ms": {
+    "uniform": 0.056617599725723264,
+    "shared": 0.04410400092601776
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 4,
+   "tactic": [
+    null
+   ],
+   "median_ms": {
+    "uniform": 0.08051519989967346,
+    "shared": 0.053548800945281985
+   },
+   "default_median_ms": {
+    "uniform": 0.08051519989967346,
+    "shared": 0.053548800945281985
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 8,
+   "tactic": [
+    null
+   ],
+   "median_ms": {
+    "uniform": 0.11471039652824402,
+    "shared": 0.05529119968414307
+   },
+   "default_median_ms": {
+    "uniform": 0.11471039652824402,
+    "shared": 0.05529119968414307
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 16,
+   "tactic": [
+    null
+   ],
+   "median_ms": {
+    "uniform": 0.16807680130004882,
+    "shared": 0.05643999874591828
+   },
+   "default_median_ms": {
+    "uniform": 0.16807680130004882,
+    "shared": 0.05643999874591828
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 32,
+   "tactic": [
+    null
+   ],
+   "median_ms": {
+    "uniform": 0.2194607973098755,
+    "shared": 0.0562175989151001
+   },
+   "default_median_ms": {
+    "uniform": 0.2194607973098755,
+    "shared": 0.0562175989151001
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 64,
+   "tactic": [
+    null
+   ],
+   "median_ms": {
+    "uniform": 0.25465760231018064,
+    "shared": 0.05730559825897216
+   },
+   "default_median_ms": {
+    "uniform": 0.25465760231018064,
+    "shared": 0.05730559825897216
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 128,
+   "tactic": [
+    null
+   ],
+   "median_ms": {
+    "uniform": 0.2588176012039185,
+    "shared": 0.05983040034770966
+   },
+   "default_median_ms": {
+    "uniform": 0.2588176012039185,
+    "shared": 0.05983040034770966
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 256,
+   "tactic": [
+    null
+   ],
+   "median_ms": {
+    "uniform": 0.2620047926902771,
+    "shared": 0.06125440001487732
+   },
+   "default_median_ms": {
+    "uniform": 0.2620047926902771,
+    "shared": 0.06125440001487732
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 384,
+   "tactic": [
+    null
+   ],
+   "median_ms": {
+    "uniform": 0.26504479646682744,
+    "shared": 0.07269439995288848
+   },
+   "default_median_ms": {
+    "uniform": 0.26504479646682744,
+    "shared": 0.07269439995288848
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 512,
+   "tactic": [
+    null
+   ],
+   "median_ms": {
+    "uniform": 0.26548320055007935,
+    "shared": 0.08015040159225464
+   },
+   "default_median_ms": {
+    "uniform": 0.26548320055007935,
+    "shared": 0.08015040159225464
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 768,
+   "tactic": [
+    [
+     [
+      [
+       128,
+       128
+      ],
+      [
+       1,
+       1
+      ]
+     ],
+     [
+      [
+       128,
+       128
+      ],
+      [
+       1,
+       2
+      ]
+     ]
+    ]
+   ],
+   "median_ms": {
+    "uniform": 0.2752496004104614,
+    "shared": 0.10662879943847656
+   },
+   "default_median_ms": {
+    "uniform": 0.2757264018058777,
+    "shared": 0.11577600240707397
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 1024,
+   "tactic": [
+    null
+   ],
+   "median_ms": {
+    "uniform": 0.2804272055625916,
+    "shared": 0.13271039724349976
+   },
+   "default_median_ms": {
+    "uniform": 0.2804272055625916,
+    "shared": 0.13271039724349976
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 1536,
+   "tactic": [
+    [
+     [
+      [
+       128,
+       128
+      ],
+      [
+       1,
+       1
+      ]
+     ],
+     [
+      [
+       128,
+       128
+      ],
+      [
+       1,
+       2
+      ]
+     ]
+    ]
+   ],
+   "median_ms": {
+    "uniform": 0.28882399797439573,
+    "shared": 0.17763839960098265
+   },
+   "default_median_ms": {
+    "uniform": 0.28964159488677976,
+    "shared": 0.1840719997882843
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 2048,
+   "tactic": [
+    [
+     [
+      [
+       128,
+       128
+      ],
+      [
+       1,
+       1
+      ]
+     ],
+     [
+      [
+       128,
+       256
+      ],
+      [
+       1,
+       1
+      ]
+     ]
+    ]
+   ],
+   "median_ms": {
+    "uniform": 0.33609120845794677,
+    "shared": 0.20597440004348755
+   },
+   "default_median_ms": {
+    "uniform": 0.34829440116882326,
+    "shared": 0.25269120931625366
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 3072,
+   "tactic": [
+    [
+     [
+      [
+       256,
+       128
+      ],
+      [
+       2,
+       1
+      ]
+     ],
+     [
+      [
+       256,
+       256
+      ],
+      [
+       2,
+       1
+      ]
+     ]
+    ]
+   ],
+   "median_ms": {
+    "uniform": 0.410427188873291,
+    "shared": 0.3172639966011047
+   },
+   "default_median_ms": {
+    "uniform": 0.4437583923339844,
+    "shared": 0.3621455907821655
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 4096,
+   "tactic": [
+    [
+     [
+      [
+       256,
+       128
+      ],
+      [
+       2,
+       1
+      ]
+     ],
+     [
+      [
+       256,
+       128
+      ],
+      [
+       2,
+       2
+      ]
+     ]
+    ]
+   ],
+   "median_ms": {
+    "uniform": 0.5188431978225708,
+    "shared": 0.3868896007537842
+   },
+   "default_median_ms": {
+    "uniform": 0.553108811378479,
+    "shared": 0.49394237995147705
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 6144,
+   "tactic": [
+    [
+     [
+      [
+       128,
+       128
+      ],
+      [
+       1,
+       1
+      ]
+     ],
+     [
+      [
+       128,
+       256
+      ],
+      [
+       1,
+       1
+      ]
+     ]
+    ]
+   ],
+   "median_ms": {
+    "uniform": 0.6926336050033569,
+    "shared": 0.5976320028305053
+   },
+   "default_median_ms": {
+    "uniform": 0.7822207927703857,
+    "shared": 0.6656847953796388
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 8192,
+   "tactic": [
+    [
+     [
+      [
+       256,
+       128
+      ],
+      [
+       2,
+       1
+      ]
+     ],
+     [
+      [
+       256,
+       256
+      ],
+      [
+       2,
+       1
+      ]
+     ]
+    ]
+   ],
+   "median_ms": {
+    "uniform": 0.9207087993621826,
+    "shared": 0.7707552194595337
+   },
+   "default_median_ms": {
+    "uniform": 0.9390640258789062,
+    "shared": 0.8847904205322266
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 12288,
+   "tactic": [
+    [
+     [
+      [
+       256,
+       128
+      ],
+      [
+       2,
+       1
+      ]
+     ],
+     [
+      [
+       256,
+       256
+      ],
+      [
+       2,
+       1
+      ]
+     ]
+    ]
+   ],
+   "median_ms": {
+    "uniform": 1.3339151859283447,
+    "shared": 1.099241590499878
+   },
+   "default_median_ms": {
+    "uniform": 1.3750064373016357,
+    "shared": 1.3071791648864746
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
+  },
+  {
+   "device": "NVIDIA GB200",
+   "flashinfer": "0.6.18",
+   "provider": "cutedsl",
+   "format": "bfloat16",
+   "experts": 128,
+   "hidden": 2816,
+   "intermediate": 704,
+   "top_k": 8,
+   "activation": "gelu_tanh",
+   "tokens": 16384,
+   "tactic": [
+    [
+     [
+      [
+       256,
+       128
+      ],
+      [
+       2,
+       1
+      ]
+     ],
+     [
+      [
+       256,
+       256
+      ],
+      [
+       2,
+       1
+      ]
+     ]
+    ]
+   ],
+   "median_ms": {
+    "uniform": 1.7104047775268554,
+    "shared": 1.5157439708709717
+   },
+   "default_median_ms": {
+    "uniform": 1.9394335746765137,
+    "shared": 1.7498095512390135
+   },
+   "candidates": 7,
+   "failed": 0,
+   "mismatched": 0,
+   "measured_utc": "2026-09-27T06:20:06+00:00",
+   "rounds": 10
   }
  ]
 }
