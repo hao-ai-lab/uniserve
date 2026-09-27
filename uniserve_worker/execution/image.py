@@ -574,9 +574,11 @@ def vision_state_row(
         token_embeddings=token_embeddings,
         token_embedding_mask=embedding_mask,
         positions=positions,
+        # A row that samples no token only writes the K/V cache; its
+        # outcome reads no output (``token._finish_visual``).
         selection=TokenSelection.LAST_LOGITS
         if logits
-        else TokenSelection.HIDDEN,
+        else TokenSelection.CACHE,
         request_pool_idx=cache[0],
         seq_len=cache[1],
         write_kv=True,

@@ -36,6 +36,34 @@ class CacheLayer:
     head_dim: int
 
 
+class PhasedLayer:
+    """A decoder layer whose evaluation splits after its attention sublayer.
+
+    ``forward(hidden, residual, positions, attention)`` equals
+    ``feed_forward(*attend(hidden, residual, positions, attention))``.
+    ``attend`` evaluates the attention sublayer, which mixes tokens, and
+    returns the layer's state after it as a tuple of ``[tokens, ...]``
+    tensors; ``feed_forward`` evaluates the rest of the layer from that
+    state and returns its ``(hidden, residual)`` streams. The rest acts on
+    each token alone, so ``feed_forward`` may evaluate any subset of the
+    state's rows. ``write_cache`` evaluates the layer only up to its K/V
+    cache write and returns nothing, for a pass whose only product is the
+    cache. ``TransformerDecoder`` uses these phases for its final layer; a
+    final layer without them runs whole.
+    """
+
+    def attend(
+        self, hidden, residual, positions, attention
+    ) -> tuple[torch.Tensor, ...]:
+        raise NotImplementedError
+
+    def feed_forward(self, *state: torch.Tensor):
+        raise NotImplementedError
+
+    def write_cache(self, hidden, residual, positions, attention) -> None:
+        raise NotImplementedError
+
+
 class TransformerDecoder(nn.Module):
     """Traverse resident layers, carrying a separate residual stream.
 
@@ -50,6 +78,12 @@ class TransformerDecoder(nn.Module):
     with their original dtypes; only the final stage normalizes and gathers
     the token shards. Placement binding selects resident modules before
     loading.
+
+    Besides the complete pass (``forward``), ``fill_cache`` evaluates the
+    model's final layer only up to its K/V cache write
+    (``PhasedLayer.write_cache``), for prompts whose only product is the
+    cache. Every other layer, and every layer of an earlier pipeline stage,
+    runs whole.
     """
 
     # Pipeline binding drops the embedding outside the first stage and the
@@ -144,6 +178,62 @@ class TransformerDecoder(nn.Module):
         *,
         routes: tuple[RouteSpan, ...] = (),
     ) -> torch.Tensor:
+        """Evaluate every layer and, on the final stage, the output norm.
+
+        Returns the final stage's normalized ``[tokens, hidden]`` rows, or
+        the activations an earlier stage forwards.
+        """
+        traversal = self._traverse(
+            embeddings, positions, attention, routes, split=False
+        )
+        hidden, residual, local_routes = (
+            traversal.hidden,
+            traversal.residual,
+            traversal.routes,
+        )
+        if self._pipeline.rank != self._pipeline.size - 1:
+            return self._forward_stage(hidden, residual, local_routes)
+        return traversal.partition.gather(
+            self._normalize(hidden, residual, local_routes)
+        )
+
+    def fill_cache(
+        self,
+        embeddings: torch.Tensor | None,
+        positions: torch.Tensor,
+        attention: AttentionBatch,
+        *,
+        routes: tuple[RouteSpan, ...] = (),
+    ) -> None:
+        """Write every layer's K/V cache without evaluating any output.
+
+        The final layer stops at its K/V write (``PhasedLayer.write_cache``)
+        and the output norm is skipped; earlier stages forward their
+        activations as ``forward`` does. The cache holds exactly what
+        ``forward`` writes.
+        """
+        traversal = self._traverse(
+            embeddings, positions, attention, routes, split=True
+        )
+        if self._pipeline.rank != self._pipeline.size - 1:
+            self._forward_stage(
+                traversal.hidden, traversal.residual, traversal.routes
+            )
+        elif traversal.final is not None:
+            traversal.final.write_cache(
+                traversal.hidden,
+                traversal.residual,
+                traversal.positions,
+                attention,
+            )
+
+    def _traverse(self, embeddings, positions, attention, routes, *, split):
+        """Evaluate the resident layers, all but a split final layer.
+
+        With ``split``, an unrouted pass leaves the model's final layer on
+        the final pipeline stage unevaluated when it is a ``PhasedLayer``,
+        returning it as ``final`` with the streams it would receive.
+        """
         count = positions.shape[-1]
         if not routes and self._default_route is not None:
             routes = (RouteSpan(self._default_route, 0, count),)
@@ -196,7 +286,16 @@ class TransformerDecoder(nn.Module):
                     residual, local_routes, routes=keys
                 )
 
-        for layer in self.layers.values():
+        layers = tuple(self.layers.values())
+        final = None
+        if (
+            split
+            and not routes
+            and self._pipeline.rank == self._pipeline.size - 1
+            and isinstance(layers[-1], PhasedLayer)
+        ):
+            final, layers = layers[-1], layers[:-1]
+        for layer in layers:
             if routes:
                 hidden, residual = layer(
                     hidden, residual, positions, attention, routes=local_routes
@@ -205,31 +304,36 @@ class TransformerDecoder(nn.Module):
                 hidden, residual = layer(hidden, residual, positions, attention)
         # Layers that defer their residual addition return the stream they
         # carry forward; complete-stream layers return none.
-        if (residual is None) == self.separate_residual:
+        if final is None and (residual is None) == self.separate_residual:
             raise ValueError(
                 "decoder layers must return a residual stream exactly when "
                 "the decoder carries one separately"
             )
+        return _Traversal(
+            hidden, residual, positions, partition, local_routes, final
+        )
 
-        last = self._pipeline.rank == self._pipeline.size - 1
-        if not last:
-            for stream in (hidden, residual):
-                if stream is None:
-                    continue
-                packed = (
-                    stream.packed(local_routes)
-                    if isinstance(stream, RoutedTensor)
-                    else stream
-                )
-                self._pipeline.send(packed, dst=self._pipeline.rank + 1)
-            return (
-                hidden.packed(local_routes)
-                if isinstance(hidden, RoutedTensor)
-                else hidden
+    def _forward_stage(self, hidden, residual, local_routes):
+        """Send an earlier stage's streams on and return its hidden stream."""
+        for stream in (hidden, residual):
+            if stream is None:
+                continue
+            packed = (
+                stream.packed(local_routes)
+                if isinstance(stream, RoutedTensor)
+                else stream
             )
+            self._pipeline.send(packed, dst=self._pipeline.rank + 1)
+        return (
+            hidden.packed(local_routes)
+            if isinstance(hidden, RoutedTensor)
+            else hidden
+        )
 
-        # Fold the residual into the output norm only on the final stage,
-        # which retains the norm. Layers keep both streams in one form.
+    def _normalize(self, hidden, residual, local_routes):
+        """Fold the residual into the final stage's output norm."""
+        # Only the final stage retains the norm. Layers keep both streams in
+        # one form.
         norm = self.norm
         assert norm is not None
         if residual is None:
@@ -250,7 +354,23 @@ class TransformerDecoder(nn.Module):
                 )
             else:
                 result = norm(hidden + residual)
-        return partition.gather(result)
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class _Traversal:
+    """The streams one ``TransformerDecoder._traverse`` leaves, and how.
+
+    ``positions`` and ``routes`` are local to this rank's token shard of
+    ``partition``; ``final`` is the unevaluated final layer of a split pass.
+    """
+
+    hidden: torch.Tensor | RoutedTensor
+    residual: torch.Tensor | RoutedTensor | None
+    positions: torch.Tensor
+    partition: TokenShard
+    routes: tuple[RouteSpan, ...]
+    final: PhasedLayer | None
 
 
 class TransformerEncoder(nn.Module):

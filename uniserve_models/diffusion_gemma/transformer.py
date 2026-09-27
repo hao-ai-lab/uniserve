@@ -12,7 +12,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from uniserve.model import TransformerDecoder
+from uniserve.model import PhasedLayer, TransformerDecoder
 from uniserve.nn.attention import Attention as ScaledAttention
 from uniserve.nn.attention import AttentionBatch
 from uniserve.nn.functional import qk_norm_rope, sandwich_rms_norm
@@ -89,6 +89,24 @@ class Attention(nn.Module):
         positions: torch.Tensor,
         attention: AttentionBatch,
     ) -> torch.Tensor:
+        query, key, value = self._project(hidden, positions)
+        attended = self.attention(query, key, value, attention)
+        return self.output(attended.flatten(1))
+
+    def write_cache(
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        attention: AttentionBatch,
+    ) -> None:
+        """Write the K/V ``forward`` writes, without attending."""
+        _, key, value = self._project(hidden, positions)
+        self.attention.update_cache(key, value, attention)
+
+    def _project(
+        self, hidden: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Normalized, rotated ``[tokens, local heads, head_dim]`` Q, K, V."""
         # Compact [tokens, head_dim / 2] factors; proportional recipes give
         # the unrotated pairs a zero angle.
         cos, sin = self.rotary(
@@ -117,8 +135,7 @@ class Attention(nn.Module):
             eps=self.eps,
             axis_dims=(self.head_dim,),
         )
-        attended = self.attention(query, key, value, attention)
-        return self.output(attended.flatten(1))
+        return query, key, value
 
 
 class Router(nn.Module):
@@ -187,7 +204,7 @@ class MoE(nn.Module):
         return self.experts(hidden, ids, weights)
 
 
-class Layer(nn.Module):
+class Layer(nn.Module, PhasedLayer):
     """One Gemma-4 layer with sandwich norms and a trailing layer scalar.
 
     With ``h = x + post_attention_norm(attention(input_norm(x)))`` the layer
@@ -198,7 +215,10 @@ class Layer(nn.Module):
     evaluate everything between the attention, MLP and expert calls. The
     scalar rescales the whole stream, so the layer cannot defer its residual
     addition: it receives and returns ``residual=None`` and ``hidden`` is
-    the complete stream, rounded where the reference rounds it.
+    the complete stream, rounded where the reference rounds it. ``attend``
+    returns ``(x, attention(input_norm(x)))``, from which ``feed_forward``
+    evaluates the rest token by token, starting with the first sandwich
+    normalization.
     """
 
     def __init__(self, config: TextConfig, index: int):
@@ -225,10 +245,25 @@ class Layer(nn.Module):
         positions: torch.Tensor,
         attention: AttentionBatch,
     ) -> tuple[torch.Tensor, None]:
+        return self.feed_forward(
+            *self.attend(hidden, residual, positions, attention)
+        )
+
+    def attend(
+        self,
+        hidden: torch.Tensor,
+        residual: None,
+        positions: torch.Tensor,
+        attention: AttentionBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is not None:
             raise ValueError("DiffusionGemma layers carry the complete stream")
-
         attended = self.attention(self.input_norm(hidden), positions, attention)
+        return hidden, attended
+
+    def feed_forward(
+        self, hidden: torch.Tensor, attended: torch.Tensor
+    ) -> tuple[torch.Tensor, None]:
         stream, (dense_input, expert_input, routed) = sandwich_rms_norm(
             hidden,
             ((attended, None),),
@@ -254,6 +289,19 @@ class Layer(nn.Module):
             scale=self.layer_scalar,
         )
         return stream, None
+
+    def write_cache(
+        self,
+        hidden: torch.Tensor,
+        residual: None,
+        positions: torch.Tensor,
+        attention: AttentionBatch,
+    ) -> None:
+        if residual is not None:
+            raise ValueError("DiffusionGemma layers carry the complete stream")
+        self.attention.write_cache(
+            self.input_norm(hidden), positions, attention
+        )
 
 
 class Backbone(TransformerDecoder):

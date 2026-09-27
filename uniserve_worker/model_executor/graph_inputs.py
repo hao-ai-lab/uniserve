@@ -79,6 +79,9 @@ class PrefillShape:
         embeddings: Whether the call replaces token embeddings with supplied
             values, as image feature rows and every prefill of a lane with an
             image builder do.
+        outputs: Whether the graph evaluates the backbone's hidden states,
+            from which rows select their outputs, or only writes the K/V
+            cache, for calls whose rows all select ``TokenSelection.CACHE``.
     """
 
     token_bucket: int
@@ -86,6 +89,7 @@ class PrefillShape:
     live_rows: int
     causal: bool = True
     embeddings: bool = False
+    outputs: bool = True
 
 
 def select_flow_captures(
@@ -137,7 +141,14 @@ def prefill_units(pages, rows, tokens):
 
 
 def select_prefill_captures(
-    token_sizes, row_sizes, *, max_rows, max_tokens, variants, pool=None
+    token_sizes,
+    row_sizes,
+    *,
+    max_rows,
+    max_tokens,
+    variants,
+    outputs=True,
+    pool=None,
 ):
     """Build prefill capture buckets from configured token and row sizes.
 
@@ -151,7 +162,8 @@ def select_prefill_captures(
     ``max_rows``; a bucket's own row count is the configured size and may
     exceed ``max_rows``, since a full batch still needs a strictly larger
     bucket. Every shape is captured once per ``(causal, embeddings)`` pair
-    of ``variants``.
+    of ``variants``, evaluating hidden states with ``outputs`` and only the
+    K/V cache without.
 
     ``pool`` is ``(pages, units)``: the ``prefill_units`` pages of every
     cache group and the unit pool's allocatable units, or None before the
@@ -182,7 +194,9 @@ def select_prefill_captures(
                 if prefill_units(pages, minimum_rows, least) > units:
                     break
             buckets.extend(
-                PrefillShape(tokens, rows, minimum_rows, causal, embeddings)
+                PrefillShape(
+                    tokens, rows, minimum_rows, causal, embeddings, outputs
+                )
                 for causal, embeddings in variants
             )
             least = tokens + 1
@@ -229,9 +243,11 @@ def prefill_captures(
     embedding replacement when the lane has an ``image_builder`` (every
     prefill of such a lane replaces embeddings); a model whose image
     processor declares ``feature_injection`` also appends non-causal image
-    feature rows, which always replace embeddings. Empty when the graph
-    policy is off or prefill graphs are disabled, which leaves prefill calls
-    eager.
+    feature rows, which always replace embeddings. The graphs evaluate
+    hidden states when the deployment's prefill calls select outputs
+    (``prefill_outputs``) and only write the K/V cache otherwise. Empty when
+    the graph policy is off or prefill graphs are disabled, which leaves
+    prefill calls eager.
     """
     from uniserve_worker.config.execution import (
         DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
@@ -248,6 +264,7 @@ def prefill_captures(
         max_rows=max_rows,
         max_tokens=max_tokens,
         variants=variants,
+        outputs=config.prefill_outputs,
         pool=pool,
     )
 

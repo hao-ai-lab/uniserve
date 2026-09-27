@@ -118,6 +118,8 @@ def prepare_forward(
             sampling.return_prompt_logprobs
             or int(sampling.n_prompt_logprobs) > 0
         )
+        # A chunk that neither samples its next token nor scores its prompt
+        # only writes the K/V cache (``prepare_sampling`` reads no logits).
         task = token_task(
             call,
             request,
@@ -125,7 +127,9 @@ def prepare_forward(
             tuple(range(start, start + len(tokens))),
             TokenSelection.ALL_LOGITS
             if scores_prompt
-            else TokenSelection.LAST_LOGITS,
+            else TokenSelection.LAST_LOGITS
+            if call.token_output is not None
+            else TokenSelection.CACHE,
             request_tables=request_tables,
         )
     elif mode is ForwardMode.DECODE:

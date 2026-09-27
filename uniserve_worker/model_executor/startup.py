@@ -251,10 +251,12 @@ def prepare_prefill(
     """Capture each selected physical token/row bucket, largest first.
 
     Buckets are ordered by token-times-row footprint, so the first capture
-    sizes the runner's shared prefill output. Each capture stages the
-    ``capture_lengths`` rows of its bucket on zeroed scratch KV units, which
-    the pool's allocatable units hold, with the bucket's causality and
-    embedding replacement, through serving's staging with its real paged
+    of hidden states sizes the runner's shared prefill output. Each capture
+    stages the ``capture_lengths`` rows of its bucket on zeroed scratch KV
+    units, which the pool's allocatable units hold, with the bucket's
+    causality, embedding replacement and outputs (rows of a cache-only
+    bucket select ``TokenSelection.CACHE``), through serving's staging with
+    its real paged
     attention input: per-table block tables, device start pages for windowed
     tables and their host mirrors; the runner's ``select_graph_shape`` pads
     them to the bucket.
@@ -288,6 +290,9 @@ def prepare_prefill(
                 buffers,
                 tuple((0,) * length for length in lengths),
                 scratch_tables(cache, scratch, lengths),
+                selection=TokenSelection.LAST_LOGITS
+                if shape.outputs
+                else TokenSelection.CACHE,
                 causal=shape.causal,
                 embeddings=shape.embeddings,
             )

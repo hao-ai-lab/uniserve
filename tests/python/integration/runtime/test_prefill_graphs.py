@@ -11,12 +11,15 @@ captured graph holds fails instead of running eagerly, and the worker
 reports the most rows its prefill and decode graphs hold, at most the rows
 its KV unit pool holds a page of each cache group for. On pools of few
 units, whose cache groups have pages of different sizes, startup captures
-every prefill bucket a batch the pool holds selects, and each replays.
+every prefill bucket a batch the pool holds selects, and each replays. A
+worker whose prefills select no output replays graphs that only write the
+K/V cache, and leaves the cache of the eager pass that evaluates outputs.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 
 import pytest
 import torch
@@ -84,13 +87,16 @@ UNITS = 1024
 
 
 @contextmanager
-def _diffusion_gemma_worker(root, *, graphs, units=UNITS, slots=4):
+def _diffusion_gemma_worker(
+    root, *, graphs, units=UNITS, slots=4, outputs=True
+):
     """Bind a DiffusionGemma worker's staged calls over a fresh unit pool.
 
     Startup captures prefill graphs when ``graphs`` is set and runs prefill
-    eagerly otherwise. The pool holds ``units`` units and the worker
-    ``slots`` request slots, which also bound its calls. Yields the executor
-    and the pool's manager.
+    eagerly otherwise; without ``outputs`` the worker's prefills select no
+    output. The pool holds ``units`` units and the worker ``slots`` request
+    slots, which also bound its calls. Yields the executor, the pool's
+    manager and the worker configuration.
     """
     source = models.read_config(root)
     model = models.load_model(
@@ -107,6 +113,7 @@ def _diffusion_gemma_worker(root, *, graphs, units=UNITS, slots=4):
         max_batch_tokens=768,
         max_sequence_tokens=SEQUENCE,
         prefill_cuda_graph=graphs,
+        prefill_outputs=outputs,
         prefill_graph_token_sizes=(64, 256),
         decode_graph_batch_sizes=(1,),
     )
@@ -332,6 +339,52 @@ def test_prefill_graph_replay_matches_eager_execution(tmp_path, kind):
         for actual, expected in zip(graph_call, eager_call, strict=True):
             torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
     for actual, expected in zip(graph_cache, eager_cache, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@SM100
+@torch.inference_mode()
+@pytest.mark.parametrize("kind", ["causal", "image_block", "commit"])
+def test_cache_only_prefill_writes_the_cache_of_the_complete_pass(
+    tmp_path, kind
+):
+    """Prefills that select no output write what the complete pass writes.
+
+    A worker whose prefills select no output replays graphs that stop at the
+    final layer's cache write, and returns an empty value per row. Over the
+    same calls, the cache it leaves equals that of an eager worker whose
+    rows select their outputs, within the rounding their different shapes
+    allow.
+    """
+    diffusion_gemma_checkpoint(
+        tmp_path, text=NATIVE_TEXT, vision=NATIVE_VISION, unit_scores=True
+    )
+    prompt, measured = _scenario(kind)
+    caches = {}
+    for graphs in (True, False):
+        with _diffusion_gemma_worker(
+            tmp_path, graphs=graphs, outputs=not graphs
+        ) as (runner, manager, _):
+            slots = range(1, len(prompt) + 1)
+            _install(manager, slots, retired=0)
+            for rows in (prompt, measured):
+                if rows is measured:
+                    _install(manager, slots, retired=RETIRED)
+                if graphs:
+                    rows = tuple(
+                        replace(row, selection=TokenSelection.CACHE)
+                        for row in rows
+                    )
+                output = _call(runner, manager, rows)
+                if graphs:
+                    assert output.stats.cuda_graph_replays == 1
+                    assert all(
+                        value.numel() == 0
+                        for value in output.materialize().values
+                    )
+            caches[graphs] = _cache_values(manager)
+
+    for actual, expected in zip(caches[True], caches[False], strict=True):
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
