@@ -36,10 +36,14 @@ tables, the encoded FC1 output and its scales, the ``[T * K, H]`` BF16
 route rows and the returned output) comes from PyTorch's caching
 allocator, and from the graph's private pool under CUDA graph capture, so
 ``workspace_buffers`` is empty. Every kernel runs on the caller's current
-stream; the operator owns no stream or event. The first eager call
-compiles the kernels; the tactic is FlashInfer's default unless its
-autotuner has recorded one. Capture must follow an eager call, as for
-every prepared operator.
+stream; the operator owns no stream or event. Each call runs the tactic
+(routing tile size and each GEMM's MMA tile, cluster shape and raster
+order) measured best for its token count on this device and FlashInfer
+version (``tactics.json``, see ``tactics``), and FlashInfer's default
+tactic for shapes the table does not cover. The measurement admits only
+tactics whose outputs equal the default's bit for bit. The first eager
+call of a tactic compiles its kernels, so capture must follow an eager
+call at the captured token count, as for every prepared operator.
 """
 
 from __future__ import annotations
@@ -50,6 +54,12 @@ from uniserve.quantization import RowOrder
 
 from . import NVFP4Backend
 from . import Operator as _Operator
+from .tactics import Tactics
+
+
+def _tuple(value):
+    """A tactic decoded from JSON, with its nested lists as tuples."""
+    return tuple(map(_tuple, value)) if isinstance(value, list) else value
 
 
 class _CuteDsl(_Operator):
@@ -123,6 +133,7 @@ class _CuteDsl(_Operator):
             use_fused_finalize=False,
             quant_mode="w4a4",
         )
+        self._tactics = Tactics(Backend.name, module)
 
     def _validate(self, hidden, topk_ids, topk_weights):
         super()._validate(hidden, topk_ids, topk_weights)
@@ -131,11 +142,19 @@ class _CuteDsl(_Operator):
                 "CuTeDSL NVFP4 experts read and write BF16 hidden states"
             )
 
-    def __call__(self, hidden, topk_ids, topk_weights):
+    def __call__(self, hidden, topk_ids, topk_weights, *, tactic=None):
+        """Evaluate the routed experts; ``tactic`` overrides the table.
+
+        A tactic is ``[choice]``: ``None`` for FlashInfer's default or one
+        complete ``(tile_size, gemm1, gemm2)`` tactic of the wrapper.
+        """
         self._validate(hidden, topk_ids, topk_weights)
         tokens = hidden.shape[0]
         if not tokens:
             return torch.empty_like(hidden)
+        if tactic is None:
+            tactic = self._tactics.select(tokens)
+        choice = None if tactic is None else _tuple(tactic[0])
 
         # The FC1 gather reads the linear token-major [T, H / 16] scales.
         values, scales = self._quantize(
@@ -158,7 +177,12 @@ class _CuteDsl(_Operator):
             self._fc2,
             self._fc2_scale,
             self._fc2_alpha,
+            tactic=choice,
         )
+
+    def tactic_space(self) -> list[list]:
+        """One dimension: FlashInfer's default, then every valid tactic."""
+        return [[None, *self._kernel.get_valid_tactics()]]
 
     def close(self) -> None:
         super().close()

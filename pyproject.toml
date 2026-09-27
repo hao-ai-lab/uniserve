@@ -68,6 +68,10 @@ uniserve-worker = "uniserve_worker.main:main"
 # ship a console script whose dependencies it never declares.
 include = ["uniserve", "uniserve.*", "uniserve_models*", "uniserve_worker*"]
 
+[tool.setuptools.package-data]
+# Measured grouped-expert kernel tactics (uniserve.runtime.backends.moe.tactics).
+uniserve = ["runtime/backends/moe/tactics.json"]
+
 # Native worker IPC extension (PyO3).
 [[tool.setuptools-rust.ext-modules]]
 target = "uniserve_worker._uniserve_ipc"

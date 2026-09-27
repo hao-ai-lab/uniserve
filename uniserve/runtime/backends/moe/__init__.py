@@ -59,6 +59,14 @@ class Operator:
     ) -> torch_lib.Tensor:
         raise NotImplementedError
 
+    def tactic_space(self) -> list[list]:
+        """Independent tactic dimensions, each listing its default first.
+
+        A provider whose calls take a measured tactic (see ``tactics``)
+        describes its choices here; the others have none.
+        """
+        return []
+
     def close(self) -> None:
         self._closed = True
         self.module = None
