@@ -50,7 +50,7 @@ import torch.distributed as dist
 from uniserve.distributed import Communicator
 from uniserve.quantization import QuantizedTensor, ScaleLayout
 
-__all__ = ["ExpertExchange"]
+__all__ = ["ExpertExchange", "JoinGraphs"]
 
 
 class ExpertExchange:
@@ -343,3 +343,79 @@ class ExpertExchange:
         if output.shape[0] != tokens:
             raise RuntimeError("the combine returned another token count")
         return output
+
+
+class JoinGraphs:
+    """Captured participation of a rank without work in expert steps.
+
+    A rank of an expert group that has no forward of its own still takes
+    part in every step another rank starts: at each expert-parallel layer of
+    ``context`` it exchanges with no tokens of its own and runs its experts
+    over the rows it receives (``ExecutionContext.join_expert_layers``).
+    Launched eagerly, that is a host-issued run of kernels per layer, and
+    every other rank waits for it at each layer's exchange; one captured
+    graph per step capacity keeps a join at device speed, as SGLang's
+    data-parallel ranks without work replay the decode CUDA graph in IDLE
+    mode (``model_executor/runner/decode_cuda_graph_runner.py:1395-1450``).
+
+    Construction is collective over ``exchange``'s group: every rank
+    captures the same ``capacities`` in the same order, largest first, and
+    warms each with one eager join step, which exchanges with every rank.
+    The graphs allocate from ``pools`` (see ``CUDAGraph``) and read the
+    bindings ``context`` has prepared, so the caller closes them before the
+    context.
+    """
+
+    def __init__(
+        self,
+        context,
+        exchange: ExpertExchange,
+        capacities,
+        *,
+        pools=None,
+    ) -> None:
+        from .cuda_graph import CUDAGraph
+
+        self._graphs: dict[int, CUDAGraph] = {}
+        try:
+            for capacity in sorted(frozenset(capacities), reverse=True):
+
+                def join(capacity=capacity):
+                    exchange.begin(capacity)
+                    try:
+                        context.join_expert_layers()
+                    finally:
+                        exchange.end()
+
+                with context.activate():
+                    join()
+                graph = CUDAGraph(context=context, pools=pools)
+                self._graphs[capacity] = graph
+                graph.capture(join)
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def capacities(self) -> frozenset[int]:
+        """The step capacities a join replays at."""
+        return frozenset(self._graphs)
+
+    def replay(self, capacity: int) -> None:
+        """Join the open step of ``capacity`` on the context's stream.
+
+        Raises:
+            RuntimeError: No join of ``capacity`` was captured.
+        """
+        graph = self._graphs.get(capacity)
+        if graph is None:
+            raise RuntimeError(
+                f"no captured expert join serves step capacity {capacity}"
+            )
+        graph.replay()
+
+    def close(self) -> None:
+        """Release every join graph; the caller has drained their replays."""
+        graphs, self._graphs = self._graphs, {}
+        for graph in graphs.values():
+            graph.close()

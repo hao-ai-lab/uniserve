@@ -36,7 +36,7 @@ from .graph_inputs import (
     replay_hidden,
     text_shape,
 )
-from .model_runner import ModelRunner
+from .model_runner import ModelRunner, joining_experts
 
 
 def _host_indices(ranges, device):
@@ -517,15 +517,20 @@ class TextRunner(ModelRunner):
         if key[0] != "prefill":
             return super().capture_graph(key, execution, forward)
         outputs = key[-1]
+
+        # A prefill that stops after the final layer's cache write skips that
+        # layer's experts; inside an expert step the graph joins them, so its
+        # replay makes all of the step's exchanges.
         return capture_hidden(
             self.context,
             execution,
-            (
+            joining_experts(
                 lambda static: (
                     self.hidden_states(static.inputs)
                     if outputs
                     else self.model.fill_cache(static.inputs)
-                )
+                ),
+                self.context,
             ),
             pools=self.pools,
             cache=self.cache,

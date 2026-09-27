@@ -53,6 +53,27 @@ from .input_batch import InputBatch
 from .output import ExecutionOutput
 
 
+def joining_experts(forward, context):
+    """``forward``, then a join of every expert layer it did not reach.
+
+    Inside an open expert step (see ``ExecutionContext.join_expert_layers``)
+    a graph captured over the returned call carries every exchange of the
+    step; outside one the join does nothing. Each call accounts for the
+    layers it reaches afresh, since a warm-up call and its capture share
+    one step.
+    """
+
+    def call(*args):
+        experts = context.experts
+        if experts is not None and experts.capacity:
+            experts.invoked.clear()
+        result = forward(*args)
+        context.join_expert_layers()
+        return result
+
+    return call
+
+
 def _masked_starts(table):
     """Mask a table's host start pages for graph keying; device views stay."""
     if table.start_page_host is None:
@@ -392,14 +413,16 @@ class ModelRunner(Execution, ABC):
         """Capture the graph of ``key`` over its fixed input ``execution``.
 
         ``forward`` evaluates the batch; the graph also computes greedy
-        decoding where ``graph_inputs.greedy_decode`` applies. Runners with
-        other captured computations override this together with
+        decoding where ``graph_inputs.greedy_decode`` applies. Inside an
+        expert step the graph also joins every expert layer ``forward`` did
+        not reach, so its replay makes all of the step's exchanges. Runners
+        with other captured computations override this together with
         ``replay_graph``.
         """
         return capture_batch(
             self.context,
             execution,
-            forward,
+            joining_experts(forward, self.context),
             pools=self.pools,
             cache=self.cache,
             predicates=self.decode_predicates,

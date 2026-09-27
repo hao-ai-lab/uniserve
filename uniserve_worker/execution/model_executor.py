@@ -302,6 +302,10 @@ class ModelExecutor:
         # runners stepping through it are registered at capture.
         self.experts = None
         self._expert_runners: list[ModelRunner] = []
+        # With graphs, a rank without a forward of its own joins each expert
+        # step by replaying the captured join of the step's capacity
+        # (``JoinGraphs``), which startup captures after the runners' graphs.
+        self._expert_joins = None
         # A standalone denoiser's component, binding and call, the request
         # bank and latent pool its ladders gather through, and the one
         # runner that serves every layout the media builder admits.
@@ -1530,12 +1534,20 @@ class ModelExecutor:
         if stream is not None:
             stream.wait(torch.cuda.current_stream(runner.device))
         try:
-            with torch.inference_mode(), context.activate():
-                exchange.begin(capacity)
-                try:
-                    context.join_expert_layers()
-                finally:
-                    exchange.end()
+            with torch.inference_mode():
+                if self._expert_joins is not None:
+                    # Every capacity the agreement returns is one some
+                    # runner's graphs step at, and startup captured a join
+                    # at each; a missing one fails rather than join eagerly.
+                    self._expert_joins.replay(capacity)
+                else:
+                    # Without graphs every step, joins included, is eager.
+                    with context.activate():
+                        exchange.begin(capacity)
+                        try:
+                            context.join_expert_layers()
+                        finally:
+                            exchange.end()
         finally:
             if stream is not None:
                 torch.cuda.current_stream(runner.device).wait_stream(
@@ -1638,7 +1650,36 @@ class ModelExecutor:
 
                     prepare_flow(self, entry, latents, tokenizer)
         prepare_images(self, latents)
+        self._capture_expert_joins()
         self.synchronize()
+
+    def _capture_expert_joins(self):
+        """Capture a rank's join of an expert step at every step capacity.
+
+        The step agreement returns a capacity some expert runner's graphs
+        step at (``ExpertExchange.agree``), so a join graph at each of those
+        capacities serves every step this rank joins without a forward of
+        its own; replaying it keeps the join at device speed instead of a
+        host-launched run of kernels per layer, which every other rank would
+        wait on at each exchange. Every rank captures the same capacities in
+        the same order, after the runners' graphs, in the first expert
+        runner's context and graph pools. Without graphs nothing is
+        captured and joins stay eager like every other step.
+        """
+        from uniserve.runtime.expert_exchange import JoinGraphs
+
+        exchange = self.experts
+        if exchange is None or not self._expert_runners:
+            return
+        runner = self._expert_runners[0]
+        if not runner.pools:
+            return
+        self._expert_joins = JoinGraphs(
+            runner.context,
+            exchange,
+            frozenset().union(*exchange.kinds),
+            pools=runner.pools,
+        )
 
     def complete_startup(self):
         """Seal startup: check captured-graph storage budgets and stream grants.
@@ -1780,6 +1821,9 @@ class ModelExecutor:
                 *(() if self._diffusion is None else (self._diffusion,)),
             )
         ]
+        joins, self._expert_joins = self._expert_joins, None
+        if joins is not None:
+            actions.append(joins.close)
         close_resources(*actions)
 
     def close(self, *, aborted: bool = False):
