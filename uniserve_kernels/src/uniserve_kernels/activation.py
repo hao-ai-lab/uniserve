@@ -12,10 +12,14 @@ same formulas only off CUDA.
 Every input is addressed as rows with unit channel stride: packed inputs
 ``[..., 2 * width]`` whose leading axes flatten to rows of one stride (see
 :func:`row_stride`), separate SwiGLU views likewise, and contiguous outputs.
+
+:func:`softcap` bounds contiguous values to ``(-cap, cap)`` as
+``tanh(x * (1 / cap)) * cap`` in one pass, with PyTorch's CUDA arithmetic.
 """
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 
 from uniserve_kernels.triton import tl, triton, unsupported_operands
@@ -38,6 +42,10 @@ MAX_FP8_WIDTH = 32768
 #: Programs that also reduce a magnitude cover this many elements; callers
 #: size ``partials`` as ``ceil(elements / ABSMAX_BLOCK)`` FP32 entries.
 ABSMAX_BLOCK = 32768
+#: Elements per program and warps of the softcap kernel, which streams a
+#: logits tensor once (the gated kernel's streaming shape).
+_SOFTCAP_BLOCK = 4096
+_SOFTCAP_WARPS = 8
 
 _FLOATING = (torch.float16, torch.bfloat16, torch.float32)
 
@@ -302,6 +310,83 @@ if triton is not None:
         )
         tl.store(output_ptr + row * width + columns, quantized, mask=mask)
         tl.store(output_scale_ptr + row, output_scale)
+
+
+if triton is not None:
+
+    @triton.jit
+    def _softcap_kernel(
+        input_ptr,
+        output_ptr,
+        elements,
+        inverse,
+        cap,
+        BLOCK: tl.constexpr,  # noqa: N803
+    ):
+        """Store ``tanh(x * inverse) * cap`` of contiguous elements.
+
+        Every step is one FP32 operation PyTorch's CUDA kernels apply to
+        ``torch.tanh(x.float() / cap) * cap``: the division by a scalar
+        multiplies by its FP32 reciprocal ``inverse``, ``tanh`` is libdevice
+        ``tanhf`` without flushing subnormals, and the product by ``cap``
+        rounds once, so the output is bit-identical to that expression.
+        """
+        program = tl.program_id(0).to(tl.int64)
+        offsets = program * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < elements
+        values = tl.load(input_ptr + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        capped = libdevice.tanh(values * inverse) * cap
+        tl.store(
+            output_ptr + offsets,
+            capped.to(output_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+
+def unsupported_softcap(x: torch.Tensor, out: torch.Tensor) -> str | None:
+    """Return why :func:`softcap` cannot map ``x`` to ``out``, or ``None``.
+
+    Both are contiguous floating tensors of one shape on one CUDA device.
+    """
+    reason = unsupported_operands(x, out)
+    if reason is not None:
+        return reason
+    if x.dtype not in _FLOATING or out.dtype not in _FLOATING:
+        return "softcap reads and writes float16, bfloat16 or float32"
+    if x.shape != out.shape:
+        return "the softcap output does not match the input shape"
+    if not (x.is_contiguous() and out.is_contiguous()):
+        return "softcap operands are not contiguous"
+    return None
+
+
+def softcap(x: torch.Tensor, cap: float, out: torch.Tensor) -> None:
+    """Store ``tanh(x.float() / cap) * cap`` into ``out`` in its dtype.
+
+    ``cap`` is a positive finite number; the division uses its FP32
+    reciprocal, as PyTorch divides a CUDA tensor by a scalar. Callers first
+    check :func:`unsupported_softcap`.
+    """
+    elements = x.numel()
+    if elements == 0:
+        return
+    # The FP32 reciprocal PyTorch computes for a scalar divisor, and the
+    # FP32 multiplier it applies for ``* cap``.
+    inverse = float(np.float32(1.0) / np.float32(cap))
+    _softcap_kernel[(triton.cdiv(elements, _SOFTCAP_BLOCK),)](
+        x,
+        out,
+        elements,
+        inverse,
+        float(np.float32(cap)),
+        _SOFTCAP_BLOCK,
+        num_warps=_SOFTCAP_WARPS,
+        # PyTorch's tanhf keeps subnormal arguments; libdevice's flushing
+        # variant would return zero for |x / cap| below FP32's normal range.
+        enable_reflect_ftz=False,
+    )
 
 
 def row_stride(x: torch.Tensor) -> int | None:

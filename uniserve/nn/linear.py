@@ -15,6 +15,7 @@ from uniserve.quantization import QuantizedTensor, Quantizer
 
 from . import _binding
 from .attention.config import AttentionParallelConfig
+from .functional._activation import softcap
 from .functional._linear import apply_linear, apply_merged_linear
 from .functional._tensors import as_matrix
 
@@ -639,8 +640,9 @@ class VocabParallelHead(ColumnParallelLinear):
 
     ``softcap`` bounds every logit to ``(-softcap, softcap)`` as
     ``softcap * tanh(logits / softcap)``. The projection first rounds to the
-    activation dtype; the cap then evaluates in FP32, and capped logits are
-    FP32 unless the caller asks for another ``output_dtype``.
+    activation dtype; the cap then evaluates in FP32 (``functional.softcap``,
+    one pass over the projected logits on CUDA), and capped logits are FP32
+    unless the caller asks for another ``output_dtype``.
     """  # noqa: D205
 
     def __init__(
@@ -692,7 +694,8 @@ class VocabParallelHead(ColumnParallelLinear):
         _check_output(
             out, (*x.shape[:-1], self.weight.shape[0]), dtype, x.device
         )
-        logits = super().forward(x).float()
         # Padding columns project to zero and stay zero under the cap.
-        capped = torch.tanh(logits / self.softcap) * self.softcap
-        return capped.to(dtype) if out is None else out.copy_(capped)
+        logits = super().forward(x)
+        if out is not None and not out.is_contiguous():
+            return out.copy_(softcap(logits, self.softcap, dtype=dtype))
+        return softcap(logits, self.softcap, dtype=dtype, out=out)
