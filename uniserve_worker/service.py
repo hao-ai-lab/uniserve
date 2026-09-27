@@ -15,6 +15,8 @@ registers with `Worker.set_completion_wake`.
 from __future__ import annotations
 
 import gc
+import logging
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -36,6 +38,13 @@ if TYPE_CHECKING:
 # step again. It bounds how long a step another rank starts waits for this
 # rank while all ranks are idle.
 _EXPERT_STEP_POLL_US = 200
+# How long, in seconds, an expert-parallel rank with open requests waits after
+# sending a result for its engine's next batch before it joins other ranks'
+# steps instead: the p99 of the engine's result-to-next-batch latency measured
+# on DEP4 DiffusionGemma generation was 5.7-7.6 ms per rank (p50 1.0-1.2 ms).
+_OWN_STEP_WAIT_S = 0.008
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -68,6 +77,10 @@ class Service:
         self._closing = False
         # The Close acknowledgment, sent only after the drain completes.
         self._shutdown_response: dict[str, Any] | None = None
+        # When this rank last sent a result, and whether its wait for its own
+        # next expert step since then has already run out.
+        self._last_result = time.monotonic()
+        self._own_step_expired = False
 
     def run(self) -> None:
         """Serve until Close drains accepted work; leave resources to Worker.
@@ -118,8 +131,12 @@ class Service:
                 # its own to launch, as vLLM's data-parallel engines run a
                 # dummy batch while any engine has work
                 # (``v1/engine/core.py:1870-1927``); it therefore never
-                # blocks for long.
+                # blocks for long. A rank whose own next batch is coming
+                # waits for it instead (``_awaits_own_step``).
                 experts = self.worker.runner.experts is not None
+                if experts and self._awaits_own_step():
+                    self.endpoint.wait_incoming(_EXPERT_STEP_POLL_US)
+                    continue
                 if experts and self.worker.runner.join_expert_step():
                     continue
 
@@ -178,6 +195,43 @@ class Service:
             unexpected=not isinstance(error, WorkerError),
         )
         return messages.error_response(classified, correlation)
+
+    def _awaits_own_step(self) -> bool:
+        """Whether this expert-parallel rank waits for its own next batch.
+
+        A rank with open requests takes part in every expert step with a
+        forward of its own instead of joining another rank's step with none,
+        as a vLLM data-parallel engine with unfinished requests always runs
+        its own scheduled step and only an engine without them runs the
+        dummy batch (``DPEngineCoreProc.run_busy_loop``,
+        ``v1/engine/core.py:1870-1927``). Ranks with work then step together
+        rather than taking turns, each of the others joining at every step.
+
+        While one of its batches is in flight or awaiting its response, the
+        rank's engine sends its next batch after that result, so it waits;
+        after its last result it waits at most ``_OWN_STEP_WAIT_S`` and then
+        joins, logging the expiry. The wait cannot deadlock: every batch in
+        flight was launched after its step's agreement on every rank, so it
+        completes and its result goes out without any further agreement, and
+        the engine's next batch depends on that result alone.
+        """
+        if not self.worker.requests.has_open_requests():
+            return False
+        if self._pending or self.worker.executor.inflight:
+            return True
+        if self._own_step_expired:
+            return False
+        waited = time.monotonic() - self._last_result
+        if waited < _OWN_STEP_WAIT_S:
+            return True
+        self._own_step_expired = True
+        logger.info(
+            "expert step: no batch arrived within %.1f ms of this rank's last "
+            "result while it holds open requests; joining the other ranks' "
+            "steps until it does",
+            waited * 1e3,
+        )
+        return False
 
     def _accept(self, request: dict[str, Any]) -> None:
         """Admit one request, queueing its response envelope.
@@ -251,6 +305,8 @@ class Service:
                     response = self._error(pending.kind, response, error)
 
             self._pending.remove(pending)
+            self._last_result = time.monotonic()
+            self._own_step_expired = False
             with profile_range(
                 worker_range_name(
                     "finalize_response",
