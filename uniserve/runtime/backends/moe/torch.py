@@ -7,7 +7,7 @@ from . import Operator as _Operator
 
 
 class _Torch(_Operator):
-    def __call__(self, hidden, topk_ids, topk_weights):
+    def __call__(self, hidden, topk_ids, topk_weights, *, combine=True):
         self._validate(hidden, topk_ids, topk_weights)
         module = self.module
         return functional.fused_moe(
@@ -21,6 +21,7 @@ class _Torch(_Operator):
                 module.up_gate.input_quantizer,
                 module.down.input_quantizer,
             ),
+            combine=combine,
         )
 
 

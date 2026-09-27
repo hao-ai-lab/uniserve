@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from uniserve.model.inputs import TextSize
+from uniserve.nn.functional import Routes
 from uniserve.quantization import QuantizedTensor, RowOrder
 
 from ..backends import moe as moe_backend
@@ -39,6 +40,17 @@ class MoEBinding:
                 "an expert-parallel call site needs the worker's expert "
                 "exchange"
             )
+        # Unit route weights of an uncombined expert-parallel call, filled
+        # once for the exchange's largest local token count.
+        self._unit = (
+            None
+            if self.exchange is None
+            else torch.ones(
+                (self.exchange.max_tokens, 1),
+                dtype=torch.float32,
+                device=device,
+            )
+        )
 
     def prepare(self, size: TextSize):
         previous = self.operator
@@ -117,11 +129,11 @@ class MoEBinding:
             }
         ]
 
-    def __call__(self, hidden, topk_ids, topk_weights):
+    def __call__(self, hidden, topk_ids, topk_weights, *, combine=True):
         exchange = self.exchange
         if exchange is None:
             operator = self.prepare(TextSize(hidden.shape[0], 1))
-            return operator(hidden, topk_ids, topk_weights)
+            return operator(hidden, topk_ids, topk_weights, combine=combine)
 
         operator = self.prepare(TextSize(hidden.shape[0], 1))
         received = exchange.dispatch(
@@ -131,8 +143,15 @@ class MoEBinding:
             topk_weights,
             invalid_expert=self._invalid_expert,
         )
-        partial = operator(*received)
-        return exchange.combine(partial, hidden.shape[0])
+        # The local experts combine their routes into this rank's partial
+        # sums, and the exchange sums the ranks' partials (FP32, one BF16
+        # rounding); uncombined, those combined rows are the one-route
+        # Routes of unit weight.
+        output = exchange.combine(operator(*received), hidden.shape[0])
+        if combine:
+            return output
+        assert self._unit is not None
+        return Routes(output.unsqueeze(1), self._unit[: output.shape[0]])
 
     def join(self, hidden_size: int, dtype: torch.dtype) -> None:
         """Exchange at this layer with no tokens of this rank's own.
@@ -153,3 +172,4 @@ class MoEBinding:
         if self.operator is not None:
             self.operator.close()
         self.operator = self.provider = None
+        self._unit = None

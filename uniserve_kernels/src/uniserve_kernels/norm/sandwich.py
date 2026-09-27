@@ -19,6 +19,13 @@ results are bit-identical to the composition of those kernels and the
 tensor operations between them. The scale is read from device memory, so the
 launch synchronizes nothing and CUDA graphs capture it.
 
+An update may also be given as routes: ``[rows, K, width]`` rows and
+``[rows, K]`` FP32 weights whose update value is the FP32 fused
+multiply-add chain over ``k = 0 .. K - 1`` in order, from zero, rounded
+once to the row dtype (``uniserve.nn.functional.Routes``). The launch
+evaluates that value while reading the routes, so the combined rows are
+never stored.
+
 A normalization may instead be stored in a calibrated NVFP4 encoding: its
 row, rounded to the row dtype as the unencoded output would store it, is
 encoded by :func:`uniserve_kernels.quantization.nvfp4_encode` into packed
@@ -28,6 +35,7 @@ encoder encodes the stored row, and the unencoded row is never written.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from numbers import Real
 
 import torch
@@ -41,6 +49,8 @@ ROW_DTYPES = (torch.bfloat16, torch.float16)
 #: Updates summed before the normalization, and normalizations of the stream.
 MAX_UPDATES = 2
 MAX_NORMS = 4
+#: Routes of an update given as routes; each is one unrolled row load.
+MAX_ROUTES = 32
 _VECTOR_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
 
@@ -70,10 +80,42 @@ if triton is not None:
         return normalized
 
     @triton.jit
+    def _update(
+        rows_ptr,
+        weights_ptr,
+        row,
+        columns,
+        mask,
+        ROUTES: tl.constexpr,  # noqa: N803
+        WIDTH: tl.constexpr,  # noqa: N803
+        BLOCK: tl.constexpr,  # noqa: N803
+    ):
+        """One update row in FP32: a stored row (``ROUTES`` 0) or the value
+        of ``ROUTES`` weighted route rows, the FP32 fma chain in route order
+        from zero rounded once to the row dtype.
+        """  # noqa: D205
+        if ROUTES == 0:
+            return tl.load(
+                rows_ptr + row * WIDTH + columns, mask=mask, other=0.0
+            ).to(tl.float32)
+        total = tl.zeros([BLOCK], dtype=tl.float32)
+        for route in tl.static_range(ROUTES):
+            values = tl.load(
+                rows_ptr + (row * ROUTES + route) * WIDTH + columns,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            weight = tl.load(weights_ptr + row * ROUTES + route)
+            total = tl.fma(values, weight, total)
+        return total.to(rows_ptr.dtype.element_ty).to(tl.float32)
+
+    @triton.jit
     def _sandwich_kernel(
         residual_ptr,
         first_ptr,
         second_ptr,
+        first_routes_ptr,
+        second_routes_ptr,
         first_weight_ptr,
         second_weight_ptr,
         weight_ptr,
@@ -91,6 +133,8 @@ if triton is not None:
         BLOCK: tl.constexpr,  # noqa: N803
         HAS_RESIDUAL: tl.constexpr,  # noqa: N803
         TWO: tl.constexpr,  # noqa: N803
+        FIRST_ROUTES: tl.constexpr,  # noqa: N803
+        SECOND_ROUTES: tl.constexpr,  # noqa: N803
         FIRST_NORMALIZED: tl.constexpr,  # noqa: N803
         SECOND_NORMALIZED: tl.constexpr,  # noqa: N803
         SCALED: tl.constexpr,  # noqa: N803
@@ -101,6 +145,9 @@ if triton is not None:
     ):
         """Sandwich-normalize one contiguous row.
 
+        ``FIRST_ROUTES`` / ``SECOND_ROUTES`` count the routes of an update
+        given as routes (rows at ``*_ptr``, FP32 weights at
+        ``*_routes_ptr``), zero for a stored update.
         ``NORM_SCALARS[i]`` is the trailing number of normalization ``i``,
         or ``None``. An ``NORM_ENCODED[i]`` normalization stores its NVFP4
         encoding with calibrated scale ``norm_encode_scales[i]`` into
@@ -115,8 +162,15 @@ if triton is not None:
         mask = columns < WIDTH
         base = row * WIDTH
 
-        update = tl.load(first_ptr + base + columns, mask=mask, other=0.0).to(
-            tl.float32
+        update = _update(
+            first_ptr,
+            first_routes_ptr,
+            row,
+            columns,
+            mask,
+            FIRST_ROUTES,
+            WIDTH,
+            BLOCK,
         )
         if FIRST_NORMALIZED:
             update = _normalize(
@@ -124,9 +178,16 @@ if triton is not None:
             )
             update = update.to(dtype).to(tl.float32)
         if TWO:
-            term = tl.load(
-                second_ptr + base + columns, mask=mask, other=0.0
-            ).to(tl.float32)
+            term = _update(
+                second_ptr,
+                second_routes_ptr,
+                row,
+                columns,
+                mask,
+                SECOND_ROUTES,
+                WIDTH,
+                BLOCK,
+            )
             if SECOND_NORMALIZED:
                 term = _normalize(
                     term, second_weight_ptr, columns, mask, True, WIDTH, EPS
@@ -199,7 +260,13 @@ def _unsupported_vector(vector: torch.Tensor, width: int, device) -> str | None:
 
 def unsupported(
     residual: torch.Tensor,
-    updates: tuple[tuple[torch.Tensor, torch.Tensor | None], ...],
+    updates: tuple[
+        tuple[
+            torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+            torch.Tensor | None,
+        ],
+        ...,
+    ],
     weight: torch.Tensor,
     scale: torch.Tensor | None,
     norms: tuple[tuple, ...],
@@ -212,13 +279,24 @@ def unsupported(
     vector factors are contiguous FP32, BF16 or FP16 ``[width]`` vectors (a
     normalization weight may be ``None``: unweighted), ``scale`` holds one
     floating value, and each normalization's factors are at most one vector
-    followed by at most one Python number. ``encodings`` holds, per
-    normalization, ``None`` or a calibrated NVFP4 ``Quantizer`` whose
-    encoding stores it; encoded rows are a whole number of K16 blocks.
+    followed by at most one Python number. An update given as routes is a
+    ``(rows, weights)`` pair: contiguous ``[rows, K, width]`` rows of the
+    residual dtype, ``1 <= K <=`` :data:`MAX_ROUTES`, with contiguous
+    ``[rows, K]`` FP32 weights. ``encodings`` holds, per normalization,
+    ``None`` or a calibrated NVFP4 ``Quantizer`` whose encoding stores it;
+    encoded rows are a whole number of K16 blocks.
     """
-    rows = (residual, *(update for update, _ in updates))
+    routed = [
+        (update, None) if isinstance(update, torch.Tensor) else update
+        for update, _ in updates
+    ]
+    rows = (residual, *(values for values, _ in routed))
     reason = unsupported_operands(
-        *rows, weight, scale, *(w for _, w in updates)
+        *rows,
+        *(weights for _, weights in routed),
+        weight,
+        scale,
+        *(w for _, w in updates),
     )
     if reason is not None:
         return reason
@@ -232,11 +310,30 @@ def unsupported(
             f"the kernel sums 1..{MAX_UPDATES} updates and stores at most "
             f"{MAX_NORMS} normalizations"
         )
-    for row in rows:
-        if row.dtype != residual.dtype or row.shape != residual.shape:
+    for row, weights in ((residual, None), *routed):
+        # Route rows [rows, K, width] add the route axis to [rows, width].
+        shape = (
+            row.shape
+            if weights is None
+            else (row.shape[0], *row.shape[2:])
+            if row.ndim == 3
+            else None
+        )
+        if row.dtype != residual.dtype or shape != residual.shape:
             return "updates do not match the residual rows"
         if not row.is_contiguous():
             return "rows are not contiguous"
+    for values, weights in routed:
+        if weights is None:
+            continue
+        if not 1 <= values.shape[1] <= MAX_ROUTES:
+            return f"routes number 1..{MAX_ROUTES} per row"
+        if (
+            weights.dtype != torch.float32
+            or weights.shape != values.shape[:2]
+            or not weights.is_contiguous()
+        ):
+            return "route weights are not contiguous FP32 [rows, K]"
     vectors = [weight, *(w for _, w in updates if w is not None)]
     for norm in norms:
         if norm[0] is not None:
@@ -274,7 +371,13 @@ def unsupported(
 
 def sandwich(
     residual: torch.Tensor,
-    updates: tuple[tuple[torch.Tensor, torch.Tensor | None], ...],
+    updates: tuple[
+        tuple[
+            torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+            torch.Tensor | None,
+        ],
+        ...,
+    ],
     weight: torch.Tensor,
     scale: torch.Tensor | None,
     norms: tuple[tuple, ...],
@@ -285,23 +388,27 @@ def sandwich(
 ) -> None:
     """Store the stream and its normalizations into caller outputs.
 
-    ``stream`` and each unencoded entry of ``outputs`` (one per
-    normalization) are contiguous rows like ``residual``, overlapping no
-    operand. The output of a normalization ``encodings`` names is that
-    quantizer's ``QuantizedTensor`` of the rows' shape with linear block
-    scales; the launch fills its values, block scales and tensor scale.
+    ``updates`` entries are ``(update, branch_weight)`` with ``update`` a
+    row tensor or a ``(rows, weights)`` routes pair (see
+    :func:`unsupported`). ``stream`` and each unencoded entry of
+    ``outputs`` (one per normalization) are contiguous rows like
+    ``residual``, overlapping no operand. The output of a normalization
+    ``encodings`` names is that quantizer's ``QuantizedTensor`` of the rows'
+    shape with linear block scales; the launch fills its values, block
+    scales and tensor scale.
     Callers first check :func:`unsupported`.
     """
     width = int(residual.shape[-1])
     rows = residual.numel() // width
     encodings = tuple(encodings) + (None,) * (len(norms) - len(encodings))
-    fields = [
-        None if quantizer is None else output.buffers()
+    # The storage of each encoded output (a QuantizedTensor), else None.
+    fields: list[Mapping[str, torch.Tensor] | None] = [
+        None if quantizer is None else output.buffers()  # type: ignore[attr-defined]
         for quantizer, output in zip(encodings, outputs, strict=True)
     ]
     if rows == 0:
         for quantizer, field in zip(encodings, fields, strict=True):
-            if quantizer is not None:
+            if quantizer is not None and field is not None:
                 field["tensor_scale"].fill_(quantizer.calibrated_scale)
         return
     weights, factors, scalars = [], [], []
@@ -315,13 +422,24 @@ def sandwich(
     # The block and warp count of the rms row kernel give every
     # normalization its reduction layout, hence its FP32 order.
     block, warps = row_launch(width)
-    first, first_weight = updates[0]
-    second, second_weight = updates[1] if len(updates) == 2 else (first, None)
+    # Each update is (rows, route weights or None, branch weight).
+    terms = [
+        (update, None, branch)
+        if isinstance(update, torch.Tensor)
+        else (*update, branch)
+        for update, branch in updates
+    ]
+    first, first_routes, first_weight = terms[0]
+    second, second_routes, second_weight = (
+        terms[1] if len(terms) == 2 else (first, None, None)
+    )
     # Absent pointers stand in as the stream; the kernel never reads them.
     _sandwich_kernel[(rows,)](
         residual,
         first,
         second,
+        stream if first_routes is None else first_routes,
+        stream if second_routes is None else second_routes,
         stream if first_weight is None else first_weight,
         stream if second_weight is None else second_weight,
         weight,
@@ -345,6 +463,8 @@ def sandwich(
         block,
         True,
         len(updates) == 2,
+        0 if first_routes is None else first.shape[1],
+        0 if second_routes is None else second.shape[1],
         first_weight is not None,
         second_weight is not None,
         scale is not None,

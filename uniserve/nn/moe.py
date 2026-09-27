@@ -9,9 +9,10 @@ from torch import nn
 
 from uniserve.distributed import Communicator
 from uniserve.nn import _binding, functional
+from uniserve.nn.functional import Routes
 from uniserve.quantization import Quantizer
 
-__all__ = ["ExpertLinear", "FusedMoE", "TopK"]
+__all__ = ["ExpertLinear", "FusedMoE", "Routes", "TopK"]
 
 Activation = Literal["silu", "gelu_tanh"]
 
@@ -95,10 +96,17 @@ class FusedMoE(nn.Module):
     already encoded as ``up_gate.input_quantizer.quantize(hidden)`` would
     encode it (a producer that stores its rows in that encoding directly,
     such as ``sandwich_rms_norm``, saves the separate encoding pass); the
-    kernels then read it as stored. Routing belongs to the model; this
-    module consumes its result. Tensor-parallel binding splits
-    ``I`` across the tensor-parallel group and sums the partial outputs once
-    after combining the experts. Expert-parallel binding
+    kernels then read it as stored. With ``combine=False`` the call returns
+    the terms of that sum as :class:`Routes` (``rows[t, k]`` the down
+    projection of route ``k``, ``weights`` the route weights), whose value
+    is the combined output bit for bit, for a consumer that evaluates the
+    sum while reading it (``sandwich_rms_norm``). Kernels that combine
+    routes internally, and expert-parallel exchanges, which combine the
+    ranks' partial sums, return their combined rows as the one-route
+    instance of unit weight. Routing belongs to the model; this module
+    consumes its result. Tensor-parallel binding splits ``I`` across the
+    tensor-parallel group and sums the partial outputs (route rows when
+    uncombined) once after the experts. Expert-parallel binding
     (``uniserve.distributed.partition_experts``) keeps the global experts
     ``expert_slice`` resident, ``[E / P, ...]`` of each stacked weight for an
     expert group of ``P`` ranks, while ``topk_ids`` keep naming global
@@ -166,7 +174,9 @@ class FusedMoE(nn.Module):
         hidden: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-    ) -> torch.Tensor:
+        *,
+        combine: bool = True,
+    ) -> torch.Tensor | Routes:
         if (
             hidden.ndim != 2
             or topk_ids.shape != topk_weights.shape
@@ -181,7 +191,7 @@ class FusedMoE(nn.Module):
             )
         operator = _binding.moe.get().get(id(self))
         if operator is not None:
-            result = operator(hidden, topk_ids, topk_weights)
+            result = operator(hidden, topk_ids, topk_weights, combine=combine)
         elif self.expert_group.size > 1:
             raise RuntimeError(
                 "expert-parallel experts exchange tokens through the operator "
@@ -199,11 +209,18 @@ class FusedMoE(nn.Module):
                     self.up_gate.input_quantizer,
                     self.down.input_quantizer,
                 ),
+                combine=combine,
             )
         else:
             from uniserve.runtime.backends.moe import evaluate
 
-            result = evaluate(self, hidden, topk_ids, topk_weights)
+            result = evaluate(
+                self, hidden, topk_ids, topk_weights, combine=combine
+            )
         if self.group.size > 1:
-            self.group.all_reduce(result)
+            # Partial sums over the intermediate shards complete each route
+            # row as well as each combined row.
+            self.group.all_reduce(
+                result.rows if isinstance(result, Routes) else result
+            )
         return result

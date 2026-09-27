@@ -14,6 +14,7 @@ import torch
 from torch.nn import functional as F
 from uniserve_kernels.triton import require_kernel
 
+from ._moe import Routes
 from ._tensors import check_output, result
 
 if TYPE_CHECKING:
@@ -124,7 +125,7 @@ def add_rms_norm(
 
 def sandwich_rms_norm(
     residual: torch.Tensor,
-    updates: tuple[tuple[torch.Tensor, torch.Tensor | None], ...],
+    updates: tuple[tuple[torch.Tensor | Routes, torch.Tensor | None], ...],
     weight: torch.Tensor,
     *,
     eps: float,
@@ -137,7 +138,9 @@ def sandwich_rms_norm(
     Sandwich normalization, as the Gemma layers apply it around each
     sublayer. Each ``(update, branch_weight)`` pair contributes
     ``rms_norm(update, branch_weight)``, or ``update`` itself when the
-    weight is ``None``; the contributions sum left to right. Then::
+    weight is ``None``; the contributions sum left to right. An update may
+    be :class:`Routes`, whose value it contributes; on CUDA the launch
+    evaluates that value while reading the routes. Then::
 
         stream = residual + rms_norm(summed, weight)
         stream = stream * scale                      # when scale is given
@@ -180,13 +183,31 @@ def sandwich_rms_norm(
     encodings = tuple(encodings) + (None,) * (len(norms) - len(encodings))
 
     if residual.is_cuda:
+        # The kernel takes routes as (rows, weights) tensor pairs.
+        kernel_updates: tuple[
+            tuple[
+                torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+                torch.Tensor | None,
+            ],
+            ...,
+        ] = tuple(
+            ((update.rows, update.weights), branch)
+            if isinstance(update, Routes)
+            else (update, branch)
+            for update, branch in updates
+        )
         require_kernel(
             "sandwich_rms_norm",
             sandwich.unsupported(
-                residual, updates, weight, scale, norms, encodings
+                residual, kernel_updates, weight, scale, norms, encodings
             ),
             residual=residual,
-            **{f"update{i}": update for i, (update, _) in enumerate(updates)},
+            **{
+                f"update{i}": update.rows
+                if isinstance(update, Routes)
+                else update
+                for i, (update, _) in enumerate(updates)
+            },
             scale=scale,
         )
         stream = torch.empty_like(residual)
@@ -202,7 +223,7 @@ def sandwich_rms_norm(
         )
         sandwich.sandwich(
             residual,
-            updates,
+            kernel_updates,
             weight,
             scale,
             norms,
@@ -214,9 +235,13 @@ def sandwich_rms_norm(
         return stream, outputs
 
     # The composition that defines the kernel's rounding points.
+    values = [
+        update.combine() if isinstance(update, Routes) else update
+        for update, _ in updates
+    ]
     terms = [
-        update if branch is None else rms_norm(update, branch, eps)
-        for update, branch in updates
+        value if branch is None else rms_norm(value, branch, eps)
+        for value, (_, branch) in zip(values, updates, strict=True)
     ]
     summed = terms[0]
     for term in terms[1:]:

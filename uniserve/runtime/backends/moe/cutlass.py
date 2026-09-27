@@ -34,7 +34,7 @@ from uniserve.quantization import QuantizedTensor
 from uniserve.tensors import BufferConfig
 
 from . import Backend as _Backend
-from . import Operator as _Operator
+from . import CombiningOperator
 from .tactics import Tactics
 
 
@@ -44,7 +44,7 @@ def _activation(name):
     return ActivationType.Swiglu if name == "silu" else ActivationType.GegluTanh
 
 
-class _Cutlass(_Operator):
+class _Cutlass(CombiningOperator):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         from flashinfer.fused_moe import cutlass_fused_moe
@@ -53,17 +53,20 @@ class _Cutlass(_Operator):
         self._activation_type = _activation(self.module.activation)
         self._tactics = Tactics(Backend.name, self.module)
 
-    def __call__(self, hidden, topk_ids, topk_weights, *, tactic=None):
+    def __call__(
+        self, hidden, topk_ids, topk_weights, *, combine=True, tactic=None
+    ):
         """Evaluate the routed experts; ``tactic`` overrides the table.
 
         A tactic is ``[gemm1, gemm2]``: indices into the runner's combined
-        configuration list, ``-1`` for a GEMM's default.
+        configuration list, ``-1`` for a GEMM's default. The kernels store
+        combined rows, returned uncombined as one-route ``Routes``.
         """
         self._validate(hidden, topk_ids, topk_weights)
         output = torch.empty_like(hidden)
         tokens = hidden.shape[0]
         if not tokens:
-            return output
+            return self._result(output, combine)
         if tactic is None:
             tactic = self._tactics.select(tokens)
         module = self.module
@@ -86,7 +89,7 @@ class _Cutlass(_Operator):
             ep_size=module.expert_group.size,
             ep_rank=module.expert_group.rank,
         )
-        return output
+        return self._result(output, combine)
 
     def tactic_space(self) -> list[list[int]]:
         """GEMM1 and GEMM2 configuration indices, each default (-1) first.
