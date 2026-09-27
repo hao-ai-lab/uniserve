@@ -1854,20 +1854,54 @@ impl Scheduler {
 
         // Other successor kinds require an exact projected physical variant
         // match and, unless they follow unconditionally, a completion
-        // predicate. The canvas pass that follows the prefill completing a
-        // context (a readout's pass or a block's first step) always runs,
-        // since the prefill cannot stop the request, so it carries no
-        // predicate. It reads the KV the prefill writes, and only the
-        // worker's device order puts the write first: forwards run in
-        // submission order on one stream, and a forward on an execution lane
-        // forks from and joins back into the device's control stream
-        // (`ModelExecutor.forward` in uniserve_worker).
-        let unconditional = target == CallKind::Forward(ForwardMode::TokenDenoising)
-            && is_prompt_extend(&predecessor.call);
-        (predecessor.call.completion_output.is_some() || unconditional)
+        // predicate.
+        (predecessor.call.completion_output.is_some() || self.follows_unconditionally(id, target))
             && self
                 .pending_successor_code(id)
                 .is_some_and(|variant| variant == target)
+    }
+
+    /// Returns whether a successor of kind `target`, queued behind the
+    /// request's last in-flight call, runs whatever that call's device result
+    /// is, and so carries no predicate.
+    ///
+    /// Two successors follow unconditionally:
+    /// - The canvas pass that follows the prefill completing a context (a
+    ///   readout's pass or a block's first step), since the prefill cannot
+    ///   stop the request. The pass reads the KV the prefill writes, and only
+    ///   the worker's device order puts the write first: forwards run in
+    ///   submission order on one stream, and a forward on an execution lane
+    ///   forks from and joins back into the device's control stream
+    ///   (`ModelExecutor.forward` in uniserve_worker).
+    /// - A stopped block's commit queued behind the block's steps still in
+    ///   flight. The host has accepted the step that stopped the block, so
+    ///   every step behind it is a no-op whose completion is false, and the
+    ///   commit runs regardless. The commit writes the block's tokens to KV
+    ///   positions `[P, P + canvas)`, where `P` is the context length each
+    ///   step of the block reads; a canvas step reads KV below `P` and writes
+    ///   none, so the commit's writes never overlap what those steps read.
+    ///   Each rank also runs the commit after them in submission order on
+    ///   its device stream, under data and expert parallelism alike.
+    pub(super) fn follows_unconditionally(&self, id: RequestId, target: CallKind) -> bool {
+        let Some(predecessor) = self
+            .inflight
+            .pending_calls
+            .get(&id)
+            .and_then(|queue| queue.back())
+        else {
+            return false;
+        };
+        match target {
+            CallKind::Forward(ForwardMode::TokenDenoising) => is_prompt_extend(&predecessor.call),
+            CallKind::Forward(ForwardMode::Prefill) => self.running.get(&id).is_some_and(|state| {
+                state.phase == Phase::CommitCanvas
+                    && predecessor
+                        .call
+                        .canvas
+                        .is_some_and(|step| step.block == state.canvas_block)
+            }),
+            _ => false,
+        }
     }
 
     /// Determines the next pipelined computation from its submitted predecessor.
@@ -2931,13 +2965,24 @@ impl Scheduler {
                 // A predicated call was skipped because its device predicate
                 // was false, so it is rolled back like an invalidated
                 // descendant and marks any later descendants invalidated.
+                // A step queued behind the step that stopped its block is the
+                // exception: the host knew it for a no-op once it accepted the
+                // stopping step, and every call queued since, the block's
+                // commit and the next block's steps, was planned from that
+                // host-observed stop (`follows_unconditionally`).
                 if record.status == CallStatus::Predicated {
                     let has_unresolved_descendants = self.inflight.has_pending_calls(id);
                     if let Some(state) = self.running.get_mut(&id) {
                         state.num_kv_units_sent = state
                             .num_kv_units_sent
                             .saturating_sub(u64::from(call.bounds.max_kv_units));
-                        state.speculative_chain_invalidated = has_unresolved_descendants;
+                        let stop_observed = state.phase == Phase::CommitCanvas
+                            && call
+                                .canvas
+                                .is_some_and(|step| step.block == state.canvas_block);
+                        if !stop_observed {
+                            state.speculative_chain_invalidated = has_unresolved_descendants;
+                        }
                     }
                     self.free_buffers(call.output_buffers());
                     self.finish_pending_if_idle(id);
@@ -3277,11 +3322,17 @@ impl Scheduler {
                         },
                     );
                 }
+                let terminal_published = self
+                    .inflight
+                    .pending_finishes
+                    .get(&id)
+                    .is_some_and(|finish| finish.terminal_published);
                 self.inflight.pending_finishes.insert(
                     id,
                     PendingFinish {
                         reason: FinishReason::Error,
                         stop_reason: None,
+                        terminal_published,
                     },
                 );
             }

@@ -480,6 +480,9 @@ pub struct SimEngine {
     /// Readout candidate whose log-probability is reported as NaN, as a
     /// worker with a numerical defect reports it.
     non_finite_candidate: Option<u32>,
+    /// Releases for batches that skip a predicated call: such a batch returns
+    /// only after taking one release, or once the sender is dropped.
+    predicated_release: Option<Receiver<()>>,
     /// Admitted requests by id, removed when a `Finish` for the same request
     /// key executes.
     requests: HashMap<RequestId, SimRequestState>,
@@ -510,6 +513,7 @@ impl SimEngine {
             vocab: SYNTH_VOCAB_SIZE,
             results_on_wait: false,
             non_finite_candidate: None,
+            predicated_release: None,
             requests: HashMap::new(),
         }
     }
@@ -1088,6 +1092,16 @@ impl SimEngine {
         self.non_finite_candidate = Some(token);
     }
 
+    /// Holds every batch that skips a predicated call until the returned
+    /// sender releases it, as a worker whose skipped step is still running
+    /// holds its batch's result: each message releases one held batch, and
+    /// dropping the sender releases the rest.
+    pub fn hold_predicated_batches(&mut self) -> Sender<()> {
+        let (release, held) = crossbeam_channel::unbounded();
+        self.predicated_release = Some(held);
+        release
+    }
+
     /// Returns mutable access to the simulator's advertised capabilities.
     pub fn mut_info_for_test(&mut self) -> &mut WorkerInfo {
         &mut self.info
@@ -1303,6 +1317,15 @@ impl SimEngine {
                 request.state_call_id = call.call_id;
             }
             completions.push(completion);
+        }
+
+        if let Some(release) = &self.predicated_release
+            && completions
+                .iter()
+                .any(|completion| completion.status == CallStatus::Predicated)
+        {
+            // A disconnected sender releases every later batch.
+            let _ = release.recv();
         }
 
         let report = BatchOutput {

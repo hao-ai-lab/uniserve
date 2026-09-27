@@ -706,7 +706,8 @@ impl Scheduler {
         // A device successor consumes the token or completion tensor of
         // either its in-flight predecessor or the latest resolved call as its
         // predicate: a decode follows the predecessor's sampled token, any
-        // other successor its completion product. The first call and
+        // other successor its completion product unless it follows
+        // unconditionally (`follows_unconditionally`). The first call and
         // host-observed transitions use the latest accepted call identity and
         // carry no predicate.
         let projected_successor = self.inflight.has_pending_calls(request_id);
@@ -741,6 +742,8 @@ impl Scheduler {
             };
             if call.code == CallKind::Forward(ForwardMode::Decode) {
                 predecessor.token_output.clone()
+            } else if self.follows_unconditionally(request_id, call.code) {
+                None
             } else {
                 predecessor.completion_output.clone()
             }
@@ -1602,10 +1605,15 @@ impl Scheduler {
                 {
                     return None;
                 }
+                // The steps in flight that the planned step follows are those
+                // behind the latest queued prefill: steps queued before a
+                // commit are the stopped block's no-ops.
                 let queued = self.inflight.pending_calls.get(&id);
                 let steps_in_flight = queued.map_or(0, |calls| {
                     calls
                         .iter()
+                        .rev()
+                        .take_while(|inflight| !is_prompt_extend(&inflight.call))
                         .filter(|inflight| inflight.call.canvas.is_some())
                         .count()
                 });
@@ -1631,10 +1639,17 @@ impl Scheduler {
             }
             Phase::CommitCanvas => {
                 // The stopped block's tokens extend the context as one causal
-                // prefill row.
+                // prefill row. The commit is planned once the host accepts
+                // the step that stopped the block, queued without a predicate
+                // behind the block's steps still in flight, which are no-ops
+                // (`follows_unconditionally`), so the worker launches it
+                // while they run.
                 let st = self.running.get(&id)?;
                 let tokens = st.canvas_commit.clone();
-                if self.inflight.has_pending_calls(id) || tokens.len() > budget {
+                if (self.inflight.has_pending_calls(id)
+                    && !self.can_queue_successor(id, CallKind::Forward(ForwardMode::Prefill)))
+                    || tokens.len() > budget
+                {
                     return None;
                 }
                 let end = (kv_visible_len as usize).saturating_add(tokens.len());
