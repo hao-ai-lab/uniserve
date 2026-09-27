@@ -105,10 +105,11 @@ def topk_softmax(
     """Route tokens to their ``k`` most probable experts.
 
     ``scores`` is ``[tokens, experts]``. Returns int32 ``ids`` and FP32
-    ``weights``, both ``[tokens, k]`` in descending probability: the full
-    FP32 softmax of the scores, its top-k, divided by their sum (clamped
-    below by the FP32 epsilon) when ``renormalize`` is set, then multiplied
-    by ``scale[id]`` (an ``[experts]`` vector) when given.
+    ``weights``, both ``[tokens, k]`` in descending probability with equal
+    probabilities in ascending expert order: the full FP32 softmax of the
+    scores, its top-k, divided by their sum (clamped below by the FP32
+    epsilon) when ``renormalize`` is set, then multiplied by ``scale[id]``
+    (an ``[experts]`` vector) when given.
     """
     from uniserve_kernels.triton import require_kernel
 
@@ -136,7 +137,12 @@ def topk_softmax(
         return ids, weights
 
     probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32)
-    weights, ids = torch.topk(probabilities, k, dim=-1)
+    # A stable descending sort lists equal probabilities in ascending expert
+    # order; BF16 scores make such ties common.
+    weights, ids = torch.sort(
+        probabilities, dim=-1, descending=True, stable=True
+    )
+    weights, ids = weights[:, :k], ids[:, :k]
     if renormalize:
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(
             torch.finfo(weights.dtype).eps

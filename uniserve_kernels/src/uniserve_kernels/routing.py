@@ -6,10 +6,9 @@ tensor composition, allocates the outputs and raises on CUDA with the reason
 :func:`unsupported` reports. One warp routes one token and reproduces the
 composition's FP32 arithmetic and order: PyTorch's warp softmax over the
 scores, the k largest probabilities in descending order with equal ones in
-the order ``torch.topk`` gives them (its gather order sorted by its bitonic
-network), their renormalization by PyTorch's butterfly row sum clamped below
-by the FP32 epsilon, and an optional per-expert scale. Outputs are int32
-expert ids and FP32 weights, both ``[tokens, k]``.
+ascending expert order, their renormalization by PyTorch's butterfly row
+sum clamped below by the FP32 epsilon, and an optional per-expert scale.
+Outputs are int32 expert ids and FP32 weights, both ``[tokens, k]``.
 
 The extension builds with :func:`uniserve_kernels.jit.load` on first use;
 :func:`unsupported` never compiles. Launches synchronize nothing, so CUDA
