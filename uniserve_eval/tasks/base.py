@@ -147,16 +147,18 @@ class BenchmarkTask:
     def apply_text_sampling(self, payload: dict[str, Any]) -> None:
         """Add configured text-sampling fields to an endpoint payload.
 
-        Optional fields are added only when configured. `extra_body` is merged
-        last, so its keys override every field set here. Chat tasks call this
-        after setting their own fields, such as the output limit, so
-        `extra_body` overrides those as well.
+        Fields are added only when configured: a control of `None`, as a
+        point with server-owned sampling declares for every control, stays
+        out of the request. `extra_body` is merged last, so its keys override
+        every field set here. Chat tasks call this after setting their own
+        fields, such as the output limit, so `extra_body` overrides those as
+        well.
         """
         sampling = self.point.sampling
-        payload["temperature"] = sampling.temperature
-        payload["top_p"] = sampling.top_p
-        payload["ignore_eos"] = sampling.ignore_eos
         for key in (
+            "temperature",
+            "top_p",
+            "ignore_eos",
             "top_k",
             "min_p",
             "repetition_penalty",
