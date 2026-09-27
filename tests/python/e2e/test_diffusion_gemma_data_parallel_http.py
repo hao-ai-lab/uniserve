@@ -9,7 +9,8 @@ client observes:
 
 - readouts sent together are all answered correctly, and every replica
   admits some of them;
-- a seeded chat reply is the same whichever replica serves it.
+- a seeded chat request sent to every replica at once is answered by each,
+  with the same reply wherever the replicas are independent.
 
 The checkpoint directories come from ``UNISERVE_DIFFUSION_GEMMA_MODEL``
 (BF16) and ``UNISERVE_DIFFUSION_GEMMA_NVFP4_MODEL`` (NVFP4). The worker
@@ -76,8 +77,12 @@ def _checkpoint(precision: str) -> Path:
     ],
     ids="-".join,
 )
-def served(request, tmp_path_factory) -> Iterator[tuple[str, int]]:
-    """Serve one replica per visible GPU; yield the URL and replica count."""
+def served(request, tmp_path_factory) -> Iterator[tuple[str, int, str]]:
+    """Serve one replica per visible GPU.
+
+    Yields the URL, the replica count and the topology (a key of
+    ``TOPOLOGIES``).
+    """
     replicas = torch.cuda.device_count()
     if replicas < 2:
         pytest.fail(f"data-parallel serving needs two GPUs, found {replicas}")
@@ -112,7 +117,7 @@ def served(request, tmp_path_factory) -> Iterator[tuple[str, int]]:
     ]
     log = tmp_path_factory.mktemp(f"{precision}-{topology}") / "server.log"
     with server_process(args, base_url, log, timeout_s=1800.0):
-        yield base_url, replicas
+        yield base_url, replicas, topology
 
 
 def _post(base_url: str, route: str, body: dict) -> dict:
@@ -130,7 +135,7 @@ def _admitted(base_url: str) -> dict[int, float]:
 
 
 def test_concurrent_readouts_are_answered_by_every_replica(served):
-    base_url, replicas = served
+    base_url, replicas, _ = served
     question = {
         "color": {
             "type": "choice",
@@ -172,14 +177,21 @@ def test_concurrent_readouts_are_answered_by_every_replica(served):
     assert all(count > 0 for count in admitted.values()), admitted
 
 
-def test_a_seeded_reply_is_the_same_on_every_replica(served):
+def test_every_replica_answers_a_seeded_request(served):
     """One seeded request sent once per replica at the same time.
 
     Each copy is routed while the others are in flight, so every replica
-    serves exactly one; the replicas hold the same model, so the replies
-    are identical.
+    serves one. Independent replicas each serve their copy alone with the
+    same model, so their replies are identical. Expert-parallel replicas
+    take every expert layer in steps together, and each pads its forward to
+    the graph of the step's agreed exchange capacity, as SGLang
+    (``prepare_mlp_sync_batch_raw``) and vLLM (``coordinate_batch_across_dp``)
+    pad data-parallel ranks to their largest: a copy that starts while the
+    other replicas run larger steps runs in a larger graph, so a reply's
+    numerics follow what the other replicas run alongside it. There each
+    replica answers with a complete reply of its own.
     """
-    base_url, replicas = served
+    base_url, replicas, topology = served
     body = {
         "model": SERVED_MODEL,
         "messages": [
@@ -201,8 +213,13 @@ def test_a_seeded_reply_is_the_same_on_every_replica(served):
             )
         )
 
-    first = replies[0]
-    assert first["usage"]["completion_tokens"] > 0
-    for reply in replies[1:]:
-        assert reply["choices"] == first["choices"]
-        assert reply["usage"] == first["usage"]
+    for reply in replies:
+        (choice,) = reply["choices"]
+        assert choice["message"]["content"].strip()
+        assert choice["finish_reason"] in ("stop", "length")
+        assert 0 < reply["usage"]["completion_tokens"] <= 256
+    if topology == "replicas":
+        first = replies[0]
+        for reply in replies[1:]:
+            assert reply["choices"] == first["choices"]
+            assert reply["usage"] == first["usage"]
