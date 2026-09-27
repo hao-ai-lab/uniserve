@@ -4,7 +4,8 @@ Two ranks each keep half of the experts of one ``FusedMoE`` and exchange
 tokens through the NVLink all-to-all at every call. Each rank's tokens return
 with the complete routed sum over all experts, whichever rank holds them, and
 a rank without tokens of its own still serves the other rank's tokens routed
-to its experts by joining the step. Replaying a captured step reproduces it.
+to its experts by joining the step, in one launch of the join captured at
+the step's capacity. Replaying a captured step reproduces it.
 The fused MegaMoE exchange serves NVFP4 experts with the same step protocol
 and gates with each layer's declared nonlinearity.
 """
@@ -15,6 +16,7 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 from torch.nn import functional as F
+from torch.profiler import ProfilerActivity, profile
 
 from uniserve.distributed import partition_experts
 from uniserve.model import TextSize
@@ -22,7 +24,7 @@ from uniserve.nn import functional
 from uniserve.nn.moe import FusedMoE
 from uniserve.quantization import Quantizer, ScaleLayout
 from uniserve.runtime import CUDAGraph, CUDAStream, ExecutionContext
-from uniserve.runtime.expert_exchange import ExpertExchange
+from uniserve.runtime.expert_exchange import ExpertExchange, JoinGraphs
 from uniserve.runtime.process_groups import (
     Rendezvous,
     initialize_process_groups,
@@ -183,6 +185,100 @@ def test_expert_parallel_ranks_return_the_complete_routed_sum():
     if torch.cuda.device_count() < len(TOKENS):
         pytest.fail(f"expert exchange needs {len(TOKENS)} GPUs")
     mp.spawn(_run, (_free_port(),), nprocs=len(TOKENS), join=True)
+
+
+@torch.inference_mode()
+def _run_joined(rank, port):
+    device = torch.device("cuda", rank)
+    with initialize_process_groups(
+        rank=0,
+        local_rank=rank,
+        world_size=1,
+        device=device,
+        experts=(rank, len(TOKENS), Rendezvous("127.0.0.1", port)),
+    ) as groups:
+        up_gate, down, hidden, ids, weights = _inputs(rank, device)
+        # Two expert layers of the same experts: a join covers every layer.
+        layers = torch.nn.ModuleList(
+            FusedMoE(
+                EXPERTS,
+                HIDDEN,
+                INTERMEDIATE,
+                top_k=TOP_K,
+                activation="gelu_tanh",
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            for _ in range(2)
+        )
+        for layer in layers:
+            layer.up_gate.weight.copy_(up_gate)
+            layer.down.weight.copy_(down)
+        partition_experts(layers, groups.experts)
+
+        exchange = ExpertExchange(
+            groups.experts,
+            max_tokens=CAPACITY,
+            top_k=TOP_K,
+            num_experts=EXPERTS,
+            hidden_size=HIDDEN,
+            device=device,
+        )
+        stream = CUDAStream.external(torch.cuda.Stream(device=device))
+        stream.wait(torch.cuda.current_stream(device))
+        expected = _reference(hidden, up_gate, down, ids, weights)
+        with (
+            stream,
+            ExecutionContext(
+                layers, stream=stream, experts=exchange
+            ) as context,
+        ):
+            context.prepare(TextSize(CAPACITY, 1))
+            # Collective: every rank captures its joins at the same point.
+            joins = JoinGraphs(context, exchange, {CAPACITY})
+            try:
+                if hidden.shape[0]:
+                    # This rank's eager step meets the other rank's replay.
+                    with context.activate():
+                        exchange.begin(CAPACITY)
+                        try:
+                            outputs = [
+                                layer(hidden, ids, weights) for layer in layers
+                            ]
+                        finally:
+                            exchange.end()
+                    stream.synchronize()
+                else:
+                    with profile(activities=[ProfilerActivity.CUDA]) as trace:
+                        joins.replay(CAPACITY)
+                        stream.synchronize()
+                    calls = [event.name for event in trace.events()]
+            finally:
+                joins.close()
+
+        if hidden.shape[0]:
+            # The joining rank's experts served both layers' routes.
+            for output in outputs:
+                torch.testing.assert_close(
+                    output.double(), expected, rtol=_gamma(6), atol=0
+                )
+        else:
+            # One graph launch, and no kernel launched on its own.
+            assert sum("GraphLaunch" in name for name in calls) == 1, calls
+            assert not [name for name in calls if "LaunchKernel" in name]
+
+
+def test_a_rank_without_tokens_joins_every_layer_in_one_graph_launch():
+    """A captured join serves the other rank's step at device speed.
+
+    The rank without tokens takes part in a two-layer step by replaying the
+    join captured at the step's capacity: one graph launch and no kernel
+    launched from the host, while its experts serve the other rank's tokens
+    in both layers, whose outputs match the routed equation.
+    """
+    if torch.cuda.device_count() < len(TOKENS):
+        pytest.fail(f"expert exchange needs {len(TOKENS)} GPUs")
+    mp.spawn(_run_joined, (_free_port(),), nprocs=len(TOKENS), join=True)
 
 
 # E4M3 byte of 2**-6: the block scale of every expert weight.
