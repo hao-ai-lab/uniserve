@@ -13,6 +13,9 @@ The bundle in the output directory contains:
   measured requests that finished before it, in completion order, and
   `run.json` is `failed`.
 - `gpu_samples.jsonl`: `GpuStorageSampler` telemetry snapshots.
+- `server_metrics_before.txt` and `server_metrics_after.txt`: the server's
+  `/metrics` exposition just before the measured window opens and after it
+  closes, written on the completion path when the server serves metrics.
 - `samples/`: decoded image and video outputs referenced by the records.
 - `summary.json` and `summary.md`: the validated summary, written only on the
   completion path.
@@ -35,6 +38,7 @@ import numpy as np
 from ..artifacts import ArtifactWriter
 from ..datasets import load_examples
 from ..load import GpuStorageSampler, WarmupFailure, run_load
+from ..server_metrics import scrape_metrics, window_summary
 from ..tasks import get_task
 from ..transport import send_request
 from ..types import (
@@ -92,6 +96,7 @@ async def run_point(
     records: list[RequestRecord] = []
     sampler: GpuStorageSampler | None = None
     duration = 0.0
+    metrics_before: str | None = None
 
     # Empty streams and the preparing record make partial failures
     # inspectable with the same artifact names as completed points.
@@ -176,6 +181,11 @@ async def run_point(
                     records.append(record)
                 return record
 
+            async def snapshot_metrics() -> None:
+                """Scrape server counters just before the measured window."""
+                nonlocal metrics_before
+                metrics_before = await scrape_metrics(client, base_url)
+
             # Sampling spans warmup, the settle pause, and the measured
             # window.
             sampler = GpuStorageSampler()
@@ -188,6 +198,7 @@ async def run_point(
                     max_concurrency=point.load.max_concurrency,
                     submit=submit,
                     warmup_requests=point.load.warmup_requests,
+                    before_measure=snapshot_metrics,
                 )
             except WarmupFailure as error:
                 # `WarmupFailure` is the only `run_load` exception that
@@ -208,7 +219,9 @@ async def run_point(
             records = cast(list[RequestRecord], list(load_result.outputs))
             duration = load_result.duration_s
 
-            # Provenance is fetched after the measured window closes.
+            # Counters and provenance are fetched after the measured window
+            # closes.
+            metrics_after = await scrape_metrics(client, base_url)
             server_version = await _fetch_server_version(client, base_url)
 
         summary = build_summary(
@@ -226,11 +239,28 @@ async def run_point(
         if sampler.summary() is not None:
             summary["gpu_memory"] = sampler.summary()
 
+        # The measured window's utilization of the GPUs the server was
+        # launched on, and the server counters the window advanced.
+        summary["gpu_utilization"] = sampler.window_utilization(
+            load_result.window_start,
+            load_result.window_end,
+            _launch_gpu_indices(launch_record),
+        )
+        summary["server_metrics"] = window_summary(
+            metrics_before, metrics_after
+        )
+
         # The completed lifecycle record is written after every result
         # artifact so it acts as the bundle's commit marker.
         _write_records(writer, "warmup_requests.jsonl", warmup_records)
         _write_records(writer, "requests.jsonl", records)
         writer.write_jsonl("gpu_samples.jsonl", list(sampler.sample_records))
+        for name, text in (
+            ("server_metrics_before.txt", metrics_before),
+            ("server_metrics_after.txt", metrics_after),
+        ):
+            if text is not None:
+                (output_path / name).write_text(text, encoding="utf-8")
         writer.write_json("summary.json", summary)
         (output_path / "summary.md").write_text(
             render_markdown(summary), encoding="utf-8"
@@ -289,6 +319,26 @@ async def run_point(
             }
         writer.write_json("run.json", failure)
         raise
+
+
+def _launch_gpu_indices(launch: dict[str, Any]) -> tuple[int, ...] | None:
+    """Return the GPU indices a launch selected with `CUDA_VISIBLE_DEVICES`.
+
+    The selector names `nvidia-smi` indices when it lists integers; a UUID
+    selector or none at all selects every sampled GPU (`None`).
+    """
+    environment = launch.get("environment")
+    selector = (
+        environment.get("CUDA_VISIBLE_DEVICES")
+        if isinstance(environment, dict)
+        else None
+    )
+    if not isinstance(selector, str) or not selector.strip():
+        return None
+    try:
+        return tuple(int(item) for item in selector.split(","))
+    except ValueError:
+        return None
 
 
 def _write_empty_streams(writer: ArtifactWriter) -> None:
