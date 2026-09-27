@@ -553,6 +553,7 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
     positive_fields = {
         "--max-batch-calls": namespace.max_batch_calls,
         "--max-batch-tokens": namespace.max_batch_tokens,
+        "--max-request-pool-size": namespace.max_request_pool_size,
         "--queue-depth": namespace.queue_depth,
         "--ipc-payload-cap": namespace.ipc_payload_cap,
         "--world-size": namespace.world_size,

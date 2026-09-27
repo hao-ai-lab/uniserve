@@ -54,6 +54,7 @@ DEFAULTS: dict[str, Any] = {
     "block_size": 64,
     "max_batch_calls": 256,
     "max_batch_tokens": 8192,
+    "max_request_pool_size": 129,
     "max_model_len": 8192,
     "max_video_seconds": 15.0,
     "graph_policy": "off",

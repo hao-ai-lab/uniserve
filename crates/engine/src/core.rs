@@ -27,6 +27,7 @@ use crate::scheduler::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
 };
+use crate::scheduler::{MAX_FLOW_PREFIX_ROWS, MAX_NUM_SEQS, flow_prefix_rows};
 use crate::scheduler::{Scheduler, SpecialTokenIds};
 use crate::scheduler::{SchedulerConfig, SchedulerStats, SchedulingPolicy};
 use crate::worker::{WorkerExecutor, WorkerGroup, WorkerProcessArgs};
@@ -327,7 +328,8 @@ pub struct EngineConfig {
     pub max_batch: usize,
     /// Maximum number of tokens scheduled in one engine step.
     pub max_num_batched_tokens: usize,
-    /// Maximum number of concurrently running requests.
+    /// Maximum number of concurrently running requests. `EngineCore::new`
+    /// sizes every worker's request pool from it.
     pub max_num_seqs: usize,
     /// Per-request token ceiling for one prefill chunk.
     pub long_prefill_threshold: usize,
@@ -447,13 +449,18 @@ impl EngineCore {
     /// Launches every configured WorkerGroup, builds the scheduler, and starts
     /// the scheduler owner thread.
     ///
+    /// Every group is launched with a request pool of `max_num_seqs` rows
+    /// plus the largest reserve a runtime keeps outside that limit.
+    ///
     /// Blocks until every rank has loaded the model and reported its
     /// capabilities. Fails when `config.data_parallel_size` is not one (see
     /// [`EngineCore::replicas`]), `WorkerConfig::validate_all` rejects the
     /// workers, a configured transfer edge names an unconfigured worker,
     /// `WorkerGroup::spawn_all` fails to launch a group,
-    /// `WorkerExecutor::try_new` refuses the launched groups, or the scheduler
-    /// or its thread cannot be created.
+    /// `WorkerExecutor::try_new` refuses the launched groups, the workers of
+    /// a runtime with a KV cache hold too few request rows for
+    /// `max_num_seqs` running requests, or the scheduler or its thread
+    /// cannot be created.
     pub fn new(config: EngineConfig) -> anyhow::Result<Self> {
         anyhow::ensure!(
             config.data_parallel_size == 1,
@@ -550,6 +557,14 @@ impl EngineCore {
             "transfer edge names an unconfigured worker"
         );
 
+        // Every group holds a request row for each running request the
+        // scheduler may keep resident, plus the rows a runtime keeps outside
+        // that limit. Only the loaded capabilities decide that reserve
+        // (`flow_prefix_rows`), so the launch sizes for the largest one.
+        let max_num_seqs = config.max_num_seqs.clamp(1, MAX_NUM_SEQS);
+        let max_request_pool_size = u32::try_from(max_num_seqs + MAX_FLOW_PREFIX_ROWS)
+            .context("max_num_seqs exceeds the worker request-pool field")?;
+
         // Each group launches from the shared defaults with its own identity,
         // placement, components, queue depth, and storage fraction, plus its
         // replica's resolved transfer edges and the components of every group
@@ -568,6 +583,7 @@ impl EngineCore {
                     components: worker.components.clone(),
                     peers: peers.clone(),
                     queue_depth: worker.queue_depth,
+                    max_request_pool_size,
                     kv_storage_fraction: worker
                         .storage_fraction
                         .unwrap_or(config.worker_process.kv_storage_fraction),
@@ -588,6 +604,21 @@ impl EngineCore {
         for (replica, transfer) in replicas.iter().zip(transfers) {
             let workers = groups.by_ref().take(replica.len()).collect();
             let executor = WorkerExecutor::try_new(workers, transfer.clone())?;
+
+            // A token runtime serves `max_num_seqs` running requests only while
+            // its workers hold that many request rows beyond the reserve; the
+            // scheduler would otherwise lower the limit. Workers without a KV
+            // cache fit their request pools to device storage, and the
+            // scheduler bounds their requests by the rows they report.
+            let info = executor.info().runtime_info()?;
+            let request_rows = info.request_slots as usize;
+            let needed_rows = max_num_seqs + flow_prefix_rows(&info);
+            anyhow::ensure!(
+                !info.uses_kv() || request_rows >= needed_rows,
+                "the workers hold {request_rows} request rows, but {max_num_seqs} running \
+                 requests need {needed_rows}"
+            );
+
             let waker = executor.command_waker();
             let replica_config = EngineConfig {
                 workers: replica.to_vec(),

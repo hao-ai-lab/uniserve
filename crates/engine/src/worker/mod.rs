@@ -97,6 +97,11 @@ pub struct WorkerProcessArgs {
     pub max_batch_calls: u32,
     /// Maximum tokens accepted in one worker run.
     pub max_batch_tokens: u32,
+    /// Request rows each rank holds: the size of the worker's request pool,
+    /// whose rows carry per-request state such as canvases, sampling state
+    /// and block tables. A worker that fits its request tensors to device
+    /// storage takes this as the largest pool it may choose.
+    pub max_request_pool_size: u32,
     /// Attention implementation selected for model execution.
     pub attention_backend: uniserve_worker_ipc::AttentionBackend,
     /// Optional public worker capability selectors; empty uses the model default.

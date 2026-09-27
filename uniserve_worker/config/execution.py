@@ -472,6 +472,8 @@ def worker_config_from_namespace(
         block_size=_positive_optional_int(namespace.block_size),
         max_batch_calls=int(namespace.max_batch_calls),
         max_batch_tokens=int(namespace.max_batch_tokens),
+        # The engine sizes the request pool from its running-request limit.
+        max_request_pool_size=int(namespace.max_request_pool_size),
         max_sequence_tokens=int(namespace.max_model_len),
         max_video_seconds=float(namespace.max_video_seconds),
         min_video_seconds=_optional_float(

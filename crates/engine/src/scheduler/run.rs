@@ -63,6 +63,25 @@ fn resolve_generation_limits(
     limits
 }
 
+/// Largest number of request-pool rows a runtime keeps outside
+/// `max_num_seqs` (`flow_prefix_rows`). A launch sizes worker request pools
+/// before the loaded capabilities decide the actual reserve.
+pub(crate) const MAX_FLOW_PREFIX_ROWS: usize = 1;
+
+/// Request-pool rows the runtime keeps outside `max_num_seqs`.
+///
+/// A KV runtime with denoising keeps one row: a running request's
+/// multi-branch guidance prefix (`Scheduler::ensure_flow_prefix`) allocates
+/// its own row from the same request pool. Other runtimes keep none.
+pub(crate) fn flow_prefix_rows(info: &WorkerInfo) -> usize {
+    usize::from(
+        info.uses_kv()
+            && info
+                .supported_calls
+                .contains(&CallKind::Media(MediaCall::Denoising)),
+    )
+}
+
 impl Scheduler {
     /// Constructs an engine loop with the default scheduler configuration.
     ///
@@ -227,25 +246,27 @@ impl Scheduler {
 
         config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
 
-        // KV runtimes with denoising keep one request slot outside
-        // `max_num_seqs`. A running request's multi-branch guidance prefix
-        // (`Scheduler::ensure_flow_prefix`) allocates its own slot from the
-        // same request pool. `set_max_num_seqs` applies the same reserve.
-        let flow_slot_reserve = usize::from(
-            info.uses_kv()
-                && info
-                    .supported_calls
-                    .contains(&CallKind::Media(MediaCall::Denoising)),
-        );
+        // The request pool also holds the rows the runtime keeps outside
+        // `max_num_seqs` (`flow_prefix_rows`); `set_max_num_seqs` applies the
+        // same reserve. `EngineCore::new` launches workers with enough rows
+        // and refuses a token runtime whose workers hold fewer, so this clamp
+        // lowers the limit only for a supplied executor or for workers that
+        // fit their request pools to device storage.
         let request_pool_capacity = info.request_slots as usize;
         let main_request_capacity = request_pool_capacity
-            .saturating_sub(flow_slot_reserve)
+            .saturating_sub(flow_prefix_rows(&info))
             .max(1);
 
-        config.max_num_seqs = config
-            .max_num_seqs
-            .clamp(1, MAX_NUM_SEQS)
-            .min(main_request_capacity);
+        let requested_seqs = config.max_num_seqs.clamp(1, MAX_NUM_SEQS);
+        if requested_seqs > main_request_capacity {
+            tracing::warn!(
+                requested = requested_seqs,
+                request_rows = info.request_slots,
+                running = main_request_capacity,
+                "the workers' request rows lower the running-request limit"
+            );
+        }
+        config.max_num_seqs = requested_seqs.min(main_request_capacity);
         config.max_num_batched_tokens = config.max_num_batched_tokens.max(1).min(max_batch_tokens);
         if max_batch_calls > 0 {
             config.max_batch = config.max_batch.min(max_batch_calls.max(1));
@@ -345,18 +366,11 @@ impl Scheduler {
     ///
     /// Keeps the flow-prefix slot reserve applied at construction.
     pub fn set_max_num_seqs(&mut self, n: usize) {
-        let flow_slot_reserve = usize::from(
-            self.info.uses_kv()
-                && self
-                    .info
-                    .supported_calls
-                    .contains(&CallKind::Media(MediaCall::Denoising)),
-        );
         let capacity = self
             .storage
             .request_pool
             .capacity()
-            .saturating_sub(flow_slot_reserve)
+            .saturating_sub(flow_prefix_rows(&self.info))
             .max(1);
         self.config.max_num_seqs = n.clamp(1, capacity);
     }
