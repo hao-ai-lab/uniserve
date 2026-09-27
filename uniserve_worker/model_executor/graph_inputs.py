@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from itertools import accumulate
 
 import torch
 
@@ -418,7 +419,17 @@ def _fixed_view(tensor, shape):
     )
 
 
-def pad_text(batch, rows, tokens, widths, decode):
+def _stage_offsets(offsets: torch.Tensor, lengths: tuple[int, ...]) -> None:
+    """Copy the running offsets of host ``lengths``, from zero, into place."""
+    offsets.copy_(
+        torch.tensor(
+            tuple(accumulate(lengths, initial=0)), dtype=offsets.dtype
+        ),
+        non_blocking=True,
+    )
+
+
+def pad_text(batch, rows, tokens, widths, decode, *, staging):
     """Borrow a fixed bucket and make padding inert, including cache writes.
 
     Physical unit zero is valid storage. Padding queries read disposable
@@ -427,10 +438,13 @@ def pad_text(batch, rows, tokens, widths, decode):
     one additional numerical sequence. ``widths[t]`` is the staged width of
     numerical table ``t``.
 
-    The batch's tensors must be views of the runner's fixed staging: padding
-    is written in place past the live extents, and the returned batch views
-    the same storage at the bucket shape. Padding rows use request slot zero,
-    which the block tables reserve for padding.
+    The batch's tensors must be views of ``staging``, the runner's fixed
+    staging (``AttentionBuffers``): padding is written in place past the
+    live extents, and the returned batch views the same storage at the
+    bucket shape. Padding rows use request slot zero, which the block tables
+    reserve for padding. Lengths and offsets derive from the host lengths
+    and stage with one copy each; every table's padding clears with one
+    launch per column.
     """
     inputs, live_rows = batch.inputs, batch.row_count
     attention, live_tokens = inputs.attention, inputs.input_ids.numel()
@@ -465,50 +479,54 @@ def pad_text(batch, rows, tokens, widths, decode):
     slots = _fixed_view(batch.request_pool_indices, (rows,))
     slots[live_rows:].zero_()
 
-    # The shared query domain pads once; every table then pads its own page
-    # columns, prefixes and write addresses against it.
+    # The shared query domain pads once, from the host lengths.
     queries = _fixed_view(attention.queries.values, (rows,))
-    queries[live_rows:].zero_()
-    if decode:
-        queries[live_rows:].fill_(1)
-    elif padding:
-        queries[live_rows : live_rows + 1].fill_(padding)
+    if extra:
+        queries[live_rows:].copy_(
+            torch.tensor(dummy, dtype=queries.dtype), non_blocking=True
+        )
     query_offsets = _fixed_view(attention.queries.offsets, (rows + 1,))
-    torch.cumsum(queries, dim=0, out=query_offsets[1:])
+    _stage_offsets(query_offsets, host_queries)
     shared = SequenceLengths(
         host=host_queries, values=queries, offsets=query_offsets
     )
 
+    # Tables staged together share one prefix column, padded once; every
+    # table's page columns and write addresses pad with one launch each.
+    staging.clear_padding(
+        live_rows=live_rows, rows=rows, live_tokens=live_tokens, tokens=tokens
+    )
+    padded_prefixes = {}
     entries = {}
     for number, entry in attention.entries.items():
         blocks = entry.block_table
         table = _fixed_view(blocks.indices, (rows, widths[number]))
-        table[live_rows:].zero_()
         start = blocks.start_page
         start_host = blocks.start_page_host
         if start is not None:
             start = _fixed_view(start, (rows,))
-            start[live_rows:].zero_()
             if start_host is not None:
                 start_host = start_host + (0,) * extra
 
-        prefix = _fixed_view(entry.prefixes.values, (rows,))
-        prefix[live_rows:].zero_()
-        prefix_offsets = _fixed_view(entry.prefixes.offsets, (rows + 1,))
-        torch.cumsum(prefix, dim=0, out=prefix_offsets[1:])
+        prefixes = padded_prefixes.get(id(entry.prefixes.values))
+        if prefixes is None:
+            prefix = _fixed_view(entry.prefixes.values, (rows,))
+            prefix[live_rows:].zero_()
+            prefix_offsets = _fixed_view(entry.prefixes.offsets, (rows + 1,))
+            host_prefixes = entry.prefixes.host + (0,) * extra
+            _stage_offsets(prefix_offsets, host_prefixes)
+            prefixes = SequenceLengths(
+                host=host_prefixes, values=prefix, offsets=prefix_offsets
+            )
+            padded_prefixes[id(entry.prefixes.values)] = prefixes
 
         writes = entry.write_indices
         if writes is not None:
             writes = _fixed_view(writes, (tokens,))
-            writes[live_tokens:].fill_(-1)
 
         entries[number] = PagedInput(
             shared,
-            SequenceLengths(
-                host=entry.prefixes.host + (0,) * extra,
-                values=prefix,
-                offsets=prefix_offsets,
-            ),
+            prefixes,
             BlockTable(table, blocks.block_size, start, start_host),
             writes,
             (causal,) * rows,

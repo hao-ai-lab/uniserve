@@ -396,7 +396,7 @@ class TextRunner(ModelRunner):
                 ]
                 finish.zero_()
                 batch = replace(batch, decode_force_finish=finish)
-            padded = pad_text(batch, *shape)
+            padded = pad_text(batch, *shape, staging=self.input_buffers)
             inputs = padded.inputs
             key: tuple[object, ...] = (
                 "text",
@@ -411,7 +411,7 @@ class TextRunner(ModelRunner):
 
         # A prefill graph computes hidden states, or only the K/V cache;
         # the force-finish column and the rows' selections stay outside it.
-        padded = pad_text(batch, *shape)
+        padded = pad_text(batch, *shape, staging=self.input_buffers)
         inputs = padded.inputs
         key = (
             "prefill",

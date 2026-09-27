@@ -478,6 +478,23 @@ class AttentionBuffers(InputBuffers):
             )
             offset += count
 
+    def clear_padding(self, *, live_rows, rows, live_tokens, tokens):
+        """Make the padding of every staged table inert, one launch per column.
+
+        Rows ``live_rows..rows`` of every table's units and start pages
+        become zero (unit zero is valid storage, page zero the first), and
+        tokens ``live_tokens..tokens`` of every table's write addresses
+        become -1, no cache write. Each column is one ``[table, ...]``
+        tensor whose tables are the staged views (``_stage_table``), so one
+        launch covers every table; columns past a table's graph width are
+        never read.
+        """
+        if rows > live_rows:
+            self.block_tables[:, live_rows:rows].zero_()
+            self.start_pages[:, live_rows:rows].zero_()
+        if tokens > live_tokens:
+            self.write_indices[:, live_tokens:tokens].fill_(-1)
+
     def _vector(self, target, source):
         if source.numel() > target.numel():
             raise ValueError("numerical column exceeds input-buffer capacity")
