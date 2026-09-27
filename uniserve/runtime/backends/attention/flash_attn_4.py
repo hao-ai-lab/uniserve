@@ -106,6 +106,10 @@ def _lse(result):
 
 
 class _FlashAttentionOperator(_Operator):
+    # The kernels read every length, offset and table on the device; ``bind``
+    # only checks the batch.
+    builds_launch_plan = False
+
     def requires_host_lengths(self, batch):
         return (
             isinstance(batch, (PagedInput, VarlenInput))

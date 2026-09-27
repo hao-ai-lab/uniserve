@@ -118,6 +118,9 @@ class _PrefixBlock(_Operator):
     # holds absolute logical page ``start_page``; no row reads a retired
     # page because the window starts at or after its start page.
     reads_retired_tables = True
+    # The kernels read every length, offset and table origin on the
+    # device; ``bind`` only checks the batch.
+    builds_launch_plan = False
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

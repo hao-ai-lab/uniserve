@@ -215,6 +215,23 @@ class AttentionBinding:
             or self.module.exchange.group.size > 1
         )
 
+    @property
+    def builds_launch_plan(self):
+        """Whether binding builds per-batch state a captured launch reads.
+
+        True when an operator builds a launch plan
+        (``Operator.builds_launch_plan``), when token partitions follow
+        host lengths, or before any operator is prepared.
+        """
+        return (
+            not self.operators
+            or self.partitions_tokens()
+            or any(
+                operator.builds_launch_plan
+                for operator in self.operators.values()
+            )
+        )
+
     def reads_host_lengths(self, batch):
         """Report whether binding ``batch`` reads its exact host lengths."""
         return self.partitions_tokens() or any(

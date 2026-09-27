@@ -664,7 +664,7 @@ class ExecutionContext(Generic[SizeT]):
         self._vsa_context[parallel] = buffers
         return buffers
 
-    def bind_attention(self, batch):
+    def bind_attention(self, batch, *, replay=False):
         """Plan one call's attention metadata on the layers that read it.
 
         ``batch`` is the call's ``AttentionBatch``. A layer with a cache
@@ -678,6 +678,14 @@ class ExecutionContext(Generic[SizeT]):
         layers and tables, and only when the batch lacks them and the context
         derives host lengths; otherwise a plan that needs a missing mirror
         raises ``ValueError``.
+
+        With ``replay``, the batch feeds a captured graph's replay. When no
+        reading layer builds a launch plan (``AttentionBinding.
+        builds_launch_plan``), the captured launches read every length and
+        table on the device, so only the checks of the batch remain; the
+        layers reading one table share its entry, so one layer per table
+        checks it. Otherwise every reading layer binds as without
+        ``replay``.
         """
         from .backends.attention._sequences import batch_host_lengths
 
@@ -692,6 +700,14 @@ class ExecutionContext(Generic[SizeT]):
                     else binding.table in batch.entries
                 )
             )
+            if replay and not any(
+                binding.builds_launch_plan for binding in readers
+            ):
+                # The first layer reading each table checks its entry.
+                first = {}
+                for binding in readers:
+                    first.setdefault(binding.table, binding)
+                readers = tuple(first.values())
             mirrored = batch
             if any(
                 binding.reads_host_lengths(batch.entry(binding.table))

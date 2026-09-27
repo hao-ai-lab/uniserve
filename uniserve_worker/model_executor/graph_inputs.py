@@ -696,7 +696,8 @@ def _replay(graph, batch):
         attention = getattr(batch.inputs, "attention", None)
         if attention is not None:
             context.bind_attention(
-                bind_attention(graph.inputs.value.inputs.attention, attention)
+                bind_attention(graph.inputs.value.inputs.attention, attention),
+                replay=True,
             )
         return graph.executable.replay()
 
