@@ -638,7 +638,6 @@ class Worker:
             self.tensor_store = TensorStore(
                 capacity=arena.tensor_store,
                 byte_capacity=arena.device_product_bytes,
-                entry_capacity=int(info.encoder_cache_entries),
                 max_entry_bytes=max(1, int(info.encoder_entry_bytes)),
                 devices=owner_devices,
                 request_capacity=int(info.request_slots),

@@ -389,6 +389,9 @@ def _token_worker_layout(
     unresolved_window = call_window(
         int(queue_depth), int(worker_config.max_batch_calls)
     )
+    # The scheduler's encoder cache retains up to ``encoder_cache_entries``
+    # features and places the next image's feature before it evicts the
+    # least recently used one, so the pool holds one feature beyond them.
     buffer_pool_bytes = (encoder_cache_entries + 1) * max(
         max_latent_feature_bytes, max_vision_feature_bytes
     )
