@@ -10,8 +10,8 @@
 // - softmax as PyTorch's warp softmax evaluates a row: lane l holds scores
 //   l + 32 * i, the maximum and the sum of expf(score - max) reduce by xor
 //   butterflies, and each probability is exp / sum;
-// - the k largest probabilities in descending order, equal ones in the
-//   order torch.topk gives them;
+// - the k largest probabilities in descending order, equal ones in
+//   ascending expert order, by repeated warp arg-max;
 // - their sum by the xor butterfly over k lanes that PyTorch's row sum of a
 //   [tokens, k] tensor uses, clamped below by FLT_EPSILON, divides them;
 // - a per-expert scale multiplies the result in FP32.
@@ -53,9 +53,6 @@ __global__ void topk_softmax_kernel(const void* scores, int score_kind, int64_t 
                                     int rows, int experts, int top, int renormalize,
                                     const void* scale, int scale_kind, int32_t* ids,
                                     float* weights) {
-  __shared__ float shared_value[kWarpsPerBlock][kWarp];
-  __shared__ int shared_expert[kWarpsPerBlock][kWarp];
-  __shared__ bool shared_valid[kWarpsPerBlock][kWarp];
   const int row = blockIdx.x * kWarpsPerBlock + threadIdx.x / kWarp;
   const int lane = threadIdx.x % kWarp;
   if (row >= rows) return;  // uniform per warp
@@ -91,14 +88,16 @@ __global__ void topk_softmax_kernel(const void* scores, int score_kind, int64_t 
 #pragma unroll
   for (int it = 0; it < kIterations; ++it) values[it] = values[it] / sum;
 
-  // Top-k by repeated warp arg-max; every lane ends with all k picks.
+  // Top-k by repeated warp arg-max; every lane ends with all k picks, in
+  // descending order with equal values in ascending expert order.
   float top_value[kTop];
-  float kth = 0.f;
+  int top_expert[kTop];
   unsigned taken = 0u;
 #pragma unroll
   for (int j = 0; j < kTop; ++j) {
     if (j >= top) {
       top_value[j] = 0.f;
+      top_expert[j] = 0;
       continue;
     }
     float best = -1.f;
@@ -121,72 +120,21 @@ __global__ void topk_softmax_kernel(const void* scores, int score_kind, int64_t 
       }
     }
     top_value[j] = best;
-    if (j == top - 1) kth = best;
+    top_expert[j] = best_expert;
     if (best_expert % kWarp == lane) taken |= 1u << (best_expert / kWarp);
   }
 
-  // The order of the picks. Equal probabilities keep the order that the
-  // composition's torch.topk gives them: its gather lists the probabilities
-  // above the k-th largest in expert order, then those equal to it in
-  // expert order, and a bitonic network over 32 slots (16 threads, two
-  // slots each, strict comparison) sorts them in descending order.
-  float* slot_value = shared_value[threadIdx.x / kWarp];
-  int* slot_expert = shared_expert[threadIdx.x / kWarp];
-  bool* slot_valid = shared_valid[threadIdx.x / kWarp];
-  slot_valid[lane] = false;
-  slot_value[lane] = 0.f;
-  slot_expert[lane] = 0;
-  __syncwarp();
-  int placed = 0;
-#pragma unroll
-  for (int pass = 0; pass < 2; ++pass) {
-#pragma unroll
-    for (int it = 0; it < kIterations; ++it) {
-      const int expert = lane + it * kWarp;
-      const bool listed = expert < experts &&
-                          (pass == 0 ? values[it] > kth : values[it] == kth);
-      const unsigned ballot = __ballot_sync(0xffffffffu, listed);
-      const int position = placed + __popc(ballot & ((1u << lane) - 1u));
-      if (listed && position < top) {
-        slot_value[position] = values[it];
-        slot_expert[position] = expert;
-        slot_valid[position] = true;
-      }
-      placed += __popc(ballot);
-    }
-  }
-  __syncwarp();
-  auto exchange = [&](int stride, bool descending_half) {
-    if (lane < kWarp / 2) {
-      const int a = 2 * lane - (lane & (stride - 1));
-      const int b = a + stride;
-      const bool swap = (slot_value[a] > slot_value[b] && slot_valid[a]) || !slot_valid[b];
-      if (swap == descending_half) {
-        const float value = slot_value[a];
-        const int expert = slot_expert[a];
-        const bool valid = slot_valid[a];
-        slot_value[a] = slot_value[b];
-        slot_expert[a] = slot_expert[b];
-        slot_valid[a] = slot_valid[b];
-        slot_value[b] = value;
-        slot_expert[b] = expert;
-        slot_valid[b] = valid;
-      }
-    }
-    __syncwarp();
-  };
-#pragma unroll
-  for (int size = 2; size < kWarp; size *= 2) {
-#pragma unroll
-    for (int stride = size / 2; stride > 0; stride /= 2) exchange(stride, (lane & (size / 2)) != 0);
-  }
-#pragma unroll
-  for (int stride = kWarp / 2; stride > 0; stride /= 2) exchange(stride, false);
-
   // Lane j of the first k lanes stores pick j.
   if (lane >= top) return;
-  float weight = slot_value[lane];
-  const int expert = slot_expert[lane];
+  float weight = 0.f;
+  int expert = 0;
+#pragma unroll
+  for (int j = 0; j < kTop; ++j) {
+    if (j == lane) {
+      weight = top_value[j];
+      expert = top_expert[j];
+    }
+  }
   if (renormalize) {
     // The butterfly over k lanes: at each step lane j adds lane j ^ offset.
     float partial[kTop];

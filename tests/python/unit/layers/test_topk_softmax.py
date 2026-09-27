@@ -3,7 +3,7 @@
 ``topk_softmax`` returns each token's k most probable experts under the FP32
 softmax of its router scores, renormalized and scaled per expert when asked.
 On CUDA the kernel reproduces the tensor composition bit for bit, including
-the order in which ``torch.topk`` lists equal probabilities.
+the order of equal probabilities (ascending expert order).
 """
 
 from __future__ import annotations
@@ -18,7 +18,10 @@ pytestmark = pytest.mark.unit
 
 def _composition(scores, k, renormalize, scale):
     probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32)
-    weights, ids = torch.topk(probabilities, k, dim=-1)
+    weights, ids = torch.sort(
+        probabilities, dim=-1, descending=True, stable=True
+    )
+    weights, ids = weights[:, :k], ids[:, :k]
     if renormalize:
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(
             torch.finfo(weights.dtype).eps
@@ -37,7 +40,8 @@ def test_routing_takes_the_most_probable_experts_in_order():
     probabilities = torch.softmax(scores, dim=-1)
     assert ids.dtype is torch.int32 and weights.dtype is torch.float32
     assert ids[0].tolist() == [1, 3]
-    assert set(ids[1].tolist()) == {0, 1}
+    # Equal probabilities list in ascending expert order.
+    assert ids[1].tolist() == [0, 1]
     first = probabilities[0, [1, 3]]
     torch.testing.assert_close(
         weights[0], first / first.sum() * scale[[1, 3]], rtol=0, atol=1e-7
@@ -57,7 +61,7 @@ def test_routing_takes_the_most_probable_experts_in_order():
 def test_cuda_routing_reproduces_the_composition_bit_for_bit(
     dtype, experts, k, renormalize
 ):
-    """BF16 scores tie often, which exercises torch.topk's order of ties."""
+    """BF16 scores tie often, which exercises the order of equal picks."""
     torch.manual_seed(13)
     scores = (torch.randn((777, experts), device="cuda") * 4).to(dtype)
     scale = (torch.rand((experts,), device="cuda") + 0.5).to(torch.bfloat16)
