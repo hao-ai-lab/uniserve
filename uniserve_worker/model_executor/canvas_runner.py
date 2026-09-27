@@ -61,7 +61,12 @@ from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve_worker.storage.canvas_slots import STEP_CONTINUED, STEP_SKIPPED
 
 from .cuda_graph import CUDAGraphRunner, GraphBucket
-from .graph_inputs import _fixed_view, capture_hidden, replay_hidden
+from .graph_inputs import (
+    _fixed_view,
+    _stage_offsets,
+    capture_hidden,
+    replay_hidden,
+)
 from .input_batch import CanvasStepInput, InputBatch, ReadoutInput
 from .model_runner import ModelRunner
 from .output import ExecutionOutput
@@ -358,7 +363,7 @@ class CanvasRunner(ModelRunner):
 
         widths = self.input_buffers.table_widths
         if isinstance(inputs, CanvasStepInput):
-            padded = _pad_steps(batch, rows, length, widths)
+            padded = _pad_steps(batch, rows, length, widths, self.input_buffers)
             key: tuple[object, ...] = (
                 "canvas_step",
                 rows,
@@ -366,7 +371,9 @@ class CanvasRunner(ModelRunner):
                 padded.inputs.first,
             )
         else:
-            padded = _pad_readout(batch, rows, length, widths)
+            padded = _pad_readout(
+                batch, rows, length, widths, self.input_buffers
+            )
             key = ("canvas", rows)
         return key, padded, True
 
@@ -495,6 +502,7 @@ def _pad_attention(
     padding: tuple[int, ...],
     width: int,
     widths: tuple[int, ...],
+    staging,
 ):
     """Append padding sequences to staged canvas attention in place.
 
@@ -505,7 +513,9 @@ def _pad_attention(
     every sequence of the call, live or padding, whenever it replays; it
     sizes the captured attention launch. Table ``t`` is viewed at its graph
     width ``widths[t]``; live rows read only the pages their prefixes
-    cover.
+    cover. Offsets derive from the host lengths, and every table's padding
+    rows clear with one launch per column of ``staging``, whose views the
+    attention is.
     """
     queries = attention.queries
     live = queries.batch_size
@@ -518,7 +528,7 @@ def _pad_attention(
             torch.tensor(padding, dtype=values.dtype), non_blocking=True
         )
     offsets = _fixed_view(queries.offsets, (rows + 1,))
-    torch.cumsum(values, dim=0, out=offsets[1:])
+    _stage_offsets(offsets, queries.host + padding)
     shared = SequenceLengths(
         host=queries.host + padding, values=values, offsets=offsets
     )
@@ -527,12 +537,17 @@ def _pad_attention(
     prefix_values = _fixed_view(first.values, (rows,))
     prefix_values[live:].zero_()
     prefix_offsets = _fixed_view(first.offsets, (rows + 1,))
-    torch.cumsum(prefix_values, dim=0, out=prefix_offsets[1:])
+    host_prefixes = None
+    if first.host is None:
+        # Device-resident prefix lengths have no host mirror to sum.
+        torch.cumsum(prefix_values, dim=0, out=prefix_offsets[1:])
+    else:
+        host_prefixes = first.host + (0,) * extra
+        _stage_offsets(prefix_offsets, host_prefixes)
     prefixes = SequenceLengths(
-        host=None if first.host is None else first.host + (0,) * extra,
-        values=prefix_values,
-        offsets=prefix_offsets,
+        host=host_prefixes, values=prefix_values, offsets=prefix_offsets
     )
+    staging.clear_padding(live_rows=live, rows=rows, live_tokens=0, tokens=0)
 
     # Every canvas token sees its whole canvas.
     visible = values[:, None].expand(-1, width)
@@ -542,11 +557,9 @@ def _pad_attention(
         if blocks.indices.shape[1] > widths[number]:
             raise ValueError("prefix table exceeds its configured graph width")
         table = _fixed_view(blocks.indices, (rows, widths[number]))
-        table[live:].zero_()
         start, start_host = blocks.start_page, blocks.start_page_host
         if start is not None:
             start = _fixed_view(start, (rows,))
-            start[live:].zero_()
             if start_host is not None:
                 start_host = start_host + (0,) * extra
         entries[number] = SegmentedInput(
@@ -584,7 +597,11 @@ def canvas_staging_rows(max_rows: int) -> int:
 
 
 def _pad_readout(
-    batch: InputBatch, rows: int, length: int, widths: tuple[int, ...]
+    batch: InputBatch,
+    rows: int,
+    length: int,
+    widths: tuple[int, ...],
+    staging,
 ) -> InputBatch:
     """The canvas pass of a readout call as the ``rows`` bucket stages it.
 
@@ -615,14 +632,20 @@ def _pad_readout(
         CanvasInput(
             ids,
             positions,
-            _pad_attention(canvas.attention, tuple(padding), length, widths),
+            _pad_attention(
+                canvas.attention, tuple(padding), length, widths, staging
+            ),
         ),
         _pad_rows(batch.request_pool_indices, 2 * rows, live),
     )
 
 
 def _pad_steps(
-    batch: InputBatch, rows: int, length: int, widths: tuple[int, ...]
+    batch: InputBatch,
+    rows: int,
+    length: int,
+    widths: tuple[int, ...],
+    staging,
 ) -> InputBatch:
     """A canvas step call widened to ``rows`` canvases.
 
@@ -660,6 +683,7 @@ def _pad_steps(
                     (length,) * (rows - live),
                     length,
                     widths,
+                    staging,
                 ),
                 self_conditioning=self_conditioning,
             ),
