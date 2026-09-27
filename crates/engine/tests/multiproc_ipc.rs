@@ -1395,6 +1395,38 @@ fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result
 /// Workers launched by the engine hold a request row for every running
 /// request the engine is configured to keep resident, beyond the worker's
 /// own default pool.
+/// Launched ranks keep their host heap out of transparent huge pages: no
+/// mapping of a rank process is advised for them (`MADV_HUGEPAGE`, VmFlags
+/// `hg`), so khugepaged never collapses a serving rank's memory.
+#[test]
+fn launched_ranks_hold_no_huge_page_advised_memory() -> anyhow::Result<()> {
+    let worker = spawn_rank_group()?;
+    // The ranks are this thread's children, each launched with `--rank`.
+    let ranks: Vec<String> = std::fs::read_to_string("/proc/thread-self/children")?
+        .split_whitespace()
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|args| args.split(|byte| *byte == 0).any(|arg| arg == b"--rank"))
+        })
+        .map(str::to_owned)
+        .collect();
+    anyhow::ensure!(ranks.len() == WORLD_SIZE, "found rank processes {ranks:?}");
+    for pid in &ranks {
+        let smaps = std::fs::read_to_string(format!("/proc/{pid}/smaps"))?;
+        let advised = smaps
+            .lines()
+            .filter_map(|line| line.strip_prefix("VmFlags:"))
+            .filter(|flags| flags.split_whitespace().any(|flag| flag == "hg"))
+            .count();
+        assert_eq!(
+            advised, 0,
+            "rank process {pid} holds {advised} mappings advised for huge pages"
+        );
+    }
+    drop(worker);
+    Ok(())
+}
+
 #[test]
 fn launched_workers_hold_a_request_row_per_running_request() -> anyhow::Result<()> {
     const RUNNING: usize = 200;
