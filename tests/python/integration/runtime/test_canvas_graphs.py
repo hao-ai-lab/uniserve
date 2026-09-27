@@ -17,6 +17,8 @@ without a graph over a copy of each request, prefilled in the same call:
 
 A readout reading more slots than the largest readout tail graph holds
 replays the tails in chunks and returns the eager pass's log-probabilities.
+A model whose final layer exchanges tokens across an expert group keeps its
+readout tail eager.
 After startup, a call of more canvases than every bucket fails instead of
 running eagerly. A worker whose KV unit pool holds fewer requests than its
 call bound starts, and replays calls of as many canvases as the pool holds.
@@ -36,6 +38,7 @@ from tests.python.integration.runtime.test_prefill_graphs import (
     NATIVE_VISION,
     SM100,
 )
+from uniserve.distributed import Communicator, partition_experts
 from uniserve.loading import weights
 from uniserve.math import ceil_div
 from uniserve.runtime import PrefixCache
@@ -48,7 +51,10 @@ from uniserve_worker.bootstrap.capacity import (
 from uniserve_worker.config.execution import WorkerConfig
 from uniserve_worker.errors import ResourceError
 from uniserve_worker.execution.model_executor import ModelExecutor
-from uniserve_worker.model_executor.canvas_runner import SLOT_BUCKETS
+from uniserve_worker.model_executor.canvas_runner import (
+    SLOT_BUCKETS,
+    tail_exchanges,
+)
 from uniserve_worker.model_executor.input_batch import (
     CanvasRow,
     CanvasStepRow,
@@ -406,6 +412,27 @@ def test_a_readout_of_more_slots_than_every_tail_replays_in_chunks(tmp_path):
         eager = _values(_eager(runner, manager, rows))
         for actual, expected in zip(replayed, eager, strict=True):
             torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@torch.inference_mode()
+def test_a_readout_tail_with_an_expert_exchange_is_not_graphed(tmp_path):
+    """Expert-parallel final layers keep the readout tail eager.
+
+    Partitioning the model's experts over a two-rank expert group makes the
+    final layer exchange tokens across ranks, which a captured tail cannot
+    replay at every step's agreed capacity; the same model on one rank has
+    a rank-local tail.
+    """
+    _checkpoint(tmp_path)
+    source = models.read_config(tmp_path)
+    for size in (1, 2):
+        model = models.load_model(
+            source, device="meta", weights=weights.Config(dtype=torch.bfloat16)
+        ).model
+        partition_experts(
+            model, Communicator(ranks=tuple(range(size)), name="experts")
+        )
+        assert tail_exchanges(model.denoiser) is (size > 1)
 
 
 @SM100
