@@ -384,6 +384,45 @@ def test_nvfp4_gating_applies_the_declared_nonlinearity(activation, provider):
 
 @pytest.mark.parametrize("provider", NVFP4_PROVIDERS)
 @torch.inference_mode()
+def test_nvfp4_experts_read_hidden_states_stored_in_their_input_encoding(
+    provider,
+):
+    """Hidden states stored in the experts' input encoding give the output
+    of the same states in BF16, bit for bit, eager and replayed; another
+    encoding is rejected.
+    """  # noqa: D205
+    generator = torch.Generator().manual_seed(67)
+    module, hidden = _exact_nvfp4("gelu_tanh", generator)
+    hidden = hidden * (torch.rand(hidden.shape, generator=generator) + 0.5).to(
+        DEVICE, torch.bfloat16
+    )
+    ids, weights = _routes(generator)
+    encoded = module.up_gate.input_quantizer.quantize(hidden)
+
+    stream = CUDAStream.external(torch.cuda.Stream(device=DEVICE))
+    stream.wait(torch.cuda.current_stream(DEVICE))
+    with (
+        stream,
+        ExecutionContext(module, stream=stream, moe=provider) as context,
+    ):
+        context.prepare(TextSize(TOKENS, 1))
+        with context.activate():
+            expected = module(hidden, ids, weights).clone()
+            assert torch.equal(module(encoded, ids, weights), expected)
+            with pytest.raises(ValueError, match="input encoding"):
+                module(
+                    Quantizer("nvfp4", calibrated_scale=2.0).quantize(hidden),
+                    ids,
+                    weights,
+                )
+        with CUDAGraph(context=context) as graph:
+            graph.capture(lambda: module(encoded, ids, weights))
+            assert torch.equal(graph.replay(), expected)
+    torch.cuda.synchronize(DEVICE)
+
+
+@pytest.mark.parametrize("provider", NVFP4_PROVIDERS)
+@torch.inference_mode()
 def test_nvfp4_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
     """Eight routes per token combine identically on every call.
 

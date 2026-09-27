@@ -4,14 +4,16 @@ The provider serves W4A4 NVFP4 experts whose activations use the static
 calibrated scales of ``up_gate.input_quantizer`` and
 ``down.input_quantizer``, with SiLU (``Swiglu``) or tanh-approximated GELU
 (``GegluTanh``) gating, over routing the model has already computed. One
-call encodes the hidden states to NVFP4 with FlashInfer's ``fp4_quantize``
-and runs ``CuteDslMoEWrapper``: a routing sort groups the (token, route)
-pairs by expert into 128-row tiles; the FC1 GEMM gathers each tile's token
-rows, accumulates in FP32, applies the gating nonlinearity to the
-dequantized FP32 products and encodes the gated product to NVFP4 in its
-epilogue; the FC2 GEMM dequantizes in FP32 and stores each (token, route)
-row in BF16; a final pass sums every token's routes in route order in FP32,
-each weighted by its FP32 route weight, and rounds the sum to BF16 once.
+call reads hidden states in that NVFP4 input encoding, as a caller stored
+them or as FlashInfer's ``fp4_quantize`` encodes BF16 hidden states (see
+``NVFP4Operator``), and runs ``CuteDslMoEWrapper``: a routing sort groups
+the (token, route) pairs by expert into 128-row tiles; the FC1 GEMM gathers
+each tile's token rows, accumulates in FP32, applies the gating nonlinearity
+to the dequantized FP32 products and encodes the gated product to NVFP4 in
+its epilogue; the FC2 GEMM dequantizes in FP32 and stores each (token,
+route) row in BF16; a final pass sums every token's routes in route order in
+FP32, each weighted by its FP32 route weight, and rounds the sum to BF16
+once.
 
 The provider uses only this two-stage combination (FlashInfer's
 ``use_fused_finalize=False``). FlashInfer's fused alternative adds each
@@ -31,19 +33,19 @@ replacing its parameters with the rearranged encoding; the logical weights
 are unchanged, so every provider and the portable reference decode them
 identically, and only one copy stays resident.
 
-Every per-call buffer (the encoded hidden states and their scales, routing
-tables, the encoded FC1 output and its scales, the ``[T * K, H]`` BF16
-route rows and the returned output) comes from PyTorch's caching
+Every per-call buffer (the hidden states' encoding when the call encodes
+them, routing tables, the encoded FC1 output and its scales, the BF16 route rows
+``[T * K, H]`` and the returned output) comes from PyTorch's caching
 allocator, and from the graph's private pool under CUDA graph capture, so
 ``workspace_buffers`` is empty. Every kernel runs on the caller's current
 stream; the operator owns no stream or event. Each call runs the tactic
-(routing tile size and each GEMM's MMA tile, cluster shape and raster
-order) measured best for its token count on this device and FlashInfer
-version (``tactics.json``, see ``tactics``), and FlashInfer's default
-tactic for shapes the table does not cover. The measurement admits only
-tactics whose outputs equal the default's bit for bit. The first eager
-call of a tactic compiles its kernels, so capture must follow an eager
-call at the captured token count, as for every prepared operator.
+(routing tile size and each GEMM's MMA tile, cluster shape and raster order)
+measured best for its token count on this device and FlashInfer version
+(``tactics.json``, see ``tactics``), and FlashInfer's default tactic for
+shapes the table does not cover. The measurement admits only tactics whose
+outputs equal the default's bit for bit. The first eager call of a tactic
+compiles its kernels, so capture must follow an eager call at the captured
+token count, as for every prepared operator.
 """
 
 from __future__ import annotations
@@ -52,8 +54,7 @@ import torch
 
 from uniserve.quantization import RowOrder
 
-from . import NVFP4Backend
-from . import Operator as _Operator
+from . import NVFP4Backend, NVFP4Operator
 from .tactics import Tactics
 
 
@@ -62,14 +63,12 @@ def _tuple(value):
     return tuple(map(_tuple, value)) if isinstance(value, list) else value
 
 
-class _CuteDsl(_Operator):
+class _CuteDsl(NVFP4Operator):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        from flashinfer import fp4_quantize
         from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
         from flashinfer.fused_moe import ActivationType, CuteDslMoEWrapper
 
-        self._quantize = fp4_quantize
         module = self.module
         up_gate, down = module.up_gate.weight, module.down.weight
         experts, rows, hidden = up_gate.shape
@@ -107,7 +106,6 @@ class _CuteDsl(_Operator):
             dtype=torch.float32,
             device=device,
         )
-        self._input_scale = input13.reciprocal()
         self._fc1_alpha = fields13["tensor_scale"] * input13
         self._fc2_input_scale = input2.reciprocal()
         self._fc2_alpha = fields2["tensor_scale"] * input2
@@ -156,20 +154,14 @@ class _CuteDsl(_Operator):
         self._validate(hidden, topk_ids, topk_weights)
         tokens = hidden.shape[0]
         if not tokens:
-            return torch.empty_like(hidden)
+            return torch.empty(
+                hidden.shape, dtype=torch.bfloat16, device=hidden.device
+            )
         if tactic is None:
             tactic = self._tactics.select(tokens)
         choice = None if tactic is None else _tuple(tactic[0])
 
-        # The FC1 gather reads the linear token-major [T, H / 16] scales.
-        values, scales = self._quantize(
-            hidden.contiguous(),
-            global_scale=self._input_scale,
-            is_sf_swizzled_layout=False,
-        )
-        scales = scales.view(torch.float8_e4m3fn).reshape(
-            tokens, hidden.shape[1] // 16
-        )
+        values, scales = self._encoded(hidden)
         return self._kernel.run(
             values,
             scales,
@@ -195,7 +187,7 @@ class _CuteDsl(_Operator):
         # operator never keeps a replaced encoding resident.
         self._kernel = None
         self._fc1 = self._fc2 = self._fc1_scale = self._fc2_scale = None
-        self._input_scale = self._fc1_alpha = None
+        self._fc1_alpha = None
         self._fc2_input_scale = self._fc2_alpha = None
 
 

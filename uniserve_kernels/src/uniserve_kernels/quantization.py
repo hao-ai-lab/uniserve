@@ -11,6 +11,11 @@ agreement with it.
 
 Every input is a ``[rows, width]`` matrix with unit column stride and any
 row stride; outputs are contiguous.
+
+:func:`nvfp4_encode` is a Triton device function, not a launch: kernels
+that produce a row in registers call it to store the row directly in a
+calibrated NVFP4 encoding, bit for bit as FlashInfer's NVFP4 encoder
+would store it.
 """
 
 from __future__ import annotations
@@ -129,6 +134,90 @@ if triton is not None:
             ).to(tl.float32)
             maximum = tl.maximum(maximum, tl.abs(values))
         tl.store(partials_ptr + program, tl.max(maximum, axis=0))
+
+    @triton.jit
+    def _rcp_approx(x):
+        """``rcp.approx.ftz.f32``: the reciprocal the NVFP4 encoder uses."""
+        return tl.inline_asm_elementwise(
+            "rcp.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            [x],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+
+    @triton.jit
+    def _e4m3_byte(x):
+        """The saturating round-to-nearest E4M3 byte of FP32 ``x``.
+
+        ``cvt.rn.satfinite.e4m3x2.f32`` stores its first operand in the
+        upper byte; the lower byte encodes ``x``.
+        """
+        pair = tl.inline_asm_elementwise(
+            "{ .reg .b16 pair; "
+            "cvt.rn.satfinite.e4m3x2.f32 pair, $2, $1; "
+            "cvt.u32.u16 $0, pair; }",
+            "=r,f,f",
+            [x, tl.zeros_like(x)],
+            dtype=tl.uint32,
+            is_pure=True,
+            pack=1,
+        )
+        return (pair & 0xFF).to(tl.uint8)
+
+    @triton.jit
+    def _e2m1_pair(even, odd):
+        """One byte of two saturating round-to-nearest E2M1 codes.
+
+        The lower nibble holds ``even`` (the lower column), as FlashInfer's
+        packed NVFP4 values store them.
+        """
+        pair = tl.inline_asm_elementwise(
+            "{ .reg .b8 pair; .reg .b16 wide; "
+            "cvt.rn.satfinite.e2m1x2.f32 pair, $2, $1; "
+            "mov.b16 wide, {pair, 0}; cvt.u32.u16 $0, wide; }",
+            "=r,f,f",
+            [even, odd],
+            dtype=tl.uint32,
+            is_pure=True,
+            pack=1,
+        )
+        return pair.to(tl.uint8)
+
+    @triton.jit
+    def nvfp4_encode(values, tensor_scale, BLOCK: tl.constexpr):  # noqa: N803
+        """Encode one row of ``BLOCK`` FP32 values with a static tensor scale.
+
+        ``values`` hold the 16-bit row values in FP32 (padding columns
+        zero); ``tensor_scale`` is the calibrated NVFP4 activation scale
+        ``s`` whose reciprocal is the encoder's global scale. Returns the
+        ``[BLOCK // 2]`` packed E2M1 bytes and the ``[BLOCK // 16]`` E4M3
+        block-scale bytes of the linear layout. The arithmetic is
+        FlashInfer's ``fp4_quantize`` (TensorRT-LLM
+        ``cvt_warp_fp16_to_fp4``, quantization_utils.cuh:431-690) step for
+        step, so the bytes equal its output: each K16 block's amax times
+        ``rcp.approx(6)`` times ``1 / s`` rounds to the E4M3 block scale;
+        values multiply by ``rcp.approx(scale * rcp.approx(1 / s))`` (zero
+        for an all-zero block) and round to E2M1, saturating.
+        """
+        blocks = tl.reshape(values, [BLOCK // 16, 16])
+        amax = tl.max(tl.abs(blocks), axis=1)
+
+        # The global scale is the correctly rounded FP32 1 / s, as the
+        # reference encoders compute it on the device.
+        global_scale = tl.math.div_rn(1.0, tensor_scale)
+        sixth = _rcp_approx(tl.full([BLOCK // 16], 6.0, tl.float32))
+        scale_bytes = _e4m3_byte(global_scale * (amax * sixth))
+        decoded = scale_bytes.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        inverse_global = _rcp_approx(tl.zeros_like(amax) + global_scale)
+        output_scale = tl.where(
+            amax != 0.0, _rcp_approx(decoded * inverse_global), 0.0
+        )
+
+        scaled = blocks * output_scale[:, None]
+        even, odd = tl.split(tl.reshape(scaled, [BLOCK // 2, 2]))
+        return _e2m1_pair(even, odd), scale_bytes
 
 
 def unsupported_rowwise_fp8(x: torch.Tensor) -> str | None:

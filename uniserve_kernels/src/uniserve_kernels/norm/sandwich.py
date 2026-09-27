@@ -18,6 +18,12 @@ the one of the separate normalizations this launch replaces, and the
 results are bit-identical to the composition of those kernels and the
 tensor operations between them. The scale is read from device memory, so the
 launch synchronizes nothing and CUDA graphs capture it.
+
+A normalization may instead be stored in a calibrated NVFP4 encoding: its
+row, rounded to the row dtype as the unencoded output would store it, is
+encoded by :func:`uniserve_kernels.quantization.nvfp4_encode` into packed
+E2M1 values and linear E4M3 block scales, bit for bit as FlashInfer's NVFP4
+encoder encodes the stored row, and the unencoded row is never written.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from numbers import Real
 import torch
 
 from uniserve_kernels.norm.rms import MAX_WIDTH, row_launch
+from uniserve_kernels.quantization import nvfp4_encode
 from uniserve_kernels.triton import tl, triton, unsupported_operands
 
 #: Rows are 16-bit floating values.
@@ -75,6 +82,10 @@ if triton is not None:
         norm_weights,
         norm_factors,
         norm_outputs,
+        norm_values,
+        norm_block_scales,
+        norm_tensor_scales,
+        norm_encode_scales,
         WIDTH: tl.constexpr,  # noqa: N803
         EPS: tl.constexpr,  # noqa: N803
         BLOCK: tl.constexpr,  # noqa: N803
@@ -86,12 +97,17 @@ if triton is not None:
         NORM_WEIGHTED: tl.constexpr,  # noqa: N803
         NORM_FACTORED: tl.constexpr,  # noqa: N803
         NORM_SCALARS: tl.constexpr,  # noqa: N803
+        NORM_ENCODED: tl.constexpr,  # noqa: N803
     ):
         """Sandwich-normalize one contiguous row.
 
         ``NORM_SCALARS[i]`` is the trailing number of normalization ``i``,
-        or ``None``. Every ``.to(dtype)`` marks a rounding point of the
-        composition.
+        or ``None``. An ``NORM_ENCODED[i]`` normalization stores its NVFP4
+        encoding with calibrated scale ``norm_encode_scales[i]`` into
+        ``norm_values[i]`` (``[rows, WIDTH / 2]`` packed E2M1),
+        ``norm_block_scales[i]`` (``[rows, WIDTH / 16]`` E4M3) and, from the
+        first row, ``norm_tensor_scales[i]``. Every ``.to(dtype)`` marks a
+        rounding point of the composition.
         """
         dtype = stream_ptr.dtype.element_ty
         row = tl.program_id(0).to(tl.int64)
@@ -148,7 +164,27 @@ if triton is not None:
                 value = (value * factor).to(dtype).to(tl.float32)
             if NORM_SCALARS[n] is not None:
                 value = value * NORM_SCALARS[n]
-            tl.store(norm_outputs[n] + base + columns, value, mask=mask)
+            if NORM_ENCODED[n]:
+                # Encode the row as the unencoded output would store it.
+                packed, scale_bytes = nvfp4_encode(
+                    value.to(dtype).to(tl.float32), norm_encode_scales[n], BLOCK
+                )
+                pairs = tl.arange(0, BLOCK // 2)
+                tl.store(
+                    norm_values[n] + row * (WIDTH // 2) + pairs,
+                    packed,
+                    mask=pairs < WIDTH // 2,
+                )
+                blocks = tl.arange(0, BLOCK // 16)
+                tl.store(
+                    norm_block_scales[n] + row * (WIDTH // 16) + blocks,
+                    scale_bytes,
+                    mask=blocks < WIDTH // 16,
+                )
+                if row == 0:
+                    tl.store(norm_tensor_scales[n], norm_encode_scales[n])
+            else:
+                tl.store(norm_outputs[n] + base + columns, value, mask=mask)
 
 
 def _unsupported_vector(vector: torch.Tensor, width: int, device) -> str | None:
@@ -167,6 +203,7 @@ def unsupported(
     weight: torch.Tensor,
     scale: torch.Tensor | None,
     norms: tuple[tuple, ...],
+    encodings: tuple = (),
 ) -> str | None:
     """Return why the kernel cannot take a sandwich call, or ``None``.
 
@@ -175,7 +212,9 @@ def unsupported(
     vector factors are contiguous FP32, BF16 or FP16 ``[width]`` vectors (a
     normalization weight may be ``None``: unweighted), ``scale`` holds one
     floating value, and each normalization's factors are at most one vector
-    followed by at most one Python number.
+    followed by at most one Python number. ``encodings`` holds, per
+    normalization, ``None`` or a calibrated NVFP4 ``Quantizer`` whose
+    encoding stores it; encoded rows are a whole number of K16 blocks.
     """
     rows = (residual, *(update for update, _ in updates))
     reason = unsupported_operands(
@@ -221,6 +260,15 @@ def unsupported(
         scale.numel() != 1 or scale.dtype not in _VECTOR_DTYPES
     ):
         return "the scale is not one floating value"
+    if len(encodings) > len(norms):
+        return "more encodings than normalizations"
+    for quantizer in encodings:
+        if quantizer is None:
+            continue
+        if quantizer.format != "nvfp4" or quantizer.calibrated_scale is None:
+            return "only calibrated NVFP4 encodings are stored"
+        if width % 16:
+            return f"row width {width} is not a whole number of K16 blocks"
     return None
 
 
@@ -233,16 +281,28 @@ def sandwich(
     eps: float,
     stream: torch.Tensor,
     outputs: tuple[torch.Tensor, ...],
+    encodings: tuple = (),
 ) -> None:
     """Store the stream and its normalizations into caller outputs.
 
-    ``stream`` and each of ``outputs`` (one per normalization) are
-    contiguous rows like ``residual``, overlapping no operand. Callers first
-    check :func:`unsupported`.
+    ``stream`` and each unencoded entry of ``outputs`` (one per
+    normalization) are contiguous rows like ``residual``, overlapping no
+    operand. The output of a normalization ``encodings`` names is that
+    quantizer's ``QuantizedTensor`` of the rows' shape with linear block
+    scales; the launch fills its values, block scales and tensor scale.
+    Callers first check :func:`unsupported`.
     """
     width = int(residual.shape[-1])
     rows = residual.numel() // width
+    encodings = tuple(encodings) + (None,) * (len(norms) - len(encodings))
+    fields = [
+        None if quantizer is None else output.buffers()
+        for quantizer, output in zip(encodings, outputs, strict=True)
+    ]
     if rows == 0:
+        for quantizer, field in zip(encodings, fields, strict=True):
+            if quantizer is not None:
+                field["tensor_scale"].fill_(quantizer.calibrated_scale)
         return
     weights, factors, scalars = [], [], []
     for norm in norms:
@@ -269,7 +329,17 @@ def sandwich(
         stream,
         tuple(stream if w is None else w for w in weights),
         tuple(stream if f is None else f for f in factors),
-        tuple(outputs),
+        tuple(
+            stream if f is not None else output
+            for f, output in zip(fields, outputs, strict=True)
+        ),
+        tuple(stream if f is None else f["values"] for f in fields),
+        tuple(stream if f is None else f["block_scale"] for f in fields),
+        tuple(stream if f is None else f["tensor_scale"] for f in fields),
+        tuple(
+            1.0 if quantizer is None else float(quantizer.calibrated_scale)
+            for quantizer in encodings
+        ),
         width,
         float(eps),
         block,
@@ -281,5 +351,6 @@ def sandwich(
         tuple(w is not None for w in weights),
         tuple(f is not None for f in factors),
         tuple(scalars),
+        tuple(quantizer is not None for quantizer in encodings),
         num_warps=warps,
     )

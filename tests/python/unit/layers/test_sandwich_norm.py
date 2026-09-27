@@ -174,3 +174,53 @@ def test_cuda_sandwich_of_strided_rows_raises():
         ValueError, match="sandwich_rms_norm has no CUDA kernel"
     ):
         sandwich_rms_norm(strided, ((strided, None),), weight, eps=EPS)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("width", (64, 2816))
+def test_cuda_sandwich_stores_a_normalization_in_its_consumer_encoding(width):
+    """An encoded normalization is the quantizer's encoding of its rows.
+
+    Its values, block scales and tensor scale equal, bit for bit, what the
+    calibrated NVFP4 quantizer stores for the unencoded normalization of the
+    same call; the other outputs are unchanged. Rows include an all-zero
+    K16 block and one whose block scale saturates.
+    """
+    from uniserve.quantization import QuantizedTensor, Quantizer, ScaleLayout
+
+    torch.manual_seed(11)
+    device, dtype = "cuda", torch.bfloat16
+    residual = torch.randn((300, width), dtype=dtype, device=device) * 3
+    update = torch.randn_like(residual)
+    weights = torch.randn((3, width), dtype=dtype, device=device)
+    weights[2, :16] = 0
+    weights[2, 16:32] = 1e4
+    quantizer = Quantizer("nvfp4", calibrated_scale=0.0123)
+    norms = ((weights[1],), (weights[2],))
+
+    stream, (first, plain) = sandwich_rms_norm(
+        residual, ((update, None),), weights[0], eps=EPS, norms=norms
+    )
+    encoded_stream, (encoded_first, encoded) = sandwich_rms_norm(
+        residual,
+        ((update, None),),
+        weights[0],
+        eps=EPS,
+        norms=norms,
+        encodings=(None, quantizer),
+    )
+
+    assert torch.equal(encoded_stream, stream)
+    assert torch.equal(encoded_first, first)
+    assert isinstance(encoded, QuantizedTensor)
+    assert encoded.quantizer == quantizer
+    assert encoded.scale_layout is ScaleLayout.LINEAR
+    expected = quantizer.quantize(plain).buffers()
+    for name, field in encoded.buffers().items():
+        assert torch.equal(
+            field.view(torch.uint8) if field.dtype != torch.float32 else field,
+            expected[name].view(torch.uint8)
+            if expected[name].dtype != torch.float32
+            else expected[name],
+        ), name
