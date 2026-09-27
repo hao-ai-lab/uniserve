@@ -416,8 +416,8 @@ class KVCacheManager:
         ``ranges`` holds ``(unit, token offset, token count)`` spans. Applies
         ``require_writable`` and also rejects spans that an execution access
         still retains, including one whose completion failed or was
-        cancelled. ``zero_units`` and ``CacheImports.reserve`` call this
-        before writing units.
+        cancelled. ``zero_units``, ``recycle_units`` and
+        ``CacheImports.reserve`` call this before handing units to a writer.
 
         Raises:
             WorkerError: A resource error when a span overlaps a publication,
@@ -725,6 +725,23 @@ class KVCacheManager:
             return
         self.require_reusable(self.unit_spans(units))
         self.cache.zero_units(units)
+
+    def recycle_units(self, unit_ids: Iterable[int]) -> None:
+        """Prepare newly allocated units for their new owner.
+
+        Resets only the unit state a new writer reads
+        (`PrefixCache.recycle_units`); stale values stay unread.
+
+        Raises:
+            WorkerError: ``invalid_descriptor`` when the units are invalid;
+                a resource error from ``require_reusable`` when any selected
+                unit is still retained.
+        """
+        units = self.validate_units(unit_ids)
+        if not units:
+            return
+        self.require_reusable(self.unit_spans(units))
+        self.cache.recycle_units(units)
 
     def _published_start(self, group: int, base: int, visible: int) -> int:
         """Return the first token a group carries in a publication.

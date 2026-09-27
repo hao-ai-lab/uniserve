@@ -351,6 +351,53 @@ def test_zero_units_preserves_other_units_and_layers(device, quantized):
             assert state.key.buffers()["scale"][2].item() == 4
 
 
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda", marks=pytest.mark.gpu))
+)
+def test_recycled_fp8_unit_encodes_like_a_fresh_unit(device):
+    with _cache(True, device) as cache:
+        state = cache.state("attention")
+        large = torch.full((4, 2, 2), 1792.0, device=device)
+        state.write((1,), start=0, key=large, value=-large)
+        cache.recycle_units((1,))
+
+        # 1.1 encodes exactly at its own scale but not at the stale scale 4
+        # the previous owner left, so only a reset scale reproduces it.
+        small = torch.full((1, 2, 2), 1.1, device=device)
+        for unit in (1, 2):
+            state.write((unit,), start=0, key=small, value=-small)
+        recycled = state.read((1,), start=0, length=1)
+        fresh = state.read((2,), start=0, length=1)
+        for value, reference in zip(recycled, fresh, strict=True):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
+        scales = state.key.buffers()["scale"].flatten().tolist()
+        assert scales[1] == scales[2]
+
+
+def test_recycled_units_of_mixed_types_read_finite_in_every_group():
+    config = Config(
+        {
+            "wide": mha.Config(2, 8, (0, 1), torch.float32),
+            "narrow": mha.Config(2, 8, (0, 1), torch.bfloat16),
+        }
+    )
+    with PrefixCache(config, num_units=3, block_size=4, device="cpu") as cache:
+        # A finite FP32 value whose low half is a BF16 NaN: the narrow
+        # group's view of the same bytes is not finite.
+        bits = torch.full((4, 2, 8), 0x3F807FC0, dtype=torch.int32)
+        wide = bits.view(torch.float32)
+        cache.state("wide").write((1,), start=0, key=wide, value=wide)
+        narrow = cache.planes_of(1, "key")[:, 1]
+        assert torch.isfinite(wide).all()
+        assert not torch.isfinite(narrow).all()
+
+        cache.recycle_units((1,))
+        for group in range(2):
+            for field in ("key", "value"):
+                planes = cache.planes_of(group, field)[:, 1]
+                assert torch.isfinite(planes).all()
+
+
 @pytest.mark.parametrize("quantized", (False, True))
 def test_slot_zero_is_writable_and_minus_one_does_not_initialize(quantized):
     state = _cache(quantized).state("attention")

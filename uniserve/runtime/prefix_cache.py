@@ -44,17 +44,6 @@ from .tensor_buffers import TensorBuffers
 _FIELDS = ("key", "value")
 
 
-def _ranges(units: tuple[int, ...]) -> list[tuple[int, int]]:
-    """Merge unit ids into sorted half-open intervals of adjacent units."""
-    ranges: list[tuple[int, int]] = []
-    for unit in sorted(set(units)):
-        if ranges and ranges[-1][1] == unit:
-            ranges[-1] = (ranges[-1][0], unit + 1)
-        else:
-            ranges.append((unit, unit + 1))
-    return ranges
-
-
 @dataclass(frozen=True, slots=True)
 class CacheGroup:
     """Cache layers that share a history window and a K/V page shape.
@@ -290,6 +279,11 @@ class PrefixCache:
             quantization=quantization,
         )
         self.num_units = num_units
+        # Groups storing different element types reinterpret each other's
+        # stale bytes, which need not decode as finite (`recycle_units`).
+        self._mixed_types = (
+            len({group.dtype for group in self.planes.groups}) > 1
+        )
 
         requirements = self.planes.buffers(num_units)
         self._backing = TensorBuffers.allocate(requirements, device=self.device)
@@ -401,31 +395,82 @@ class PrefixCache:
             raise ValueError("unquantized K/V planes carry no scales")
         return self._fields[f"{field}.scale"]
 
+    def _unit_index(self, units: tuple[int, ...]) -> torch.Tensor:
+        """Stage unit ids as an index on the pool's device.
+
+        On CUDA the ids are copied from pinned host memory without blocking,
+        on the current stream: PyTorch's caching host allocator keeps the
+        pinned source until that copy completes, so the host never waits on
+        queued device work and the index is ordered before every later
+        operation on the stream.
+        """
+        pinned = self.device.type == "cuda"
+        index = torch.tensor(units, dtype=torch.long, pin_memory=pinned)
+        return index.to(self.device, non_blocking=pinned)
+
     def zero_units(self, units: tuple[int, ...]) -> None:
         """Reset caller-selected units in every column and field.
 
         Resets the units' bytes, initialization flags and FP8 scales, so a
-        unit leaving one group can join any other. Adjacent units reset as
-        one interval, enqueued on the current stream of the pool's device
-        without a host read.
+        unit leaving one group can join any other. Each field resets with one
+        indexed fill over its unit axis, however the units are scattered,
+        enqueued on the current stream of the pool's device without a host
+        read. Repeated ids are allowed.
         """
         _blocks(units, self.num_units)
-        ranges = _ranges(units)
+        if not units:
+            return
+
+        index = self._unit_index(units)
         for name, tensor in self._fields.items():
-            value = int(name.endswith(".scale"))
-            for start, stop in ranges:
-                tensor[:, start:stop].fill_(value)
+            # Every field is laid out [columns, num_units, ...].
+            tensor.index_fill_(1, index, int(name.endswith(".scale")))
+
+    def recycle_units(self, units: tuple[int, ...]) -> None:
+        """Prepare units that held earlier tokens for a new owner.
+
+        Readers never weigh tokens a unit's owner has not written: every
+        attention kernel replaces the scores of unwritten positions, so
+        their values contribute exactly zero while they are finite. The pool
+        starts zeroed and writers store finite values, so when every group
+        stores one element type, stale bytes decode as finite values in
+        every group's view and stay in place. What a writer reads is reset:
+        the FP8 scales and initialization flags that decide whether a write
+        grows a block's scale. Unquantized writes only set flags, so an
+        unquantized pool of one element type needs no device work. A pool
+        whose groups store different element types is reset completely
+        (``zero_units``), since stale bytes of one type need not decode as
+        finite values of another.
+        """
+        _blocks(units, self.num_units)
+        if not units:
+            return
+
+        if self._mixed_types:
+            self.zero_units(units)
+            return
+        if not self.planes.quantized:
+            return
+
+        index = self._unit_index(units)
+        for field in _FIELDS:
+            self._fields[f"{field}.initialized"].index_fill_(1, index, False)
+            self._fields[f"{field}.scale"].index_fill_(1, index, 1)
 
     def mark_initialized(self, units: tuple[int, ...]) -> None:
         """Commit externally transferred values and scales of whole units.
 
         Every column of a unit holds a layer of the unit's group, so the
-        flags of both fields in every column are set, without a host read.
+        flags of both fields in every column are set with one indexed fill
+        per field, without a host read.
         """
         _blocks(units, self.num_units)
-        for start, stop in _ranges(units):
-            for field in _FIELDS:
-                self._fields[f"{field}.initialized"][:, start:stop].fill_(True)
+        if not units:
+            return
+
+        index = self._unit_index(units)
+        for field in _FIELDS:
+            self._fields[f"{field}.initialized"].index_fill_(1, index, True)
 
     def close(self) -> None:
         """Release owner references.
