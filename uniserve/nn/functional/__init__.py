@@ -19,7 +19,7 @@ from ._activation import (
 )
 from ._attention import attention
 from ._linear import linear, merged_linear
-from ._moe import fused_moe, topk_softmax
+from ._moe import Routes, fused_moe, topk_softmax
 from ._norm import (
     add_rms_norm,
     gated_residual,
@@ -40,6 +40,7 @@ from ._patch import patchify, unpatchify, unpatchify_video_tokens
 from ._rope import apply_rotary, qk_bias_rms_norm_rope_, qk_norm_rope
 
 __all__ = [
+    "Routes",
     "add_rms_norm",
     "apply_rotary",
     "attention",

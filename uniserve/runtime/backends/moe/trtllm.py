@@ -42,10 +42,10 @@ import torch
 
 from uniserve.quantization import RowOrder
 
-from . import NVFP4Backend, NVFP4Operator
+from . import CombiningOperator, NVFP4Backend, NVFP4Operator
 
 
-class _TrtllmGen(NVFP4Operator):
+class _TrtllmGen(NVFP4Operator, CombiningOperator):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         from flashinfer.fused_moe import (
@@ -116,14 +116,16 @@ class _TrtllmGen(NVFP4Operator):
                 "trtllm-gen NVFP4 experts read and write BF16 hidden states"
             )
 
-    def __call__(self, hidden, topk_ids, topk_weights):
+    def __call__(self, hidden, topk_ids, topk_weights, *, combine=True):
+        # The kernels store combined rows, returned uncombined as one-route
+        # Routes.
         self._validate(hidden, topk_ids, topk_weights)
         output = torch.empty(
             hidden.shape, dtype=torch.bfloat16, device=hidden.device
         )
         tokens = hidden.shape[0]
         if not tokens:
-            return output
+            return self._result(output, combine)
 
         values, scales = self._encoded(hidden)
         self._kernel(
@@ -156,7 +158,7 @@ class _TrtllmGen(NVFP4Operator):
             output=output,
             tune_max_num_tokens=self.size.num_tokens,
         )
-        return output
+        return self._result(output, combine)
 
     def close(self) -> None:
         super().close()

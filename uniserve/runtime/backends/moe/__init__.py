@@ -1,13 +1,13 @@
 """Prepared routed-expert operators borrowing stacked expert weights.
 
 A provider evaluates one ``FusedMoE`` call site: routed tokens of up to the
-prepared ``TextSize`` capacity through that module's resident expert
-weights. Operators borrow the module's parameters and context-owned
-workspace; host planning happens only in ``prepare`` so calls can be
-captured in CUDA graphs. A provider whose kernel reads expert weights in
-another physical row order places them in that order when it is prepared;
-the logical weights stay unchanged and only one copy stays resident
-(``NVFP4Backend``).
+prepared ``TextSize`` capacity through that module's resident expert weights,
+returning the combined output or, uncombined, its ``Routes``. Operators borrow
+the module's parameters and context-owned workspace; host planning happens only
+in ``prepare`` so calls can be captured in CUDA graphs. A provider whose kernel
+reads expert weights in another physical row order places them in that order
+when it is prepared; the logical weights stay unchanged and only one copy stays
+resident (``NVFP4Backend``).
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import torch as torch_lib
 from torch import nn
 
 from uniserve.model.inputs import TextSize
+from uniserve.nn.functional import Routes
 from uniserve.quantization import QuantizedTensor, RowOrder, ScaleLayout
 from uniserve.tensors import BufferConfig
 
@@ -67,7 +68,12 @@ class Operator:
         hidden: torch_lib.Tensor,
         topk_ids: torch_lib.Tensor,
         topk_weights: torch_lib.Tensor,
-    ) -> torch_lib.Tensor:
+        *,
+        combine: bool = True,
+    ) -> torch_lib.Tensor | Routes:
+        """Evaluate the routed experts: the combined ``[T, H]`` output, or
+        with ``combine=False`` its :class:`Routes` (see ``FusedMoE``).
+        """  # noqa: D205
         raise NotImplementedError
 
     def tactic_space(self) -> list[list]:
@@ -82,6 +88,35 @@ class Operator:
         self._closed = True
         self.module = None
         self.workspace = {}
+
+
+class CombiningOperator(Operator):
+    """An operator whose kernels store each token's combined rows.
+
+    An uncombined call returns them as the one-route :class:`Routes` of
+    unit weight. The unit weights are one ``[capacity, 1]`` FP32 buffer the
+    operator fills once when it is prepared, so no call allocates them and
+    captured calls borrow a prefix at a fixed address.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._unit: torch_lib.Tensor | None = torch_lib.ones(
+            (self.size.num_tokens, 1),
+            dtype=torch_lib.float32,
+            device=self.module.up_gate.weight.device,
+        )
+
+    def _result(self, output, combine: bool):
+        """Return ``output`` itself or as one-route ``Routes``."""
+        if combine:
+            return output
+        assert self._unit is not None
+        return Routes(output.unsqueeze(1), self._unit[: output.shape[0]])
+
+    def close(self) -> None:
+        super().close()
+        self._unit = None
 
 
 class NVFP4Operator(Operator):
@@ -308,7 +343,7 @@ def resolve(
     return provider
 
 
-def evaluate(module, hidden, topk_ids, topk_weights):
+def evaluate(module, hidden, topk_ids, topk_weights, *, combine=True):
     """Run one standalone call through a provider prepared just for it.
 
     The call owns its workspace for its duration; execution contexts bind a
@@ -324,6 +359,6 @@ def evaluate(module, hidden, topk_ids, topk_weights):
             module=module, size=size, workspace=buffers.view(requirements)
         )
         try:
-            return operator(hidden, topk_ids, topk_weights)
+            return operator(hidden, topk_ids, topk_weights, combine=combine)
         finally:
             operator.close()

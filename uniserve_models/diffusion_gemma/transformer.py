@@ -24,7 +24,7 @@ from uniserve.nn.linear import (
     VocabParallelEmbedding,
 )
 from uniserve.nn.mlp import GatedMLP
-from uniserve.nn.moe import FusedMoE, TopK
+from uniserve.nn.moe import FusedMoE, Routes, TopK
 from uniserve.nn.norm import RMSNorm
 from uniserve.nn.rope import RotaryEmbedding
 
@@ -194,14 +194,14 @@ class MoE(nn.Module):
         )
         self.output_norm = RMSNorm(size, eps)
 
-    def forward(
-        self, routed: torch.Tensor, hidden: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, routed: torch.Tensor, hidden: torch.Tensor) -> Routes:
         """Return the experts' unnormalized sum for the router input
-        ``routed`` and the expert input ``hidden``.
+        ``routed`` and the expert input ``hidden``, as the routes whose
+        value it is: the layer's second sandwich normalization evaluates
+        the sum while it reads them.
         """  # noqa: D205
         ids, weights = self.router(routed)
-        return self.experts(hidden, ids, weights)
+        return self.experts(hidden, ids, weights, combine=False)
 
 
 class Layer(nn.Module, PhasedLayer):
