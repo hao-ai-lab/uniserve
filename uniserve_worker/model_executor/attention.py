@@ -20,7 +20,7 @@ then stages into its fixed device backing.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -33,6 +33,7 @@ from uniserve.nn.attention import (
     PagedInput,
     SegmentedInput,
     SequenceLengths,
+    paged_append,
 )
 from uniserve_worker.errors import invalid_descriptor
 from uniserve_worker.model_executor.input_batch import AttentionRow
@@ -230,27 +231,38 @@ def from_tables(
     prefixes = SequenceLengths.from_lengths(prefix_lengths, device="cpu")
 
     if any(write):
+        # Rows that do not write keep their query positions but address no
+        # cache token.
+        skipped = np.repeat(
+            np.logical_not(np.asarray(write, dtype=bool)),
+            np.asarray(query_lengths, dtype=np.int64),
+        )
         entries = {}
         for number, table in enumerate(pages):
-            entry = PagedInput.from_blocks(
-                blocks=table.rows,
+            start_pages = table.start_pages if table.windowed else None
+            blocks, writes = paged_append(
+                table.rows,
                 query_lengths=query_lengths,
                 prefix_lengths=prefix_lengths,
                 block_size=table.block_size,
-                causal=tuple(causal),
-                device="cpu",
-                start_pages=table.start_pages if table.windowed else None,
+                start_pages=start_pages,
             )
-            writes = entry.write_indices
-            if writes is None:
-                raise ValueError("paged appends require cache write addresses")
-            offset = 0
-            for length, enabled in zip(query_lengths, write, strict=True):
-                if not enabled:
-                    writes[offset : offset + length].fill_(-1)
-                offset += length
+            writes[skipped] = -1
             # Every table reads the same query domain and prefixes.
-            entries[number] = replace(entry, queries=queries, prefixes=prefixes)
+            entries[number] = PagedInput(
+                queries,
+                prefixes,
+                BlockTable(
+                    torch.from_numpy(blocks),
+                    table.block_size,
+                    None
+                    if start_pages is None
+                    else torch.tensor(start_pages, dtype=torch.int32),
+                    start_pages,
+                ),
+                torch.from_numpy(writes),
+                tuple(causal),
+            )
         return AttentionBatch(entries, queries)
 
     if any(causal):
