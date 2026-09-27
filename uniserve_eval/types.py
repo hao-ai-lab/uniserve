@@ -112,17 +112,24 @@ class SamplingConfig:
     interleave tasks always stream and the other tasks never do. With
     ``ignore_eos`` set, the text and i2t tasks also validate fixed-length
     output.
+
+    ``temperature``, ``top_p``, and ``ignore_eos`` of ``None`` leave the
+    field out of the request, like the optional controls. A block-diffusion
+    server samples every canvas under its own configured schedule and
+    refuses these controls, so its points send none of them; a profile
+    declares that with ``server_sampling = true`` (see
+    ``uniserve_eval.config``).
     """
 
-    temperature: float = 0.0
-    top_p: float = 1.0
+    temperature: float | None = 0.0
+    top_p: float | None = 1.0
     top_k: int | None = None
     min_p: float | None = None
     repetition_penalty: float | None = None
     frequency_penalty: float | None = None
     presence_penalty: float | None = None
     sampling_seed: int | None = None
-    ignore_eos: bool = True
+    ignore_eos: bool | None = True
     max_tokens: int | None = None
     stream: bool = True
     extra_body: dict[str, Any] = field(default_factory=dict)

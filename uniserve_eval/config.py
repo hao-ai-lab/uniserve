@@ -71,6 +71,20 @@ _SAMPLING_FIELDS = set(SamplingConfig.__dataclass_fields__)
 _IMAGE_FIELDS = set(ImageConfig.__dataclass_fields__)
 _VIDEO_FIELDS = set(VideoConfig.__dataclass_fields__)
 
+# Request-level sampling controls a point with server-owned sampling may not
+# set: every token-sampling parameter, the request seed, and ignore_eos.
+_TOKEN_SAMPLING_CONTROLS = {
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+    "frequency_penalty",
+    "presence_penalty",
+    "sampling_seed",
+    "ignore_eos",
+}
+
 # The settings dataclasses a benchmark table's nested tables construct.
 _Settings = TypeVar(
     "_Settings", LoadConfig, SamplingConfig, ImageConfig, VideoConfig
@@ -459,9 +473,29 @@ def _load_config(raw: Any, context: str) -> LoadConfig:
 def _sampling_config(
     raw: Any, task: type[BenchmarkTask], context: str
 ) -> SamplingConfig:
-    """Parse sampling settings with task-specific streaming defaults."""
+    """Parse sampling settings with task-specific streaming defaults.
+
+    `server_sampling = true` declares that the server's configured sampling
+    schedule governs every request, as on a block-diffusion server that
+    refuses token-sampling controls. TOML has no null, so this key stands
+    for setting `temperature`, `top_p`, and `ignore_eos` to `None`; the
+    requests then carry no token-sampling control at all, and the table may
+    not name any of them. The key itself is not a `SamplingConfig` field:
+    the resolved workload shows the omitted controls as nulls.
+    """
     value = dict(_mapping(raw, context)) if raw is not None else {}
+    server_sampling = value.pop("server_sampling", False)
+    if not isinstance(server_sampling, bool):
+        raise ValueError(f"{context}.server_sampling must be a boolean")
     _reject_unknown(value, _SAMPLING_FIELDS, context)
+    if server_sampling:
+        named = sorted(_TOKEN_SAMPLING_CONTROLS & set(value))
+        if named:
+            raise ValueError(
+                f"{context} declares server_sampling and sets token-sampling "
+                f"controls: {', '.join(named)}"
+            )
+        value.update(temperature=None, top_p=None, ignore_eos=None)
     if "stream" not in value:
         value["stream"] = task.default_stream
     extra = value.get("extra_body", {})
