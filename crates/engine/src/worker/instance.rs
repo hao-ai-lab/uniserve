@@ -60,22 +60,36 @@ impl WorkerProcessArgs {
     /// `launchers` is the deployment's registry, which owns the launcher of
     /// every host this process does not run on; a group placing a rank on
     /// such a host requires it.
+    ///
+    /// A replica of an expert-parallel world is not relaunched: its peers
+    /// hold that world's communicators and exchange tokens with it at every
+    /// expert layer, so a replacement rank cannot join them alone.
     fn launch(
         &self,
         cancel: Option<Arc<AtomicBool>>,
         launchers: Option<super::launcher::Launchers>,
     ) -> anyhow::Result<LaunchedGroup> {
-        self.adopt_ranks(self.spawn_ranks(cancel, launchers)?)
+        anyhow::ensure!(
+            self.expert_parallel.is_none(),
+            "worker {} shares its experts with other replicas and cannot rejoin their \
+             expert-parallel world",
+            self.worker_id
+        );
+        self.adopt_ranks(self.spawn_ranks(cancel, launchers, None)?)
     }
 
     /// Starts every rank of one group without waiting for its endpoint report.
     ///
     /// Spawning is separated from adoption so several groups start their
     /// processes concurrently and then wait for all of their reports together.
+    ///
+    /// `expert_store` is the socket the group's first rank serves its
+    /// expert-parallel world's store on, when that rank is the world's rank 0.
     fn spawn_ranks(
         &self,
         cancel: Option<Arc<AtomicBool>>,
         launchers: Option<super::launcher::Launchers>,
+        mut expert_store: Option<std::net::TcpListener>,
     ) -> anyhow::Result<LaunchedRanks> {
         let cancel = cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         crate::WorkerConfig::validate_members(&self.ranks, &self.components)?;
@@ -139,13 +153,17 @@ impl WorkerProcessArgs {
                 Some(rendezvous) if rank == 0 => rendezvous.listener.take(),
                 _ => None,
             };
+            let sockets = super::process::RankSockets {
+                group: store_listener,
+                experts: if rank == 0 { expert_store.take() } else { None },
+            };
             ranks.push(PendingRank::spawn_rank(
                 self,
                 rank as u32,
                 rendezvous
                     .as_ref()
                     .map(|rendezvous| rendezvous.address.as_str()),
-                store_listener,
+                sockets,
                 remote.as_mut(),
                 Arc::clone(&cancel),
                 registry.address(),
@@ -388,11 +406,54 @@ impl WorkerGroup {
             )?,
             None => None,
         };
+
+        // Replicas sharing their experts form one expert-parallel world at a
+        // TCP store its rank 0 serves. The head binds the store's socket here,
+        // routable when some rank runs on another host, and the world's rank
+        // 0, which must run on this host, inherits it, so the port is held
+        // from the reservation until that rank serves on it.
+        let mut expert_store = None;
+        if arguments.iter().any(|args| args.expert_parallel.is_some()) {
+            let head = match launchers.as_ref() {
+                Some(registry) => Some(super::launcher::lock(registry)?.reachable_host()?),
+                None => None,
+            };
+            let rendezvous = super::registration::reserve_rendezvous(head)?;
+            for args in &mut arguments {
+                let placement = args.expert_parallel.as_mut().with_context(|| {
+                    format!(
+                        "worker {} does not join the deployment's expert-parallel world",
+                        args.worker_id
+                    )
+                })?;
+                anyhow::ensure!(
+                    args.ranks.len() == 1,
+                    "expert-parallel replica {} must be one rank",
+                    args.worker_id
+                );
+                placement.address = Some(rendezvous.address.clone());
+                if placement.rank == 0 {
+                    anyhow::ensure!(
+                        args.ranks[0].node == args.host,
+                        "expert-parallel rank 0 ({}) must run on the head's host",
+                        args.worker_id
+                    );
+                }
+            }
+            expert_store = rendezvous.listener;
+        }
+
         // Every group's processes start before any group waits for reports, so
         // their interpreter and library import overlap.
         let launched = arguments
             .iter()
-            .map(|args| args.spawn_ranks(None, launchers.clone()))
+            .map(|args| {
+                let store = match &args.expert_parallel {
+                    Some(placement) if placement.rank == 0 => expert_store.take(),
+                    _ => None,
+                };
+                args.spawn_ranks(None, launchers.clone(), store)
+            })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let groups = arguments
             .iter()

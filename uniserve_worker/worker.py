@@ -199,6 +199,13 @@ class Worker:
                 device=config.execution.device,
                 backend=config.distributed_backend,
                 rendezvous=config.rendezvous,
+                experts=None
+                if config.expert_parallel is None
+                else (
+                    config.expert_parallel.rank,
+                    config.expert_parallel.size,
+                    config.expert_parallel.rendezvous,
+                ),
             )
         except ValueError as error:
             # Public numerical resources report ordinary argument errors;
@@ -221,6 +228,7 @@ class Worker:
                 source=source,
                 description=description,
                 declarations=declarations,
+                experts=distributed.experts,
             )
 
             # Sampling broadcasts selected tokens over the `tp` group of the

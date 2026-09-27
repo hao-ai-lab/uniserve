@@ -2,8 +2,10 @@
 
 ``uniserve serve --data-parallel-size N`` runs a full model replica on each
 of the N visible GPUs, each with its own scheduler and KV cache, and routes
-every request to the replica with the fewest requests in flight. The tests
-check what a client observes:
+every request to the replica with the fewest requests in flight; with
+``--expert-parallel`` the replicas also shard the routed experts and exchange
+tokens at every expert layer. On both topologies the tests check what a
+client observes:
 
 - readouts sent together are all answered correctly, and every replica
   admits some of them;
@@ -46,6 +48,8 @@ CHECKPOINTS = {
     "nvfp4": "UNISERVE_DIFFUSION_GEMMA_NVFP4_MODEL",
 }
 # One series per replica: requests each replica's scheduler admitted.
+# Each replica keeps every expert, or the replicas shard the experts.
+TOPOLOGIES = {"replicas": (), "experts": ("--expert-parallel",)}
 ADMITTED = re.compile(
     r'^uniserve:num_requests_admitted_total\{[^}]*engine="(\d+)"[^}]*\} (\S+)$',
     re.MULTILINE,
@@ -63,13 +67,22 @@ def _checkpoint(precision: str) -> Path:
     return path
 
 
-@pytest.fixture(scope="module", params=sorted(CHECKPOINTS))
+@pytest.fixture(
+    scope="module",
+    params=[
+        (precision, topology)
+        for precision in sorted(CHECKPOINTS)
+        for topology in TOPOLOGIES
+    ],
+    ids="-".join,
+)
 def served(request, tmp_path_factory) -> Iterator[tuple[str, int]]:
     """Serve one replica per visible GPU; yield the URL and replica count."""
     replicas = torch.cuda.device_count()
     if replicas < 2:
         pytest.fail(f"data-parallel serving needs two GPUs, found {replicas}")
-    checkpoint = _checkpoint(request.param)
+    precision, topology = request.param
+    checkpoint = _checkpoint(precision)
     try:
         binary = require_uniserve_binary()
     except FileNotFoundError as error:
@@ -95,8 +108,9 @@ def served(request, tmp_path_factory) -> Iterator[tuple[str, int]]:
         "8192",
         "--data-parallel-size",
         str(replicas),
+        *TOPOLOGIES[topology],
     ]
-    log = tmp_path_factory.mktemp(request.param) / "server.log"
+    log = tmp_path_factory.mktemp(f"{precision}-{topology}") / "server.log"
     with server_process(args, base_url, log, timeout_s=1800.0):
         yield base_url, replicas
 

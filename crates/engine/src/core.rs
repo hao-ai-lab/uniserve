@@ -353,6 +353,11 @@ pub struct EngineConfig {
     /// blocks of groups; each replica is served by its own engine core
     /// ([`EngineCore::replicas`]). One means the workers form one engine.
     pub data_parallel_size: usize,
+    /// Whether the data-parallel replicas shard the model's routed experts:
+    /// each replica is then one rank, keeps its share of every expert layer
+    /// and exchanges tokens with the other replicas at those layers, while
+    /// attention and every other layer stay data-parallel.
+    pub expert_parallel: bool,
     /// Rank launch defaults refined by each WorkerGroup configuration.
     ///
     /// Every constructor also reads the model identifier (`model`) and
@@ -408,6 +413,7 @@ impl EngineConfig {
             )],
             transfer: TransferConfig::default(),
             data_parallel_size: 1,
+            expert_parallel: false,
             worker_process,
             bos: 0,
             // `SimEngine` fabricates this fake EOS id after `text_len` tokens; the
@@ -518,6 +524,19 @@ impl EngineCore {
             }
         }
 
+        // Replicas that shard their experts are one rank each: the expert
+        // exchange joins one rank per replica, and a replica with tensor
+        // parallel attention would also need its own expert partition.
+        anyhow::ensure!(
+            !config.expert_parallel
+                || (size > 1
+                    && replicas
+                        .iter()
+                        .all(|replica| { replica.len() == 1 && replica[0].ranks.len() == 1 })),
+            "expert parallelism shards experts across two or more data-parallel \
+             replicas of one rank each"
+        );
+
         // Each replica resolves its transfer edges over its own groups. The
         // edges `with_worker_defaults` adds only name the replica's groups, so
         // checking the configured ones covers every edge.
@@ -571,7 +590,7 @@ impl EngineCore {
         // of its replica (`peers`), from which the group resolves the ranks,
         // possibly in other groups, that read its products.
         let mut arguments = Vec::with_capacity(config.workers.len());
-        for (replica, transfer) in replicas.iter().zip(&transfers) {
+        for (index, (replica, transfer)) in replicas.iter().zip(&transfers).enumerate() {
             let peers = replica
                 .iter()
                 .map(|worker| (worker.id.to_string(), worker.components.clone()))
@@ -588,6 +607,13 @@ impl EngineCore {
                         .storage_fraction
                         .unwrap_or(config.worker_process.kv_storage_fraction),
                     transfer: transfer.clone(),
+                    expert_parallel: config.expert_parallel.then_some(
+                        crate::worker::ExpertParallelPlacement {
+                            rank: index as u32,
+                            size: size as u32,
+                            address: None,
+                        },
+                    ),
                     ..config.worker_process.clone()
                 });
             }
@@ -624,6 +650,7 @@ impl EngineCore {
                 workers: replica.to_vec(),
                 transfer,
                 data_parallel_size: 1,
+                expert_parallel: false,
                 ..config.clone()
             };
             cores.push(Self::assemble(replica_config, Box::new(executor), waker)?);
@@ -1007,6 +1034,32 @@ mod tests {
             .err()
             .expect("unequal replicas are refused");
         assert!(error.to_string().contains("data-parallel replicas"));
+    }
+
+    /// Experts shard across two or more replicas of one rank each; any other
+    /// placement is refused before a rank launches.
+    #[test]
+    fn expert_parallelism_needs_several_one_rank_replicas() {
+        let hosts = ["localhost".to_owned()];
+        for (replicas, ranks) in [(1, 1), (2, 2)] {
+            let config = EngineConfig {
+                workers: WorkerConfig::replicated(
+                    &hosts,
+                    "cpu",
+                    replicas,
+                    ranks,
+                    2,
+                    WorkerConfig::single_component("model", ranks),
+                ),
+                data_parallel_size: replicas,
+                expert_parallel: true,
+                ..EngineConfig::sim("sim-model")
+            };
+            let error = EngineCore::replicas(config)
+                .err()
+                .expect("the placement is refused");
+            assert!(error.to_string().contains("expert parallelism"), "{error}");
+        }
     }
 
     #[test]

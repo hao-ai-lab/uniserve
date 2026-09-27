@@ -245,6 +245,7 @@ impl Default for WorkerProcessArgs {
             max_model_len: 8192,
             max_video_seconds: 15.0,
             min_video_seconds: None,
+            expert_parallel: None,
         }
     }
 }
@@ -325,6 +326,7 @@ impl WorkerProcessArgs {
         registration: &str,
         rendezvous: Option<&str>,
         rendezvous_listen_fd: Option<std::os::fd::RawFd>,
+        expert_listen_fd: Option<std::os::fd::RawFd>,
     ) -> anyhow::Result<serde_json::Value> {
         let depth = self.queue_depth.max(1);
         let max_payload = self.req_slot_cap.max(self.resp_slot_cap).max(1);
@@ -407,6 +409,21 @@ impl WorkerProcessArgs {
         fields.insert(
             uniserve_core::launch::RENDEZVOUS_LISTEN_FD.into(),
             json!(rendezvous_listen_fd),
+        );
+        // A replica sharing its experts joins the expert-parallel world at the
+        // store world rank 0 serves on the socket it inherits at the named
+        // descriptor; the other replicas receive only the address.
+        fields.insert(
+            "expert_parallel".into(),
+            match &self.expert_parallel {
+                Some(placement) => json!({
+                    "rank": placement.rank,
+                    "size": placement.size,
+                    "address": placement.address,
+                    "listen_fd": expert_listen_fd,
+                }),
+                None => Value::Null,
+            },
         );
         fields.insert(
             "distributed_backend".into(),
@@ -648,17 +665,28 @@ fn allocator_environment(
     }
 }
 
+/// Bound listening sockets a rank inherits and serves collective stores on.
+#[derive(Default)]
+pub(crate) struct RankSockets {
+    /// The group's rendezvous store, served by the group's first rank.
+    pub(crate) group: Option<std::net::TcpListener>,
+    /// The expert-parallel world's store, served by that world's rank 0.
+    pub(crate) experts: Option<std::net::TcpListener>,
+}
+
 impl PendingRank {
     /// Spawns one rank, which reports its endpoint to `registration`.
     ///
     /// The rank's channel is bound afterwards from that report, so nothing here
     /// names the endpoint and nothing waits for model readiness. `rendezvous`
-    /// is the group's collective store address, and `store_listener` the
+    /// is the group's collective store address, and `sockets.group` the
     /// socket this rank serves that store on when it is the group's first rank
     /// and this process spawns it; the rank inherits the socket and this
     /// process keeps no copy. With `remote`, the launch goes to that host's
     /// launcher and no process is started here. `startup_abort` is the
     /// startup cancellation flag shared by the ranks launched together.
+    /// `sockets.experts` is the socket this rank serves its expert-parallel
+    /// world's store on, when it is that world's rank 0.
     ///
     /// Fails when the descriptor directory cannot be created, the rank's
     /// host-relative values or its descriptor cannot be built, the descriptor
@@ -668,7 +696,7 @@ impl PendingRank {
         args: &WorkerProcessArgs,
         rank: u32,
         rendezvous: Option<&str>,
-        store_listener: Option<std::net::TcpListener>,
+        sockets: RankSockets,
         remote: Option<&mut super::launcher::RemoteHost<'_>>,
         startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
         registration: &str,
@@ -715,14 +743,23 @@ impl PendingRank {
 
         // The command owns the store socket from here and closes this
         // process's copy when it is dropped, after the spawn below.
-        let rendezvous_listen_fd = store_listener
+        let rendezvous_listen_fd = sockets
+            .group
+            .map(|listener| uniserve_core::launch::inherit_listener(&mut cmd, listener));
+        let expert_listen_fd = sockets
+            .experts
             .map(|listener| uniserve_core::launch::inherit_listener(&mut cmd, listener));
 
         // One typed descriptor carries every launch value. argv keeps the
         // process identity and the descriptor's location so a running worker
         // remains identifiable from the process table.
-        let descriptor =
-            args.launch_descriptor(rank, registration, rendezvous, rendezvous_listen_fd)?;
+        let descriptor = args.launch_descriptor(
+            rank,
+            registration,
+            rendezvous,
+            rendezvous_listen_fd,
+            expert_listen_fd,
+        )?;
         std::fs::write(&descriptor_path, serde_json::to_vec_pretty(&descriptor)?)
             .context("writing the worker launch descriptor")?;
 

@@ -31,6 +31,12 @@ if TYPE_CHECKING:
     from uniserve_worker.bootstrap.launch import WorkerIpcEndpoint
     from uniserve_worker.worker import Worker
 
+# How long, in microseconds, an expert-parallel rank without a forward of its
+# own waits for a request or completion before it agrees on the next expert
+# step again. It bounds how long a step another rank starts waits for this
+# rank while all ranks are idle.
+_EXPERT_STEP_POLL_US = 200
+
 
 @dataclass(slots=True)
 class PendingResponse:
@@ -87,6 +93,13 @@ class Service:
 
                 if self._closing and not self._pending:
                     if not self.worker.executor.inflight:
+                        # An expert-parallel rank leaves only once every rank
+                        # of its group is leaving, so none waits on it.
+                        runner = self.worker.runner
+                        if runner.experts is not None:
+                            runner.join_expert_step(leaving=True)
+                            if not runner.experts.released:
+                                continue
                         if self._shutdown_response is not None:
                             self.endpoint.respond(self._shutdown_response)
                         return
@@ -100,6 +113,16 @@ class Service:
                         self._accept(request)
                         continue
 
+                # An expert-parallel rank takes part in every step another
+                # rank of its expert group starts while it has no forward of
+                # its own to launch, as vLLM's data-parallel engines run a
+                # dummy batch while any engine has work
+                # (``v1/engine/core.py:1870-1927``); it therefore never
+                # blocks for long.
+                experts = self.worker.runner.experts is not None
+                if experts and self.worker.runner.join_expert_step():
+                    continue
+
                 if self._pending or self.worker.executor.inflight:
                     # Work is outstanding: wait for a request or a completion
                     # wake (timeouts are in microseconds). Consumer
@@ -110,8 +133,17 @@ class Service:
                         for transport in self.worker.transports.values()
                     )
                     self.endpoint.wait_incoming(
-                        1_000 if awaiting else 60_000_000
+                        _EXPERT_STEP_POLL_US
+                        if experts
+                        else 1_000
+                        if awaiting
+                        else 60_000_000
                     )
+                    continue
+
+                if experts:
+                    # Idle: poll for a request or another rank's step.
+                    self.endpoint.wait_incoming(_EXPERT_STEP_POLL_US)
                     continue
 
                 # Fully idle: block until the next request.

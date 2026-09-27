@@ -330,7 +330,19 @@ class CanvasRunner(ModelRunner):
                 )
         return records
 
-    def select_graph_shape(self, batch, *, eligible):
+    def expert_capacities(self) -> frozenset[int]:
+        """The canvas buckets' token counts: an expert step pads to one."""
+        return frozenset(rows * self.canvas_length for rows in self.canvas_rows)
+
+    def graph_capacity(self, key) -> int:
+        """A canvas bucket's canvas tokens; its graph exchanges at that many."""
+        return key[1] * self.canvas_length
+
+    def expert_tokens(self, batch) -> int:
+        """Every staged canvas sends its whole canvas through the exchange."""
+        return batch.row_count * self.canvas_length
+
+    def select_graph_shape(self, batch, *, eligible, capacity=None):
         """Choose the canvas graph bucket of a call and pad the call to it.
 
         Returns ``None`` for eager execution, without graph pools or for an
@@ -338,7 +350,9 @@ class CanvasRunner(ModelRunner):
         readout key is ``("canvas", rows)`` and its padded batch holds the
         canvas pass's input alone; a step key is ``("canvas_step", rows,
         sampling, first)``, where ``first`` is whether every row starts its
-        canvas; padding rows start one too.
+        canvas; padding rows start one too. In an expert step of per-rank
+        ``capacity`` tokens the call pads to the bucket of that many canvas
+        tokens, whose graph exchanges at it.
 
         Raises:
             CUDAGraphError: The call holds more canvases than every bucket,
@@ -350,7 +364,13 @@ class CanvasRunner(ModelRunner):
         length = self.canvas_length
         buckets = self.canvas_rows
         rows = next(
-            (value for value in buckets if value >= batch.row_count), None
+            (
+                value
+                for value in buckets
+                if value >= batch.row_count
+                and (capacity is None or value * length == capacity)
+            ),
+            None,
         )
         if rows is None or max(inputs.attention.queries.host) > length:
             raise CUDAGraphError(
