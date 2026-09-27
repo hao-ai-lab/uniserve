@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncGenerator, Callable, Coroutine
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -30,11 +30,19 @@ Submit = Callable[[Example, float | None], Coroutine[Any, Any, T]]
 
 @dataclass(frozen=True)
 class LoadResult:
-    """Contains warmup outputs, measured outputs, and measured duration."""
+    """Contains warmup outputs, measured outputs, and the measured window.
+
+    ``window_start`` and ``window_end`` are wall-clock ``time.time()``
+    seconds bounding the measured window, for aligning it with telemetry
+    sampled on that clock; ``duration_s`` is the same window measured on
+    the monotonic clock.
+    """
 
     warmup_outputs: tuple[Any, ...]
     outputs: tuple[Any, ...]
     duration_s: float
+    window_start: float = 0.0
+    window_end: float = 0.0
 
 
 class WarmupFailure(RuntimeError):  # noqa: N818  # deliberate taxonomy name
@@ -88,6 +96,7 @@ async def run_load(
     max_concurrency: int | None,
     submit: Submit[T],
     warmup_requests: int = 1,
+    before_measure: Callable[[], Awaitable[None]] | None = None,
 ) -> LoadResult:
     """Run warmup, settle, and measured requests under a concurrency limit.
 
@@ -103,6 +112,9 @@ async def run_load(
             ``0``) for no limit.
         submit: Coroutine that sends one example; see ``Submit``.
         warmup_requests: Number of warmup submissions; ``0`` skips warmup.
+        before_measure: Coroutine awaited after the settle pause and before
+            the measured window opens, outside its duration; the runner
+            snapshots server counters there.
 
     Returns:
         Warmup and measured outputs in submission order, and the measured
@@ -147,7 +159,10 @@ async def run_load(
     # A fixed pause precedes the measured window, with or without warmup,
     # and lies outside the reported duration.
     await asyncio.sleep(1.0)
+    if before_measure is not None:
+        await before_measure()
 
+    window_start = time.time()
     benchmark_start_time = time.perf_counter()
 
     tasks: list[asyncio.Task[T]] = []
@@ -164,6 +179,7 @@ async def run_load(
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
     benchmark_end_time = time.perf_counter()
+    window_end = time.time()
 
     # Duration runs from the first arrival until every measured request has
     # finished. The arrival loop ends at the final arrival (see
@@ -174,4 +190,6 @@ async def run_load(
         tuple(warmup_outputs),
         tuple(outputs),
         benchmark_end_time - benchmark_start_time,
+        window_start,
+        window_end,
     )
